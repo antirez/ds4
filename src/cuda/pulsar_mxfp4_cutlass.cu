@@ -2,7 +2,7 @@
 // Weights arrive pre-packed in CUTLASS B layout (from the offline converter); activations are
 // packed to MXFP4 on-device at runtime. Path: pack(x) -> gate/up GEMM -> SwiGLU -> pack(mid) -> down GEMM.
 // Build (standalone test):  nvcc -std=c++17 -arch=sm_120f --expt-relaxed-constexpr --expt-extended-lambda
-//                           -DDS4_MXFP4_STANDALONE -I cutlass/include -I cutlass/tools/util/include ...
+//                           -DPULSAR_MXFP4_STANDALONE -I cutlass/include -I cutlass/tools/util/include ...
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -172,7 +172,7 @@ static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, in
   /* Vectorized pack is default; PULSAR_ACT_PACK_SCALAR=1 forces the scalar twin
    * (bit-exact) for the A/B. Env read ONCE (init-time static), not per launch. */
   static int scalar = -1;
-  if (scalar < 0) { const char *e = getenv("DS4_ACT_PACK_SCALAR"); scalar = (e && e[0]=='1') ? 1 : 0; }
+  if (scalar < 0) { const char *e = getenv("PULSAR_ACT_PACK_SCALAR"); scalar = (e && e[0]=='1') ? 1 : 0; }
   if (scalar) pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
   else        pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
 }

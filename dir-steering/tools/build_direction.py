@@ -87,9 +87,9 @@ def run_capture(
     dump_prefix = work / "dump"
 
     env = os.environ.copy()
-    env["DS4_CUDA_GRAPH_DUMP_PREFIX"] = str(dump_prefix)
-    env["DS4_CUDA_GRAPH_DUMP_NAME"] = component
-    env["DS4_CUDA_GRAPH_DUMP_POS"] = "0"
+    env["PULSAR_CUDA_GRAPH_DUMP_PREFIX"] = str(dump_prefix)
+    env["PULSAR_CUDA_GRAPH_DUMP_NAME"] = component
+    env["PULSAR_CUDA_GRAPH_DUMP_POS"] = "0"
 
     cmd = [
         str(ds4),

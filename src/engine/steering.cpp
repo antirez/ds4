@@ -129,7 +129,7 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
 bool gpu_graph_debug_dump_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
-        const char *p = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+        const char *p = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
         enabled = (p && p[0]) ? 1 : 0;
     }
     return enabled != 0;
@@ -143,14 +143,14 @@ bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
      * flag; caching does not change runtime behavior. */
     if (!gpu_graph_debug_dump_enabled()) return false;
 
-    const char *name_env = getenv("DS4_CUDA_GRAPH_DUMP_NAME");
+    const char *name_env = getenv("PULSAR_CUDA_GRAPH_DUMP_NAME");
     if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
 
-    const char *layer_env = getenv("DS4_CUDA_GRAPH_DUMP_LAYER");
+    const char *layer_env = getenv("PULSAR_CUDA_GRAPH_DUMP_LAYER");
     if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
         (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
 
-    const char *pos_env = getenv("DS4_CUDA_GRAPH_DUMP_POS");
+    const char *pos_env = getenv("PULSAR_CUDA_GRAPH_DUMP_POS");
     if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
 
     return true;

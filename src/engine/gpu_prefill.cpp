@@ -233,7 +233,7 @@ bool gpu_graph_upload_prompt_embeddings_hc(
     static long gpu_min_cached = -1;
     if (gpu_min_cached < 0) {
         gpu_min_cached = 512;
-        const char *gpu_min_env = getenv("DS4_CUDA_GPU_BATCH_EMBED_MIN");
+        const char *gpu_min_env = getenv("PULSAR_CUDA_GPU_BATCH_EMBED_MIN");
         if (gpu_min_env && gpu_min_env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(gpu_min_env, &end, 10);
@@ -271,7 +271,7 @@ bool gpu_graph_warmup_prefill_kernels(
         uint32_t           n_tokens) {
     static bool warmed = false;
     if (warmed) return true;
-    if (getenv("DS4_CUDA_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+    if (getenv("PULSAR_CUDA_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
 
     /*
      * The first batched F16 matmul can pay GPU's one-time pipeline execution
@@ -348,16 +348,16 @@ static bool gpu_graph_profile_layer_env_match(const char *env_name, uint32_t il)
 
 static bool gpu_graph_layer_stage_profile_enabled(uint32_t il) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_LAYER_STAGE_PROFILE", &cache) &&
-           gpu_graph_profile_layer_env_match("DS4_CUDA_LAYER_STAGE_PROFILE_LAYER", il);
+    return gpu_graph_env_flag("PULSAR_CUDA_LAYER_STAGE_PROFILE", &cache) &&
+           gpu_graph_profile_layer_env_match("PULSAR_CUDA_LAYER_STAGE_PROFILE_LAYER", il);
 }
 
 
 
 bool gpu_graph_decode_stage_profile_enabled(uint32_t il) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DECODE_STAGE_PROFILE", &cache) &&
-           gpu_graph_profile_layer_env_match("DS4_CUDA_DECODE_STAGE_PROFILE_LAYER", il);
+    return gpu_graph_env_flag("PULSAR_CUDA_DECODE_STAGE_PROFILE", &cache) &&
+           gpu_graph_profile_layer_env_match("PULSAR_CUDA_DECODE_STAGE_PROFILE_LAYER", il);
 }
 
 
@@ -445,9 +445,9 @@ bool gpu_graph_encode_layer_attention_batch(
     }
     const bool zero_prefix = pos0 == 0;
     static int index_stage_env = -1, q_stage_env = -1;
-    const bool index_stage_profile = gpu_graph_env_flag("DS4_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
+    const bool index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &index_stage_env);
     const bool layer_stage_profile = gpu_graph_layer_stage_profile_enabled(il);
-    const bool q_stage_profile = gpu_graph_env_flag("DS4_CUDA_Q_STAGE_PROFILE", &q_stage_env);
+    const bool q_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_Q_STAGE_PROFILE", &q_stage_env);
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
     double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
 #define PULSAR_CUDA_PROFILE_ATTN_STAGE(name) do { \
@@ -2731,7 +2731,7 @@ bool gpu_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
 
-    const bool profile = getenv("DS4_CUDA_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool profile = getenv("PULSAR_CUDA_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
     const int captured = pulsar_gpu_decode_graph_begin();

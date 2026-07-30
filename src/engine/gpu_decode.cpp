@@ -64,35 +64,35 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
 
 bool gpu_graph_use_reference_hc_decode(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_HC_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_HC_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_kv_decode(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_KV_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_KV_FUSION", &cache);
 }
 
 
 
 bool gpu_graph_use_reference_qkv_norm(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_QKV_NORM_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_QKV_NORM_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_compressor_pair_proj(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_hc_norm_decode(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_HC_NORM_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_HC_NORM_FUSION", &cache);
 }
 
 
@@ -105,21 +105,21 @@ bool gpu_graph_enable_batch_hc_norm_fusion(void) {
 
 static bool gpu_graph_use_reference_shared_down_hc(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
 }
 
 
 
 static bool gpu_graph_use_reference_attn_out_hc(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_ATTN_OUT_HC_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
 /* Evaluated every layer on the decode path; cache the flag reads (like the
  * fusion toggles above) instead of scanning environ per layer. */
 static bool gpu_graph_disable_shared_gate_up_swiglu(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION", &cache);
 }
 
 
@@ -168,7 +168,7 @@ static bool gpu_graph_decode_hc_pre(
 
 static bool gpu_graph_hc_norm_fusion_check_enabled(void) {
     static int cache = -1;
-    return gpu_graph_env_flag("DS4_CUDA_HC_NORM_FUSION_CHECK", &cache);
+    return gpu_graph_env_flag("PULSAR_CUDA_HC_NORM_FUSION_CHECK", &cache);
 }
 
 
@@ -178,7 +178,7 @@ static float gpu_graph_hc_norm_fusion_check_tolerance(void) {
     static float tolerance;
     if (initialized) return tolerance;
     tolerance = 2.0e-4f;
-    const char *env = getenv("DS4_CUDA_HC_NORM_FUSION_CHECK_TOL");
+    const char *env = getenv("PULSAR_CUDA_HC_NORM_FUSION_CHECK_TOL");
     if (env && env[0]) {
         char *end = NULL;
         const float v = strtof(env, &end);
@@ -331,19 +331,19 @@ static int gpu_graph_env_default_flag(const char *name, int def) {
 
 int gpu_graph_attn_pack_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_ATTN_PACK", 1);
+    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_ATTN_PACK", 1);
     return cached;
 }
 
 int gpu_graph_idx_fp4_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_IDX_FP4", 1);
+    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_IDX_FP4", 1);
     return cached;
 }
 
 int gpu_graph_raw_f16_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("DS4_RAW_F16", 1);
+    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_RAW_F16", 1);
     return cached;
 }
 
@@ -368,9 +368,9 @@ int gpu_graph_raw_f16_enabled(void) {
 int gpu_graph_decode_descr_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *v = getenv("DS4_DECODE_DESCR");
+        const char *v = getenv("PULSAR_DECODE_DESCR");
         if (v && strcmp(v, "2") == 0) cached = 2;
-        else cached = gpu_graph_env_default_flag("DS4_DECODE_DESCR", 0);
+        else cached = gpu_graph_env_default_flag("PULSAR_DECODE_DESCR", 0);
     }
     return cached;
 }
@@ -384,7 +384,7 @@ static bool gpu_graph_decode_descr_prepare(pulsar_gpu_graph *g, uint32_t pos) {
         const int32_t bank0 = 0;
         if (!g->descr_diag_pos || !g->descr_diag_seq ||
             !pulsar_gpu_tensor_write(g->descr_diag_seq, 0, &bank0, sizeof(bank0))) {
-            fprintf(stderr, "pulsar: DS4_DECODE_DESCR descriptor alloc failed\n");
+            fprintf(stderr, "pulsar: PULSAR_DECODE_DESCR descriptor alloc failed\n");
             /* Release and reset BOTH so a later call retries the whole block
              * instead of keying off a half-allocated descr_diag_pos and
              * failing forever (descr_diag_seq NULL / unwritten). */
@@ -407,7 +407,7 @@ static bool gpu_graph_decode_descr_prepare(pulsar_gpu_graph *g, uint32_t pos) {
 uint32_t gpu_graph_prefill_slice(void) {
     static long cached = -1;
     if (cached < 0) {
-        const char *e = getenv("DS4_PREFILL_SLICE");
+        const char *e = getenv("PULSAR_PREFILL_SLICE");
         long v = (e && e[0]) ? strtol(e, NULL, 10) : 512;
         cached = v > 0 ? v : 0;
     }
@@ -904,7 +904,7 @@ bool gpu_graph_encode_decode_layer(
     uint32_t n_selected = 0;
     double decode_index_stage_t0 = 0.0;
     static int decode_index_stage_env = -1;
-    const bool decode_index_stage_profile = gpu_graph_env_flag("DS4_CUDA_INDEXER_STAGE_PROFILE", &decode_index_stage_env);
+    const bool decode_index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &decode_index_stage_env);
     /* PULSAR_DECODE_DESCR diagnostic: refresh the 1-row descriptor arrays once
      * per layer (both the banked indexer scan and the banked attention below
      * read them). */
@@ -2549,7 +2549,7 @@ int gpu_graph_decode_test(
 
 uint32_t gpu_graph_token_split_after_layers(void) {
     uint32_t split_after_layers = 4;
-    const char *split_env = getenv("DS4_CUDA_GRAPH_TOKEN_SPLIT_LAYERS");
+    const char *split_env = getenv("PULSAR_CUDA_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(split_env, &end, 10);

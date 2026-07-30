@@ -1820,9 +1820,9 @@ int pulsar_gpu_attention_prefill_raw_heads_tensor(pulsar_gpu_tensor *heads, cons
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_window_attn = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    static const int force_window_attn = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
-    static const int no_cublas_attn = getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") != NULL;
+    static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
+    static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
     if (n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
@@ -2062,8 +2062,8 @@ static int attention_decode_batch_launch(
         return 0;
     }
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_window_attn = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    static const int force_window_attn = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
+    static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {
@@ -2265,13 +2265,13 @@ int pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
         (descr && comp_bank_ptrs) ? (const void * const *)comp_bank_ptrs->ptr : NULL;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_indexed_topk_sort = getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") != NULL;
-    static const int no_indexed_heads8 = getenv("DS4_CUDA_NO_INDEXED_HEADS8") != NULL;
-    static const int twopass_requested = getenv("DS4_CUDA_INDEXED_TWOPASS") != NULL;
+    static const int no_indexed_topk_sort = getenv("PULSAR_CUDA_NO_INDEXED_TOPK_SORT") != NULL;
+    static const int no_indexed_heads8 = getenv("PULSAR_CUDA_NO_INDEXED_HEADS8") != NULL;
+    static const int twopass_requested = getenv("PULSAR_CUDA_INDEXED_TWOPASS") != NULL;
     /* Kill-switch for the single-token (decode) heads8-online route added below;
      * set it to restore the pre-change generic per-(row,head) decode kernel. */
     static const int no_indexed_decode_heads8 =
-        getenv("DS4_CUDA_NO_INDEXED_DECODE_HEADS8") != NULL;
+        getenv("PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8") != NULL;
     /* The sort stays OFF for n_tokens == 1.  It is a pure locality optimization:
      * attention_indexed_mixed_heads8_online_kernel reads topk[] in whatever order
      * it is given, clamps each id against visible_comp, and folds rows through an
@@ -2430,9 +2430,9 @@ static int attention_prefill_mixed_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_window_attn = getenv("DS4_CUDA_NO_WINDOW_ATTENTION") != NULL;
-    static const int force_window_attn = getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL;
-    static const int no_cublas_attn = getenv("DS4_CUDA_NO_CUBLAS_ATTENTION") != NULL;
+    static const int no_window_attn = getenv("PULSAR_CUDA_NO_WINDOW_ATTENTION") != NULL;
+    static const int force_window_attn = getenv("PULSAR_CUDA_WINDOW_ATTENTION") != NULL;
+    static const int no_cublas_attn = getenv("PULSAR_CUDA_NO_CUBLAS_ATTENTION") != NULL;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         !no_window_attn &&
         (force_window_attn || (!g_quality_mode && n_tokens >= 128u))) {

@@ -290,7 +290,7 @@ static void dspark_bulk_drain(pulsar_gpu_graph *g, const token_vec *prompt,
          * this is the invariant that catches every new prompt.) */
         for (int i2 = 0; i2 < 3; i2++) g->dspark_n_raw[i2] = 0;
     }
-    const char *path = getenv("DS4_DSPARK_PREFILL_DUMP");
+    const char *path = getenv("PULSAR_DSPARK_PREFILL_DUMP");
     if (!path || !path[0] || !g->dspark_bulk_h[0]) return;
     static FILE *f = NULL;
     static float *host = NULL;
@@ -379,7 +379,7 @@ static bool gpu_graph_prefill_layer_major_inner(
      * by gpu_graph_prefill_chunked_range after the chunk syncs. */
     g->dspark_bulk_n = g->dspark_bulk_h[0] ? n_tokens : 0;
 
-    const bool split_profile = getenv("DS4_CUDA_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
+    const bool split_profile = getenv("PULSAR_CUDA_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
      * A full long-prompt prefill can keep the GPU busy for a long time. Split
      * non-tiny prefills when a frontend asked for display progress: completed
@@ -394,7 +394,7 @@ static bool gpu_graph_prefill_layer_major_inner(
      * progress is dropped in favor of throughput. */
     const bool split_commands = split_profile ||
                                 n_tokens > 2048 || imatrix != NULL;
-    const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
+    const bool profile = getenv("PULSAR_CUDA_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -430,7 +430,7 @@ static bool gpu_graph_prefill_layer_major_inner(
 
         const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
-        const char *output_row_env = getenv("DS4_CUDA_GRAPH_OUTPUT_ROW");
+        const char *output_row_env = getenv("PULSAR_CUDA_GRAPH_OUTPUT_ROW");
         if (output_row_env && output_row_env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(output_row_env, &end, 10);
@@ -606,7 +606,7 @@ static bool gpu_graph_prefill_layer_major_inner(
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = getenv("DS4_CUDA_GRAPH_OUTPUT_ROW");
+    const char *output_row_env = getenv("PULSAR_CUDA_GRAPH_OUTPUT_ROW");
     if (output_row_env && output_row_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(output_row_env, &end, 10);
@@ -739,7 +739,7 @@ bool gpu_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
-    const bool profile = getenv("DS4_CUDA_GRAPH_PREFILL_PROFILE") != NULL;
+    const bool profile = getenv("PULSAR_CUDA_GRAPH_PREFILL_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     const uint32_t end = start + n_tokens;
 
@@ -899,7 +899,7 @@ bool gpu_graph_verify_suffix_tops(
     /* Diagnostic flag: read the environment once per process (C has no
      * static-initializer form for this, so use the repo's -1 sentinel idiom). */
     static int timing_env = -1;
-    if (timing_env < 0) timing_env = getenv("DS4_SPEC_VERIFY_TIMING") != NULL;
+    if (timing_env < 0) timing_env = getenv("PULSAR_SPEC_VERIFY_TIMING") != NULL;
     const bool timing = timing_env != 0;
     const double t0 = timing ? now_sec() : 0.0;
     bool ok = gpu_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
@@ -1244,7 +1244,7 @@ uint32_t gpu_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
-    const char *env = getenv("DS4_CUDA_GRAPH_RAW_CAP");
+    const char *env = getenv("PULSAR_CUDA_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -1275,7 +1275,7 @@ uint32_t gpu_graph_prefill_cap_for_prompt(int prompt_len,
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
  * as a conservative crossover.  The env knob remains useful for retuning. */
 uint32_t gpu_graph_resume_prefill_min_tokens(void) {
-    const char *env = getenv("DS4_CUDA_RESUME_PREFILL_MIN");
+    const char *env = getenv("PULSAR_CUDA_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);

@@ -28,7 +28,7 @@ static pulsar_engine *test_engine_fast;
 static pulsar_engine *test_engine_quality;
 
 static const char *test_model_path(void) {
-    const char *model_path = getenv("DS4_TEST_MODEL");
+    const char *model_path = getenv("PULSAR_TEST_MODEL");
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
 }
 
@@ -504,7 +504,7 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
 }
 
 static void test_long_story_fact_recall(void) {
-    const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
+    const char *prompt_path = getenv("PULSAR_TEST_LONG_PROMPT");
     if (!prompt_path || !prompt_path[0]) {
         prompt_path = "tests/long_context_story_prompt.txt";
     }
@@ -743,17 +743,17 @@ static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
 }
 
 static void test_official_logprob_vectors_run(const char *case_filter) {
-    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+    const char *path = getenv("PULSAR_TEST_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
-    setenv("DS4_CUDA_PREFILL_CHUNK", "2048", 1);
+    char *saved_prefill_chunk = test_save_env("PULSAR_CUDA_PREFILL_CHUNK");
+    setenv("PULSAR_CUDA_PREFILL_CHUNK", "2048", 1);
     pulsar_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -764,7 +764,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
         fprintf(stderr,
                 "pulsar-test: logprob-vectors SKIPPED (pruned model diverges from official reference by design)\n");
         pulsar_engine_close(engine);
-        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -787,7 +787,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     }
     TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
     pulsar_engine_close(engine);
-    test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+    test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -970,18 +970,18 @@ static void test_local_golden_case_run(pulsar_engine *engine,
 }
 
 static void test_local_golden_vectors(void) {
-    const char *path = getenv("DS4_TEST_LOCAL_GOLDEN_FILE");
+    const char *path = getenv("PULSAR_TEST_LOCAL_GOLDEN_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/local-golden.vec";
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_CUDA_PREFILL_CHUNK");
-    setenv("DS4_CUDA_PREFILL_CHUNK", "4096", 1);
+    char *saved_prefill_chunk = test_save_env("PULSAR_CUDA_PREFILL_CHUNK");
+    setenv("PULSAR_CUDA_PREFILL_CHUNK", "4096", 1);
 
     pulsar_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+        test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -993,7 +993,7 @@ static void test_local_golden_vectors(void) {
     }
 
     pulsar_engine_close(engine);
-    test_restore_env("DS4_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
+    test_restore_env("PULSAR_CUDA_PREFILL_CHUNK", saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -1260,7 +1260,7 @@ static bool test_mpp_capture_logits_only(pulsar_engine *engine,
 }
 
 static bool test_mpp_eq_case_selected(const char *id) {
-    const char *filter = getenv("DS4_TEST_MPP_EQ_CASE");
+    const char *filter = getenv("PULSAR_TEST_MPP_EQ_CASE");
     if (!filter || !filter[0]) return true;
 
     char buf[256];
@@ -1273,7 +1273,7 @@ static bool test_mpp_eq_case_selected(const char *id) {
 }
 
 static int test_load_mpp_cases(pulsar_engine *engine, test_mpp_eq_case *cases, int cap) {
-    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+    const char *path = getenv("PULSAR_TEST_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
@@ -1480,7 +1480,7 @@ static void test_think_tool_recovery(void) {
     }
     TEST_ASSERT(pulsar_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
-    if (getenv("DS4_TEST_RECOVERY_PROBE") != NULL) {
+    if (getenv("PULSAR_TEST_RECOVERY_PROBE") != NULL) {
         /* Diagnostic: print the model's natural tool-call turn for this
          * request instead of running the recovery. */
         buf nat = {0};
@@ -2969,10 +2969,10 @@ static void test_print_help(const char *prog) {
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
-    puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
-    puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
-    puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
-    puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  PULSAR_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  PULSAR_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
+    puts("  PULSAR_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
+    puts("  PULSAR_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }
 
 static const pulsar_test_entry *test_find_entry(const char *arg) {

@@ -71,7 +71,7 @@ static int check_large_topk(void) {
         }
     }
     if (rc == 0) {
-        const double max_seconds = getenv_seconds("DS4_CUDA_TOPK_REGRESSION_SEC", 2.0);
+        const double max_seconds = getenv_seconds("PULSAR_CUDA_TOPK_REGRESSION_SEC", 2.0);
         fprintf(stderr, "cuda-regression: top-k n_comp=%u n_tokens=%u elapsed=%.3fs\n",
                 n_comp, n_tokens, elapsed);
         if (elapsed > max_seconds) {
@@ -920,11 +920,11 @@ static int check_multibank_decode_attention(void) {
         const mb_row idx_rows[3] = { {0, 100, 25}, {1, 39, 10}, {1, 37, 9} };
         /* Banked mode forces the generic indexed kernel (heads8 variants stay
          * single-bank); pin the scalar reference to the same kernel. */
-        setenv("DS4_CUDA_NO_INDEXED_HEADS8", "1", 1);
+        setenv("PULSAR_CUDA_NO_INDEXED_HEADS8", "1", 1);
         const int idx_rc = mb_run_case("indexed-generic", idx_rows, 3, raw_slab, raw_cap,
                                        comp_slab, comp_cap, 25, window, ratio, n_banks,
                                        sinks, n_head, head_dim, 1, topk_host, top_k);
-        unsetenv("DS4_CUDA_NO_INDEXED_HEADS8");
+        unsetenv("PULSAR_CUDA_NO_INDEXED_HEADS8");
         if (idx_rc != 0) goto done;
     }
 

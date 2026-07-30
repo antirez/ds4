@@ -18,11 +18,10 @@
  *   - A future backend (Metal and ROCm were stripped in the CUDA-only fork;
  *     re-adding one means a new src/<backend>/ implementing these functions)
  *     must be selectable via pulsar_backend without engine changes.
- *   - Engine files may read backend TUNING knobs from the environment; the
- *     legacy DS4_CUDA_* env NAMES are grandfathered as a compatibility
- *     surface (ops scripts use them), but the questions they answer in
- *     engine code must stay backend-neutral ("is fusion disabled", "dump
- *     wanted", "prefill chunk override").
+ *   - Engine files may read backend TUNING knobs from the environment under
+ *     the PULSAR_CUDA_* env NAMES (ops scripts use them), but the questions
+ *     they answer in engine code must stay backend-neutral ("is fusion
+ *     disabled", "dump wanted", "prefill chunk override").
  *   - Backend-branded log lines (e.g. "CUDA loading model tensors") are
  *     emitted only by the backend TUs about themselves.
  */

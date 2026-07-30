@@ -315,7 +315,7 @@ live-`MemAvailable` floor backstop instead. And the guard is **decode-quantum
 granular**, so a bank's *prefill* growth between checks is not proactively
 bounded — the layered defenses (admission floor + MemAvailable backstop) catch
 that case. An operator who wants a hard per-session cap passes a smaller `--ctx`;
-`DS4_OVERCOMMIT=0` reverts to classic full-charge admission (1M ⇒ a single
+`PULSAR_OVERCOMMIT=0` reverts to classic full-charge admission (1M ⇒ a single
 session).
 
 ### Startup warmup and session admission
@@ -349,9 +349,9 @@ the first real request already has its working set resident, which is why cold
 and process-warm prefill agree within run-to-run noise.)
 
 Long-context KV state is kept compact by default: the compressed-attention
-cache uses a bit-exact packed value layout (`DS4_ATTN_PACK`, on by default),
+cache uses a bit-exact packed value layout (`PULSAR_ATTN_PACK`, on by default),
 and the ratio-4 indexer cache — the dominant KV term at very long context —
-is stored MXFP4-packed (`DS4_IDX_FP4`, on by default). Set either to `0` only
+is stored MXFP4-packed (`PULSAR_IDX_FP4`, on by default). Set either to `0` only
 for debugging comparisons against the plain f32 layouts.
 
 ## Speculative decoding (DSpark)
@@ -407,7 +407,7 @@ speed, never the sampled output distribution.
 
 Prefill chunking is configurable and affects the KV checkpoint/logit path.
 Sessions prefill long prompts in 4096-token chunks by default; use the server's
-`--prefill-chunk N` (or `DS4_CUDA_PREFILL_CHUNK=N`) to compare another chunk
+`--prefill-chunk N` (or `PULSAR_CUDA_PREFILL_CHUNK=N`) to compare another chunk
 size, for example `2048` to match the strict official-vector checkpoint path,
 or `0` to prefill a prompt as one whole batch when memory allows. Changing the
 chunk changes the KV checkpoint/logit path, so compare it as an explicit run
@@ -468,7 +468,7 @@ moment — the same class of numerical nondeterminism as batched inference in ot
 engines. Likewise, v0.3.1's head-grouped decode-attention kernel is not
 bit-identical to v0.2.3 at depth, so a given greedy prompt's continuation may
 differ from the prior release (quality-verified neutral; set
-`DS4_CUDA_NO_INDEXED_DECODE_HEADS8=1` to restore the prior kernel).
+`PULSAR_CUDA_NO_INDEXED_DECODE_HEADS8=1` to restore the prior kernel).
 Two further guardrails keep a misbehaving client from wedging the server:
 concurrent client connections are capped (64; connections over the cap get an
 immediate 503 instead of piling up threads), and a whole-request read deadline
@@ -732,8 +732,8 @@ matches the local `~/bin/claude-ds4` setup:
 #!/bin/sh
 unset ANTHROPIC_API_KEY
 
-export ANTHROPIC_BASE_URL="${DS4_ANTHROPIC_BASE_URL:-http://127.0.0.1:8000}"
-export ANTHROPIC_AUTH_TOKEN="${DS4_API_KEY:-dsv4-local}"
+export ANTHROPIC_BASE_URL="${PULSAR_ANTHROPIC_BASE_URL:-http://127.0.0.1:8000}"
+export ANTHROPIC_AUTH_TOKEN="${PULSAR_API_KEY:-dsv4-local}"
 export ANTHROPIC_MODEL="deepseek-v4-flash"
 
 export ANTHROPIC_CUSTOM_MODEL_OPTION="deepseek-v4-flash"
@@ -1029,7 +1029,7 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `./pulsar --dump-logprobs` (the `pulsar` development CLI, built with `make pulsar`) and
 compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
-C runner pins `DS4_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
+C runner pins `PULSAR_CUDA_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
 
 All project tests are driven by the C runners:
@@ -1040,7 +1040,7 @@ make test                  # pulsar_test
 ./pulsar_test --server
 ```
 
-`pulsar_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`);
+`pulsar_test` loads a model (`PULSAR_TEST_MODEL`, default `./ds4flash.gguf`);
 `pulsar_agent_test` and the eval self-test run without one. `make
 cuda-regression` runs a GPU kernel smoke test that needs no model.
 

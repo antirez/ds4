@@ -178,7 +178,7 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
     pulsar_gpu_graph *g = &s->graph;
     if ((int)gpu_graph_bank_pool_count(g) < n) {
-        fprintf(stderr, "pool too small: %u < %d (set DS4_MSEQ_BANKS)\n",
+        fprintf(stderr, "pool too small: %u < %d (set PULSAR_MSEQ_BANKS)\n",
                 gpu_graph_bank_pool_count(g), n);
         pulsar_session_free(s);
         return false;
@@ -453,14 +453,14 @@ int main(int argc, char **argv) {
      * as a side effect of DSpark init — a config no gate covered, because
      * both gates default to the drafter-merged FRONTIER_MODEL.  Read once at
      * startup (this is the test's own config, not a hot path). */
-    if (getenv("DS4_GATE_NO_DSPARK") != NULL) {
+    if (getenv("PULSAR_GATE_NO_DSPARK") != NULL) {
         opt.dspark_disable = true;
         printf("CONFIG: DSpark DISABLED (dspark_disable=1) — the driver must "
                "work with no speculation machinery allocated\n");
     }
     if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (getenv("DS4_GATE_NO_DSPARK") != NULL && pulsar_engine_has_dspark(g_e)) {
-        fprintf(stderr, "MULTISEQ GATE FAIL: DS4_GATE_NO_DSPARK set but the "
+    if (getenv("PULSAR_GATE_NO_DSPARK") != NULL && pulsar_engine_has_dspark(g_e)) {
+        fprintf(stderr, "MULTISEQ GATE FAIL: PULSAR_GATE_NO_DSPARK set but the "
                         "engine still reports a drafter — the no-dspark case "
                         "is not actually being exercised\n");
         return 1;

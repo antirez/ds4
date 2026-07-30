@@ -16,9 +16,9 @@
 # identical across three routings (per the gate-A finding, KV bytes are only
 # comparable at chunk-aligned cuts; full-match forks continue from the trunk's
 # exact frontier, so OUTPUT tokens are the oracle):
-#   (iii) warm-fork  DS4_WARM_FORK=1  -> forks fire, trunk preserved
-#   (ii)  warm cont. DS4_WARM_FORK=0  -> in-place: R2 consumes A, R3 rewinds A
-#   (i)   cold       DS4_WARM_FORK=0, fresh server per branch (no reuse at all)
+#   (iii) warm-fork  PULSAR_WARM_FORK=1  -> forks fire, trunk preserved
+#   (ii)  warm cont. PULSAR_WARM_FORK=0  -> in-place: R2 consumes A, R3 rewinds A
+#   (i)   cold       PULSAR_WARM_FORK=0, fresh server per branch (no reuse at all)
 # plus: >=2 forks fired (routing alive) and >=1 "trunk preserved" line.
 # Run manually under GPU discipline (flock, drop_caches, watchdog, one load).
 #   usage: tests/warm_fork_3way.sh [MODEL] [PORT]
@@ -27,7 +27,7 @@ MODEL=${1:-gguf/model.gguf}; PORT=${2:-8901}
 DIR=$(mktemp -d /tmp/warmfork.XXXX); LOG=$DIR/server.log
 TRUNK=$(python3 -c "print('Shared preamble sentence. '*380)")   # ~2.7k-token trunk
 jreq(){ python3 -c "import json,sys;print(json.dumps({'prompt':sys.argv[1],'max_tokens':int(sys.argv[2]),'temperature':0.0,'stream':False}))" "$1" "$2"; }
-start(){ DS4_WARM_FORK=$1 DS4_MSEQ_BANKS=3 ./pulsar-server -m "$MODEL" --host 127.0.0.1 --port $PORT \
+start(){ PULSAR_WARM_FORK=$1 PULSAR_MSEQ_BANKS=3 ./pulsar-server -m "$MODEL" --host 127.0.0.1 --port $PORT \
         -c 32768 --kv-disk-dir "" >"$LOG" 2>&1 & SP=$!
   for i in $(seq 1 240); do [ "$(curl -s -m2 -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/health)" = 200 ] && return 0; sleep 1; done; return 1; }
 stop(){ kill -INT $SP 2>/dev/null; sleep 2; kill -9 $SP 2>/dev/null; }

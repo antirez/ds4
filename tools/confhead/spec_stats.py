@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate DSpark fused-step stats from a ds4-server log (DS4_DSPARK_STATS=1).
+"""Aggregate DSpark fused-step stats from a ds4-server log (PULSAR_DSPARK_STATS=1).
 
 Reports, whole-log and per-request (requests delimited by the server's
 'completion ... prompt start' markers -- n_batch==1 is NOT a boundary, see

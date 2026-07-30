@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
                                         : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
     if (pool < 2) {
         fprintf(stderr, "accounting_gate: WARNING pool<2 — comp/index may be "
-                        "device-resident (not demand-paged); set DS4_MSEQ_BANKS>=2\n");
+                        "device-resident (not demand-paged); set PULSAR_MSEQ_BANKS>=2\n");
     }
 
     /* A tiled token buffer of `peak` tokens, prefixes reused as we grow. */

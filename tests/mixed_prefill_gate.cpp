@@ -115,9 +115,9 @@ int main(int argc,char**argv){
     if(argc<2){ fprintf(stderr,"usage: %s MODEL\n",argv[0]); return 2; }
     pulsar_engine_options o; memset(&o,0,sizeof o); o.model_path=argv[1]; o.backend=PULSAR_BACKEND_CUDA;
     if(pulsar_engine_open(&g_e,&o)!=0){ fprintf(stderr,"engine open failed\n"); return 1; }
-    printf("CONFIG: DS4_ATTN_PACK=%s DS4_IDX_FP4=%s\n",
-        getenv("DS4_ATTN_PACK")?getenv("DS4_ATTN_PACK"):"(unset,default 1)",
-        getenv("DS4_IDX_FP4")?getenv("DS4_IDX_FP4"):"(unset,default 1)");
+    printf("CONFIG: PULSAR_ATTN_PACK=%s PULSAR_IDX_FP4=%s\n",
+        getenv("PULSAR_ATTN_PACK")?getenv("PULSAR_ATTN_PACK"):"(unset,default 1)",
+        getenv("PULSAR_IDX_FP4")?getenv("PULSAR_IDX_FP4"):"(unset,default 1)");
     size_t tl=0; char*txt=read_file("tests/long_context_story_prompt.txt",&tl);
     if(!txt){ fprintf(stderr,"prompt read failed\n"); return 1; }
     memset(&g_toks,0,sizeof g_toks); pulsar_tokenize_text(g_e,txt,&g_toks); free(txt);

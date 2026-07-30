@@ -734,8 +734,8 @@ int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tens
         if (!hash) ok = 0;
     }
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_warp_select = getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
-    static const int no_parallel_select = getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
+    static const int no_warp_select = getenv("PULSAR_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
+    static const int no_parallel_select = getenv("PULSAR_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
     if (ok) {
         if (!no_warp_select && !no_parallel_select) {
             dim3 block(32, 4, 1);
@@ -781,8 +781,8 @@ int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gp
         if (!hash) return 0;
     }
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_warp_select = getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
-    static const int no_parallel_select = getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
+    static const int no_warp_select = getenv("PULSAR_CUDA_NO_WARP_ROUTER_SELECT") != NULL;
+    static const int no_parallel_select = getenv("PULSAR_CUDA_NO_PARALLEL_ROUTER_SELECT") != NULL;
     if (!no_warp_select && !no_parallel_select) {
         dim3 block(32, 4, 1);
         router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
@@ -1123,7 +1123,7 @@ int pulsar_gpu_matmul_fp8_hc_expand_tensor(
         const pulsar_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc) {
-    static const int disable_fused = getenv("DS4_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") != NULL;
+    static const int disable_fused = getenv("PULSAR_CUDA_DISABLE_FP8_HC_EXPAND_FUSED") != NULL;
     if (!disable_fused) {
         return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
                                                         model_map, model_size,

@@ -131,27 +131,27 @@ seam-check:
 # check `free -g` headroom (the model is ~87 GB).
 FRONTIER_MODEL ?= ./ds4flash.gguf
 cuda-frontier-gate: tests/multiseq_frontier_gate
-	DS4_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=2 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
 
 # Multiseq-vs-solo token-stream gate + first aggregate-throughput measurement
 # (see the header of tests/multiseq_decode_gate.c).  MODEL-DEPENDENT — run
 # manually on the GB10 with the same memory discipline as the frontier gate.
 cuda-multiseq-gate: tests/multiseq_decode_gate
-	DS4_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 512
+	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 512
 
 # The same gate with speculation DISABLED — the pulsar-bench/pulsar-eval/agent and
 # `pulsar-server --no-dspark` config, and a different allocation shape (no DSpark
 # graph state).  The driver must work there; it used to reject every step.
 # Shorter (N=2, 64 steps): this is a config gate, not a throughput run.
 cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
-	DS4_MSEQ_BANKS=2 DS4_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
+	PULSAR_MSEQ_BANKS=2 PULSAR_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
 
 # Tier-2 PATH A / Option F: fused DSpark speculation on a BANK (N=1 spec-on-
 # bank == classic, N=2 spec-time-slice with warm per-bank rings, mseq_dirty
 # cheap resume).  See tests/bank_spec_gate.c.  MODEL-DEPENDENT, drafter-merged
 # model, same memory discipline as the gates above; hold temp/gpu.lock.
 cuda-bank-spec-gate: tests/bank_spec_gate
-	DS4_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 128
+	PULSAR_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 128
 
 # Tier-2 overcommit accounting-exactness gate (task #55, increment 1): the
 # exact-frontier touched-KV number the eviction guard triggers on must track the
@@ -160,35 +160,35 @@ cuda-bank-spec-gate: tests/bank_spec_gate
 # above (hold temp/gpu.lock, drop_caches, no other pulsar process); fills stay
 # modest (peak ~64k tokens) and do not exercise eviction.
 cuda-accounting-gate: tests/accounting_gate
-	DS4_MSEQ_BANKS=2 ./tests/accounting_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=2 ./tests/accounting_gate $(FRONTIER_MODEL)
 
 # Tier-2 increment 2b bank evict/restore bit-identity + reclaim gate (the
 # memory-safety core; no OOM risk). See tests/bank_evict_restore_gate.c.
 cuda-evict-restore-gate: tests/bank_evict_restore_gate tests/bank_fork_gate
-	DS4_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
 
 # Tier-2 PATH-A full-prefix fork gate (plan-33 inc A): fork==cold oracle. See
-# tests/bank_fork_gate.c. MODEL-DEPENDENT, needs DS4_MSEQ_BANKS>=3.
+# tests/bank_fork_gate.c. MODEL-DEPENDENT, needs PULSAR_MSEQ_BANKS>=3.
 cuda-fork-gate: tests/bank_fork_gate
-	DS4_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=3 ./tests/bank_fork_gate $(FRONTIER_MODEL)
 
 # plan-34 phase-2 inc 2: cuBLASLt algo-stability. A decode bank's step logits must
 # be byte-identical across batched-step widths M (incl. the M=4->5 custom->cuBLASLt
 # boundary) so a co-scheduled big prefill (inc 4) cannot perturb it. MODEL-DEPENDENT,
-# needs DS4_MSEQ_BANKS>=8. Run pack on/off + idx-fp4 on/off under GPU discipline.
+# needs PULSAR_MSEQ_BANKS>=8. Run pack on/off + idx-fp4 on/off under GPU discipline.
 cuda-algo-stability-gate: tests/algo_stability_gate
-	DS4_MSEQ_BANKS=8 ./tests/algo_stability_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=8 ./tests/algo_stability_gate $(FRONTIER_MODEL)
 
 # plan-34 phase-2 inc 3: K-row single-bank prefill through the mixed entry —
 # coherence vs classic, K>ratio boundary, tensor-core speed. MODEL-DEPENDENT.
 cuda-mixed-prefill-gate: tests/mixed_prefill_gate
-	DS4_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
 # a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
 cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
-	DS4_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
+	PULSAR_MSEQ_BANKS=3 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # plan-33 inc B: 3-way output-equality harness (server-level; see the script).
 warm-fork-3way: pulsar-server

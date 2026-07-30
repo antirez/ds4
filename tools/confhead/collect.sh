@@ -41,11 +41,11 @@ if [ "${avail_gb:-0}" -lt 100 ]; then
     exit 1
 fi
 
-export DS4_DSPARK_STATS=1
-export DS4_DSPARK_CONF_SCHED=off       # unbiased labels: verify all n_draft
-export DS4_DSPARK_DUMP="$OUT/dump.bin"
-export DS4_DSPARK_DUMP_LEAN=1
-export DS4_DSPARK_DUMP_STEPS=200000
+export PULSAR_DSPARK_STATS=1
+export PULSAR_DSPARK_CONF_SCHED=off       # unbiased labels: verify all n_draft
+export PULSAR_DSPARK_DUMP="$OUT/dump.bin"
+export PULSAR_DSPARK_DUMP_LEAN=1
+export PULSAR_DSPARK_DUMP_STEPS=200000
 
 ./pulsar-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
     > "$OUT/server.log" 2>&1 &

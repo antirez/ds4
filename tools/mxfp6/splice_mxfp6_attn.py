@@ -88,7 +88,7 @@ def tensor_bytes(typ, dims):
 
 
 def is_selected(name, which):
-    """The per-token-read attention weight set (what DS4_ATTN_MXFP4 targeted).
+    """The per-token-read attention weight set (what PULSAR_ATTN_MXFP4 targeted).
     Excludes: output.weight (LM head - already has its own 1.87% verdict),
     token_embd (gathered, ~0 traffic), dspark.* / mtp.* (drafter: affects
     acceptance rate, not output quality - and would contaminate the frontier

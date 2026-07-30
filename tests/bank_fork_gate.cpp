@@ -136,7 +136,7 @@ int main(int argc, char **argv) {
     if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "fork_gate: pool banks=%u ctx=%d n_cached=%d L=%d\n", pool, ctx, n_cached, L);
-    if (pool < 3) { fprintf(stderr, "need DS4_MSEQ_BANKS>=3\n"); return 1; }
+    if (pool < 3) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=3\n"); return 1; }
 
     int *toks = (int *)malloc((size_t)L * sizeof(int));
     for (int i = 0; i < L; i++) toks[i] = base.v[i % base.len];

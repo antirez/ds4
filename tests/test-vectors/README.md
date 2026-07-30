@@ -35,7 +35,7 @@ It also consumes the local golden fixture:
 ```
 
 The `--logprob-vectors` runner opens the normal non-quality path with
-accelerator-specific fast routes disabled and pins `DS4_CUDA_PREFILL_CHUNK=2048`
+accelerator-specific fast routes disabled and pins `PULSAR_CUDA_PREFILL_CHUNK=2048`
 for this strict official-vector check.
 
 `official.vec` is intentionally trivial to parse from C: each case points to a

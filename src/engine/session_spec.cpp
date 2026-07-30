@@ -17,7 +17,7 @@
 static float dspark_conf_sched_tau(void) {
     static float cached = -1.0f;
     if (cached < 0.0f) {
-        const char *cs = getenv("DS4_DSPARK_CONF_SCHED");
+        const char *cs = getenv("PULSAR_DSPARK_CONF_SCHED");
         if (!cs || !cs[0]) cached = 0.25f;
         else if (!strcmp(cs, "off") || !strcmp(cs, "false")) cached = 0.0f;
         else {
@@ -230,7 +230,7 @@ void spec_quench_reset(pulsar_session *s) {
 static int spec_quench_force_step(void) {
     static int cached = -2;
     if (cached == -2) {
-        const char *fs = getenv("DS4_QUENCH_FORCE_STEP");
+        const char *fs = getenv("PULSAR_QUENCH_FORCE_STEP");
         cached = fs && fs[0] ? atoi(fs) : -1;
         if (cached < -1) cached = -1;
     }
@@ -372,10 +372,10 @@ static float dspark_base_top1_prob(const float *logits, int n) {
  * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
 static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
                              const int32_t *refined_ids, int n_draft) {
-    const char *path = getenv("DS4_DSPARK_DUMP");
+    const char *path = getenv("PULSAR_DSPARK_DUMP");
     if (!path || !path[0]) return;
     static int dumped = 0;
-    const char *lim = getenv("DS4_DSPARK_DUMP_STEPS");
+    const char *lim = getenv("PULSAR_DSPARK_DUMP_STEPS");
     const int max_steps = lim ? atoi(lim) : 8;
     if (dumped >= max_steps) return;
 
@@ -390,7 +390,7 @@ static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
      * engine's confidence kernel consumes (Step 5c), ~64 KB/step at draft=4
      * instead of ~1 MB. Bulk-collectable for the drafter-retune Phase 0. */
     static int lean = -1;
-    if (lean < 0) lean = getenv("DS4_DSPARK_DUMP_LEAN") != NULL;
+    if (lean < 0) lean = getenv("PULSAR_DSPARK_DUMP_LEAN") != NULL;
     if (lean) {
         int32_t hdr[3] = { (int32_t)pos, (int32_t)first_token, (int32_t)n_draft };
         fwrite(hdr, sizeof(int32_t), 3, f);
@@ -486,9 +486,9 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     const void *dmap = e->dspark_model.map;
     const uint64_t dsize = e->dspark_model.size;
     static int dspark_stats_env = -1;
-    const int dspark_stats = gpu_graph_env_flag("DS4_DSPARK_STATS", &dspark_stats_env);
+    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("DS4_DTREE_STATS", &dtree_stats_env);
+    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
     const double t0 = dspark_stats ? now_sec() : 0.0;
     int n_accept = 0;
 
@@ -798,7 +798,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         s->checkpoint.len = saved_len;
         ok_state = spec_frontier_restore(&frontier, s);
         static int no_replay = -1;
-        if (no_replay < 0) no_replay = getenv("DS4_DSPARK_REPLAY") == NULL;
+        if (no_replay < 0) no_replay = getenv("PULSAR_DSPARK_REPLAY") == NULL;
         if (ok_state && no_replay) {
             /* Stage B: transformer-free rollback. Roll only the recurrent
              * compressor/indexer pool state forward through the committed
@@ -984,11 +984,11 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
     {
         static int opsteps = -1;
         if (opsteps < 0) {
-            const char *e2 = getenv("DS4_DSPARK_DUMP_ONPOLICY");
+            const char *e2 = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
             opsteps = e2 && e2[0] ? atoi(e2) : 0;
         }
         static int opdone = 0;
-        const char *oppath = getenv("DS4_DSPARK_DUMP_ONPOLICY_PATH");
+        const char *oppath = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
         if (opdone < opsteps && oppath && oppath[0]) {
             FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
             if (f2) {
@@ -1015,7 +1015,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
                  * Lets the torch reference attend over the ENGINE'S OWN ring
                  * to split "seed rows wrong" from "block compute wrong". */
                 static int dump_ring = -1;
-                if (dump_ring < 0) dump_ring = getenv("DS4_DSPARK_DUMP_RING") != NULL;
+                if (dump_ring < 0) dump_ring = getenv("PULSAR_DSPARK_DUMP_RING") != NULL;
                 if (dump_ring) {
                     const uint64_t ring_bytes =
                         (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float);
@@ -1208,7 +1208,7 @@ int pulsar_session::eval_speculative_block(int first_token,
      * and byte-identical deterministic output. PULSAR_DSPARK_LEGACY_LOOP restores
      * the old Step1+verify loop as an operational fallback. */
     static int fused_cache = -1;
-    if (fused_cache < 0) fused_cache = getenv("DS4_DSPARK_LEGACY_LOOP") == NULL;
+    if (fused_cache < 0) fused_cache = getenv("PULSAR_DSPARK_LEGACY_LOOP") == NULL;
     /* an externally chosen first_token invalidates any pending carry */
     s->spec.spec_carry_valid = false;
     if (fused_cache)
@@ -1221,7 +1221,7 @@ int pulsar_session::eval_speculative_block(int first_token,
     const uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
     int n_accept = 0;
     static int dspark_stats_env = -1;
-    const int dspark_stats = gpu_graph_env_flag("DS4_DSPARK_STATS", &dspark_stats_env);
+    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
     const double dspark_t0 = dspark_stats ? now_sec() : 0.0;
     double dspark_draft_ms = 0.0;
     int dspark_base0 = -1;   /* draft-forward's row-0 argmax (pre-markov) */
@@ -1259,7 +1259,7 @@ int pulsar_session::eval_speculative_block(int first_token,
     {
         static float min_conf = -1.0f;
         if (min_conf < 0.0f) {
-            const char *mc = getenv("DS4_DSPARK_MIN_CONF");
+            const char *mc = getenv("PULSAR_DSPARK_MIN_CONF");
             const float v = mc ? (float)atof(mc) : 0.0f;
             min_conf = v > 0.0f ? v : 0.0f;
         }

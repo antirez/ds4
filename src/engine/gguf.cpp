@@ -612,7 +612,7 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
 
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
     uint64_t mb = 1024;
-    const char *env = getenv("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
+    const char *env = getenv("PULSAR_CUDA_WEIGHT_PRELOAD_SPAN_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
@@ -793,7 +793,7 @@ bool accelerator_cache_model_tensors(pulsar_backend backend,
         fprintf(stderr, "pulsar: %llu MXFP8 workhorse weights detected -> FP8 matmul path"
                 " (%llu pre-stored MXFP8_LT, zero-copy)\n",
                 (unsigned long long)n_fp8, (unsigned long long)n_fp8_lt);
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+    if (getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
 

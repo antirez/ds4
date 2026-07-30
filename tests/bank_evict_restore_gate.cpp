@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
     if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed\n"); return 1; }
     const uint32_t pool = gpu_graph_bank_pool_count(&s->graph);
     fprintf(stderr, "evict_restore_gate: pool banks=%u ctx=%d L=%d\n", pool, ctx, L);
-    if (pool < 2) { fprintf(stderr, "need DS4_MSEQ_BANKS>=2\n"); return 1; }
+    if (pool < 2) { fprintf(stderr, "need PULSAR_MSEQ_BANKS>=2\n"); return 1; }
 
     /* 1. Prefill bank 0 (cur=0), capture its frontier, checksum its KV. */
     int *toks = (int *)malloc((size_t)L * sizeof(int));

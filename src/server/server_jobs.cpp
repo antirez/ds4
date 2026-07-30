@@ -605,7 +605,7 @@ static bool gen_client_disconnected(int fd) {
     if (fd < 0) return false;
     static int enabled = -1;
     if (enabled < 0) {
-        const char *e = getenv("DS4_ABORT_ON_DISCONNECT");
+        const char *e = getenv("PULSAR_ABORT_ON_DISCONNECT");
         enabled = (e && e[0] == '0') ? 0 : 1;
     }
     if (!enabled) return false;
@@ -1157,8 +1157,8 @@ void server::gen_decode_init(session_slot *sl) {
         g->thinking_gates_tool_markers && g->thinking.inside;
     g->think_recovery_scan_from = 0;
     g->think_tool_recovery_enabled =
-        getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
-    g->dspark_spec_enabled = getenv("DS4_DSPARK_DISABLE") == NULL;
+        getenv("PULSAR_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
+    g->dspark_spec_enabled = getenv("PULSAR_DSPARK_DISABLE") == NULL;
     dsml_decode_tracker_init(&g->dsml_tracker);
 
     /* tool_choice="required": the prompt was prefilled into an open DSML

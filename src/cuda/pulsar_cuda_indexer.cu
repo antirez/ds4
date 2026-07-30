@@ -961,8 +961,8 @@ static int indexer_scores_launch(
     const void * const *index_bank_ptrs_ptr =
         (descr && index_bank_ptrs) ? (const void * const *)index_bank_ptrs->ptr : NULL;
     const uint32_t kernel_n_banks = descr ? n_banks : 1u;
-    static const int no_direct_one = getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") != NULL;
-    static const int no_wmma = getenv("DS4_CUDA_NO_INDEXER_WMMA") != NULL;
+    static const int no_direct_one = getenv("PULSAR_CUDA_NO_INDEXER_DIRECT_ONE") != NULL;
+    static const int no_wmma = getenv("PULSAR_CUDA_NO_INDEXER_WMMA") != NULL;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u && !no_direct_one) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -1073,10 +1073,10 @@ int pulsar_gpu_indexer_topk_tensor(
         return 0;
     }
     /* Launch-path dispatch flags: read the environment once per process. */
-    static const int no_topk1024 = getenv("DS4_CUDA_NO_TOPK1024") != NULL;
-    static const int no_topk2048 = getenv("DS4_CUDA_NO_TOPK2048") != NULL;
-    static const int no_topk8192 = getenv("DS4_CUDA_NO_TOPK8192") != NULL;
-    static const int no_topk_chunked = getenv("DS4_CUDA_NO_TOPK_CHUNKED") != NULL;
+    static const int no_topk1024 = getenv("PULSAR_CUDA_NO_TOPK1024") != NULL;
+    static const int no_topk2048 = getenv("PULSAR_CUDA_NO_TOPK2048") != NULL;
+    static const int no_topk8192 = getenv("PULSAR_CUDA_NO_TOPK8192") != NULL;
+    static const int no_topk_chunked = getenv("PULSAR_CUDA_NO_TOPK_CHUNKED") != NULL;
     if (top_k == 512u && n_comp <= 1024u &&
         !no_topk1024) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,

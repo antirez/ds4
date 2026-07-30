@@ -9,7 +9,7 @@ REPO="twaggs88/DeepSeek-V4-Flash-REAP25-DSpark-ds4-GGUF"
 V5MX_FILE="ds4flash-v5mx-reap25-type40-mxfp8lt-dspark-v1.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
+OUT_DIR=${PULSAR_GGUF_DIR:-"$ROOT/gguf"}
 case "$OUT_DIR" in
     /*) ;;
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
@@ -37,7 +37,7 @@ Options:
                  HF_TOKEN or the local HF token cache is used if present.
 
 Environment:
-  DS4_GGUF_DIR   Directory used for downloaded GGUF files.
+  PULSAR_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
 
 After download the script updates:

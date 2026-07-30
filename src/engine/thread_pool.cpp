@@ -32,7 +32,7 @@ public:
             n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
         }
 
-        const char *env = getenv("DS4_THREADS");
+        const char *env = getenv("PULSAR_THREADS");
         if (env && env[0]) {
             long v = strtol(env, NULL, 10);
             if (v > 0) n_threads = (uint32_t)v;

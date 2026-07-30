@@ -45,7 +45,7 @@
 #include <unistd.h>
 
 
-/* Build-time version string (Makefile passes -DDS4_VERSION_STR from
+/* Build-time version string (Makefile passes -DPULSAR_VERSION_STR from
  * `git describe`); fall back to "unknown" for non-Makefile/ad-hoc builds. */
 #ifndef PULSAR_VERSION_STR
 #define PULSAR_VERSION_STR "unknown"

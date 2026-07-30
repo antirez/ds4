@@ -82,7 +82,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 
 - `make test` runs `./pulsar-eval --self-test-extractors`, `./pulsar_agent_test`,
   and `./pulsar_test`. The eval self-test and agent test need no model;
-  `pulsar_test` loads a model (`DS4_TEST_MODEL`, default `./ds4flash.gguf`).
+  `pulsar_test` loads a model (`PULSAR_TEST_MODEL`, default `./ds4flash.gguf`).
 - `pulsar_test` distinguishes **gating** internal-correctness tests (any failure
   fails the suite) from **informational** ones: `logprob-vectors` compares
   the 2-bit production model against full-precision official-API logprobs (a
@@ -92,7 +92,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
 - `make cuda-regression` runs `tests/cuda_long_context_smoke`: GPU kernel
   smoke tests, no model required.
 - `./pulsar_test --logprob-vectors` compares against official-API vectors and
-  pins `DS4_CUDA_PREFILL_CHUNK=2048`.
+  pins `PULSAR_CUDA_PREFILL_CHUNK=2048`.
 - imatrix collection (`--imatrix-dataset` / `--imatrix-out`) requires `--cuda`.
 
 ## Validation Culture
@@ -104,7 +104,7 @@ mxf4 block-scale MMA; the Makefile handles its flags.
   q1..q4 token-count gate; recent reference point on the 97 GB zero-Q8 Flash
   oracle: ppl 7.3216, decode 12.35 t/s, long-prompt prefill 162 t/s.
 - **One pulsar process at a time on the GB10.** Two ~97 GB model mappings OOM the
-  box; the instance lock (`DS4_LOCK_FILE`) is intentional.
+  box; the instance lock (`PULSAR_LOCK_FILE`) is intentional.
 
 ## Supported Weight Formats (binder-enforced)
 
@@ -131,9 +131,9 @@ only as *activation* quantization inside the routed-expert (MoE) kernels.
 
 ## Environment Variables
 
-All runtime tuning/diagnostic gates use the `DS4_CUDA_*` prefix (this fork
-renamed every `DS4_METAL_*` gate; there are no compatibility aliases).
-Also: `DS4_FP8_NO_MXCORE`, `DS4_TEST_MODEL`, `DS4_LOCK_FILE`, `DS4_GGUF_DIR`
+All runtime tuning/diagnostic gates use the `PULSAR_CUDA_*` prefix (this fork
+renamed every `PULSAR_METAL_*` gate; there are no compatibility aliases).
+Also: `PULSAR_FP8_NO_MXCORE`, `PULSAR_TEST_MODEL`, `PULSAR_LOCK_FILE`, `PULSAR_GGUF_DIR`
 (download script).
 
 ## Deferred Work

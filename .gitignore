@@ -53,3 +53,7 @@ __pycache__/
 /tests/algo_stability_gate
 /tests/mixed_prefill_gate
 /tests/mixed_neutrality_gate
+
+# ad-hoc pre-cutover backup binaries
+/ds4-server.bak-preoop
+*.bak-preoop

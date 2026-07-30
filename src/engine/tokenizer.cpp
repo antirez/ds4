@@ -1755,12 +1755,12 @@ int generate_gpu_graph_raw_swa(
         gpu_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_CUDA_MEMORY_REPORT") != NULL;
+    const bool memory_report = getenv("PULSAR_CUDA_MEMORY_REPORT") != NULL;
     if (memory_report) pulsar_gpu_print_memory_report("after graph alloc");
 
     float *logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(logits[0]));
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    const bool trace_top = getenv("PULSAR_TRACE_TOP") != NULL;
+    const bool token_timing = getenv("PULSAR_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
@@ -1783,7 +1783,7 @@ int generate_gpu_graph_raw_swa(
         gpu_graph_free(&g);
         return 1;
     }
-    const char *dump_prefill_logits = getenv("DS4_CUDA_DUMP_PREFILL_LOGITS");
+    const char *dump_prefill_logits = getenv("PULSAR_CUDA_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
         if (!write_f32_binary_file(dump_prefill_logits, logits, PULSAR_N_VOCAB)) {
             free(logits);

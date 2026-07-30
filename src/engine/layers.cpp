@@ -19,7 +19,7 @@ uint32_t pulsar_prefill_cap_for_prompt(int prompt_len,
     if (requested_chunk != 0) {
         cap = requested_chunk;
     } else {
-        const char *env = getenv("DS4_CUDA_PREFILL_CHUNK");
+        const char *env = getenv("PULSAR_CUDA_PREFILL_CHUNK");
         if (env && env[0]) {
             char *endp = NULL;
             const long v = strtol(env, &endp, 10);

@@ -95,7 +95,7 @@ static void *memdiag_main(void *ud) {
  * diagnostic is off.  Caller joins d->thread at shutdown iff d->running. */
 static bool memdiag_start(memdiag *d, server *s) {
     memset(d, 0, sizeof(*d));
-    const char *v = getenv("DS4_SERVER_MEMDIAG");
+    const char *v = getenv("PULSAR_SERVER_MEMDIAG");
     if (!v || !v[0]) return false;
     d->s = s;
     d->out = stderr;
@@ -103,14 +103,14 @@ static bool memdiag_start(memdiag *d, server *s) {
         d->out = fopen(v, "w");
         if (!d->out) {
             server_log(PULSAR_LOG_WARNING,
-                       "pulsar-server: DS4_SERVER_MEMDIAG: cannot open %s: %s "
+                       "pulsar-server: PULSAR_SERVER_MEMDIAG: cannot open %s: %s "
                        "(sampling to stderr)", v, strerror(errno));
             d->out = stderr;
         }
     }
     if (pthread_create(&d->thread, NULL, memdiag_main, d) != 0) {
         server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: DS4_SERVER_MEMDIAG: sampler thread failed to start");
+                   "pulsar-server: PULSAR_SERVER_MEMDIAG: sampler thread failed to start");
         if (d->out != stderr) fclose(d->out);
         return false;
     }
@@ -299,7 +299,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
  * full-charge admission; PULSAR_MSEQ_BANKS still pins and bypasses auto-sizing.
  * Read once at startup, never on a hot path. */
 static bool server_overcommit_enabled(void) {
-    const char *v = getenv("DS4_OVERCOMMIT");
+    const char *v = getenv("PULSAR_OVERCOMMIT");
     if (!v || !v[0]) return true; /* default ON (v0.3.0) */
     return !(v[0] == '0' || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
 }
@@ -309,7 +309,7 @@ static bool server_overcommit_enabled(void) {
  * bank that grows to this depth was pre-admitted). Default 0 => pure overcommit
  * (charge only the eager floor). Clamped to non-negative; garbage => 0. */
 static int server_overcommit_reserve_ctx(void) {
-    const char *v = getenv("DS4_OVERCOMMIT_RESERVE_CTX");
+    const char *v = getenv("PULSAR_OVERCOMMIT_RESERVE_CTX");
     if (!v || !v[0]) return 0;
     char *end = NULL;
     long n = strtol(v, &end, 10);
@@ -468,7 +468,7 @@ static const char *resolve_default_gguf(const char *pointer) {
     const char *p;
     if ((p = resolve_gguf_at("gguf", pointer)) != NULL) return p;
     if (access(pointer, R_OK) == 0) return pointer;
-    const char *dir = getenv("DS4_MODEL_DIR");
+    const char *dir = getenv("PULSAR_MODEL_DIR");
     if (dir && dir[0] && (p = resolve_gguf_at(dir, pointer)) != NULL) return p;
     return NULL;
 }
@@ -777,9 +777,9 @@ int main(int argc, char **argv) {
             ? pulsar_engine_demand_paged_bytes_per_bank(engine, reserve_ctx) : 0;
     }
 
-    if (getenv("DS4_MSEQ_BANKS")) {
+    if (getenv("PULSAR_MSEQ_BANKS")) {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: Tier-2 pool: DS4_MSEQ_BANKS pinned by operator "
+                   "pulsar-server: Tier-2 pool: PULSAR_MSEQ_BANKS pinned by operator "
                    "(auto-sizing skipped)");
     } else {
         /* Fit table across reference contexts — how many banks (1..cap) fit
@@ -829,7 +829,7 @@ int main(int argc, char **argv) {
         }
         char banks[8];
         snprintf(banks, sizeof(banks), "%d", chosen);
-        setenv("DS4_MSEQ_BANKS", banks, 1);
+        setenv("PULSAR_MSEQ_BANKS", banks, 1);
         if (overcommit) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: Tier-2 OVERCOMMIT auto-sized to %d bank(s) for --ctx %d: "
@@ -857,7 +857,7 @@ int main(int argc, char **argv) {
     const uint64_t full_banked_est = pulsar_engine_session_cost_bytes(engine, cfg.ctx_size);
     uint64_t overcommit_admission_est = 0;
     if (overcommit) {
-        const char *nb = getenv("DS4_MSEQ_BANKS");
+        const char *nb = getenv("PULSAR_MSEQ_BANKS");
         long finalN = nb && nb[0] ? strtol(nb, NULL, 10) : 1;
         if (finalN < 1) finalN = 1;
         overcommit_admission_est = oc_shared + (uint64_t)finalN * (oc_eager_pb + oc_expect_pb);
@@ -991,7 +991,7 @@ int main(int argc, char **argv) {
      * when alone (N=1 byte-identical), batch at N>=2. Env PULSAR_SERVER_SPEC_MAX_LIVE
      * retunes without a rebuild (e.g. =2 to force spec through N=2). */
     {
-        const char *sm = getenv("DS4_SERVER_SPEC_MAX_LIVE");
+        const char *sm = getenv("PULSAR_SERVER_SPEC_MAX_LIVE");
         int v = sm ? atoi(sm) : 1;
         if (v < 1) v = 1;
         if (s.pool_banks > 0 && v > s.pool_banks) v = s.pool_banks;
@@ -1025,22 +1025,22 @@ int main(int argc, char **argv) {
          * measured NEUTRAL at 4x4096=16384 aggregate rows and -29% pp/-48% tg
          * at 4x8192=32768, so the default threshold 16384 stops fusing exactly
          * where fusing stops paying, and regimes (a)/(b) keep their win.
-         * DS4_MIXED_BATCH=0 still forces the lane fully off;
-         * DS4_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
-        const char *mb = getenv("DS4_MIXED_BATCH");
+         * PULSAR_MIXED_BATCH=0 still forces the lane fully off;
+         * PULSAR_MIXED_DEEP_GUARD_ROWS overrides the threshold (0 = no guard). */
+        const char *mb = getenv("PULSAR_MIXED_BATCH");
         s.mixed_batch_enabled = s.pool_banks > 0 &&
                                 !(mb && (mb[0] == '0' || !strcasecmp(mb, "off")));
-        const char *mc = getenv("DS4_MIXED_CHUNK");
+        const char *mc = getenv("PULSAR_MIXED_CHUNK");
         int kc = mc ? atoi(mc) : 8;
         if (kc < 1) kc = 1;
         s.mixed_chunk_tokens = kc;
-        const char *mg = getenv("DS4_MIXED_DEEP_GUARD_ROWS");
+        const char *mg = getenv("PULSAR_MIXED_DEEP_GUARD_ROWS");
         s.mixed_deep_guard_rows = mg ? atoi(mg) : 16384;
         if (s.mixed_deep_guard_rows < 0) s.mixed_deep_guard_rows = 0;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: fused mixed-batch lane %s (chunk=%d/step, deep guard=%d rows)",
-                   s.mixed_batch_enabled ? "ENABLED (default; opt out with DS4_MIXED_BATCH=0)"
-                                         : "disabled (DS4_MIXED_BATCH)",
+                   s.mixed_batch_enabled ? "ENABLED (default; opt out with PULSAR_MIXED_BATCH=0)"
+                                         : "disabled (PULSAR_MIXED_BATCH)",
                    s.mixed_chunk_tokens,
                    s.mixed_deep_guard_rows);
     }
@@ -1048,13 +1048,13 @@ int main(int argc, char **argv) {
      * pool mode; PULSAR_WARM_FORK=0 restores today's in-place-continuation routing
      * exactly. One startup read — never on a hot path. */
     {
-        const char *wf = getenv("DS4_WARM_FORK");
+        const char *wf = getenv("PULSAR_WARM_FORK");
         s.warm_fork_enabled = s.pool_banks > 0 &&
                               !(wf && (wf[0] == '0' || !strcasecmp(wf, "off")));
         /* inc D: partial-cut floor. Default 256 tokens (2 ratio-4 groups of
          * reuse); floor to 128 so a cut always aligns to >= one group of R. */
         s.warm_partial_min = 256;
-        const char *wpm = getenv("DS4_WARM_PARTIAL_MIN");
+        const char *wpm = getenv("PULSAR_WARM_PARTIAL_MIN");
         if (wpm && *wpm) {
             int v = atoi(wpm);
             if (v < 128) v = 128;
@@ -1096,7 +1096,7 @@ int main(int argc, char **argv) {
      * fills while the box stays far from real OOM. */
     if (overcommit && s.pool_banks > 0) {
         uint64_t budget = kv_budget_final;
-        const char *ov = getenv("DS4_SERVER_KV_BUDGET_OVERRIDE");
+        const char *ov = getenv("PULSAR_SERVER_KV_BUDGET_OVERRIDE");
         if (ov && ov[0]) {
             unsigned long long b = strtoull(ov, NULL, 10);
             if (b > 0) { budget = (uint64_t)b;
@@ -1110,7 +1110,7 @@ int main(int argc, char **argv) {
         /* Direct touched-budget override (bytes) for the memory-safety smoke: sets
          * the resident demand-paged-KV ceiling the guard keeps under, so it fires
          * at a precise modest fill while the box stays far from real OOM. */
-        const char *tb = getenv("DS4_SERVER_GUARD_TOUCHED_BUDGET");
+        const char *tb = getenv("PULSAR_SERVER_GUARD_TOUCHED_BUDGET");
         if (tb && tb[0]) {
             unsigned long long b = strtoull(tb, NULL, 10);
             if (b > 0) { s.guard_touched_budget = (uint64_t)b;
@@ -1118,7 +1118,7 @@ int main(int argc, char **argv) {
                     "pulsar-server: guard: touched budget OVERRIDDEN to %.3f GiB (test hook)",
                     (double)s.guard_touched_budget / (1024.0*1024.0*1024.0)); }
         }
-        const char *sd = getenv("DS4_SERVER_SPILL_DIR");
+        const char *sd = getenv("PULSAR_SERVER_SPILL_DIR");
         snprintf(s.spill_dir, sizeof s.spill_dir, "%s",
                  (sd && sd[0]) ? sd : "./ds4-spill");
         (void)mkdir(s.spill_dir, 0700);                   /* best-effort; may exist */

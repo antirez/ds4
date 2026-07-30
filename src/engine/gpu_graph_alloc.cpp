@@ -51,7 +51,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
     static uint32_t cached = 0;
     if (parsed < 0) {
         parsed = 0;
-        const char *env = getenv("DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD");
+        const char *env = getenv("PULSAR_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD");
         if (env && env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(env, &end, 10);
@@ -63,7 +63,7 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
                 parsed = 1;
             } else {
                 fprintf(stderr,
-                        "pulsar: invalid DS4_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
+                        "pulsar: invalid PULSAR_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
                         "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
                         env);
             }

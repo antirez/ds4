@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
         pulsar_session *s = NULL;
         if (pulsar_session_create(&s, g_e, 4096) != 0) { CHECK(0, "T1 create"); break; }
         if ((int)gpu_graph_bank_pool_count(&s->graph) < 2) {
-            printf("TEST1: SKIP (pool < 2; set DS4_MSEQ_BANKS>=2)\n");
+            printf("TEST1: SKIP (pool < 2; set PULSAR_MSEQ_BANKS>=2)\n");
             pulsar_session_free(s); break;
         }
         /* Populate both banks so bank 1's spec runs with a live bankmate present

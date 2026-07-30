@@ -717,7 +717,7 @@ void pulsar_gpu_mxfp8_act_cache_arm(const pulsar_gpu_tensor *x, uint64_t n_tok, 
     /* Operational kill switch / A-B measurement handle. Read ONCE (this runs
      * per layer, not per token), and disarming restores the exact pre-cache
      * code path in the GEMMs below. */
-    static const int off = getenv("DS4_NO_MXFP8_ACT_CACHE") != NULL;
+    static const int off = getenv("PULSAR_NO_MXFP8_ACT_CACHE") != NULL;
     g_act_cache.valid = 0;
     g_act_cache.valid_h = 0;
     if (off || !x || !x->ptr || n_tok == 0 || in_dim == 0 || (in_dim % 32) != 0) {
@@ -1276,9 +1276,9 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * and never lands a 5..8 remainder, so it does NOT cover this. Keep 4.
          * The width-6 verify win is real but belongs entirely to moe_gemv_cap
          * (see pulsar_cuda_moe.cu) -- these three caps cost ~28 ms/verify on top. */
-        static const int gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
+        static const int gemv_max_n = []{ const char *e = getenv("PULSAR_FP8_GEMV_MAX_N");
                 return e ? atoi(e) : 4; }();
-        static const int nt_fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
+        static const int nt_fp8_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
         /* inc 2: raise the custom-nt cap to PULSAR_MSEQ_MAX (8) for a batched step so
          * n_tok 5..8 keep the M-independent kernel instead of cuBLASLt. Default cap
          * (gemv_max_n=4) is unchanged for classic prefill (never armed) and for the
@@ -1311,7 +1311,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
         /* Prefill (n_tok>1) uses the cuBLASLt MX tensor-core GEMM; decode falls
          * through to the per-token mmvq kernel below. PULSAR_FP8_NO_MXCORE forces
          * the mmvq path everywhere as an operational fallback. */
-        if (n_tok > 1 && getenv("DS4_FP8_NO_MXCORE") == NULL &&
+        if (n_tok > 1 && getenv("PULSAR_FP8_NO_MXCORE") == NULL &&
                 cuda_matmul_fp8_mx_tensor_labeled(out, model_map, model_size,
                 weight_offset, in_dim, out_dim, x, n_tok, label)) return 1;
         const unsigned wpb = 8;  /* output rows per block */
@@ -1320,7 +1320,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * loads, vs the raw 33B-interleaved kernel's misaligned 1-byte/thread reads).
          * Bit-exact vs the raw kernel (verified: rel 0 across all workhorse shapes);
          * ~+8% decode. PULSAR_FP8_MMVQ_RAW forces the raw path as an operational fallback. */
-        static const int fp8_mmvq_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
+        static const int fp8_mmvq_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
         const fp8_mx_weight *w = (in_dim % 128 == 0 && !fp8_mmvq_raw)
                 ? cuda_fp8_mx_weight(model_map, weight_offset, fbytes, in_dim, out_dim, label)
                 : NULL;
@@ -1340,7 +1340,7 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
          * MXFP8_LT gguf. */
         if (g_mxfp8_lt_offsets.count(weight_offset)) {
             fprintf(stderr, "pulsar: MXFP8_LT weight at offset %llu cannot use the raw "
-                    "interleaved mmvq path (DS4_FP8_MMVQ_RAW must not be set with a "
+                    "interleaved mmvq path (PULSAR_FP8_MMVQ_RAW must not be set with a "
                     "pre-stored MXFP8_LT gguf)\n", (unsigned long long)weight_offset);
             return 0;
         }
@@ -1389,8 +1389,8 @@ int pulsar_gpu_matmul_mxfp8_pair_tensor(
      * de-interleaved mmvq launches into one. Only when both are registered
      * de-interleavable MXFP8 weights and the raw mmvq fallback is not forced;
      * otherwise defer to the per-weight path below. */
-    static const int fp8_mmvq_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
-    static const int no_pair_fuse = getenv("DS4_CUDA_NO_MXFP8_PAIR_FUSE") != NULL;
+    static const int fp8_mmvq_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
+    static const int no_pair_fuse = getenv("PULSAR_CUDA_NO_MXFP8_PAIR_FUSE") != NULL;
     if (n_tok == 1 && in_dim % 128 == 0 && !fp8_mmvq_raw && !no_pair_fuse &&
         g_fp8_offsets.count(weight0_offset) && g_fp8_offsets.count(weight1_offset)) {
         const uint64_t fblocks = (in_dim + 31) / 32;
@@ -1469,7 +1469,7 @@ int cuda_matmul_fp8_hc_expand_tensor_labeled(
 
     /* Decode uses the de-interleaved cached weight (coalesced vectorized loads); raw
      * 33B path retained as PULSAR_FP8_MMVQ_RAW fallback. Same weight buffers as mmvq. */
-    static const int fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
+    static const int fp8_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
     const fp8_mx_weight *dw = (in_dim % 32 == 0 && !fp8_raw)
             ? cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim,
                                  label ? label : "fp8_hc_expand")
@@ -1536,7 +1536,7 @@ int pulsar_gpu_matmul_f16_tensor(pulsar_gpu_tensor *out, const void *model_map, 
      * above. This one is the clearest case: the cuBLAS side converts activations
      * to __half for cublasGemmEx while the GEMV stays f32, so the two dispatches
      * were never going to agree. Measured non-bit-exact at widths 6 and 8. */
-    static const int f16_gemv_max_n = []{ const char *e = getenv("DS4_F16_GEMV_MAX_N");
+    static const int f16_gemv_max_n = []{ const char *e = getenv("PULSAR_F16_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
     /* inc 2: batched step forces the M-independent nt kernel across [2..8] (see the
      * mxfp8 twin). Default cap 4 for prefill / decode-only (identical cases 2/3/4). */
@@ -1713,7 +1713,7 @@ static int launch_grouped_fp8mx_a(float *low, const void *model_map, uint64_t ou
         uint32_t n_groups, uint32_t n_tokens, uint64_t blocks_a, uint64_t low_dim,
         const float *heads, const char *label) {
     const dim3 grid_a(((unsigned)low_dim + 31u) / 32u, (unsigned)n_tokens, 1);
-    static const int fp8_raw = getenv("DS4_FP8_MMVQ_RAW") != NULL;
+    static const int fp8_raw = getenv("PULSAR_FP8_MMVQ_RAW") != NULL;
     const fp8_mx_weight *dw = (group_dim % 32 == 0 && !fp8_raw)
             ? cuda_fp8_mx_weight(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, label) : NULL;
     const int KBp = mx_rup((int)(group_dim / 32), 4);
@@ -1816,7 +1816,7 @@ int pulsar_gpu_attention_output_batch_tensor(
     /* 2026-07-21: raising to 8 was TRIED and REVERTED (see the dense-matmul gate
      * for the measurement). Shares PULSAR_FP8_GEMV_MAX_N with that gate, so the two
      * defaults must move together. */
-    static const int a_gemv_max_n = []{ const char *e = getenv("DS4_FP8_GEMV_MAX_N");
+    static const int a_gemv_max_n = []{ const char *e = getenv("PULSAR_FP8_GEMV_MAX_N");
             return e ? atoi(e) : 4; }();
     int a_done = 0;
     /* plan-34 inc 2: a batched multiseq/mixed step must NOT take the M-dependent
@@ -1825,7 +1825,7 @@ int pulsar_gpu_attention_output_batch_tensor(
      * DEINT kernel), so a co-scheduled decode bank's attn-output row is invariant
      * to the batch width. Classic prefill (not armed) keeps the tensor-core path. */
     if (n_tokens > 1 && (int)n_tokens > a_gemv_max_n && g_mneutral_rows == 0 &&
-        getenv("DS4_FP8_NO_MXCORE") == NULL) {
+        getenv("PULSAR_FP8_NO_MXCORE") == NULL) {
         a_done = cuda_attention_output_a_mx_gemm(low, model_map, model_size, out_a_offset,
                                                  group_dim, rank, n_groups, heads, n_tokens);
     }

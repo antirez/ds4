@@ -49,7 +49,7 @@ void gpu_graph_debug_dump_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -82,7 +82,7 @@ void gpu_graph_debug_dump_hc_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -113,7 +113,7 @@ void gpu_graph_debug_dump_f16_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_f16 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -147,7 +147,7 @@ void gpu_graph_debug_dump_i32_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("DS4_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -515,7 +515,7 @@ uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
 static int gpu_graph_kv_managed_override(void) {
     static int cached = -2;
     if (cached == -2) {
-        const char *v = getenv("DS4_KV_MANAGED");
+        const char *v = getenv("PULSAR_KV_MANAGED");
         if (!v || !v[0]) {
             cached = -1;
         } else if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
@@ -529,7 +529,7 @@ static int gpu_graph_kv_managed_override(void) {
              * silently force-flipping a measurement flag (a typo'd "of[f]"
              * must not force-manage the KV of a 128 GB box). */
             fprintf(stderr,
-                    "pulsar: DS4_KV_MANAGED=\"%s\" not recognized "
+                    "pulsar: PULSAR_KV_MANAGED=\"%s\" not recognized "
                     "(want 1/on/true or 0/off/false); using size policy\n", v);
             cached = -1;
         }
@@ -549,7 +549,7 @@ static int gpu_graph_kv_managed_override(void) {
 uint32_t gpu_graph_bank_pool_n(void) {
     static long cached = -1;
     if (cached < 0) {
-        const char *v = getenv("DS4_MSEQ_BANKS");
+        const char *v = getenv("PULSAR_MSEQ_BANKS");
         long n = 1;
         if (v && v[0]) {
             char *end = NULL;
@@ -559,11 +559,11 @@ uint32_t gpu_graph_bank_pool_n(void) {
             while (end && isspace((unsigned char)*end)) end++;
             if (end == v || (end && *end != '\0') || n < 1) {
                 fprintf(stderr,
-                        "pulsar: DS4_MSEQ_BANKS=\"%s\" not recognized (want 1..%u); "
+                        "pulsar: PULSAR_MSEQ_BANKS=\"%s\" not recognized (want 1..%u); "
                         "bank pool disabled\n", v, PULSAR_MSEQ_MAX);
                 n = 1;
             } else if (n > (long)PULSAR_MSEQ_MAX) {
-                fprintf(stderr, "pulsar: DS4_MSEQ_BANKS=%ld clamped to %u\n",
+                fprintf(stderr, "pulsar: PULSAR_MSEQ_BANKS=%ld clamped to %u\n",
                         n, PULSAR_MSEQ_MAX);
                 n = (long)PULSAR_MSEQ_MAX;
             }
@@ -1546,19 +1546,19 @@ bool gpu_graph_alloc_raw_cap(
 
     /* PULSAR_ATTN_PACK validation lives up here: no allocations have happened
      * yet, so these early returns need no cleanup. */
-    if (getenv("DS4_ATTN_MX") != NULL) {
+    if (getenv("PULSAR_ATTN_MX") != NULL) {
         /* Removed 2026-07-10: superseded by PULSAR_ATTN_PACK (bit-exact, smaller
          * rows; MX re-quantized the rope dims and cost drafter acceptance).
          * Refuse loudly instead of silently running a different format. */
         fprintf(stderr,
-                "pulsar: DS4_ATTN_MX has been removed (superseded by DS4_ATTN_PACK); "
-                "unset DS4_ATTN_MX (use DS4_ATTN_PACK=0 for the classic f32 comp cache)\n");
+                "pulsar: PULSAR_ATTN_MX has been removed (superseded by PULSAR_ATTN_PACK); "
+                "unset PULSAR_ATTN_MX (use PULSAR_ATTN_PACK=0 for the classic f32 comp cache)\n");
         return false;
     }
     if (gpu_graph_attn_pack_enabled() &&
         (PULSAR_N_ROT != 64u || ((PULSAR_N_HEAD_DIM - PULSAR_N_ROT) % 64u) != 0u)) {
         fprintf(stderr,
-                "pulsar: DS4_ATTN_PACK requires n_rot 64 and 64-aligned nope dims "
+                "pulsar: PULSAR_ATTN_PACK requires n_rot 64 and 64-aligned nope dims "
                 "(head_dim %u / n_rot %u)\n",
                 (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_ROT);
         return false;
@@ -1591,7 +1591,7 @@ bool gpu_graph_alloc_raw_cap(
         : pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
     if (managed_override >= 0) {
         fprintf(stderr,
-                "pulsar: DS4_KV_MANAGED override: KV caches use %s allocation "
+                "pulsar: PULSAR_KV_MANAGED override: KV caches use %s allocation "
                 "(measurement flag; policy would have chosen %s)\n",
                 managed_kv_cache ? "MANAGED (cudaMallocManaged)"
                                  : "DEVICE (cudaMalloc)",
@@ -1742,7 +1742,7 @@ bool gpu_graph_alloc_raw_cap(
             /* The packed loader and QAT+pack kernels hard-code the 68-byte
              * head_dim-128 row; fail loud here instead of deep in a launch. */
             fprintf(stderr,
-                    "pulsar: DS4_IDX_FP4 requires indexer head_dim 128 (model has %u)\n",
+                    "pulsar: PULSAR_IDX_FP4 requires indexer head_dim 128 (model has %u)\n",
                     PULSAR_N_INDEXER_HEAD_DIM);
             gpu_graph_free(g);
             return false;

@@ -2,7 +2,7 @@
 """Confidence-head retrain, stage 1 driver: the labeled-position request suite.
 
 Runs a temp x workload x depth mixture against a live ds4-server whose fused
-DSpark loop is dumping lean confidence records (DS4_DSPARK_DUMP_LEAN=1) with
+DSpark loop is dumping lean confidence records (PULSAR_DSPARK_DUMP_LEAN=1) with
 conf-sched OFF (unbiased, fully-verified labels).  The dump supplies features;
 the fused stats log supplies labels (committed counts = the engine's actual
 p/q sampled-acceptance outcomes — or greedy argmax-equality on the temp-0

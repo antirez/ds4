@@ -22,7 +22,7 @@ Dump/label mechanics are unchanged from the old pipeline: lean dump record r
 (features: batch_ffn_cur rows + markov_w1[refined_ids], the exact conf-kernel
 input) is labeled by fused stats line r+1's committed count, valid only when
 line r+1 actually verified r's drafts (n_batch == 1 + pend_r); request
-boundaries fail this automatically. Collect with DS4_DSPARK_CONF_SCHED=off.
+boundaries fail this automatically. Collect with PULSAR_DSPARK_CONF_SCHED=off.
 
 Usage: retrain.py --run-dir temp/confhead/run1 [--gguf gguf/dspark-conf3-v1.gguf]
                   [--out temp/confhead/run1/proj_new.npy]

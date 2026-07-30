@@ -67,7 +67,7 @@ static bool fused_step_logits(int K, uint32_t head_cap, float *dec_rows, float *
     const uint32_t n_pre_bank = (K > 0) ? 1u : 0u;
     const uint32_t need_banks = (uint32_t)N_DEC + n_pre_bank;
     bool ok = gpu_graph_bank_pool_count(g) >= need_banks;
-    if (!ok) fprintf(stderr, "pool too small: %u < %u (set DS4_MSEQ_BANKS)\n",
+    if (!ok) fprintf(stderr, "pool too small: %u < %u (set PULSAR_MSEQ_BANKS)\n",
                      gpu_graph_bank_pool_count(g), need_banks);
     char err[256];
     int argtok[N_DEC];
@@ -169,9 +169,9 @@ int main(int argc, char **argv) {
     pulsar_engine_options o; memset(&o, 0, sizeof o);
     o.model_path = argv[1]; o.backend = PULSAR_BACKEND_CUDA;
     if (pulsar_engine_open(&g_e, &o) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    printf("CONFIG: DS4_ATTN_PACK=%s DS4_IDX_FP4=%s  (n_dec=%d K=%d)\n",
-           getenv("DS4_ATTN_PACK") ? getenv("DS4_ATTN_PACK") : "(unset,default 1)",
-           getenv("DS4_IDX_FP4") ? getenv("DS4_IDX_FP4") : "(unset,default 1)", N_DEC, K_PRE);
+    printf("CONFIG: PULSAR_ATTN_PACK=%s PULSAR_IDX_FP4=%s  (n_dec=%d K=%d)\n",
+           getenv("PULSAR_ATTN_PACK") ? getenv("PULSAR_ATTN_PACK") : "(unset,default 1)",
+           getenv("PULSAR_IDX_FP4") ? getenv("PULSAR_IDX_FP4") : "(unset,default 1)", N_DEC, K_PRE);
 
     size_t tl = 0; char *txt = read_file("tests/long_context_story_prompt.txt", &tl);
     if (!txt) { fprintf(stderr, "prompt read failed\n"); return 1; }

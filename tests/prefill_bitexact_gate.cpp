@@ -164,7 +164,7 @@
  * (`--dump` over the default baseline path, from the tree under test) silently
  * re-baselines the gate against ITSELF, and it then prints PASS forever, output
  * indistinguishable from a real pass.  So the Makefile compiles the dumping
- * binary with -DDS4_GATE_BUILD_REF=<git short HEAD of the tree that built it>,
+ * binary with -DPULSAR_GATE_BUILD_REF=<git short HEAD of the tree that built it>,
  * the blob records it, and --check REQUIRES the caller to state the ref it
  * expects (the Makefile passes PREFILL_BASELINE_REF).  A self-baseline from a
  * D2R commit then fails LOUD instead of passing vacuously.
@@ -258,7 +258,7 @@ static pulsar_tokens g_toks;
 static const char *const g_env_keep[] = {
     /* Infrastructure: the lock PATH, not any numeric.  Read by
      * src/engine/engine_api.c, which this binary does link. */
-    "DS4_LOCK_FILE",
+    "PULSAR_LOCK_FILE",
 };
 
 /* Numerics knobs OUTSIDE the PULSAR_ namespace.  The scrub below sweeps PULSAR_* by
@@ -306,7 +306,7 @@ static void scrub_numerics_env(void) {
     const size_t cap = sizeof(names) / sizeof(names[0]);
     size_t n = 0;
     for (char **e = environ; *e; e++) {
-        if (strncmp(*e, "DS4_", 4) != 0) continue;
+        if (strncmp(*e, "PULSAR_", 4) != 0) continue;
         const char *eq = strchr(*e, '=');
         if (!eq) continue;
         const size_t len = (size_t)(eq - *e);
@@ -316,7 +316,7 @@ static void scrub_numerics_env(void) {
          * whole file refuses to take on faith.  Fail loud instead. */
         if (n == cap) {
             fprintf(stderr,
-                    "PREFILL GATE FAIL: more than %zu DS4_* variables in the "
+                    "PREFILL GATE FAIL: more than %zu PULSAR_* variables in the "
                     "environment — the scrub list is full, so the remainder would "
                     "stay SET and silently steer the numerics this gate claims to "
                     "certify.  Raise the cap in scrub_numerics_env().\n", cap);

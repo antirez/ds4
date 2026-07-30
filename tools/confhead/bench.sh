@@ -29,8 +29,8 @@ if [ "${avail_gb:-0}" -lt 100 ]; then
     exit 1
 fi
 
-export DS4_DSPARK_STATS=1
-export DS4_DSPARK_CONF_SCHED="$TAU"
+export PULSAR_DSPARK_STATS=1
+export PULSAR_DSPARK_CONF_SCHED="$TAU"
 
 ./pulsar-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
     > "$OUT/server.log" 2>&1 &

@@ -53,9 +53,9 @@ What they cover:
 The runner defaults to `ds4flash.gguf`. Override paths when needed:
 
 ```sh
-DS4_TEST_MODEL=/path/to/model.gguf ./pulsar_test --logprob-vectors
-DS4_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
-DS4_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
+PULSAR_TEST_MODEL=/path/to/model.gguf ./pulsar_test --logprob-vectors
+PULSAR_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
+PULSAR_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
 ```
 
 For kernel or GPU-path changes, also run the CUDA smoke regression:

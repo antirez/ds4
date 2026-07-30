@@ -204,7 +204,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
     void *reg_dev = NULL;
 
     unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
-    if (getenv("DS4_CUDA_HOST_REGISTER_PLAIN") != NULL) {
+    if (getenv("PULSAR_CUDA_HOST_REGISTER_PLAIN") != NULL) {
         flags = cudaHostRegisterMapped;
     }
 
@@ -225,7 +225,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
             char *dev_ptr = (char *)reg_dev + reg_delta;
             g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
             g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
                 fprintf(stderr, "pulsar: CUDA mapped %s %.2f MiB\n",
                         what ? what : "weights",
                         (double)bytes / 1048576.0);
@@ -242,7 +242,7 @@ static const char *cuda_model_range_register_mapped(const void *model_map,
     if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
         g_model_range_mapping_supported = 0;
     }
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "pulsar: CUDA model range map skipped for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
     }
@@ -262,7 +262,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                                                           const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
             fprintf(stderr, "pulsar: CUDA skipped device copy for %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                     what ? what : "weights",
                     (double)bytes / 1048576.0,
@@ -299,7 +299,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "pulsar: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
@@ -339,14 +339,14 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
 
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
-        getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        getenv("PULSAR_CUDA_WEIGHT_CACHE") == NULL &&
+        getenv("PULSAR_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
     }
-    const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
+    const char *direct_env = getenv("PULSAR_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
-    if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
+    if (getenv("PULSAR_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
     }
@@ -407,7 +407,7 @@ static double cuda_wall_sec(void) {
 
 
 static int cuda_model_load_progress_enabled(void) {
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
+    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
     return 1;
 }
 
@@ -486,10 +486,10 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
-        getenv("DS4_CUDA_COPY_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
+    if (getenv("PULSAR_CUDA_NO_MODEL_PREFETCH") != NULL ||
+        getenv("PULSAR_CUDA_COPY_MODEL") != NULL ||
+        getenv("PULSAR_CUDA_WEIGHT_CACHE") != NULL ||
+        getenv("PULSAR_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
 
@@ -547,7 +547,7 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
         (void)cudaGetLastError();
         return 0;
     }
-    if (getenv("DS4_CUDA_MODEL_PREFETCH_SYNC") != NULL) {
+    if (getenv("PULSAR_CUDA_MODEL_PREFETCH_SYNC") != NULL) {
         err = cudaStreamSynchronize(g_model_prefetch_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA model prefetch sync failed: %s\n", cudaGetErrorString(err));
@@ -568,7 +568,7 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
 
 static uint64_t cuda_model_copy_chunk_bytes(void) {
     uint64_t mb = 64;
-    const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
+    const char *env = getenv("PULSAR_CUDA_MODEL_COPY_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
@@ -583,7 +583,7 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
-    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
+    if (getenv("PULSAR_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -604,7 +604,7 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_fd < 0 || getenv("PULSAR_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -719,7 +719,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "pulsar: CUDA direct model read disabled: %s\n", strerror(direct_errno));
                 }
                 (void)close(g_model_direct_fd);
@@ -739,7 +739,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
-    const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+    const char *env = getenv("PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
@@ -766,7 +766,7 @@ static uint64_t cuda_model_local_model_limit_bytes(void) {
 
 
 static int cuda_model_cache_limit_explicit(void) {
-    const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+    const char *env = getenv("PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB");
     return env && env[0];
 }
 
@@ -774,7 +774,7 @@ static int cuda_model_cache_limit_explicit(void) {
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t mb = 1792;
-    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
+    const char *env = getenv("PULSAR_CUDA_WEIGHT_ARENA_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
@@ -827,7 +827,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         return NULL;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
         uint64_t arena_bytes = 0;
         for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
         fprintf(stderr, "pulsar: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
@@ -844,7 +844,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  * or a device copy instead of surfacing an async illegal access later. */
 static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
     if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL) {
         return cuda_model_ptr(model_map, offset);
     }
     return NULL;
@@ -861,7 +861,7 @@ static const char *cuda_model_range_ptr_from_fd(
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
             fprintf(stderr, "pulsar: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
                     what ? what : "weights",
                     (double)bytes / 1048576.0,
@@ -872,7 +872,7 @@ static const char *cuda_model_range_ptr_from_fd(
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        if (getenv("PULSAR_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_direct_fallback_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
@@ -939,7 +939,7 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+    if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "pulsar: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
                 what ? what : "weights",
                 (double)bytes / 1048576.0,
@@ -952,10 +952,10 @@ static const char *cuda_model_range_ptr_from_fd(
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
-        getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
-        getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
+    if (getenv("PULSAR_CUDA_NO_MODEL_COPY") != NULL ||
+        getenv("PULSAR_CUDA_DIRECT_MODEL") != NULL ||
+        getenv("PULSAR_CUDA_WEIGHT_CACHE") != NULL ||
+        getenv("PULSAR_CUDA_WEIGHT_PRELOAD") != NULL) {
         return 0;
     }
     if (g_model_device_owned || g_model_registered) return 1;
@@ -1017,7 +1017,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         cuda_model_discard_source_pages(model_map, model_size, off, n);
         copied += n;
         const double now = cuda_wall_sec();
-        if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
+        if (getenv("PULSAR_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
             fprintf(stderr, "pulsar: CUDA model chunk copy %.2f/%.2f GiB\n",
                     (double)copied / 1073741824.0,
                     (double)map_size / 1073741824.0);
@@ -1116,7 +1116,7 @@ int pulsar_gpu_init(void) {
          * a CUDA graph; cuBLAS must launch onto the same stream. */
         (void)cublasSetStream(g_cublas, cudaStreamPerThread);
         const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            (g_quality_mode || getenv("PULSAR_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
@@ -1468,7 +1468,7 @@ int pulsar_gpu_decode_graph_begin(void) {
      * The capture path is kept as working infrastructure for the follow-up
      * that reuses a stable tape with parameter-only updates. */
     if (g_decode_graphs_off < 0)
-        g_decode_graphs_off = getenv("DS4_CUDA_GRAPHS") == NULL;
+        g_decode_graphs_off = getenv("PULSAR_CUDA_GRAPHS") == NULL;
     if (g_decode_graphs_off) return 0;
     if (cudaStreamBeginCapture(cudaStreamPerThread,
                                cudaStreamCaptureModeRelaxed) != cudaSuccess) {
@@ -1511,7 +1511,7 @@ int pulsar_gpu_decode_graph_end(void) {
                          "decode graph launch");
     if (ok) ok = cuda_ok(cudaStreamSynchronize(cudaStreamPerThread),
                          "decode graph sync");
-    if (ok && getenv("DS4_CUDA_GRAPH_STATS") != NULL &&
+    if (ok && getenv("PULSAR_CUDA_GRAPH_STATS") != NULL &&
         (g_decode_graph_updates + g_decode_graph_instantiates) % 256 == 0) {
         fprintf(stderr, "pulsar: decode graphs: %llu updates, %llu instantiates\n",
                 (unsigned long long)g_decode_graph_updates,
@@ -1572,7 +1572,7 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
 int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
-    const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
+    const char *copy_env = getenv("PULSAR_CUDA_COPY_MODEL");
     if (copy_env && copy_env[0]) {
         void *dev = NULL;
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
@@ -1598,7 +1598,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     }
 
     unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
-    if (getenv("DS4_CUDA_HOST_REGISTER_PLAIN") != NULL) {
+    if (getenv("PULSAR_CUDA_HOST_REGISTER_PLAIN") != NULL) {
         flags = cudaHostRegisterMapped;
     }
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
@@ -1623,7 +1623,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
             fprintf(stderr,
                     "pulsar: CUDA model %.2f GiB exceeds the default single-GPU "
                     "startup cache budget %.2f GiB; set "
-                    "DS4_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly if the model "
+                    "PULSAR_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly if the model "
                     "plus scratch and KV still fit in memory\n",
                     (double)model_size / 1073741824.0,
                     (double)limit / 1073741824.0);
@@ -1638,7 +1638,7 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 int pulsar_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!pulsar_gpu_set_model_map(model_map, model_size)) return 0;
-    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
+    if (getenv("PULSAR_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
@@ -1664,18 +1664,18 @@ int pulsar_gpu_set_model_fd_for_map(int fd, const void *model_map) {
             if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
         }
 #if defined(__linux__) && defined(O_DIRECT)
-        if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
+        if (getenv("PULSAR_CUDA_NO_DIRECT_IO") == NULL) {
             char proc_path[64];
             snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
             int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
             if (direct_fd >= 0) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "pulsar: CUDA model direct I/O enabled (align=%llu)\n",
                             (unsigned long long)g_model_direct_align);
                 }
-            } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            } else if (getenv("PULSAR_CUDA_WEIGHT_CACHE_VERBOSE")) {
                 fprintf(stderr, "pulsar: CUDA model direct I/O unavailable: %s\n", strerror(errno));
             }
         }
@@ -1804,7 +1804,7 @@ void pulsar_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
         const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            (g_quality_mode || getenv("PULSAR_CUDA_NO_TF32") != NULL)
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);

@@ -97,11 +97,11 @@ void pulsar_release_instance_lock(void) {
 /* Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,
  * so a stale accidental second run is more dangerous than a normal CLI error. */
 void pulsar_acquire_instance_lock(void) {
-    const char *path = getenv("DS4_LOCK_FILE");
+    const char *path = getenv("PULSAR_LOCK_FILE");
     /* The default lock path stays "/tmp/ds4.lock" DELIBERATELY after the
      * Pulsar rebrand: an old ds4-server and a new pulsar binary must contend
      * on the SAME lock during the transition — two live instances would OOM
-     * the GB10. Do not rename this path (or the DS4_* env names). */
+     * the GB10. Do not rename this path (or the PULSAR_* env names). */
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);

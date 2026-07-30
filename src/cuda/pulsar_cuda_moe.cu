@@ -2305,7 +2305,7 @@ static int routed_moe_launch_cutlass_dispatch(
         const pulsar_gpu_tensor *x, uint32_t n_tokens) {
     static int grouped = -1;
     if (grouped < 0) {
-        const char *e = getenv("DS4_MOE_FP4_GROUPED");
+        const char *e = getenv("PULSAR_MOE_FP4_GROUPED");
         grouped = !(e && e[0] == '0');
     }
     if (grouped) {
@@ -2315,7 +2315,7 @@ static int routed_moe_launch_cutlass_dispatch(
                 selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
         {
             static int glog = -1;
-            if (glog < 0) glog = getenv("DS4_MOE_GROUPED_LOG") != NULL ? 1 : 0;
+            if (glog < 0) glog = getenv("PULSAR_MOE_GROUPED_LOG") != NULL ? 1 : 0;
             static int logged = 0;
             if (glog && !logged) { logged = 1;
                 fprintf(stderr, "pulsar: moe grouped path rc=%d n_tok=%u n_total=%u n_exp=%u -> %s\n",
@@ -2741,7 +2741,7 @@ static int routed_moe_launch(
     /* MXFP4 (type-39) big-batch expert-tiled prefill path (PULSAR_MOE_FP4_TILED, default on;
      * =0 restores the per-pair qwarp32 kernels). Bit-identical, ~10x faster at prefill. */
     static int fp4_tiled = -1;
-    if (fp4_tiled < 0) { const char *e = getenv("DS4_MOE_FP4_TILED"); fp4_tiled = !(e && e[0] == '0'); }
+    if (fp4_tiled < 0) { const char *e = getenv("PULSAR_MOE_FP4_TILED"); fp4_tiled = !(e && e[0] == '0'); }
     if (gate_type != 16u && !gate_q2k && !gate_mxfp4) return 0;
     if (down_type != 10u && !down_iq2 && !down_mxfp4) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
@@ -2767,7 +2767,7 @@ static int routed_moe_launch(
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        const uint32_t profile_moe = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
             for (uint32_t i = 0; i < 7u; i++) {
@@ -3239,7 +3239,7 @@ int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *
          * n_tokens>=1). PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
         static int fp4_gemv = -1;
         if (fp4_gemv < 0) {
-            const char *e = getenv("DS4_MOE_FP4_GEMV");
+            const char *e = getenv("PULSAR_MOE_FP4_GEMV");
             fp4_gemv = !(e && e[0] == '0');
         }
         if (fp4_gemv &&
@@ -3365,7 +3365,7 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
     }
     {
         static int entry_log = -1;
-        if (entry_log < 0) entry_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 200 : 0;
+        if (entry_log < 0) entry_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 200 : 0;
         if (entry_log > 0) { entry_log--;
             fprintf(stderr, "pulsar: moe_batch ENTRY layer=%u gate_type=%u down_type=%u n_tok=%u\n",
                     layer_index, gate_type, down_type, n_tokens); }
@@ -3384,11 +3384,11 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
          * PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
         static int fp4_gemv = -1;
         if (fp4_gemv < 0) {
-            const char *e = getenv("DS4_MOE_FP4_GEMV");
+            const char *e = getenv("PULSAR_MOE_FP4_GEMV");
             fp4_gemv = !(e && e[0] == '0');
         }
         static int path_log = -1;
-        if (path_log < 0) path_log = getenv("DS4_MOE_PATH_LOG") != NULL ? 400 : 0;
+        if (path_log < 0) path_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 400 : 0;
         if (path_log > 0) {
             path_log--;
             fprintf(stderr,
@@ -3496,14 +3496,14 @@ static int g_moe_time_n = 0;
 static void moe_time_dump(void){
     if (g_moe_time_n == 0) return;
     double tot = 0; for (int i = 0; i < g_moe_time_n; i++) tot += g_moe_time[i].ms;
-    fprintf(stderr, "\n=== DS4_MOE_TIME per-format MoE batch GPU time (total %.2f ms over all calls) ===\n", tot);
+    fprintf(stderr, "\n=== PULSAR_MOE_TIME per-format MoE batch GPU time (total %.2f ms over all calls) ===\n", tot);
     for (int i = 0; i < g_moe_time_n; i++) {
         moe_time_bucket *b = &g_moe_time[i];
         fprintf(stderr, "  gate_type=%2u down_type=%2u : %9.2f ms  (%5.1f%%)  calls=%llu  avg=%.3f ms\n",
                 b->gate_type, b->down_type, b->ms, tot > 0 ? 100.0 * b->ms / tot : 0.0,
                 (unsigned long long)b->calls, b->calls ? b->ms / (double)b->calls : 0.0);
     }
-    fprintf(stderr, "=== end DS4_MOE_TIME ===\n");
+    fprintf(stderr, "=== end PULSAR_MOE_TIME ===\n");
 }
 static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
     for (int i = 0; i < g_moe_time_n; i++)
@@ -3520,7 +3520,7 @@ static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
 
 int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     static int time_moe = -1;
-    if (time_moe < 0) time_moe = getenv("DS4_MOE_TIME") != NULL ? 1 : 0;
+    if (time_moe < 0) time_moe = getenv("PULSAR_MOE_TIME") != NULL ? 1 : 0;
     if (!time_moe) {
         return routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
                 gate_offset, up_offset, down_offset, gate_type, down_type,
