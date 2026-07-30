@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 
 
 
@@ -180,18 +181,12 @@ bool server::kv_tool_map_write(FILE *fp, const char *text,
     if (written_bytes) *written_bytes = 0;
     if (!s || s->disable_exact_dsml_tool_replay || !fp || !text || !text[0]) return true;
 
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     uint32_t count = 0;
     uint64_t bytes = 0;
     bool ok = s->kv_tool_map_measure_locked(text, &count, &bytes);
-    if (!ok) {
-        pthread_mutex_unlock(&s->tool_mu);
-        return false;
-    }
-    if (count == 0) {
-        pthread_mutex_unlock(&s->tool_mu);
-        return true;
-    }
+    if (!ok) return false;
+    if (count == 0) return true;
 
     uint8_t h[KV_TOOL_MAP_HEADER];
     h[0] = KV_TOOL_MAP_MAGIC0;
@@ -225,7 +220,6 @@ bool server::kv_tool_map_write(FILE *fp, const char *text,
         }
         p = end;
     }
-    pthread_mutex_unlock(&s->tool_mu);
 
     if (ok && written_bytes) *written_bytes = bytes;
     return ok;

@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 
 
 
@@ -299,9 +300,8 @@ void visible_live_free(visible_live_state *st) {
 void server::thinking_live_clear(session_slot *sl) {
     auto *s = this;
     if (!s || !sl) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     visible_live_clear_locked(&sl->thinking_live);
-    pthread_mutex_unlock(&s->tool_mu);
 }
 
 
@@ -309,13 +309,12 @@ void server::thinking_live_clear(session_slot *sl) {
 void server::thinking_live_remember(session_slot *sl, const char *visible_text) {
     auto *s = this;
     if (!s || !sl || !visible_text || !visible_text[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     visible_live_clear_locked(&sl->thinking_live);
     sl->thinking_live.visible_text = xstrdup(visible_text);
     sl->thinking_live.visible_len = strlen(visible_text);
     sl->thinking_live.live_tokens = s->slot_frontier_pos(sl);
     sl->thinking_live.valid = true;
-    pthread_mutex_unlock(&s->tool_mu);
 }
 
 
@@ -324,7 +323,7 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
                                     const tool_calls *calls) {
     auto *s = this;
     if (!s || !sl || !visible_text || !visible_text[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
     sl->responses_live.visible_text = xstrdup(visible_text);
     sl->responses_live.visible_len = strlen(visible_text);
@@ -335,7 +334,6 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
     }
     sl->responses_live.live_tokens = s->slot_frontier_pos(sl);
     sl->responses_live.valid = true;
-    pthread_mutex_unlock(&s->tool_mu);
 }
 
 
@@ -343,14 +341,13 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
 void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) {
     auto *s = this;
     if (!s || !sl || !calls || calls->len == 0) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->anthropic_live);
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
     sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl);
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
-    pthread_mutex_unlock(&s->tool_mu);
 }
 
 
@@ -358,9 +355,8 @@ void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) 
 void server::responses_live_clear(session_slot *sl) {
     auto *s = this;
     if (!s || !sl) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
-    pthread_mutex_unlock(&s->tool_mu);
 }
 
 
@@ -368,9 +364,8 @@ void server::responses_live_clear(session_slot *sl) {
 void server::anthropic_live_clear(session_slot *sl) {
     auto *s = this;
     if (!s || !sl) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->anthropic_live);
-    pthread_mutex_unlock(&s->tool_mu);
 }
 
 
@@ -382,9 +377,8 @@ void server::anthropic_live_clear(session_slot *sl) {
  * miss a slot provisioned this instant, whose bindings are still empty. */
 int server::n_slots_snapshot() {
     auto *s = this;
-    pthread_mutex_lock(&s->mu);
+    pulsar::ScopedLock lk(&s->mu);
     const int n = s->n_slots;
-    pthread_mutex_unlock(&s->mu);
     return n;
 }
 
@@ -394,13 +388,12 @@ bool server::responses_live_has_call_id(const char *id) {
     auto *s = this;
     if (!s || !id || !id[0]) return false;
     const int n = s->n_slots_snapshot();
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     bool found = false;
     for (int i = 0; i < n && !found; i++) {
         const live_tool_state *st = &s->slots[i].responses_live;
         found = st->valid && id_list_contains(&st->call_ids, id);
     }
-    pthread_mutex_unlock(&s->tool_mu);
     return found;
 }
 
@@ -410,13 +403,12 @@ bool server::anthropic_live_has_call_id(const char *id) {
     auto *s = this;
     if (!s || !id || !id[0]) return false;
     const int n = s->n_slots_snapshot();
-    pthread_mutex_lock(&s->tool_mu);
+    pulsar::ScopedLock lk(&s->tool_mu);
     bool found = false;
     for (int i = 0; i < n && !found; i++) {
         const live_tool_state *st = &s->slots[i].anthropic_live;
         found = st->valid && id_list_contains(&st->call_ids, id);
     }
-    pthread_mutex_unlock(&s->tool_mu);
     return found;
 }
 
