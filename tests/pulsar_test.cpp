@@ -1542,9 +1542,9 @@ static void test_think_tool_recovery(void) {
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
         TEST_ASSERT(thinking.inside);
-        rec = chat_think_tool_recovery(&srv, &srv.slots[0], &text, &thinking,
-                                       &scan_from,
-                                       &completion, 512, err, sizeof(err));
+        rec = srv.chat_think_tool_recovery(&srv.slots[0], &text, &thinking,
+                                           &scan_from,
+                                           &completion, 512, err, sizeof(err));
         TEST_ASSERT(rec >= 0);
         if (rec == 1) {
             triggered_at = i;
