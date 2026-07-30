@@ -50119,24 +50119,55 @@ static bool laguna_graph_forward_batch(
                     split_decode_rows) != 0;
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_attn");
-        if (ok) {
+        /* Beyond its KV store, the last layer of a plain prefill only feeds
+         * the final row's logits: run the FFN/MoE chain on that single row
+         * (or skip it entirely for non-final chunks). */
+        const bool last_row_tail =
+            il + 1u == (uint32_t)DS4_N_LAYER && n_tokens > 1u &&
+            capture == NULL && row_argmax_out == NULL;
+        const bool tail_skip = last_row_tail && logits_out == NULL;
+        const uint32_t tail_rows = last_row_tail ? 1u : n_tokens;
+        ds4_gpu_tensor *tail_heads = g->heads;
+        ds4_gpu_tensor *tail_cur = g->cur;
+        ds4_gpu_tensor *tail_next = g->next;
+        ds4_gpu_tensor *tail_views[3] = {NULL, NULL, NULL};
+        if (ok && last_row_tail && !tail_skip) {
+            const uint64_t embd_off =
+                (uint64_t)(n_tokens - 1u) * DS4_N_EMBD * sizeof(float);
+            const uint64_t embd_len = (uint64_t)DS4_N_EMBD * sizeof(float);
+            const uint64_t head_len =
+                (uint64_t)n_head * DS4_N_HEAD_DIM * sizeof(float);
+            tail_views[0] = ds4_gpu_tensor_view(
+                    g->heads, (uint64_t)(n_tokens - 1u) * head_len, head_len);
+            tail_views[1] = ds4_gpu_tensor_view(g->cur, embd_off, embd_len);
+            tail_views[2] = ds4_gpu_tensor_view(g->next, embd_off, embd_len);
+            ok = tail_views[0] && tail_views[1] && tail_views[2];
+            if (ok) {
+                tail_heads = tail_views[0];
+                tail_cur = tail_views[1];
+                tail_next = tail_views[2];
+            } else {
+                failed_stage = "last-row tail views";
+            }
+        }
+        if (ok && !tail_skip) {
             failed_stage = "attention output projection";
             ok = laguna_graph_matmul_decode_rows(g->attn_out,
                                                  model,
                                                  l->attn_output,
-                                                 g->heads,
-                                                 n_tokens,
+                                                 tail_heads,
+                                                 tail_rows,
                                                  exact_q8_rows);
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_attn_out");
-        if (ok) {
+        if (ok && !tail_skip) {
             failed_stage = "attention residual";
             ok = ds4_gpu_add_tensor(g->after_attn,
-                                    g->cur,
+                                    tail_cur,
                                     g->attn_out,
-                                    (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+                                    (uint64_t)tail_rows * DS4_N_EMBD) != 0;
         }
-        if (ok) {
+        if (ok && !tail_skip) {
             failed_stage = "FFN norm";
             ok = ds4_gpu_rms_norm_weight_rows_tensor(
                     g->ffn_norm,
@@ -50145,7 +50176,7 @@ static bool laguna_graph_forward_batch(
                     model->size,
                     l->ffn_norm->abs_offset,
                     DS4_N_EMBD,
-                    n_tokens,
+                    tail_rows,
                     DS4_RMS_EPS) != 0;
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_norms");
@@ -50190,7 +50221,7 @@ static bool laguna_graph_forward_batch(
                                         (uint64_t)n_tokens * DS4_N_EMBD) != 0;
             }
             if (ok && stage_prof) ok = laguna_stage_mark("p_dense");
-        } else if (ok) {
+        } else if (ok && !tail_skip) {
             if (exact_q8_rows) {
                 failed_stage = "decode-row router";
                 ok = laguna_graph_router_decode_rows(
@@ -50205,7 +50236,7 @@ static bool laguna_graph_forward_batch(
                         DS4_N_EMBD,
                         DS4_N_EXPERT,
                         g->ffn_norm,
-                        n_tokens) != 0;
+                        tail_rows) != 0;
             }
             if (ok && !exact_q8_rows) {
                 failed_stage = "router selection";
@@ -50220,7 +50251,7 @@ static bool laguna_graph_forward_batch(
                         DS4_N_EXPERT,
                         DS4_N_EXPERT_USED,
                         DS4_EXPERT_WEIGHT_SCALE,
-                        n_tokens) != 0;
+                        tail_rows) != 0;
             }
 
         if (ok && stage_prof) ok = laguna_stage_mark("p_router");
@@ -50278,7 +50309,7 @@ static bool laguna_graph_forward_batch(
                             DS4_N_EXPERT_USED,
                             il,
                             g->ffn_norm,
-                            n_tokens,
+                            tail_rows,
                             DS4_N_EXPERT_USED * DS4_N_FF_EXP,
                             true) != 0;
                 }
@@ -50310,14 +50341,14 @@ static bool laguna_graph_forward_batch(
                          model,
                          l->ffn_gate_shexp,
                          g->ffn_norm,
-                         n_tokens,
+                         tail_rows,
                          exact_q8_rows) &&
                      laguna_graph_matmul_decode_rows(
                          g->ffn_up,
                          model,
                          l->ffn_up_shexp,
                          g->ffn_norm,
-                         n_tokens,
+                         tail_rows,
                          exact_q8_rows);
                 if (ok) {
                     failed_stage = "shared expert SwiGLU";
@@ -50325,7 +50356,7 @@ static bool laguna_graph_forward_batch(
                             g->ffn_mid,
                             g->ffn_gate,
                             g->ffn_up,
-                            (uint64_t)n_tokens * DS4_N_FF_SHARED,
+                            (uint64_t)tail_rows * DS4_N_FF_SHARED,
                             0.0f,
                             1.0f) != 0;
                 }
@@ -50337,22 +50368,25 @@ static bool laguna_graph_forward_batch(
                          model,
                          l->ffn_down_shexp,
                          g->ffn_mid,
-                         n_tokens,
+                         tail_rows,
                          exact_q8_rows);
             }
         if (ok && stage_prof) ok = laguna_stage_mark("p_shexp");
             if (ok) {
                 failed_stage = "MoE residual";
                 ok = ds4_gpu_add3_tensor(
-                        g->next,
+                        tail_next,
                         g->after_attn,
                         g->ffn_out,
                         g->shared_out,
-                        (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+                        (uint64_t)tail_rows * DS4_N_EMBD) != 0;
             }
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_resid");
 
+        ds4_gpu_tensor_free(tail_views[0]);
+        ds4_gpu_tensor_free(tail_views[1]);
+        ds4_gpu_tensor_free(tail_views[2]);
         if (ok) {
             ds4_gpu_tensor *tmp = g->cur;
             g->cur = g->next;
