@@ -6249,8 +6249,12 @@ static void test_think_tool_recovery(void) {
                                    512, 32768, &r, err, sizeof(err)));
 
     ds4_session *session = NULL;
+    ds4_session *other_session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
-    if (!session) {
+    TEST_ASSERT(ds4_session_create(&other_session, engine, 32768) == 0);
+    if (!session || !other_session) {
+        ds4_session_free(other_session);
+        ds4_session_free(session);
         request_free(&r);
         return;
     }
@@ -6293,13 +6297,37 @@ static void test_think_tool_recovery(void) {
     server srv;
     memset(&srv, 0, sizeof(srv));
     srv.engine = engine;
-    server_slot slot = {
-        .srv = &srv,
-        .session = session,
+    server_slot slots[2] = {
+        {.srv = &srv, .id = 0, .session = other_session},
+        {.srv = &srv, .id = 1, .session = session},
     };
-    srv.slots = &slot;
-    srv.slot_count = 1;
+    server_slot *slot = &slots[1];
+    srv.slots = slots;
+    srv.slot_count = 2;
+    srv.batched_mode = true;
     pthread_mutex_init(&srv.inference_mu, NULL);
+    pthread_mutex_init(&srv.model_mu, NULL);
+    pthread_cond_init(&srv.model_cv, NULL);
+
+    /* server_eval_token waits for the decode coordinator in batched mode;
+     * starting the real worker keeps this test from providing fake coverage
+     * or deadlocking on the condition variable. */
+    pthread_t decode_thread;
+    int decode_started = pthread_create(&decode_thread, NULL,
+                                        decode_worker_main, &srv);
+    TEST_ASSERT(decode_started == 0);
+    if (decode_started != 0) {
+        pthread_cond_destroy(&srv.model_cv);
+        pthread_mutex_destroy(&srv.model_mu);
+        pthread_mutex_destroy(&srv.inference_mu);
+        ds4_session_free(other_session);
+        ds4_session_free(session);
+        request_free(&r);
+        test_close_engine(false);
+        return;
+    }
+    const int other_pos_before = ds4_session_pos(other_session);
+    const int target_pos_before = ds4_session_pos(session);
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza
@@ -6322,7 +6350,7 @@ static void test_think_tool_recovery(void) {
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
         TEST_ASSERT(thinking.inside);
-        rec = chat_think_tool_recovery(&srv, &slot, &text, &thinking, &scan_from,
+        rec = chat_think_tool_recovery(&srv, slot, &text, &thinking, &scan_from,
                                        &completion, 512, err, sizeof(err));
         TEST_ASSERT(rec >= 0);
         if (rec == 1) {
@@ -6339,6 +6367,11 @@ static void test_think_tool_recovery(void) {
     buf_free(&forced);
     TEST_ASSERT(!thinking.inside);
     TEST_ASSERT(completion > 0);
+    /* The explicit slot argument must be the session that receives the
+     * injected recovery tokens; slots[0] is a guard against accidental
+     * server-slot aliasing. */
+    TEST_ASSERT(ds4_session_pos(other_session) == other_pos_before);
+    TEST_ASSERT(ds4_session_pos(session) == target_pos_before + completion);
     TEST_ASSERT(text.ptr && text.len >= 10 &&
                 !memcmp(text.ptr + text.len - 10, "</think>\n\n", 10));
 
@@ -6383,7 +6416,15 @@ static void test_think_tool_recovery(void) {
     free(reasoning);
     tool_calls_free(&calls);
     buf_free(&text);
+    pthread_mutex_lock(&srv.model_mu);
+    srv.model_stopping = true;
+    pthread_cond_broadcast(&srv.model_cv);
+    pthread_mutex_unlock(&srv.model_mu);
+    pthread_join(decode_thread, NULL);
+    pthread_cond_destroy(&srv.model_cv);
+    pthread_mutex_destroy(&srv.model_mu);
     pthread_mutex_destroy(&srv.inference_mu);
+    ds4_session_free(other_session);
     ds4_session_free(session);
     request_free(&r);
     test_close_engine(false);
