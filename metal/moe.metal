@@ -2806,12 +2806,18 @@ static inline void glm_iq4_xs_pair_swiglu_f32_impl(
     float sumu[N_R0_IQ4_XS_PAIR] = {0.f};
 
     for (int ib = ix; ib < nb; ib += 4) {
-        device const float *yb = y + (uint64_t)ib * QK_K + 32 * it;
+        /* 32*it and ib*QK_K are 128B-aligned float offsets: vector loads. */
+        device const float4 *yb4 =
+            (device const float4 *)(y + (uint64_t)ib * QK_K + 32 * it);
         float yl[16];
         float yh[16];
-        for (short i = 0; i < 16; ++i) {
-            yl[i] = yb[i];
-            yh[i] = yb[i + 16];
+        FOR_UNROLL (short v = 0; v < 4; ++v) {
+            const float4 lo = yb4[v];
+            const float4 hi = yb4[v + 4];
+            yl[4 * v + 0] = lo.x; yl[4 * v + 1] = lo.y;
+            yl[4 * v + 2] = lo.z; yl[4 * v + 3] = lo.w;
+            yh[4 * v + 0] = hi.x; yh[4 * v + 1] = hi.y;
+            yh[4 * v + 2] = hi.z; yh[4 * v + 3] = hi.w;
         }
 
         for (short row = 0; row < N_R0_IQ4_XS_PAIR && row0 + (uint)row < args.mid_dim; row++) {
@@ -2821,15 +2827,30 @@ static inline void glm_iq4_xs_pair_swiglu_f32_impl(
             device const block_iq4_xs *u =
                 (device const block_iq4_xs *)(up_base +
                     (uint64_t)(row0 + (uint)row) * args.up_row_bytes) + ib;
-            device const uchar *qg = g->qs + 16 * it;
-            device const uchar *qu = u->qs + 16 * it;
+            /* qs + 16*it is 4-byte aligned (8B header + 16B strides). */
+            device const uint *qg32 = (device const uint *)(g->qs + 16 * it);
+            device const uint *qu32 = (device const uint *)(u->qs + 16 * it);
             float accg = 0.f;
             float accu = 0.f;
-            FOR_UNROLL (short j = 0; j < 16; ++j) {
-                accg += yl[j] * ds4_kvalues_iq4nl_f[qg[j] & 0x0F] +
-                        yh[j] * ds4_kvalues_iq4nl_f[qg[j] >> 4];
-                accu += yl[j] * ds4_kvalues_iq4nl_f[qu[j] & 0x0F] +
-                        yh[j] * ds4_kvalues_iq4nl_f[qu[j] >> 4];
+            FOR_UNROLL (short k = 0; k < 4; ++k) {
+                const uint gw = qg32[k];
+                const uint uw = qu32[k];
+                accg += yl[4 * k + 0] * ds4_kvalues_iq4nl_f[gw & 0x0Fu] +
+                        yh[4 * k + 0] * ds4_kvalues_iq4nl_f[(gw >> 4u) & 0x0Fu] +
+                        yl[4 * k + 1] * ds4_kvalues_iq4nl_f[(gw >> 8u) & 0x0Fu] +
+                        yh[4 * k + 1] * ds4_kvalues_iq4nl_f[(gw >> 12u) & 0x0Fu] +
+                        yl[4 * k + 2] * ds4_kvalues_iq4nl_f[(gw >> 16u) & 0x0Fu] +
+                        yh[4 * k + 2] * ds4_kvalues_iq4nl_f[(gw >> 20u) & 0x0Fu] +
+                        yl[4 * k + 3] * ds4_kvalues_iq4nl_f[(gw >> 24u) & 0x0Fu] +
+                        yh[4 * k + 3] * ds4_kvalues_iq4nl_f[gw >> 28u];
+                accu += yl[4 * k + 0] * ds4_kvalues_iq4nl_f[uw & 0x0Fu] +
+                        yh[4 * k + 0] * ds4_kvalues_iq4nl_f[(uw >> 4u) & 0x0Fu] +
+                        yl[4 * k + 1] * ds4_kvalues_iq4nl_f[(uw >> 8u) & 0x0Fu] +
+                        yh[4 * k + 1] * ds4_kvalues_iq4nl_f[(uw >> 12u) & 0x0Fu] +
+                        yl[4 * k + 2] * ds4_kvalues_iq4nl_f[(uw >> 16u) & 0x0Fu] +
+                        yh[4 * k + 2] * ds4_kvalues_iq4nl_f[(uw >> 20u) & 0x0Fu] +
+                        yl[4 * k + 3] * ds4_kvalues_iq4nl_f[(uw >> 24u) & 0x0Fu] +
+                        yh[4 * k + 3] * ds4_kvalues_iq4nl_f[uw >> 28u];
             }
             sumg[row] += ds4_iq4_xs_subblock_scale(g, it) * accg;
             sumu[row] += ds4_iq4_xs_subblock_scale(u, it) * accu;
@@ -2898,22 +2919,34 @@ static inline void glm_iq4_xs_down_f32_impl(
         device const float *yy = mid + mid_base + (uint64_t)slot * args.mid_dim;
 
         for (int ib = ix; ib < nb; ib += 4) {
-            device const float *yb = yy + (uint64_t)ib * QK_K + 32 * it;
+            device const float4 *yb4 =
+                (device const float4 *)(yy + (uint64_t)ib * QK_K + 32 * it);
             float yl[16];
             float yh[16];
-            for (short i = 0; i < 16; ++i) {
-                yl[i] = yb[i];
-                yh[i] = yb[i + 16];
+            FOR_UNROLL (short v = 0; v < 4; ++v) {
+                const float4 lo = yb4[v];
+                const float4 hi = yb4[v + 4];
+                yl[4 * v + 0] = lo.x; yl[4 * v + 1] = lo.y;
+                yl[4 * v + 2] = lo.z; yl[4 * v + 3] = lo.w;
+                yh[4 * v + 0] = hi.x; yh[4 * v + 1] = hi.y;
+                yh[4 * v + 2] = hi.z; yh[4 * v + 3] = hi.w;
             }
             for (short row = 0; row < N_R0_IQ4_XS_DOWN && row0 + (uint)row < args.out_dim; row++) {
                 device const block_iq4_xs *xq =
                     (device const block_iq4_xs *)(down_base +
                         (uint64_t)(row0 + (uint)row) * args.down_row_bytes) + ib;
-                device const uchar *qs = xq->qs + 16 * it;
+                device const uint *qs32 = (device const uint *)(xq->qs + 16 * it);
                 float acc = 0.f;
-                FOR_UNROLL (short j = 0; j < 16; ++j) {
-                    acc += yl[j] * ds4_kvalues_iq4nl_f[qs[j] & 0x0F] +
-                           yh[j] * ds4_kvalues_iq4nl_f[qs[j] >> 4];
+                FOR_UNROLL (short k = 0; k < 4; ++k) {
+                    const uint w = qs32[k];
+                    acc += yl[4 * k + 0] * ds4_kvalues_iq4nl_f[w & 0x0Fu] +
+                           yh[4 * k + 0] * ds4_kvalues_iq4nl_f[(w >> 4u) & 0x0Fu] +
+                           yl[4 * k + 1] * ds4_kvalues_iq4nl_f[(w >> 8u) & 0x0Fu] +
+                           yh[4 * k + 1] * ds4_kvalues_iq4nl_f[(w >> 12u) & 0x0Fu] +
+                           yl[4 * k + 2] * ds4_kvalues_iq4nl_f[(w >> 16u) & 0x0Fu] +
+                           yh[4 * k + 2] * ds4_kvalues_iq4nl_f[(w >> 20u) & 0x0Fu] +
+                           yl[4 * k + 3] * ds4_kvalues_iq4nl_f[(w >> 24u) & 0x0Fu] +
+                           yh[4 * k + 3] * ds4_kvalues_iq4nl_f[w >> 28u];
                 }
                 sumf[row] += ds4_iq4_xs_subblock_scale(xq, it) * acc;
             }
@@ -8492,6 +8525,12 @@ template [[host_name("kernel_mul_mm_id_q4_K_ff32")]]        kernel mul_mm_id_ff3
 template [[host_name("kernel_mul_mm_id_q5_K_ff32")]]        kernel mul_mm_id_ff32 kernel_mul_mm_id<32, float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_ff32")]]        kernel mul_mm_id_ff32 kernel_mul_mm_id<32, float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_iq4_xs_ff32")]]      kernel mul_mm_id_ff32 kernel_mul_mm_id<32, float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq4_xs, QK_NL, dequantize_iq4_xs, float, float4x4, float, float2x4>;
+
+/* Dense GEMM instantiations for the APEX q6_k attention/embedding
+ * projections at prefill (the QMV kernel re-reads the whole weight matrix
+ * per token).  The mul_mm template and mul_mm_t typedef come from
+ * dense.metal, which precedes this file in the concatenated library. */
+template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
 
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;

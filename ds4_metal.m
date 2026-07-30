@@ -17336,10 +17336,47 @@ int ds4_gpu_matmul_q6_K_tensor(
                                                        weight_offset,
                                                        weight_bytes,
                                                        &inner_offset);
+        if (!xbuf || !outbuf || !wbuf) return 0;
+
+        /* Batched tokens: use the tiled GEMM so weight tiles are reused
+         * across the token dimension.  The QMV below re-reads the entire
+         * weight matrix once per token, which dominates APEX q6_k attention
+         * prefill cost. */
+        if (n_tok >= 32u) {
+            const bool bc_inp = (in_dim % 32u) != 0;
+            const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+            id<MTLComputePipelineState> mm_pipeline =
+                ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q6_K_f32", bc_inp, bc_out);
+            if (mm_pipeline) {
+                ds4_gpu_mul_mm_args mm_args =
+                    ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+                int owned = 0;
+                id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                if (!cb) return 0;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:mm_pipeline];
+                [enc setBytes:&mm_args length:sizeof(mm_args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                                      ((NSUInteger)out_dim + 63u) / 64u,
+                                                      1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q6_K tensor matmul")) {
+                    return 0;
+                }
+                return 1;
+            }
+            /* fall through to the QMV if the GEMM pipeline is unavailable */
+        }
+
         id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
             g_laguna_q6_k_matmul_pipeline,
             "kernel_laguna_q6_K_matmul_f32");
-        if (!xbuf || !outbuf || !wbuf || !pipeline) return 0;
+        if (!pipeline) return 0;
 
         ds4_gpu_laguna_q6_matmul_args args = {
             .in_dim = (uint32_t)in_dim,
