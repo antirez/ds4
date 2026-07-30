@@ -1101,8 +1101,14 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     free(text);
 
     /* Seed the graph with enough real context to stay on the normal Metal
-     * prefill path; scoring starts immediately after this fixed prefix. */
-    const int prefix_len = 32;
+     * prefill path; scoring starts immediately after the prefix.  Text
+     * beyond the context window extends the prefix instead of being
+     * dropped, so the scored tail always sees its true preceding context
+     * and long files exercise the batched prefill path. */
+    int prefix_len = 32;
+    if (tokens.len > cfg->gen.ctx_size) {
+        prefix_len = tokens.len - (cfg->gen.ctx_size - prefix_len);
+    }
     if (tokens.len <= prefix_len) {
         fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
         ds4_tokens_free(&tokens);
