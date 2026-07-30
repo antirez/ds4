@@ -357,8 +357,9 @@ static bool openai_tool_stream_has_id(const openai_tool_stream *ts,
 
 
 
-static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
+const char *server::openai_tool_stream_id(openai_tool_stream *ts,
                                          int index) {
+    auto *s = this;
     if (!ts || index < 0) return "";
     if (index >= ts->ids_cap) {
         int old = ts->ids_cap;
@@ -373,7 +374,7 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
         for (;;) {
             random_tool_id(id, sizeof(id), API_OPENAI);
             if (!openai_tool_stream_has_id(ts, id, index) &&
-                !tool_memory_has_id(s, id)) break;
+                !s->tool_memory_has_id(id)) break;
         }
         ts->ids[index] = xstrdup(id);
     }
@@ -999,7 +1000,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     free(tag);
     if (!name) return openai_tool_stream_fail(ts);
 
-    const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
+    const char *tool_id = s->openai_tool_stream_id(ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
     free(name);

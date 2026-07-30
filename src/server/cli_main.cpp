@@ -379,7 +379,8 @@ bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes) {
 
 
 
-static void server_close_resources(server *s) {
+void server::close_resources() {
+    auto *s = this;
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -1191,7 +1192,7 @@ int main(int argc, char **argv) {
         if (!s.trace) {
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
-            server_close_resources(&s);
+            s.close_resources();
             return 1;
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
@@ -1203,7 +1204,7 @@ int main(int argc, char **argv) {
      * calls into the engine (CUDA-state audit, pulsar_server_internal.h). This
      * runs before the worker thread starts, so it is still single-threaded
      * engine access. */
-    server_publish_metrics_snapshot(&s);
+    s.publish_metrics_snapshot();
 
     memdiag mdiag;
     const bool mdiag_on = memdiag_start(&mdiag, &s);
@@ -1220,7 +1221,7 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&s.mu);
         pthread_join(worker, NULL);
         if (mdiag_on) pthread_join(mdiag.thread, NULL);
-        server_close_resources(&s);
+        s.close_resources();
         return 1;
     }
     g_listen_fd = lfd;
@@ -1295,7 +1296,7 @@ int main(int argc, char **argv) {
          * matched that stale cur_bank early-returned "success" over mixed views
          * and silently lost its snapshot too.  Skip the slot if it can't be
          * installed rather than persisting another conversation's frontier. */
-        if (s.pool_banks > 0 && !server_bank_switch(&s, sl->bank)) {
+        if (s.pool_banks > 0 && !s.bank_switch(sl->bank)) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: slot %d bank %d could not be installed at shutdown; "
                        "skipping its KV persist", i, sl->bank);
@@ -1306,10 +1307,10 @@ int main(int argc, char **argv) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: persisting slot %d KV cache before shutdown tokens=%d",
                        i, tokens->len);
-            kv_cache_store_current(&s, sl, "shutdown");
+            s.kv_cache_store_current(sl, "shutdown");
         }
     }
-    server_close_resources(&s);
+    s.close_resources();
     return 0;
 }
 

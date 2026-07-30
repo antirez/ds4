@@ -173,8 +173,8 @@ bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_t
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
-    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    s->kv_cache_restore_tool_memory_for_messages(&msgs);
+    s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
     const char *active_tool_schemas;
     active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
@@ -401,7 +401,7 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (!anthropic_validate_tool_results(s, &msgs,
+    if (!s->anthropic_validate_tool_results(&msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
     {
@@ -411,8 +411,8 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
         request_free(r);
         return false;
     }
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
-    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    s->kv_cache_restore_tool_memory_for_messages(&msgs);
+    s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas;
     active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -1357,7 +1357,7 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = pulsar_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
+    if (!s->responses_validate_tool_outputs(&msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
                                          err, errlen)) {
@@ -1369,8 +1369,8 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
         request_free(r);
         return false;
     }
-    kv_cache_restore_tool_memory_for_messages(s, &msgs);
-    tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    s->kv_cache_restore_tool_memory_for_messages(&msgs);
+    s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_preserves_reasoning(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);

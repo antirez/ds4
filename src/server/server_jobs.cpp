@@ -33,8 +33,7 @@
  *
  * Returns 1 when an injection was performed (text extended, thinking closed),
  * 0 when there is nothing to do or no budget, -1 on eval failure. */
-static int chat_think_tool_recovery(server *s,
-                                    session_slot *sl,
+int server::chat_think_tool_recovery(session_slot *sl,
                                     buf *text,
                                     thinking_state *thinking,
                                     size_t *scan_from,
@@ -42,6 +41,7 @@ static int chat_think_tool_recovery(server *s,
                                     int max_tokens,
                                     char *err,
                                     size_t errlen) {
+    auto *s = this;
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (!thinking->inside || !text->ptr) return 0;
     if (*scan_from > text->len) *scan_from = text->len;
@@ -84,10 +84,11 @@ static int chat_think_tool_recovery(server *s,
 
 
 
-static bool append_rendered_suffix_to_live_session(server *s, session_slot *sl,
+bool server::append_rendered_suffix_to_live_session(session_slot *sl,
                                                    const char *suffix,
                                                    int *tokens_appended,
                                                    char *err, size_t errlen) {
+    auto *s = this;
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (tokens_appended) *tokens_appended = 0;
     if (!s || !suffix || !suffix[0]) return true;
@@ -111,14 +112,15 @@ static bool append_rendered_suffix_to_live_session(server *s, session_slot *sl,
 
 
 
-static bool continue_after_invalid_dsml(server *s, session_slot *sl,
+bool server::continue_after_invalid_dsml(session_slot *sl,
                                         const request *r,
                                         const thinking_state *thinking,
                                         const char *detail,
                                         int *tokens_appended,
                                         char *err, size_t errlen) {
+    auto *s = this;
     char *suffix = build_invalid_dsml_tool_error_suffix(r, thinking, detail);
-    bool ok = append_rendered_suffix_to_live_session(s, sl, suffix,
+    bool ok = s->append_rendered_suffix_to_live_session(sl, suffix,
                                                      tokens_appended,
                                                      err, errlen);
     free(suffix);
@@ -190,7 +192,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            p->srv->kv_cache_maybe_store_continued(p->slot);
         }
         return;
     }
@@ -231,16 +233,17 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        p->srv->kv_cache_maybe_store_continued(p->slot);
     }
 }
 
 
 
-static void send_prefill_failure_response(server *s, const job *j,
+void server::send_prefill_failure_response(const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
+    auto *s = this;
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -263,9 +266,10 @@ static void send_prefill_failure_response(server *s, const job *j,
 
 
 
-static void remember_thinking_checkpoint(server *s, session_slot *sl,
+void server::remember_thinking_checkpoint(session_slot *sl,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content) {
+    auto *s = this;
     /* The key must byte-match what render_chat_prompt_text emits for this turn
      * once it becomes historical on the next request.  With tools advertised
      * (tool_context) a stripped historical assistant turn renders
@@ -287,11 +291,11 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
     }
     if (!visible) return;
 
-    thinking_live_remember(s, sl, visible);
+    s->thinking_live_remember(sl, visible);
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, pulsar_session_pos(s->sess), strlen(visible));
-    trace_event(s, trace_id,
+    s->trace_event(trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 pulsar_session_pos(s->sess), strlen(visible));
     free(visible);
@@ -316,11 +320,12 @@ static void remember_thinking_checkpoint(server *s, session_slot *sl,
  * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
  * for non-tool-context requests (should_remember_thinking_checkpoint bails when
  * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay. */
-static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
+void server::remember_tool_thinking_checkpoint(session_slot *sl,
                                               const job *j, const char *ctx,
                                               uint64_t trace_id, const char *content,
                                               const char *reasoning,
                                               const tool_calls *calls) {
+    auto *s = this;
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
     if (!pulsar_think_mode_enabled(j->req.think_mode)) return;
 
@@ -335,11 +340,11 @@ static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
     buf_puts(&visible, j->req.prompt_text);
     buf_puts(&visible, suffix);
     if (visible.ptr) {
-        thinking_live_remember(s, sl, visible.ptr);
+        s->thinking_live_remember(sl, visible.ptr);
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
                    ctx, pulsar_session_pos(s->sess), visible.len);
-        trace_event(s, trace_id,
+        s->trace_event(trace_id,
                     "tool thinking checkpoint remembered: live=%d visible=%zu",
                     pulsar_session_pos(s->sess), visible.len);
     }
@@ -354,10 +359,11 @@ static void remember_tool_thinking_checkpoint(server *s, session_slot *sl,
  * tool id.  If a client sends a tool call without an id we know, the fallback
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
-static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
+void server::canonicalize_tool_checkpoint(session_slot *sl,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
+    auto *s = this;
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
@@ -388,7 +394,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
     free(live_text);
 
     if (common < j->req.prompt.len) {
-        trace_event(s, trace_id,
+        s->trace_event(trace_id,
                     "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
                     common, j->req.prompt.len, live_len, canonical.len);
         goto done;
@@ -403,7 +409,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
                    ctx, common, live_len, canonical.len);
-        trace_event(s, trace_id,
+        s->trace_event(trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
     } else if (rr == PULSAR_SESSION_REWRITE_REBUILD_NEEDED) {
@@ -413,7 +419,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
          * a very long conversation from token zero. */
         char *path = NULL;
         pulsar_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, sl, rendered.ptr ? rendered.ptr : "",
+        int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) pulsar_session_invalidate(s->sess);
 
@@ -472,14 +478,14 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
                 server_log(PULSAR_LOG_KVCACHE,
                            "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
                            rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
-                trace_event(s, trace_id,
+                s->trace_event(trace_id,
                             "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
                             common, live_len, canonical.len, loaded, path ? path : "");
             } else {
                 server_log(PULSAR_LOG_KVCACHE,
                            "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
                            rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
-                trace_event(s, trace_id,
+                s->trace_event(trace_id,
                             "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
                             common, live_len, canonical.len, err);
             }
@@ -490,7 +496,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
                        "pulsar-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
                        canonical.len, sync_err);
-            trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
+            s->trace_event(trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
         }
         pulsar_tokens_free(&effective);
         free(path);
@@ -498,7 +504,7 @@ static void canonicalize_tool_checkpoint(server *s, session_slot *sl,
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
-        trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
+        s->trace_event(trace_id, "tool checkpoint canonicalization failed: %s", err);
     }
 
 done:
@@ -630,18 +636,19 @@ static bool gen_prefill_cancel_cb(void *ud) {
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
  * after each pulsar_session_sync failure). Token vectors and the disk path are
  * freed centrally by gen_state_free. */
-static void gen_prefill_fail(server *s, session_slot *sl) {
+void server::gen_prefill_fail(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    kv_cache_tracker_bind(s, sl);
+    s->kv_cache_tracker_bind(sl);
     kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
                                           g->cold_store_len);
-    kv_cache_tracker_flush(s, sl);
-    kv_cache_discard_failed_disk_entry(s, sl, g->disk_cache_path);
-    trace_event(s, g->trace_id, "prefill failed: %s", g->err);
-    send_prefill_failure_response(s, g->j, &g->progress, g->ctx_span,
+    s->kv_cache_tracker_flush(sl);
+    s->kv_cache_discard_failed_disk_entry(sl, g->disk_cache_path);
+    s->trace_event(g->trace_id, "prefill failed: %s", g->err);
+    s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
     g->phase = GEN_DONE;
 }
@@ -660,7 +667,8 @@ static void gen_prefill_fail(server *s, session_slot *sl) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
-static void gen_begin(server *s, session_slot *sl) {
+void server::gen_begin(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
@@ -668,10 +676,10 @@ static void gen_begin(server *s, session_slot *sl) {
      * bank). No-op in classic mode / when already live. Finding 1: a failed spill
      * restore (KV unrecoverable) must fail the request, not run against another
      * bank's KV. */
-    if (!server_bank_switch(s, sl->bank)) {
+    if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err,
                  "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
-        gen_prefill_fail(s, sl);
+        s->gen_prefill_fail(sl);
         return;
     }
     const int old_pos = pulsar_session_pos(s->sess);
@@ -694,19 +702,19 @@ static void gen_begin(server *s, session_slot *sl) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = responses_live_visible_prefix_prompt(s, sl, &j->req, old_pos,
+    int cached = s->responses_live_visible_prefix_prompt(sl, &j->req, old_pos,
                                                       &effective_prompt);
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, sl, &j->req.responses_live_call_ids,
+        if (s->responses_live_matches_request(sl, &j->req.responses_live_call_ids,
                                            old_pos))
         {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
     if (cached == 0) {
-        cached = responses_live_continuation_prompt(s, sl, &j->req, old_pos,
+        cached = s->responses_live_continuation_prompt(sl, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
@@ -716,7 +724,7 @@ static void gen_begin(server *s, session_slot *sl) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
     } else {
-        cached = anthropic_live_continuation_prompt(s, sl, &j->req, old_pos,
+        cached = s->anthropic_live_continuation_prompt(sl, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
         if (cached > 0) {
@@ -751,7 +759,7 @@ static void gen_begin(server *s, session_slot *sl) {
     }
     if (cached == 0) {
         int thinking_cached =
-            thinking_live_visible_prefix_prompt(s, sl, &j->req, old_pos,
+            s->thinking_live_visible_prefix_prompt(sl, &j->req, old_pos,
                                                 &effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
@@ -763,7 +771,7 @@ static void gen_begin(server *s, session_slot *sl) {
     int disk_cached = 0;
     uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
-        int text_cached = live_text_prefix_prompt(s, sl, &j->req, &effective_prompt);
+        int text_cached = s->live_text_prefix_prompt(sl, &j->req, &effective_prompt);
         if (text_cached > 0) {
             cached = text_cached;
             cache_source = "memory-text";
@@ -782,10 +790,10 @@ static void gen_begin(server *s, session_slot *sl) {
         /* Loading a disk snapshot replaces the live GPU session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, sl, "evict");
+        s->kv_cache_store_current(sl, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, sl, &j->req, &effective_prompt,
+        disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
                                         &g->disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
@@ -820,7 +828,7 @@ static void gen_begin(server *s, session_slot *sl) {
 
     g->prompt_tokens = prompt_tokens;
     g->t0 = server_now_sec();
-    g->trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
+    g->trace_id = s->trace_begin(j, cached, prompt_tokens, &cache_diag,
                               cache_source, disk_cached, g->disk_cache_path);
     request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, prompt_tokens);
     g->progress = (server_prefill_progress){
@@ -871,7 +879,7 @@ static void gen_begin(server *s, session_slot *sl) {
                    cache_source,
                    cached,
                    prompt_tokens);
-        trace_event(s, g->trace_id,
+        s->trace_event(g->trace_id,
                     "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
                     cache_source, cached);
     }
@@ -906,10 +914,10 @@ static void gen_begin(server *s, session_slot *sl) {
          * write it as "cold".  Mark the frontier as already handled before the
          * sync reaches it; if the cold write fails, restore the old schedule so
          * a later continued write can still try. */
-        kv_cache_tracker_bind(s, sl);
+        s->kv_cache_tracker_bind(sl);
         g->suppressed_continued_last =
             kv_cache_suppress_continued_store(&s->kv, cold_store_len);
-        kv_cache_tracker_flush(s, sl);
+        s->kv_cache_tracker_flush(sl);
     }
 
     /* Transfer prompt ownership into the slot state; the prefill phases run in
@@ -945,7 +953,8 @@ static void gen_begin(server *s, session_slot *sl) {
 /* One prefill quantum: (re-)issue the sync toward the phase's target; the
  * cancel callback stops it after one completed chunk and the checkpoint
  * carries the progress to the next quantum. */
-static void gen_step_prefill(server *s, session_slot *sl) {
+void server::gen_step_prefill(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
@@ -972,23 +981,23 @@ static void gen_step_prefill(server *s, session_slot *sl) {
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: client disconnected during prefill, abandoning");
             snprintf(g->err, sizeof(g->err), "client disconnected");
-            gen_prefill_fail(s, sl);
+            s->gen_prefill_fail(sl);
             return;
         }
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */
         /* Interrupted without progress cannot be our cancel callback; fail
          * rather than risk a live-lock re-issuing the same sync forever. */
-        gen_prefill_fail(s, sl);
+        s->gen_prefill_fail(sl);
         return;
     }
     if (rc != 0) {
-        gen_prefill_fail(s, sl);
+        s->gen_prefill_fail(sl);
         return;
     }
 
     if (cold) {
-        kv_cache_tracker_bind(s, sl);
-        if (kv_cache_store_live_prefix(s, sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
+        s->kv_cache_tracker_bind(sl);
+        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {
@@ -996,32 +1005,33 @@ static void gen_step_prefill(server *s, session_slot *sl) {
                                                   g->cold_store_len);
             g->suppressed_continued_last = -1;
         }
-        kv_cache_tracker_flush(s, sl);
+        s->kv_cache_tracker_flush(sl);
         pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
     }
 
     pulsar_session_set_cancel(s->sess, NULL, NULL);
-    gen_stream_begin(s, sl);
+    s->gen_stream_begin(sl);
 }
 
 /* Runs once, in the same quantum that completed the main prefill: clear stale
  * live bindings, persist checkpoints, emit response identity, and start the
  * protocol stream projections that persist across all decode quanta. */
-void gen_stream_begin(server *s, session_slot *sl) {
+void server::gen_stream_begin(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
     free(g->disk_cache_path);
     g->disk_cache_path = NULL;
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
-    if (!g->responses_live_continuation) responses_live_clear(s, sl);
-    if (!g->anthropic_live_continuation) anthropic_live_clear(s, sl);
-    if (!g->thinking_live_continuation) thinking_live_clear(s, sl);
+    if (!g->responses_live_continuation) s->responses_live_clear(sl);
+    if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
+    if (!g->thinking_live_continuation) s->thinking_live_clear(sl);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    kv_cache_maybe_store_continued(s, sl);
+    s->kv_cache_maybe_store_continued(sl);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -1030,15 +1040,15 @@ void gen_stream_begin(server *s, session_slot *sl) {
                g->req_flags,
                server_now_sec() - g->t0);
     if (g->cold_store_len == g->prompt_for_sync->len) {
-        kv_cache_tracker_bind(s, sl);
-        if (kv_cache_store_live_prefix(s, sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
+        s->kv_cache_tracker_bind(sl);
+        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {
             kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
                                                   g->cold_store_len);
         }
-        kv_cache_tracker_flush(s, sl);
+        s->kv_cache_tracker_flush(sl);
     }
     snprintf(g->id, sizeof(g->id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
@@ -1113,7 +1123,8 @@ void gen_stream_begin(server *s, session_slot *sl) {
 /* (Re)initialize a decode attempt: the body of the old decode_again label.
  * Runs both for a fresh request and after a tool-error recovery appended a
  * model-visible correction to the live session. */
-static void gen_decode_init(server *s, session_slot *sl) {
+void server::gen_decode_init(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
     buf_free(&g->text);
@@ -1131,7 +1142,7 @@ static void gen_decode_init(server *s, session_slot *sl) {
     g->next_decode_log = 50;
     if (g->max_tokens < 0) g->max_tokens = 0;
     if (g->max_tokens > room) g->max_tokens = room;
-    trace_event(s, g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
+    s->trace_event(g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
     g->decode_t0 = server_now_sec();
     /* Snapshot the session's cumulative DSpark counters so gen_step_finish can
      * diff them into this request's accept-rate/tokens-per-step. Re-snapshotting
@@ -1210,7 +1221,8 @@ void gen_resolve_sampling(const request *req, float *temperature,
  * recovery, which the batched path never reaches because n>=2 is plain,
  * tool-gated decode by contract). Behavior for the single-session path is
  * byte-identical to the pre-factoring inner loop. */
-bool gen_emit_token(server *s, session_slot *sl, int token) {
+bool server::gen_emit_token(session_slot *sl, int token) {
+    auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
     if (token == pulsar_token_eos(s->engine)) {
@@ -1222,7 +1234,7 @@ bool gen_emit_token(server *s, session_slot *sl, int token) {
     char *piece = pulsar_token_text(s->engine, token, &piece_len);
     g->completion++;
 
-    trace_piece(s, g->trace_id, piece, piece_len);
+    s->trace_piece(g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);
     thinking_state_feed(&g->thinking, piece, piece_len);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -1294,7 +1306,7 @@ bool gen_emit_token(server *s, session_slot *sl, int token) {
              * close so the model restarts the call on the executable
              * side. */
             const int recovered = g->think_tool_recovery_enabled ?
-                chat_think_tool_recovery(s, sl, &g->text, &g->thinking,
+                s->chat_think_tool_recovery(sl, &g->text, &g->thinking,
                                          &g->think_recovery_scan_from,
                                          &g->completion, g->max_tokens,
                                          g->err, sizeof(g->err)) : 0;
@@ -1310,7 +1322,7 @@ bool gen_emit_token(server *s, session_slot *sl, int token) {
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
                            g->completion);
-                trace_event(s, g->trace_id,
+                s->trace_event(g->trace_id,
                             "think tool recovery after %d generated tokens",
                             g->completion);
                 dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
@@ -1340,21 +1352,21 @@ bool gen_emit_token(server *s, session_slot *sl, int token) {
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
                            g->completion);
-                trace_event(s, g->trace_id,
+                s->trace_event(g->trace_id,
                             "ignored orphan tool-call end marker after %d generated tokens",
                             g->completion);
             }
             if (g->saw_tool_start && !old_start) {
-                trace_event(s, g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
+                s->trace_event(g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
             }
             if (g->saw_tool_end && !old_end) {
-                trace_event(s, g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
+                s->trace_event(g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
             }
             const size_t marker_hold = 80;
             size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
             if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
             if (s->trace && g->completion >= g->next_tool_progress) {
-                trace_event(s, g->trace_id,
+                s->trace_event(g->trace_id,
                             "progress gen=%d dsml_start=%d dsml_end=%d",
                             g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
                 g->next_tool_progress += 128;
@@ -1397,7 +1409,8 @@ bool gen_emit_token(server *s, session_slot *sl, int token) {
  * PULSAR_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
  * state parked in gen_state. The session is untouched between quanta, so
  * resuming is exactly the next iteration of the old run-to-completion loop. */
-static void gen_step_decode(server *s, session_slot *sl) {
+void server::gen_step_decode(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
     const int quantum_start = g->completion;
@@ -1425,7 +1438,7 @@ static void gen_step_decode(server *s, session_slot *sl) {
             g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (g->saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s, sl);
+            s->kv_cache_maybe_store_continued(sl);
         }
         float temperature, top_p, min_p;
         int top_k;
@@ -1472,7 +1485,7 @@ static void gen_step_decode(server *s, session_slot *sl) {
         if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
 
         for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
-            if (gen_emit_token(s, sl, toks[ti])) {
+            if (s->gen_emit_token(sl, toks[ti])) {
                 stop_decode = true;
                 break;
             }
@@ -1489,7 +1502,8 @@ static void gen_step_decode(server *s, session_slot *sl) {
 /* Post-decode epilogue: tool repair/recovery, final parse, protocol live
  * state, checkpoints, the final response, and logging. Recovery paths loop
  * back to GEN_DECODE_INIT (the old goto decode_again). */
-static void gen_step_finish(server *s, session_slot *sl) {
+void server::gen_step_finish(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
 
@@ -1529,7 +1543,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
                            g->req_flags[0] ? " " : "",
                            g->req_flags,
                            test_calls.len);
-                trace_event(s, g->trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
+                s->trace_event(g->trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
             }
             tool_calls_free(&test_calls);
         }
@@ -1542,9 +1556,9 @@ static void gen_step_finish(server *s, session_slot *sl) {
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags);
-                trace_event(s, g->trace_id,
+                s->trace_event(g->trace_id,
                             "unterminated tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, sl, &j->req, &g->thinking,
+                if (s->continue_after_invalid_dsml(sl, &j->req, &g->thinking,
                                                 "unterminated tool call",
                                                 &recovery_tokens,
                                                 recovery_err,
@@ -1557,7 +1571,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
                                g->req_flags[0] ? " " : "",
                                g->req_flags,
                                recovery_tokens);
-                    trace_event(s, g->trace_id,
+                    s->trace_event(g->trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     buf_free(&repaired);
@@ -1626,9 +1640,9 @@ static void gen_step_finish(server *s, session_slot *sl) {
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags);
-                trace_event(s, g->trace_id,
+                s->trace_event(g->trace_id,
                             "invalid tool call; continuing with model-visible tool error");
-                if (continue_after_invalid_dsml(s, sl, &j->req, &g->thinking,
+                if (s->continue_after_invalid_dsml(sl, &j->req, &g->thinking,
                                                 detail,
                                                 &recovery_tokens,
                                                 recovery_err,
@@ -1641,7 +1655,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
                                g->req_flags[0] ? " " : "",
                                g->req_flags,
                                recovery_tokens);
-                    trace_event(s, g->trace_id,
+                    s->trace_event(g->trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     free(parsed_content);
@@ -1692,7 +1706,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
                            g->req_flags,
                            (int)dsml_snippet_len,
                            dsml_start ? dsml_start : "(none)");
-                trace_event(s, g->trace_id,
+                s->trace_event(g->trace_id,
                             "invalid tool call returned as assistant text finish=%s",
                             final_finish);
             }
@@ -1701,11 +1715,11 @@ static void gen_step_finish(server *s, session_slot *sl) {
             if (g->openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &g->openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &g->anthropic_live);
-            assign_tool_call_ids(s, &parsed_calls, j->req.api);
-            tool_memory_remember(s, &parsed_calls);
+            s->assign_tool_call_ids(&parsed_calls, j->req.api);
+            s->tool_memory_remember(&parsed_calls);
             final_finish = "tool_calls";
         } else if (j->req.api == API_RESPONSES) {
-            responses_live_clear(s, sl);
+            s->responses_live_clear(sl);
         }
     }
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
@@ -1733,7 +1747,7 @@ static void gen_step_finish(server *s, session_slot *sl) {
         t->valid = true;
     }
 
-    trace_finish(s, g->trace_id, &j->req, final_finish, g->completion,
+    s->trace_finish(g->trace_id, &j->req, final_finish, g->completion,
                  g->saw_tool_start, g->saw_tool_end,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
@@ -1752,21 +1766,21 @@ static void gen_step_finish(server *s, session_slot *sl) {
             buf visible = {0};
             buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, sl, visible.ptr ? visible.ptr : "",
+            s->responses_live_remember(sl, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL);
             buf_free(&visible);
             free(visible_suffix);
         } else {
-            responses_live_clear(s, sl);
+            s->responses_live_clear(sl);
         }
     }
     if (j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
-            anthropic_live_remember(s, sl, &parsed_calls);
+            s->anthropic_live_remember(sl, &parsed_calls);
         } else {
-            anthropic_live_clear(s, sl);
+            s->anthropic_live_clear(sl);
         }
     }
 
@@ -1782,12 +1796,12 @@ static void gen_step_finish(server *s, session_slot *sl) {
          * key and keep the live tokens — the next request byte-matches the key and
          * continues from live KV (or a disk-reloaded checkpoint keyed by the same
          * visible transcript) with no rebuild. */
-        remember_tool_thinking_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
+        s->remember_tool_thinking_checkpoint(sl, j, g->ctx_span, g->trace_id,
                                           parsed_content ? parsed_content : "",
                                           parsed_reasoning, &parsed_calls);
     } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        s->should_canonicalize_tool_checkpoint(&parsed_calls))
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
@@ -1795,18 +1809,18 @@ static void gen_step_finish(server *s, session_slot *sl) {
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
          * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
+        s->canonicalize_tool_checkpoint(sl, j, g->ctx_span, g->trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, sl);
+        s->thinking_live_clear(sl);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s, sl);
+        s->thinking_live_clear(sl);
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &g->thinking, final_finish)) {
-        remember_thinking_checkpoint(s, sl, j, g->ctx_span, g->trace_id,
+        s->remember_thinking_checkpoint(sl, j, g->ctx_span, g->trace_id,
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
-        thinking_live_clear(s, sl);
+        s->thinking_live_clear(sl);
     }
 
     if (j->req.stream) {
@@ -1939,7 +1953,8 @@ static void gen_step_finish(server *s, session_slot *sl) {
 
 /* ---- state-machine driver: bind, step, unbind ---- */
 
-static void gen_state_free(server *s, session_slot *sl) {
+void server::gen_state_free(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     if (!g) return;
     (void)s;
@@ -1963,7 +1978,8 @@ static void gen_state_free(server *s, session_slot *sl) {
 
 
 /* Bind a dequeued job to the slot and resolve its prompt (the first quantum). */
-void generate_job_begin(server *s, session_slot *sl, job *j) {
+void server::generate_job_begin(session_slot *sl, job *j) {
+    auto *s = this;
     gen_state *g = (gen_state *)server_xmalloc(sizeof(*g));
     memset(g, 0, sizeof(*g));
     g->j = j;
@@ -1977,20 +1993,21 @@ void generate_job_begin(server *s, session_slot *sl, job *j) {
      * and deferred; drained in generate_job_end. */
     slot_writer_init(&g->writer, j->fd);
     slot_writer_install(&g->writer);
-    gen_begin(s, sl);
+    s->gen_begin(sl);
 }
 
 
 
 /* Advance the job by one quantum. */
-void generate_job_step(server *s, session_slot *sl) {
+void server::generate_job_step(session_slot *sl) {
+    auto *s = this;
     gen_state *g = sl->gen;
     /* Tier-2: install this slot's bank before any engine work this quantum.
      * After another slot (or a fresh bind) was serviced in between, the pool's
      * live bank may be someone else's; switch back to ours. No-op in classic
      * mode / when already live. Finding 1: fail the request on a failed spill
      * restore rather than run engine work against the wrong bank's KV. */
-    if (!server_bank_switch(s, sl->bank)) {
+    if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err,
                  "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
         g->finish = "error";
@@ -2021,21 +2038,21 @@ void generate_job_step(server *s, session_slot *sl) {
     case GEN_PREFILL_COLD:
     case GEN_PREFILL_MAIN:
         sl->state = SLOT_PREFILLING;
-        gen_step_prefill(s, sl);
+        s->gen_step_prefill(sl);
         break;
     case GEN_DECODE_INIT:
         sl->state = SLOT_DECODING;
-        gen_decode_init(s, sl);
+        s->gen_decode_init(sl);
         if (g->phase != GEN_DECODE) break;
         /* fall through into the first decode quantum */
-        gen_step_decode(s, sl);
+        s->gen_step_decode(sl);
         break;
     case GEN_DECODE:
         sl->state = SLOT_DECODING;
-        gen_step_decode(s, sl);
+        s->gen_step_decode(sl);
         break;
     case GEN_FINISH:
-        gen_step_finish(s, sl);
+        s->gen_step_finish(sl);
         break;
     case GEN_DONE:
         break;
@@ -2045,9 +2062,10 @@ void generate_job_step(server *s, session_slot *sl) {
 
 
 /* Unbind: drain deferred client bytes, free the resumable state. */
-void generate_job_end(server *s, session_slot *sl) {
+void server::generate_job_end(session_slot *sl) {
+    auto *s = this;
     if (sl->gen) slot_writer_drain(&sl->gen->writer);
-    gen_state_free(s, sl);
+    s->gen_state_free(sl);
     sl->active_job = NULL;
     sl->state = SLOT_IDLE;
     sl->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);

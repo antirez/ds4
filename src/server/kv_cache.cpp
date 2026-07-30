@@ -121,9 +121,10 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
 
 
 
-static bool kv_tool_map_measure_locked(server *s, const char *text,
+bool server::kv_tool_map_measure_locked(const char *text,
                                        uint32_t *count_out,
                                        uint64_t *bytes_out) {
+    auto *s = this;
     uint32_t count = 0;
     uint64_t bytes = KV_TOOL_MAP_HEADER;
     uint64_t scan = ++s->tool_mem.scan_clock;
@@ -159,28 +160,30 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
 
 
 
-bool kv_tool_map_serialized_size(server *s, const char *text,
+bool server::kv_tool_map_serialized_size(const char *text,
                                         uint64_t *bytes_out) {
+    auto *s = this;
     if (bytes_out) *bytes_out = 0;
     if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return true;
 
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = kv_tool_map_measure_locked(s, text, NULL, bytes_out);
+    bool ok = s->kv_tool_map_measure_locked(text, NULL, bytes_out);
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
 }
 
 
 
-bool kv_tool_map_write(server *s, FILE *fp, const char *text,
+bool server::kv_tool_map_write(FILE *fp, const char *text,
                               uint64_t *written_bytes) {
+    auto *s = this;
     if (written_bytes) *written_bytes = 0;
     if (!s || s->disable_exact_dsml_tool_replay || !fp || !text || !text[0]) return true;
 
     pthread_mutex_lock(&s->tool_mu);
     uint32_t count = 0;
     uint64_t bytes = 0;
-    bool ok = kv_tool_map_measure_locked(s, text, &count, &bytes);
+    bool ok = s->kv_tool_map_measure_locked(text, &count, &bytes);
     if (!ok) {
         pthread_mutex_unlock(&s->tool_mu);
         return false;
@@ -230,7 +233,8 @@ bool kv_tool_map_write(server *s, FILE *fp, const char *text,
 
 
 
-int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
+int server::kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted) {
+    auto *s = this;
     if (!s || s->disable_exact_dsml_tool_replay || !fp) return 0;
     uint8_t h[KV_TOOL_MAP_HEADER];
     size_t n = fread(h, 1, sizeof(h), fp);
@@ -256,7 +260,7 @@ int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
         id[id_len] = '\0';
         dsml[dsml_len] = '\0';
         if (ok && (!wanted || id_list_contains(wanted, id))) {
-            tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
+            s->tool_memory_put_source(id, dsml, TOOL_MEMORY_DISK);
             loaded++;
         }
         free(id);
@@ -292,7 +296,8 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
 
 
 
-void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
+void server::kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs) {
+    auto *s = this;
     if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
@@ -304,7 +309,7 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
     {
         int keep = 0;
         for (int i = 0; i < wanted.len; i++) {
-            if (!tool_memory_has_id(s, wanted.v[i])) {
+            if (!s->tool_memory_has_id(wanted.v[i])) {
                 wanted.v[keep++] = wanted.v[i];
             } else {
                 free(wanted.v[i]);
@@ -344,14 +349,14 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
         {
-            kv_tool_map_load_from_pos(s, fp, &wanted);
+            s->kv_tool_map_load_from_pos(fp, &wanted);
         }
         fclose(fp);
         /* Cold restore satisfied: stop scanning once every missing id is in
          * memory instead of walking the rest of the cache directory. */
         bool all_found = true;
         for (int i = 0; i < wanted.len; i++) {
-            if (!tool_memory_has_id(s, wanted.v[i])) { all_found = false; break; }
+            if (!s->tool_memory_has_id(wanted.v[i])) { all_found = false; break; }
         }
         if (all_found) break;
     }
@@ -492,26 +497,26 @@ bool kv_cache_file_size_fits(const kv_disk_cache *kc,
 
 static bool kv_cache_tool_map_size_cb(void *ud, const char *text,
                                       uint64_t *bytes_out) {
-    return kv_tool_map_serialized_size((server *)ud, text, bytes_out);
+    return ((server *)ud)->kv_tool_map_serialized_size(text, bytes_out);
 }
 
 
 
 static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
                                        uint64_t *written_bytes) {
-    return kv_tool_map_write((server *)ud, fp, text, written_bytes);
+    return ((server *)ud)->kv_tool_map_write(fp, text, written_bytes);
 }
 
 
 
 static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
-    return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
+    return ((server *)ud)->kv_tool_map_load_from_pos(fp, (const stop_list *)wanted);
 }
 
 
 
-static pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
-                                                         const stop_list *wanted) {
+pulsar_kvstore_trailer_hooks server::kv_cache_tool_map_hooks(const stop_list *wanted) {
+    auto *s = this;
     return (pulsar_kvstore_trailer_hooks){
         .ud = s,
         .ext_flag = KV_EXT_TOOL_MAP,
@@ -524,15 +529,16 @@ static pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
 
 
 
-static bool kv_cache_store_live_prefix_text(server *s, session_slot *sl,
+bool server::kv_cache_store_live_prefix_text(session_slot *sl,
                                             const pulsar_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
+    auto *s = this;
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     char err[160] = {0};
-    pulsar_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    pulsar_kvstore_trailer_hooks hooks = s->kv_cache_tool_map_hooks(NULL);
     return pulsar_kvstore_store_live_prefix_text(&s->kv, s->engine, s->sess,
                                               tokens, store_len, reason,
                                               cache_text_override,
@@ -543,16 +549,18 @@ static bool kv_cache_store_live_prefix_text(server *s, session_slot *sl,
 
 
 
-bool kv_cache_store_live_prefix(server *s, session_slot *sl,
+bool server::kv_cache_store_live_prefix(session_slot *sl,
                                        const pulsar_tokens *tokens,
                                        int store_len, const char *reason) {
-    return kv_cache_store_live_prefix_text(s, sl, tokens, store_len, reason,
+    auto *s = this;
+    return s->kv_cache_store_live_prefix_text(sl, tokens, store_len, reason,
                                            NULL, 0, NULL);
 }
 
 
 
-bool kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
+bool server::kv_cache_store_current(session_slot *sl, const char *reason) {
+    auto *s = this;
     const pulsar_tokens *tokens = pulsar_session_tokens(s->sess);
     if (!tokens) return false;
 
@@ -586,12 +594,12 @@ bool kv_cache_store_current(server *s, session_slot *sl, const char *reason) {
      * tokenizes only the visible suffix that follows this key. */
     bool stored;
     if (visible_text) {
-        stored = kv_cache_store_live_prefix_text(s, sl, tokens, tokens->len,
+        stored = s->kv_cache_store_live_prefix_text(sl, tokens, tokens->len,
                                                  reason, visible_text,
                                                  visible_ext, visible_key);
         free(visible_text);
     } else {
-        stored = kv_cache_store_live_prefix(s, sl, tokens, tokens->len, reason);
+        stored = s->kv_cache_store_live_prefix(sl, tokens, tokens->len, reason);
     }
     return stored;
 }
@@ -618,8 +626,9 @@ void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
 
 
 
-void kv_cache_discard_failed_disk_entry(server *s, session_slot *sl,
+void server::kv_cache_discard_failed_disk_entry(session_slot *sl,
                                                const char *path) {
+    auto *s = this;
     if (!s || !path) return;
     if (unlink(path) == 0) {
         server_log(PULSAR_LOG_KVCACHE,
@@ -636,29 +645,32 @@ void kv_cache_discard_failed_disk_entry(server *s, session_slot *sl,
 
 
 
-void kv_cache_tracker_bind(server *s, session_slot *sl) {
+void server::kv_cache_tracker_bind(session_slot *sl) {
+    auto *s = this;
     s->kv.continued_last_store_tokens = sl->continued_last_store_tokens;
 }
 
 
 
-void kv_cache_tracker_flush(server *s, session_slot *sl) {
+void server::kv_cache_tracker_flush(session_slot *sl) {
+    auto *s = this;
     sl->continued_last_store_tokens = s->kv.continued_last_store_tokens;
 }
 
 
 
-void kv_cache_maybe_store_continued(server *s, session_slot *sl) {
+void server::kv_cache_maybe_store_continued(session_slot *sl) {
+    auto *s = this;
     kv_disk_cache *kc = &s->kv;
     const pulsar_tokens *tokens = pulsar_session_tokens(s->sess);
     if (!tokens) return;
-    kv_cache_tracker_bind(s, sl);
+    s->kv_cache_tracker_bind(sl);
     const int target = kv_cache_continued_store_target(kc, tokens->len);
     if (target != 0 &&
-        kv_cache_store_live_prefix(s, sl, tokens, target, "continued")) {
+        s->kv_cache_store_live_prefix(sl, tokens, target, "continued")) {
         kv_cache_note_store(kc, target);
     }
-    kv_cache_tracker_flush(s, sl);
+    s->kv_cache_tracker_flush(sl);
 }
 
 
@@ -674,22 +686,23 @@ int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 #endif
 
 
-int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
+int server::kv_cache_try_load_text(session_slot *sl, const char *prompt_text,
                                   pulsar_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
+    auto *s = this;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     pulsar_kvstore_load_result lr = {0};
-    pulsar_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    pulsar_kvstore_trailer_hooks hooks = s->kv_cache_tool_map_hooks(NULL);
     /* A successful load advances the continued-store frontier (the lib sets
      * kc->continued_last_store_tokens = loaded) — bracket it per slot. */
-    kv_cache_tracker_bind(s, sl);
+    s->kv_cache_tracker_bind(sl);
     int loaded = pulsar_kvstore_try_load_text(&s->kv, s->engine, s->sess,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
-    kv_cache_tracker_flush(s, sl);
+    s->kv_cache_tracker_flush(sl);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
@@ -700,11 +713,12 @@ int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
 
 
 
-int kv_cache_try_load(server *s, session_slot *sl, const request *req,
+int server::kv_cache_try_load(session_slot *sl, const request *req,
                              pulsar_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, sl, req ? req->prompt_text : NULL,
+    auto *s = this;
+    return s->kv_cache_try_load_text(sl, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
@@ -713,8 +727,9 @@ int kv_cache_try_load(server *s, session_slot *sl, const request *req,
 
 
 
-int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
+int server::live_text_prefix_prompt(session_slot *sl, const request *req,
                                    pulsar_tokens *effective_prompt) {
+    auto *s = this;
     (void)sl; /* slot is a pure bank descriptor; the session is s->sess */
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
@@ -749,15 +764,16 @@ int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
  * long visible prefix to match in that shape; the call_id itself is the
  * protocol binding to the previous live assistant output.  Use it only when the
  * remembered live frontier and call-id set match exactly. */
-int responses_live_continuation_prompt(server *s, session_slot *sl,
+int server::responses_live_continuation_prompt(session_slot *sl,
                                               const request *req,
                                               int live_pos,
                                               pulsar_tokens *effective_prompt,
                                               int *matched_ids) {
+    auto *s = this;
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
     if (req->responses_live_call_ids.len == 0) return 0;
-    if (!responses_live_matches_request(s, sl, &req->responses_live_call_ids,
+    if (!s->responses_live_matches_request(sl, &req->responses_live_call_ids,
                                         live_pos)) return 0;
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
@@ -778,15 +794,16 @@ int responses_live_continuation_prompt(server *s, session_slot *sl,
  * API, but its tool_use_id is still a precise continuation handle inside a live
  * local agent loop.  When the IDs and live token frontier match, continue from
  * the sampled DSML state and append only the user tool_result suffix. */
-int anthropic_live_continuation_prompt(server *s, session_slot *sl,
+int server::anthropic_live_continuation_prompt(session_slot *sl,
                                               const request *req,
                                               int live_pos,
                                               pulsar_tokens *effective_prompt,
                                               int *matched_ids) {
+    auto *s = this;
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
-    if (!anthropic_live_matches_request(s, sl, &req->anthropic_live_call_ids,
+    if (!s->anthropic_live_matches_request(sl, &req->anthropic_live_call_ids,
                                         live_pos)) return 0;
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
@@ -814,10 +831,11 @@ int anthropic_live_continuation_prompt(server *s, session_slot *sl,
  * If this check fails, DS4 has no special Responses state to trust.  The caller
  * then uses normal token/text/disk matching, which is the correct fallback for
  * cold starts, edits, restarts, or cross-client replays. */
-int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
+int server::responses_live_visible_prefix_prompt(session_slot *sl,
                                                 const request *req,
                                                 int live_pos,
                                                 pulsar_tokens *effective_prompt) {
+    auto *s = this;
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->api != API_RESPONSES) return 0;
 
@@ -859,10 +877,11 @@ int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
  * selects the checkpoint, while the payload stays the exact sampled token
  * frontier.  If the visible key does not match, callers fall back to ordinary
  * token/text/disk matching. */
-int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
+int server::thinking_live_visible_prefix_prompt(session_slot *sl,
                                                const request *req,
                                                int live_pos,
                                                pulsar_tokens *effective_prompt) {
+    auto *s = this;
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
@@ -903,8 +922,9 @@ int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
  * can prefer the most recent frontier if several slots hold bindings for
  * prefixes of one conversation, or 0 for no match. Never dereferences
  * s->sess (the caller passes the slot's live position). */
-size_t thinking_live_binds_prompt(server *s, session_slot *sl,
+size_t server::thinking_live_binds_prompt(session_slot *sl,
                                   const request *req, int live_pos) {
+    auto *s = this;
     if (!s || !sl || !req || !req->prompt_text) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 

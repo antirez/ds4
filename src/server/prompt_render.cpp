@@ -520,11 +520,12 @@ static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
  * condition so generate_job() can prefer live / visible checkpoints and emit a
  * warning if it must fall back to visible replay instead of aborting the
  * session. */
-bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
+bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
                                             pulsar_think_mode think_mode,
                                             bool *requires_live_tool_state,
                                             bool *requires_live_reasoning,
                                             char *err, size_t errlen) {
+    auto *s = this;
     if (!msgs) return true;
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (requires_live_reasoning) *requires_live_reasoning = false;
@@ -537,7 +538,7 @@ bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
         chat_msg_collect_tool_call_ids(m, &ids);
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
-            const bool live_known = responses_live_has_call_id(s, id);
+            const bool live_known = s->responses_live_has_call_id(id);
             const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
             if (!live_known && !prior) {
                 snprintf(err, errlen,
@@ -620,9 +621,10 @@ static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
  * stateless replay, where exact DSML tool memory can restore the sampled tool
  * bytes before prefix matching.  A tool-result-only request with an unknown
  * live id has no safe prefix to reconstruct, so report a clear client error. */
-bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
+bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
                                             bool *requires_live_tool_state,
                                             char *err, size_t errlen) {
+    auto *s = this;
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (!msgs) return true;
     for (int i = 0; i < msgs->len; i++) {
@@ -633,7 +635,7 @@ bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
         chat_msg_collect_tool_call_ids(m, &ids);
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
-            const bool live_known = anthropic_live_has_call_id(s, id);
+            const bool live_known = s->anthropic_live_has_call_id(id);
             const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
             if (!live_known && !prior) {
                 snprintf(err, errlen,

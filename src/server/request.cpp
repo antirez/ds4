@@ -61,14 +61,10 @@ void request_apply_forced_tool_prefill(request *r) {
     r->prompt_text = buf_take(&pt);
 }
 
-void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
-                                           tool_replay_stats *stats);
 
 
-bool tool_memory_has_id(server *s, const char *id);
 
 
-void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
 
 
 
@@ -84,10 +80,8 @@ void id_list_push_unique(stop_list *ids, const char *id);
 void id_list_free(stop_list *ids);
 
 
-bool responses_live_has_call_id(server *s, const char *id);
 
 
-bool anthropic_live_has_call_id(server *s, const char *id);
 
 
 

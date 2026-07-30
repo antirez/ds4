@@ -190,7 +190,8 @@ char *build_toolless_thinking_visible_text(const request *r,
 
 
 
-bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
+bool server::should_canonicalize_tool_checkpoint(const tool_calls *calls) const {
+    const auto *s = this; (void)s;
     if (!calls || calls->len == 0) return false;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_dsml && calls->raw_dsml[0])

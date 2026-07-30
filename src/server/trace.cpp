@@ -87,8 +87,7 @@ static void trace_write_token(FILE *fp, pulsar_engine *engine, int token) {
 
 
 
-static void trace_write_cache_diag(
-        server *s,
+void server::trace_write_cache_diag(
         const trace_cache_diag *d,
         const tool_replay_stats *tool_replay,
         int cached,
@@ -96,6 +95,7 @@ static void trace_write_cache_diag(
         int disk_cached,
         const char *disk_path)
 {
+    auto *s = this;
     fprintf(s->trace,
             "\n--- cache decision ---\n"
             "live_tokens_before: %d\n"
@@ -164,8 +164,7 @@ static void trace_time(FILE *fp) {
 
 
 
-uint64_t trace_begin(
-        server *s,
+uint64_t server::trace_begin(
         const job *j,
         int cached,
         int effective_prompt_tokens,
@@ -173,6 +172,7 @@ uint64_t trace_begin(
         const char *cache_source,
         int disk_cached,
         const char *disk_path) {
+    auto *s = this;
     if (!s->trace) return 0;
 
     pthread_mutex_lock(&s->trace_mu);
@@ -197,7 +197,7 @@ uint64_t trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
-    trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
+    s->trace_write_cache_diag(cache_diag, &j->req.tool_replay, cached,
                            cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
         fputs("\n--- raw request json ---\n", s->trace);
@@ -221,7 +221,8 @@ uint64_t trace_begin(
 
 
 
-void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
+void server::trace_piece(uint64_t id, const char *piece, size_t len) {
+    auto *s = this;
     if (!s->trace || !id || !piece || !len) return;
     pthread_mutex_lock(&s->trace_mu);
     fwrite(piece, 1, len, s->trace);
@@ -231,7 +232,8 @@ void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
 
 
 
-void trace_event(server *s, uint64_t id, const char *fmt, ...) {
+void server::trace_event(uint64_t id, const char *fmt, ...) {
+    auto *s = this;
     if (!s->trace || !id) return;
     pthread_mutex_lock(&s->trace_mu);
     fputs("\n\n--- trace: ", s->trace);
@@ -246,8 +248,7 @@ void trace_event(server *s, uint64_t id, const char *fmt, ...) {
 
 
 
-void trace_finish(
-        server *s,
+void server::trace_finish(
         uint64_t id,
         const request *r,
         const char *final_finish,
@@ -258,6 +259,7 @@ void trace_finish(
         const char *parsed_reasoning,
         const tool_calls *parsed_calls,
         double elapsed) {
+    auto *s = this;
     if (!s->trace || !id) return;
 
     pthread_mutex_lock(&s->trace_mu);

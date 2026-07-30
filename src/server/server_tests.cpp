@@ -2144,10 +2144,10 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     server s;
     memset(&s, 0, sizeof(s));
     pthread_mutex_init(&s.tool_mu, NULL);
-    assign_tool_call_ids(&s, &sampled, API_OPENAI);
+    &s->assign_tool_call_ids(&sampled, API_OPENAI);
     TEST_ASSERT(sampled.v[0].id != NULL);
     TEST_ASSERT(!strncmp(sampled.v[0].id, "call_", 5));
-    tool_memory_remember(&s, &sampled);
+    &s->tool_memory_remember(&sampled);
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
@@ -2162,7 +2162,7 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     chat_msgs_push(&msgs, assistant);
 
     tool_replay_stats stats = {0};
-    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    &s->tool_memory_attach_to_messages(&msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.disk == 0);
@@ -2201,7 +2201,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     server s;
     memset(&s, 0, sizeof(s));
     pthread_mutex_init(&s.tool_mu, NULL);
-    tool_memory_put(&s, "toolu_exact", sampled_dsml);
+    &s->tool_memory_put("toolu_exact", sampled_dsml);
 
     const char *json =
         "["
@@ -2225,7 +2225,7 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     id_list_free(&ids);
 
     tool_replay_stats stats = {0};
-    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    &s->tool_memory_attach_to_messages(&msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
     TEST_ASSERT(stats.mem == 1);
     TEST_ASSERT(stats.canonical == 0);
@@ -2304,7 +2304,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     chat_msgs_push(&msgs, user);
 
     char err[160] = {0};
-    TEST_ASSERT(!anthropic_validate_tool_results(&s, &msgs, NULL,
+    TEST_ASSERT(!&s->anthropic_validate_tool_results(&msgs, NULL,
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Anthropic continuation state is not available") != NULL);
 
@@ -2316,7 +2316,7 @@ static void test_anthropic_tool_result_id_validation(void) {
     pthread_mutex_unlock(&s.tool_mu);
     bool needs_live_tool_state = false;
     err[0] = '\0';
-    TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
+    TEST_ASSERT(&s->anthropic_validate_tool_results(&msgs,
                                                 &needs_live_tool_state,
                                                 err, sizeof(err)));
     TEST_ASSERT(needs_live_tool_state);
@@ -2350,7 +2350,7 @@ static void test_anthropic_full_replay_allows_unknown_live_id(void) {
 
     bool needs_live_tool_state = false;
     char err[160] = {0};
-    TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
+    TEST_ASSERT(&s->anthropic_validate_tool_results(&msgs,
                                                 &needs_live_tool_state,
                                                 err, sizeof(err)));
     TEST_ASSERT(!needs_live_tool_state);
@@ -2398,7 +2398,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
 
     bool needs_live_tool_state = false;
     char err[160] = {0};
-    TEST_ASSERT(anthropic_validate_tool_results(&s, &msgs,
+    TEST_ASSERT(&s->anthropic_validate_tool_results(&msgs,
                                                 &needs_live_tool_state,
                                                 err, sizeof(err)));
     TEST_ASSERT(!needs_live_tool_state);
@@ -2426,15 +2426,15 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
         "</｜DSML｜invoke>\n"
         PULSAR_TOOL_CALLS_END);
 
-    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(!s.should_canonicalize_tool_checkpoint(&calls));
 
     s.disable_exact_dsml_tool_replay = true;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(s.should_canonicalize_tool_checkpoint(&calls));
 
     s.disable_exact_dsml_tool_replay = false;
     free(calls.raw_dsml);
     calls.raw_dsml = NULL;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(s.should_canonicalize_tool_checkpoint(&calls));
 
     tool_calls_free(&calls);
 }
@@ -2492,7 +2492,7 @@ static void test_responses_tool_output_id_validation(void) {
     chat_msgs_push(&msgs, tool);
 
     char err[160] = {0};
-    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, PULSAR_THINK_HIGH, NULL, NULL,
+    TEST_ASSERT(!&s->responses_validate_tool_outputs(&msgs, PULSAR_THINK_HIGH, NULL, NULL,
                                                  err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
@@ -2504,7 +2504,7 @@ static void test_responses_tool_output_id_validation(void) {
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     bool needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, PULSAR_THINK_HIGH,
+    TEST_ASSERT(&s->responses_validate_tool_outputs(&msgs, PULSAR_THINK_HIGH,
                                                 &needs_live_tool_state, NULL,
                                                 err, sizeof(err)));
     TEST_ASSERT(needs_live_tool_state);
@@ -2539,7 +2539,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     char err[160] = {0};
     bool needs_live_reasoning = false;
     bool needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, PULSAR_THINK_HIGH,
+    TEST_ASSERT(&s->responses_validate_tool_outputs(&msgs, PULSAR_THINK_HIGH,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -2555,7 +2555,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, PULSAR_THINK_HIGH,
+    TEST_ASSERT(&s->responses_validate_tool_outputs(&msgs, PULSAR_THINK_HIGH,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -2567,7 +2567,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, PULSAR_THINK_HIGH,
+    TEST_ASSERT(&s->responses_validate_tool_outputs(&msgs, PULSAR_THINK_HIGH,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -2579,7 +2579,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     err[0] = '\0';
     needs_live_reasoning = false;
     needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, PULSAR_THINK_NONE,
+    TEST_ASSERT(&s->responses_validate_tool_outputs(&msgs, PULSAR_THINK_NONE,
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
@@ -2637,7 +2637,7 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
 
     server s = {0};
     pthread_mutex_init(&s.tool_mu, NULL);
-    tool_memory_put(&s, "call_disabled", dsml);
+    &s->tool_memory_put("call_disabled", dsml);
     s.disable_exact_dsml_tool_replay = true;
 
     chat_msgs msgs = {0};
@@ -2651,7 +2651,7 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     chat_msgs_push(&msgs, assistant);
 
     tool_replay_stats stats = {0};
-    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    &s->tool_memory_attach_to_messages(&msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
@@ -2659,7 +2659,7 @@ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     FILE *fp = tmpfile();
     TEST_ASSERT(fp != NULL);
     uint64_t bytes = 123;
-    TEST_ASSERT(kv_tool_map_write(&s, fp, dsml, &bytes));
+    TEST_ASSERT(&s->kv_tool_map_write(fp, dsml, &bytes));
     TEST_ASSERT(bytes == 0);
 
     if (fp) fclose(fp);
@@ -2743,9 +2743,9 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
     server s = {0};
     pthread_mutex_init(&s.tool_mu, NULL);
     s.tool_mem.max_entries = 2;
-    tool_memory_put(&s, "call_a", a_dsml);
-    tool_memory_put(&s, "call_b", b_dsml);
-    tool_memory_put(&s, "call_c", c_dsml);
+    &s->tool_memory_put("call_a", a_dsml);
+    &s->tool_memory_put("call_b", b_dsml);
+    &s->tool_memory_put("call_c", c_dsml);
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
@@ -2755,7 +2755,7 @@ static void test_tool_memory_max_ids_prunes_oldest(void) {
     chat_msgs_push(&msgs, a);
 
     tool_replay_stats stats = {0};
-    tool_memory_attach_to_messages(&s, &msgs, &stats);
+    &s->tool_memory_attach_to_messages(&msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml == NULL);
     TEST_ASSERT(stats.canonical == 1);
     TEST_ASSERT(stats.missing_ids == 1);
@@ -3523,19 +3523,19 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     server src = {0}, dst = {0};
     pthread_mutex_init(&src.tool_mu, NULL);
     pthread_mutex_init(&dst.tool_mu, NULL);
-    tool_memory_put(&src, "call_keep", dsml_keep);
-    tool_memory_put(&src, "call_drop", dsml_drop);
+    &src->tool_memory_put("call_keep", dsml_keep);
+    &src->tool_memory_put("call_drop", dsml_drop);
 
     FILE *fp = tmpfile();
     TEST_ASSERT(fp != NULL);
     uint64_t estimated_bytes = 0;
-    TEST_ASSERT(kv_tool_map_serialized_size(&src, dsml_keep, &estimated_bytes));
+    TEST_ASSERT(&src->kv_tool_map_serialized_size(dsml_keep, &estimated_bytes));
     uint64_t bytes = 0;
-    TEST_ASSERT(kv_tool_map_write(&src, fp, dsml_keep, &bytes));
+    TEST_ASSERT(&src->kv_tool_map_write(fp, dsml_keep, &bytes));
     TEST_ASSERT(bytes > 0);
     TEST_ASSERT(estimated_bytes == bytes);
     rewind(fp);
-    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+    TEST_ASSERT(&dst->kv_tool_map_load_from_pos(fp, NULL) == 1);
 
     chat_msgs msgs = {0};
     chat_msg a = {0};
@@ -3549,7 +3549,7 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     tool_calls_push(&b.calls, drop);
     chat_msgs_push(&msgs, b);
     tool_replay_stats stats = {0};
-    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    &dst->tool_memory_attach_to_messages(&msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
     TEST_ASSERT(msgs.v[1].calls.raw_dsml == NULL);
     TEST_ASSERT(stats.disk == 1);
@@ -3588,7 +3588,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
 
     server src = {0};
     pthread_mutex_init(&src.tool_mu, NULL);
-    tool_memory_put(&src, "call_disk", dsml);
+    &src->tool_memory_put("call_disk", dsml);
 
     FILE *fp = fopen(path, "wb");
     TEST_ASSERT(fp != NULL);
@@ -3601,7 +3601,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
         TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
         TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
         uint64_t ignored = 0;
-        TEST_ASSERT(kv_tool_map_write(&src, fp, dsml, &ignored));
+        TEST_ASSERT(&src->kv_tool_map_write(fp, dsml, &ignored));
         TEST_ASSERT(fclose(fp) == 0);
     }
 
@@ -3621,9 +3621,9 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     tool_calls_push(&a.calls, tc);
     chat_msgs_push(&msgs, a);
 
-    kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+    &dst->kv_cache_restore_tool_memory_for_messages(&msgs);
     tool_replay_stats stats = {0};
-    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    &dst->tool_memory_attach_to_messages(&msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
     TEST_ASSERT(stats.disk == 1);
     TEST_ASSERT(stats.canonical == 0);
@@ -4536,31 +4536,31 @@ static void test_thinking_binding_routes_visible_continuation(void) {
     req.prompt_text = prompt;
 
     /* the continuation matches its slot at the remembered frontier */
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == strlen(vis));
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 40) == strlen(vis));
     /* frontier moved (slot served someone else meanwhile): stale, no match */
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 41) == 0);
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 41) == 0);
     /* a different conversation sharing only the header must not match —
      * longer than the binding key so the BYTE COMPARE is what rejects it,
      * not the visible_len < prompt_len guard (2026-07-16 review) */
     char other[] = "<BOS>sys<U>completely different much longer conversation";
     req.prompt_text = other;
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 40) == 0);
     /* an exact replay (no new suffix) is not a continuation */
     char exact[] = "<BOS>sys<U>hi<A></think>hello<EOS>";
     req.prompt_text = exact;
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 40) == 0);
     /* owner-routed protocols resolve via live call ids upstream; the probe
      * must not claim them */
     req.prompt_text = prompt;
     req.api = API_RESPONSES;
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 40) == 0);
     req.api = API_OPENAI;
     req.kind = REQ_COMPLETION;
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 40) == 0);
     /* invalidated binding (clobbered/evicted slot) never matches */
     req.kind = REQ_CHAT;
     sl.thinking_live.valid = false;
-    TEST_ASSERT(thinking_live_binds_prompt(&s, &sl, &req, 40) == 0);
+    TEST_ASSERT(&s->thinking_live_binds_prompt(&sl, &req, 40) == 0);
 
     pthread_mutex_destroy(&s.tool_mu);
 }

@@ -882,6 +882,25 @@ typedef struct {
     visible_live_state thinking_live;
 } session_slot;
 
+/* Forward declarations / relocated types referenced by struct server's member
+ * methods (C++ port) whose full definitions appear later in this header or (for
+ * provision_refusal) in server_sched.cpp. Pointer params only need a forward
+ * declaration; provision_refusal is an unscoped enum and must be complete here. */
+struct job;
+struct server_prefill_progress;
+struct thinking_state;
+struct trace_cache_diag;
+typedef enum {
+    PROVISION_OK = 0,
+    PROVISION_REFUSED_POOL_FULL,   /* no free slot entry — eviction helps */
+    PROVISION_REFUSED_ADMISSION,   /* ledger full — eviction helps */
+    PROVISION_REFUSED_MEM_FLOOR,   /* machine physically tight (incl. an
+                                      unreadable /proc/meminfo, fail closed) —
+                                      eviction does NOT promptly help */
+    PROVISION_REFUSED_CREATE_FAIL, /* allocation failed — eviction unsafe to
+                                      chain on (same physical pressure) */
+} provision_refusal;
+
 struct server {
     pulsar_engine *engine;
     /* The ONE session (created at startup, freed once at shutdown): classic
@@ -1000,6 +1019,113 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+
+    /* ---- methods (C++ port): 1:1 mirror of the server_ / worker_ verb family;
+     * bodies keep the auto *s = this alias, numerics/logic verbatim. ---- */
+    bool send_model(int fd, const char *id);
+    bool send_models(int fd);
+    bool send_liveness(int fd);
+    bool send_health(int fd);
+    bool send_version(int fd);
+    bool send_root(int fd);
+    bool send_metrics(int fd);
+    void client_done();
+    bool kv_tool_map_measure_locked(const char *text, uint32_t *count_out, uint64_t *bytes_out);
+    bool kv_tool_map_serialized_size(const char *text, uint64_t *bytes_out);
+    bool kv_tool_map_write(FILE *fp, const char *text, uint64_t *written_bytes);
+    int kv_tool_map_load_from_pos(FILE *fp, const stop_list *wanted);
+    void kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs);
+    pulsar_kvstore_trailer_hooks kv_cache_tool_map_hooks(const stop_list *wanted);
+    bool kv_cache_store_live_prefix_text(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason, const char *cache_text_override, uint8_t cache_text_ext, const char *cache_text_key);
+    bool kv_cache_store_live_prefix(session_slot *sl, const pulsar_tokens *tokens, int store_len, const char *reason);
+    bool kv_cache_store_current(session_slot *sl, const char *reason);
+    void kv_cache_discard_failed_disk_entry(session_slot *sl, const char *path);
+    void kv_cache_tracker_bind(session_slot *sl);
+    void kv_cache_tracker_flush(session_slot *sl);
+    void kv_cache_maybe_store_continued(session_slot *sl);
+    int kv_cache_try_load_text(session_slot *sl, const char *prompt_text, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out, bool responses_protocol);
+    int kv_cache_try_load(session_slot *sl, const request *req, pulsar_tokens *effective_prompt, char **loaded_path_out, uint8_t *loaded_ext_flags_out);
+    int live_text_prefix_prompt(session_slot *sl, const request *req, pulsar_tokens *effective_prompt);
+    int responses_live_continuation_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt, int *matched_ids);
+    int anthropic_live_continuation_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt, int *matched_ids);
+    int responses_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
+    int thinking_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
+    size_t thinking_live_binds_prompt(session_slot *sl, const request *req, int live_pos);
+    const char * anthropic_tool_stream_id(anthropic_tool_stream *ts, int index);
+    const char * openai_tool_stream_id(openai_tool_stream *ts, int index);
+    bool responses_validate_tool_outputs(const chat_msgs *msgs, pulsar_think_mode think_mode, bool *requires_live_tool_state, bool *requires_live_reasoning, char *err, size_t errlen);
+    bool anthropic_validate_tool_results(const chat_msgs *msgs, bool *requires_live_tool_state, char *err, size_t errlen);
+    int chat_think_tool_recovery(session_slot *sl, buf *text, thinking_state *thinking, size_t *scan_from, int *completion, int max_tokens, char *err, size_t errlen);
+    bool append_rendered_suffix_to_live_session(session_slot *sl, const char *suffix, int *tokens_appended, char *err, size_t errlen);
+    bool continue_after_invalid_dsml(session_slot *sl, const request *r, const thinking_state *thinking, const char *detail, int *tokens_appended, char *err, size_t errlen);
+    void send_prefill_failure_response(const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);
+    void remember_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content);
+    void remember_tool_thinking_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
+    void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
+    void gen_prefill_fail(session_slot *sl);
+    void gen_begin(session_slot *sl);
+    void gen_step_prefill(session_slot *sl);
+    void gen_stream_begin(session_slot *sl);
+    void gen_decode_init(session_slot *sl);
+    bool gen_emit_token(session_slot *sl, int token);
+    void gen_step_decode(session_slot *sl);
+    void gen_step_finish(session_slot *sl);
+    void gen_state_free(session_slot *sl);
+    void generate_job_begin(session_slot *sl, job *j);
+    void generate_job_step(session_slot *sl);
+    void generate_job_end(session_slot *sl);
+    void thinking_live_clear(session_slot *sl);
+    void thinking_live_remember(session_slot *sl, const char *visible_text);
+    void responses_live_remember(session_slot *sl, const char *visible_text, const tool_calls *calls);
+    void anthropic_live_remember(session_slot *sl, const tool_calls *calls);
+    void responses_live_clear(session_slot *sl);
+    void anthropic_live_clear(session_slot *sl);
+    bool responses_live_has_call_id(const char *id);
+    bool anthropic_live_has_call_id(const char *id);
+    bool responses_live_matches_request(const session_slot *sl, const stop_list *ids, int live_tokens);
+    bool anthropic_live_matches_request(const session_slot *sl, const stop_list *ids, int live_tokens);
+    session_slot * live_slot_for_ids(const stop_list *ids, bool anthropic);
+    session_slot * responses_live_slot_for_ids(const stop_list *ids);
+    session_slot * anthropic_live_slot_for_ids(const stop_list *ids);
+    bool tool_memory_has_id(const char *id);
+    void tool_memory_remember(const tool_calls *calls);
+    void tool_memory_put_source(const char *id, const char *dsml, tool_memory_source source);
+    void tool_memory_put(const char *id, const char *dsml);
+    void tool_memory_attach_to_messages(chat_msgs *msgs, tool_replay_stats *stats);
+    void assign_tool_call_ids(tool_calls *calls, api_style api);
+    void trace_piece(uint64_t id, const char *piece, size_t len);
+    void trace_event(uint64_t id, const char *fmt, ...);
+    void trace_write_cache_diag(const trace_cache_diag *d, const tool_replay_stats *tool_replay, int cached, const char *cache_source, int disk_cached, const char *disk_path);
+    uint64_t trace_begin(const job *j, int cached, int effective_prompt_tokens, const trace_cache_diag *cache_diag, const char *cache_source, int disk_cached, const char *disk_path);
+    void trace_finish(uint64_t id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
+    bool enqueue(job *j);
+    void close_resources();
+    bool bank_switch(int bank);
+    bool fork_make_room(const session_slot *trunk);
+    bool bank_restore_spilled(int bank);
+    int pick_superseded_idle(const bool *protect);
+    bool spill_bank(session_slot *victim);
+    int guard_pick_victim(session_slot **dec, int n);
+    void guard_maybe_evict(session_slot **dec, int n);
+    void publish_metrics_snapshot();
+    int n_slots_snapshot();
+    void worker_protect_queued_owner_slots(bool protect[PULSAR_SESSION_POOL_CAP]);
+    bool worker_eviction_could_help(const job *j, const bool *protect);
+    bool worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]);
+    bool worker_try_bind();
+    void worker_finish_slot(session_slot *sl);
+    void worker_batched_decode_quantum(session_slot **dec, int n);
+    session_slot * worker_find_fuse_prefill();
+    void worker_mixed_batch_quantum(session_slot **dec, int n, session_slot *pf);
+    session_slot * provision_bank(provision_refusal *refusal);
+    session_slot * provision_slot(int ctx, provision_refusal *refusal);
+    session_slot * choose_slot_for_job(job *j, int *reject_ctx, bool *waiting_owner, bool *clobbers, provision_refusal *refusal);
+    /* const readers (take a const server *s in the C predecessor). */
+    bool should_canonicalize_tool_checkpoint(const tool_calls *calls) const;
+    int slot_common_prefix(const session_slot *sl, const pulsar_tokens *prompt) const;
+    int job_needed_ctx(const job *j) const;
+    int slot_frontier_pos(const session_slot *sl) const;
+    int provision_ctx_for_job(const job *j) const;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -1022,7 +1148,7 @@ typedef enum {
     KV_REASON_SHUTDOWN  = PULSAR_KVSTORE_REASON_SHUTDOWN,
 } kv_cache_reason;
 
-typedef struct {
+typedef struct trace_cache_diag {
     bool valid;
     int old_pos;
     int prompt_len;
@@ -1033,7 +1159,7 @@ typedef struct {
     int prompt_id[TRACE_CACHE_WINDOW];
 } trace_cache_diag;
 
-typedef struct {
+typedef struct server_prefill_progress {
     server *srv;
     session_slot *slot; /* slot whose session is prefilling (worker thread) */
     req_kind kind;
@@ -1059,7 +1185,7 @@ typedef struct {
     double last_keepalive;
 } server_prefill_progress;
 
-typedef struct {
+typedef struct thinking_state {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
     int tail_len;
@@ -1294,16 +1420,8 @@ bool chat_history_preserves_reasoning(const chat_msgs *msgs,
 char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      pulsar_think_mode think_mode);
-bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
-                                            pulsar_think_mode think_mode,
-                                            bool *requires_live_tool_state,
-                                            bool *requires_live_reasoning,
-                                            char *err, size_t errlen);
 void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
-bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
-                                            bool *requires_live_tool_state,
-                                            char *err, size_t errlen);
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs);
 bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
@@ -1469,33 +1587,8 @@ void visible_live_free(visible_live_state *st);
 /* Live protocol bindings are per-slot (they describe one session's sampled
  * frontier); has_call_id scans every provisioned slot because request parsing
  * runs before the job is bound to a slot. */
-void thinking_live_clear(server *s, session_slot *sl);
-void thinking_live_remember(server *s, session_slot *sl, const char *visible_text);
-void responses_live_remember(server *s, session_slot *sl, const char *visible_text,
-                                    const tool_calls *calls);
-void anthropic_live_remember(server *s, session_slot *sl, const tool_calls *calls);
-void responses_live_clear(server *s, session_slot *sl);
-void anthropic_live_clear(server *s, session_slot *sl);
-bool responses_live_has_call_id(server *s, const char *id);
-bool anthropic_live_has_call_id(server *s, const char *id);
-bool responses_live_matches_request(server *s, const session_slot *sl,
-                                           const stop_list *ids,
-                                           int live_tokens);
-bool anthropic_live_matches_request(server *s, const session_slot *sl,
-                                           const stop_list *ids,
-                                           int live_tokens);
 /* Slots whose live binding contains all of the request's continuation ids
  * (worker thread; used to route a continuation to the session that owns it). */
-session_slot *responses_live_slot_for_ids(server *s, const stop_list *ids);
-session_slot *anthropic_live_slot_for_ids(server *s, const stop_list *ids);
-bool tool_memory_has_id(server *s, const char *id);
-void tool_memory_remember(server *s, const tool_calls *calls);
-void tool_memory_put_source(server *s, const char *id, const char *dsml,
-                                   tool_memory_source source);
-void tool_memory_put(server *s, const char *id, const char *dsml);
-void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
-                                           tool_replay_stats *stats);
-void assign_tool_call_ids(server *s, tool_calls *calls, api_style api);
 void apply_openai_stream_tool_ids(tool_calls *calls,
                                          const openai_stream *st);
 void apply_anthropic_stream_tool_ids(tool_calls *calls,
@@ -1508,17 +1601,11 @@ void id_list_push_unique(stop_list *ids, const char *id);
 void id_list_free(stop_list *ids);
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids);
 char *path_join(const char *dir, const char *name);
-bool kv_tool_map_serialized_size(server *s, const char *text,
-                                        uint64_t *bytes_out);
-bool kv_tool_map_write(server *s, FILE *fp, const char *text,
-                              uint64_t *written_bytes);
-int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted);
 void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint8_t reason, uint8_t ext_flags,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes);
-void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
 double kv_entry_eviction_score(const kv_entry *e, const pulsar_tokens *live,
                                       uint64_t now,
                                       const pulsar_kvstore_eviction_context *incoming);
@@ -1547,13 +1634,9 @@ bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                     uint64_t tool_map_bytes,
                                     uint64_t *file_bytes_out,
                                     uint64_t *required_bytes_out);
-bool kv_cache_store_live_prefix(server *s, session_slot *sl,
-                                       const pulsar_tokens *tokens,
-                                       int store_len, const char *reason);
 /* Returns whether a checkpoint file was actually written — eviction uses this
  * for failure honesty (evict-without-snapshot falls back to client re-prefill;
  * older callers ignore the result as before). */
-bool kv_cache_store_current(server *s, session_slot *sl, const char *reason);
 /* The continued-store frontier (lib field kc->continued_last_store_tokens) is
  * per-conversation state on a kvstore shared by every slot. Every
  * tracker-touching operation brackets itself with these on the single worker
@@ -1561,55 +1644,19 @@ bool kv_cache_store_current(server *s, session_slot *sl, const char *reason);
  * writes it back (2026-07-14 review: without this, slot A's high-water mark
  * suppressed slot B's continued checkpoints, and a cold request on B reset
  * A's schedule). */
-void kv_cache_tracker_bind(server *s, session_slot *sl);
-void kv_cache_tracker_flush(server *s, session_slot *sl);
 void kv_cache_note_store(kv_disk_cache *kc, int tokens);
 int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens);
 void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
                                                   int old_tokens,
                                                   int suppressed_tokens);
-void kv_cache_discard_failed_disk_entry(server *s, session_slot *sl,
-                                               const char *path);
-void kv_cache_maybe_store_continued(server *s, session_slot *sl);
 int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size);
-int kv_cache_try_load_text(server *s, session_slot *sl, const char *prompt_text,
-                                  pulsar_tokens *effective_prompt,
-                                  char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out,
-                                  bool responses_protocol);
-int kv_cache_try_load(server *s, session_slot *sl, const request *req,
-                             pulsar_tokens *effective_prompt,
-                             char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out);
-int live_text_prefix_prompt(server *s, session_slot *sl, const request *req,
-                                   pulsar_tokens *effective_prompt);
-int responses_live_continuation_prompt(server *s, session_slot *sl,
-                                              const request *req,
-                                              int live_pos,
-                                              pulsar_tokens *effective_prompt,
-                                              int *matched_ids);
-int anthropic_live_continuation_prompt(server *s, session_slot *sl,
-                                              const request *req,
-                                              int live_pos,
-                                              pulsar_tokens *effective_prompt,
-                                              int *matched_ids);
-int responses_live_visible_prefix_prompt(server *s, session_slot *sl,
-                                                const request *req,
-                                                int live_pos,
-                                                pulsar_tokens *effective_prompt);
-int thinking_live_visible_prefix_prompt(server *s, session_slot *sl,
-                                               const request *req,
-                                               int live_pos,
-                                               pulsar_tokens *effective_prompt);
 /* Routing probe: does this slot's live thinking binding mark it as the warm
  * continuation of req's visible transcript? Same guards as
  * thinking_live_visible_prefix_prompt but byte-prefix check only — no
  * tokenization, no effective-prompt build. Returns the matched visible-key
  * length (>0), or 0 for no match (defined in kv_cache.c; unit-tested in
  * cli_main.c). */
-size_t thinking_live_binds_prompt(server *s, session_slot *sl,
-                                         const request *req, int live_pos);
 /* Trivial-match classifier for the router's choose-vs-provision decision
  * (defined in generate.c; unit-tested in cli_main.c). */
 bool server_slot_match_is_trivial(int common, int slot_pos,
@@ -1650,8 +1697,6 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
  * carry, reloads a guard-spilled target from disk, and repoints the graph's
  * views.  Returns false WITHOUT installing on any failure — callers must fail
  * the request rather than run against a half-repointed view set. */
-bool server_bank_switch(server *s, int bank);
-int server_slot_frontier_pos(const server *s, const session_slot *sl);
 /* LRU eviction victim: least-recently-serviced idle provisioned slot,
  * tie-broken by smallest committed bytes; slot 0 pinned; protect[i] (may be
  * NULL) marks slots a queued live continuation still needs. Returns a slot
@@ -1666,29 +1711,6 @@ void trace_cache_capture(
         int old_pos,
         int common);
 const char *trace_cache_miss_reason(const trace_cache_diag *d);
-uint64_t trace_begin(
-        server *s,
-        const job *j,
-        int cached,
-        int effective_prompt_tokens,
-        const trace_cache_diag *cache_diag,
-        const char *cache_source,
-        int disk_cached,
-        const char *disk_path);
-void trace_piece(server *s, uint64_t id, const char *piece, size_t len);
-void trace_event(server *s, uint64_t id, const char *fmt, ...);
-void trace_finish(
-        server *s,
-        uint64_t id,
-        const request *r,
-        const char *final_finish,
-        int completion,
-        bool saw_tool_start,
-        bool saw_tool_end,
-        const char *parsed_content,
-        const char *parsed_reasoning,
-        const tool_calls *parsed_calls,
-        double elapsed);
 void request_ctx_span(char *buf, size_t len, int cached, int prompt);
 void log_flags(char *buf, size_t len, bool responses_protocol,
                       bool tools, bool thinking,
@@ -1715,21 +1737,13 @@ char *build_responses_visible_assistant_suffix(const request *r,
                                                       const tool_calls *calls);
 char *build_toolless_thinking_visible_text(const request *r,
                                                   const char *content);
-bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls);
-bool enqueue(server *s, job *j);
 void *worker_main(void *arg);
-void server_publish_metrics_snapshot(server *s);
 /* Job-lifecycle entry points (server_jobs.c), driven by the scheduler/
  * worker (server_sched.c): bind/step/unbind plus the three per-token
  * helpers the batched and fused mixed-batch quanta share with the classic
  * decode loop. */
 void gen_resolve_sampling(const request *req, float *temperature,
                           int *top_k, float *top_p, float *min_p);
-bool gen_emit_token(server *s, session_slot *sl, int token);
-void gen_stream_begin(server *s, session_slot *sl);
-void generate_job_begin(server *s, session_slot *sl, job *j);
-void generate_job_step(server *s, session_slot *sl);
-void generate_job_end(server *s, session_slot *sl);
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens);
 void *client_main(void *arg);

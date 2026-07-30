@@ -165,7 +165,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
 
 
 
-static bool send_model(server *s, int fd, const char *id) {
+bool server::send_model(int fd, const char *id) {
+    auto *s = this;
     buf b = {0};
     append_model_json(&b, s, id);
     buf_putc(&b, '\n');
@@ -176,7 +177,8 @@ static bool send_model(server *s, int fd, const char *id) {
 
 
 
-static bool send_models(server *s, int fd) {
+bool server::send_models(int fd) {
+    auto *s = this;
     /* Advertise only the model actually loaded (its shape id), not both
      * flash/pro aliases — the server serves one GGUF at a time. */
     buf b = {0};
@@ -192,7 +194,8 @@ static bool send_models(server *s, int fd) {
  * while the process runs — deliberately independent of readiness/drain state,
  * so a k8s liveness probe never restarts a server that is merely draining.
  * Lock-free, engine-free (safe on a client thread). */
-static bool send_liveness(server *s, int fd) {
+bool server::send_liveness(int fd) {
+    auto *s = this;
     return http_response(fd, s->enable_cors, 200, "application/json",
                          "{\"status\":\"ok\"}\n");
 }
@@ -202,7 +205,8 @@ static bool send_liveness(server *s, int fd) {
  * {"status":"draining",...} once shutdown has been requested so a load
  * balancer stops routing to it. Reads only the worker-published snapshot under
  * mu (same discipline as /metrics — no engine calls on the client thread). */
-static bool send_health(server *s, int fd) {
+bool server::send_health(int fd) {
+    auto *s = this;
     const char *model = server_served_model_id(s);
     bool draining;
     int n_slots, running, waiting;
@@ -241,7 +245,8 @@ static bool send_health(server *s, int fd) {
 
 /* Version + build identity (/version), vLLM/OpenAI convention. Version is the
  * git-describe string baked in at build time (see Makefile). */
-static bool send_version(server *s, int fd) {
+bool server::send_version(int fd) {
+    auto *s = this;
     buf b = {0};
     buf_printf(&b,
         "{\"version\":\"%s\",\"engine\":\"pulsar\",\"cuda_arch\":\"sm_120f\","
@@ -257,7 +262,8 @@ static bool send_version(server *s, int fd) {
 
 /* Root banner so a bare GET / (browsers, uptime probes) gets a 200 with the
  * version and a pointer to the real endpoints instead of a 404. */
-static bool send_root(server *s, int fd) {
+bool server::send_root(int fd) {
+    auto *s = this;
     buf b = {0};
     buf_printf(&b,
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
@@ -274,7 +280,8 @@ static bool send_root(server *s, int fd) {
  * tool-eval-bench --spec-live (and any vLLM-oriented scraper) reads acceptance
  * rate, acceptance length, and the per-position waterfall unchanged. All
  * counters are cumulative since engine open; gauges are point-in-time. */
-static bool send_metrics(server *s, int fd) {
+bool server::send_metrics(int fd) {
+    auto *s = this;
     /* This runs on a client thread: it must not call into the engine
      * (CUDA-state audit, pulsar_server_internal.h). Everything below reads the
      * snapshots the worker publishes under mu (m_spec/m_slot_pos/m_slot_ctx,
@@ -370,7 +377,8 @@ static bool send_metrics(server *s, int fd) {
 
 
 
-static void client_done(server *s) {
+void server::client_done() {
+    auto *s = this;
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
     pthread_cond_broadcast(&s->clients_cv);
@@ -402,33 +410,33 @@ void *client_main(void *arg) {
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
-        send_health(s, fd);
+        s->send_health(fd);
         http_request_free(&hr);
         goto done;
     }
     if (!strcmp(hr.method, "GET") &&
         (!strcmp(hr.path, "/healthz") || !strcmp(hr.path, "/ping"))) {
-        send_liveness(s, fd);
+        s->send_liveness(fd);
         http_request_free(&hr);
         goto done;
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/version")) {
-        send_version(s, fd);
+        s->send_version(fd);
         http_request_free(&hr);
         goto done;
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/")) {
-        send_root(s, fd);
+        s->send_root(fd);
         http_request_free(&hr);
         goto done;
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
-        send_models(s, fd);
+        s->send_models(fd);
         http_request_free(&hr);
         goto done;
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
-        send_metrics(s, fd);
+        s->send_metrics(fd);
         http_request_free(&hr);
         goto done;
     }
@@ -441,7 +449,7 @@ void *client_main(void *arg) {
         !strcmp(hr.path + model_path_prefix_len,
                 server_served_model_id(s)))
     {
-        send_model(s, fd, hr.path + model_path_prefix_len);
+        s->send_model(fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
         goto done;
     }
@@ -494,7 +502,7 @@ void *client_main(void *arg) {
     pthread_cond_init(&j.cv, NULL);
 
     pthread_mutex_lock(&j.mu);
-    if (!enqueue(s, &j)) {
+    if (!s->enqueue(&j)) {
         pthread_mutex_unlock(&j.mu);
         http_error(fd, s->enable_cors, 503, "server shutting down");
         pthread_cond_destroy(&j.cv);
@@ -510,7 +518,7 @@ void *client_main(void *arg) {
     request_free(&j.req);
 done:
     close(fd);
-    client_done(s);
+    s->client_done();
     return NULL;
 }
 

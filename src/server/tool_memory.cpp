@@ -296,7 +296,8 @@ void visible_live_free(visible_live_state *st) {
 
 
 
-void thinking_live_clear(server *s, session_slot *sl) {
+void server::thinking_live_clear(session_slot *sl) {
+    auto *s = this;
     if (!s || !sl) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&sl->thinking_live);
@@ -305,21 +306,23 @@ void thinking_live_clear(server *s, session_slot *sl) {
 
 
 
-void thinking_live_remember(server *s, session_slot *sl, const char *visible_text) {
+void server::thinking_live_remember(session_slot *sl, const char *visible_text) {
+    auto *s = this;
     if (!s || !sl || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&sl->thinking_live);
     sl->thinking_live.visible_text = xstrdup(visible_text);
     sl->thinking_live.visible_len = strlen(visible_text);
-    sl->thinking_live.live_tokens = server_slot_frontier_pos(s, sl);
+    sl->thinking_live.live_tokens = s->slot_frontier_pos(sl);
     sl->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void responses_live_remember(server *s, session_slot *sl, const char *visible_text,
+void server::responses_live_remember(session_slot *sl, const char *visible_text,
                                     const tool_calls *calls) {
+    auto *s = this;
     if (!s || !sl || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
@@ -330,28 +333,30 @@ void responses_live_remember(server *s, session_slot *sl, const char *visible_te
             id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    sl->responses_live.live_tokens = server_slot_frontier_pos(s, sl);
+    sl->responses_live.live_tokens = s->slot_frontier_pos(sl);
     sl->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void anthropic_live_remember(server *s, session_slot *sl, const tool_calls *calls) {
+void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) {
+    auto *s = this;
     if (!s || !sl || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&sl->anthropic_live);
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    sl->anthropic_live.live_tokens = server_slot_frontier_pos(s, sl);
+    sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl);
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
 
 
-void responses_live_clear(server *s, session_slot *sl) {
+void server::responses_live_clear(session_slot *sl) {
+    auto *s = this;
     if (!s || !sl) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
@@ -360,7 +365,8 @@ void responses_live_clear(server *s, session_slot *sl) {
 
 
 
-void anthropic_live_clear(server *s, session_slot *sl) {
+void server::anthropic_live_clear(session_slot *sl) {
+    auto *s = this;
     if (!s || !sl) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&sl->anthropic_live);
@@ -374,7 +380,8 @@ void anthropic_live_clear(server *s, session_slot *sl) {
  * published under mu (its owning lock) — take mu for the snapshot rather than
  * asserting cross-lock visibility. A momentarily stale snapshot would only
  * miss a slot provisioned this instant, whose bindings are still empty. */
-static int server_n_slots_snapshot(server *s) {
+int server::n_slots_snapshot() {
+    auto *s = this;
     pthread_mutex_lock(&s->mu);
     const int n = s->n_slots;
     pthread_mutex_unlock(&s->mu);
@@ -383,9 +390,10 @@ static int server_n_slots_snapshot(server *s) {
 
 
 
-bool responses_live_has_call_id(server *s, const char *id) {
+bool server::responses_live_has_call_id(const char *id) {
+    auto *s = this;
     if (!s || !id || !id[0]) return false;
-    const int n = server_n_slots_snapshot(s);
+    const int n = s->n_slots_snapshot();
     pthread_mutex_lock(&s->tool_mu);
     bool found = false;
     for (int i = 0; i < n && !found; i++) {
@@ -398,9 +406,10 @@ bool responses_live_has_call_id(server *s, const char *id) {
 
 
 
-bool anthropic_live_has_call_id(server *s, const char *id) {
+bool server::anthropic_live_has_call_id(const char *id) {
+    auto *s = this;
     if (!s || !id || !id[0]) return false;
-    const int n = server_n_slots_snapshot(s);
+    const int n = s->n_slots_snapshot();
     pthread_mutex_lock(&s->tool_mu);
     bool found = false;
     for (int i = 0; i < n && !found; i++) {
@@ -427,9 +436,10 @@ static bool live_state_matches_ids_locked(const live_tool_state *st,
 
 
 
-bool responses_live_matches_request(server *s, const session_slot *sl,
+bool server::responses_live_matches_request(const session_slot *sl,
                                            const stop_list *ids,
                                            int live_tokens) {
+    auto *s = this;
     if (!s || !sl || !ids || ids->len == 0) return false;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = live_state_matches_ids_locked(&sl->responses_live, ids, live_tokens);
@@ -439,9 +449,10 @@ bool responses_live_matches_request(server *s, const session_slot *sl,
 
 
 
-bool anthropic_live_matches_request(server *s, const session_slot *sl,
+bool server::anthropic_live_matches_request(const session_slot *sl,
                                            const stop_list *ids,
                                            int live_tokens) {
+    auto *s = this;
     if (!s || !sl || !ids || ids->len == 0) return false;
     pthread_mutex_lock(&s->tool_mu);
     bool ok = live_state_matches_ids_locked(&sl->anthropic_live, ids, live_tokens);
@@ -454,8 +465,9 @@ bool anthropic_live_matches_request(server *s, const session_slot *sl,
 /* Scheduler routing (worker thread): find the slot whose live binding holds
  * ALL of the request's continuation ids at that slot's current frontier, so
  * the job can be bound to the session that owns its conversation. */
-static session_slot *live_slot_for_ids(server *s, const stop_list *ids,
+session_slot *server::live_slot_for_ids(const stop_list *ids,
                                        bool anthropic) {
+    auto *s = this;
     if (!s || !ids || ids->len == 0) return NULL;
     session_slot *found = NULL;
     pthread_mutex_lock(&s->tool_mu);
@@ -465,7 +477,7 @@ static session_slot *live_slot_for_ids(server *s, const stop_list *ids,
                                               : &sl->responses_live;
         /* Bank-aware: match against THIS slot's bank frontier, not the pool's
          * live cursor (Tier-2 shared pool). -1 for an unprovisioned slot. */
-        const int pos = sl->provisioned ? server_slot_frontier_pos(s, sl) : -1;
+        const int pos = sl->provisioned ? s->slot_frontier_pos(sl) : -1;
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);
@@ -474,19 +486,22 @@ static session_slot *live_slot_for_ids(server *s, const stop_list *ids,
 
 
 
-session_slot *responses_live_slot_for_ids(server *s, const stop_list *ids) {
-    return live_slot_for_ids(s, ids, false);
+session_slot *server::responses_live_slot_for_ids(const stop_list *ids) {
+    auto *s = this;
+    return s->live_slot_for_ids(ids, false);
 }
 
 
 
-session_slot *anthropic_live_slot_for_ids(server *s, const stop_list *ids) {
-    return live_slot_for_ids(s, ids, true);
+session_slot *server::anthropic_live_slot_for_ids(const stop_list *ids) {
+    auto *s = this;
+    return s->live_slot_for_ids(ids, true);
 }
 
 
 
-bool tool_memory_has_id(server *s, const char *id) {
+bool server::tool_memory_has_id(const char *id) {
+    auto *s = this;
     if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
     bool found = tool_memory_find_entry_locked(&s->tool_mem, id) != NULL;
@@ -509,7 +524,8 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
 
 
 
-void tool_memory_remember(server *s, const tool_calls *calls) {
+void server::tool_memory_remember(const tool_calls *calls) {
+    auto *s = this;
     if (!s || s->disable_exact_dsml_tool_replay ||
         !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -522,8 +538,9 @@ void tool_memory_remember(server *s, const tool_calls *calls) {
 
 
 
-void tool_memory_put_source(server *s, const char *id, const char *dsml,
+void server::tool_memory_put_source(const char *id, const char *dsml,
                                    tool_memory_source source) {
+    auto *s = this;
     if (!s || s->disable_exact_dsml_tool_replay ||
         !id || !id[0] || !dsml || !dsml[0]) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -535,16 +552,18 @@ void tool_memory_put_source(server *s, const char *id, const char *dsml,
 
 #ifdef PULSAR_SERVER_TEST
 
-void tool_memory_put(server *s, const char *id, const char *dsml) {
-    tool_memory_put_source(s, id, dsml, TOOL_MEMORY_RAM);
+void server::tool_memory_put(const char *id, const char *dsml) {
+    auto *s = this;
+    s->tool_memory_put_source(id, dsml, TOOL_MEMORY_RAM);
 }
 
 
 #endif
 
 
-void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
+void server::tool_memory_attach_to_messages(chat_msgs *msgs,
                                            tool_replay_stats *stats) {
+    auto *s = this;
     if (!msgs) return;
     if (!s || s->disable_exact_dsml_tool_replay) {
         if (stats) {
@@ -611,14 +630,15 @@ static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int 
 
 
 
-void assign_tool_call_ids(server *s, tool_calls *calls, api_style api) {
+void server::assign_tool_call_ids(tool_calls *calls, api_style api) {
+    auto *s = this;
     if (!calls) return;
     for (int i = 0; i < calls->len; i++) {
         if (calls->v[i].id && calls->v[i].id[0]) continue;
         char id[64];
         for (;;) {
             random_tool_id(id, sizeof(id), api);
-            if (!tool_calls_contains_id(calls, id, i) && !tool_memory_has_id(s, id)) break;
+            if (!tool_calls_contains_id(calls, id, i) && !s->tool_memory_has_id(id)) break;
         }
         calls->v[i].id = xstrdup(id);
     }
