@@ -95,6 +95,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+#ifdef __APPLE__
+/* Metal only: cumulative GPU busy milliseconds over all waited command
+ * buffers.  Deltas across ds4_gpu_end_commands() give exact per-stage GPU
+ * time for diagnostics, independent of host-side sync overhead. */
+double ds4_gpu_busy_accum_ms(void);
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

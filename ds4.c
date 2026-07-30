@@ -49049,6 +49049,84 @@ static bool dflash_graph_draft_block(
     return ok;
 }
 
+/* Diagnostic stage timer for the Laguna decode graph.  When
+ * DS4_LAGUNA_DECODE_STAGE_PROFILE is set, every stage boundary submits and
+ * drains the pending command batch so per-stage wall time becomes visible, at
+ * the cost of one extra synchronization per boundary.  The synthetic "sync"
+ * stage measures an empty boundary: subtract its average from a small stage to
+ * approximate its pure GPU time. */
+typedef struct {
+    const char *name;
+    double      total_ms;
+    double      busy_ms;
+} laguna_stage_profile_slot;
+
+static laguna_stage_profile_slot g_laguna_stage_slots[24];
+static uint32_t g_laguna_stage_tokens;
+static double   g_laguna_stage_t0;
+static double   g_laguna_stage_busy0;
+
+static double laguna_stage_busy_ms(void) {
+#ifdef __APPLE__
+    return ds4_gpu_busy_accum_ms();
+#else
+    return 0.0;
+#endif
+}
+
+static bool laguna_stage_profile_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_LAGUNA_DECODE_STAGE_PROFILE") != NULL;
+    return enabled == 1;
+}
+
+static bool laguna_stage_mark(const char *name) {
+    if (!laguna_stage_profile_enabled()) return true;
+    if (!ds4_gpu_commands_active() || ds4_gpu_end_commands() == 0) return false;
+    const double now = now_sec() * 1000.0;
+    const double busy = laguna_stage_busy_ms();
+    const size_t n_slots =
+        sizeof(g_laguna_stage_slots) / sizeof(g_laguna_stage_slots[0]);
+    for (size_t i = 0; i < n_slots; i++) {
+        laguna_stage_profile_slot *slot = &g_laguna_stage_slots[i];
+        if (!slot->name) slot->name = name;
+        if (slot->name == name || strcmp(slot->name, name) == 0) {
+            slot->total_ms += now - g_laguna_stage_t0;
+            slot->busy_ms += busy - g_laguna_stage_busy0;
+            break;
+        }
+    }
+    g_laguna_stage_t0 = now;
+    g_laguna_stage_busy0 = busy;
+    return ds4_gpu_begin_commands() != 0;
+}
+
+static void laguna_stage_token_done(void) {
+    if (!laguna_stage_profile_enabled()) return;
+    const uint32_t window = 16u;
+    if (++g_laguna_stage_tokens % window) return;
+    const size_t n_slots =
+        sizeof(g_laguna_stage_slots) / sizeof(g_laguna_stage_slots[0]);
+    double total = 0.0;
+    double busy_total = 0.0;
+    fprintf(stderr,
+            "ds4: laguna decode stages, wall/gpu ms per token over %u tokens:\n",
+            window);
+    for (size_t i = 0; i < n_slots; i++) {
+        laguna_stage_profile_slot *slot = &g_laguna_stage_slots[i];
+        if (!slot->name) break;
+        fprintf(stderr, "  %-10s %8.3f %8.3f\n", slot->name,
+                slot->total_ms / (double)window,
+                slot->busy_ms / (double)window);
+        total += slot->total_ms;
+        busy_total += slot->busy_ms;
+        slot->total_ms = 0.0;
+        slot->busy_ms = 0.0;
+    }
+    fprintf(stderr, "  %-10s %8.3f %8.3f\n", "total",
+            total / (double)window, busy_total / (double)window);
+}
+
 static bool laguna_graph_forward_token(
         ds4_laguna_gpu_graph *g,
         const ds4_model      *model,
@@ -49062,6 +49140,10 @@ static bool laguna_graph_forward_token(
         return false;
     }
 
+    if (laguna_stage_profile_enabled()) {
+        g_laguna_stage_t0 = now_sec() * 1000.0;
+        g_laguna_stage_busy0 = laguna_stage_busy_ms();
+    }
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -49073,6 +49155,7 @@ static bool laguna_graph_forward_token(
                                               (uint32_t)token,
                                               DS4_N_EMBD) != 0;
     }
+    if (ok) ok = laguna_stage_mark("embed");
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -49103,6 +49186,7 @@ static bool laguna_graph_forward_token(
                                              l->attn_norm->abs_offset,
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
+        if (ok) ok = laguna_stage_mark("attn_norm") && laguna_stage_mark("sync");
         if (ok) {
             if (l->attn_q->type == DS4_TENSOR_F16) {
                 ok = ds4_gpu_laguna_qkvg_f16_tensor(
@@ -49173,6 +49257,7 @@ static bool laguna_graph_forward_token(
 #endif
             }
         }
+        if (ok) ok = laguna_stage_mark("qkvg");
         if (ok) {
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
                     g->q,
@@ -49196,6 +49281,7 @@ static bool laguna_graph_forward_token(
                     beta_slow,
                     DS4_RMS_EPS) != 0;
         }
+        if (ok) ok = laguna_stage_mark("qk_rope");
         uint32_t key_count = pos + 1u;
         if (key_count > g->cache_cap[il]) key_count = g->cache_cap[il];
         const uint32_t key_start = pos + 1u - key_count;
@@ -49217,6 +49303,7 @@ static bool laguna_graph_forward_token(
                     DS4_N_HEAD_DIM,
                     1.0f / sqrtf((float)DS4_N_HEAD_DIM)) != 0;
         }
+        if (ok) ok = laguna_stage_mark("attn");
         if (ok) {
             if (l->attn_output->type == DS4_TENSOR_F16) {
                 ok = ds4_gpu_laguna_attn_output_residual_f16_tensor(
@@ -49240,6 +49327,7 @@ static bool laguna_graph_forward_token(
                                         DS4_N_EMBD) != 0;
             }
         }
+        if (ok) ok = laguna_stage_mark("attn_out");
         if (ok) {
             ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm,
                                                  g->after_attn,
@@ -49249,6 +49337,7 @@ static bool laguna_graph_forward_token(
                                                  DS4_N_EMBD,
                                                  DS4_RMS_EPS) != 0;
         }
+        if (ok) ok = laguna_stage_mark("ffn_norm");
         if (ok && il < DS4_N_LEADING_DENSE) {
             ok = laguna_graph_matmul(g->ffn_gate,
                                      model,
@@ -49281,6 +49370,7 @@ static bool laguna_graph_forward_token(
                                         g->ffn_out,
                                         DS4_N_EMBD) != 0;
             }
+            if (ok) ok = laguna_stage_mark("dense");
         } else if (ok) {
             ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
                                             model->map,
@@ -49303,6 +49393,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         DS4_EXPERT_WEIGHT_SCALE) != 0;
             }
+            if (ok) ok = laguna_stage_mark("router");
 
             const uint64_t gate_row_bytes =
                 routed_expert_row_bytes(l->ffn_gate_exps);
@@ -49424,6 +49515,7 @@ static bool laguna_graph_forward_token(
                                              1);
                 }
             }
+            if (ok) ok = laguna_stage_mark("moe");
             if (ok) {
                 ok = ds4_gpu_add3_tensor(g->next,
                                          g->after_attn,
@@ -49431,6 +49523,7 @@ static bool laguna_graph_forward_token(
                                          g->shared_out,
                                          DS4_N_EMBD) != 0;
             }
+            if (ok) ok = laguna_stage_mark("resid");
         }
 
         if (ok) {
@@ -49458,6 +49551,7 @@ static bool laguna_graph_forward_token(
                                      g->output_norm,
                                      1);
         }
+        if (ok) ok = laguna_stage_mark("head");
     }
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
     if (ok && logits_out) {
@@ -49466,6 +49560,7 @@ static bool laguna_graph_forward_token(
                                  logits_out,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok) laguna_stage_token_done();
     return ok;
 }
 

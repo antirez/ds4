@@ -926,12 +926,17 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+double ds4_gpu_busy_accum_ms(void) {
+    return g_gpu_busy_accum * 1000.0;
+}
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
-    if (getenv("DS4_METAL_GPU_BUSY_PROFILE")) {
+    {
         const double busy = cb.GPUEndTime - cb.GPUStartTime;
         if (busy > 0) g_gpu_busy_accum += busy;
-        if ((++g_gpu_busy_cbs % 64u) == 0u) {
+        if (getenv("DS4_METAL_GPU_BUSY_PROFILE") &&
+            (++g_gpu_busy_cbs % 64u) == 0u) {
             fprintf(stderr, "ds4: gpu busy accum %.1f ms over %llu cbs\n",
                     g_gpu_busy_accum * 1000.0,
                     (unsigned long long)g_gpu_busy_cbs);
