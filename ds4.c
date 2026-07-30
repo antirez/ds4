@@ -48206,6 +48206,40 @@ static bool laguna_graph_routed_moe_decode_rows(
     const uint64_t weight_bytes =
         (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
 
+    /* Diagnostic: measure how many routed-expert selections are shared
+     * between the rows of a multi-row decode (DFlash verification).  The
+     * unique/total ratio bounds what expert-level weight-read dedup could
+     * save.  Costs one sync per layer; diagnostics only. */
+    if (n_rows > 1u && getenv("DS4_LAGUNA_MOE_OVERLAP_STATS") != NULL &&
+        ds4_gpu_commands_active() && ds4_gpu_end_commands() != 0) {
+        int32_t sel[DS4_DFLASH_BLOCK_SIZE * 32];
+        const uint32_t n_sel = n_rows * DS4_N_EXPERT_USED;
+        if (n_sel <= sizeof(sel) / sizeof(sel[0]) &&
+            ds4_gpu_tensor_read(g->router_selected, 0, sel,
+                                (uint64_t)n_sel * sizeof(int32_t)) != 0) {
+            static uint64_t total_pairs, unique_pairs, calls;
+            uint32_t unique = 0;
+            for (uint32_t i = 0; i < n_sel; i++) {
+                bool seen = false;
+                for (uint32_t j = 0; j < i && !seen; j++) {
+                    seen = sel[j] == sel[i];
+                }
+                if (!seen) unique++;
+            }
+            total_pairs += n_sel;
+            unique_pairs += unique;
+            if ((++calls % 470u) == 0u) {
+                fprintf(stderr,
+                        "ds4: laguna verify expert overlap: unique %.1f%% "
+                        "of %llu selections over %llu layer passes\n",
+                        100.0 * (double)unique_pairs / (double)total_pairs,
+                        (unsigned long long)total_pairs,
+                        (unsigned long long)calls);
+            }
+        }
+        if (ds4_gpu_begin_commands() == 0) return false;
+    }
+
 #if defined(__APPLE__)
     if (l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
@@ -68767,6 +68801,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         }
     }
 
+    const double conf_done = now_sec();
     verify_tokens[0] = first_token;
     ds4_laguna_feature_capture capture =
         ds4_session_dflash_capture(s, 0, n_rows);
@@ -68785,6 +68820,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
             NULL,
             NULL,
             0);
+    const double verify_encoded = now_sec();
     bool inject_ok = false;
     if (verify_ok) {
         inject_ok = ds4_session_dflash_finish_capture(s, pos0, n_rows);
@@ -68804,6 +68840,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
                 (uint64_t)n_rows * sizeof(draft_top[0])) != 0;
         }
     }
+    const double reads_done = now_sec();
     if (!verify_ok || !inject_ok || !target_read_ok || !draft_read_ok) {
         (void)laguna_graph_spec_restore(
             &s->laguna_graph, pos0, 0, n_rows);
@@ -68848,6 +68885,31 @@ static int ds4_session_eval_dflash_speculative_argmax(
     s->dflash_synced = true;
 
     const double verify_done = now_sec();
+    if (getenv("DS4_DFLASH_TIMING") != NULL) {
+        /* Phase attribution: draft = snapshot + draft-block encode/submit;
+         * conf = wait for draft + confidence readback; enc = verifier encode
+         * (near zero when the pre-encoded verifier is committed); read =
+         * verifier execution + argmax readback; tail = full-row logits read
+         * + ring restore.  Sample adds the host-side pick from logits. */
+        static double acc[6];
+        static uint32_t acc_cycles;
+        acc[0] += (submit_done - cycle_t0) * 1000.0;
+        acc[1] += (conf_done - submit_done) * 1000.0;
+        acc[2] += (verify_encoded - conf_done) * 1000.0;
+        acc[3] += (reads_done - verify_encoded) * 1000.0;
+        acc[4] += (verify_done - reads_done) * 1000.0;
+        acc[5] += s->last_sample_ms;
+        if ((++acc_cycles % 64u) == 0u) {
+            fprintf(stderr,
+                    "ds4: DFlash phases ms/cycle over %u cycles: "
+                    "draft %.2f conf %.2f enc %.2f read %.2f tail %.2f "
+                    "sample %.2f\n",
+                    64u,
+                    acc[0] / 64.0, acc[1] / 64.0, acc[2] / 64.0,
+                    acc[3] / 64.0, acc[4] / 64.0, acc[5] / 64.0);
+            memset(acc, 0, sizeof(acc));
+        }
+    }
     /* CUDA installs the anonymous F16 support mapping lazily. Its first draft
      * cycle faults roughly 2 GiB of weights and is intentionally a one-time
      * warmup, not evidence that steady-state speculation is unprofitable. */
