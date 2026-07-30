@@ -639,6 +639,19 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* One-token Q8_0 matvec with a fused two-residual epilogue:
+ * out = res_a + res_b + W.x.  Metal only. */
+int ds4_gpu_matmul_q8_0_add2_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *res_a,
+        const ds4_gpu_tensor *res_b);
+
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,

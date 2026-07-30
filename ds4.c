@@ -49382,6 +49382,7 @@ static bool laguna_graph_forward_token(
             }
             if (ok) ok = laguna_stage_mark("dense");
         } else if (ok) {
+            bool resid_added = false;
             ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
                                             model->map,
                                             model->size,
@@ -49519,15 +49520,35 @@ static bool laguna_graph_forward_token(
                             0.0f) != 0;
                 }
                 if (ok) {
-                    ok = laguna_graph_matmul(g->shared_out,
-                                             model,
-                                             l->ffn_down_shexp,
-                                             g->ffn_mid,
-                                             1);
+#ifdef __APPLE__
+                    /* Fold the layer's three-way residual into the shared
+                     * down matvec epilogue: one dispatch writes the layer
+                     * output instead of a matvec plus an add3. */
+                    if (l->ffn_down_shexp->type == DS4_TENSOR_Q8_0) {
+                        ok = ds4_gpu_matmul_q8_0_add2_tensor(
+                                g->next,
+                                model->map,
+                                model->size,
+                                l->ffn_down_shexp->abs_offset,
+                                l->ffn_down_shexp->dim[0],
+                                l->ffn_down_shexp->dim[1],
+                                g->ffn_mid,
+                                g->after_attn,
+                                g->ffn_out) != 0;
+                        resid_added = ok;
+                    } else
+#endif
+                    {
+                        ok = laguna_graph_matmul(g->shared_out,
+                                                 model,
+                                                 l->ffn_down_shexp,
+                                                 g->ffn_mid,
+                                                 1);
+                    }
                 }
             }
             if (ok) ok = laguna_stage_mark("moe");
-            if (ok) {
+            if (ok && !resid_added) {
                 ok = ds4_gpu_add3_tensor(g->next,
                                          g->after_attn,
                                          g->ffn_out,
