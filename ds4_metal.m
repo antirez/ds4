@@ -32491,8 +32491,15 @@ int ds4_gpu_laguna_attention_prefill_tensor(
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* The register-resident tensor-unit kernel replaces the serial
+         * per-key simdgroup walk whenever the M5 tensor path is live. */
+        id<MTLComputePipelineState> nax_pipeline =
+            ds4_gpu_mpp_available() && head_dim == 128u ?
+            ds4_gpu_get_pipeline("kernel_laguna_attention_prefill_nax_f16") :
+            nil;
         enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:attention_pipeline];
+        [enc setComputePipelineState:nax_pipeline ? nax_pipeline
+                                                  : attention_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
         [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:2];
@@ -32503,12 +32510,19 @@ int ds4_gpu_laguna_attention_prefill_tensor(
         [enc setBuffer:stagedvaluebuf offset:ds4_gpu_tensor_offset(staged_value)
                 atIndex:6];
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:7];
-        const uint32_t attention_groups = use_gqa6 ?
-            n_head / 6u : use_gqa3 ? n_head / 3u : n_head;
-        [enc dispatchThreadgroups:MTLSizeMake(attention_groups,
-                                              n_tokens,
-                                              1)
-             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (nax_pipeline) {
+            [enc dispatchThreadgroups:MTLSizeMake((n_tokens + 63u) / 64u,
+                                                  n_head,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            const uint32_t attention_groups = use_gqa6 ?
+                n_head / 6u : use_gqa3 ? n_head / 3u : n_head;
+            [enc dispatchThreadgroups:MTLSizeMake(attention_groups,
+                                                  n_tokens,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
 
         enc = ds4_gpu_compute_encoder(cb);

@@ -1417,3 +1417,442 @@ kernel void kernel_laguna_q6_K_matmul_f32(
         }
     }
 }
+
+#ifdef DS4_METAL_HAS_TENSOR
+/*
+ * Register-resident FlashAttention for Laguna prefill on the M5 tensor
+ * units.  The fragment machinery is a compact port of MLX's steel NAX
+ * attention support (Copyright © 2025 Apple Inc., MIT license): 16x16
+ * fragments live in registers, matmuls run through
+ * mpp::tensor_ops::matmul2d<16,32,16> per simdgroup, and the online
+ * softmax reduces rows with two lane shuffles.  No threadgroup memory is
+ * used anywhere.
+ *
+ * Laguna specifics on top of the steel kernel: keys arrive as up to three
+ * linear segments (the full-attention ring is linear, the sliding-window
+ * ring splits at its wrap point, and the current chunk lives in the staging
+ * buffers), masking applies causality plus the 512-token window in absolute
+ * positions, and the learned per-head gate multiplies the normalized output
+ * in the epilogue.
+ */
+
+#define STEEL_CONST static constant constexpr const
+
+namespace ds4nax {
+
+constant constexpr float kNegInf = -3.402823466e38f;
+
+struct Frag {
+    STEEL_CONST short kFragRows = 16;
+    STEEL_CONST short kFragCols = 16;
+    STEEL_CONST short kElemsPerFrag = 8;
+    STEEL_CONST short kElemRows = 2;
+    STEEL_CONST short kElemCols = 4;
+    STEEL_CONST short kElemRowsJump = 8;
+
+    template <typename U>
+    using frag_t = metal::vec<U, kElemsPerFrag>;
+
+    METAL_FUNC static short2 get_coord() {
+        const ushort lane = __metal_get_thread_index_in_simdgroup(ushort());
+        const short qid = lane >> 2;
+        const short fm = ((qid & 4) | ((lane >> 1) & 3));
+        const short fn = ((qid & 2) | (lane & 1)) * 4;
+        return short2{fn, fm};
+    }
+
+    template <typename T, typename U>
+    METAL_FUNC static void load(
+            thread frag_t<T> &dst,
+            device const U *src,
+            const int ld,
+            const int off_x,
+            const int off_y) {
+        const short2 sc = get_coord();
+        src += (sc.y + off_x) * ld + sc.x + off_y;
+        FOR_UNROLL (short i = 0; i < kElemRows; i++) {
+            FOR_UNROLL (short j = 0; j < kElemCols; j++) {
+                dst[i * kElemCols + j] =
+                    static_cast<T>(src[i * kElemRowsJump * ld + j]);
+            }
+        }
+    }
+
+    template <typename T, typename U>
+    METAL_FUNC static void load_rows(
+            thread frag_t<T> &dst,
+            device const U *src,
+            const int ld,
+            const int lim_x,
+            const int off_x,
+            const int off_y) {
+        const short2 sc = get_coord();
+        src += (sc.y + off_x) * ld + sc.x + off_y;
+        const int lx = lim_x - off_x - sc.y;
+        FOR_UNROLL (short i = 0; i < kElemRows; i++) {
+            if (i * kElemRowsJump < lx) {
+                FOR_UNROLL (short j = 0; j < kElemCols; j++) {
+                    dst[i * kElemCols + j] =
+                        static_cast<T>(src[i * kElemRowsJump * ld + j]);
+                }
+            } else {
+                FOR_UNROLL (short j = 0; j < kElemCols; j++) {
+                    dst[i * kElemCols + j] = T(0);
+                }
+            }
+        }
+    }
+
+    template <typename T, typename U>
+    METAL_FUNC static void store_rows(
+            const thread frag_t<T> &src,
+            device U *dst,
+            const int ld,
+            const int lim_x,
+            const int off_x,
+            const int off_y) {
+        const short2 sc = get_coord();
+        dst += (sc.y + off_x) * ld + sc.x + off_y;
+        const int lx = lim_x - off_x - sc.y;
+        FOR_UNROLL (short i = 0; i < kElemRows; i++) {
+            if (i * kElemRowsJump < lx) {
+                FOR_UNROLL (short j = 0; j < kElemCols; j++) {
+                    dst[i * kElemRowsJump * ld + j] =
+                        static_cast<U>(src[i * kElemCols + j]);
+                }
+            }
+        }
+    }
+
+    template <typename Op, typename T>
+    METAL_FUNC static void row_reduce(
+            const thread frag_t<T> &inp,
+            thread T *reduced) {
+        FOR_UNROLL (short i = 0; i < kElemRows; i++) {
+            T tr = Op::apply(
+                Op::apply(inp[i * kElemCols + 0], inp[i * kElemCols + 1]),
+                Op::apply(inp[i * kElemCols + 2], inp[i * kElemCols + 3]));
+            T qr = simd_shuffle_xor(tr, ushort(1));
+            qr = Op::apply(tr, qr);
+            T sr = simd_shuffle_xor(qr, ushort(8));
+            sr = Op::apply(qr, sr);
+            reduced[i] = Op::apply(reduced[i], sr);
+        }
+    }
+
+    template <typename Op, typename T>
+    METAL_FUNC static void row_bin_op(
+            thread frag_t<T> &inp,
+            const thread T *rows) {
+        FOR_UNROLL (short i = 0; i < kElemRows; i++) {
+            FOR_UNROLL (short j = 0; j < kElemCols; j++) {
+                inp[i * kElemCols + j] =
+                    Op::apply(inp[i * kElemCols + j], rows[i]);
+            }
+        }
+    }
+
+    /* C[16x32] += A[16x16] x (B0|B1)[16x32], optionally B transposed. */
+    template <typename CT, typename AT, typename BT, bool tb>
+    METAL_FUNC static void mma(
+            thread frag_t<CT> &c0,
+            thread frag_t<CT> &c1,
+            const thread frag_t<AT> &a,
+            const thread frag_t<BT> &b0,
+            const thread frag_t<BT> &b1,
+            metal::bool_constant<tb>) {
+        constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 16, false, tb, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+        auto ca = op.template get_left_input_cooperative_tensor<AT, BT, CT>();
+        auto cb = op.template get_right_input_cooperative_tensor<AT, BT, CT>();
+        auto cc = op.template get_destination_cooperative_tensor<
+            decltype(ca), decltype(cb), CT>();
+        FOR_UNROLL (short i = 0; i < kElemsPerFrag; i++) {
+            ca[i] = a[i];
+        }
+        FOR_UNROLL (short i = 0; i < kElemsPerFrag; i++) {
+            cb[i] = b0[i];
+            cb[kElemsPerFrag + i] = b1[i];
+        }
+        FOR_UNROLL (short i = 0; i < kElemsPerFrag; i++) {
+            cc[i] = c0[i];
+            cc[kElemsPerFrag + i] = c1[i];
+        }
+        op.run(ca, cb, cc);
+        FOR_UNROLL (short i = 0; i < kElemsPerFrag; i++) {
+            c0[i] = cc[i];
+            c1[i] = cc[kElemsPerFrag + i];
+        }
+    }
+};
+
+struct MaxOp {
+    template <typename T>
+    METAL_FUNC static T apply(T x, T y) { return metal::max(x, y); }
+};
+struct SumOp {
+    template <typename T>
+    METAL_FUNC static T apply(T x, T y) { return x + y; }
+};
+struct MulOp {
+    template <typename T>
+    METAL_FUNC static T apply(T x, T y) { return x * y; }
+};
+struct ExpSubOp {
+    template <typename T>
+    METAL_FUNC static T apply(T x, T y) { return metal::fast::exp2(x - y); }
+};
+
+} // namespace ds4nax
+
+/* One threadgroup covers 64 query rows of one head: four simdgroups of 16
+ * rows each, fully warp-autonomous except for two scheduling barriers that
+ * every warp reaches the same number of times (loop bounds derive from the
+ * threadgroup's query range; per-row precision comes from masking). */
+kernel void kernel_laguna_attention_prefill_nax_f16(
+        constant ds4_metal_args_laguna_prefill_attention &args,
+        device const float *q,
+        device const float *gate,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device const half  *staged_key,
+        device const half  *staged_value,
+        device float       *out,
+        ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    using Frag = ds4nax::Frag;
+    constexpr short BQ = 64;
+    constexpr short BK = 32;
+    constexpr short TD = 8;   /* 128 / 16 head-dim fragments */
+    constexpr short TK = 2;   /* 32 / 16 key fragments per block */
+    using frag_f = Frag::frag_t<float>;
+    using frag_h = Frag::frag_t<half>;
+
+    const uint head = tgpig.y;
+    if (head >= args.n_head || args.head_dim != 128u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const int kv_ld = (int)(args.n_head_kv * args.head_dim);
+    const int q_ld = (int)(args.n_head * args.head_dim);
+
+    const int tile_row0 = (int)tgpig.x * BQ + 16 * (int)simd_group_id;
+    device const float *Qw = q + (uint64_t)tile_row0 * q_ld +
+                             (uint64_t)head * args.head_dim;
+    const int rows_lim = (int)args.n_tokens - tile_row0;
+    const int q_abs0 = (int)args.pos0 + tile_row0;
+
+    /* Threadgroup-uniform query range for loop bounds. */
+    const int tg_q_lo = (int)args.pos0 + (int)tgpig.x * BQ;
+    const int tg_q_hi = (int)args.pos0 +
+        metal::min((int)tgpig.x * BQ + BQ, (int)args.n_tokens) - 1;
+    const int window = args.cache_cap == 512u ? 512 : 0x40000000;
+
+    const float scale2 = args.scale * 1.44269504089f;
+
+    frag_f Ofrag[TD];
+    FOR_UNROLL (short i = 0; i < TD; i++) {
+        Ofrag[i] = frag_f(0.0f);
+    }
+    float2 max_score = float2(ds4nax::kNegInf);
+    float2 sum_score = float2(0.0f);
+
+    /* Key/value segments in absolute-position order. */
+    device const half *seg_k[3];
+    device const half *seg_v[3];
+    int seg_abs[3];
+    int seg_len[3];
+    short n_segs = 0;
+    if (args.cache_cap != 512u) {
+        /* Full attention: the ring never wraps during prefill. */
+        if (args.pos0 != 0u) {
+            seg_k[n_segs] = key_cache + (uint64_t)kv_head * args.head_dim;
+            seg_v[n_segs] = value_cache + (uint64_t)kv_head * args.head_dim;
+            seg_abs[n_segs] = 0;
+            seg_len[n_segs] = (int)args.pos0;
+            n_segs++;
+        }
+    } else {
+        const int h = metal::min((int)args.pos0, 512);
+        if (h > 0) {
+            const int base_abs = (int)args.pos0 - h;
+            const int slot0 = base_abs % 512;
+            const int part1 = metal::min(h, 512 - slot0);
+            seg_k[n_segs] = key_cache + (uint64_t)slot0 * kv_ld +
+                            (uint64_t)kv_head * args.head_dim;
+            seg_v[n_segs] = value_cache + (uint64_t)slot0 * kv_ld +
+                            (uint64_t)kv_head * args.head_dim;
+            seg_abs[n_segs] = base_abs;
+            seg_len[n_segs] = part1;
+            n_segs++;
+            if (h > part1) {
+                seg_k[n_segs] = key_cache + (uint64_t)kv_head * args.head_dim;
+                seg_v[n_segs] = value_cache + (uint64_t)kv_head * args.head_dim;
+                seg_abs[n_segs] = base_abs + part1;
+                seg_len[n_segs] = h - part1;
+                n_segs++;
+            }
+        }
+    }
+    seg_k[n_segs] = staged_key + (uint64_t)kv_head * args.head_dim;
+    seg_v[n_segs] = staged_value + (uint64_t)kv_head * args.head_dim;
+    seg_abs[n_segs] = (int)args.pos0;
+    seg_len[n_segs] = (int)args.n_tokens;
+    n_segs++;
+
+    const short2 sc = Frag::get_coord();
+    const short sm = sc.y;
+    const short sn = sc.x;
+
+    for (short seg = 0; seg < n_segs; seg++) {
+        const int s_abs = seg_abs[seg];
+        const int s_len = seg_len[seg];
+        /* Block culling against the threadgroup's query range. */
+        int kb_start = 0;
+        if (window != 0x40000000) {
+            kb_start = metal::max(0, (tg_q_lo - window + 1 - s_abs) / BK);
+        }
+        int kb_lim = (tg_q_hi - s_abs) / BK + 1;
+        kb_lim = metal::min(kb_lim, (s_len + BK - 1) / BK);
+        if (kb_lim <= kb_start) continue;
+
+        device const half *Kw = seg_k[seg] + (uint64_t)kb_start * BK * kv_ld;
+        device const half *Vw = seg_v[seg] + (uint64_t)kb_start * BK * kv_ld;
+
+        for (int kb = kb_start; kb < kb_lim; kb++) {
+            const int col_abs0 = s_abs + kb * BK;
+            const int col_in_seg0 = kb * BK;
+            const bool tail_k = col_in_seg0 + BK > s_len;
+
+            /* S = Q @ K^T in the exp2 domain. */
+            frag_f Sfrag[TK];
+            FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                Sfrag[ik] = frag_f(0.0f);
+            }
+            FOR_UNROLL (short id = 0; id < TD; id++) {
+                frag_h Qf;
+                frag_h K0;
+                frag_h K1;
+                if (rows_lim < 16) {
+                    Frag::load_rows(Qf, Qw, q_ld, rows_lim, 0, id * 16);
+                } else {
+                    Frag::load(Qf, Qw, q_ld, 0, id * 16);
+                }
+                if (tail_k) {
+                    Frag::load_rows(K0, Kw, kv_ld, s_len - col_in_seg0,
+                                    0, id * 16);
+                    Frag::load_rows(K1, Kw, kv_ld, s_len - col_in_seg0,
+                                    16, id * 16);
+                } else {
+                    Frag::load(K0, Kw, kv_ld, 0, id * 16);
+                    Frag::load(K1, Kw, kv_ld, 16, id * 16);
+                }
+                Frag::mma(Sfrag[0], Sfrag[1], Qf, K0, K1,
+                          metal::bool_constant<true>{});
+            }
+            FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                FOR_UNROLL (short ii = 0; ii < Frag::kElemsPerFrag; ii++) {
+                    Sfrag[ik][ii] *= scale2;
+                }
+            }
+
+            /* Causality, sliding window, and segment tail in one mask. */
+            const bool needs_causal = col_abs0 + BK - 1 > tg_q_lo;
+            const bool needs_window = window != 0x40000000 &&
+                col_abs0 < tg_q_hi - window + 1;
+            if (needs_causal || needs_window || tail_k) {
+                FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                    FOR_UNROLL (short ii = 0; ii < Frag::kElemRows; ii++) {
+                        const int r = q_abs0 + sm + ii * Frag::kElemRowsJump;
+                        FOR_UNROLL (short jj = 0; jj < Frag::kElemCols; jj++) {
+                            const int c = col_abs0 + ik * 16 + sn + jj;
+                            const int cs = col_in_seg0 + ik * 16 + sn + jj;
+                            const bool valid =
+                                c <= r && r - c < window && cs < s_len;
+                            const short loc = ii * Frag::kElemCols + jj;
+                            Sfrag[ik][loc] =
+                                valid ? Sfrag[ik][loc] : ds4nax::kNegInf;
+                        }
+                    }
+                }
+            }
+
+            /* Online softmax. */
+            float2 new_max = max_score;
+            FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                Frag::row_reduce<ds4nax::MaxOp>(Sfrag[ik],
+                                                (thread float *)&new_max);
+            }
+            FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                Frag::row_bin_op<ds4nax::ExpSubOp>(Sfrag[ik],
+                                                   (thread float *)&new_max);
+            }
+            float2 factor;
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                factor[i] = metal::fast::exp2(max_score[i] - new_max[i]);
+                max_score[i] = new_max[i];
+                sum_score[i] *= factor[i];
+            }
+            FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                Frag::row_reduce<ds4nax::SumOp>(Sfrag[ik],
+                                                (thread float *)&sum_score);
+            }
+            FOR_UNROLL (short id = 0; id < TD; id++) {
+                Frag::row_bin_op<ds4nax::MulOp>(Ofrag[id],
+                                                (thread float *)&factor);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            /* O += P @ V. */
+            FOR_UNROLL (short id = 0; id < TD; id += 2) {
+                if (id == 4) {
+                    threadgroup_barrier(mem_flags::mem_none);
+                }
+                FOR_UNROLL (short ik = 0; ik < TK; ik++) {
+                    frag_h V0;
+                    frag_h V1;
+                    if (tail_k) {
+                        Frag::load_rows(V0, Vw, kv_ld, s_len - col_in_seg0,
+                                        ik * 16, id * 16);
+                        Frag::load_rows(V1, Vw, kv_ld, s_len - col_in_seg0,
+                                        ik * 16, id * 16 + 16);
+                    } else {
+                        Frag::load(V0, Vw, kv_ld, ik * 16, id * 16);
+                        Frag::load(V1, Vw, kv_ld, ik * 16, id * 16 + 16);
+                    }
+                    Frag::mma(Ofrag[id], Ofrag[id + 1], Sfrag[ik], V0, V1,
+                              metal::bool_constant<false>{});
+                }
+            }
+
+            Kw += BK * kv_ld;
+            Vw += BK * kv_ld;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_none);
+
+    /* Normalize and apply the learned per-head softplus gate. */
+    float2 rcp;
+    FOR_UNROLL (short i = 0; i < 2; i++) {
+        const int t = tile_row0 + sm + i * Frag::kElemRowsJump;
+        float gate_scale = 1.0f;
+        if (t < (int)args.n_tokens) {
+            const float gv = gate[(uint64_t)t * args.n_head + head];
+            gate_scale = gv > 20.0f ? gv : metal::log(1.0f + metal::exp(gv));
+        }
+        rcp[i] = sum_score[i] > 0.0f ? gate_scale / sum_score[i] : 0.0f;
+    }
+    FOR_UNROLL (short id = 0; id < TD; id++) {
+        Frag::row_bin_op<ds4nax::MulOp>(Ofrag[id], (thread float *)&rcp);
+    }
+
+    device float *Ow = out + (uint64_t)tile_row0 * q_ld +
+                       (uint64_t)head * args.head_dim;
+    FOR_UNROLL (short id = 0; id < TD; id++) {
+        Frag::store_rows(Ofrag[id], Ow, q_ld, rows_lim, 0, id * 16);
+    }
+}
+#endif
