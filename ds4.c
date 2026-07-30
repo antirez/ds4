@@ -49080,6 +49080,16 @@ static bool laguna_stage_profile_enabled(void) {
     return enabled == 1;
 }
 
+static uint32_t laguna_decode_flush_stride(void) {
+    static int stride = -1;
+    if (stride < 0) {
+        const char *env = getenv("DS4_LAGUNA_DECODE_FLUSH_STRIDE");
+        stride = env ? atoi(env) : 6;
+        if (stride < 0) stride = 0;
+    }
+    return (uint32_t)stride;
+}
+
 static bool laguna_stage_mark(const char *name) {
     if (!laguna_stage_profile_enabled()) return true;
     if (!ds4_gpu_commands_active() || ds4_gpu_end_commands() == 0) return false;
@@ -49380,6 +49390,7 @@ static bool laguna_graph_forward_token(
                                             DS4_N_EXPERT,
                                             g->ffn_norm,
                                             1) != 0;
+            if (ok) ok = laguna_stage_mark("router_mm");
             if (ok) {
                 ok = ds4_gpu_glm_router_select_tensor(
                         g->router_selected,
@@ -49530,6 +49541,15 @@ static bool laguna_graph_forward_token(
             ds4_gpu_tensor *tmp = g->cur;
             g->cur = g->next;
             g->next = tmp;
+        }
+        /* Commit encoded layers early so the GPU starts this token while the
+         * host is still encoding the remaining layers.  The front-loaded
+         * schedule matters: the widest GPU idle gap is at the start of the
+         * token, before anything has been submitted.  The final
+         * end_commands drains these pipelined submissions. */
+        if (ok && laguna_decode_flush_stride() != 0 &&
+            (il == 0 || il % laguna_decode_flush_stride() == 0)) {
+            ok = ds4_gpu_flush_commands() != 0;
         }
     }
 
