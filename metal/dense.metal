@@ -490,8 +490,8 @@ kernel void kernel_mul_mv_q8_0_f32_add2(
 // have independent weight ranges and output extents. Keep the standalone Q8_0
 // lane/block traversal and two-stage reduction verbatim for each bank; only
 // the activation load and threadgroup scheduling are shared.
-[[host_name("kernel_mul_mv_q8_0_f32_pair")]]
-kernel void kernel_mul_mv_q8_0_f32_pair(
+template<short NR0>
+void kernel_mul_mv_q8_0_f32_pair_impl(
         constant ds4_metal_args_mul_mv & args0,
         constant ds4_metal_args_mul_mv & args1,
         device const char * src0_a,
@@ -499,14 +499,13 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
         device const char * src1,
         device       char * dst_a,
         device       char * dst_b,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
-    constexpr short NR0 = N_R0_Q8_0;
 
     const int nb = args0.ne00 / QK8_0;
     const int r0 = tgpig.x * NR0;
@@ -608,6 +607,42 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
             }
         }
     }
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_pair")]]
+kernel void kernel_mul_mv_q8_0_f32_pair(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_pair_impl<N_R0_Q8_0>(
+        args0, args1, src0_a, src0_b, src1, dst_a, dst_b,
+        shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_pair_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_pair_r4(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_pair_impl<4>(
+        args0, args1, src0_a, src0_b, src1, dst_a, dst_b,
+        shmem, tgpig, tiisg, sgitg);
 }
 
 // Decode shared-expert gate/up projections followed by SwiGLU:

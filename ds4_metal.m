@@ -17496,8 +17496,10 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_q8_0_matvec_args args1 = ds4_gpu_make_q8_0_mv_args(in_dim, out1_dim);
         args0.nr0 = dispatch0.nr0;
         args1.nr0 = dispatch1.nr0;
+        const char *pair_fn = dispatch0.nr0 == 4 ?
+            "kernel_mul_mv_q8_0_f32_pair_r4" : "kernel_mul_mv_q8_0_f32_pair";
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_pair", dispatch0.nsg);
+            ds4_gpu_get_mul_mv_pipeline(pair_fn, dispatch0.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
