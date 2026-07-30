@@ -48118,6 +48118,30 @@ static bool laguna_graph_matmul(
         const ds4_gpu_tensor *x,
         uint64_t              n_tokens) {
     if (!out || !model || !weight || !x || weight->ndim < 2) return false;
+#ifdef __APPLE__
+    /* The Metal 4 tensor matmul path requires 32-row batches, so a prompt of
+     * arbitrary length would fall back entirely to the legacy kernels.
+     * Split off the aligned head; only the sub-32-row tail takes the legacy
+     * path. */
+    if (n_tokens > 32u && (n_tokens % 32u) != 0u) {
+        const uint64_t head_rows = n_tokens & ~31ull;
+        const uint64_t tail_rows = n_tokens - head_rows;
+        ds4_gpu_tensor *x_tail = ds4_gpu_tensor_view(
+                x,
+                head_rows * weight->dim[0] * sizeof(float),
+                tail_rows * weight->dim[0] * sizeof(float));
+        ds4_gpu_tensor *out_tail = ds4_gpu_tensor_view(
+                out,
+                head_rows * weight->dim[1] * sizeof(float),
+                tail_rows * weight->dim[1] * sizeof(float));
+        const bool ok = x_tail && out_tail &&
+            laguna_graph_matmul(out, model, weight, x, head_rows) &&
+            laguna_graph_matmul(out_tail, model, weight, x_tail, tail_rows);
+        ds4_gpu_tensor_free(out_tail);
+        ds4_gpu_tensor_free(x_tail);
+        return ok;
+    }
+#endif
 #ifdef DS4_ROCM_BUILD
     if (weight->type == DS4_TENSOR_Q8_0 && n_tokens == 1u) {
         return ds4_gpu_matmul_q8_0_decode_preq_tensor(
@@ -49095,7 +49119,7 @@ typedef struct {
     double      busy_ms;
 } laguna_stage_profile_slot;
 
-static laguna_stage_profile_slot g_laguna_stage_slots[24];
+static laguna_stage_profile_slot g_laguna_stage_slots[40];
 static uint32_t g_laguna_stage_tokens;
 static double   g_laguna_stage_t0;
 static double   g_laguna_stage_busy0;
@@ -49169,6 +49193,30 @@ static void laguna_stage_token_done(void) {
     }
     fprintf(stderr, "  %-10s %8.3f %8.3f\n", "total",
             total / (double)window, busy_total / (double)window);
+}
+
+/* Print and reset accumulated stage totals normalized by denom (e.g. the
+ * token count of a prefill chunk). */
+static void laguna_stage_dump(const char *what, double denom) {
+    if (!laguna_stage_profile_enabled() || denom <= 0.0) return;
+    const size_t n_slots =
+        sizeof(g_laguna_stage_slots) / sizeof(g_laguna_stage_slots[0]);
+    double total = 0.0;
+    double busy_total = 0.0;
+    fprintf(stderr, "ds4: laguna %s stages, wall/gpu ms per token:\n", what);
+    for (size_t i = 0; i < n_slots; i++) {
+        laguna_stage_profile_slot *slot = &g_laguna_stage_slots[i];
+        if (!slot->name) break;
+        if (slot->total_ms == 0.0 && slot->busy_ms == 0.0) continue;
+        fprintf(stderr, "  %-10s %8.4f %8.4f\n", slot->name,
+                slot->total_ms / denom, slot->busy_ms / denom);
+        total += slot->total_ms;
+        busy_total += slot->busy_ms;
+        slot->total_ms = 0.0;
+        slot->busy_ms = 0.0;
+    }
+    fprintf(stderr, "  %-10s %8.4f %8.4f\n", "total",
+            total / denom, busy_total / denom);
 }
 
 static bool laguna_graph_forward_token(
@@ -49880,6 +49928,15 @@ static bool laguna_graph_forward_batch(
      * lower-overhead single-command path. */
     const bool live_progress = display_progress != NULL && n_tokens >= 32u;
     const bool exact_q8_rows = row_argmax_out != NULL;
+    /* Stage attribution for plain prefill only: DFlash verification shares
+     * its command stream with the draft graph and must not be drained at
+     * stage boundaries. */
+    const bool stage_prof =
+        laguna_stage_profile_enabled() && gpu_draft_tokens == NULL;
+    if (stage_prof) {
+        g_laguna_stage_t0 = now_sec() * 1000.0;
+        g_laguna_stage_busy0 = laguna_stage_busy_ms();
+    }
     if (gpu_draft_tokens) {
         ok = gpu_draft_pipeline_ready;
     } else {
@@ -49960,6 +50017,7 @@ static bool laguna_graph_forward_batch(
                                                  n_tokens,
                                                  exact_q8_rows);
         }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_qkvg");
         if (ok && exact_q8_rows) {
             failed_stage = "Q/K norm/RoPE";
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
@@ -50027,6 +50085,7 @@ static bool laguna_graph_forward_batch(
                         DS4_RMS_EPS) != 0;
             }
         }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_rope");
         if (ok) {
             failed_stage = "causal attention";
             /* Ask the backend to replay decode's split-key attention per
@@ -50059,6 +50118,7 @@ static bool laguna_graph_forward_batch(
                     1.0f / sqrtf((float)DS4_N_HEAD_DIM),
                     split_decode_rows) != 0;
         }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_attn");
         if (ok) {
             failed_stage = "attention output projection";
             ok = laguna_graph_matmul_decode_rows(g->attn_out,
@@ -50068,6 +50128,7 @@ static bool laguna_graph_forward_batch(
                                                  n_tokens,
                                                  exact_q8_rows);
         }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_attn_out");
         if (ok) {
             failed_stage = "attention residual";
             ok = ds4_gpu_add_tensor(g->after_attn,
@@ -50087,6 +50148,7 @@ static bool laguna_graph_forward_batch(
                     n_tokens,
                     DS4_RMS_EPS) != 0;
         }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_norms");
         if (ok && il < DS4_N_LEADING_DENSE) {
             failed_stage = "dense FFN gate/up";
             ok = laguna_graph_matmul_decode_rows(g->ffn_gate,
@@ -50127,6 +50189,7 @@ static bool laguna_graph_forward_batch(
                                         g->ffn_out,
                                         (uint64_t)n_tokens * DS4_N_EMBD) != 0;
             }
+            if (ok && stage_prof) ok = laguna_stage_mark("p_dense");
         } else if (ok) {
             if (exact_q8_rows) {
                 failed_stage = "decode-row router";
@@ -50160,6 +50223,7 @@ static bool laguna_graph_forward_batch(
                         n_tokens) != 0;
             }
 
+        if (ok && stage_prof) ok = laguna_stage_mark("p_router");
             const uint64_t gate_row_bytes =
                 routed_expert_row_bytes(l->ffn_gate_exps);
             const uint64_t up_row_bytes =
@@ -50219,6 +50283,7 @@ static bool laguna_graph_forward_batch(
                             true) != 0;
                 }
             }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_moe");
             const bool exact_q8_shared =
                 exact_q8_rows &&
                 l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
@@ -50275,6 +50340,7 @@ static bool laguna_graph_forward_batch(
                          n_tokens,
                          exact_q8_rows);
             }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_shexp");
             if (ok) {
                 failed_stage = "MoE residual";
                 ok = ds4_gpu_add3_tensor(
@@ -50285,6 +50351,7 @@ static bool laguna_graph_forward_batch(
                         (uint64_t)n_tokens * DS4_N_EMBD) != 0;
             }
         }
+        if (ok && stage_prof) ok = laguna_stage_mark("p_resid");
 
         if (ok) {
             ds4_gpu_tensor *tmp = g->cur;
@@ -50394,6 +50461,7 @@ static bool laguna_graph_forward_batch(
                                      1);
         }
     }
+    if (ok && stage_prof) ok = laguna_stage_mark("p_head");
     /* A speculative cycle appends support-cache injection before completing
      * the shared snapshot/draft/verify command stream. */
     const bool defer_completion = ok && gpu_draft_tokens != NULL;
@@ -50402,6 +50470,7 @@ static bool laguna_graph_forward_batch(
         ok = false;
     }
     ds4_gpu_tensor_free(last);
+    if (ok && stage_prof) laguna_stage_dump("prefill", (double)n_tokens);
     if (ok && row_argmax_out && !defer_completion) {
         ok = ds4_gpu_tensor_read(g->spec_argmax,
                                  0,
