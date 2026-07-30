@@ -4576,6 +4576,11 @@ kernel void kernel_glm_attention_indexed_batch_q2_group4(
 
 // GLM-5.2 decode router for one token. Selection uses sigmoid(logit)+bias,
 // while route weights are normalized from the unbiased sigmoid probabilities.
+// The 256-lane bitonic sort keeps (score, index) pairs in registers: the 30
+// stages with stride < 32 exchange partners through simd_shuffle_xor with no
+// barrier at all, and only the 6 stride >= 32 stages round-trip threadgroup
+// memory.  Comparator and renormalization order match the previous
+// shared-memory sort exactly, so selection and weights are unchanged.
 kernel void kernel_glm_router_select_one(
         constant ds4_metal_args_glm_router_select_one & args,
         device const float *logits,
@@ -4586,8 +4591,8 @@ kernel void kernel_glm_router_select_one(
         threadgroup float *scratch [[threadgroup(0)]],
         uint token [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]]) {
-    threadgroup float *sel_scores = scratch;
-    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
+    threadgroup float *s_arr = scratch;
+    threadgroup int32_t *i_arr = (threadgroup int32_t *)(scratch + 256);
     device const float *token_logits = logits + (uint64_t)token * args.n_expert;
     device int32_t *token_selected = selected + (uint64_t)token * args.n_expert_used;
     device float *token_weights = weights + (uint64_t)token * args.n_expert_used;
@@ -4597,42 +4602,53 @@ kernel void kernel_glm_router_select_one(
     const bool active = tid < n_expert;
     const float p = active ? ds4_glm_router_sigmoid(token_logits[tid]) : 0.0f;
     if (active) token_probs[tid] = p;
-    sel_scores[tid] = active ? p + bias[tid] : -INFINITY;
-    idx[tid] = (int32_t)tid;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float s = active ? p + bias[tid] : -INFINITY;
+    int32_t idx = (int32_t)tid;
 
     for (uint k = 2; k <= 256; k <<= 1) {
         for (uint j = k >> 1; j > 0; j >>= 1) {
-            const uint other = tid ^ j;
-            if (other > tid) {
-                const int32_t a = idx[tid];
-                const int32_t b = idx[other];
-                const bool descending = (tid & k) == 0;
-                const bool swap = descending
-                    ? ds4_glm_router_better(sel_scores, b, a)
-                    : ds4_glm_router_better(sel_scores, a, b);
-                if (swap) {
-                    idx[tid] = b;
-                    idx[other] = a;
-                }
+            float os;
+            int32_t oi;
+            if (j < 32) {
+                os = simd_shuffle_xor(s, (ushort)j);
+                oi = simd_shuffle_xor(idx, (ushort)j);
+            } else {
+                s_arr[tid] = s;
+                i_arr[tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const uint other = tid ^ j;
+                os = s_arr[other];
+                oi = i_arr[other];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const bool descending = (tid & k) == 0;
+            const bool keep_better = descending == ((tid & j) == 0);
+            const bool mine_better = s > os || (s == os && idx < oi);
+            if (mine_better != keep_better) {
+                s = os;
+                idx = oi;
+            }
         }
     }
 
+    /* Rank tid now holds the tid-th best (score, expert) pair.  Stage the
+     * per-expert sigmoid and the top-k expert ids in threadgroup memory so
+     * the renormalization reads the same values in the same order as the
+     * previous device round-trip. */
     const uint k_used = min(args.n_expert_used, n_expert);
-    if (tid < k_used) {
-        token_selected[tid] = idx[tid];
-    }
+    s_arr[tid] = p;
+    if (tid < k_used) i_arr[tid] = idx;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid < k_used) {
+        token_selected[tid] = idx;
         float sum = 0.0f;
         for (uint i = 0; i < k_used; i++) {
-            sum += token_probs[(uint)token_selected[i]];
+            sum += s_arr[(uint)i_arr[i]];
         }
         sum = max(sum, 6.103515625e-5f);
-        token_weights[tid] = token_probs[(uint)token_selected[tid]] / sum * args.expert_weight_scale;
+        token_weights[tid] = s_arr[(uint)idx] / sum * args.expert_weight_scale;
     }
 }
 
