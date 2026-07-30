@@ -4561,6 +4561,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_IQ4_XS ||
+           type == DS4_TENSOR_BF16 ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
@@ -4571,6 +4572,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_Q8_0:    return 34;
+    case DS4_TENSOR_BF16:    return 2;   /* 1 element per "block" */
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_IQ4_XS:  return sizeof(block_iq4_xs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
@@ -5253,6 +5255,9 @@ static void weights_validate_laguna_layout(
             layer_routed_type == DS4_TENSOR_Q4_K ||
             layer_routed_type == DS4_TENSOR_Q3_K ||
             layer_routed_type == DS4_TENSOR_Q2_K ||
+            /* Poolside's official mixed-precision export keeps the last
+             * routed layers in bf16 beside q4_k elsewhere. */
+            layer_routed_type == DS4_TENSOR_BF16 ||
             (apex_q6 && (layer_routed_type == DS4_TENSOR_IQ4_XS ||
                          layer_routed_type == DS4_TENSOR_Q5_K ||
                          layer_routed_type == DS4_TENSOR_Q6_K));
