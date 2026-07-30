@@ -5,6 +5,7 @@
  * make-room path, the proactive spill/restore guard, Tier-2 bank
  * switching, and the frontier/committed-pos readers. */
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 
 
 
@@ -1615,10 +1616,12 @@ void *worker_main(void *arg) {
              * (slot 0 always fits), so an unbound head cannot reach this
              * wait: sleeping on the condvar until new work or shutdown is
              * safe. */
-            pthread_mutex_lock(&s->mu);
-            while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-            const bool quit = !s->head && s->stopping;
-            pthread_mutex_unlock(&s->mu);
+            bool quit;
+            {
+                pulsar::ScopedLock lk(&s->mu);
+                while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+                quit = !s->head && s->stopping;   /* read shared state under the lock */
+            }
             if (quit) break;
             continue;
         }

@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 #include "pulsar_gpu.h"
 
 #include <malloc.h>
@@ -1278,9 +1279,10 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&s.mu);
     pthread_join(worker, NULL);
     if (mdiag_on) pthread_join(mdiag.thread, NULL);
-    pthread_mutex_lock(&s.mu);
-    while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
-    pthread_mutex_unlock(&s.mu);
+    {
+        pulsar::ScopedLock lk(&s.mu);
+        while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
+    }
 
     for (int i = 0; i < s.n_slots; i++) {
         session_slot *sl = &s.slots[i];
