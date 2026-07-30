@@ -176,9 +176,12 @@ static bool anthropic_tool_stream_has_id(const anthropic_tool_stream *ts,
 
 
 
-const char *server::anthropic_tool_stream_id(anthropic_tool_stream *ts,
+/* Free function (NOT a server:: method): legitimately called with a null server
+ * (no bound server — streaming tests, parse-without-server). As a member the
+ * `!s` guard below would be dead code under -O3 this-non-null assumption; as a
+ * free function taking server* the guard holds. */
+static const char *anthropic_tool_stream_id(server *s, anthropic_tool_stream *ts,
                                             int index) {
-    auto *s = this;
     if (!ts || index < 0) return "";
     if (index >= ts->ids_cap) {
         int old = ts->ids_cap;
@@ -193,7 +196,7 @@ const char *server::anthropic_tool_stream_id(anthropic_tool_stream *ts,
         for (;;) {
             random_tool_id(id, sizeof(id), API_ANTHROPIC);
             if (!anthropic_tool_stream_has_id(ts, id, index) &&
-                !s->tool_memory_has_id(id)) break;
+                (!s || !s->tool_memory_has_id(id))) break;  /* null s (no bound server) => no dedup, as the predecessor free fn did */
         }
         ts->ids[index] = xstrdup(id);
     }
@@ -425,7 +428,7 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
      * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
      * before tool_memory_remember(), so the next tool_result can continue from
      * the live KV state instead of re-rendering canonical JSON. */
-    const char *tool_id = s->anthropic_tool_stream_id(ts, ts->index);
+    const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
     bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
               anthropic_tool_emit_args_fragment(fd, st, "{", 1);
     free(name);

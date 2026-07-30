@@ -1051,8 +1051,6 @@ struct server {
     int responses_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
     int thinking_live_visible_prefix_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt);
     size_t thinking_live_binds_prompt(session_slot *sl, const request *req, int live_pos);
-    const char * anthropic_tool_stream_id(anthropic_tool_stream *ts, int index);
-    const char * openai_tool_stream_id(openai_tool_stream *ts, int index);
     bool responses_validate_tool_outputs(const chat_msgs *msgs, pulsar_think_mode think_mode, bool *requires_live_tool_state, bool *requires_live_reasoning, char *err, size_t errlen);
     bool anthropic_validate_tool_results(const chat_msgs *msgs, bool *requires_live_tool_state, char *err, size_t errlen);
     int chat_think_tool_recovery(session_slot *sl, buf *text, thinking_state *thinking, size_t *scan_from, int *completion, int max_tokens, char *err, size_t errlen);
