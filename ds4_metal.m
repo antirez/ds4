@@ -35957,10 +35957,26 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
 
         id<MTLComputePipelineState> map_pipeline =
             ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert));
-        id<MTLComputePipelineState> gate_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
-        id<MTLComputePipelineState> up_pipeline = ds4_gpu_routed_mm_pipeline(up_type);
-        id<MTLComputePipelineState> down_pipeline =
+        /* All-Q4_K expert stacks take the TensorOps twin of the tiled
+         * expert matmul: same tile shape and staging precision, cooperative
+         * matmul instead of simdgroup MMA. */
+        const bool mm_id_mpp =
+            ds4_gpu_mpp_available() &&
+            gate_type == DS4_METAL_TENSOR_Q4_K &&
+            up_type == DS4_METAL_TENSOR_Q4_K &&
+            down_type == DS4_METAL_TENSOR_Q4_K &&
+            getenv("DS4_METAL_DISABLE_MOE_MM_ID_MPP") == NULL;
+        id<MTLComputePipelineState> gate_pipeline = mm_id_mpp ?
+            ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_mpp", false) :
+            ds4_gpu_routed_mm_pipeline(gate_type);
+        id<MTLComputePipelineState> up_pipeline = mm_id_mpp ?
+            gate_pipeline :
+            ds4_gpu_routed_mm_pipeline(up_type);
+        id<MTLComputePipelineState> down_pipeline = mm_id_mpp ?
+            ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16_mpp", false) :
             ds4_gpu_routed_mm_f16_rhs_pipeline(down_type);
+        const NSUInteger mm_id_tile_threadgroup_bytes =
+            mm_id_mpp ? 20736u : mm_id_threadgroup_bytes;
         if (!map_pipeline || !gate_pipeline || !up_pipeline || !down_pipeline) {
             return 0;
         }
@@ -36054,7 +36070,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        ds4_gpu_tensor_offset(x),
                                                        g_moe_gate_scratch_buffer,
                                                        0,
-                                                       mm_id_threadgroup_bytes);
+                                                       mm_id_tile_threadgroup_bytes);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("gate");
         if (ok) {
@@ -36067,7 +36083,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        ds4_gpu_tensor_offset(x),
                                                        g_moe_gate_scratch_buffer,
                                                        (NSUInteger)gate_scratch_bytes,
-                                                       mm_id_threadgroup_bytes);
+                                                       mm_id_tile_threadgroup_bytes);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("up");
         if (ok) {
@@ -36099,7 +36115,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        ds4_gpu_tensor_offset(mid),
                                                        down_dst,
                                                        down_dst_off,
-                                                       mm_id_threadgroup_bytes);
+                                                       mm_id_tile_threadgroup_bytes);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("down");
         if (ok && n_expert > 1) {

@@ -8277,6 +8277,184 @@ typedef decltype(kernel_attn_out_low_q8_0_mpp_direct_rhs<64>) attn_out_low_q8_0_
 
 template [[host_name("kernel_attn_out_low_q8_0_mpp_direct_rhs_n64")]] kernel attn_out_low_q8_0_mpp_direct_rhs_n64_t kernel_attn_out_low_q8_0_mpp_direct_rhs<64>;
 
+// TensorOps twin of kernel_mul_mm_id for Q4_K routed experts.  Staging keeps
+// the legacy kernel's precision profile exactly -- expert weights dequantized
+// to half, gathered activations staged as half, float accumulation -- so only
+// the multiply-accumulate order changes.  Both operand tiles are
+// double-buffered: the next k-step's dequant and gather overlap the current
+// cooperative matmul, one threadgroup barrier per step.
+//
+// Threadgroup layout (20736 bytes): A tiles 2x(64x32 half), B tiles
+// 2x(32x32 half), C store 64x32 float, 32 gathered row offsets.
+template<typename T1>
+kernel void kernel_mul_mm_id_q4_K_mpp(
+        constant ds4_metal_args_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    const int32_t neh1 = tpe_u32[im];
+    if (r1 >= neh1) {
+        return;
+    }
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (short)(args.ne0 - r0) : (short)NR0;
+    const short nr1 = (    neh1 - r1 < NR1) ? (short)(    neh1 - r1) : (short)NR1;
+
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const short ide = idj % args.ne20;
+            const int   idt = idj / args.ne20;
+            device float * D = (device float *) dst + r0 + ide*args.ne0 +
+                (uint64_t)idt*args.ne1*args.ne0;
+            for (int i = tiisg; i < nr0; i += 32) {
+                D[i] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    threadgroup half *sa = (threadgroup half *)shmem;
+    threadgroup half *sb = (threadgroup half *)(shmem + 2*NR0*NK*sizeof(half));
+    threadgroup float *sc_out = (threadgroup float *)
+        (shmem + 2*NR0*NK*sizeof(half) + 2*NR1*NK*sizeof(half));
+    threadgroup uint64_t *b_off = (threadgroup uint64_t *)(sc_out + NR0*NR1);
+
+    if (tiitg < NR1) {
+        if ((short)tiitg < nr1) {
+            const int id = ids_i32[im*args.ne21 + r1 + tiitg];
+            const short i11 = (id % args.ne20) % args.ne11;
+            const int   i12 = id / args.ne20;
+            b_off[tiitg] = (uint64_t)args.nb12*i12 + (uint64_t)args.nb11*i11;
+        } else {
+            b_off[tiitg] = (uint64_t)-1;
+        }
+    }
+
+    const uint64_t offset0 = (uint64_t)(im - args.tp_expert_base)*args.nb02;
+
+    auto tA0 = tensor(sa,          dextents<int32_t, 2>(NK, NR0));
+    auto tA1 = tensor(sa + NR0*NK, dextents<int32_t, 2>(NK, NR0));
+    auto tB0 = tensor(sb,          dextents<int32_t, 2>(NK, NR1));
+    auto tB1 = tensor(sb + NR1*NK, dextents<int32_t, 2>(NK, NR1));
+
+    /* Full-precision accumulation: the reduced-precision descriptor drifts
+     * far outside the legacy kernel's envelope on 48-layer MoE stacks. */
+    matmul2d<
+        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB0), decltype(tA0), float>();
+
+    #pragma unroll
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        if (cT.is_valid_element(i)) {
+            cT[i] = 0.0f;
+        }
+    }
+
+    auto stage_a = [&](const int loop_k, threadgroup half *buf) {
+        const short row = tiitg / 2;
+        const short chunk = tiitg % 2;
+        const int k_pos = loop_k + chunk*16;
+        if (r0 + row < args.ne0) {
+            device const block_q4_K *x =
+                (device const block_q4_K *)(src0 + args.nb01*(r0 + row) + offset0) +
+                k_pos/QK_K;
+            half4x4 temp;
+            dequantize_q4_K(x, (short)((k_pos % QK_K)/16), temp);
+            threadgroup half4 *dst4 = (threadgroup half4 *)(buf + row*NK + chunk*16);
+            dst4[0] = temp[0];
+            dst4[1] = temp[1];
+            dst4[2] = temp[2];
+            dst4[3] = temp[3];
+        } else {
+            threadgroup half4 *dst4 = (threadgroup half4 *)(buf + row*NK + chunk*16);
+            dst4[0] = half4(0.0h);
+            dst4[1] = half4(0.0h);
+            dst4[2] = half4(0.0h);
+            dst4[3] = half4(0.0h);
+        }
+    };
+    auto stage_b = [&](const int loop_k, threadgroup half *buf) {
+        const short row = tiitg / 4;
+        const short seg = tiitg % 4;
+        const uint64_t off = b_off[row];
+        threadgroup half *out8 = buf + row*NK + seg*8;
+        if (off != (uint64_t)-1) {
+            device const T1 *y = (device const T1 *)(src1 + off) + loop_k + seg*8;
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                out8[i] = (half)y[i];
+            }
+        } else {
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                out8[i] = (half)0;
+            }
+        }
+    };
+
+    stage_a(0, sa);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stage_b(0, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint buf_sel = 0;
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        auto mA = (buf_sel ? tA1 : tA0).slice(0, 0);
+        auto mB = (buf_sel ? tB1 : tB0).slice(0, 0);
+        mm.run(mB, mA, cT);
+
+        const int next_k = loop_k + NK;
+        if (next_k < args.ne00) {
+            buf_sel ^= 1u;
+            stage_a(next_k, buf_sel ? sa + NR0*NK : sa);
+            stage_b(next_k, buf_sel ? sb + NR1*NK : sb);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    auto tC = tensor(sc_out, dextents<int32_t, 2>(NR0, NR1));
+    cT.store(tC);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const short ide = idj % args.ne20;
+        const int   idt = idj / args.ne20;
+        device float * D = (device float *) dst + r0 + ide*args.ne0 +
+            (uint64_t)idt*args.ne1*args.ne0;
+        threadgroup const float * C = sc_out + j*NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = C[i];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_q4_K_mpp<float>) mul_mm_id_q4_K_mpp_f32_t;
+typedef decltype(kernel_mul_mm_id_q4_K_mpp<half>)  mul_mm_id_q4_K_mpp_f16_t;
+
+template [[host_name("kernel_mul_mm_id_q4_K_f32_mpp")]] kernel mul_mm_id_q4_K_mpp_f32_t kernel_mul_mm_id_q4_K_mpp<float>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_mpp")]] kernel mul_mm_id_q4_K_mpp_f16_t kernel_mul_mm_id_q4_K_mpp<half>;
+
 #endif
 
 #undef QK_NL
