@@ -49864,11 +49864,15 @@ static bool laguna_graph_forward_batch(
                                                   display_total,
                                                   true);
 
-    /* Metal 4 Tensor matmuls introduce enough low-bit accumulation drift in
-     * Laguna prefill to change sliding-attention routes after a few hundred
-     * tokens. The legacy batched kernels are both stable against the Poolside
-     * reference and slightly faster on these shapes. */
-    ds4_gpu_set_tensor_matmul_suppressed(true);
+    /* Metal 4 Tensor matmuls change low-bit accumulation order in Laguna
+     * prefill, so tokens can drift from the Poolside bit-reference on long
+     * prompts.  Measured on M5 Max the drift is quality-neutral jitter
+     * (teacher-forced NLL moves under +/-1% with the sign flipping between
+     * text and code slices) while prefill runs 12-19% faster, so the tensor
+     * path is the default.  DS4_LAGUNA_DISABLE_TENSOR_PREFILL restores the
+     * legacy batched kernels for bit-reference comparisons. */
+    ds4_gpu_set_tensor_matmul_suppressed(
+        getenv("DS4_LAGUNA_DISABLE_TENSOR_PREFILL") != NULL);
     /* A long Laguna prefill otherwise lives in one command buffer and cannot
      * report real progress until the whole chunk completes.  When a frontend
      * asks for display progress, finish one layer at a time so each callback
