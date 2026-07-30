@@ -3651,46 +3651,49 @@ void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 &reg)
 
 template <typename type4x4>
 void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 &reg) {
+    /* Branchless + word-load form of the quarter decode above; identical
+     * arithmetic per element (GEMM tile staging is the hot caller). */
     const short n128 = il / 8;
     const short il128 = il & 7;
-    const short quarter = il128 / 2;
+    const short quarter = il128 >> 1;
     const short l0 = (il128 & 1) * 16;
-    const uint ql_base = (uint)n128 * 64u;
-    const uint qh_base = (uint)n128 * 32u;
-    const uint sc_base = (uint)n128 * 8u + (uint)quarter * 2u + (uint)(il128 & 1);
-    const float d = (float)xb->d * (float)((int)xb->scales[sc_base]);
+    /* block_q6_K is 210 bytes, so blocks alternate between 0- and 2-mod-4
+     * addresses: 16-bit loads are the widest always-aligned access. */
+    device const ushort *ql = (device const ushort *)
+        (xb->ql + (uint)n128 * 64u + ((quarter & 1) ? 32u : 0u) + (uint)l0);
+    device const ushort *qh = (device const ushort *)
+        (xb->qh + (uint)n128 * 32u + (uint)l0);
+    const uint nib_shift = (quarter < 2) ? 0u : 4u;
+    const uint h_shift = 2u * (uint)quarter;
+    const float d = (float)xb->d * (float)((int)xb->scales[il]);
 
-    for (int i = 0; i < 16; ++i) {
-        const uint l = (uint)l0 + (uint)i;
-        uint v;
-        if (quarter == 0) {
-            v = ((uint)xb->ql[ql_base + l] & 0x0Fu) |
-                ((((uint)xb->qh[qh_base + l] >> 0u) & 3u) << 4u);
-        } else if (quarter == 1) {
-            v = ((uint)xb->ql[ql_base + 32u + l] & 0x0Fu) |
-                ((((uint)xb->qh[qh_base + l] >> 2u) & 3u) << 4u);
-        } else if (quarter == 2) {
-            v = ((uint)xb->ql[ql_base + l] >> 4u) |
-                ((((uint)xb->qh[qh_base + l] >> 4u) & 3u) << 4u);
-        } else {
-            v = ((uint)xb->ql[ql_base + 32u + l] >> 4u) |
-                ((((uint)xb->qh[qh_base + l] >> 6u) & 3u) << 4u);
+    FOR_UNROLL (short v = 0; v < 8; ++v) {
+        const uint qlv = (uint)ql[v];
+        const uint qhv = (uint)qh[v];
+        FOR_UNROLL (short j = 0; j < 2; ++j) {
+            const uint nib = (qlv >> (8u * (uint)j + nib_shift)) & 0x0Fu;
+            const uint hb = (qhv >> (8u * (uint)j + h_shift)) & 3u;
+            const short i = 2 * v + j;
+            reg[i / 4][i % 4] = d * (float)((int)(nib | (hb << 4u)) - 32);
         }
-        reg[i / 4][i % 4] = d * (float)((int)v - 32);
     }
 }
 
 template <typename type4x4>
 void dequantize_iq4_xs(device const block_iq4_xs *xb, short il, thread type4x4 &reg) {
     /* il indexes 16-element chunks in linear order: chunk pair (2k, 2k+1)
-     * covers sub-block k's low- and high-nibble halves. */
+     * covers sub-block k's low- and high-nibble halves.  Word loads +
+     * in-register nibble extraction; identical arithmetic per element. */
     const short ib = il / 2;
-    const short hi = il & 1;
+    const uint nib_shift = (il & 1) ? 4u : 0u;
     const float dl = ds4_iq4_xs_subblock_scale(xb, ib);
-    device const uchar *qs = xb->qs + 16 * ib;
-    for (int i = 0; i < 16; ++i) {
-        const uchar q = hi ? (qs[i] >> 4) : (qs[i] & 0x0F);
-        reg[i / 4][i % 4] = dl * ds4_kvalues_iq4nl_f[q];
+    device const uint *qs = (device const uint *)(xb->qs + 16 * ib);
+    FOR_UNROLL (short v = 0; v < 4; ++v) {
+        const uint w = qs[v] >> nib_shift;
+        reg[v][0] = dl * ds4_kvalues_iq4nl_f[w & 0x0Fu];
+        reg[v][1] = dl * ds4_kvalues_iq4nl_f[(w >> 8u) & 0x0Fu];
+        reg[v][2] = dl * ds4_kvalues_iq4nl_f[(w >> 16u) & 0x0Fu];
+        reg[v][3] = dl * ds4_kvalues_iq4nl_f[(w >> 24u) & 0x0Fu];
     }
 }
 
@@ -8531,6 +8534,13 @@ template [[host_name("kernel_mul_mm_id_iq4_xs_ff32")]]      kernel mul_mm_id_ff3
  * per token).  The mul_mm template and mul_mm_t typedef come from
  * dense.metal, which precedes this file in the concatenated library. */
 template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+
+/* Metal-4 tensor-API (MPP direct-RHS) variants of the q6_K dense GEMM, the
+ * same fast path the q8_0/q4_K prefill uses: dequantize 64x32 weight tiles
+ * to half in threadgroup memory, direct-RHS MPP for the activation tile. */
+template [[host_name("kernel_mul_mm_q6_K_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q6_K_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q6_K_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
 
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;

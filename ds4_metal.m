@@ -17338,6 +17338,88 @@ int ds4_gpu_matmul_q6_K_tensor(
                                                        &inner_offset);
         if (!xbuf || !outbuf || !wbuf) return 0;
 
+        /* Batched tokens on Metal-4 hardware: the MPP direct-RHS GEMM (the
+         * same fast path dense q8_0/q4_K prefill uses).  Real prompt lengths
+         * are rarely 32-aligned, so run NAX on the aligned token prefix and
+         * finish the <=31-token remainder with the plain tiled GEMM in the
+         * same command buffer.  Falls through entirely on shape mismatch or
+         * older devices. */
+        const uint64_t nax_aligned = n_tok & ~(uint64_t)31u;
+        if (ds4_gpu_mpp_available() &&
+            nax_aligned >= 32u &&
+            (in_dim % 64u) == 0 &&
+            (out_dim % 64u) == 0) {
+            uint64_t nax_tile_n = 32u;
+            if ((nax_aligned % 128u) == 0) {
+                nax_tile_n = 128u;
+            } else if ((nax_aligned % 64u) == 0) {
+                nax_tile_n = 64u;
+            }
+            const char *nax_fn = nax_tile_n == 128u
+                ? "kernel_mul_mm_q6_K_f32_nax_direct_rhs_n128"
+                : (nax_tile_n == 64u
+                    ? "kernel_mul_mm_q6_K_f32_nax_direct_rhs_n64"
+                    : "kernel_mul_mm_q6_K_f32_nax_direct_rhs");
+            id<MTLComputePipelineState> nax_pipeline =
+                ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
+            const uint64_t nax_rem = n_tok - nax_aligned;
+            id<MTLComputePipelineState> rem_pipeline = nil;
+            if (nax_pipeline && nax_rem != 0) {
+                const bool rem_bc_out = true;   /* nax_rem < 32 */
+                rem_pipeline = ds4_gpu_get_mul_mm_pipeline(
+                    "kernel_mul_mm_q6_K_f32", (in_dim % 32u) != 0, rem_bc_out);
+                if (!rem_pipeline) nax_pipeline = nil;   /* all-or-nothing */
+            }
+            if (nax_pipeline) {
+                int owned = 0;
+                id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                if (!cb) return 0;
+
+                ds4_gpu_mul_mm_args nax_args =
+                    ds4_gpu_make_mm_args(in_dim, out_dim, nax_aligned, row_bytes);
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:nax_pipeline];
+                [enc setBytes:&nax_args length:sizeof(nax_args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_aligned / nax_tile_n),
+                                                      (NSUInteger)out_dim / 64u,
+                                                      1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                if (nax_rem != 0) {
+                    ds4_gpu_mul_mm_args rem_args =
+                        ds4_gpu_make_mm_args(in_dim, out_dim, nax_rem, row_bytes);
+                    id<MTLComputeCommandEncoder> renc = ds4_gpu_compute_encoder(cb);
+                    [renc setComputePipelineState:rem_pipeline];
+                    [renc setBytes:&rem_args length:sizeof(rem_args) atIndex:0];
+                    [renc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                    [renc setBuffer:xbuf
+                             offset:ds4_gpu_tensor_offset(x) +
+                                    (NSUInteger)(nax_aligned * in_dim * sizeof(float))
+                            atIndex:2];
+                    [renc setBuffer:outbuf
+                             offset:ds4_gpu_tensor_offset(out) +
+                                    (NSUInteger)(nax_aligned * out_dim * sizeof(float))
+                            atIndex:3];
+                    [renc setThreadgroupMemoryLength:8192u atIndex:0];
+                    [renc dispatchThreadgroups:MTLSizeMake(((NSUInteger)nax_rem + 31u) / 32u,
+                                                           ((NSUInteger)out_dim + 63u) / 64u,
+                                                           1)
+                          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    ds4_gpu_end_compute_encoder(cb, renc);
+                }
+
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q6_K NAX tensor matmul")) {
+                    return 0;
+                }
+                return 1;
+            }
+        }
+
         /* Batched tokens: use the tiled GEMM so weight tiles are reused
          * across the token dimension.  The QMV below re-reads the entire
          * weight matrix once per token, which dominates APEX q6_k attention
