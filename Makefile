@@ -416,25 +416,6 @@ test: pulsar_test seam-check
 	./pulsar_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test
 	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate
 	rm -f pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cli/*.o src/lib/*.o src/vendor/*.o tests/*.o tests/cuda_long_context_smoke tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/spec_sampling_gate tests/accounting_gate tests/bank_evict_restore_gate tests/bank_fork_gate
 
-# --- Transitional aliases: old DwarfStar/ds4 target names (remove after ops
-# migrate). Each alias depends on the new pulsar target and leaves an old-name
-# symlink next to it so existing ops scripts and muscle memory keep working.
-.PHONY: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test
-ds4: pulsar
-	ln -sf pulsar ds4
-ds4-server: pulsar-server
-	ln -sf pulsar-server ds4-server
-ds4-bench: pulsar-bench
-	ln -sf pulsar-bench ds4-bench
-ds4-eval: pulsar-eval
-	ln -sf pulsar-eval ds4-eval
-ds4-agent: pulsar-agent
-	ln -sf pulsar-agent ds4-agent
-ds4_test: pulsar_test
-	ln -sf pulsar_test ds4_test
-ds4_agent_test: pulsar_agent_test
-	ln -sf pulsar_agent_test ds4_agent_test

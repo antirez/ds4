@@ -15,7 +15,7 @@ run_depth () {
   free -g | head -2
   DS4_MOE_TIME=1 nsys profile --trace=cuda --sample=none \
       -o "$OUT/prof_p${D}" --force-overwrite true \
-      ./ds4-bench -m "$MODEL" --prompt-file "$PROMPT" --cuda \
+      ./pulsar-bench -m "$MODEL" --prompt-file "$PROMPT" --cuda \
       --ctx-start $D --ctx-max $D --gen-tokens 0 --prefill-chunk $D \
       --csv "$OUT/p${D}.csv" > "$OUT/moetime_p${D}.log" 2>&1
   echo "exit=$? depth $D done $(date +%T)"

@@ -14,8 +14,8 @@ PORT=8077
 LOG="$ART/teb-$TAG.log"
 
 # never touch a server we did not start; refuse if one is up
-if pgrep -f '[.]/ds4-server' >/dev/null || pgrep -x ds4-server >/dev/null; then
-    echo "FATAL: a ds4-server is already running (not ours); refusing" | tee -a "$LOG"
+if pgrep -f '[.]/pulsar-server' >/dev/null || pgrep -x pulsar-server >/dev/null; then
+    echo "FATAL: a pulsar-server is already running (not ours); refusing" | tee -a "$LOG"
     exit 1
 fi
 
@@ -27,7 +27,7 @@ if [ "$avail_kb" -le $((95 * 1024 * 1024)) ]; then
 fi
 
 cd "$WT"
-./ds4-server -m "$MODEL" --port $PORT > "$ART/teb-$TAG-server.log" 2>&1 &
+./pulsar-server -m "$MODEL" --port $PORT > "$ART/teb-$TAG-server.log" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 

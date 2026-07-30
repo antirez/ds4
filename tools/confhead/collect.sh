@@ -11,7 +11,7 @@
 # at request temperature (labels = real p/q accept outcomes), and spans the
 # temp x workload x depth mixture instead of greedy-only ~1k ctx.
 #
-# GB10 discipline: refuses to start if any ds4-server is already running
+# GB10 discipline: refuses to start if any pulsar-server is already running
 # (never kills a process it did not start), drops caches before the load,
 # and runs a sustained-breach MemAvailable watchdog (4 consecutive 5s samples
 # < 5 GiB) that kills only the server it spawned. Callers serialize GPU use
@@ -26,8 +26,8 @@ CTX="${4:-36864}"
 shift $(( $# < 4 ? $# : 4 ))
 mkdir -p "$OUT"
 
-if pgrep -x ds4-server >/dev/null; then
-    echo "FATAL: a ds4-server is already running; refusing to proceed" >&2
+if pgrep -x pulsar-server >/dev/null; then
+    echo "FATAL: a pulsar-server is already running; refusing to proceed" >&2
     exit 1
 fi
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
@@ -47,7 +47,7 @@ export DS4_DSPARK_DUMP="$OUT/dump.bin"
 export DS4_DSPARK_DUMP_LEAN=1
 export DS4_DSPARK_DUMP_STEPS=200000
 
-./ds4-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
+./pulsar-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
     > "$OUT/server.log" 2>&1 &
 SRV=$!
 echo "server pid $SRV"

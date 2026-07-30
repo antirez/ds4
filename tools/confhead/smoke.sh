@@ -12,8 +12,8 @@ TAU="${3:?}"
 PORT="${4:-8077}"
 mkdir -p "$OUT"
 
-if pgrep -x ds4-server >/dev/null; then
-    echo "FATAL: a ds4-server is already running; refusing to proceed" >&2
+if pgrep -x pulsar-server >/dev/null; then
+    echo "FATAL: a pulsar-server is already running; refusing to proceed" >&2
     exit 1
 fi
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
@@ -23,7 +23,7 @@ if [ "${avail_gb:-0}" -lt 100 ]; then
     exit 1
 fi
 
-DS4_DSPARK_CONF_SCHED="$TAU" ./ds4-server -m "$MODEL" --dspark-draft 5 \
+DS4_DSPARK_CONF_SCHED="$TAU" ./pulsar-server -m "$MODEL" --dspark-draft 5 \
     -c 36864 --port "$PORT" > "$OUT/server.log" 2>&1 &
 SRV=$!
 echo "server pid $SRV (tau=$TAU)"

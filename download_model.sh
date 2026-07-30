@@ -44,7 +44,7 @@ After download the script updates:
   ./ds4flash.gguf -> <download directory>/<selected model>
 
 Then start the server (the shipped binary reads ./ds4flash.gguf by default):
-  ./ds4-server -m ds4flash.gguf --ctx 100000
+  ./pulsar-server -m ds4flash.gguf --ctx 100000
 EOF
 }
 

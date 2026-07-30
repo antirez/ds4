@@ -1,5 +1,5 @@
 #!/bin/bash
-# One bench leg: launch ds4-server on MODEL with conf-sched TAU, run a
+# One bench leg: launch pulsar-server on MODEL with conf-sched TAU, run a
 # fixed-seed suite, tear down. Callers serialize via flock on the gpu lock.
 #
 # Usage: tools/confhead/bench.sh <out_dir> <model.gguf> <tau> <suite> [runs] [port] [ctx]
@@ -17,8 +17,8 @@ PORT="${6:-8077}"
 CTX="${7:-36864}"
 mkdir -p "$OUT"
 
-if pgrep -x ds4-server >/dev/null; then
-    echo "FATAL: a ds4-server is already running; refusing to proceed" >&2
+if pgrep -x pulsar-server >/dev/null; then
+    echo "FATAL: a pulsar-server is already running; refusing to proceed" >&2
     exit 1
 fi
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
@@ -32,7 +32,7 @@ fi
 export DS4_DSPARK_STATS=1
 export DS4_DSPARK_CONF_SCHED="$TAU"
 
-./ds4-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
+./pulsar-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
     > "$OUT/server.log" 2>&1 &
 SRV=$!
 echo "server pid $SRV (tau=$TAU model=$MODEL)"

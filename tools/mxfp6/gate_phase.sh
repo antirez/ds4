@@ -6,7 +6,7 @@
 # (model is 91 GB; we never touch processes we did not start).
 set -u
 WT=/home/tyler/Projects/AI/temp/wt-mxfp6
-BENCH="$WT/ds4-bench"
+BENCH="$WT/pulsar-bench"
 PROMPT="$WT/speed-bench/promessi_sposi.txt"
 LOG="$1"; shift
 
