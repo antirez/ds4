@@ -49303,6 +49303,34 @@ static bool laguna_graph_forward_token(
         }
         if (ok) ok = laguna_stage_mark("qkvg");
         if (ok) {
+#ifdef __APPLE__
+            /* The fused kernel also commits this row's K/V to the ring, so
+             * the attention call below skips its store dispatch. */
+            ok = ds4_gpu_laguna_qk_head_rms_norm_rope_store_tensor(
+                    g->q,
+                    g->k,
+                    model->map,
+                    model->size,
+                    l->attn_q_norm->abs_offset,
+                    l->attn_k_norm->abs_offset,
+                    n_head,
+                    DS4_N_HEAD_KV,
+                    DS4_N_HEAD_DIM,
+                    n_rot,
+                    pos,
+                    rope_ctx,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow,
+                    DS4_RMS_EPS,
+                    g->v,
+                    g->key_cache[il],
+                    g->value_cache[il],
+                    g->cache_cap[il]) != 0;
+#else
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
                     g->q,
                     g->k,
@@ -49324,6 +49352,7 @@ static bool laguna_graph_forward_token(
                     beta_fast,
                     beta_slow,
                     DS4_RMS_EPS) != 0;
+#endif
         }
         if (ok) ok = laguna_stage_mark("qk_rope");
         uint32_t key_count = pos + 1u;
@@ -49335,8 +49364,13 @@ static bool laguna_graph_forward_token(
                     g->key_cache[il],
                     g->value_cache[il],
                     g->q,
+#ifdef __APPLE__
+                    NULL,
+                    NULL,
+#else
                     g->k,
                     g->v,
+#endif
                     g->gate,
                     pos,
                     g->cache_cap[il],
@@ -49541,6 +49575,7 @@ static bool laguna_graph_forward_token(
                         il,
                         g->ffn_norm,
                         true) != 0;
+                if (ok) ok = laguna_stage_mark("moe_routed");
                 if (ok) {
                     ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                             g->ffn_mid,
@@ -49553,6 +49588,7 @@ static bool laguna_graph_forward_token(
                             g->ffn_norm,
                             0.0f) != 0;
                 }
+                if (ok) ok = laguna_stage_mark("moe_shsw");
                 if (ok) {
 #ifdef __APPLE__
                     /* Fold the layer's three-way residual into the shared
@@ -68664,7 +68700,11 @@ static int ds4_session_eval_dflash_speculative_argmax(
         requested_draft = DS4_DFLASH_BLOCK_SIZE - 1u;
     }
     if (s->dflash_active_draft == 0u) {
-        s->dflash_active_draft = requested_draft < 3u ? requested_draft : 3u;
+        /* Diagnostic: start at the requested depth instead of the adaptive
+         * calibration's conservative depth-3 opening. */
+        s->dflash_active_draft =
+            getenv("DS4_DFLASH_FORCE_DRAFT") != NULL ? requested_draft :
+            requested_draft < 3u ? requested_draft : 3u;
     }
     uint32_t n_draft = requested_draft;
     if (n_draft > s->dflash_active_draft) {

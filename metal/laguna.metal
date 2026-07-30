@@ -16,7 +16,7 @@ struct ds4_metal_args_laguna_norm_rope {
     float    attn_factor;
     float    beta_fast;
     float    beta_slow;
-    uint32_t pad0;
+    uint32_t cache_row;   /* used only by the fused rope+store variant */
 };
 
 static inline void laguna_head_rms_norm_rope_neox(
@@ -137,6 +137,108 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_neox(
     device const float *weight = is_q ? q_weight : k_weight;
     laguna_head_rms_norm_rope_neox(
         args, row, weight, scratch, tid, ntg_u.x, token);
+}
+
+// Decode-only twin of the Q/K kernel above that also commits the roped K row
+// and the untouched V row to the attention ring as f16, removing the separate
+// store dispatch from the per-token chain.  The norm and rotation arithmetic
+// is identical; the rope section is predicated instead of early-returning so
+// every thread reaches the store barrier.  Q-head threadgroups exit before
+// the store uniformly.
+kernel void kernel_laguna_qk_head_rms_norm_rope_store_neox(
+        constant ds4_metal_args_laguna_norm_rope &args,
+        device float       *q,
+        device float       *k,
+        device const float *q_weight,
+        device const float *k_weight,
+        constant uint      &n_q_head,
+        device const float *v,
+        device half        *key_cache,
+        device half        *value_cache,
+        threadgroup float  *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint combined_head = tgpig.x;
+    const uint nth = ntg_u.x;
+    if (combined_head >= args.n_head || args.n_tokens != 1u ||
+        n_q_head >= args.n_head || args.head_dim == 0u ||
+        args.n_rot > args.head_dim || (args.n_rot & 1u) != 0u) {
+        return;
+    }
+
+    const bool is_q = combined_head < n_q_head;
+    const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
+    const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
+    device float *row = (is_q ? q : k) +
+        (uint64_t)tensor_head * args.head_dim;
+    device const float *weight = is_q ? q_weight : k_weight;
+
+    float ss = 0.0f;
+    for (uint i = tid; i < args.head_dim; i += nth) {
+        const float value = row[i];
+        ss += value * value;
+    }
+    scratch[tid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1u; step != 0u; step >>= 1u) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv = rsqrt(scratch[0] / (float)args.head_dim + args.eps);
+    for (uint i = tid; i < args.head_dim; i += nth) {
+        row[i] = row[i] * inv * weight[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const uint half_rot = args.n_rot >> 1u;
+    if (tid < half_rot) {
+        float corr_dims[2] = {0.0f, 0.0f};
+        if (args.ext_factor != 0.0f) {
+            rope_yarn_corr_dims((int)args.n_rot,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+        }
+        const int rel_i0 = (int)(tid * 2u);
+        const float inv_ndims = -1.0f / (float)args.n_rot;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = (float)args.pos0 *
+            exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
+#else
+        const float theta = (float)args.pos0 *
+            pow(args.freq_base, inv_ndims * (float)rel_i0);
+#endif
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta,
+                  args.freq_scale,
+                  corr_dims,
+                  rel_i0,
+                  args.ext_factor,
+                  args.attn_factor,
+                  &cos_theta,
+                  &sin_theta);
+        const float x0 = row[tid];
+        const float x1 = row[tid + half_rot];
+        row[tid] = x0 * cos_theta - x1 * sin_theta;
+        row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
+    }
+    if (is_q) return;
+
+    threadgroup_barrier(mem_flags::mem_device);
+    const uint width = tensor_n_head * args.head_dim;
+    const uint64_t dst =
+        (uint64_t)args.cache_row * width +
+        (uint64_t)tensor_head * args.head_dim;
+    device const float *v_row = v + (uint64_t)tensor_head * args.head_dim;
+    for (uint i = tid; i < args.head_dim; i += nth) {
+        key_cache[dst + i] = (half)row[i];
+        value_cache[dst + i] = (half)v_row[i];
+    }
 }
 
 struct ds4_metal_args_laguna_kv_store {

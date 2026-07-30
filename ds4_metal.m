@@ -235,6 +235,7 @@ static id<MTLComputePipelineState> g_laguna_routed_shared_q4_down_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_q6_down_pipeline;
 static id<MTLComputePipelineState> g_laguna_head_norm_rope_pipeline;
 static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_pipeline;
+static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_store_pipeline;
 static id<MTLComputePipelineState> g_laguna_store_kv_pipeline;
 static id<MTLComputePipelineState> g_laguna_attention_pipeline;
 static id<MTLComputePipelineState> g_laguna_stage_kv_pipeline;
@@ -5462,7 +5463,7 @@ typedef struct {
     float    attn_factor;
     float    beta_fast;
     float    beta_slow;
-    uint32_t pad0;
+    uint32_t cache_row;   /* used only by the fused rope+store variant */
 } ds4_gpu_laguna_norm_rope_args;
 
 typedef struct {
@@ -7964,6 +7965,9 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_laguna_head_rms_norm_rope_neox");
         g_laguna_qk_head_norm_rope_pipeline =
             ds4_gpu_get_pipeline("kernel_laguna_qk_head_rms_norm_rope_neox");
+        g_laguna_qk_head_norm_rope_store_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_qk_head_rms_norm_rope_store_neox");
         g_laguna_store_kv_pipeline =
             ds4_gpu_get_pipeline("kernel_laguna_store_kv_f16");
         g_laguna_attention_pipeline =
@@ -9454,6 +9458,7 @@ void ds4_gpu_cleanup(void) {
         g_laguna_routed_shared_q6_down_pipeline = nil;
         g_laguna_head_norm_rope_pipeline = nil;
         g_laguna_qk_head_norm_rope_pipeline = nil;
+        g_laguna_qk_head_norm_rope_store_pipeline = nil;
         g_laguna_store_kv_pipeline = nil;
         g_laguna_attention_pipeline = nil;
         g_laguna_stage_kv_pipeline = nil;
@@ -31524,6 +31529,126 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
     return 1;
 }
 
+int ds4_gpu_laguna_qk_head_rms_norm_rope_store_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint32_t              n_q_head,
+        uint32_t              n_k_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps,
+        const ds4_gpu_tensor *v,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        uint32_t              cache_cap) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!q || !k || !v || !key_cache || !value_cache || !model_map ||
+        n_q_head == 0 || n_k_head == 0 ||
+        n_q_head > UINT32_MAX - n_k_head ||
+        head_dim == 0 || head_dim > 128u || n_rot == 0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        cache_cap == 0 || pos0 == UINT32_MAX ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        !isfinite(freq_scale) || freq_scale <= 0.0f ||
+        !isfinite(ext_factor) || !isfinite(attn_factor) ||
+        !isfinite(beta_fast) || !isfinite(beta_slow) ||
+        !isfinite(eps) || eps <= 0.0f) {
+        return 0;
+    }
+
+    const uint64_t q_values = (uint64_t)n_q_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_k_head * head_dim;
+    const uint64_t cache_values = (uint64_t)cache_cap * kv_values;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    if (ds4_gpu_tensor_bytes(q) < q_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(k) < kv_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(v) < kv_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(key_cache) < cache_values * sizeof(uint16_t) ||
+        ds4_gpu_tensor_bytes(value_cache) < cache_values * sizeof(uint16_t) ||
+        q_weight_offset > model_size ||
+        weight_bytes > model_size - q_weight_offset ||
+        k_weight_offset > model_size ||
+        weight_bytes > model_size - k_weight_offset) {
+        fprintf(stderr, "ds4: Metal Laguna fused rope/store received an invalid buffer or weight range\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> kbuf = ds4_gpu_tensor_buffer(k);
+        id<MTLBuffer> vbuf = ds4_gpu_tensor_buffer(v);
+        id<MTLBuffer> keybuf = ds4_gpu_tensor_buffer(key_cache);
+        id<MTLBuffer> valuebuf = ds4_gpu_tensor_buffer(value_cache);
+        uint64_t q_weight_inner = 0;
+        uint64_t k_weight_inner = 0;
+        id<MTLBuffer> q_weightbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, q_weight_offset, weight_bytes,
+            &q_weight_inner);
+        id<MTLBuffer> k_weightbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, k_weight_offset, weight_bytes,
+            &k_weight_inner);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
+            g_laguna_qk_head_norm_rope_store_pipeline,
+            "kernel_laguna_qk_head_rms_norm_rope_store_neox");
+        if (!qbuf || !kbuf || !vbuf || !keybuf || !valuebuf ||
+            !q_weightbuf || !k_weightbuf || !pipeline) {
+            return 0;
+        }
+
+        ds4_gpu_laguna_norm_rope_args args = {
+            .n_tokens = 1u,
+            .n_head = n_q_head + n_k_head,
+            .head_dim = head_dim,
+            .n_rot = n_rot,
+            .pos0 = pos0,
+            .n_ctx_orig = n_ctx_orig,
+            .eps = eps,
+            .freq_base = freq_base,
+            .freq_scale = freq_scale,
+            .ext_factor = ext_factor,
+            .attn_factor = attn_factor,
+            .beta_fast = beta_fast,
+            .beta_slow = beta_slow,
+            .cache_row = pos0 % cache_cap,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:kbuf offset:ds4_gpu_tensor_offset(k) atIndex:2];
+        [enc setBuffer:q_weightbuf offset:(NSUInteger)q_weight_inner atIndex:3];
+        [enc setBuffer:k_weightbuf offset:(NSUInteger)k_weight_inner atIndex:4];
+        [enc setBytes:&n_q_head length:sizeof(n_q_head) atIndex:5];
+        [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v) atIndex:6];
+        [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:7];
+        [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:8];
+        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_q_head + n_k_head, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "Laguna fused Q/K rope + KV store")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int ds4_gpu_encode_laguna_flash_attention_decode(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        headsbuf,
@@ -31739,7 +31864,11 @@ int ds4_gpu_laguna_store_attention_tensor(
         uint32_t              head_dim,
         float                 scale) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!heads || !key_cache || !value_cache || !q || !k || !v || !gate ||
+    /* k and v may both be NULL when a fused upstream kernel has already
+     * committed the current row to the ring; only the attention runs then. */
+    const bool store_kv = k != NULL || v != NULL;
+    if (!heads || !key_cache || !value_cache || !q || !gate ||
+        (store_kv && (!k || !v)) ||
         cache_cap == 0 || key_count == 0 || key_count > cache_cap ||
         n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 ||
         head_dim != 128u || !isfinite(scale) || scale <= 0.0f) {
@@ -31749,8 +31878,9 @@ int ds4_gpu_laguna_store_attention_tensor(
     const uint64_t kv_values = (uint64_t)n_head_kv * head_dim;
     const uint64_t cache_values = (uint64_t)cache_cap * kv_values;
     if (ds4_gpu_tensor_bytes(q) < q_values * sizeof(float) ||
-        ds4_gpu_tensor_bytes(k) < kv_values * sizeof(float) ||
-        ds4_gpu_tensor_bytes(v) < kv_values * sizeof(float) ||
+        (store_kv &&
+         (ds4_gpu_tensor_bytes(k) < kv_values * sizeof(float) ||
+          ds4_gpu_tensor_bytes(v) < kv_values * sizeof(float))) ||
         ds4_gpu_tensor_bytes(gate) < (uint64_t)n_head * sizeof(float) ||
         ds4_gpu_tensor_bytes(heads) < q_values * sizeof(float) ||
         ds4_gpu_tensor_bytes(key_cache) < cache_values * sizeof(uint16_t) ||
@@ -31764,15 +31894,16 @@ int ds4_gpu_laguna_store_attention_tensor(
         id<MTLBuffer> keybuf = ds4_gpu_tensor_buffer(key_cache);
         id<MTLBuffer> valuebuf = ds4_gpu_tensor_buffer(value_cache);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
-        id<MTLBuffer> kbuf = ds4_gpu_tensor_buffer(k);
-        id<MTLBuffer> vbuf = ds4_gpu_tensor_buffer(v);
+        id<MTLBuffer> kbuf = store_kv ? ds4_gpu_tensor_buffer(k) : nil;
+        id<MTLBuffer> vbuf = store_kv ? ds4_gpu_tensor_buffer(v) : nil;
         id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
         id<MTLComputePipelineState> store_pipeline = ds4_gpu_hot_pipeline(
             g_laguna_store_kv_pipeline, "kernel_laguna_store_kv_f16");
         id<MTLComputePipelineState> attention_pipeline = ds4_gpu_hot_pipeline(
             g_laguna_attention_pipeline,
             "kernel_laguna_attention_decode_gqa_f16");
-        if (!headsbuf || !keybuf || !valuebuf || !qbuf || !kbuf || !vbuf ||
+        if (!headsbuf || !keybuf || !valuebuf || !qbuf ||
+            (store_kv && (!kbuf || !vbuf)) ||
             !gatebuf || !store_pipeline || !attention_pipeline) {
             return 0;
         }
@@ -31780,22 +31911,25 @@ int ds4_gpu_laguna_store_attention_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-        ds4_gpu_laguna_kv_store_args store_args = {
-            .cache_cap = cache_cap,
-            .cache_row = pos % cache_cap,
-            .n_head_kv = n_head_kv,
-            .head_dim = head_dim,
-        };
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:store_pipeline];
-        [enc setBytes:&store_args length:sizeof(store_args) atIndex:0];
-        [enc setBuffer:kbuf offset:ds4_gpu_tensor_offset(k) atIndex:1];
-        [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v) atIndex:2];
-        [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
-        [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (store_kv) {
+            ds4_gpu_laguna_kv_store_args store_args = {
+                .cache_cap = cache_cap,
+                .cache_row = pos % cache_cap,
+                .n_head_kv = n_head_kv,
+                .head_dim = head_dim,
+            };
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:store_pipeline];
+            [enc setBytes:&store_args length:sizeof(store_args) atIndex:0];
+            [enc setBuffer:kbuf offset:ds4_gpu_tensor_offset(k) atIndex:1];
+            [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v) atIndex:2];
+            [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
+            [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
 
         /* The global-attention cache is contiguous until it reaches capacity.
          * A full sliding ring also contains exactly the active key set; its
