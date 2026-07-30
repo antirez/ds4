@@ -1,4 +1,5 @@
 #include "pulsar_engine_internal.h"
+#include "pulsar_file.hpp"
 
 /* Small leaf helpers with no state: string views, hashing, alignment,
  * wall-clock, and f32 blob file I/O. Everything with a real concern of its
@@ -62,13 +63,15 @@ void sleep_sec(double sec) {
 
 
 bool write_f32_binary_file(const char *path, const float *data, uint64_t n) {
-    FILE *fp = fopen(path, "wb");
+    pulsar::FileHandle fp(fopen(path, "wb"));
     if (!fp) {
         fprintf(stderr, "pulsar: failed to open %s for writing: %s\n", path, strerror(errno));
         return false;
     }
-    const size_t nw = fwrite(data, sizeof(float), (size_t)n, fp);
-    const bool ok = nw == (size_t)n && fclose(fp) == 0;
+    const size_t nw = fwrite(data, sizeof(float), (size_t)n, fp.get());
+    /* fp.close() returns the fclose status; on a short write it is short-
+     * circuited and the FileHandle destructor closes fp (previously leaked). */
+    const bool ok = nw == (size_t)n && fp.close() == 0;
     if (!ok) {
         fprintf(stderr, "pulsar: failed to write %s\n", path);
         return false;
@@ -93,13 +96,15 @@ bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
         return false;
     }
 
-    FILE *fp = fopen(path, "rb");
+    pulsar::FileHandle fp(fopen(path, "rb"));
     if (!fp) {
         fprintf(stderr, "pulsar: failed to open %s for reading: %s\n", path, strerror(errno));
         return false;
     }
-    const size_t nr = fread(data, sizeof(float), (size_t)n, fp);
-    const bool ok = nr == (size_t)n && fclose(fp) == 0;
+    const size_t nr = fread(data, sizeof(float), (size_t)n, fp.get());
+    /* fp.close() returns the fclose status; on a short read it is short-
+     * circuited and the FileHandle destructor closes fp (previously leaked). */
+    const bool ok = nr == (size_t)n && fp.close() == 0;
     if (!ok) {
         fprintf(stderr, "pulsar: failed to read %s\n", path);
         return false;
