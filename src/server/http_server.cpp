@@ -1,4 +1,5 @@
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 
 
 
@@ -501,18 +502,19 @@ void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
-    pthread_mutex_lock(&j.mu);
-    if (!s->enqueue(&j)) {
-        pthread_mutex_unlock(&j.mu);
-        http_error(fd, s->enable_cors, 503, "server shutting down");
-        pthread_cond_destroy(&j.cv);
-        pthread_mutex_destroy(&j.mu);
-        request_free(&j.req);
-        goto done;
+    bool enqueued;
+    {
+        /* Hold j.mu across enqueue + the wait for the worker's completion
+         * signal. The ScopedLock MUST release before the destroy below (you
+         * cannot pthread_mutex_destroy a held mutex), so the lock lives in this
+         * inner scope and the single shared teardown runs after it unlocks. */
+        pulsar::ScopedLock lk(&j.mu);
+        enqueued = s->enqueue(&j);
+        if (enqueued) {
+            while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+        }
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
-    pthread_mutex_unlock(&j.mu);
-
+    if (!enqueued) http_error(fd, s->enable_cors, 503, "server shutting down");
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);
