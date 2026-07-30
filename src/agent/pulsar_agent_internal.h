@@ -483,6 +483,18 @@ struct agent_bash_job {
     bool timed_out;
     struct agent_bash_job *next;
     agent_worker *worker;  /* back-pointer for terminal state restoration */
+
+    /* ---- methods (C++ port): 1:1 mirror of the agent_bash_* verb family;
+     * bodies keep the auto *job = this alias, logic verbatim. ---- */
+    int display_lines() const;
+    void note_output(const char *s, size_t n);
+    void job_free();
+    void drain();
+    void finalize(int status);
+    void poll();
+    char *read_head(int max_lines, size_t max_bytes, int *lines_read, bool *byte_limited) const;
+    char *read_tail_lines(int max_lines) const;
+    char *observation(bool mark_observed);
 };
 
 typedef struct {
@@ -724,7 +736,6 @@ agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid);
 void agent_bash_remove_job(agent_worker *w, agent_bash_job *target);
 agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len);
-char *agent_bash_observation(agent_bash_job *job, bool mark_observed);
 char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool wait, int refresh_sec,
                                         bool stop, bool remove_if_done);

@@ -2,14 +2,16 @@
 
 
 
-static int agent_bash_display_lines(const agent_bash_job *job) {
+int agent_bash_job::display_lines() const {
+    const auto *job = this;
     if (!job || job->bytes == 0) return 0;
     return job->newline_count + (job->last_byte != '\n');
 }
 
 
 
-static void agent_bash_note_output(agent_bash_job *job, const char *s, size_t n) {
+void agent_bash_job::note_output(const char *s, size_t n) {
+    auto *job = this;
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '\n') job->newline_count++;
     }
@@ -19,7 +21,8 @@ static void agent_bash_note_output(agent_bash_job *job, const char *s, size_t n)
 
 
 
-static void agent_bash_job_free(agent_bash_job *job) {
+void agent_bash_job::job_free() {
+    auto *job = this;
     if (!job) return;
     if (job->running && job->pid > 0) {
         kill(-job->pid, SIGKILL);
@@ -43,7 +46,7 @@ void agent_bash_jobs_free(agent_worker *w) {
     agent_bash_job *job = w->bash_jobs;
     while (job) {
         agent_bash_job *next = job->next;
-        agent_bash_job_free(job);
+        job->job_free();
         job = next;
     }
     w->bash_jobs = NULL;
@@ -67,7 +70,7 @@ void agent_bash_remove_job(agent_worker *w, agent_bash_job *target) {
         if (*link == target) {
             *link = target->next;
             target->next = NULL;
-            agent_bash_job_free(target);
+            target->job_free();
             return;
         }
         link = &(*link)->next;
@@ -76,13 +79,14 @@ void agent_bash_remove_job(agent_worker *w, agent_bash_job *target) {
 
 
 
-static void agent_bash_drain(agent_bash_job *job) {
+void agent_bash_job::drain() {
+    auto *job = this;
     if (!job || job->pipe_fd < 0) return;
     char tmp[4096];
     for (;;) {
         ssize_t n = read(job->pipe_fd, tmp, sizeof(tmp));
         if (n > 0) {
-            agent_bash_note_output(job, tmp, (size_t)n);
+            job->note_output(tmp, (size_t)n);
             if (job->tmp_fd >= 0) write_all(job->tmp_fd, tmp, (size_t)n);
             continue;
         }
@@ -102,8 +106,9 @@ static void agent_worker_note_terminal_mode_may_have_changed(agent_worker *w) {
 
 
 
-static void agent_bash_finalize(agent_bash_job *job, int status) {
-    agent_bash_drain(job);
+void agent_bash_job::finalize(int status) {
+    auto *job = this;
+    job->drain();
     if (job->pipe_fd >= 0) {
         close(job->pipe_fd);
         job->pipe_fd = -1;
@@ -127,14 +132,15 @@ static void agent_bash_finalize(agent_bash_job *job, int status) {
 /* Drain available output, notice process exit, and enforce timeout.  This is
  * called opportunistically by status/wait/compaction instead of a background
  * reaper thread, keeping all bash job state owned by the agent worker. */
-static void agent_bash_poll(agent_bash_job *job) {
+void agent_bash_job::poll() {
+    auto *job = this;
     if (!job || !job->running) return;
-    agent_bash_drain(job);
+    job->drain();
 
     int status = 0;
     pid_t rc = waitpid(job->pid, &status, WNOHANG);
     if (rc == job->pid) {
-        agent_bash_finalize(job, status);
+        job->finalize(status);
         return;
     }
     if (rc < 0 && errno != EINTR) {
@@ -156,7 +162,7 @@ static void agent_bash_poll(agent_bash_job *job) {
         kill(-job->pid, SIGKILL);
         kill(job->pid, SIGKILL);
         while (waitpid(job->pid, &status, 0) < 0 && errno == EINTR) {}
-        agent_bash_finalize(job, status);
+        job->finalize(status);
     }
 }
 
@@ -252,9 +258,10 @@ static void agent_tail_append(agent_buf *b, const char *s, size_t n, size_t max)
 
 /* Read the first max_lines from the output file, with a byte cap to avoid a
  * pathological single long line flooding the next model turn. */
-static char *agent_bash_read_head(const agent_bash_job *job, int max_lines,
-                                  size_t max_bytes, int *lines_read,
-                                  bool *byte_limited) {
+char *agent_bash_job::read_head(int max_lines,
+                                size_t max_bytes, int *lines_read,
+                                bool *byte_limited) const {
+    const auto *job = this;
     if (lines_read) *lines_read = 0;
     if (byte_limited) *byte_limited = false;
     if (!job || !job->path[0] || job->bytes == 0) return xstrdup("");
@@ -287,7 +294,8 @@ static char *agent_bash_read_head(const agent_bash_job *job, int max_lines,
 
 /* Read the last max_lines from the full output file.  The model-visible label
  * says "tail -N <file>" so it is clear this is not the complete output. */
-static char *agent_bash_read_tail_lines(const agent_bash_job *job, int max_lines) {
+char *agent_bash_job::read_tail_lines(int max_lines) const {
+    const auto *job = this;
     if (!job || !job->path[0] || job->bytes == 0) return xstrdup("");
     FILE *fp = fopen(job->path, "rb");
     if (!fp) return xstrdup("<failed to reopen output file>\n");
@@ -325,10 +333,11 @@ static char *agent_bash_read_tail_lines(const agent_bash_job *job, int max_lines
 
 /* Build the tool result for a bash job.  mark_observed advances the per-job
  * cursor so the next status reports only fresh output. */
-char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
-    agent_bash_poll(job);
+char *agent_bash_job::observation(bool mark_observed) {
+    auto *job = this;
+    job->poll();
     bool first_observation = !job->observed_once;
-    int display_lines = agent_bash_display_lines(job);
+    int display_lines = job->display_lines();
     double elapsed = agent_now_sec() - job->start_time;
 
     agent_buf out = {0};
@@ -353,7 +362,7 @@ char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     } else if (first_observation) {
         int shown_lines = 0;
         bool byte_limited = false;
-        char *head = agent_bash_read_head(job, AGENT_BASH_HEAD_LINES,
+        char *head = job->read_head(AGENT_BASH_HEAD_LINES,
                                           AGENT_BASH_HEAD_BYTES,
                                           &shown_lines, &byte_limited);
         bool truncated = byte_limited || display_lines > shown_lines;
@@ -379,7 +388,7 @@ char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     } else {
         int tail_lines = job->running ? AGENT_BASH_PROGRESS_TAIL_LINES :
                                         AGENT_BASH_FINAL_TAIL_LINES;
-        char *tail = agent_bash_read_tail_lines(job, tail_lines);
+        char *tail = job->read_tail_lines(tail_lines);
         snprintf(line, sizeof(line),
                  "output_path=%s (%zu bytes, %d lines)\n",
                  job->path[0] ? job->path : "<unavailable>",
@@ -460,12 +469,12 @@ static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
     double start = agent_now_sec();
     while (job->running && agent_now_sec() - start < refresh_sec) {
         if (worker_should_interrupt(w)) break;
-        agent_bash_poll(job);
+        job->poll();
         if (!job->running) break;
         struct pollfd pfd = {.fd = job->pipe_fd, .events = POLLIN};
         poll(&pfd, 1, 100);
     }
-    agent_bash_poll(job);
+    job->poll();
 }
 
 
@@ -479,7 +488,7 @@ char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
         kill(job->pid, SIGTERM);
         double start = agent_now_sec();
         while (job->running && agent_now_sec() - start < 1.0) {
-            agent_bash_poll(job);
+            job->poll();
             if (!job->running) break;
             usleep(20000);
         }
@@ -489,9 +498,9 @@ char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
         }
     }
     if (wait || stop) agent_bash_refresh_for(w, job, refresh_sec);
-    else agent_bash_poll(job);
+    else job->poll();
 
-    char *obs = agent_bash_observation(job, true);
+    char *obs = job->observation(true);
     agent_bash_publish_observation(w, obs);
     if (remove_if_done && !job->running) agent_bash_remove_job(w, job);
     return obs;

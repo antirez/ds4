@@ -101,7 +101,7 @@ char *agent_bash_jobs_compaction_observation(agent_worker *w) {
         "Bash job update after context compaction. Running jobs still need explicit bash_status or bash_stop if relevant.\n");
     for (agent_bash_job *job = w->bash_jobs, *next = NULL; job; job = next) {
         next = job->next;
-        char *obs = agent_bash_observation(job, true);
+        char *obs = job->observation(true);
         char hdr[64];
         snprintf(hdr, sizeof(hdr), "\nJob %d:\n", job->id);
         agent_buf_puts(&out, hdr);
