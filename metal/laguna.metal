@@ -437,7 +437,83 @@ kernel void kernel_laguna_attention_prefill_gqa3_f16(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
-    for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
+    /* Four keys per pass: one vector simd_sum yields four scores, so the
+     * per-key reduction and exp latency chains overlap.  The softmax result
+     * is unchanged; only the running-max rescale happens per quad. */
+    uint key_pos = key_start;
+    for (; key_pos + 4u <= query_pos + 1u; key_pos += 4u) {
+        uint64_t kb[4];
+        bool cur[4];
+        FOR_UNROLL (short kk = 0; kk < 4; kk++) {
+            const uint kp = key_pos + (uint)kk;
+            cur[kk] = kp >= args.pos0;
+            const uint source_row = cur[kk] ?
+                kp - args.pos0 : kp % args.cache_cap;
+            kb[kk] = (uint64_t)source_row * cache_width +
+                     (uint64_t)kv_head * args.head_dim;
+        }
+
+        float4 p0 = float4(0.0f);
+        float4 p1 = float4(0.0f);
+        float4 p2 = float4(0.0f);
+        for (uint d = lane; d < args.head_dim; d += 32u) {
+            const float q0 = qh0[d];
+            const float q1 = qh1[d];
+            const float q2 = qh2[d];
+            FOR_UNROLL (short kk = 0; kk < 4; kk++) {
+                const float key_value = cur[kk] ?
+                    (float)staged_key[kb[kk] + d] :
+                    (float)key_cache[kb[kk] + d];
+                p0[kk] += q0 * key_value;
+                p1[kk] += q1 * key_value;
+                p2[kk] += q2 * key_value;
+            }
+        }
+        const float4 s0 = simd_sum(p0) * args.scale;
+        const float4 s1 = simd_sum(p1) * args.scale;
+        const float4 s2 = simd_sum(p2) * args.scale;
+
+        const float next_max0 =
+            max(max0, max(max(s0.x, s0.y), max(s0.z, s0.w)));
+        const float next_max1 =
+            max(max1, max(max(s1.x, s1.y), max(s1.z, s1.w)));
+        const float next_max2 =
+            max(max2, max(max(s2.x, s2.y), max(s2.z, s2.w)));
+        const float old_scale0 = max0 == -INFINITY ?
+            0.0f : exp(max0 - next_max0);
+        const float old_scale1 = max1 == -INFINITY ?
+            0.0f : exp(max1 - next_max1);
+        const float old_scale2 = max2 == -INFINITY ?
+            0.0f : exp(max2 - next_max2);
+        const float4 e0 = exp(s0 - next_max0);
+        const float4 e1 = exp(s1 - next_max1);
+        const float4 e2 = exp(s2 - next_max2);
+        sum0 = sum0 * old_scale0 + (e0.x + e0.y) + (e0.z + e0.w);
+        sum1 = sum1 * old_scale1 + (e1.x + e1.y) + (e1.z + e1.w);
+        sum2 = sum2 * old_scale2 + (e2.x + e2.y) + (e2.z + e2.w);
+        acc0 = acc0 * old_scale0;
+        acc1 = acc1 * old_scale1;
+        acc2 = acc2 * old_scale2;
+        const uint d0 = lane;
+        FOR_UNROLL (short kk = 0; kk < 4; kk++) {
+            const float4 value = cur[kk] ?
+                float4((float)staged_value[kb[kk] + d0],
+                       (float)staged_value[kb[kk] + d0 + 32u],
+                       (float)staged_value[kb[kk] + d0 + 64u],
+                       (float)staged_value[kb[kk] + d0 + 96u]) :
+                float4((float)value_cache[kb[kk] + d0],
+                       (float)value_cache[kb[kk] + d0 + 32u],
+                       (float)value_cache[kb[kk] + d0 + 64u],
+                       (float)value_cache[kb[kk] + d0 + 96u]);
+            acc0 += value * e0[kk];
+            acc1 += value * e1[kk];
+            acc2 += value * e2[kk];
+        }
+        max0 = next_max0;
+        max1 = next_max1;
+        max2 = next_max2;
+    }
+    for (; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
             key_pos - args.pos0 : key_pos % args.cache_cap;
@@ -578,7 +654,109 @@ kernel void kernel_laguna_attention_prefill_gqa6_f16(
     float sum3 = 0.0f;
     float sum4 = 0.0f;
     float sum5 = 0.0f;
-    for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
+    /* Two keys per pass: vector simd_sums overlap the reduction and exp
+     * chains while keeping the six-head register footprint in bounds. */
+    uint key_pos = key_start;
+    for (; key_pos + 2u <= query_pos + 1u; key_pos += 2u) {
+        uint64_t kb[2];
+        bool cur[2];
+        FOR_UNROLL (short kk = 0; kk < 2; kk++) {
+            const uint kp = key_pos + (uint)kk;
+            cur[kk] = kp >= args.pos0;
+            const uint source_row = cur[kk] ?
+                kp - args.pos0 : kp % args.cache_cap;
+            kb[kk] = (uint64_t)source_row * cache_width +
+                     (uint64_t)kv_head * args.head_dim;
+        }
+
+        float2 p0 = float2(0.0f);
+        float2 p1 = float2(0.0f);
+        float2 p2 = float2(0.0f);
+        float2 p3 = float2(0.0f);
+        float2 p4 = float2(0.0f);
+        float2 p5 = float2(0.0f);
+        for (uint d = lane; d < args.head_dim; d += 32u) {
+            const float2 key_value = float2(
+                cur[0] ? (float)staged_key[kb[0] + d]
+                       : (float)key_cache[kb[0] + d],
+                cur[1] ? (float)staged_key[kb[1] + d]
+                       : (float)key_cache[kb[1] + d]);
+            p0 += qh0[d] * key_value;
+            p1 += qh1[d] * key_value;
+            p2 += qh2[d] * key_value;
+            p3 += qh3[d] * key_value;
+            p4 += qh4[d] * key_value;
+            p5 += qh5[d] * key_value;
+        }
+        const float2 s0 = simd_sum(p0) * args.scale;
+        const float2 s1 = simd_sum(p1) * args.scale;
+        const float2 s2 = simd_sum(p2) * args.scale;
+        const float2 s3 = simd_sum(p3) * args.scale;
+        const float2 s4 = simd_sum(p4) * args.scale;
+        const float2 s5 = simd_sum(p5) * args.scale;
+
+        const float next_max0 = max(max0, max(s0.x, s0.y));
+        const float next_max1 = max(max1, max(s1.x, s1.y));
+        const float next_max2 = max(max2, max(s2.x, s2.y));
+        const float next_max3 = max(max3, max(s3.x, s3.y));
+        const float next_max4 = max(max4, max(s4.x, s4.y));
+        const float next_max5 = max(max5, max(s5.x, s5.y));
+        const float old_scale0 = max0 == -INFINITY ?
+            0.0f : exp(max0 - next_max0);
+        const float old_scale1 = max1 == -INFINITY ?
+            0.0f : exp(max1 - next_max1);
+        const float old_scale2 = max2 == -INFINITY ?
+            0.0f : exp(max2 - next_max2);
+        const float old_scale3 = max3 == -INFINITY ?
+            0.0f : exp(max3 - next_max3);
+        const float old_scale4 = max4 == -INFINITY ?
+            0.0f : exp(max4 - next_max4);
+        const float old_scale5 = max5 == -INFINITY ?
+            0.0f : exp(max5 - next_max5);
+        const float2 e0 = exp(s0 - next_max0);
+        const float2 e1 = exp(s1 - next_max1);
+        const float2 e2 = exp(s2 - next_max2);
+        const float2 e3 = exp(s3 - next_max3);
+        const float2 e4 = exp(s4 - next_max4);
+        const float2 e5 = exp(s5 - next_max5);
+        sum0 = sum0 * old_scale0 + e0.x + e0.y;
+        sum1 = sum1 * old_scale1 + e1.x + e1.y;
+        sum2 = sum2 * old_scale2 + e2.x + e2.y;
+        sum3 = sum3 * old_scale3 + e3.x + e3.y;
+        sum4 = sum4 * old_scale4 + e4.x + e4.y;
+        sum5 = sum5 * old_scale5 + e5.x + e5.y;
+        acc0 = acc0 * old_scale0;
+        acc1 = acc1 * old_scale1;
+        acc2 = acc2 * old_scale2;
+        acc3 = acc3 * old_scale3;
+        acc4 = acc4 * old_scale4;
+        acc5 = acc5 * old_scale5;
+        const uint dv = lane;
+        FOR_UNROLL (short kk = 0; kk < 2; kk++) {
+            const float4 value = cur[kk] ?
+                float4((float)staged_value[kb[kk] + dv],
+                       (float)staged_value[kb[kk] + dv + 32u],
+                       (float)staged_value[kb[kk] + dv + 64u],
+                       (float)staged_value[kb[kk] + dv + 96u]) :
+                float4((float)value_cache[kb[kk] + dv],
+                       (float)value_cache[kb[kk] + dv + 32u],
+                       (float)value_cache[kb[kk] + dv + 64u],
+                       (float)value_cache[kb[kk] + dv + 96u]);
+            acc0 += value * e0[kk];
+            acc1 += value * e1[kk];
+            acc2 += value * e2[kk];
+            acc3 += value * e3[kk];
+            acc4 += value * e4[kk];
+            acc5 += value * e5[kk];
+        }
+        max0 = next_max0;
+        max1 = next_max1;
+        max2 = next_max2;
+        max3 = next_max3;
+        max4 = next_max4;
+        max5 = next_max5;
+    }
+    for (; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
             key_pos - args.pos0 : key_pos % args.cache_cap;
