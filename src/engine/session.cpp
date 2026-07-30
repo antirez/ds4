@@ -75,7 +75,7 @@ const pulsar_tokens *pulsar_session::tokens() {
 
 void pulsar_engine::dump_tokens(const pulsar_tokens *tokens) {
     auto *e = this;
-    ::dump_tokens(&e->vocab, tokens);  /* global helper; the member name hides it */
+    e->vocab.dump_tokens(tokens);  /* the pulsar_vocab member */
 }
 
 
@@ -87,12 +87,12 @@ int pulsar_dump_text_tokenization(const char *model_path, const char *text, FILE
 
     if (!fp) fp = stdout;
     model_open(&model, model_path, false, false);
-    vocab_load(&vocab, &model);
-    tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
+    vocab.vocab_load(&model);
+    vocab.tokenize_rendered_chat_vocab(text ? text : "", &tokens);
 
     dump_tokens_fp(fp, &vocab, &tokens);
     token_vec_free(&tokens);
-    vocab_free(&vocab);
+    vocab.vocab_free();
     model_close(&model);
     return 0;
 }
@@ -474,7 +474,7 @@ int pulsar_engine::open(pulsar_engine **out, const pulsar_engine_options *opt) {
     if (graph_backend) pulsar_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
-    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
+    if (!opt->inspect_only) e->vocab.vocab_load(&e->model);
     config_validate_model(&e->model);
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         const char *sep = strrchr(opt->expert_overlay, ':');
@@ -793,7 +793,7 @@ void pulsar_engine::destroy() {
     auto *e = this;
     if (!e) return;
     weights_free(&e->weights);
-    vocab_free(&e->vocab);
+    e->vocab.vocab_free();
     pulsar_threads_shutdown();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */

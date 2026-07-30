@@ -1203,6 +1203,8 @@ typedef struct {
     uint64_t used;
 } str_i32_table;
 
+struct owned_str;  /* forward decl: bpe_rank() param; full def appears later */
+
 struct pulsar_vocab {
     pulsar_str *token;
     int n_vocab;
@@ -1215,6 +1217,21 @@ struct pulsar_vocab {
     int dsml_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
+
+    /* ---- methods (C++ port): 1:1 mirror of the vocab verb family in
+     * tokenizer.cpp; bodies keep the auto *vocab = this alias, logic verbatim.
+     * Names kept as-is (none carry the pulsar_vocab type-name prefix). ---- */
+    int bpe_rank(const owned_str *a, const owned_str *b) const;
+    void bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const;
+    void bpe_tokenize_text(const char *text, token_vec *out) const;
+    int vocab_lookup(const char *text) const;
+    void vocab_load(const pulsar_model *model);
+    void vocab_free();
+    bool special_token_at(const char *p, int *token, size_t *len) const;
+    void tokenize_span(const char *p, size_t n, token_vec *out) const;
+    void tokenize_rendered_chat_vocab(const char *text, token_vec *out) const;
+    void bpe_tokenize_tool_result_text(const char *content, token_vec *out);
+    void dump_tokens(const token_vec *tokens) const;
 };
 
 struct pulsar_engine {
@@ -1288,7 +1305,7 @@ struct pulsar_engine {
     bool has_dspark();
 };
 
-typedef struct {
+typedef struct owned_str {
     char *ptr;
     uint64_t len;
 } owned_str;
@@ -2682,12 +2699,7 @@ void cpu_directional_steering_project_rows(
         uint32_t     il,
         uint32_t     rows,
         float        scale);
-void vocab_load(pulsar_vocab *vocab, const pulsar_model *model);
-void vocab_free(pulsar_vocab *vocab);
-void tokenize_rendered_chat_vocab(const pulsar_vocab *vocab, const char *text,
-                                         token_vec *out);
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens);
-void dump_tokens(const pulsar_vocab *vocab, const token_vec *tokens);
 int sample_argmax(const float *logits, uint32_t n_vocab);
 typedef struct {
     int *ids;

@@ -220,7 +220,8 @@ static owned_str owned_copy(const char *ptr, uint64_t len) {
 
 
 /* Look up the merge rank for two adjacent BPE symbols. */
-static int bpe_rank(const pulsar_vocab *vocab, const owned_str *a, const owned_str *b) {
+int pulsar_vocab::bpe_rank(const owned_str *a, const owned_str *b) const {
+    const auto *vocab = this;
     uint64_t len = a->len + 1 + b->len;
     char stack[512];
     char *buf = len <= sizeof(stack) ? stack : (char *)xmalloc((size_t)len);
@@ -239,7 +240,8 @@ static int bpe_rank(const pulsar_vocab *vocab, const owned_str *a, const owned_s
 
 
 /* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
-static void bpe_emit_piece(const pulsar_vocab *vocab, pulsar_str raw_piece, token_vec *out) {
+void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
+    const auto *vocab = this;
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
@@ -263,7 +265,7 @@ static void bpe_emit_piece(const pulsar_vocab *vocab, pulsar_str raw_piece, toke
         int best_rank = INT32_MAX;
 
         for (int i = 0; i + 1 < n_sym; i++) {
-            int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
+            int rank = vocab->bpe_rank(&sym[i], &sym[i + 1]);
             if (rank >= 0 && rank < best_rank) {
                 best_rank = rank;
                 best_i = i;
@@ -438,7 +440,8 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
  */
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
-static void bpe_tokenize_text(const pulsar_vocab *vocab, const char *text, token_vec *out) {
+void pulsar_vocab::bpe_tokenize_text(const char *text, token_vec *out) const {
+    const auto *vocab = this;
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -504,13 +507,14 @@ static void bpe_tokenize_text(const pulsar_vocab *vocab, const char *text, token
         }
 
         if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (pulsar_str){ text + start, pos - start }, out);
+        vocab->bpe_emit_piece((pulsar_str){ text + start, pos - start }, out);
     }
 }
 
 
 
-static int vocab_lookup(const pulsar_vocab *vocab, const char *text) {
+int pulsar_vocab::vocab_lookup(const char *text) const {
+    const auto *vocab = this;
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
         fprintf(stderr, "pulsar: required tokenizer token is missing: %s\n", text);
@@ -522,7 +526,8 @@ static int vocab_lookup(const pulsar_vocab *vocab, const char *text) {
 
 
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
-void vocab_load(pulsar_vocab *vocab, const pulsar_model *model) {
+void pulsar_vocab::vocab_load(const pulsar_model *model) {
+    auto *vocab = this;
     memset(vocab, 0, sizeof(*vocab));
 
     pulsar_array_ref tokens;
@@ -555,18 +560,19 @@ void vocab_load(pulsar_vocab *vocab, const pulsar_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
-    vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
-    vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
-    vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
-    vocab->think_start_id = vocab_lookup(vocab, "<think>");
-    vocab->think_end_id = vocab_lookup(vocab, "</think>");
-    vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+    vocab->bos_id       = vocab->vocab_lookup("<｜begin▁of▁sentence｜>");
+    vocab->eos_id       = vocab->vocab_lookup("<｜end▁of▁sentence｜>");
+    vocab->user_id      = vocab->vocab_lookup("<｜User｜>");
+    vocab->assistant_id = vocab->vocab_lookup("<｜Assistant｜>");
+    vocab->think_start_id = vocab->vocab_lookup("<think>");
+    vocab->think_end_id = vocab->vocab_lookup("</think>");
+    vocab->dsml_id = vocab->vocab_lookup("｜DSML｜");
 }
 
 
 
-void vocab_free(pulsar_vocab *vocab) {
+void pulsar_vocab::vocab_free() {
+    auto *vocab = this;
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
@@ -586,13 +592,13 @@ static void encode_chat_prompt(
         token_vec       *out) {
     token_vec_push(out, vocab->bos_id);
     if (think_mode == PULSAR_THINK_MAX) {
-        bpe_tokenize_text(vocab, PULSAR_REASONING_EFFORT_MAX_PREFIX, out);
+        vocab->bpe_tokenize_text(PULSAR_REASONING_EFFORT_MAX_PREFIX, out);
     }
     if (system && system[0]) {
-        bpe_tokenize_text(vocab, system, out);
+        vocab->bpe_tokenize_text(system, out);
     }
     token_vec_push(out, vocab->user_id);
-    bpe_tokenize_text(vocab, prompt, out);
+    vocab->bpe_tokenize_text(prompt, out);
     token_vec_push(out, vocab->assistant_id);
     if (pulsar_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
@@ -604,12 +610,13 @@ static void encode_chat_prompt(
 
 
 void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    bpe_tokenize_text(&e->vocab, text ? text : "", out);
+    e->vocab.bpe_tokenize_text(text ? text : "", out);
 }
 
 
 
-static bool special_token_at(const pulsar_vocab *vocab, const char *p, int *token, size_t *len) {
+bool pulsar_vocab::special_token_at(const char *p, int *token, size_t *len) const {
+    const auto *vocab = this;
     struct special {
         const char *text;
         int token;
@@ -636,19 +643,21 @@ static bool special_token_at(const pulsar_vocab *vocab, const char *p, int *toke
 
 
 
-static void tokenize_span(const pulsar_vocab *vocab, const char *p, size_t n, token_vec *out) {
+void pulsar_vocab::tokenize_span(const char *p, size_t n, token_vec *out) const {
+    const auto *vocab = this;
     if (!n) return;
     char *tmp = (char *)xmalloc(n + 1);
     memcpy(tmp, p, n);
     tmp[n] = '\0';
-    bpe_tokenize_text(vocab, tmp, out);
+    vocab->bpe_tokenize_text(tmp, out);
     free(tmp);
 }
 
 
 
-void tokenize_rendered_chat_vocab(const pulsar_vocab *vocab, const char *text,
-                                         token_vec *out) {
+void pulsar_vocab::tokenize_rendered_chat_vocab(const char *text,
+                                                token_vec *out) const {
+    const auto *vocab = this;
     if (!text) text = "";
 
     const char *span = text;
@@ -656,8 +665,8 @@ void tokenize_rendered_chat_vocab(const pulsar_vocab *vocab, const char *text,
     while (*p) {
         int token = -1;
         size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
+        if (vocab->special_token_at(p, &token, &len)) {
+            vocab->tokenize_span(span, (size_t)(p - span), out);
             token_vec_push(out, token);
             p += len;
             span = p;
@@ -665,13 +674,13 @@ void tokenize_rendered_chat_vocab(const pulsar_vocab *vocab, const char *text,
         }
         p++;
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    vocab->tokenize_span(span, (size_t)(p - span), out);
 }
 
 
 
 void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    tokenize_rendered_chat_vocab(&e->vocab, text, out);
+    e->vocab.tokenize_rendered_chat_vocab(text, out);
 }
 
 
@@ -694,12 +703,13 @@ void pulsar_encode_chat_prompt(
 
 
 void pulsar_chat_append_max_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, PULSAR_REASONING_EFFORT_MAX_PREFIX, tokens);
+    e->vocab.bpe_tokenize_text(PULSAR_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
 
 
-static void bpe_tokenize_tool_result_text(pulsar_vocab *vocab, const char *content, token_vec *out) {
+void pulsar_vocab::bpe_tokenize_tool_result_text(const char *content, token_vec *out) {
+    auto *vocab = this;
     /* Tool output is plain data inside <tool_result>...</tool_result>.
      * Preserve literal '<', '>' and '&' so shell output and file snippets stay
      * intact, but escape the exact closing sentinel so a malicious or accidental
@@ -710,15 +720,15 @@ static void bpe_tokenize_tool_result_text(pulsar_vocab *vocab, const char *conte
     const char *p = span;
     while (*p) {
         if (!strncmp(p, end, endlen)) {
-            tokenize_span(vocab, span, (size_t)(p - span), out);
-            bpe_tokenize_text(vocab, "&lt;", out);
+            vocab->tokenize_span(span, (size_t)(p - span), out);
+            vocab->bpe_tokenize_text("&lt;", out);
             p++;
             span = p;
         } else {
             p++;
         }
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    vocab->tokenize_span(span, (size_t)(p - span), out);
 }
 
 
@@ -729,21 +739,21 @@ void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const c
     if (!content) content = "";
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        bpe_tokenize_text(vocab, content, tokens);
+        vocab->bpe_tokenize_text(content, tokens);
     } else if (!strcmp(role, "assistant")) {
         token_vec_push(tokens, vocab->assistant_id);
         if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
             token_vec_push(tokens, vocab->think_end_id);
         }
-        bpe_tokenize_text(vocab, content, tokens);
+        vocab->bpe_tokenize_text(content, tokens);
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         token_vec_push(tokens, vocab->user_id);
-        bpe_tokenize_text(vocab, "<tool_result>", tokens);
-        bpe_tokenize_tool_result_text(vocab, content, tokens);
-        bpe_tokenize_text(vocab, "</tool_result>", tokens);
+        vocab->bpe_tokenize_text("<tool_result>", tokens);
+        vocab->bpe_tokenize_tool_result_text(content, tokens);
+        vocab->bpe_tokenize_text("</tool_result>", tokens);
     } else {
         token_vec_push(tokens, vocab->user_id);
-        bpe_tokenize_text(vocab, content, tokens);
+        vocab->bpe_tokenize_text(content, tokens);
     }
 }
 
@@ -775,7 +785,8 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 
 
 
-void dump_tokens(const pulsar_vocab *vocab, const token_vec *tokens) {
+void pulsar_vocab::dump_tokens(const token_vec *tokens) const {
+    const auto *vocab = this;
     dump_tokens_fp(stdout, vocab, tokens);
 }
 
