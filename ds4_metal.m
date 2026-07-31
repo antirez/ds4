@@ -16846,9 +16846,15 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
-        const uint32_t rows_per_group =
+        uint32_t rows_per_group =
             n_rows >= 4u ? 4u : n_rows == 3u ? 3u :
             n_rows == 2u ? 2u : 1u;
+        /* Diagnostic: cap the exact-rows kernel's tokens per threadgroup. */
+        const char *rows_cap_env = getenv("DS4_METAL_Q8_ROWS_EXACT_MAX");
+        if (rows_cap_env != NULL) {
+            const uint32_t cap = (uint32_t)atoi(rows_cap_env);
+            if (cap >= 1u && cap < rows_per_group) rows_per_group = cap;
+        }
         const char *function_name =
             rows_per_group == 4u ?
                 "kernel_mul_mv_q8_0_f32_rows4_exact" :

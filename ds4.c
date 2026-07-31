@@ -49942,9 +49942,13 @@ static bool laguna_graph_forward_batch(
     const bool exact_q8_rows = row_argmax_out != NULL;
     /* Stage attribution for plain prefill only: DFlash verification shares
      * its command stream with the draft graph and must not be drained at
-     * stage boundaries. */
+     * stage boundaries.  DS4_LAGUNA_VERIFY_STAGE_PROFILE opts the verifier
+     * in anyway (diagnostics; the drains distort wall time but the GPU-busy
+     * column still localizes execution cost). */
     const bool stage_prof =
-        laguna_stage_profile_enabled() && gpu_draft_tokens == NULL;
+        laguna_stage_profile_enabled() &&
+        (gpu_draft_tokens == NULL ||
+         getenv("DS4_LAGUNA_VERIFY_STAGE_PROFILE") != NULL);
     if (stage_prof) {
         g_laguna_stage_t0 = now_sec() * 1000.0;
         g_laguna_stage_busy0 = laguna_stage_busy_ms();
