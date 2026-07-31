@@ -69289,6 +69289,54 @@ static int ds4_session_eval_dflash_speculative_argmax(
      * its host-side scan of the vocabulary. */
     s->dflash_greedy_next = target_top[n_accept - 1];
 
+    /* Training-data harvest (diagnostic): append one record per accepted
+     * position — the captured aux features the draft conditions on, the
+     * verified token, and its absolute position.  The greedy stream itself
+     * provides the prediction labels at training time. */
+    do {
+        static FILE *dump_fp;
+        static int dump_state;
+        if (dump_state == 0) {
+            const char *dump_path = getenv("DS4_DFLASH_DUMP");
+            if (dump_path != NULL && dump_path[0] != '\0') {
+                dump_fp = fopen(dump_path, "ab");
+                if (dump_fp != NULL && ftell(dump_fp) == 0) {
+                    const uint32_t header[4] = {
+                        0x44344446u, /* "D4DF" */
+                        1u, DS4_DFLASH_N_AUX, DS4_N_EMBD,
+                    };
+                    fwrite(header, sizeof(header), 1, dump_fp);
+                }
+            }
+            dump_state = dump_fp != NULL ? 1 : -1;
+        }
+        if (dump_state != 1) break;
+        const uint32_t feat_elems = DS4_DFLASH_N_AUX * DS4_N_EMBD;
+        float *feat = malloc((size_t)feat_elems * sizeof(float));
+        uint16_t *half = malloc((size_t)feat_elems * sizeof(uint16_t));
+        if (!feat || !half) { free(feat); free(half); break; }
+        for (int r = 0; r < n_accept; r++) {
+            if (!ds4_gpu_tensor_read(
+                    s->dflash_graph.features,
+                    (uint64_t)r * feat_elems * sizeof(float),
+                    feat, (uint64_t)feat_elems * sizeof(float))) {
+                break;
+            }
+            for (uint32_t i = 0; i < feat_elems; i++) {
+                /* f32 -> f16 via the compiler's conversion */
+                _Float16 h = (_Float16)feat[i];
+                memcpy(&half[i], &h, sizeof(uint16_t));
+            }
+            const uint32_t rec_pos = pos0 + (uint32_t)r;
+            const int32_t rec_token = accepted[r];
+            fwrite(&rec_pos, sizeof(rec_pos), 1, dump_fp);
+            fwrite(&rec_token, sizeof(rec_token), 1, dump_fp);
+            fwrite(half, sizeof(uint16_t), feat_elems, dump_fp);
+        }
+        free(feat);
+        free(half);
+    } while (0);
+
     const double verify_done = now_sec();
     const double busy_verify = laguna_stage_busy_ms();
     if (laguna_dflash_timing_enabled()) {
