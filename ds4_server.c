@@ -11601,6 +11601,9 @@ decode_again:
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    /* Verifier argmax carried over from a speculative iteration; valid for
+     * exactly one loop turn and only for greedy sampling. */
+    int greedy_next = -1;
 
     server_generation_enter(s);
     while (!g_stop_requested && completion < max_tokens &&
@@ -11633,8 +11636,14 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(slot->session, temperature, top_k,
+        int token;
+        if (greedy_next >= 0 && temperature <= 0.0f) {
+            token = greedy_next;
+        } else {
+            token = ds4_session_sample(slot->session, temperature, top_k,
                                        top_p, min_p, &rng);
+        }
+        greedy_next = -1;
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -11660,6 +11669,7 @@ decode_again:
                 finish = "error";
                 break;
             }
+            greedy_next = ds4_session_greedy_next(slot->session);
         } else {
             if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
                 finish = "error";
