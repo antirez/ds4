@@ -147,6 +147,55 @@ kernel void kernel_get_rows_q4_0_f32(
     }
 }
 
+struct ds4_get_rows_block_q6_K {
+    uchar ql[128];
+    uchar qh[64];
+    char  scales[16];
+    half  d;
+};
+
+kernel void kernel_get_rows_q6_K_f32(
+        constant ds4_metal_args_get_rows_q8_0 & args,
+        device const char    * src0,
+        device const char    * src1,
+        device       char    * dst,
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                ntg [[threads_per_threadgroup]]) {
+    const int32_t block = (int32_t)tgpig.x;
+    const int32_t tok_i = (int32_t)tgpig.y;
+    if (tok_i >= args.n_tokens) return;
+
+    const int32_t token =
+        ((const device int32_t *)(src1 + (uint64_t)tok_i * args.token_stride))[0];
+    if (token < 0 || token >= args.n_vocab) return;
+
+    const device ds4_get_rows_block_q6_K *row =
+        (const device ds4_get_rows_block_q6_K *)(src0 + (uint64_t)token * args.src_row_bytes);
+    const device ds4_get_rows_block_q6_K *qb = row + block;
+    device float *out =
+        (device float *)(dst + (uint64_t)tok_i * args.dst_row_bytes);
+
+    const int32_t i0 = block * 256;
+    const float d = (float)qb->d;
+    for (int32_t i = (int32_t)tiitg; i < 256; i += (int32_t)ntg.x) {
+        const int32_t idx = i0 + i;
+        if (idx < args.n_embd) {
+            const uint half128 = (uint)i >> 7u;         /* which 128-elem half */
+            const uint pos = (uint)i & 127u;
+            const uint quarter = pos >> 5u;
+            const uint l = pos & 31u;
+            const uint ql_idx = half128 * 64u + ((quarter & 1u) ? 32u : 0u) + l;
+            const uint nib = (quarter < 2u)
+                ? ((uint)qb->ql[ql_idx] & 0x0Fu)
+                : ((uint)qb->ql[ql_idx] >> 4u);
+            const uint hb = ((uint)qb->qh[half128 * 32u + l] >> (2u * quarter)) & 3u;
+            const int v = (int)(nib | (hb << 4u)) - 32;
+            out[idx] = d * (float)((int)qb->scales[(uint)i >> 4u]) * (float)v;
+        }
+    }
+}
+
 kernel void kernel_get_rows_q4_K_f32(
         constant ds4_metal_args_get_rows_q8_0 & args,
         device const char    * src0,
