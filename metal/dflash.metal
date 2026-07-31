@@ -110,6 +110,8 @@ kernel void kernel_dflash_probabilities(
         device const float   *logits,
         device const int32_t *argmax,
         device       float   *probabilities,
+        device       int32_t *top2,
+        device       float   *probabilities2,
         threadgroup float    *scratch [[threadgroup(0)]],
         uint tid [[thread_index_in_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]],
@@ -118,7 +120,11 @@ kernel void kernel_dflash_probabilities(
     if (row >= args.n_rows || args.n_vocab == 0u) return;
     const int32_t top = argmax[row];
     if (top < 0 || (uint32_t)top >= args.n_vocab) {
-        if (tid == 0u) probabilities[row] = 0.0f;
+        if (tid == 0u) {
+            probabilities[row] = 0.0f;
+            top2[row] = -1;
+            probabilities2[row] = 0.0f;
+        }
         return;
     }
 
@@ -126,20 +132,41 @@ kernel void kernel_dflash_probabilities(
         logits + (uint64_t)row * args.n_vocab;
     const float top_logit = row_logits[top];
     float sum = 0.0f;
+    float m2 = -INFINITY;
+    uint i2 = 0xFFFFFFFFu;
     if (isfinite(top_logit)) {
         for (uint col = tid; col < args.n_vocab; col += ntg.x) {
-            const float term = exp(row_logits[col] - top_logit);
+            const float value = row_logits[col];
+            const float term = exp(value - top_logit);
             if (isfinite(term)) sum += term;
+            if (col != (uint32_t)top && value > m2) {
+                m2 = value;
+                i2 = col;
+            }
         }
     }
     scratch[tid] = sum;
+    threadgroup float *max2 = scratch + ntg.x;
+    threadgroup uint *idx2 = (threadgroup uint *)(max2 + ntg.x);
+    max2[tid] = m2;
+    idx2[tid] = i2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint step = ntg.x >> 1u; step != 0u; step >>= 1u) {
-        if (tid < step) scratch[tid] += scratch[tid + step];
+        if (tid < step) {
+            scratch[tid] += scratch[tid + step];
+            if (max2[tid + step] > max2[tid]) {
+                max2[tid] = max2[tid + step];
+                idx2[tid] = idx2[tid + step];
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0u) {
-        probabilities[row] =
+        const float inv_sum =
             scratch[0] > 0.0f ? 1.0f / scratch[0] : 0.0f;
+        probabilities[row] = inv_sum;
+        top2[row] = idx2[0] == 0xFFFFFFFFu ? -1 : (int32_t)idx2[0];
+        probabilities2[row] = isfinite(max2[0]) ?
+            exp(max2[0] - top_logit) * inv_sum : 0.0f;
     }
 }

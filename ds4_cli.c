@@ -54,7 +54,10 @@ static bool cli_greedy_fast_attention_requested(void) {
 
 static bool cli_greedy_argmax_requested(bool speculative_requested) {
     if (cli_greedy_fast_attention_requested()) return true;
-    if (speculative_requested) return false;
+    /* Speculative sessions expose the verifier's own argmax through
+     * ds4_session_greedy_next; paths that don't provide it return -1 and
+     * fall back to the sampled scan. */
+    if (speculative_requested) return true;
     return cli_env_flag_enabled("DS4_CUDA_GREEDY_TOP1", true);
 }
 
@@ -624,6 +627,10 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
+            }
+            if (greedy_argmax) {
+                greedy_next = ds4_session_greedy_next(session);
+                have_greedy_next = greedy_next >= 0;
             }
         } else {
             size_t piece_len = 0;
@@ -1537,6 +1544,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
+            }
+            if (greedy_argmax) {
+                greedy_next = ds4_session_greedy_next(chat->session);
+                have_greedy_next = greedy_next >= 0;
             }
         } else {
             size_t piece_len = 0;

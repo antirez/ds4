@@ -411,6 +411,11 @@ int ds4_sessions_eval_batch_with_prefill(
         ds4_decode_item *items, int count,
         ds4_session *prefill_session, const ds4_tokens *prefill_prompt,
         char *err, size_t errlen);
+/* After a successful ds4_session_eval_speculative_argmax at temperature 0,
+ * returns the verifier's own argmax of the freshly exposed logits (the
+ * greedy next token), or -1 when unavailable. */
+int ds4_session_greedy_next(const ds4_session *s);
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,

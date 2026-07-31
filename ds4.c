@@ -47711,6 +47711,8 @@ typedef struct {
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *argmax;
     ds4_gpu_tensor *probabilities;
+    ds4_gpu_tensor *top2;
+    ds4_gpu_tensor *probabilities2;
     ds4_gpu_tensor *key_cache[DS4_DFLASH_N_LAYER];
     ds4_gpu_tensor *value_cache[DS4_DFLASH_N_LAYER];
 } ds4_dflash_gpu_graph;
@@ -48618,6 +48620,8 @@ static void dflash_graph_free(ds4_dflash_gpu_graph *g) {
     DS4_DFLASH_FREE(logits);
     DS4_DFLASH_FREE(argmax);
     DS4_DFLASH_FREE(probabilities);
+    DS4_DFLASH_FREE(top2);
+    DS4_DFLASH_FREE(probabilities2);
 #undef DS4_DFLASH_FREE
     for (uint32_t il = 0; il < DS4_DFLASH_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->key_cache[il]);
@@ -48680,6 +48684,8 @@ static bool dflash_graph_alloc(ds4_dflash_gpu_graph *g) {
     DS4_DFLASH_ALLOC(logits, block_rows * DS4_N_VOCAB * f32);
     DS4_DFLASH_ALLOC(argmax, block_rows * sizeof(int32_t));
     DS4_DFLASH_ALLOC(probabilities, block_rows * f32);
+    DS4_DFLASH_ALLOC(top2, block_rows * sizeof(int32_t));
+    DS4_DFLASH_ALLOC(probabilities2, block_rows * f32);
 #undef DS4_DFLASH_ALLOC
 
     const uint64_t cache_bytes =
@@ -49107,6 +49113,8 @@ static bool dflash_graph_draft_block(
     if (ok && e->dflash_p_min > 0.0f) {
         ok = ds4_gpu_dflash_probabilities_tensor(
                  g->probabilities,
+                 g->top2,
+                 g->probabilities2,
                  g->logits,
                  g->argmax,
                  n_rows,
@@ -51585,6 +51593,7 @@ struct ds4_session {
     uint64_t dflash_proposed;
     uint64_t dflash_pruned;
     uint64_t dflash_accepted;
+    int dflash_greedy_next;
     double dflash_draft_ms;
     double dflash_verify_ms;
     double dflash_baseline_ms;
@@ -68938,6 +68947,8 @@ static int ds4_session_eval_dflash_speculative_argmax(
     uint32_t n_rows = n_draft + 1u;
     const uint32_t generated_draft = n_draft;
     int draft_top[DS4_DFLASH_BLOCK_SIZE] = {0};
+    int draft_top2[DS4_DFLASH_BLOCK_SIZE] = {0};
+    float draft_p2[DS4_DFLASH_BLOCK_SIZE] = {0};
     int target_top[DS4_DFLASH_BLOCK_SIZE] = {0};
     int verify_tokens[DS4_DFLASH_BLOCK_SIZE] = {0};
     const float draft_p_min = e->dflash_p_min;
@@ -69026,7 +69037,17 @@ static int ds4_session_eval_dflash_speculative_argmax(
                 0,
                 draft_probabilities,
                 (uint64_t)n_rows *
-                    sizeof(draft_probabilities[0])) != 0;
+                    sizeof(draft_probabilities[0])) != 0 &&
+            ds4_gpu_tensor_read(
+                s->dflash_graph.top2,
+                0,
+                draft_top2,
+                (uint64_t)n_rows * sizeof(draft_top2[0])) != 0 &&
+            ds4_gpu_tensor_read(
+                s->dflash_graph.probabilities2,
+                0,
+                draft_p2,
+                (uint64_t)n_rows * sizeof(draft_p2[0])) != 0;
 #else
         draft_read_ok =
             ds4_gpu_end_commands() != 0 &&
@@ -69208,6 +69229,10 @@ static int ds4_session_eval_dflash_speculative_argmax(
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->dflash_synced = true;
+    /* The verifier argmax of the last accepted row is exactly the greedy
+     * sample of s->logits; expose it so a temperature-0 caller can skip
+     * its host-side scan of the vocabulary. */
+    s->dflash_greedy_next = target_top[n_accept - 1];
 
     const double verify_done = now_sec();
     const double busy_verify = laguna_stage_busy_ms();
@@ -69218,7 +69243,12 @@ static int ds4_session_eval_dflash_speculative_argmax(
          * verifier execution + argmax readback; tail = full-row logits read
          * + ring restore.  Sample adds the host-side pick from logits. */
         static double acc[6];
+        static double inter_cycle_acc;
+        static double last_cycle_end;
         static uint32_t acc_cycles;
+        if (last_cycle_end != 0.0) {
+            inter_cycle_acc += (cycle_t0 - last_cycle_end) * 1000.0;
+        }
         static uint64_t accept_len_hist[DS4_DFLASH_BLOCK_SIZE + 1u];
         static uint64_t draft_len_hist[DS4_DFLASH_BLOCK_SIZE + 1u];
         acc[0] += (submit_done - cycle_t0) * 1000.0;
@@ -69235,6 +69265,15 @@ static int ds4_session_eval_dflash_speculative_argmax(
         busy[4] += busy_verify - busy_reads;
         accept_len_hist[n_accept - 1]++;
         draft_len_hist[n_draft]++;
+        static uint64_t p1_rejects, p1_top2_hits;
+        static double p1_top2_p2_sum;
+        if (n_draft >= 1u && target_top[0] != draft_top[1]) {
+            p1_rejects++;
+            if (target_top[0] == draft_top2[1]) {
+                p1_top2_hits++;
+                p1_top2_p2_sum += draft_p2[1];
+            }
+        }
         if ((++acc_cycles % 64u) == 0u) {
             fprintf(stderr,
                     "ds4: DFlash phases ms/cycle over %u cycles: "
@@ -69267,7 +69306,18 @@ static int ds4_session_eval_dflash_speculative_argmax(
                     (unsigned long long)draft_len_hist[3],
                     (unsigned long long)draft_len_hist[4],
                     (unsigned long long)draft_len_hist[5]);
+            fprintf(stderr,
+                    "ds4: DFlash position-1 rejects %llu, draft-top2 would "
+                    "have hit %llu (mean p2 %.3f); inter-cycle %.2f "
+                    "ms/cycle\n",
+                    (unsigned long long)p1_rejects,
+                    (unsigned long long)p1_top2_hits,
+                    p1_top2_hits != 0u ?
+                        p1_top2_p2_sum / (double)p1_top2_hits : 0.0,
+                    inter_cycle_acc / 64.0);
+            inter_cycle_acc = 0.0;
         }
+        last_cycle_end = now_sec();
     }
     /* CUDA installs the anonymous F16 support mapping lazily. Its first draft
      * cycle faults roughly 2 GiB of weights and is intentionally a one-time
@@ -69443,11 +69493,16 @@ static int ds4_session_eval_dflash_speculative_argmax(
 }
 #endif
 
+int ds4_session_greedy_next(const ds4_session *s) {
+    return s ? s->dflash_greedy_next : -1;
+}
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    s->dflash_greedy_next = -1;
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;

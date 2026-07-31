@@ -1239,6 +1239,8 @@ int ds4_gpu_dflash_commit_kv_tensor(
 
 int ds4_gpu_dflash_probabilities_tensor(
         ds4_gpu_tensor       *probabilities,
+        ds4_gpu_tensor       *top2,
+        ds4_gpu_tensor       *probabilities2,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *argmax,
         uint32_t              n_rows,

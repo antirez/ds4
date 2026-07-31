@@ -33154,14 +33154,20 @@ typedef struct {
 
 int ds4_gpu_dflash_probabilities_tensor(
         ds4_gpu_tensor       *probabilities,
+        ds4_gpu_tensor       *top2,
+        ds4_gpu_tensor       *probabilities2,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *argmax,
         uint32_t              n_rows,
         uint32_t              n_vocab) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!probabilities || !logits || !argmax ||
+    if (!probabilities || !top2 || !probabilities2 || !logits || !argmax ||
         n_rows == 0u || n_vocab == 0u ||
         ds4_gpu_tensor_bytes(probabilities) <
+            (uint64_t)n_rows * sizeof(float) ||
+        ds4_gpu_tensor_bytes(top2) <
+            (uint64_t)n_rows * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(probabilities2) <
             (uint64_t)n_rows * sizeof(float) ||
         ds4_gpu_tensor_bytes(logits) <
             (uint64_t)n_rows * n_vocab * sizeof(float) ||
@@ -33173,11 +33179,15 @@ int ds4_gpu_dflash_probabilities_tensor(
     @autoreleasepool {
         id<MTLBuffer> probabilitiesbuf =
             ds4_gpu_tensor_buffer(probabilities);
+        id<MTLBuffer> top2buf = ds4_gpu_tensor_buffer(top2);
+        id<MTLBuffer> probabilities2buf =
+            ds4_gpu_tensor_buffer(probabilities2);
         id<MTLBuffer> logitsbuf = ds4_gpu_tensor_buffer(logits);
         id<MTLBuffer> argmaxbuf = ds4_gpu_tensor_buffer(argmax);
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_pipeline("kernel_dflash_probabilities");
-        if (!probabilitiesbuf || !logitsbuf || !argmaxbuf || !pipeline) {
+        if (!probabilitiesbuf || !top2buf || !probabilities2buf ||
+            !logitsbuf || !argmaxbuf || !pipeline) {
             return 0;
         }
 
@@ -33200,7 +33210,13 @@ int ds4_gpu_dflash_probabilities_tensor(
         [enc setBuffer:probabilitiesbuf
                 offset:ds4_gpu_tensor_offset(probabilities)
                atIndex:3];
-        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc setBuffer:top2buf
+                offset:ds4_gpu_tensor_offset(top2)
+               atIndex:4];
+        [enc setBuffer:probabilities2buf
+                offset:ds4_gpu_tensor_offset(probabilities2)
+               atIndex:5];
+        [enc setThreadgroupMemoryLength:256u * 3u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
