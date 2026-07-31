@@ -59609,7 +59609,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifdef DS4_NATIVE_CUDA_BUILD
         e->dflash_draft_tokens = 15;
 #else
-        e->dflash_draft_tokens = 3;
+        /* Deep drafts under confidence pruning: with the NAX/gqa3 verify,
+         * (5, 0.50) beats the old (3, 0.40) optimum — cold paired runs
+         * 84.5 vs 83.9 tok/s, identical greedy output. */
+        e->dflash_draft_tokens = 5;
 #endif
     }
     if (opt->dflash_p_min_set &&
@@ -59621,8 +59624,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+#ifdef DS4_NATIVE_CUDA_BUILD
     e->dflash_p_min =
         opt->dflash_p_min_set ? opt->dflash_p_min : 0.4f;
+#else
+    e->dflash_p_min =
+        opt->dflash_p_min_set ? opt->dflash_p_min : 0.5f;
+#endif
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
     if (opt->dspark_confidence_threshold_set) {
         e->dspark_confidence_threshold = opt->dspark_confidence_threshold;
@@ -68844,6 +68852,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
     bool draft_read_ok = false;
 
     const double cycle_t0 = now_sec();
+    const double busy_t0 = laguna_stage_busy_ms();
     if (!laguna_graph_spec_snapshot(&s->laguna_graph, pos0, n_rows)) {
         if (errlen) snprintf(err, errlen, "Laguna verifier snapshot failed");
         return -1;
@@ -68864,6 +68873,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         return 1;
     }
     const double submit_done = now_sec();
+    const double busy_submit = laguna_stage_busy_ms();
     bool target_preencoded = false;
 #ifdef __APPLE__
     if (draft_p_min > 0.0f && ds4_gpu_flush_commands() != 0) {
@@ -68949,6 +68959,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
     }
 
     const double conf_done = now_sec();
+    const double busy_conf = laguna_stage_busy_ms();
     verify_tokens[0] = first_token;
     ds4_laguna_feature_capture capture =
         ds4_session_dflash_capture(s, 0, n_rows);
@@ -68968,6 +68979,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
             NULL,
             0);
     const double verify_encoded = now_sec();
+    const double busy_encoded = laguna_stage_busy_ms();
     bool inject_ok = false;
     if (verify_ok) {
         inject_ok = ds4_session_dflash_finish_capture(s, pos0, n_rows);
@@ -68988,6 +69000,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         }
     }
     const double reads_done = now_sec();
+    const double busy_reads = laguna_stage_busy_ms();
     if (!verify_ok || !inject_ok || !target_read_ok || !draft_read_ok) {
         (void)laguna_graph_spec_restore(
             &s->laguna_graph, pos0, 0, n_rows);
@@ -69032,6 +69045,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
     s->dflash_synced = true;
 
     const double verify_done = now_sec();
+    const double busy_verify = laguna_stage_busy_ms();
     if (getenv("DS4_DFLASH_TIMING") != NULL) {
         /* Phase attribution: draft = snapshot + draft-block encode/submit;
          * conf = wait for draft + confidence readback; enc = verifier encode
@@ -69040,12 +69054,22 @@ static int ds4_session_eval_dflash_speculative_argmax(
          * + ring restore.  Sample adds the host-side pick from logits. */
         static double acc[6];
         static uint32_t acc_cycles;
+        static uint64_t accept_len_hist[DS4_DFLASH_BLOCK_SIZE + 1u];
+        static uint64_t draft_len_hist[DS4_DFLASH_BLOCK_SIZE + 1u];
         acc[0] += (submit_done - cycle_t0) * 1000.0;
         acc[1] += (conf_done - submit_done) * 1000.0;
         acc[2] += (verify_encoded - conf_done) * 1000.0;
         acc[3] += (reads_done - verify_encoded) * 1000.0;
         acc[4] += (verify_done - reads_done) * 1000.0;
         acc[5] += s->last_sample_ms;
+        static double busy[5];
+        busy[0] += busy_submit - busy_t0;
+        busy[1] += busy_conf - busy_submit;
+        busy[2] += busy_encoded - busy_conf;
+        busy[3] += busy_reads - busy_encoded;
+        busy[4] += busy_verify - busy_reads;
+        accept_len_hist[n_accept - 1]++;
+        draft_len_hist[n_draft]++;
         if ((++acc_cycles % 64u) == 0u) {
             fprintf(stderr,
                     "ds4: DFlash phases ms/cycle over %u cycles: "
@@ -69054,7 +69078,30 @@ static int ds4_session_eval_dflash_speculative_argmax(
                     64u,
                     acc[0] / 64.0, acc[1] / 64.0, acc[2] / 64.0,
                     acc[3] / 64.0, acc[4] / 64.0, acc[5] / 64.0);
+            fprintf(stderr,
+                    "ds4: DFlash GPU-busy ms/cycle: draft %.2f conf %.2f "
+                    "enc %.2f read %.2f tail %.2f\n",
+                    busy[0] / 64.0, busy[1] / 64.0, busy[2] / 64.0,
+                    busy[3] / 64.0, busy[4] / 64.0);
             memset(acc, 0, sizeof(acc));
+            memset(busy, 0, sizeof(busy));
+            fprintf(stderr,
+                    "ds4: DFlash accept-length hist 0..5: "
+                    "%llu %llu %llu %llu %llu %llu | "
+                    "post-prune draft-length hist 0..5: "
+                    "%llu %llu %llu %llu %llu %llu\n",
+                    (unsigned long long)accept_len_hist[0],
+                    (unsigned long long)accept_len_hist[1],
+                    (unsigned long long)accept_len_hist[2],
+                    (unsigned long long)accept_len_hist[3],
+                    (unsigned long long)accept_len_hist[4],
+                    (unsigned long long)accept_len_hist[5],
+                    (unsigned long long)draft_len_hist[0],
+                    (unsigned long long)draft_len_hist[1],
+                    (unsigned long long)draft_len_hist[2],
+                    (unsigned long long)draft_len_hist[3],
+                    (unsigned long long)draft_len_hist[4],
+                    (unsigned long long)draft_len_hist[5]);
         }
     }
     /* CUDA installs the anonymous F16 support mapping lazily. Its first draft
