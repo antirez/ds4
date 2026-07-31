@@ -663,11 +663,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             size_t piece_len = 0;
             char *piece = ds4_token_text(engine, toks[j], &piece_len);
             token_printer_write_text(&printer, piece, piece_len);
-            fflush(stdout);
             free(piece);
             generated++;
             if (generated >= max_tokens) break;
         }
+        fflush(stdout);
         if (stop) break;
     }
     const double t_decode1 = cli_now_sec();
