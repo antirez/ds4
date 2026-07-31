@@ -102,6 +102,61 @@ static inline float4 laguna_head_rms_norm_rope_neox_simd(
     return v;
 }
 
+// One lane-owned float4 slice of a 128-wide head row (dims lane, +32, +64,
+// +96), promoted to float.
+static inline float4 laguna_load_head4(device const half *row, uint d0) {
+    return float4((float)row[d0],
+                  (float)row[d0 + 32u],
+                  (float)row[d0 + 64u],
+                  (float)row[d0 + 96u]);
+}
+
+// One key position's online-softmax update for a three-query-head group.
+// Kept in one place so the two-deep pipelined loops below stay
+// arithmetic-identical to the original single-position bodies.
+static inline void laguna_gqa3_online_step(
+        float4 key,
+        float4 value,
+        float scale,
+        device const float *qh0,
+        device const float *qh1,
+        device const float *qh2,
+        uint d0,
+        thread float4 &acc0, thread float4 &acc1, thread float4 &acc2,
+        thread float &max0, thread float &max1, thread float &max2,
+        thread float &sum0, thread float &sum1, thread float &sum2) {
+    const float score0 = simd_sum(dot(float4(qh0[d0],
+                                               qh0[d0 + 32u],
+                                               qh0[d0 + 64u],
+                                               qh0[d0 + 96u]), key)) * scale;
+    const float score1 = simd_sum(dot(float4(qh1[d0],
+                                               qh1[d0 + 32u],
+                                               qh1[d0 + 64u],
+                                               qh1[d0 + 96u]), key)) * scale;
+    const float score2 = simd_sum(dot(float4(qh2[d0],
+                                               qh2[d0 + 32u],
+                                               qh2[d0 + 64u],
+                                               qh2[d0 + 96u]), key)) * scale;
+    const float next_max0 = max(max0, score0);
+    const float next_max1 = max(max1, score1);
+    const float next_max2 = max(max2, score2);
+    const float old_scale0 = max0 == -INFINITY ? 0.0f : exp(max0 - next_max0);
+    const float old_scale1 = max1 == -INFINITY ? 0.0f : exp(max1 - next_max1);
+    const float old_scale2 = max2 == -INFINITY ? 0.0f : exp(max2 - next_max2);
+    const float value_scale0 = exp(score0 - next_max0);
+    const float value_scale1 = exp(score1 - next_max1);
+    const float value_scale2 = exp(score2 - next_max2);
+    sum0 = sum0 * old_scale0 + value_scale0;
+    sum1 = sum1 * old_scale1 + value_scale1;
+    sum2 = sum2 * old_scale2 + value_scale2;
+    acc0 = acc0 * old_scale0 + value * value_scale0;
+    acc1 = acc1 * old_scale1 + value * value_scale1;
+    acc2 = acc2 * old_scale2 + value * value_scale2;
+    max0 = next_max0;
+    max1 = next_max1;
+    max2 = next_max2;
+}
+
 // Barrier-free variants for the Laguna head geometry (head_dim 128,
 // n_rot 64 or 128): four heads per threadgroup, one simdgroup each.
 kernel void kernel_laguna_head_rms_norm_rope_simd(
@@ -1049,49 +1104,39 @@ kernel void kernel_laguna_attention_decode_gqa3_split_f16(
     float sum2 = 0.0f;
     const uint first = iwg * args.nsg + simd_group;
     const uint stride = args.nwg * args.nsg;
-    for (uint i = first; i < key_count; i += stride) {
+    const uint d0 = lane;
+    /* Two key positions per trip with every K/V load hoisted ahead of the
+     * simd_sum chains, so the second position's device loads are in flight
+     * during the first position's reductions.  Per-position arithmetic and
+     * visit order are unchanged. */
+    uint i = first;
+    for (; i + stride < key_count; i += 2u * stride) {
+        const uint64_t base_a =
+            (uint64_t)i * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const uint64_t base_b =
+            (uint64_t)(i + stride) * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const float4 ka = laguna_load_head4(key_cache + base_a, d0);
+        const float4 va = laguna_load_head4(value_cache + base_a, d0);
+        const float4 kb = laguna_load_head4(key_cache + base_b, d0);
+        const float4 vb = laguna_load_head4(value_cache + base_b, d0);
+        laguna_gqa3_online_step(ka, va, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
+        laguna_gqa3_online_step(kb, vb, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
+    }
+    for (; i < key_count; i += stride) {
         const uint64_t kv_base =
             (uint64_t)i * cache_width +
             (uint64_t)kv_head * args.head_dim;
-        const uint d0 = lane;
-        const float4 key = float4((float)key_cache[kv_base + d0],
-                                  (float)key_cache[kv_base + d0 + 32u],
-                                  (float)key_cache[kv_base + d0 + 64u],
-                                  (float)key_cache[kv_base + d0 + 96u]);
-        const float score0 = simd_sum(dot(float4(qh0[d0],
-                                                   qh0[d0 + 32u],
-                                                   qh0[d0 + 64u],
-                                                   qh0[d0 + 96u]), key)) * args.scale;
-        const float score1 = simd_sum(dot(float4(qh1[d0],
-                                                   qh1[d0 + 32u],
-                                                   qh1[d0 + 64u],
-                                                   qh1[d0 + 96u]), key)) * args.scale;
-        const float score2 = simd_sum(dot(float4(qh2[d0],
-                                                   qh2[d0 + 32u],
-                                                   qh2[d0 + 64u],
-                                                   qh2[d0 + 96u]), key)) * args.scale;
-        const float next_max0 = max(max0, score0);
-        const float next_max1 = max(max1, score1);
-        const float next_max2 = max(max2, score2);
-        const float old_scale0 = max0 == -INFINITY ? 0.0f : exp(max0 - next_max0);
-        const float old_scale1 = max1 == -INFINITY ? 0.0f : exp(max1 - next_max1);
-        const float old_scale2 = max2 == -INFINITY ? 0.0f : exp(max2 - next_max2);
-        const float value_scale0 = exp(score0 - next_max0);
-        const float value_scale1 = exp(score1 - next_max1);
-        const float value_scale2 = exp(score2 - next_max2);
-        sum0 = sum0 * old_scale0 + value_scale0;
-        sum1 = sum1 * old_scale1 + value_scale1;
-        sum2 = sum2 * old_scale2 + value_scale2;
-        const float4 value = float4((float)value_cache[kv_base + d0],
-                                    (float)value_cache[kv_base + d0 + 32u],
-                                    (float)value_cache[kv_base + d0 + 64u],
-                                    (float)value_cache[kv_base + d0 + 96u]);
-        acc0 = acc0 * old_scale0 + value * value_scale0;
-        acc1 = acc1 * old_scale1 + value * value_scale1;
-        acc2 = acc2 * old_scale2 + value * value_scale2;
-        max0 = next_max0;
-        max1 = next_max1;
-        max2 = next_max2;
+        const float4 key = laguna_load_head4(key_cache + kv_base, d0);
+        const float4 value = laguna_load_head4(value_cache + kv_base, d0);
+        laguna_gqa3_online_step(key, value, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
     }
 
     threadgroup float *partial_max = scratch;
@@ -1430,51 +1475,35 @@ kernel void kernel_laguna_attention_decode_rows_gqa3_f16(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
-    for (uint i = simd_group; i < key_count; i += nsg) {
-        const uint key_pos = key_start + i;
-        const uint cache_row = key_pos % args.cache_cap;
-        const uint64_t kv_base =
-            (uint64_t)cache_row * cache_width +
+    const uint d0 = lane;
+    uint i = simd_group;
+    for (; i + nsg < key_count; i += 2u * nsg) {
+        const uint64_t base_a =
+            (uint64_t)((key_start + i) % args.cache_cap) * cache_width +
             (uint64_t)kv_head * args.head_dim;
-        const uint d0 = lane;
-        const float4 key = float4((float)key_cache[kv_base + d0],
-                                  (float)key_cache[kv_base + d0 + 32u],
-                                  (float)key_cache[kv_base + d0 + 64u],
-                                  (float)key_cache[kv_base + d0 + 96u]);
-        const float score0 = simd_sum(dot(float4(qh0[d0],
-                                                   qh0[d0 + 32u],
-                                                   qh0[d0 + 64u],
-                                                   qh0[d0 + 96u]), key)) * args.scale;
-        const float score1 = simd_sum(dot(float4(qh1[d0],
-                                                   qh1[d0 + 32u],
-                                                   qh1[d0 + 64u],
-                                                   qh1[d0 + 96u]), key)) * args.scale;
-        const float score2 = simd_sum(dot(float4(qh2[d0],
-                                                   qh2[d0 + 32u],
-                                                   qh2[d0 + 64u],
-                                                   qh2[d0 + 96u]), key)) * args.scale;
-        const float next_max0 = max(max0, score0);
-        const float next_max1 = max(max1, score1);
-        const float next_max2 = max(max2, score2);
-        const float old_scale0 = max0 == -INFINITY ? 0.0f : exp(max0 - next_max0);
-        const float old_scale1 = max1 == -INFINITY ? 0.0f : exp(max1 - next_max1);
-        const float old_scale2 = max2 == -INFINITY ? 0.0f : exp(max2 - next_max2);
-        const float value_scale0 = exp(score0 - next_max0);
-        const float value_scale1 = exp(score1 - next_max1);
-        const float value_scale2 = exp(score2 - next_max2);
-        sum0 = sum0 * old_scale0 + value_scale0;
-        sum1 = sum1 * old_scale1 + value_scale1;
-        sum2 = sum2 * old_scale2 + value_scale2;
-        const float4 value = float4((float)value_cache[kv_base + d0],
-                                    (float)value_cache[kv_base + d0 + 32u],
-                                    (float)value_cache[kv_base + d0 + 64u],
-                                    (float)value_cache[kv_base + d0 + 96u]);
-        acc0 = acc0 * old_scale0 + value * value_scale0;
-        acc1 = acc1 * old_scale1 + value * value_scale1;
-        acc2 = acc2 * old_scale2 + value * value_scale2;
-        max0 = next_max0;
-        max1 = next_max1;
-        max2 = next_max2;
+        const uint64_t base_b =
+            (uint64_t)((key_start + i + nsg) % args.cache_cap) * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const float4 ka = laguna_load_head4(key_cache + base_a, d0);
+        const float4 va = laguna_load_head4(value_cache + base_a, d0);
+        const float4 kb = laguna_load_head4(key_cache + base_b, d0);
+        const float4 vb = laguna_load_head4(value_cache + base_b, d0);
+        laguna_gqa3_online_step(ka, va, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
+        laguna_gqa3_online_step(kb, vb, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
+    }
+    for (; i < key_count; i += nsg) {
+        const uint64_t kv_base =
+            (uint64_t)((key_start + i) % args.cache_cap) * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const float4 key = laguna_load_head4(key_cache + kv_base, d0);
+        const float4 value = laguna_load_head4(value_cache + kv_base, d0);
+        laguna_gqa3_online_step(key, value, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
     }
 
     threadgroup float *partial_max = scratch;
@@ -1583,13 +1612,57 @@ kernel void kernel_laguna_attention_decode_rows_gqa3_staged_f16(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
-    for (uint i = simd_group; i < key_count; i += nsg) {
+    const uint d0 = lane;
+    uint i = simd_group;
+    for (; i + nsg < key_count; i += 2u * nsg) {
+        device const half *kpa;
+        device const half *vpa;
+        device const half *kpb;
+        device const half *vpb;
+        if (i < ring_len) {
+            const uint64_t kv_base =
+                (uint64_t)((key_start + i) % args.cache_cap) * cache_width +
+                (uint64_t)kv_head * args.head_dim;
+            kpa = key_cache + kv_base;
+            vpa = value_cache + kv_base;
+        } else {
+            const uint64_t kv_base =
+                (uint64_t)(i - ring_len) * cache_width +
+                (uint64_t)kv_head * args.head_dim;
+            kpa = staged_key + kv_base;
+            vpa = staged_value + kv_base;
+        }
+        if (i + nsg < ring_len) {
+            const uint64_t kv_base =
+                (uint64_t)((key_start + i + nsg) % args.cache_cap) *
+                cache_width +
+                (uint64_t)kv_head * args.head_dim;
+            kpb = key_cache + kv_base;
+            vpb = value_cache + kv_base;
+        } else {
+            const uint64_t kv_base =
+                (uint64_t)(i + nsg - ring_len) * cache_width +
+                (uint64_t)kv_head * args.head_dim;
+            kpb = staged_key + kv_base;
+            vpb = staged_value + kv_base;
+        }
+        const float4 ka = laguna_load_head4(kpa, d0);
+        const float4 va = laguna_load_head4(vpa, d0);
+        const float4 kb = laguna_load_head4(kpb, d0);
+        const float4 vb = laguna_load_head4(vpb, d0);
+        laguna_gqa3_online_step(ka, va, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
+        laguna_gqa3_online_step(kb, vb, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
+    }
+    for (; i < key_count; i += nsg) {
         device const half *kp;
         device const half *vp;
         if (i < ring_len) {
-            const uint cache_row = (key_start + i) % args.cache_cap;
             const uint64_t kv_base =
-                (uint64_t)cache_row * cache_width +
+                (uint64_t)((key_start + i) % args.cache_cap) * cache_width +
                 (uint64_t)kv_head * args.head_dim;
             kp = key_cache + kv_base;
             vp = value_cache + kv_base;
@@ -1600,45 +1673,11 @@ kernel void kernel_laguna_attention_decode_rows_gqa3_staged_f16(
             kp = staged_key + kv_base;
             vp = staged_value + kv_base;
         }
-        const uint d0 = lane;
-        const float4 key = float4((float)kp[d0],
-                                  (float)kp[d0 + 32u],
-                                  (float)kp[d0 + 64u],
-                                  (float)kp[d0 + 96u]);
-        const float score0 = simd_sum(dot(float4(qh0[d0],
-                                                   qh0[d0 + 32u],
-                                                   qh0[d0 + 64u],
-                                                   qh0[d0 + 96u]), key)) * args.scale;
-        const float score1 = simd_sum(dot(float4(qh1[d0],
-                                                   qh1[d0 + 32u],
-                                                   qh1[d0 + 64u],
-                                                   qh1[d0 + 96u]), key)) * args.scale;
-        const float score2 = simd_sum(dot(float4(qh2[d0],
-                                                   qh2[d0 + 32u],
-                                                   qh2[d0 + 64u],
-                                                   qh2[d0 + 96u]), key)) * args.scale;
-        const float next_max0 = max(max0, score0);
-        const float next_max1 = max(max1, score1);
-        const float next_max2 = max(max2, score2);
-        const float old_scale0 = max0 == -INFINITY ? 0.0f : exp(max0 - next_max0);
-        const float old_scale1 = max1 == -INFINITY ? 0.0f : exp(max1 - next_max1);
-        const float old_scale2 = max2 == -INFINITY ? 0.0f : exp(max2 - next_max2);
-        const float value_scale0 = exp(score0 - next_max0);
-        const float value_scale1 = exp(score1 - next_max1);
-        const float value_scale2 = exp(score2 - next_max2);
-        sum0 = sum0 * old_scale0 + value_scale0;
-        sum1 = sum1 * old_scale1 + value_scale1;
-        sum2 = sum2 * old_scale2 + value_scale2;
-        const float4 value = float4((float)vp[d0],
-                                    (float)vp[d0 + 32u],
-                                    (float)vp[d0 + 64u],
-                                    (float)vp[d0 + 96u]);
-        acc0 = acc0 * old_scale0 + value * value_scale0;
-        acc1 = acc1 * old_scale1 + value * value_scale1;
-        acc2 = acc2 * old_scale2 + value * value_scale2;
-        max0 = next_max0;
-        max1 = next_max1;
-        max2 = next_max2;
+        const float4 key = laguna_load_head4(kp, d0);
+        const float4 value = laguna_load_head4(vp, d0);
+        laguna_gqa3_online_step(key, value, args.scale, qh0, qh1, qh2, d0,
+                                acc0, acc1, acc2, max0, max1, max2,
+                                sum0, sum1, sum2);
     }
 
     threadgroup float *partial_max = scratch;

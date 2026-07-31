@@ -44,9 +44,16 @@ kernel void kernel_rms_norm_fuse_impl(
 
     float sumf = 0.0f;
 
-    // parallel sum
+    // parallel sum, caching the row in registers so the output pass does
+    // not re-read device memory (bit-exact: same values, same order)
+    constexpr short XCACHE = 4;
+    T xcache[XCACHE];
+    const bool cached = args.ne00_t <= (int)(XCACHE * ntg.x);
+    short nc = 0;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        const T v = x[i00];
+        if (cached) xcache[nc++] = v;
+        sumf += dot(v, v);
     }
     sumf = simd_sum(sumf);
 
@@ -65,15 +72,17 @@ kernel void kernel_rms_norm_fuse_impl(
     const float scale = 1.0f/sqrt(mean + args.eps);
 
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    nc = 0;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        const T v = cached ? xcache[nc++] : x[i00];
         if (F == 1) {
-            y[i00] = (x[i00]*scale);
+            y[i00] = (v*scale);
         }
         if (F == 2) {
-            y[i00] = (x[i00]*scale)*f0[i00];
+            y[i00] = (v*scale)*f0[i00];
         }
         if (F == 3) {
-            y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
+            y[i00] = (v*scale)*f0[i00] + f1[i00];
         }
     }
 }
@@ -114,9 +123,16 @@ kernel void kernel_add_rms_norm_mul_f32_4(
         (norm_dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
 
     float sumf = 0.0f;
+    // Register-cache the freshly computed sums so the output pass does not
+    // re-read them from device memory (sum[] stays a real output).
+    constexpr short XCACHE = 4;
+    float4 xcache[XCACHE];
+    const bool cached = args.ne00_t <= (int)(XCACHE * ntg.x);
+    short nc = 0;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         const float4 v = a[i00] + b[i00];
         sum[i00] = v;
+        if (cached) xcache[nc++] = v;
         sumf += dot(v, v);
     }
     sumf = simd_sum(sumf);
@@ -127,8 +143,10 @@ kernel void kernel_add_rms_norm_mul_f32_4(
 
     const float mean = sumf / args.ne00;
     const float scale = 1.0f / sqrt(mean + args.eps);
+    nc = 0;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        norm[i00] = (sum[i00] * scale) * w[i00];
+        const float4 v = cached ? xcache[nc++] : sum[i00];
+        norm[i00] = (v * scale) * w[i00];
     }
 }
 
