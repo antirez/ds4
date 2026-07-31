@@ -36129,6 +36129,7 @@ struct ds4_engine {
     int mtp_draft_tokens;
     int dflash_draft_tokens;
     float dflash_p_min;
+    bool dflash_p_min_default;
     float mtp_margin;
     float dspark_confidence_threshold;
     char *directional_steering_file;
@@ -49731,6 +49732,24 @@ static bool laguna_graph_forward_token(
                                  logits_out,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    /* Diagnostic: clean per-token GPU-busy without stage drains, for
+     * comparison against the DFlash verifier's read-phase busy. */
+    if (ok && getenv("DS4_LAGUNA_DECODE_BUSY") != NULL) {
+        static double busy_prev;
+        static double busy_acc;
+        static uint32_t busy_tokens;
+        const double busy_now = laguna_stage_busy_ms();
+        if (busy_prev != 0.0) {
+            busy_acc += busy_now - busy_prev;
+            if ((++busy_tokens % 64u) == 0u) {
+                fprintf(stderr,
+                        "ds4: laguna decode GPU-busy %.2f ms/token over "
+                        "64 tokens\n", busy_acc / 64.0);
+                busy_acc = 0.0;
+            }
+        }
+        busy_prev = busy_now;
+    }
     if (ok) laguna_stage_token_done();
     return ok;
 }
@@ -59654,9 +59673,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifdef DS4_NATIVE_CUDA_BUILD
     e->dflash_p_min =
         opt->dflash_p_min_set ? opt->dflash_p_min : 0.4f;
+    e->dflash_p_min_default = false;
 #else
     e->dflash_p_min =
         opt->dflash_p_min_set ? opt->dflash_p_min : 0.5f;
+    /* Without an explicit --dflash-p-min, deeper positions prune harder
+     * (0.50/0.55/0.65): chain acceptance decays with position, so a
+     * marginal tail row rarely earns its 2.5 GB verify cost. */
+    e->dflash_p_min_default = !opt->dflash_p_min_set;
 #endif
     e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
     if (opt->dspark_confidence_threshold_set) {
@@ -68962,8 +68986,36 @@ static int ds4_session_eval_dflash_speculative_argmax(
                 (uint64_t)n_rows *
                     sizeof(draft_probabilities[0])) != 0;
 #endif
+        /* Diagnostic: per-position confidence thresholds, e.g.
+         * DS4_DFLASH_P_MIN_SCHED=0.40,0.55,0.65 (later positions keep the
+         * last value); unset positions fall back to the uniform p-min. */
+        static float p_min_sched[DS4_DFLASH_BLOCK_SIZE];
+        static int p_min_sched_n = -1;
+        if (p_min_sched_n < 0) {
+            p_min_sched_n = 0;
+            const char *sched_env = getenv("DS4_DFLASH_P_MIN_SCHED");
+            while (sched_env != NULL && *sched_env != '\0' &&
+                   p_min_sched_n < (int)DS4_DFLASH_BLOCK_SIZE) {
+                char *end = NULL;
+                const float v = strtof(sched_env, &end);
+                if (end == sched_env) break;
+                p_min_sched[p_min_sched_n++] = v;
+                sched_env = *end == ',' ? end + 1 : end;
+            }
+        }
+        static const float p_min_sched_default[3] = {0.50f, 0.55f, 0.65f};
         for (uint32_t i = 0; draft_read_ok && i < n_draft; i++) {
-            if (draft_probabilities[i + 1u] < draft_p_min) {
+            float threshold;
+            if (p_min_sched_n > 0) {
+                threshold = (int)i < p_min_sched_n ?
+                    p_min_sched[i] : p_min_sched[p_min_sched_n - 1];
+            } else if (e->dflash_p_min_default) {
+                threshold = i < 3u ?
+                    p_min_sched_default[i] : p_min_sched_default[2];
+            } else {
+                threshold = draft_p_min;
+            }
+            if (draft_probabilities[i + 1u] < threshold) {
                 n_draft = i;
                 n_rows = n_draft + 1u;
                 break;
