@@ -1429,6 +1429,170 @@ kernel void kernel_laguna_attention_decode_rows_gqa3_f16(
     }
 }
 
+// Post-wrap twin of the gqa3 verifier-rows kernel: the block's own keys come
+// from the staging buffer instead of the ring, so storing the block can wait
+// until after attention and never overwrites slots still visible to earlier
+// rows.  Key visit order per row is unchanged (ring segment then staged
+// segment continue one striding sequence), so each row stays bit-identical
+// to the pre-wrap kernel's reduction.
+kernel void kernel_laguna_attention_decode_rows_gqa3_staged_f16(
+        constant ds4_metal_args_laguna_prefill_attention &args,
+        device const float *q,
+        device const float *gate,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device const half  *staged_key,
+        device const half  *staged_value,
+        device float       *out,
+        threadgroup float  *scratch [[threadgroup(0)]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group_u [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint nsg = 8u;
+    const uint head0 = tgpig.x * 3u;
+    const uint token = tgpig.y;
+    if (head0 + 2u >= args.n_head || token >= args.n_tokens ||
+        args.n_head_kv == 0u || args.head_dim != 128u) {
+        return;
+    }
+    const uint key_count = min(args.pos0 + token + 1u, args.cache_cap);
+    if (key_count == 0u) return;
+    const uint key_start = args.pos0 + token + 1u - key_count;
+    const uint ring_len = key_count - (token + 1u);
+    const uint simd_group = (uint)simd_group_u;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head0 / heads_per_kv;
+    if ((head0 + 2u) / heads_per_kv != kv_head) return;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    const uint64_t row0 = (uint64_t)token * args.n_head + head0;
+    device const float *qh0 = q + row0 * args.head_dim;
+    device const float *qh1 = qh0 + args.head_dim;
+    device const float *qh2 = qh1 + args.head_dim;
+
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    float4 acc2 = float4(0.0f);
+    float max0 = -INFINITY;
+    float max1 = -INFINITY;
+    float max2 = -INFINITY;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    for (uint i = simd_group; i < key_count; i += nsg) {
+        device const half *kp;
+        device const half *vp;
+        if (i < ring_len) {
+            const uint cache_row = (key_start + i) % args.cache_cap;
+            const uint64_t kv_base =
+                (uint64_t)cache_row * cache_width +
+                (uint64_t)kv_head * args.head_dim;
+            kp = key_cache + kv_base;
+            vp = value_cache + kv_base;
+        } else {
+            const uint64_t kv_base =
+                (uint64_t)(i - ring_len) * cache_width +
+                (uint64_t)kv_head * args.head_dim;
+            kp = staged_key + kv_base;
+            vp = staged_value + kv_base;
+        }
+        const uint d0 = lane;
+        const float4 key = float4((float)kp[d0],
+                                  (float)kp[d0 + 32u],
+                                  (float)kp[d0 + 64u],
+                                  (float)kp[d0 + 96u]);
+        const float score0 = simd_sum(dot(float4(qh0[d0],
+                                                   qh0[d0 + 32u],
+                                                   qh0[d0 + 64u],
+                                                   qh0[d0 + 96u]), key)) * args.scale;
+        const float score1 = simd_sum(dot(float4(qh1[d0],
+                                                   qh1[d0 + 32u],
+                                                   qh1[d0 + 64u],
+                                                   qh1[d0 + 96u]), key)) * args.scale;
+        const float score2 = simd_sum(dot(float4(qh2[d0],
+                                                   qh2[d0 + 32u],
+                                                   qh2[d0 + 64u],
+                                                   qh2[d0 + 96u]), key)) * args.scale;
+        const float next_max0 = max(max0, score0);
+        const float next_max1 = max(max1, score1);
+        const float next_max2 = max(max2, score2);
+        const float old_scale0 = max0 == -INFINITY ? 0.0f : exp(max0 - next_max0);
+        const float old_scale1 = max1 == -INFINITY ? 0.0f : exp(max1 - next_max1);
+        const float old_scale2 = max2 == -INFINITY ? 0.0f : exp(max2 - next_max2);
+        const float value_scale0 = exp(score0 - next_max0);
+        const float value_scale1 = exp(score1 - next_max1);
+        const float value_scale2 = exp(score2 - next_max2);
+        sum0 = sum0 * old_scale0 + value_scale0;
+        sum1 = sum1 * old_scale1 + value_scale1;
+        sum2 = sum2 * old_scale2 + value_scale2;
+        const float4 value = float4((float)vp[d0],
+                                    (float)vp[d0 + 32u],
+                                    (float)vp[d0 + 64u],
+                                    (float)vp[d0 + 96u]);
+        acc0 = acc0 * old_scale0 + value * value_scale0;
+        acc1 = acc1 * old_scale1 + value * value_scale1;
+        acc2 = acc2 * old_scale2 + value * value_scale2;
+        max0 = next_max0;
+        max1 = next_max1;
+        max2 = next_max2;
+    }
+
+    threadgroup float *partial_max = scratch;
+    threadgroup float *partial_sum = partial_max + 3u * nsg;
+    threadgroup float *partial_value = partial_sum + 3u * nsg;
+    const uint slots[3] = {simd_group,
+                           nsg + simd_group,
+                           2u * nsg + simd_group};
+    const float maxima[3] = {max0, max1, max2};
+    const float sums[3] = {sum0, sum1, sum2};
+    const float4 values[3] = {acc0, acc1, acc2};
+    for (uint h = 0u; h < 3u; h++) {
+        const uint slot = slots[h];
+        if (lane == 0u) {
+            partial_max[slot] = maxima[h];
+            partial_sum[slot] = sums[h];
+        }
+        const uint base = slot * args.head_dim + lane;
+        partial_value[base] = values[h].x;
+        partial_value[base + 32u] = values[h].y;
+        partial_value[base + 64u] = values[h].z;
+        partial_value[base + 96u] = values[h].w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group != 0u) return;
+    for (uint h = 0u; h < 3u; h++) {
+        const uint slot_base = h * nsg;
+        float global_max = partial_max[slot_base];
+        for (uint sg = 1u; sg < nsg; sg++) {
+            global_max = max(global_max, partial_max[slot_base + sg]);
+        }
+        float merged_sum = 0.0f;
+        float4 merged = float4(0.0f);
+        for (uint sg = 0u; sg < nsg; sg++) {
+            const uint slot = slot_base + sg;
+            const float weight = partial_sum[slot] > 0.0f ?
+                exp(partial_max[slot] - global_max) : 0.0f;
+            merged_sum += partial_sum[slot] * weight;
+            const uint base = slot * args.head_dim + lane;
+            merged.x += partial_value[base] * weight;
+            merged.y += partial_value[base + 32u] * weight;
+            merged.z += partial_value[base + 64u] * weight;
+            merged.w += partial_value[base + 96u] * weight;
+        }
+
+        const uint64_t row = row0 + h;
+        const float inv_sum = merged_sum > 0.0f ? 1.0f / merged_sum : 0.0f;
+        const float gate_value = gate[row];
+        const float gate_scale = gate_value > 20.0f ?
+            gate_value : log(1.0f + exp(gate_value));
+        device float *oh = out + row * args.head_dim;
+        oh[lane]       = merged.x * inv_sum * gate_scale;
+        oh[lane + 32u] = merged.y * inv_sum * gate_scale;
+        oh[lane + 64u] = merged.z * inv_sum * gate_scale;
+        oh[lane + 96u] = merged.w * inv_sum * gate_scale;
+    }
+}
+
 // Laguna's split-K decode attention consumes the generic FlashAttention
 // partial layout, but every reduced head is immediately multiplied by its
 // learned gate. Apply that epilogue before the final store so decode does not

@@ -32293,6 +32293,134 @@ int ds4_gpu_laguna_attention_prefill_tensor(
                 return 1;
             }
 
+            /* Three query heads of one KV head share every K/V read when
+             * the head grouping allows it (72/8 sliding geometry). */
+            const bool rows_gqa3_geom =
+                (n_head % 3u) == 0u &&
+                n_head_kv != 0u &&
+                ((n_head / n_head_kv) % 3u) == 0u &&
+                getenv("DS4_METAL_DISABLE_ROWS_GQA3") == NULL;
+            /* Once the ring has wrapped, the block's own keys are served
+             * from the staging buffer so the batched store can wait until
+             * after attention instead of falling back to row-at-a-time
+             * store/attend pairs. */
+            const bool use_batched_swa_rows_staged =
+                n_tokens >= 2u && n_tokens <= 16u &&
+                cache_cap == 512u &&
+                pos0 + n_tokens > cache_cap &&
+                rows_gqa3_geom &&
+                getenv("DS4_METAL_DISABLE_SWA_ROWS_STAGED") == NULL;
+            if (use_batched_swa_rows_staged) {
+                id<MTLComputePipelineState> stage_pipeline =
+                    ds4_gpu_get_pipeline("kernel_laguna_stage_kv_f16");
+                id<MTLComputePipelineState> rows_store_pipeline =
+                    ds4_gpu_get_pipeline(
+                        "kernel_laguna_store_kv_rows_f16");
+                id<MTLComputePipelineState> staged_attention_pipeline =
+                    ds4_gpu_get_pipeline(
+                        "kernel_laguna_attention_decode_rows_gqa3_staged_f16");
+                id<MTLBuffer> skbuf = ds4_gpu_tensor_buffer(staged_key);
+                id<MTLBuffer> svbuf = ds4_gpu_tensor_buffer(staged_value);
+                if (!stage_pipeline || !rows_store_pipeline ||
+                    !staged_attention_pipeline || !skbuf || !svbuf) {
+                    return 0;
+                }
+                const ds4_gpu_laguna_prefill_attention_args rows_args = {
+                    .n_tokens = n_tokens,
+                    .pos0 = pos0,
+                    .cache_cap = cache_cap,
+                    .n_head = n_head,
+                    .n_head_kv = n_head_kv,
+                    .head_dim = head_dim,
+                    .scale = scale,
+                    .pad0 = 0u,
+                };
+                id<MTLComputeCommandEncoder> enc =
+                    ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:stage_pipeline];
+                [enc setBytes:&rows_args
+                       length:sizeof(rows_args)
+                      atIndex:0];
+                [enc setBuffer:kbuf
+                        offset:ds4_gpu_tensor_offset(k)
+                       atIndex:1];
+                [enc setBuffer:vbuf
+                        offset:ds4_gpu_tensor_offset(v)
+                       atIndex:2];
+                [enc setBuffer:skbuf
+                        offset:ds4_gpu_tensor_offset(staged_key)
+                       atIndex:3];
+                [enc setBuffer:svbuf
+                        offset:ds4_gpu_tensor_offset(staged_value)
+                       atIndex:4];
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:staged_attention_pipeline];
+                [enc setBytes:&rows_args
+                       length:sizeof(rows_args)
+                      atIndex:0];
+                [enc setBuffer:qbuf
+                        offset:ds4_gpu_tensor_offset(q)
+                       atIndex:1];
+                [enc setBuffer:gatebuf
+                        offset:ds4_gpu_tensor_offset(gate)
+                       atIndex:2];
+                [enc setBuffer:keybuf
+                        offset:ds4_gpu_tensor_offset(key_cache)
+                       atIndex:3];
+                [enc setBuffer:valuebuf
+                        offset:ds4_gpu_tensor_offset(value_cache)
+                       atIndex:4];
+                [enc setBuffer:skbuf
+                        offset:ds4_gpu_tensor_offset(staged_key)
+                       atIndex:5];
+                [enc setBuffer:svbuf
+                        offset:ds4_gpu_tensor_offset(staged_value)
+                       atIndex:6];
+                [enc setBuffer:headsbuf
+                        offset:ds4_gpu_tensor_offset(heads)
+                       atIndex:7];
+                [enc setThreadgroupMemoryLength:
+                        3u * (8u + 8u + 8u * 128u) * sizeof(float)
+                                        atIndex:0];
+                [enc dispatchThreadgroups:
+                        MTLSizeMake(n_head / 3u, n_tokens, 1)
+                     threadsPerThreadgroup:
+                        MTLSizeMake(256, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:rows_store_pipeline];
+                [enc setBytes:&rows_args
+                       length:sizeof(rows_args)
+                      atIndex:0];
+                [enc setBuffer:kbuf
+                        offset:ds4_gpu_tensor_offset(k)
+                       atIndex:1];
+                [enc setBuffer:vbuf
+                        offset:ds4_gpu_tensor_offset(v)
+                       atIndex:2];
+                [enc setBuffer:keybuf
+                        offset:ds4_gpu_tensor_offset(key_cache)
+                       atIndex:3];
+                [enc setBuffer:valuebuf
+                        offset:ds4_gpu_tensor_offset(value_cache)
+                       atIndex:4];
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                if (!ds4_gpu_finish_command_buffer(
+                        cb, owned,
+                        "Laguna batched sliding-window attention (staged)")) {
+                    return 0;
+                }
+                return 1;
+            }
+
             const bool use_batched_swa_rows =
                 n_tokens >= 2u && n_tokens <= 16u &&
                 cache_cap == 512u &&
@@ -32301,13 +32429,7 @@ int ds4_gpu_laguna_attention_prefill_tensor(
                 id<MTLComputePipelineState> rows_store_pipeline =
                     ds4_gpu_get_pipeline(
                         "kernel_laguna_store_kv_rows_f16");
-                /* Three query heads of one KV head share every K/V read when
-                 * the head grouping allows it (72/8 sliding geometry). */
-                const bool rows_gqa3 =
-                    (n_head % 3u) == 0u &&
-                    n_head_kv != 0u &&
-                    ((n_head / n_head_kv) % 3u) == 0u &&
-                    getenv("DS4_METAL_DISABLE_ROWS_GQA3") == NULL;
+                const bool rows_gqa3 = rows_gqa3_geom;
                 id<MTLComputePipelineState> rows_attention_pipeline =
                     ds4_gpu_get_pipeline(rows_gqa3 ?
                         "kernel_laguna_attention_decode_rows_gqa3_f16" :
