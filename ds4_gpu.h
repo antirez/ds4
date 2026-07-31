@@ -105,6 +105,37 @@ double ds4_gpu_busy_accum_ms(void);
  * the roped K row and the V row to the attention ring, replacing the
  * separate KV store dispatch.  The paired attention call then passes NULL
  * k/v to ds4_gpu_laguna_store_attention_tensor to skip its store. */
+/* Metal only, verifier rows: fused Q/K per-head RMSNorm + RoPE that also
+ * commits the roped K rows and the V rows to consecutive cache slots
+ * cache_row .. cache_row + n_tokens - 1 (the caller guarantees the block
+ * does not wrap the sliding ring).  The paired attention call then passes
+ * NULL k/v so the row paths skip their stores. */
+int ds4_gpu_laguna_qk_head_rms_norm_rope_store_rows_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        const ds4_gpu_tensor *v,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        uint32_t              cache_row,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              n_q_head,
+        uint32_t              n_k_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps);
+
 int ds4_gpu_laguna_qk_head_rms_norm_rope_store_tensor(
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *k,

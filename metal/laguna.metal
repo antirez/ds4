@@ -198,6 +198,56 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_store_neox(
     value_cache[dst + lane + 96u] = (half)v_row[lane + 96u];
 }
 
+// Rows twin of the fused rope+store kernel: verifier rows occupy
+// consecutive cache slots (the caller guarantees the block does not wrap
+// the sliding ring), so row r lands at cache_row + r.  Norm/RoPE values
+// and the stored K/V bytes are identical to the unfused pair.
+kernel void kernel_laguna_qk_head_rms_norm_rope_store_rows_neox(
+        constant ds4_metal_args_laguna_norm_rope &args,
+        device float       *q,
+        device float       *k,
+        device const float *q_weight,
+        device const float *k_weight,
+        constant uint      &n_q_head,
+        device const float *v,
+        device half        *key_cache,
+        device half        *value_cache,
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint combined_head = tgpig.x * 4u + sgitg;
+    const uint token = tgpig.y;
+    if (combined_head >= args.n_head || token >= args.n_tokens ||
+        n_q_head >= args.n_head || args.head_dim != 128u ||
+        (args.n_rot != 64u && args.n_rot != 128u)) {
+        return;
+    }
+
+    const bool is_q = combined_head < n_q_head;
+    const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
+    const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
+    device float *row = (is_q ? q : k) +
+        ((uint64_t)token * tensor_n_head + tensor_head) * args.head_dim;
+    const float4 roped = laguna_head_rms_norm_rope_neox_simd(
+        args, row, is_q ? q_weight : k_weight, lane, token);
+    if (is_q) return;
+
+    const uint width = tensor_n_head * args.head_dim;
+    const uint64_t dst =
+        (uint64_t)(args.cache_row + token) * width +
+        (uint64_t)tensor_head * args.head_dim;
+    device const float *v_row = v +
+        ((uint64_t)token * tensor_n_head + tensor_head) * args.head_dim;
+    key_cache[dst + lane]       = (half)roped.x;
+    key_cache[dst + lane + 32u] = (half)roped.y;
+    key_cache[dst + lane + 64u] = (half)roped.z;
+    key_cache[dst + lane + 96u] = (half)roped.w;
+    value_cache[dst + lane]       = (half)v_row[lane];
+    value_cache[dst + lane + 32u] = (half)v_row[lane + 32u];
+    value_cache[dst + lane + 64u] = (half)v_row[lane + 64u];
+    value_cache[dst + lane + 96u] = (half)v_row[lane + 96u];
+}
+
 struct ds4_metal_args_laguna_kv_store {
     uint32_t cache_cap;
     uint32_t cache_row;

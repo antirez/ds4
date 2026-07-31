@@ -50053,8 +50053,49 @@ static bool laguna_graph_forward_batch(
                                                  exact_q8_rows);
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_qkvg");
+        /* Verifier rows that stay inside the ring can commit their roped
+         * K and V straight from the rope kernel and let attention skip its
+         * store dispatches (Metal-only twin of the decode fusion). */
+        const bool fused_rope_store_rows =
+#ifdef __APPLE__
+            exact_q8_rows && row_argmax_out != NULL &&
+            n_tokens <= 16u &&
+            (uint64_t)pos0 + n_tokens > 256u &&
+            (uint64_t)pos0 + n_tokens <= g->cache_cap[il];
+#else
+            false;
+#endif
         if (ok && exact_q8_rows) {
             failed_stage = "Q/K norm/RoPE";
+#ifdef __APPLE__
+            if (fused_rope_store_rows) {
+                ok = ds4_gpu_laguna_qk_head_rms_norm_rope_store_rows_tensor(
+                        g->q,
+                        g->k,
+                        g->v,
+                        g->key_cache[il],
+                        g->value_cache[il],
+                        pos0,
+                        model->map,
+                        model->size,
+                        l->attn_q_norm->abs_offset,
+                        l->attn_k_norm->abs_offset,
+                        n_tokens,
+                        n_head,
+                        DS4_N_HEAD_KV,
+                        DS4_N_HEAD_DIM,
+                        n_rot,
+                        pos0,
+                        rope_ctx,
+                        freq_base,
+                        freq_scale,
+                        ext_factor,
+                        attn_factor,
+                        beta_fast,
+                        beta_slow,
+                        DS4_RMS_EPS) != 0;
+            } else
+#endif
             ok = ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
                     g->q,
                     g->k,
@@ -50141,8 +50182,8 @@ static bool laguna_graph_forward_batch(
                     g->staged_key,
                     g->staged_value,
                     g->q,
-                    g->k,
-                    g->v,
+                    fused_rope_store_rows ? NULL : g->k,
+                    fused_rope_store_rows ? NULL : g->v,
                     g->gate,
                     pos0,
                     n_tokens,
