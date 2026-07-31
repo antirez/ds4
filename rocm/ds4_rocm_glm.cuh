@@ -487,6 +487,46 @@ __global__ static void glm_q8_project_head_kernel(
     }
 }
 
+/* Diagnostic port of the heterogeneous GLM branch's one-token Q8-head
+ * projection.  One wave cooperates on each output row instead of assigning a
+ * complete serial dot product to one thread.  The reduction changes FP32
+ * summation order, so keep it opt-in until layer and frontier-logit comparisons
+ * establish the acceptable numerical envelope. */
+__global__ static void glm_q8_project_head_wave_kernel(
+        float *out,
+        const unsigned char *weight,
+        const float *x,
+        uint32_t n_head,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t x_stride,
+        uint32_t x_head_stride,
+        uint32_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t waves_per_block = blockDim.x >> 5u;
+    const uint32_t d = blockIdx.x * waves_per_block + wave;
+    const uint32_t head = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (d >= out_dim || head >= n_head) return;
+
+    const float *xr =
+        x + (uint64_t)token * x_stride + (uint64_t)head * x_head_stride;
+    const unsigned char *row =
+        weight + ((uint64_t)head * out_dim + d) * row_bytes;
+    float acc = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        const unsigned char *blk = row + (uint64_t)(i >> 5u) * 34u;
+        const float scale = q8_0_scale_scalar(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[i & 31u];
+        acc += scale * (float)q * xr[i];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) {
+        out[((uint64_t)token * n_head + head) * out_dim + d] = acc;
+    }
+}
+
 __global__ static void glm_build_kv_cache_kernel(
         char *key_cache,
         char *value_cache,
@@ -1891,6 +1931,29 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(
                                 "glm_qk_lowrank_batch", &w, &row_bytes)) {
         return 0;
     }
+    if (n_tokens > 1u &&
+        (qk_nope & 31u) == 0u &&
+        cuda_runtime_config()->glm_grouped_qk_low) {
+        const uint32_t rows_per_block = 32u;
+        const uint32_t token_tile = 32u;
+        const uint32_t block_tile = 8u;
+        cuda_launch_grouped_q8_a_sharedx_strided(
+                (float *)qk_low->ptr,
+                w,
+                (const float *)q->ptr,
+                n_tokens,
+                n_head,
+                qk_nope >> 5u,
+                kv_lora_dim,
+                (uint32_t)x_stride64,
+                qk_dim,
+                row_bytes,
+                rows_per_block,
+                token_tile,
+                block_tile);
+        return cuda_ok(cudaGetLastError(),
+                       "glm grouped qk lowrank batch launch");
+    }
     dim3 grid(n_head, n_tokens, 1);
     glm_q8_project_head_kernel<<<grid, 256, (size_t)qk_nope * sizeof(float)>>>(
             (float *)qk_low->ptr,
@@ -1931,6 +1994,65 @@ extern "C" int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
                                 "glm_value_project", &w, &row_bytes)) {
         return 0;
     }
+    if (n_tokens > 1u &&
+        (kv_lora_dim & 31u) == 0u &&
+        cuda_runtime_config()->glm_grouped_value_project) {
+        const uint32_t rows_per_block = 32u;
+        const uint32_t token_tile = 32u;
+        const uint32_t block_tile = 16u;
+        cuda_launch_grouped_q8_a_sharedx(
+                (float *)heads->ptr,
+                w,
+                (const float *)lora->ptr,
+                n_tokens,
+                n_head,
+                kv_lora_dim >> 5u,
+                value_dim,
+                row_bytes,
+                rows_per_block,
+                token_tile,
+                block_tile);
+        return cuda_ok(cudaGetLastError(),
+                       "glm grouped value project batch heads launch");
+    }
+    const char *wave_decode_env =
+        getenv("DS4_ROCM_GLM_VALUE_PROJECT_WAVE_DECODE");
+    /*
+     * The wave-per-output-row kernel is the validated production decode path.
+     * Keep an explicit =0 fallback for correctness diagnostics.
+     */
+    if (n_tokens == 1u &&
+        (wave_decode_env == NULL || cuda_env_present(wave_decode_env))) {
+        const uint32_t threads = 256u;
+        const uint32_t waves_per_block = threads / 32u;
+        dim3 grid((value_dim + waves_per_block - 1u) / waves_per_block,
+                  n_head,
+                  n_tokens);
+        glm_q8_project_head_wave_kernel<<<grid, threads>>>(
+                (float *)heads->ptr,
+                w,
+                (const float *)lora->ptr,
+                n_head,
+                kv_lora_dim,
+                value_dim,
+                (uint32_t)x_stride64,
+                kv_lora_dim,
+                row_bytes);
+        const cudaError_t launch_err = cudaGetLastError();
+        if (launch_err == cudaSuccess) {
+            static int notice_printed = 0;
+            if (!notice_printed) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX
+                        "GLM one-token value projection using "
+                        "wave-parallel Q8 rows\n");
+                notice_printed = 1;
+            }
+            return 1;
+        }
+        return cuda_ok(launch_err,
+                       "glm wave-parallel value project launch");
+    }
     dim3 grid(n_head, n_tokens, 1);
     glm_q8_project_head_kernel<<<grid, 256, (size_t)kv_lora_dim * sizeof(float)>>>(
             (float *)heads->ptr,
@@ -1944,6 +2066,1113 @@ extern "C" int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
             kv_lora_dim,
             row_bytes);
     return cuda_ok(cudaGetLastError(), "glm value project batch heads launch");
+}
+
+__global__ static void glm_causal_gemm_cache_to_f16_kernel(
+        __half *dst,
+        const char *src,
+        uint64_t n,
+        bool src_f16) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(glm_rocm_cache_load(src, i, src_f16));
+}
+
+__global__ static void glm_causal_gemm_rope_to_f16_kernel(
+        __half *dst,
+        const char *src,
+        uint32_t n_rows,
+        uint32_t qk_rope,
+        bool src_f16,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint64_t pair = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t pairs = (uint64_t)n_rows * (qk_rope >> 1u);
+    if (pair >= pairs) return;
+    const uint32_t row = (uint32_t)(pair / (qk_rope >> 1u));
+    const uint32_t r =
+        (uint32_t)(pair - (uint64_t)row * (qk_rope >> 1u)) << 1u;
+    const float2 y = glm_rocm_rotated_cache_rope_pair(src,
+                                                       (uint64_t)row * qk_rope,
+                                                       r,
+                                                       row,
+                                                       qk_rope,
+                                                       src_f16,
+                                                       n_ctx_orig,
+                                                       freq_base,
+                                                       freq_scale,
+                                                       ext_factor,
+                                                       attn_factor,
+                                                       beta_fast,
+                                                       beta_slow);
+    dst[(uint64_t)row * qk_rope + r] = __float2half(y.x);
+    dst[(uint64_t)row * qk_rope + r + 1u] = __float2half(y.y);
+}
+
+__global__ static void glm_causal_gemm_gather_head_f16_kernel(
+        __half *low_h,
+        __half *qrope_h,
+        const float *low,
+        const float *q,
+        uint32_t n_tokens,
+        uint32_t head,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope) {
+    const uint64_t total = (uint64_t)n_tokens * kv_lora_dim;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t token = (uint32_t)(i / kv_lora_dim);
+        const uint32_t j =
+            (uint32_t)(i - (uint64_t)token * kv_lora_dim);
+        low_h[i] = __float2half(
+            low[((uint64_t)token * n_head + head) * kv_lora_dim + j]);
+    }
+    const uint64_t rope_total = (uint64_t)n_tokens * qk_rope;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < rope_total;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t token = (uint32_t)(i / qk_rope);
+        const uint32_t r = (uint32_t)(i - (uint64_t)token * qk_rope);
+        const uint32_t qk_dim = qk_nope + qk_rope;
+        qrope_h[i] = __float2half(
+            q[((uint64_t)token * n_head + head) * qk_dim + qk_nope + r]);
+    }
+}
+
+__global__ static void glm_causal_gemm_softmax_f16_kernel(
+        __half *probs,
+        float *scores,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t pos0,
+        float scale) {
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens) return;
+    float *row = scores + (uint64_t)token * n_selected;
+    __shared__ float reduce[256];
+    const uint32_t visible = min(n_selected, pos0 + token + 1u);
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        const float v = s < visible ? row[s] * scale : -INFINITY;
+        row[s] = v;
+        vmax = fmaxf(vmax, v);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        const float v = s < visible ? expf(row[s] - max_score) : 0.0f;
+        row[s] = v;
+        sum += v;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = 1.0f / fmaxf(reduce[0], 1.0e-20f);
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        probs[(uint64_t)token * n_selected + s] =
+            __float2half(row[s] * inv);
+    }
+}
+
+__global__ static void glm_causal_gemm_scatter_head_kernel(
+        float *out,
+        const float *head_out,
+        uint32_t n_tokens,
+        uint32_t head,
+        uint32_t n_head,
+        uint32_t kv_lora_dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * kv_lora_dim;
+    if (i >= n) return;
+    const uint32_t token = (uint32_t)(i / kv_lora_dim);
+    const uint32_t j = (uint32_t)(i - (uint64_t)token * kv_lora_dim);
+    out[((uint64_t)token * n_head + head) * kv_lora_dim + j] =
+        head_out[i];
+}
+
+__global__ static void glm_selected_gemm_kv_to_f16_kernel(
+        __half *dst,
+        const char *src,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t kv_lora_dim,
+        uint32_t cache_cap,
+        bool src_f16) {
+    const uint64_t total =
+        (uint64_t)n_tokens * n_selected * kv_lora_dim;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t selected_row = i / kv_lora_dim;
+        const uint32_t j =
+            (uint32_t)(i - selected_row * kv_lora_dim);
+        const int32_t cache_row = selected[selected_row];
+        dst[i] =
+            cache_row >= 0 && (uint32_t)cache_row < cache_cap ?
+                __float2half(glm_rocm_cache_load(
+                    src,
+                    (uint64_t)(uint32_t)cache_row * kv_lora_dim + j,
+                    src_f16)) :
+                __float2half(0.0f);
+    }
+}
+
+__global__ static void glm_selected_gemm_rope_to_f16_kernel(
+        __half *dst,
+        const char *src,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t qk_rope,
+        uint32_t cache_cap,
+        bool src_f16,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t rope_pairs = qk_rope >> 1u;
+    const uint64_t total =
+        (uint64_t)n_tokens * n_selected * rope_pairs;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint64_t selected_row = i / rope_pairs;
+        const uint32_t r =
+            (uint32_t)(i - selected_row * rope_pairs) << 1u;
+        const int32_t cache_row = selected[selected_row];
+        float2 y = make_float2(0.0f, 0.0f);
+        if (cache_row >= 0 && (uint32_t)cache_row < cache_cap) {
+            y = glm_rocm_rotated_cache_rope_pair(
+                    src,
+                    (uint64_t)(uint32_t)cache_row * qk_rope,
+                    r,
+                    (uint32_t)cache_row,
+                    qk_rope,
+                    src_f16,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+        }
+        const uint64_t out = selected_row * qk_rope + r;
+        dst[out] = __float2half(y.x);
+        dst[out + 1u] = __float2half(y.y);
+    }
+}
+
+__global__ static void glm_selected_gemm_softmax_f16_kernel(
+        __half *probs,
+        float *scores,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        float scale) {
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens) return;
+    float *row = scores + (uint64_t)token * n_selected;
+    __shared__ float reduce[256];
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        const float v = row[s] * scale;
+        row[s] = v;
+        vmax = fmaxf(vmax, v);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        const float v = expf(row[s] - max_score);
+        row[s] = v;
+        sum += v;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = 1.0f / fmaxf(reduce[0], 1.0e-20f);
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        probs[(uint64_t)token * n_selected + s] =
+            __float2half(row[s] * inv);
+    }
+}
+
+__global__ static void glm_selected_gemm_gather_heads_f16_kernel(
+        __half *low_h,
+        __half *qrope_h,
+        const float *low,
+        const float *q,
+        uint32_t n_tokens,
+        uint32_t head0,
+        uint32_t head_count,
+        uint32_t head_capacity,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope) {
+    const uint64_t low_per_token =
+        (uint64_t)head_capacity * kv_lora_dim;
+    const uint64_t low_total = (uint64_t)n_tokens * low_per_token;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < low_total;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t token = (uint32_t)(i / low_per_token);
+        const uint64_t token_i = i - (uint64_t)token * low_per_token;
+        const uint32_t head_local = (uint32_t)(token_i / kv_lora_dim);
+        const uint32_t j =
+            (uint32_t)(token_i - (uint64_t)head_local * kv_lora_dim);
+        if (head_local < head_count) {
+            low_h[i] = __float2half(
+                low[((uint64_t)token * n_head + head0 + head_local) *
+                    kv_lora_dim + j]);
+        }
+    }
+
+    const uint64_t rope_per_token =
+        (uint64_t)head_capacity * qk_rope;
+    const uint64_t rope_total = (uint64_t)n_tokens * rope_per_token;
+    const uint32_t qk_dim = qk_nope + qk_rope;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < rope_total;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        const uint32_t token = (uint32_t)(i / rope_per_token);
+        const uint64_t token_i = i - (uint64_t)token * rope_per_token;
+        const uint32_t head_local = (uint32_t)(token_i / qk_rope);
+        const uint32_t r =
+            (uint32_t)(token_i - (uint64_t)head_local * qk_rope);
+        if (head_local < head_count) {
+            qrope_h[i] = __float2half(
+                q[((uint64_t)token * n_head + head0 + head_local) *
+                  qk_dim + qk_nope + r]);
+        }
+    }
+}
+
+__global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
+        __half *probs,
+        float *scores,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t head_count,
+        uint32_t head_capacity,
+        float scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head_local = blockIdx.y;
+    if (token >= n_tokens || head_local >= head_count) return;
+    const uint64_t row_index =
+        (uint64_t)token * head_capacity + head_local;
+    float *row = scores + row_index * n_selected;
+    __shared__ float reduce[256];
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        const float v = row[s] * scale;
+        row[s] = v;
+        vmax = fmaxf(vmax, v);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        const float v = expf(row[s] - max_score);
+        row[s] = v;
+        sum += v;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = 1.0f / fmaxf(reduce[0], 1.0e-20f);
+    __half *prob_row = probs + row_index * n_selected;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        prob_row[s] = __float2half(row[s] * inv);
+    }
+}
+
+__global__ static void glm_selected_gemm_scatter_heads_kernel(
+        float *out,
+        const float *head_out,
+        uint32_t n_tokens,
+        uint32_t head0,
+        uint32_t head_count,
+        uint32_t head_capacity,
+        uint32_t n_head,
+        uint32_t kv_lora_dim) {
+    const uint64_t n =
+        (uint64_t)n_tokens * head_count * kv_lora_dim;
+    const uint64_t i =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t per_token = (uint64_t)head_count * kv_lora_dim;
+    const uint32_t token = (uint32_t)(i / per_token);
+    const uint64_t token_i = i - (uint64_t)token * per_token;
+    const uint32_t head_local = (uint32_t)(token_i / kv_lora_dim);
+    const uint32_t j =
+        (uint32_t)(token_i - (uint64_t)head_local * kv_lora_dim);
+    out[((uint64_t)token * n_head + head0 + head_local) *
+        kv_lora_dim + j] =
+        head_out[((uint64_t)token * head_capacity + head_local) *
+                 kv_lora_dim + j];
+}
+
+static int glm_causal_gemm_scratch_part(
+        uint64_t *offset,
+        uint64_t bytes,
+        uint64_t *part_offset) {
+    uint64_t aligned = 0;
+    if (!offset || !part_offset ||
+        !cuda_u64_add_checked(*offset, 255u, &aligned)) {
+        return 0;
+    }
+    aligned &= ~255ull;
+    if (!cuda_u64_add_checked(aligned, bytes, offset)) return 0;
+    *part_offset = aligned;
+    return 1;
+}
+
+enum glm_selected_gemm_profile_phase {
+    GLM_SELECTED_PROFILE_KV_GATHER = 0,
+    GLM_SELECTED_PROFILE_ROPE_GATHER,
+    GLM_SELECTED_PROFILE_QUERY_GATHER,
+    GLM_SELECTED_PROFILE_LORA_SCORE,
+    GLM_SELECTED_PROFILE_ROPE_SCORE,
+    GLM_SELECTED_PROFILE_SOFTMAX,
+    GLM_SELECTED_PROFILE_VALUE,
+    GLM_SELECTED_PROFILE_SCATTER,
+    GLM_SELECTED_PROFILE_PHASE_COUNT
+};
+
+struct glm_selected_gemm_profile {
+    int enabled;
+    float ms[GLM_SELECTED_PROFILE_PHASE_COUNT];
+};
+
+static cudaEvent_t g_glm_selected_profile_begin;
+static cudaEvent_t g_glm_selected_profile_end;
+static int g_glm_selected_profile_events_ready = 0;
+static int g_glm_selected_profile_claimed = 0;
+
+static uint32_t glm_selected_gemm_head_tile(void) {
+    static int initialized = 0;
+    static uint32_t tile = 16u;
+    if (initialized) return tile;
+    initialized = 1;
+    const char *env = getenv("DS4_ROCM_GLM_SELECTED_ATTN_HEAD_TILE");
+    if (!env || !env[0]) return tile;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno == 0 && end && *end == '\0' &&
+        (value == 1ul || value == 2ul ||
+         value == 4ul || value == 8ul ||
+         value == 16ul || value == 32ul ||
+         value == 64ul)) {
+        tile = (uint32_t)value;
+        return tile;
+    }
+    fprintf(stderr,
+            "ds4: invalid DS4_ROCM_GLM_SELECTED_ATTN_HEAD_TILE='%s'; "
+            "using 16 (valid values: 1,2,4,8,16,32,64)\n",
+            env);
+    return tile;
+}
+
+static void glm_selected_gemm_profile_init(
+        glm_selected_gemm_profile *profile) {
+    if (!profile) return;
+    memset(profile, 0, sizeof(*profile));
+    if (!cuda_env_present(
+            getenv("DS4_ROCM_GLM_SELECTED_ATTN_PROFILE")) ||
+        g_glm_selected_profile_claimed) {
+        return;
+    }
+    g_glm_selected_profile_claimed = 1;
+    if (!g_glm_selected_profile_events_ready) {
+        if (cudaEventCreate(&g_glm_selected_profile_begin) != cudaSuccess) {
+            return;
+        }
+        if (cudaEventCreate(&g_glm_selected_profile_end) != cudaSuccess) {
+            (void)cudaEventDestroy(g_glm_selected_profile_begin);
+            return;
+        }
+        g_glm_selected_profile_events_ready = 1;
+    }
+    profile->enabled = 1;
+}
+
+static void glm_selected_gemm_profile_begin(
+        glm_selected_gemm_profile *profile) {
+    if (!profile || !profile->enabled) return;
+    if (cudaEventRecord(g_glm_selected_profile_begin, 0) != cudaSuccess) {
+        profile->enabled = 0;
+    }
+}
+
+static void glm_selected_gemm_profile_end(
+        glm_selected_gemm_profile *profile,
+        glm_selected_gemm_profile_phase phase) {
+    if (!profile || !profile->enabled ||
+        phase >= GLM_SELECTED_PROFILE_PHASE_COUNT) {
+        return;
+    }
+    float elapsed = 0.0f;
+    if (cudaEventRecord(g_glm_selected_profile_end, 0) != cudaSuccess ||
+        cudaEventSynchronize(g_glm_selected_profile_end) != cudaSuccess ||
+        cudaEventElapsedTime(&elapsed,
+                             g_glm_selected_profile_begin,
+                             g_glm_selected_profile_end) != cudaSuccess) {
+        profile->enabled = 0;
+        return;
+    }
+    profile->ms[phase] += elapsed;
+}
+
+static void glm_selected_gemm_profile_report(
+        const glm_selected_gemm_profile *profile,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t n_head,
+        uint32_t head_tile) {
+    if (!profile || !profile->enabled) return;
+    float total = 0.0f;
+    for (uint32_t i = 0; i < GLM_SELECTED_PROFILE_PHASE_COUNT; i++) {
+        total += profile->ms[i];
+    }
+    fprintf(stderr,
+            "ds4: ROCm GLM selected attention profile "
+            "tokens=%u selected=%u heads=%u tile=%u "
+            "kv_gather=%.3fms rope_gather=%.3fms "
+            "query_gather=%.3fms lora_score=%.3fms "
+            "rope_score=%.3fms softmax=%.3fms "
+            "value=%.3fms scatter=%.3fms total=%.3fms\n",
+            n_tokens,
+            n_selected,
+            n_head,
+            head_tile,
+            profile->ms[GLM_SELECTED_PROFILE_KV_GATHER],
+            profile->ms[GLM_SELECTED_PROFILE_ROPE_GATHER],
+            profile->ms[GLM_SELECTED_PROFILE_QUERY_GATHER],
+            profile->ms[GLM_SELECTED_PROFILE_LORA_SCORE],
+            profile->ms[GLM_SELECTED_PROFILE_ROPE_SCORE],
+            profile->ms[GLM_SELECTED_PROFILE_SOFTMAX],
+            profile->ms[GLM_SELECTED_PROFILE_VALUE],
+            profile->ms[GLM_SELECTED_PROFILE_SCATTER],
+            total);
+}
+
+static int glm_attention_indexed_lora_causal_gemm(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_selected,
+        bool cache_f16,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    if (!g_cublas_ready || !lora_out || !q || !qk_low ||
+        !kv_lora_cache || !k_rope_cache ||
+        n_tokens < 256u || n_selected == 0u ||
+        n_head == 0u || kv_lora_dim == 0u ||
+        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        n_tokens > INT_MAX || n_selected > INT_MAX ||
+        kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
+        return 0;
+    }
+
+    uint64_t kv_count = 0, rope_count = 0;
+    uint64_t low_count = 0, qrope_count = 0;
+    uint64_t score_count = 0, head_count = 0;
+    if (!cuda_u64_mul_checked(n_selected, kv_lora_dim, &kv_count) ||
+        !cuda_u64_mul_checked(n_selected, qk_rope, &rope_count) ||
+        !cuda_u64_mul_checked(n_tokens, kv_lora_dim, &low_count) ||
+        !cuda_u64_mul_checked(n_tokens, qk_rope, &qrope_count) ||
+        !cuda_u64_mul_checked(n_tokens, n_selected, &score_count) ||
+        !cuda_u64_mul_checked(n_tokens, kv_lora_dim, &head_count)) {
+        return 0;
+    }
+
+    uint64_t kv_bytes = 0, rope_bytes = 0;
+    uint64_t low_bytes = 0, qrope_bytes = 0;
+    uint64_t score_bytes = 0, prob_bytes = 0, head_bytes = 0;
+    if (!cuda_u64_mul_checked(kv_count, sizeof(__half), &kv_bytes) ||
+        !cuda_u64_mul_checked(rope_count, sizeof(__half), &rope_bytes) ||
+        !cuda_u64_mul_checked(low_count, sizeof(__half), &low_bytes) ||
+        !cuda_u64_mul_checked(qrope_count, sizeof(__half), &qrope_bytes) ||
+        !cuda_u64_mul_checked(score_count, sizeof(float), &score_bytes) ||
+        !cuda_u64_mul_checked(score_count, sizeof(__half), &prob_bytes) ||
+        !cuda_u64_mul_checked(head_count, sizeof(float), &head_bytes)) {
+        return 0;
+    }
+
+    uint64_t scratch_bytes = 0;
+    uint64_t kv_offset = 0, rope_offset = 0;
+    uint64_t low_offset = 0, qrope_offset = 0;
+    uint64_t score_offset = 0, prob_offset = 0, head_offset = 0;
+    if (!glm_causal_gemm_scratch_part(&scratch_bytes, kv_bytes, &kv_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, rope_bytes, &rope_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, low_bytes, &low_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, qrope_bytes, &qrope_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, score_bytes, &score_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, prob_bytes, &prob_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, head_bytes, &head_offset)) {
+        return 0;
+    }
+
+    char *scratch =
+        (char *)cuda_tmp_alloc(scratch_bytes, "glm causal attention gemm");
+    if (!scratch) return 0;
+    __half *kv_h = (__half *)(scratch + kv_offset);
+    __half *rope_h = (__half *)(scratch + rope_offset);
+    __half *low_h = (__half *)(scratch + low_offset);
+    __half *qrope_h = (__half *)(scratch + qrope_offset);
+    float *scores = (float *)(scratch + score_offset);
+    __half *probs = (__half *)(scratch + prob_offset);
+    float *head_out = (float *)(scratch + head_offset);
+
+    glm_causal_gemm_cache_to_f16_kernel<<<
+        (kv_count + 255u) / 256u, 256>>>(
+            kv_h,
+            (const char *)kv_lora_cache->ptr,
+            kv_count,
+            cache_f16);
+    if (!cuda_ok(cudaGetLastError(), "glm causal attention kv f16 launch")) {
+        return 0;
+    }
+    const uint64_t rope_pairs = (uint64_t)n_selected * (qk_rope >> 1u);
+    glm_causal_gemm_rope_to_f16_kernel<<<
+        (rope_pairs + 255u) / 256u, 256>>>(
+            rope_h,
+            (const char *)k_rope_cache->ptr,
+            n_selected,
+            qk_rope,
+            cache_f16,
+            n_ctx_orig,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+    if (!cuda_ok(cudaGetLastError(), "glm causal attention rope f16 launch")) {
+        return 0;
+    }
+
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    const float scale = 1.0f / sqrtf((float)(qk_nope + qk_rope));
+    const uint32_t gather_blocks = (uint32_t)((low_count + 255u) / 256u);
+    const uint32_t scatter_blocks =
+        (uint32_t)((head_count + 255u) / 256u);
+    for (uint32_t head = 0; head < n_head; head++) {
+        glm_causal_gemm_gather_head_f16_kernel<<<gather_blocks, 256>>>(
+            low_h,
+            qrope_h,
+            (const float *)qk_low->ptr,
+            (const float *)q->ptr,
+            n_tokens,
+            head,
+            n_head,
+            kv_lora_dim,
+            qk_nope,
+            qk_rope);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm causal attention query gather launch")) {
+            return 0;
+        }
+        cublasStatus_t st = cublasGemmEx(g_cublas,
+                                         CUBLAS_OP_T,
+                                         CUBLAS_OP_N,
+                                         (int)n_selected,
+                                         (int)n_tokens,
+                                         (int)kv_lora_dim,
+                                         &one,
+                                         kv_h,
+                                         CUDA_R_16F,
+                                         (int)kv_lora_dim,
+                                         low_h,
+                                         CUDA_R_16F,
+                                         (int)kv_lora_dim,
+                                         &zero,
+                                         scores,
+                                         CUDA_R_32F,
+                                         (int)n_selected,
+                                         CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm causal attention lora score gemm")) {
+            return 0;
+        }
+        st = cublasGemmEx(g_cublas,
+                          CUBLAS_OP_T,
+                          CUBLAS_OP_N,
+                          (int)n_selected,
+                          (int)n_tokens,
+                          (int)qk_rope,
+                          &one,
+                          rope_h,
+                          CUDA_R_16F,
+                          (int)qk_rope,
+                          qrope_h,
+                          CUDA_R_16F,
+                          (int)qk_rope,
+                          &one,
+                          scores,
+                          CUDA_R_32F,
+                          (int)n_selected,
+                          CUBLAS_COMPUTE_32F,
+                          CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm causal attention rope score gemm")) {
+            return 0;
+        }
+        glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
+            probs, scores, n_tokens, n_selected, pos0, scale);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm causal attention softmax launch")) {
+            return 0;
+        }
+        st = cublasGemmEx(g_cublas,
+                          CUBLAS_OP_N,
+                          CUBLAS_OP_N,
+                          (int)kv_lora_dim,
+                          (int)n_tokens,
+                          (int)n_selected,
+                          &one,
+                          kv_h,
+                          CUDA_R_16F,
+                          (int)kv_lora_dim,
+                          probs,
+                          CUDA_R_16F,
+                          (int)n_selected,
+                          &zero,
+                          head_out,
+                          CUDA_R_32F,
+                          (int)kv_lora_dim,
+                          CUBLAS_COMPUTE_32F,
+                          CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm causal attention value gemm")) return 0;
+        glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256>>>(
+            (float *)lora_out->ptr,
+            head_out,
+            n_tokens,
+            head,
+            n_head,
+            kv_lora_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm causal attention head scatter launch")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int glm_attention_indexed_lora_selected_gemm(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        bool cache_f16,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    if (!g_cublas_ready || !lora_out || !q || !qk_low ||
+        !kv_lora_cache || !k_rope_cache || !selected ||
+        n_tokens < 64u || n_tokens > 256u ||
+        n_selected == 0u || n_selected > cache_cap ||
+        n_head == 0u || kv_lora_dim == 0u ||
+        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        n_tokens > INT_MAX || n_selected > INT_MAX ||
+        kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
+        return 0;
+    }
+
+    const uint32_t requested_head_tile = glm_selected_gemm_head_tile();
+    const uint32_t head_tile = min(requested_head_tile, n_head);
+    if (head_tile > 1u) {
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    "ds4: ROCm GLM selected attention using head tile %u\n",
+                    head_tile);
+            notice_printed = 1;
+        }
+    }
+
+    uint64_t selected_rows = 0;
+    uint64_t kv_count = 0, rope_count = 0;
+    uint64_t low_count = 0, qrope_count = 0;
+    uint64_t score_count = 0, head_count = 0;
+    if (!cuda_u64_mul_checked(n_tokens, n_selected, &selected_rows) ||
+        !cuda_u64_mul_checked(selected_rows, kv_lora_dim, &kv_count) ||
+        !cuda_u64_mul_checked(selected_rows, qk_rope, &rope_count) ||
+        !cuda_u64_mul_checked(n_tokens, kv_lora_dim, &low_count) ||
+        !cuda_u64_mul_checked(n_tokens, qk_rope, &qrope_count) ||
+        !cuda_u64_mul_checked(n_tokens, n_selected, &score_count) ||
+        !cuda_u64_mul_checked(n_tokens, kv_lora_dim, &head_count)) {
+        return 0;
+    }
+    if (!cuda_u64_mul_checked(low_count, head_tile, &low_count) ||
+        !cuda_u64_mul_checked(qrope_count, head_tile, &qrope_count) ||
+        !cuda_u64_mul_checked(score_count, head_tile, &score_count) ||
+        !cuda_u64_mul_checked(head_count, head_tile, &head_count)) {
+        return 0;
+    }
+
+    uint64_t kv_bytes = 0, rope_bytes = 0;
+    uint64_t low_bytes = 0, qrope_bytes = 0;
+    uint64_t score_bytes = 0, prob_bytes = 0, head_bytes = 0;
+    if (!cuda_u64_mul_checked(kv_count, sizeof(__half), &kv_bytes) ||
+        !cuda_u64_mul_checked(rope_count, sizeof(__half), &rope_bytes) ||
+        !cuda_u64_mul_checked(low_count, sizeof(__half), &low_bytes) ||
+        !cuda_u64_mul_checked(qrope_count, sizeof(__half), &qrope_bytes) ||
+        !cuda_u64_mul_checked(score_count, sizeof(float), &score_bytes) ||
+        !cuda_u64_mul_checked(score_count, sizeof(__half), &prob_bytes) ||
+        !cuda_u64_mul_checked(head_count, sizeof(float), &head_bytes)) {
+        return 0;
+    }
+
+    uint64_t scratch_bytes = 0;
+    uint64_t kv_offset = 0, rope_offset = 0;
+    uint64_t low_offset = 0, qrope_offset = 0;
+    uint64_t score_offset = 0, prob_offset = 0, head_offset = 0;
+    if (!glm_causal_gemm_scratch_part(&scratch_bytes, kv_bytes, &kv_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, rope_bytes, &rope_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, low_bytes, &low_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, qrope_bytes, &qrope_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, score_bytes, &score_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, prob_bytes, &prob_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, head_bytes, &head_offset)) {
+        return 0;
+    }
+
+    char *scratch =
+        (char *)cuda_tmp_alloc(scratch_bytes, "glm selected attention gemm");
+    if (!scratch) return 0;
+    __half *kv_h = (__half *)(scratch + kv_offset);
+    __half *rope_h = (__half *)(scratch + rope_offset);
+    __half *low_h = (__half *)(scratch + low_offset);
+    __half *qrope_h = (__half *)(scratch + qrope_offset);
+    float *scores = (float *)(scratch + score_offset);
+    __half *probs = (__half *)(scratch + prob_offset);
+    float *head_out = (float *)(scratch + head_offset);
+
+    glm_selected_gemm_profile profile;
+    glm_selected_gemm_profile_init(&profile);
+
+    const uint32_t kv_blocks =
+        (uint32_t)min((kv_count + 255u) / 256u, 4096ull);
+    glm_selected_gemm_profile_begin(&profile);
+    glm_selected_gemm_kv_to_f16_kernel<<<kv_blocks, 256>>>(
+        kv_h,
+        (const char *)kv_lora_cache->ptr,
+        (const int32_t *)selected->ptr,
+        n_tokens,
+        n_selected,
+        kv_lora_dim,
+        cache_cap,
+        cache_f16);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm selected attention kv gather launch")) {
+        return 0;
+    }
+    glm_selected_gemm_profile_end(
+        &profile, GLM_SELECTED_PROFILE_KV_GATHER);
+    const uint64_t rope_pairs = selected_rows * (qk_rope >> 1u);
+    const uint32_t rope_blocks =
+        (uint32_t)min((rope_pairs + 255u) / 256u, 4096ull);
+    glm_selected_gemm_profile_begin(&profile);
+    glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256>>>(
+        rope_h,
+        (const char *)k_rope_cache->ptr,
+        (const int32_t *)selected->ptr,
+        n_tokens,
+        n_selected,
+        qk_rope,
+        cache_cap,
+        cache_f16,
+        n_ctx_orig,
+        freq_base,
+        freq_scale,
+        ext_factor,
+        attn_factor,
+        beta_fast,
+        beta_slow);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm selected attention rope gather launch")) {
+        return 0;
+    }
+    glm_selected_gemm_profile_end(
+        &profile, GLM_SELECTED_PROFILE_ROPE_GATHER);
+
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    const float scale = 1.0f / sqrtf((float)(qk_nope + qk_rope));
+    const uint32_t gather_blocks =
+        (uint32_t)min((low_count + 255u) / 256u, 4096ull);
+    const long long kv_stride =
+        (long long)n_selected * (long long)kv_lora_dim;
+    const long long rope_stride =
+        (long long)n_selected * (long long)qk_rope;
+    const long long low_stride =
+        (long long)head_tile * (long long)kv_lora_dim;
+    const long long qrope_stride =
+        (long long)head_tile * (long long)qk_rope;
+    const long long score_stride =
+        (long long)head_tile * (long long)n_selected;
+    for (uint32_t head0 = 0; head0 < n_head; head0 += head_tile) {
+        const uint32_t tile_heads = min(head_tile, n_head - head0);
+        glm_selected_gemm_profile_begin(&profile);
+        if (head_tile == 1u) {
+            glm_causal_gemm_gather_head_f16_kernel<<<gather_blocks, 256>>>(
+                low_h,
+                qrope_h,
+                (const float *)qk_low->ptr,
+                (const float *)q->ptr,
+                n_tokens,
+                head0,
+                n_head,
+                kv_lora_dim,
+                qk_nope,
+                qk_rope);
+        } else {
+            glm_selected_gemm_gather_heads_f16_kernel<<<gather_blocks, 256>>>(
+                low_h,
+                qrope_h,
+                (const float *)qk_low->ptr,
+                (const float *)q->ptr,
+                n_tokens,
+                head0,
+                tile_heads,
+                head_tile,
+                n_head,
+                kv_lora_dim,
+                qk_nope,
+                qk_rope);
+        }
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm selected attention query gather launch")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_QUERY_GATHER);
+        glm_selected_gemm_profile_begin(&profile);
+        cublasStatus_t st = cublasGemmStridedBatchedEx(
+            g_cublas,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)n_selected,
+            (int)tile_heads,
+            (int)kv_lora_dim,
+            &one,
+            kv_h,
+            CUDA_R_16F,
+            (int)kv_lora_dim,
+            kv_stride,
+            low_h,
+            CUDA_R_16F,
+            (int)kv_lora_dim,
+            low_stride,
+            &zero,
+            scores,
+            CUDA_R_32F,
+            (int)n_selected,
+            score_stride,
+            (int)n_tokens,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm selected attention lora score gemm")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_LORA_SCORE);
+        glm_selected_gemm_profile_begin(&profile);
+        st = cublasGemmStridedBatchedEx(
+            g_cublas,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)n_selected,
+            (int)tile_heads,
+            (int)qk_rope,
+            &one,
+            rope_h,
+            CUDA_R_16F,
+            (int)qk_rope,
+            rope_stride,
+            qrope_h,
+            CUDA_R_16F,
+            (int)qk_rope,
+            qrope_stride,
+            &one,
+            scores,
+            CUDA_R_32F,
+            (int)n_selected,
+            score_stride,
+            (int)n_tokens,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm selected attention rope score gemm")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_ROPE_SCORE);
+        glm_selected_gemm_profile_begin(&profile);
+        if (head_tile == 1u) {
+            glm_selected_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
+                probs, scores, n_tokens, n_selected, scale);
+        } else {
+            const dim3 softmax_grid(n_tokens, tile_heads, 1u);
+            glm_selected_gemm_softmax_heads_f16_kernel<<<
+                softmax_grid, 256>>>(
+                    probs,
+                    scores,
+                    n_tokens,
+                    n_selected,
+                    tile_heads,
+                    head_tile,
+                    scale);
+        }
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm selected attention softmax launch")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_SOFTMAX);
+        glm_selected_gemm_profile_begin(&profile);
+        st = cublasGemmStridedBatchedEx(
+            g_cublas,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            (int)kv_lora_dim,
+            (int)tile_heads,
+            (int)n_selected,
+            &one,
+            kv_h,
+            CUDA_R_16F,
+            (int)kv_lora_dim,
+            kv_stride,
+            probs,
+            CUDA_R_16F,
+            (int)n_selected,
+            score_stride,
+            &zero,
+            head_out,
+            CUDA_R_32F,
+            (int)kv_lora_dim,
+            low_stride,
+            (int)n_tokens,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "glm selected attention value gemm")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_VALUE);
+        const uint64_t scatter_count =
+            (uint64_t)n_tokens * tile_heads * kv_lora_dim;
+        const uint32_t scatter_blocks =
+            (uint32_t)((scatter_count + 255u) / 256u);
+        glm_selected_gemm_profile_begin(&profile);
+        if (head_tile == 1u) {
+            glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256>>>(
+                (float *)lora_out->ptr,
+                head_out,
+                n_tokens,
+                head0,
+                n_head,
+                kv_lora_dim);
+        } else {
+            glm_selected_gemm_scatter_heads_kernel<<<scatter_blocks, 256>>>(
+                (float *)lora_out->ptr,
+                head_out,
+                n_tokens,
+                head0,
+                tile_heads,
+                head_tile,
+                n_head,
+                kv_lora_dim);
+        }
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm selected attention head scatter launch")) {
+            return 0;
+        }
+        glm_selected_gemm_profile_end(
+            &profile, GLM_SELECTED_PROFILE_SCATTER);
+    }
+    glm_selected_gemm_profile_report(
+        &profile, n_tokens, n_selected, n_head, head_tile);
+    return 1;
 }
 
 static int glm_attention_indexed_lora_launch(
@@ -1999,6 +3228,95 @@ static int glm_attention_indexed_lora_launch(
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
         return 0;
+    }
+    /* Once the visible context exceeds the indexer's top-k, each token carries
+     * its own selected row list.  Gather those rows into per-token FP16
+     * matrices, then batch the score and value products through BLAS.  Keep
+     * the path bounded: at 256 x 2048 selected rows the temporary workspace is
+     * already roughly 580 MiB.  An explicit zero retains the scalar-kernel
+     * fallback for diagnosis and numerical comparisons. */
+    const char *selected_attn_gemm_env =
+        getenv("DS4_ROCM_GLM_SELECTED_ATTN_GEMM");
+    if (!causal_range && has_selected &&
+        (selected_attn_gemm_env == NULL ||
+         cuda_env_present(selected_attn_gemm_env)) &&
+        glm_attention_indexed_lora_selected_gemm(lora_out,
+                                                  q,
+                                                  qk_low,
+                                                  kv_lora_cache,
+                                                  k_rope_cache,
+                                                  selected,
+                                                  n_tokens,
+                                                  n_selected,
+                                                  cache_cap,
+                                                  cache_f16,
+                                                  n_head,
+                                                  kv_lora_dim,
+                                                  qk_nope,
+                                                  qk_rope,
+                                                  n_ctx_orig,
+                                                  freq_base,
+                                                  freq_scale,
+                                                  ext_factor,
+                                                  attn_factor,
+                                                  beta_fast,
+                                                  beta_slow)) {
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "GLM selected indexed prefill using fp16 "
+                    DS4_GPU_BLAS_NAME
+                    " strided-batched attention GEMMs "
+                    "(tokens=%u selected=%u cache=%s)\n",
+                    n_tokens,
+                    n_selected,
+                    cache_f16 ? "f16" : "f32");
+            notice_printed = 1;
+        }
+        return 1;
+    }
+    /* Dense causal prefill can use contiguous cache rows directly.  Keep an
+     * explicit zero fallback for diagnosis and numerical comparisons with the
+     * scalar attention kernel. */
+    const char *causal_attn_gemm_env =
+        getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM");
+    if (causal_range && !has_selected &&
+        (causal_attn_gemm_env == NULL ||
+         cuda_env_present(causal_attn_gemm_env)) &&
+        glm_attention_indexed_lora_causal_gemm(lora_out,
+                                                q,
+                                                qk_low,
+                                                kv_lora_cache,
+                                                k_rope_cache,
+                                                n_tokens,
+                                                pos0,
+                                                n_selected,
+                                                cache_f16,
+                                                n_head,
+                                                kv_lora_dim,
+                                                qk_nope,
+                                                qk_rope,
+                                                n_ctx_orig,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                beta_fast,
+                                                beta_slow)) {
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "GLM causal indexed prefill using fp16 "
+                    DS4_GPU_BLAS_NAME
+                    " attention GEMMs (tokens=%u rows=%u cache=%s)\n",
+                    n_tokens,
+                    n_selected,
+                    cache_f16 ? "f16" : "f32");
+            notice_printed = 1;
+        }
+        return 1;
     }
     dim3 grid(n_head, n_tokens, 1);
     const size_t shmem = ((size_t)256u + n_selected) * sizeof(float);

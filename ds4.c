@@ -4472,40 +4472,66 @@ static bool ds4_streaming_routed_expert_bytes(
     if (per_expert_bytes_out) *per_expert_bytes_out = 0;
     if (!weights || !per_expert_bytes_out) return false;
 
+    /* Mixed-precision models can put an outlier quant at the first routed
+     * layer owned by a distributed slice.  Choosing that first layer as the
+     * slab class makes every ordinary layer bypass the cache.  Use the most
+     * common local size class instead (ties retain the earliest class). */
+    uint64_t best_bytes = 0;
+    uint32_t best_count = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (streaming_layer_routed_expert_bytes(&weights->layer[il],
-                                                per_expert_bytes_out)) {
-            return true;
+        uint64_t candidate = 0;
+        if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                 &candidate)) {
+            continue;
+        }
+        uint32_t count = 0;
+        for (uint32_t jl = 0; jl < DS4_N_LAYER; jl++) {
+            uint64_t bytes = 0;
+            if (streaming_layer_routed_expert_bytes(&weights->layer[jl],
+                                                    &bytes) &&
+                bytes == candidate) {
+                count++;
+            }
+        }
+        if (count > best_count) {
+            best_bytes = candidate;
+            best_count = count;
         }
     }
-    return false;
+    if (best_count == 0) return false;
+    *per_expert_bytes_out = best_bytes;
+    return true;
 }
 
 enum { DS4_STREAMING_PREFILL_HEADROOM_LAYERS = 2 };
 
-static bool ds4_streaming_max_routed_layer_bytes(
+static bool ds4_streaming_cacheable_expert_count(
         const ds4_weights *weights,
-        uint64_t          *layer_bytes_out) {
-    if (layer_bytes_out) *layer_bytes_out = 0;
-    if (!weights || !layer_bytes_out || DS4_N_EXPERT == 0) return false;
+        uint64_t          *experts_out,
+        uint32_t          *layers_out) {
+    if (experts_out) *experts_out = 0;
+    if (layers_out) *layers_out = 0;
+    if (!weights || !experts_out || DS4_N_EXPERT == 0) return false;
 
-    uint64_t max_bytes = 0;
+    uint64_t slab_bytes = 0;
+    if (!ds4_streaming_routed_expert_bytes(weights, &slab_bytes)) return false;
+
+    uint32_t layers = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         uint64_t per_expert_bytes = 0;
         if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
                                                  &per_expert_bytes)) {
             continue;
         }
-        if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
-            return false;
-        }
-        const uint64_t layer_bytes =
-            per_expert_bytes * (uint64_t)DS4_N_EXPERT;
-        if (layer_bytes > max_bytes) max_bytes = layer_bytes;
+        if (per_expert_bytes == slab_bytes) layers++;
     }
 
-    if (max_bytes == 0) return false;
-    *layer_bytes_out = max_bytes;
+    if (layers == 0 ||
+        (uint64_t)layers > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
+        return false;
+    }
+    *experts_out = (uint64_t)layers * (uint64_t)DS4_N_EXPERT;
+    if (layers_out) *layers_out = layers;
     return true;
 }
 
@@ -4515,27 +4541,38 @@ static bool ds4_streaming_prefill_headroom_bytes(
     if (bytes_out) *bytes_out = 0;
     if (!weights || !bytes_out) return false;
 
-    uint64_t layer_bytes = 0;
-    if (!ds4_streaming_max_routed_layer_bytes(weights, &layer_bytes)) {
+    uint64_t per_expert_bytes = 0;
+    uint64_t cacheable_experts = 0;
+    uint32_t cacheable_layers = 0;
+    if (!ds4_streaming_routed_expert_bytes(weights, &per_expert_bytes) ||
+        !ds4_streaming_cacheable_expert_count(weights,
+                                              &cacheable_experts,
+                                              &cacheable_layers)) {
         return false;
     }
-    if (layer_bytes >
-        UINT64_MAX / (uint64_t)DS4_STREAMING_PREFILL_HEADROOM_LAYERS) {
+    (void)cacheable_experts;
+    const uint32_t reserve_layers =
+        cacheable_layers < DS4_STREAMING_PREFILL_HEADROOM_LAYERS ?
+        cacheable_layers : DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+    if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
         return false;
     }
+    const uint64_t layer_bytes =
+        per_expert_bytes * (uint64_t)DS4_N_EXPERT;
+    if (reserve_layers != 0 &&
+        layer_bytes > UINT64_MAX / (uint64_t)reserve_layers) return false;
 
-    *bytes_out =
-        layer_bytes * (uint64_t)DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+    *bytes_out = layer_bytes * (uint64_t)reserve_layers;
     return true;
 }
 
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
  * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
- * single-size-class slab allocator sized from the FIRST routed layer, so those
- * layers can never be served from it: they must read expert weights through the
- * mapped-model views instead. A layer is "uniform" iff its per-expert bytes
- * match the slab class.
+ * single-size-class slab allocator sized from the dominant local routed-layer
+ * size class, so other layers can never be served from it: they must read
+ * expert weights through the mapped-model views instead. A layer is "uniform"
+ * iff its per-expert bytes match the slab class.
  */
 static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
@@ -5718,21 +5755,37 @@ static void config_validate_model(const ds4_model *m) {
     config_validate_deepseek4_model(m);
 }
 
-static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required) {
+static void weights_bind_output(
+        ds4_weights     *w,
+        const ds4_model *m,
+        bool             required,
+        bool             optional) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
+        } else if (optional) {
+            w->output_norm = model_find_tensor(m, "output_norm.weight");
+            w->output      = model_find_tensor(m, "output.weight");
         }
-        return;
-    }
-
-    if (required) {
+    } else if (required) {
         w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
         w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
         w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
         w->output_norm      = required_tensor(m, "output_norm.weight");
         w->output           = required_tensor(m, "output.weight");
+    } else if (optional) {
+        w->output_hc_base   = model_find_tensor(m, "output_hc_base.weight");
+        w->output_hc_fn     = model_find_tensor(m, "output_hc_fn.weight");
+        w->output_hc_scale  = model_find_tensor(m, "output_hc_scale.weight");
+        w->output_norm      = model_find_tensor(m, "output_norm.weight");
+        w->output           = model_find_tensor(m, "output.weight");
+    }
+
+    if (optional &&
+        weights_have_partial_output_head(w) &&
+        !weights_have_output_head(w)) {
+        ds4_die("partial output head in GGUF");
     }
 }
 
@@ -5838,7 +5891,8 @@ static void weights_bind(
         bool             load_slice,
         uint32_t         load_layer_start,
         uint32_t         load_layer_end,
-        bool             require_output) {
+        bool             require_output,
+        bool             optional_output) {
     memset(w, 0, sizeof(*w));
 
     uint32_t executable_layers = DS4_N_LAYER;
@@ -5857,6 +5911,7 @@ static void weights_bind(
         require_token_embd = start == 0;
     } else {
         require_output = true;
+        optional_output = false;
     }
 
     if (require_token_embd) {
@@ -5864,14 +5919,15 @@ static void weights_bind(
     } else {
         w->token_embd = model_find_tensor(m, "token_embd.weight");
     }
-    weights_bind_output(w, m, require_output);
+    weights_bind_output(w, m, require_output, optional_output);
 
     for (uint32_t il = start; il <= end; il++) {
         weights_bind_layer(&w->layer[il], m, il);
     }
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
      * so the drafter can run them. Only when the full model is loaded. */
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+    if (!load_slice &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         start == 0 && end == executable_layers - 1u) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
@@ -6090,6 +6146,7 @@ static bool glm_stream_resident_decode_layer_supported(
             l->ffn_gate_exps->type == DS4_TENSOR_Q4_K);
 }
 
+static uint32_t g_glm_streaming_full_resident_start;
 static uint32_t g_glm_streaming_full_resident_layers;
 
 static bool glm_stream_resident_decode_layer_enabled(
@@ -6097,7 +6154,9 @@ static bool glm_stream_resident_decode_layer_enabled(
         uint32_t                 il) {
     if (!glm_stream_resident_decode_layer_supported(l, il)) return false;
     return g_glm_streaming_full_resident_layers != 0 &&
-           il - DS4_N_LEADING_DENSE < g_glm_streaming_full_resident_layers;
+           il >= g_glm_streaming_full_resident_start &&
+           il - g_glm_streaming_full_resident_start <
+               g_glm_streaming_full_resident_layers;
 }
 
 static bool glm_stream_expert_cache_addr_layout_supported(
@@ -6396,7 +6455,12 @@ static DS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(
     if (!w || !bytes_out) return false;
 
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_decode_static_spans(w, true, true, &spans)) {
+    const bool include_token =
+        weights_layer_has_required(&w->layer[0], 0);
+    if (!weights_model_map_decode_static_spans(w,
+                                               include_token,
+                                               weights_have_output_head(w),
+                                               &spans)) {
         return false;
     }
     *bytes_out = model_map_span_vec_total_bytes(&spans);
@@ -16797,6 +16861,7 @@ static bool metal_graph_alloc_raw_cap(
     g->prefill_cap = prefill_cap;
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
@@ -16808,6 +16873,10 @@ static bool metal_graph_alloc_raw_cap(
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&weights->layer[il], il)) {
+            g->layer_comp_cap[il] = 0;
+            continue;
+        }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
             g->layer_comp_cap[il] = 0;
@@ -16825,7 +16894,11 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    /* Distributed coordinators do not normally own the output head. The
+     * logits workspace still has a fixed model-vocabulary shape, while the
+     * actual head is encoded only on a node that bound its tensors. */
+    const uint64_t vocab_dim =
+        weights->output ? weights->output->dim[1] : DS4_N_VOCAB;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
@@ -16912,6 +16985,10 @@ static bool metal_graph_alloc_raw_cap(
     }
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* A distributed process owns only its bound layer slice. Persistent
+         * KV state must follow that ownership just like the model tensors;
+         * allocating every model layer here defeats split-model residency. */
+        if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         /* per-layer Class L allocations land on the layer's
          * home tier. placement is NULL on single-tier / diagnostic paths
          * (all-tier-0); non-NULL on the engine path that opted into
@@ -17207,6 +17284,7 @@ static bool metal_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         if (layer_cache_ok && g->cuda_tp_attn_cache_dup) {
             layer_cache_ok = g->layer_raw_cache_tp[il] != NULL;
@@ -32582,6 +32660,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->layer_raw_cache[il]) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -34425,12 +34504,6 @@ static uint32_t glm_graph_full_indexer_layer_count_range(uint32_t layer_start,
     return n;
 }
 
-static uint32_t glm_graph_full_indexer_layer_count(uint32_t normal_layers) {
-    return normal_layers ?
-        glm_graph_full_indexer_layer_count_range(0, normal_layers - 1u) :
-        0;
-}
-
 static uint64_t glm_graph_full_kv_cache_elem_bytes(void) {
     return sizeof(uint16_t);
 }
@@ -34776,13 +34849,21 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
     return bytes;
 }
 
-static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
+static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap_slice(
         uint32_t ctx,
         uint32_t work_ctx,
         uint32_t compact_cap,
-        bool     ssd_streaming) {
+        bool     ssd_streaming,
+        uint32_t layer_start,
+        uint32_t layer_end) {
     ds4_context_memory m = {0};
     const uint32_t normal_layers = glm_graph_normal_layer_count();
+    if (normal_layers == 0 || layer_start >= normal_layers ||
+        layer_end < layer_start) {
+        return m;
+    }
+    if (layer_end >= normal_layers) layer_end = normal_layers - 1u;
+    const uint32_t layer_count = layer_end - layer_start + 1u;
     if (compact_cap > ctx) compact_cap = ctx;
 
     const bool expanded_kv = glm_graph_expanded_kv_cache_enabled(ssd_streaming);
@@ -34796,7 +34877,7 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
     m.prefill_cap = batch_rows;
     m.raw_cap = expanded_kv ? work_ctx : 0;
     if (expanded_kv) {
-        m.raw_bytes = (uint64_t)normal_layers *
+        m.raw_bytes = (uint64_t)layer_count *
                       work_ctx *
                       ((uint64_t)DS4_N_HEAD * (DS4_N_KEY_MLA + DS4_N_VALUE_MLA)) *
                       glm_graph_full_kv_cache_elem_bytes();
@@ -34809,12 +34890,32 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
         m.comp_cap = compact_cap;
         m.compressed_bytes =
             glm_graph_compact_cache_bytes_for_cap(
-                    normal_layers,
-                    glm_graph_full_indexer_layer_count(normal_layers),
+                    layer_count,
+                    glm_graph_full_indexer_layer_count_range(layer_start,
+                                                             layer_end),
                     compact_cap);
     }
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
+}
+
+static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
+        uint32_t ctx,
+        uint32_t work_ctx,
+        uint32_t compact_cap,
+        bool     ssd_streaming) {
+    const uint32_t normal_layers = glm_graph_normal_layer_count();
+    if (normal_layers == 0) {
+        const ds4_context_memory empty = {0};
+        return empty;
+    }
+    return glm_graph_context_memory_estimate_for_compact_cap_slice(
+            ctx,
+            work_ctx,
+            compact_cap,
+            ssd_streaming,
+            0,
+            normal_layers - 1u);
 }
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
@@ -35366,11 +35467,36 @@ static void ds4_engine_print_startup_memory(
         int               ctx_size) {
     if (!e || ctx_size <= 0) return;
 
-    const ds4_context_memory mem =
-        ds4_context_memory_estimate_with_prefill_mode(e->backend,
-                                                      ctx_size,
-                                                      e->prefill_chunk,
-                                                      e->ssd_streaming);
+    ds4_context_memory mem;
+#ifndef DS4_NO_GPU
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        e->distributed.role != DS4_DISTRIBUTED_NONE &&
+        e->distributed.layers.set) {
+        const uint32_t normal_layers = glm_graph_normal_layer_count();
+        const uint32_t layer_end = e->distributed.layers.has_output ?
+            (normal_layers ? normal_layers - 1u : 0u) :
+            e->distributed.layers.end;
+        const uint32_t ctx = (uint32_t)ctx_size;
+        const uint32_t work_ctx =
+            glm_graph_full_attention_cap(ctx, e->ssd_streaming);
+        const uint32_t compact_cap =
+            glm_graph_compact_cache_initial_cap(ctx, work_ctx);
+        mem = glm_graph_context_memory_estimate_for_compact_cap_slice(
+                ctx,
+                work_ctx,
+                compact_cap,
+                e->ssd_streaming,
+                e->distributed.layers.start,
+                layer_end);
+    } else {
+#endif
+        mem = ds4_context_memory_estimate_with_prefill_mode(e->backend,
+                                                            ctx_size,
+                                                            e->prefill_chunk,
+                                                            e->ssd_streaming);
+#ifndef DS4_NO_GPU
+    }
+#endif
     const uint64_t kv_bytes =
         ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
     const uint64_t dynamic_expert_cache_bytes =
@@ -37450,11 +37576,13 @@ static uint64_t glm_graph_streaming_active_model_bytes(
     uint64_t max_bytes = 0;
     ds4_model_map_span_vec spans;
 
-    if (weights_model_map_token_spans(weights, &spans)) {
+    if (weights_layer_has_required(&weights->layer[0], 0) &&
+        weights_model_map_token_spans(weights, &spans)) {
         max_bytes = model_map_span_vec_total_bytes(&spans);
         free(spans.v);
     }
-    if (weights_model_map_output_spans(weights, &spans)) {
+    if (weights_have_output_head(weights) &&
+        weights_model_map_output_spans(weights, &spans)) {
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
         if (bytes > max_bytes) max_bytes = bytes;
         free(spans.v);
@@ -37575,11 +37703,19 @@ static bool glm_graph_memory_guard_for_compact_cap(
 
     const uint32_t work_ctx =
         glm_graph_full_attention_cap(ctx_size, ssd_streaming);
-    const ds4_context_memory mem =
-        glm_graph_context_memory_estimate_for_compact_cap(ctx_size,
-                                                          work_ctx,
-                                                          compact_cap,
-                                                          ssd_streaming);
+    const ds4_context_memory mem = load_slice ?
+        glm_graph_context_memory_estimate_for_compact_cap_slice(
+                ctx_size,
+                work_ctx,
+                compact_cap,
+                ssd_streaming,
+                layer_start,
+                layer_end) :
+        glm_graph_context_memory_estimate_for_compact_cap(
+                ctx_size,
+                work_ctx,
+                compact_cap,
+                ssd_streaming);
     const uint64_t graph_bytes = mem.total_bytes;
     const uint64_t model_bytes =
         glm_graph_model_bytes_for_guard(model,
@@ -37595,8 +37731,22 @@ static bool glm_graph_memory_guard_for_compact_cap(
 
     const double fraction =
         glm_graph_env_double("DS4_GLM_MEMORY_GUARD_FRACTION", 0.99, 0.50, 1.00);
-    const double default_reserve_gib =
+    double default_reserve_gib =
         glm_graph_memory_guard_default_reserve_gib(budget_base, model_bytes);
+#ifdef DS4_ROCM_BUILD
+    if (load_slice && !ssd_streaming) {
+        /* The original fixed reserve protects Metal's shared host/GPU heap.
+         * A resident ROCm layer slice already accounts its exact model spans
+         * and owned graph state above. Keep proportional backend headroom for
+         * driver and temporary allocations without rejecting viable UMA
+         * slices merely because the heap is smaller than a high-memory Mac. */
+        double rocm_reserve_gib = glm_graph_bytes_to_gib(budget_base) / 16.0;
+        if (rocm_reserve_gib < 8.0) rocm_reserve_gib = 8.0;
+        if (rocm_reserve_gib < default_reserve_gib) {
+            default_reserve_gib = rocm_reserve_gib;
+        }
+    }
+#endif
     const double reserve_gib =
         glm_graph_env_double("DS4_GLM_MEMORY_GUARD_RESERVE_GB",
                              default_reserve_gib,
@@ -39104,6 +39254,13 @@ static bool glm_graph_alloc_slice(
         fprintf(stderr,
                 "ds4: GLM graph using compact DSA KV only; expanded full-attention KV cache is skipped\n");
     }
+#ifdef DS4_ROCM_BUILD
+    if (glm_graph_env_truthy(
+            getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"))) {
+        fprintf(stderr,
+                "ds4: ROCm GLM one-token layer slices use the optimized token graph\n");
+    }
+#endif
     if (g->compact_cache_cap != 0) {
         const uint64_t compact_kv_total =
             (uint64_t)g->layer_count * (compact_kv_lora_bytes + compact_k_rope_bytes);
@@ -41660,6 +41817,13 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_norm",
+                                      g->batch_ffn_norm,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     if (!ok) return false;
 
     if (il < DS4_N_LEADING_DENSE) {
@@ -41803,6 +41967,28 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_router_logits",
+                                      g->batch_router_logits,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_tensor("glm_ffn_router_probs",
+                                      g->batch_router_probs,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_i32_tensor("glm_ffn_router_selected",
+                                          g->batch_router_selected,
+                                          (uint64_t)n_tokens * DS4_N_EXPERT_USED,
+                                          il,
+                                          pos0);
+        metal_graph_debug_dump_tensor("glm_ffn_router_weights",
+                                      g->batch_router_weights,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED,
+                                      il,
+                                      pos0);
+    }
     if (ok) ok = glm_graph_profile_router_selection_batch(g,
                                                           l,
                                                           il,
@@ -41977,8 +42163,22 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_routed_out",
+                                      g->batch_ffn_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
 #undef DS4_GLM_ENCODE_FFN_BATCH_SHARED
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_shared_out",
+                                      g->batch_attn_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     if (ok && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
                                  after_attn,
@@ -42003,6 +42203,13 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_next",
+                                      next,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     return ok;
 }
 
@@ -53369,12 +53576,31 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
 
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
+        /* A valid distributed GLM slice can contain only the leading dense
+         * layers. It has no routed weights to stream or cache. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+            e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set) {
+            fprintf(stderr,
+                    "ds4: SSD streaming layer slice has no routed experts; "
+                    "expert cache disabled\n");
+            e->ssd_streaming_cache_experts = 0;
+            e->ssd_streaming_cache_bytes = 0;
+            return true;
+        }
         fprintf(stderr,
                 "ds4: SSD streaming auto cache could not measure routed expert size\n");
         return false;
     }
 
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
+    uint64_t max_model_experts = 0;
+    if (!ds4_streaming_cacheable_expert_count(&e->weights,
+                                              &max_model_experts,
+                                              NULL)) {
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache could not count local cacheable experts\n");
+        return false;
+    }
     ds4_ssd_cache_plan plan;
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  non_routed_bytes,
@@ -53420,9 +53646,24 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             glm_graph_full_attention_cap(guard_ctx, true);
         const uint32_t compact_cap =
             glm_graph_compact_cache_initial_cap(guard_ctx, work_ctx);
-        const ds4_context_memory graph_mem =
-            glm_graph_context_memory_estimate_for_compact_cap(
+        ds4_context_memory graph_mem;
+        if (e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set) {
+            const uint32_t normal_layers = glm_graph_normal_layer_count();
+            const uint32_t layer_end = e->distributed.layers.has_output ?
+                (normal_layers ? normal_layers - 1u : 0u) :
+                e->distributed.layers.end;
+            graph_mem = glm_graph_context_memory_estimate_for_compact_cap_slice(
+                    guard_ctx,
+                    work_ctx,
+                    compact_cap,
+                    true,
+                    e->distributed.layers.start,
+                    layer_end);
+        } else {
+            graph_mem = glm_graph_context_memory_estimate_for_compact_cap(
                     guard_ctx, work_ctx, compact_cap, true);
+        }
         uint64_t active_model_bytes =
             glm_graph_streaming_active_model_bytes(&e->weights);
         if (non_routed_bytes > active_model_bytes) {
@@ -53535,24 +53776,36 @@ static uint32_t ds4_glm_streaming_normal_layer_count(void) {
 }
 
 static uint32_t ds4_glm_streaming_supported_resident_prefix_layers(
-        const ds4_weights *weights) {
+        const ds4_weights *weights,
+        uint32_t          *layer_start_out) {
+    if (layer_start_out) *layer_start_out = 0;
     if (!weights) return 0;
     const uint32_t normal_layers = ds4_glm_streaming_normal_layer_count();
     if (normal_layers <= DS4_N_LEADING_DENSE) return 0;
 
+    uint32_t layer_start = DS4_N_LEADING_DENSE;
+    while (layer_start < normal_layers &&
+           !glm_stream_resident_decode_layer_supported(
+                   &weights->layer[layer_start], layer_start)) {
+        layer_start++;
+    }
+    if (layer_start == normal_layers) return 0;
+
     uint32_t n = 0;
-    for (uint32_t il = DS4_N_LEADING_DENSE; il < normal_layers; il++) {
+    for (uint32_t il = layer_start; il < normal_layers; il++) {
         if (!glm_stream_resident_decode_layer_supported(&weights->layer[il],
                                                         il)) {
             break;
         }
         n++;
     }
+    if (layer_start_out) *layer_start_out = layer_start;
     return n;
 }
 
 static bool ds4_glm_streaming_resident_prefix_bytes(
         const ds4_weights *weights,
+        uint32_t           layer_start,
         uint32_t           layers,
         uint64_t          *bytes_out) {
     if (bytes_out) *bytes_out = 0;
@@ -53560,7 +53813,7 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
 
     uint64_t total = 0;
     for (uint32_t i = 0; i < layers; i++) {
-        const uint32_t il = DS4_N_LEADING_DENSE + i;
+        const uint32_t il = layer_start + i;
         if (!glm_stream_resident_decode_layer_supported(&weights->layer[il],
                                                         il)) {
             return false;
@@ -53583,6 +53836,7 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
 
 static uint32_t ds4_glm_streaming_auto_full_layers(
         const ds4_weights *weights,
+        uint32_t           layer_start,
         uint32_t           supported_layers,
         uint64_t           total_budget_bytes) {
     if (!weights || supported_layers == 0 || total_budget_bytes == 0) {
@@ -53597,7 +53851,10 @@ static uint32_t ds4_glm_streaming_auto_full_layers(
     uint32_t best = 0;
     for (uint32_t n = 1; n <= supported_layers; n++) {
         uint64_t bytes = 0;
-        if (!ds4_glm_streaming_resident_prefix_bytes(weights, n, &bytes)) {
+        if (!ds4_glm_streaming_resident_prefix_bytes(weights,
+                                                     layer_start,
+                                                     n,
+                                                     &bytes)) {
             break;
         }
         if (bytes > target_bytes) break;
@@ -53607,6 +53864,7 @@ static uint32_t ds4_glm_streaming_auto_full_layers(
 }
 
 static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
+    g_glm_streaming_full_resident_start = 0;
     g_glm_streaming_full_resident_layers = 0;
 #ifdef DS4_NO_GPU
     (void)e;
@@ -53628,21 +53886,54 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 
     uint64_t per_expert_bytes = 0;
     const bool need_expert_bytes =
+        e->ssd_streaming_cache_experts != 0 ||
         e->ssd_streaming_cache_bytes != 0 ||
         (glm_full_layer_streaming && !e->ssd_streaming_full_layers_set) ||
         e->ssd_streaming_full_layers != 0;
     if (need_expert_bytes &&
         !ds4_streaming_routed_expert_bytes(&e->weights,
                                            &per_expert_bytes)) {
+        const bool no_routed_slice =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+            e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set;
+        if (no_routed_slice &&
+            e->ssd_streaming_cache_experts == 0 &&
+            e->ssd_streaming_cache_bytes == 0 &&
+            e->ssd_streaming_full_layers == 0) {
+            return true;
+        }
         fprintf(stderr,
                 "ds4: SSD streaming could not measure routed expert size\n");
         return false;
+    }
+    uint64_t max_cache_experts_u64 = 0;
+    if (need_expert_bytes &&
+        !ds4_streaming_cacheable_expert_count(&e->weights,
+                                              &max_cache_experts_u64,
+                                              NULL)) {
+        fprintf(stderr,
+                "ds4: SSD streaming could not count local cacheable experts\n");
+        return false;
+    }
+    const uint32_t max_cache_experts = max_cache_experts_u64 > UINT32_MAX ?
+        UINT32_MAX : (uint32_t)max_cache_experts_u64;
+    if (e->ssd_streaming_cache_bytes == 0 &&
+        max_cache_experts != 0 &&
+        e->ssd_streaming_cache_experts > max_cache_experts) {
+        fprintf(stderr,
+                "ds4: SSD streaming expert cache capped from %u to %u "
+                "experts cacheable by this layer slice\n",
+                e->ssd_streaming_cache_experts,
+                max_cache_experts);
+        e->ssd_streaming_cache_experts = max_cache_experts;
     }
 
     uint32_t full_layers = 0;
     uint64_t full_layers_bytes = 0;
     bool full_layers_auto = false;
     uint32_t supported = 0;
+    uint32_t supported_start = 0;
     uint64_t total_cache_bytes = e->ssd_streaming_cache_bytes;
     uint64_t prefill_headroom_bytes = 0;
     uint64_t budget_after_prefill_headroom = total_cache_bytes;
@@ -53656,7 +53947,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
         if (prefill_headroom_bytes >= total_cache_bytes) {
             fprintf(stderr,
                     "ds4: --ssd-streaming-cache-experts byte budget %.2f GiB "
-                    "is too small: two routed prefill layers need %.2f GiB\n",
+                    "is too small: routed prefill headroom needs %.2f GiB\n",
                     (double)total_cache_bytes / 1073741824.0,
                     (double)prefill_headroom_bytes / 1073741824.0);
             return false;
@@ -53667,7 +53958,8 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     e->ssd_streaming_prefill_headroom_bytes = prefill_headroom_bytes;
     if (glm_full_layer_streaming) {
         supported =
-            ds4_glm_streaming_supported_resident_prefix_layers(&e->weights);
+            ds4_glm_streaming_supported_resident_prefix_layers(
+                    &e->weights, &supported_start);
         if (!e->ssd_streaming_full_layers_set &&
             e->ssd_streaming_cache_bytes != 0) {
             /*
@@ -53684,6 +53976,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                 e->ssd_streaming_full_layers =
                     ds4_glm_streaming_auto_full_layers(
                             &e->weights,
+                            supported_start,
                             supported,
                             budget_after_prefill_headroom);
             }
@@ -53693,8 +53986,9 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 
     if (e->ssd_streaming_full_layers != 0) {
         const uint32_t requested = e->ssd_streaming_full_layers;
-        const uint32_t supported =
-            ds4_glm_streaming_supported_resident_prefix_layers(&e->weights);
+        supported =
+            ds4_glm_streaming_supported_resident_prefix_layers(
+                    &e->weights, &supported_start);
         full_layers = requested < supported ? requested : supported;
         if (full_layers != requested) {
             fprintf(stderr,
@@ -53723,6 +54017,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             while (full_layers != 0) {
                 uint64_t bytes = 0;
                 if (!ds4_glm_streaming_resident_prefix_bytes(&e->weights,
+                                                             supported_start,
                                                              full_layers,
                                                              &bytes)) {
                     fprintf(stderr,
@@ -53747,6 +54042,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             }
         } else if (full_layers != 0 &&
                    !ds4_glm_streaming_resident_prefix_bytes(&e->weights,
+                                                            supported_start,
                                                             full_layers,
                                                             &full_layers_bytes)) {
             fprintf(stderr,
@@ -53767,11 +54063,14 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
         }
 
         uint64_t budget_expert_bytes = 0;
-        const uint32_t budget =
+        uint32_t budget =
             ds4_streaming_cache_experts_for_byte_budget(
                     &e->weights,
                     dynamic_cache_bytes,
                     &budget_expert_bytes);
+        if (max_cache_experts != 0 && budget > max_cache_experts) {
+            budget = max_cache_experts;
+        }
         if (budget == 0 || budget_expert_bytes == 0) {
             fprintf(stderr,
                     "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
@@ -53840,6 +54139,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 
     e->ssd_streaming_full_layers = full_layers;
     e->ssd_streaming_full_layer_bytes = full_layers_bytes;
+    g_glm_streaming_full_resident_start = supported_start;
     g_glm_streaming_full_resident_layers = full_layers;
     return true;
 #endif
@@ -55335,17 +55635,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
     uint32_t load_layer_start = opt->load_layer_start;
     uint32_t load_layer_end = opt->load_layer_end;
     bool load_output = opt->load_output;
+    bool load_output_optional = false;
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
         opt->distributed.layers.set)
     {
         load_slice = true;
         load_layer_start = opt->distributed.layers.start;
-        load_layer_end =
-            (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-             opt->distributed.layers.has_output) ?
-                UINT32_MAX :
-                opt->distributed.layers.end;
+        load_layer_end = opt->distributed.layers.end;
         load_output = opt->distributed.layers.has_output;
+        /* A coordinator may need to apply the output head locally when the
+         * last worker advertises N:M rather than N:output. Bind it when the
+         * local GGUF contains it, without requiring split GGUFs to do so. */
+        load_output_optional =
+            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
@@ -55353,6 +55655,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+    if (load_slice && load_layer_end == UINT32_MAX) {
+        const uint32_t normal_layers = ds4_model_normal_layer_count();
+        if (normal_layers == 0) {
+            fprintf(stderr, "ds4: model reports no executable transformer layers\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        load_layer_end = normal_layers - 1u;
+    }
+    if (e->distributed.role != DS4_DISTRIBUTED_NONE &&
+        e->distributed.layers.set) {
+        e->distributed.layers.end = load_layer_end;
+    }
     if (e->cuda_tensor_parallel &&
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
@@ -55387,7 +55703,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_slice,
                  load_layer_start,
                  load_layer_end,
-                 load_output);
+                 load_output,
+                 load_output_optional);
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
@@ -55454,15 +55771,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         bool glm_backend_supported = ds4_backend_uses_graph(e->backend);
 #ifdef DS4_ROCM_BUILD
-        if (e->backend == DS4_BACKEND_CUDA && !e->ssd_streaming) {
+        const bool rocm_full_model_requires_streaming =
+            e->backend == DS4_BACKEND_CUDA &&
+            !e->ssd_streaming &&
+            !load_slice;
+        if (rocm_full_model_requires_streaming) {
             glm_backend_supported = false;
         }
 #endif
         if (!glm_backend_supported) {
 #ifdef DS4_ROCM_BUILD
-            fprintf(stderr,
-                    "ds4: GLM 5.2 ROCm inference requires --ssd-streaming; "
-                    "use --inspect or --cpu --first-token-test for CPU diagnostics\n");
+            if (rocm_full_model_requires_streaming) {
+                fprintf(stderr,
+                        "ds4: full-model GLM 5.2 ROCm inference requires "
+                        "--ssd-streaming; distributed layer slices can run "
+                        "fully resident\n");
+            } else {
+                fprintf(stderr,
+                        "ds4: GLM 5.2 inference requires the ROCm graph "
+                        "backend; use --inspect or --cpu --first-token-test "
+                        "for CPU diagnostics\n");
+            }
 #else
             fprintf(stderr,
                     "ds4: GLM 5.2 inference requires the Metal or CUDA graph "
@@ -55483,7 +55812,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                  load_layer_start,
                                                  load_layer_end,
                                                  load_layer_start == 0,
-                                                 load_output,
+                                                 load_output ||
+                                                     (load_output_optional &&
+                                                      weights_have_output_head(
+                                                              &e->weights)),
                                                  guard_ctx) :
                     glm_graph_memory_guard(&e->model,
                                            &e->weights,
@@ -55771,7 +56103,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     load_slice,
                     load_layer_start,
                     load_layer_end,
-                    load_output,
+                    load_output ||
+                        (load_output_optional &&
+                         weights_have_output_head(&e->weights)),
                     opt->context_size,
                     "after GLM streaming cache budget")) {
             ds4_engine_close(e);
@@ -55844,7 +56178,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         uint32_t load_span_count = 0;
         if (e->ssd_streaming) {
             const bool map_output = load_slice &&
-                                    load_output;
+                                    (load_output ||
+                                     (load_output_optional &&
+                                      weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
             if (load_slice) {
@@ -55852,7 +56188,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         &e->weights,
                         load_layer_start,
                         load_layer_end,
-                        true,
+                        load_layer_start == 0,
                         map_output,
                         &spans);
             } else {
@@ -55886,8 +56222,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
                 }
                 fprintf(stderr,
-                        "ds4: SSD streaming initial %s model map restricted to token + non-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                        "ds4: SSD streaming initial %s model map restricted to "
+                        "%snon-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
                         ds4_backend_name(e->backend),
+                        load_layer_start == 0 ? "token + " : "",
                         load_layer_start,
                         load_end,
                         spans.len,
@@ -55907,7 +56245,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         spans.max_tensor_bytes);
             free(spans.v);
         } else if (load_slice) {
-            const bool map_output = load_output;
+            const bool map_output =
+                load_output ||
+                (load_output_optional &&
+                 weights_have_output_head(&e->weights));
             char load_end[32];
             if (map_output && load_layer_end == UINT32_MAX) {
                 snprintf(load_end, sizeof(load_end), "output");
@@ -57339,6 +57680,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         const uint64_t hidden_dim = DS4_N_EMBD;
+#ifdef DS4_ROCM_BUILD
+        const bool rocm_layer_slice_token_decode =
+            glm_graph_env_truthy(
+                    getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"));
+#else
+        const bool rocm_layer_slice_token_decode = false;
+#endif
         uint32_t done = 0;
         while (done < n_tokens) {
             const uint32_t pos = pos0 + done;
@@ -57349,11 +57697,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             bool ok = false;
 
             /*
-             * Raw decode starts from a token embedding. Continuation slices
-             * receive a hidden vector from the previous node, so use the
-             * batch-equivalent path even for a single token.
+             * The token graph accepts both embeddings and inter-node hidden
+             * states. Keep the resident ROCm continuation path opt-in until
+             * remote output and timing tests validate it across GLM quants.
              */
-            if (remaining == 1 && pos > 0 && !input_hc && !output_hc) {
+            if (remaining == 1 && pos > 0 &&
+                ((!input_hc && !output_hc) ||
+                 rocm_layer_slice_token_decode)) {
                 float *chunk_logits = output_logits ? logits : NULL;
                 ok = glm_graph_forward_token(g,
                                              &e->model,

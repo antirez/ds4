@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -52,8 +53,7 @@ enum {
      * decode calls to the online attention kernel so this fixed buffer never
      * becomes an out-of-bounds write at long context. */
     DS4_ROCM_ATTENTION_SCORE_CAP = 8192u,
-    DS4_ROCM_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_ROCM_TOPK_MERGE_GROUP = 8u
+    DS4_ROCM_ATTENTION_RAW_SCORE_CAP = 256u
 };
 
 struct ds4_gpu_tensor {
