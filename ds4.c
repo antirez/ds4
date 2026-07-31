@@ -48991,21 +48991,33 @@ static bool dflash_graph_draft_block(
                                      l->attn_output,
                                      g->heads,
                                      n_rows) &&
-                 ds4_gpu_add_tensor(g->after_attn,
-                                    g->cur,
-                                    g->attn_out,
-                                    (uint64_t)n_rows * embd) != 0;
-        }
-        if (ok) {
-            ok = ds4_gpu_rms_norm_weight_rows_tensor(
+#ifdef __APPLE__
+                 ds4_gpu_add_rms_norm_weight_rows_tensor(
                      g->ffn_norm,
                      g->after_attn,
+                     g->cur,
+                     g->attn_out,
                      weight_map,
                      weight_map_size,
                      l->ffn_norm->abs_offset,
                      embd,
                      n_rows,
                      DS4_SHAPE_LAGUNA_S21.rms_eps) != 0;
+#else
+                 (ds4_gpu_add_tensor(g->after_attn,
+                                     g->cur,
+                                     g->attn_out,
+                                     (uint64_t)n_rows * embd) != 0 &&
+                  ds4_gpu_rms_norm_weight_rows_tensor(
+                      g->ffn_norm,
+                      g->after_attn,
+                      weight_map,
+                      weight_map_size,
+                      l->ffn_norm->abs_offset,
+                      embd,
+                      n_rows,
+                      DS4_SHAPE_LAGUNA_S21.rms_eps) != 0);
+#endif
         }
         if (ok) {
             ok = dflash_graph_matmul(g->ffn_gate,
@@ -50161,15 +50173,25 @@ static bool laguna_graph_forward_batch(
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_attn_out");
         if (ok && !tail_skip) {
-            failed_stage = "attention residual";
+            failed_stage = "attention residual + FFN norm";
+#ifdef __APPLE__
+            ok = ds4_gpu_add_rms_norm_weight_rows_tensor(
+                    g->ffn_norm,
+                    g->after_attn,
+                    tail_cur,
+                    g->attn_out,
+                    model->map,
+                    model->size,
+                    l->ffn_norm->abs_offset,
+                    DS4_N_EMBD,
+                    tail_rows,
+                    DS4_RMS_EPS) != 0;
+#else
             ok = ds4_gpu_add_tensor(g->after_attn,
                                     tail_cur,
                                     g->attn_out,
-                                    (uint64_t)tail_rows * DS4_N_EMBD) != 0;
-        }
-        if (ok && !tail_skip) {
-            failed_stage = "FFN norm";
-            ok = ds4_gpu_rms_norm_weight_rows_tensor(
+                                    (uint64_t)tail_rows * DS4_N_EMBD) != 0 &&
+                 ds4_gpu_rms_norm_weight_rows_tensor(
                     g->ffn_norm,
                     g->after_attn,
                     model->map,
@@ -50178,6 +50200,7 @@ static bool laguna_graph_forward_batch(
                     DS4_N_EMBD,
                     tail_rows,
                     DS4_RMS_EPS) != 0;
+#endif
         }
         if (ok && stage_prof) ok = laguna_stage_mark("p_norms");
         if (ok && il < DS4_N_LEADING_DENSE) {
