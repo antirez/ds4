@@ -49194,6 +49194,12 @@ static uint32_t g_laguna_stage_tokens;
 static double   g_laguna_stage_t0;
 static double   g_laguna_stage_busy0;
 
+static int laguna_dflash_timing_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_DFLASH_TIMING") != NULL ? 1 : 0;
+    return cached;
+}
+
 static double laguna_stage_busy_ms(void) {
 #ifdef __APPLE__
     return ds4_gpu_busy_accum_ms();
@@ -69285,7 +69291,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
 
     const double verify_done = now_sec();
     const double busy_verify = laguna_stage_busy_ms();
-    if (getenv("DS4_DFLASH_TIMING") != NULL) {
+    if (laguna_dflash_timing_enabled()) {
         /* Phase attribution: draft = snapshot + draft-block encode/submit;
          * conf = wait for draft + confidence readback; enc = verifier encode
          * (near zero when the pre-encoded verifier is committed); read =
@@ -69423,7 +69429,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
                     uint32_t next = s->dflash_active_draft * 2u + 1u;
                     if (next > requested_draft) next = requested_draft;
                     s->dflash_active_draft = next;
-                    if (getenv("DS4_DFLASH_TIMING") != NULL) {
+                    if (laguna_dflash_timing_enabled()) {
                         fprintf(stderr,
                                 "ds4: DFlash testing draft depth %u "
                                 "after %.2f ms/token at depth %u\n",
@@ -69435,7 +69441,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
                     if (s->dflash_cycles >= 10u) {
                         s->dflash_guard_decided = true;
                     }
-                    if (getenv("DS4_DFLASH_TIMING") != NULL) {
+                    if (laguna_dflash_timing_enabled()) {
                         fprintf(stderr,
                                 "ds4: DFlash retaining draft depth %u; "
                                 "only %u/5 calibration blocks were fully "
@@ -69475,7 +69481,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
                    cumulative_ms_per_token <
                        s->dflash_baseline_ms * 0.98) {
             s->dflash_guard_decided = true;
-            if (getenv("DS4_DFLASH_TIMING") != NULL) {
+            if (laguna_dflash_timing_enabled()) {
                 fprintf(stderr,
                         "ds4: DFlash retaining draft depth %u after local "
                         "slowdown; cumulative cost is %.2f ms/token\n",
@@ -69484,7 +69490,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
             }
         } else if (s->dflash_cycles < 10u &&
                    spec_ms_per_token < s->dflash_baseline_ms * 1.05) {
-            if (getenv("DS4_DFLASH_TIMING") != NULL) {
+            if (laguna_dflash_timing_enabled()) {
                 fprintf(stderr,
                         "ds4: DFlash calibration is within startup noise "
                         "(%.2f vs %.2f ms/token); measuring another window\n",
@@ -69529,7 +69535,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
         s->dflash_window_tokens = 0;
         s->dflash_window_cycles = 0;
     }
-    if (getenv("DS4_DFLASH_TIMING") != NULL) {
+    if (laguna_dflash_timing_enabled()) {
         fprintf(stderr,
                 "ds4: DFlash cycle drafted=%u verified=%u accepted=%d "
                 "pipeline=%.3f ms\n",

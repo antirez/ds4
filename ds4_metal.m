@@ -2147,9 +2147,28 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
         const char *function_name) {
-    NSString *key = [NSString stringWithFormat:@"%s", function_name];
+    /* Call sites pass string literals, so the pointer itself is a stable
+     * key: steady-state lookups skip NSString creation and the dictionary
+     * hash entirely (both showed up in CPU samples of the DFlash cycle). */
+    enum { DS4_PIPELINE_PTR_CACHE = 96 };
+    static const char *ptr_keys[DS4_PIPELINE_PTR_CACHE];
+    static void *ptr_vals[DS4_PIPELINE_PTR_CACHE];
+    static uint32_t ptr_count;
+    for (uint32_t i = 0; i < ptr_count; i++) {
+        if (ptr_keys[i] == function_name) {
+            return (__bridge id<MTLComputePipelineState>)ptr_vals[i];
+        }
+    }
+    NSString *key = [NSString stringWithUTF8String:function_name];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
-    if (cached) return cached;
+    if (cached) {
+        if (ptr_count < DS4_PIPELINE_PTR_CACHE) {
+            ptr_keys[ptr_count] = function_name;
+            ptr_vals[ptr_count] = (void *)CFBridgingRetain(cached);
+            ptr_count++;
+        }
+        return cached;
+    }
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -2167,6 +2186,11 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
+    if (ptr_count < DS4_PIPELINE_PTR_CACHE) {
+        ptr_keys[ptr_count] = function_name;
+        ptr_vals[ptr_count] = (void *)CFBridgingRetain(pipeline);
+        ptr_count++;
+    }
     return pipeline;
 }
 
@@ -17070,10 +17094,14 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
             n_rows >= 4u ? 4u : n_rows == 3u ? 3u :
             n_rows == 2u ? 2u : 1u;
         /* Diagnostic: cap the exact-rows kernel's tokens per threadgroup. */
-        const char *rows_cap_env = getenv("DS4_METAL_Q8_ROWS_EXACT_MAX");
-        if (rows_cap_env != NULL) {
-            const uint32_t cap = (uint32_t)atoi(rows_cap_env);
-            if (cap >= 1u && cap < rows_per_group) rows_per_group = cap;
+        static int rows_cap_cached = -2;
+        if (rows_cap_cached == -2) {
+            const char *rows_cap_env = getenv("DS4_METAL_Q8_ROWS_EXACT_MAX");
+            rows_cap_cached = rows_cap_env != NULL ? atoi(rows_cap_env) : -1;
+        }
+        if (rows_cap_cached >= 1 &&
+            (uint32_t)rows_cap_cached < rows_per_group) {
+            rows_per_group = (uint32_t)rows_cap_cached;
         }
         const char *function_name =
             rows_per_group == 4u ?
@@ -32014,6 +32042,14 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_store_tensor(
     return 1;
 }
 
+static int ds4_gpu_swa_decode_gqa3_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_DISABLE_SWA_DECODE_GQA3") == NULL ? 1 : 0;
+    }
+    return cached;
+}
+
 static int ds4_gpu_encode_laguna_flash_attention_decode(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        headsbuf,
@@ -32047,7 +32083,7 @@ static int ds4_gpu_encode_laguna_flash_attention_decode(
     const bool use_gqa3 =
         (cache_cap > 512u ||
          (key_count == cache_cap &&
-          getenv("DS4_METAL_DISABLE_SWA_DECODE_GQA3") == NULL)) &&
+          ds4_gpu_swa_decode_gqa3_enabled())) &&
         (n_head % 3u) == 0u &&
         ((n_head / n_head_kv) % 3u) == 0u;
     const NSUInteger head_bytes = (NSUInteger)head_dim * sizeof(uint16_t);
@@ -32642,21 +32678,32 @@ int ds4_gpu_laguna_attention_prefill_tensor(
 
             /* Three query heads of one KV head share every K/V read when
              * the head grouping allows it (72/8 sliding geometry). */
+            static int rows_gqa3_env = -1;
+            if (rows_gqa3_env < 0) {
+                rows_gqa3_env =
+                    getenv("DS4_METAL_DISABLE_ROWS_GQA3") == NULL ? 1 : 0;
+            }
             const bool rows_gqa3_geom =
                 (n_head % 3u) == 0u &&
                 n_head_kv != 0u &&
                 ((n_head / n_head_kv) % 3u) == 0u &&
-                getenv("DS4_METAL_DISABLE_ROWS_GQA3") == NULL;
+                rows_gqa3_env != 0;
             /* Once the ring has wrapped, the block's own keys are served
              * from the staging buffer so the batched store can wait until
              * after attention instead of falling back to row-at-a-time
              * store/attend pairs. */
+            static int staged_env = -1;
+            if (staged_env < 0) {
+                staged_env =
+                    getenv("DS4_METAL_DISABLE_SWA_ROWS_STAGED") == NULL ?
+                    1 : 0;
+            }
             const bool use_batched_swa_rows_staged =
                 n_tokens >= 2u && n_tokens <= 16u &&
                 cache_cap == 512u &&
                 pos0 + n_tokens > cache_cap &&
                 rows_gqa3_geom &&
-                getenv("DS4_METAL_DISABLE_SWA_ROWS_STAGED") == NULL;
+                staged_env != 0;
             if (use_batched_swa_rows_staged) {
                 if (!have_kv) return 0;
                 id<MTLComputePipelineState> stage_pipeline =
