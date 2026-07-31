@@ -85,6 +85,7 @@ int ds4_gpu_discard_commands(void);
  * encoded, then restore or drop it (dual-width verifier pre-encode). */
 int ds4_gpu_hold_commands(void);
 int ds4_gpu_unhold_commands(void);
+int ds4_gpu_unhold_commands_at(uint32_t idx);
 int ds4_gpu_drop_held_commands(void);
 int ds4_gpu_discard_open_commands(void);
 int ds4_gpu_commands_active(void);

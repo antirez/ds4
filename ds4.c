@@ -68969,62 +68969,45 @@ static int ds4_session_eval_dflash_speculative_argmax(
     bool target_preencoded = false;
 #ifdef __APPLE__
     uint32_t preenc_open_rows = 0;
-    bool preenc_full_held = false;
+    uint32_t preenc_held_rows[3] = {0};
+    uint32_t preenc_n_held = 0;
     if (draft_p_min > 0.0f && ds4_gpu_flush_commands() != 0) {
         /*
-         * Encode the two most likely post-prune verifier widths while the
-         * draft is executing: the full block, then one row narrower.  The
-         * confidence read keeps whichever matches and drops the other, so
-         * the serial re-encode only remains for the rarer widths.
+         * Encode every plausible post-prune verifier width while the draft
+         * is executing (widest first, narrower ones behind the held-batch
+         * stack).  The confidence read keeps exactly the matching width,
+         * so the serial re-encode disappears for draft depths <= 4.
          */
         verify_tokens[0] = first_token;
-        ds4_laguna_feature_capture speculative_capture =
-            ds4_session_dflash_capture(s, 0, n_rows);
-        const bool full_encoded = laguna_graph_forward_batch(
-            &s->laguna_graph,
-            &e->model,
-            &e->weights,
-            verify_tokens,
-            s->dflash_graph.argmax,
-            n_rows,
-            pos0,
-            NULL,
-            target_top,
-            &speculative_capture,
-            NULL,
-            NULL,
-            0);
-        if (full_encoded && n_rows >= 3u && ds4_gpu_hold_commands() != 0) {
-            preenc_full_held = true;
-            const uint32_t short_rows = n_rows - 1u;
-            ds4_laguna_feature_capture short_capture =
-                ds4_session_dflash_capture(s, 0, short_rows);
-            target_preencoded = laguna_graph_forward_batch(
+        for (uint32_t w = n_rows; w >= 1u; w--) {
+            ds4_laguna_feature_capture w_capture =
+                ds4_session_dflash_capture(s, 0, w);
+            const bool encoded = laguna_graph_forward_batch(
                 &s->laguna_graph,
                 &e->model,
                 &e->weights,
                 verify_tokens,
                 s->dflash_graph.argmax,
-                short_rows,
+                w,
                 pos0,
                 NULL,
                 target_top,
-                &short_capture,
+                &w_capture,
                 NULL,
                 NULL,
                 0);
-            if (target_preencoded) {
-                preenc_open_rows = short_rows;
-            } else if (ds4_gpu_commands_active()) {
-                (void)ds4_gpu_discard_open_commands();
+            if (!encoded) {
+                if (ds4_gpu_commands_active()) {
+                    (void)ds4_gpu_discard_open_commands();
+                }
+                break;
             }
-        } else {
-            target_preencoded = full_encoded;
-            if (target_preencoded) {
-                preenc_open_rows = n_rows;
-            } else if (ds4_gpu_commands_active()) {
-                (void)ds4_gpu_discard_open_commands();
+            if (w == 1u || ds4_gpu_hold_commands() == 0) {
+                target_preencoded = true;
+                preenc_open_rows = w;
+                break;
             }
+            preenc_held_rows[preenc_n_held++] = w;
         }
     }
 #endif
@@ -69095,31 +69078,30 @@ static int ds4_session_eval_dflash_speculative_argmax(
             }
         }
 #ifdef __APPLE__
-        if (preenc_full_held) {
-            if (n_rows == generated_draft + 1u) {
-                if (ds4_gpu_commands_active() &&
-                    ds4_gpu_discard_open_commands() == 0) {
-                    draft_read_ok = false;
+        if (target_preencoded && preenc_open_rows == n_rows) {
+            (void)ds4_gpu_drop_held_commands();
+        } else {
+            uint32_t match = UINT32_MAX;
+            for (uint32_t i = 0; i < preenc_n_held; i++) {
+                if (preenc_held_rows[i] == n_rows) {
+                    match = i;
+                    break;
                 }
-                if (draft_read_ok && ds4_gpu_unhold_commands() != 0) {
-                    target_preencoded = true;
-                    preenc_open_rows = n_rows;
-                } else {
-                    target_preencoded = false;
-                    preenc_open_rows = 0;
-                }
-            } else {
-                (void)ds4_gpu_drop_held_commands();
             }
-            preenc_full_held = false;
-        }
-        if (target_preencoded && preenc_open_rows != n_rows) {
             if (ds4_gpu_commands_active() &&
                 ds4_gpu_discard_open_commands() == 0) {
                 draft_read_ok = false;
             }
-            target_preencoded = false;
+            if (draft_read_ok && match != UINT32_MAX &&
+                ds4_gpu_unhold_commands_at(match) != 0) {
+                target_preencoded = true;
+                preenc_open_rows = n_rows;
+            } else {
+                (void)ds4_gpu_drop_held_commands();
+                target_preencoded = false;
+            }
         }
+        preenc_n_held = 0;
 #else
         if (target_preencoded && n_draft != generated_draft) {
             draft_read_ok = ds4_gpu_discard_commands() != 0;
