@@ -31674,8 +31674,13 @@ static int ds4_gpu_encode_laguna_flash_attention_decode(
     const uint32_t nwg = 32u;
     const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(key_count, nwg, ncpsg);
     const bool has_pad = (key_count % ncpsg) != 0u;
+    /* A full sliding ring is an unmasked reduction over exactly the live key
+     * set, so it can take the shared-K/V gqa3 kernel like global layers. */
     const bool use_gqa3 =
-        cache_cap > 512u && (n_head % 3u) == 0u &&
+        (cache_cap > 512u ||
+         (key_count == cache_cap &&
+          getenv("DS4_METAL_DISABLE_SWA_DECODE_GQA3") == NULL)) &&
+        (n_head % 3u) == 0u &&
         ((n_head / n_head_kv) % 3u) == 0u;
     const NSUInteger head_bytes = (NSUInteger)head_dim * sizeof(uint16_t);
     const NSUInteger cache_row_bytes =
