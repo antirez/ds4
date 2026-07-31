@@ -47755,6 +47755,7 @@ typedef struct {
     ds4_gpu_tensor *spec_logits;
     ds4_gpu_tensor *spec_argmax;
     ds4_gpu_tensor *spec_key_backup[DS4_MAX_LAYER];
+    void *spec_copy_table;
     ds4_gpu_tensor *spec_value_backup[DS4_MAX_LAYER];
     ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
@@ -47799,6 +47800,12 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     DS4_LAGUNA_FREE(spec_logits);
     DS4_LAGUNA_FREE(spec_argmax);
 #undef DS4_LAGUNA_FREE
+#ifdef __APPLE__
+    if (g->spec_copy_table) {
+        ds4_gpu_laguna_spec_table_free(g->spec_copy_table);
+        g->spec_copy_table = NULL;
+    }
+#endif
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->spec_key_backup[il]);
         ds4_gpu_tensor_free(g->spec_value_backup[il]);
@@ -47949,6 +47956,26 @@ static bool laguna_graph_ensure_spec_scratch(ds4_laguna_gpu_graph *g) {
             return false;
         }
     }
+#ifdef __APPLE__
+    if (!g->spec_copy_table &&
+        getenv("DS4_METAL_DISABLE_SPEC_COPY_ALL") == NULL) {
+        ds4_gpu_tensor *kc[DS4_MAX_LAYER];
+        ds4_gpu_tensor *vc[DS4_MAX_LAYER];
+        ds4_gpu_tensor *kb[DS4_MAX_LAYER];
+        ds4_gpu_tensor *vb[DS4_MAX_LAYER];
+        uint32_t n_swa = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!ds4_laguna_layer_is_swa(il)) continue;
+            kc[n_swa] = g->key_cache[il];
+            vc[n_swa] = g->value_cache[il];
+            kb[n_swa] = g->spec_key_backup[il];
+            vb[n_swa] = g->spec_value_backup[il];
+            n_swa++;
+        }
+        g->spec_copy_table =
+            ds4_gpu_laguna_spec_table_build(kc, vc, kb, vb, n_swa);
+    }
+#endif
     return true;
 }
 
@@ -48018,6 +48045,17 @@ static bool laguna_graph_spec_snapshot(
     const uint64_t row_bytes =
         (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
     bool ok = ds4_gpu_begin_commands() != 0;
+#ifdef __APPLE__
+    if (ok && g->spec_copy_table) {
+        uint32_t swa_cap = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER && swa_cap == 0u; il++) {
+            if (ds4_laguna_layer_is_swa(il)) swa_cap = g->cache_cap[il];
+        }
+        ok = ds4_gpu_laguna_spec_copy_all_tensor(
+                 g->spec_copy_table, pos0, 0, n_rows, swa_cap,
+                 DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 1) != 0;
+    } else
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!ds4_laguna_layer_is_swa(il)) continue;
         ok = laguna_graph_spec_ring_copy(g->key_cache[il],
@@ -48051,6 +48089,17 @@ static bool laguna_graph_spec_restore(
     const uint64_t row_bytes =
         (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
     bool ok = ds4_gpu_begin_commands() != 0;
+#ifdef __APPLE__
+    if (ok && g->spec_copy_table) {
+        uint32_t swa_cap = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER && swa_cap == 0u; il++) {
+            if (ds4_laguna_layer_is_swa(il)) swa_cap = g->cache_cap[il];
+        }
+        ok = ds4_gpu_laguna_spec_copy_all_tensor(
+                 g->spec_copy_table, pos0, first_row, n_rows, swa_cap,
+                 DS4_N_HEAD_KV * DS4_N_HEAD_DIM, 0) != 0;
+    } else
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!ds4_laguna_layer_is_swa(il)) continue;
         ok = laguna_graph_spec_ring_copy(g->key_cache[il],

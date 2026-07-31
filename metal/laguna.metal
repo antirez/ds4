@@ -248,6 +248,61 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_store_rows_neox(
     value_cache[dst + lane + 96u] = (half)v_row[lane + 96u];
 }
 
+struct ds4_metal_args_laguna_spec_copy {
+    uint32_t pos0;
+    uint32_t first_row;
+    uint32_t n_rows;
+    uint32_t cache_cap;
+    uint32_t row_elems;
+    uint32_t n_layers;
+    uint32_t to_backup;
+    uint32_t pad0;
+};
+
+// One dispatch snapshots (or restores) the speculative rows of every
+// sliding-window layer at once, replacing ~150 host-encoded blits per
+// DFlash cycle.  addrs holds {key_cache, value_cache, key_backup,
+// value_backup} GPU addresses per layer; each threadgroup moves one
+// row of one layer (K and V halves split across the thread range).
+kernel void kernel_laguna_spec_ring_copy_all_f16(
+        constant ds4_metal_args_laguna_spec_copy &args,
+        device const ulong *addrs,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint layer = tgpig.x;
+    const uint row = args.first_row + tgpig.y;
+    if (layer >= args.n_layers || row >= args.n_rows ||
+        args.cache_cap == 0u || (args.row_elems & 7u) != 0u) {
+        return;
+    }
+    const uint ring = (args.pos0 + row) % args.cache_cap;
+    const uint vec_count = args.row_elems / 8u;
+    device const ulong *base = addrs + (uint64_t)layer * 4u;
+    device uint4 *key_cache = reinterpret_cast<device uint4 *>(base[0]);
+    device uint4 *value_cache = reinterpret_cast<device uint4 *>(base[1]);
+    device uint4 *key_backup = reinterpret_cast<device uint4 *>(base[2]);
+    device uint4 *value_backup = reinterpret_cast<device uint4 *>(base[3]);
+    const uint64_t cache_off = (uint64_t)ring * vec_count;
+    const uint64_t backup_off = (uint64_t)row * vec_count;
+    for (uint t = tid; t < 2u * vec_count; t += ntg.x) {
+        if (t < vec_count) {
+            if (args.to_backup != 0u) {
+                key_backup[backup_off + t] = key_cache[cache_off + t];
+            } else {
+                key_cache[cache_off + t] = key_backup[backup_off + t];
+            }
+        } else {
+            const uint u = t - vec_count;
+            if (args.to_backup != 0u) {
+                value_backup[backup_off + u] = value_cache[cache_off + u];
+            } else {
+                value_cache[cache_off + u] = value_backup[backup_off + u];
+            }
+        }
+    }
+}
+
 struct ds4_metal_args_laguna_kv_store {
     uint32_t cache_cap;
     uint32_t cache_row;

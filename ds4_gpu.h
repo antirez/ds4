@@ -83,6 +83,25 @@ int ds4_gpu_wait_submitted_commands(void);
 int ds4_gpu_discard_commands(void);
 /* Metal only: stash the open uncommitted batch so an alternative can be
  * encoded, then restore or drop it (dual-width verifier pre-encode). */
+/* Metal only: consolidated DFlash snapshot/restore — an address table over
+ * the sliding-window caches and their speculative backups lets one dispatch
+ * replace the per-layer blit loops. */
+void *ds4_gpu_laguna_spec_table_build(
+        ds4_gpu_tensor **key_caches,
+        ds4_gpu_tensor **value_caches,
+        ds4_gpu_tensor **key_backups,
+        ds4_gpu_tensor **value_backups,
+        uint32_t         n_layers);
+void ds4_gpu_laguna_spec_table_free(void *table);
+int ds4_gpu_laguna_spec_copy_all_tensor(
+        void    *table,
+        uint32_t pos0,
+        uint32_t first_row,
+        uint32_t n_rows,
+        uint32_t cache_cap,
+        uint32_t row_elems,
+        int      to_backup);
+
 int ds4_gpu_hold_commands(void);
 int ds4_gpu_unhold_commands(void);
 int ds4_gpu_unhold_commands_at(uint32_t idx);

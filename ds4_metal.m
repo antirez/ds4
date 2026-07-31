@@ -8202,6 +8202,153 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return 1;
 }
 
+/* Consolidated speculative ring copies: an address table over every
+ * sliding-window layer's cache and backup buffers lets one dispatch
+ * replace the per-layer blit loops of DFlash snapshot/restore. */
+@interface DS4MetalSpecCopyTable : NSObject
+@property(nonatomic, strong) id<MTLBuffer> addressBuffer;
+@property(nonatomic, strong) id residencySet;
+@property(nonatomic, assign) uint32_t layers;
+@end
+@implementation DS4MetalSpecCopyTable
+- (void)dealloc {
+    if (@available(macOS 15.0, *)) {
+        if (_residencySet && g_queue &&
+            [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
+            [g_queue removeResidencySet:_residencySet];
+        }
+        if (_residencySet) [_residencySet endResidency];
+    }
+}
+@end
+
+void *ds4_gpu_laguna_spec_table_build(
+        ds4_gpu_tensor **key_caches,
+        ds4_gpu_tensor **value_caches,
+        ds4_gpu_tensor **key_backups,
+        ds4_gpu_tensor **value_backups,
+        uint32_t         n_layers) {
+    if (!g_initialized && !ds4_gpu_init()) return NULL;
+    if (!key_caches || !value_caches || !key_backups || !value_backups ||
+        n_layers == 0u) {
+        return NULL;
+    }
+    if (@available(macOS 15.0, *)) {
+        uint64_t *addrs = calloc((size_t)n_layers * 4u, sizeof(uint64_t));
+        if (!addrs) return NULL;
+        NSMutableArray *buffers = [NSMutableArray array];
+        bool ok = true;
+        for (uint32_t il = 0; ok && il < n_layers; il++) {
+            ds4_gpu_tensor *slots[4] = {
+                key_caches[il], value_caches[il],
+                key_backups[il], value_backups[il],
+            };
+            for (uint32_t j = 0; ok && j < 4u; j++) {
+                id<MTLBuffer> buf = ds4_gpu_tensor_buffer(slots[j]);
+                if (!buf) { ok = false; break; }
+                addrs[(size_t)il * 4u + j] =
+                    (uint64_t)[buf gpuAddress] +
+                    (uint64_t)ds4_gpu_tensor_offset(slots[j]);
+                [buffers addObject:buf];
+            }
+        }
+        if (!ok) { free(addrs); return NULL; }
+        id<MTLBuffer> address_buffer =
+            [g_device newBufferWithBytes:addrs
+                                  length:(NSUInteger)n_layers * 4u *
+                                         sizeof(uint64_t)
+                                 options:MTLResourceStorageModeShared];
+        free(addrs);
+        if (!address_buffer) return NULL;
+
+        MTLResidencySetDescriptor *desc =
+            [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_laguna_spec_copy";
+        desc.initialCapacity = [buffers count] + 1u;
+        NSError *error = nil;
+        id residency_set =
+            [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!residency_set) return NULL;
+        for (id<MTLBuffer> buf in buffers) {
+            [residency_set addAllocation:buf];
+        }
+        [residency_set addAllocation:address_buffer];
+        [residency_set commit];
+        [residency_set requestResidency];
+        if (g_queue &&
+            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:residency_set];
+        }
+
+        DS4MetalSpecCopyTable *table = [[DS4MetalSpecCopyTable alloc] init];
+        table.addressBuffer = address_buffer;
+        table.residencySet = residency_set;
+        table.layers = n_layers;
+        return (void *)CFBridgingRetain(table);
+    }
+    return NULL;
+}
+
+void ds4_gpu_laguna_spec_table_free(void *table) {
+    if (table) CFBridgingRelease(table);
+}
+
+typedef struct {
+    uint32_t pos0;
+    uint32_t first_row;
+    uint32_t n_rows;
+    uint32_t cache_cap;
+    uint32_t row_elems;
+    uint32_t n_layers;
+    uint32_t to_backup;
+    uint32_t pad0;
+} ds4_gpu_laguna_spec_copy_args;
+
+int ds4_gpu_laguna_spec_copy_all_tensor(
+        void    *table_ptr,
+        uint32_t pos0,
+        uint32_t first_row,
+        uint32_t n_rows,
+        uint32_t cache_cap,
+        uint32_t row_elems,
+        int      to_backup) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    DS4MetalSpecCopyTable *table =
+        (__bridge DS4MetalSpecCopyTable *)table_ptr;
+    if (!table || !table.addressBuffer || first_row >= n_rows ||
+        cache_cap == 0u || (row_elems & 7u) != 0u) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_laguna_spec_ring_copy_all_f16");
+        if (!pipeline) return 0;
+        const ds4_gpu_laguna_spec_copy_args args = {
+            .pos0 = pos0,
+            .first_row = first_row,
+            .n_rows = n_rows,
+            .cache_cap = cache_cap,
+            .row_elems = row_elems,
+            .n_layers = table.layers,
+            .to_backup = to_backup ? 1u : 0u,
+            .pad0 = 0u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:table.addressBuffer offset:0 atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(table.layers,
+                                              n_rows - first_row, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+                cb, owned, "Laguna speculative ring copy");
+    }
+}
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
