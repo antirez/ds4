@@ -8414,6 +8414,62 @@ int ds4_gpu_wait_submitted_commands(void) {
     return ds4_gpu_wait_pending_command_buffers("submitted command batch");
 }
 
+/* One stashed uncommitted batch, so a speculative verifier can be encoded
+ * at two widths while the draft executes: hold the first, encode the
+ * second, then keep whichever width the confidence prune selects. */
+static id<MTLCommandBuffer> g_held_cb;
+static BOOL g_held_has_work;
+static uint64_t g_held_expert_seq;
+
+int ds4_gpu_hold_commands(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb || g_held_cb) return 0;
+    ds4_gpu_close_batch_encoder();
+    g_held_cb = g_batch_cb;
+    g_held_has_work = g_batch_has_work;
+    g_held_expert_seq = g_stream_expert_cache_batch_seq;
+    g_stream_expert_cache_batch_seq = 0;
+    g_batch_cb = ds4_gpu_new_command_buffer();
+    g_batch_has_work = NO;
+    if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+    return g_batch_cb != nil;
+}
+
+int ds4_gpu_unhold_commands(void) {
+    if (!g_held_cb || g_batch_cb) return 0;
+    g_batch_cb = g_held_cb;
+    g_batch_has_work = g_held_has_work;
+    g_stream_expert_cache_batch_seq = g_held_expert_seq;
+    g_held_cb = nil;
+    g_held_has_work = NO;
+    g_held_expert_seq = 0;
+    return 1;
+}
+
+int ds4_gpu_drop_held_commands(void) {
+    if (!g_held_cb) return 1;
+    g_held_cb = nil;
+    g_held_has_work = NO;
+    if (g_held_expert_seq > g_stream_expert_cache_done_seq) {
+        g_stream_expert_cache_done_seq = g_held_expert_seq;
+    }
+    g_held_expert_seq = 0;
+    return 1;
+}
+
+int ds4_gpu_discard_open_commands(void) {
+    if (!g_batch_cb) return 0;
+    ds4_gpu_close_batch_encoder();
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    const uint64_t discarded_seq = g_stream_expert_cache_batch_seq;
+    g_stream_expert_cache_batch_seq = 0;
+    if (discarded_seq > g_stream_expert_cache_done_seq) {
+        g_stream_expert_cache_done_seq = discarded_seq;
+    }
+    return 1;
+}
+
 int ds4_gpu_discard_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_batch_cb) return 0;

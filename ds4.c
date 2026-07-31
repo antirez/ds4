@@ -68968,16 +68968,19 @@ static int ds4_session_eval_dflash_speculative_argmax(
     const double busy_submit = laguna_stage_busy_ms();
     bool target_preencoded = false;
 #ifdef __APPLE__
+    uint32_t preenc_open_rows = 0;
+    bool preenc_full_held = false;
     if (draft_p_min > 0.0f && ds4_gpu_flush_commands() != 0) {
         /*
-         * Confidence keeps the full draft on most cycles. Encode that common
-         * verifier while the draft is executing, then either commit it after
-         * reading confidence or discard it and encode the shorter verifier.
+         * Encode the two most likely post-prune verifier widths while the
+         * draft is executing: the full block, then one row narrower.  The
+         * confidence read keeps whichever matches and drops the other, so
+         * the serial re-encode only remains for the rarer widths.
          */
         verify_tokens[0] = first_token;
         ds4_laguna_feature_capture speculative_capture =
             ds4_session_dflash_capture(s, 0, n_rows);
-        target_preencoded = laguna_graph_forward_batch(
+        const bool full_encoded = laguna_graph_forward_batch(
             &s->laguna_graph,
             &e->model,
             &e->weights,
@@ -68991,8 +68994,37 @@ static int ds4_session_eval_dflash_speculative_argmax(
             NULL,
             NULL,
             0);
-        if (!target_preencoded && ds4_gpu_commands_active()) {
-            (void)ds4_gpu_discard_commands();
+        if (full_encoded && n_rows >= 3u && ds4_gpu_hold_commands() != 0) {
+            preenc_full_held = true;
+            const uint32_t short_rows = n_rows - 1u;
+            ds4_laguna_feature_capture short_capture =
+                ds4_session_dflash_capture(s, 0, short_rows);
+            target_preencoded = laguna_graph_forward_batch(
+                &s->laguna_graph,
+                &e->model,
+                &e->weights,
+                verify_tokens,
+                s->dflash_graph.argmax,
+                short_rows,
+                pos0,
+                NULL,
+                target_top,
+                &short_capture,
+                NULL,
+                NULL,
+                0);
+            if (target_preencoded) {
+                preenc_open_rows = short_rows;
+            } else if (ds4_gpu_commands_active()) {
+                (void)ds4_gpu_discard_open_commands();
+            }
+        } else {
+            target_preencoded = full_encoded;
+            if (target_preencoded) {
+                preenc_open_rows = n_rows;
+            } else if (ds4_gpu_commands_active()) {
+                (void)ds4_gpu_discard_open_commands();
+            }
         }
     }
 #endif
@@ -69062,12 +69094,43 @@ static int ds4_session_eval_dflash_speculative_argmax(
                 break;
             }
         }
+#ifdef __APPLE__
+        if (preenc_full_held) {
+            if (n_rows == generated_draft + 1u) {
+                if (ds4_gpu_commands_active() &&
+                    ds4_gpu_discard_open_commands() == 0) {
+                    draft_read_ok = false;
+                }
+                if (draft_read_ok && ds4_gpu_unhold_commands() != 0) {
+                    target_preencoded = true;
+                    preenc_open_rows = n_rows;
+                } else {
+                    target_preencoded = false;
+                    preenc_open_rows = 0;
+                }
+            } else {
+                (void)ds4_gpu_drop_held_commands();
+            }
+            preenc_full_held = false;
+        }
+        if (target_preencoded && preenc_open_rows != n_rows) {
+            if (ds4_gpu_commands_active() &&
+                ds4_gpu_discard_open_commands() == 0) {
+                draft_read_ok = false;
+            }
+            target_preencoded = false;
+        }
+#else
         if (target_preencoded && n_draft != generated_draft) {
             draft_read_ok = ds4_gpu_discard_commands() != 0;
             target_preencoded = false;
         }
+#endif
         if (!draft_read_ok ||
             (!target_preencoded && ds4_gpu_begin_commands() == 0)) {
+#ifdef __APPLE__
+            (void)ds4_gpu_drop_held_commands();
+#endif
             if (ds4_gpu_commands_active()) {
                 (void)ds4_gpu_discard_commands();
             }

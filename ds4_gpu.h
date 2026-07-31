@@ -81,6 +81,12 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_submit_commands(void);
 int ds4_gpu_wait_submitted_commands(void);
 int ds4_gpu_discard_commands(void);
+/* Metal only: stash the open uncommitted batch so an alternative can be
+ * encoded, then restore or drop it (dual-width verifier pre-encode). */
+int ds4_gpu_hold_commands(void);
+int ds4_gpu_unhold_commands(void);
+int ds4_gpu_drop_held_commands(void);
+int ds4_gpu_discard_open_commands(void);
 int ds4_gpu_commands_active(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
