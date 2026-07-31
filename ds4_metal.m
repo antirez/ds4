@@ -32269,8 +32269,16 @@ int ds4_gpu_laguna_attention_prefill_tensor(
                 id<MTLComputePipelineState> rows_store_pipeline =
                     ds4_gpu_get_pipeline(
                         "kernel_laguna_store_kv_rows_f16");
+                /* Three query heads of one KV head share every K/V read when
+                 * the head grouping allows it (72/8 sliding geometry). */
+                const bool rows_gqa3 =
+                    (n_head % 3u) == 0u &&
+                    n_head_kv != 0u &&
+                    ((n_head / n_head_kv) % 3u) == 0u &&
+                    getenv("DS4_METAL_DISABLE_ROWS_GQA3") == NULL;
                 id<MTLComputePipelineState> rows_attention_pipeline =
-                    ds4_gpu_get_pipeline(
+                    ds4_gpu_get_pipeline(rows_gqa3 ?
+                        "kernel_laguna_attention_decode_rows_gqa3_f16" :
                         "kernel_laguna_attention_decode_rows_gqa_f16");
                 if (!rows_store_pipeline || !rows_attention_pipeline) {
                     return 0;
@@ -32327,16 +32335,26 @@ int ds4_gpu_laguna_attention_prefill_tensor(
                 [enc setBuffer:headsbuf
                         offset:ds4_gpu_tensor_offset(heads)
                        atIndex:5];
-                [enc setThreadgroupMemoryLength:
-                        (8u + 8u + 8u * 128u) * sizeof(float)
-                                        atIndex:0];
-                const uint32_t last_key_count = pos0 + n_tokens;
-                const NSUInteger threads =
-                    last_key_count > 256u ? 256u : 32u;
-                [enc dispatchThreadgroups:
-                        MTLSizeMake(n_head, n_tokens, 1)
-                     threadsPerThreadgroup:
-                        MTLSizeMake(threads, 1, 1)];
+                if (rows_gqa3) {
+                    [enc setThreadgroupMemoryLength:
+                            3u * (8u + 8u + 8u * 128u) * sizeof(float)
+                                            atIndex:0];
+                    [enc dispatchThreadgroups:
+                            MTLSizeMake(n_head / 3u, n_tokens, 1)
+                         threadsPerThreadgroup:
+                            MTLSizeMake(256, 1, 1)];
+                } else {
+                    [enc setThreadgroupMemoryLength:
+                            (8u + 8u + 8u * 128u) * sizeof(float)
+                                            atIndex:0];
+                    const uint32_t last_key_count = pos0 + n_tokens;
+                    const NSUInteger threads =
+                        last_key_count > 256u ? 256u : 32u;
+                    [enc dispatchThreadgroups:
+                            MTLSizeMake(n_head, n_tokens, 1)
+                         threadsPerThreadgroup:
+                            MTLSizeMake(threads, 1, 1)];
+                }
                 ds4_gpu_end_compute_encoder(cb, enc);
 
                 if (!ds4_gpu_finish_command_buffer(
