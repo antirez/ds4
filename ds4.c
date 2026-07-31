@@ -68906,6 +68906,55 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 }
 
 #ifndef DS4_NO_GPU
+/* Training-data harvest sink (diagnostic): one record per verified
+ * position — captured aux features (f16), token, absolute position. */
+static void ds4_session_dflash_dump_rows(
+        ds4_session *s,
+        uint32_t     pos0,
+        const int   *tokens,
+        int          n_rows) {
+    static FILE *dump_fp;
+    static int dump_state;
+    if (dump_state == 0) {
+        const char *dump_path = getenv("DS4_DFLASH_DUMP");
+        if (dump_path != NULL && dump_path[0] != '\0') {
+            dump_fp = fopen(dump_path, "ab");
+            if (dump_fp != NULL && ftell(dump_fp) == 0) {
+                const uint32_t header[4] = {
+                    0x44344446u, /* "D4DF" */
+                    1u, DS4_DFLASH_N_AUX, DS4_N_EMBD,
+                };
+                fwrite(header, sizeof(header), 1, dump_fp);
+            }
+        }
+        dump_state = dump_fp != NULL ? 1 : -1;
+    }
+    if (dump_state != 1) return;
+    const uint32_t feat_elems = DS4_DFLASH_N_AUX * DS4_N_EMBD;
+    float *feat = malloc((size_t)feat_elems * sizeof(float));
+    uint16_t *half = malloc((size_t)feat_elems * sizeof(uint16_t));
+    if (!feat || !half) { free(feat); free(half); return; }
+    for (int r = 0; r < n_rows; r++) {
+        if (!ds4_gpu_tensor_read(
+                s->dflash_graph.features,
+                (uint64_t)r * feat_elems * sizeof(float),
+                feat, (uint64_t)feat_elems * sizeof(float))) {
+            break;
+        }
+        for (uint32_t i = 0; i < feat_elems; i++) {
+            _Float16 h = (_Float16)feat[i];
+            memcpy(&half[i], &h, sizeof(uint16_t));
+        }
+        const uint32_t rec_pos = pos0 + (uint32_t)r;
+        const int32_t rec_token = tokens[r];
+        fwrite(&rec_pos, sizeof(rec_pos), 1, dump_fp);
+        fwrite(&rec_token, sizeof(rec_token), 1, dump_fp);
+        fwrite(half, sizeof(uint16_t), feat_elems, dump_fp);
+    }
+    free(feat);
+    free(half);
+}
+
 static int ds4_session_eval_dflash_speculative_argmax(
         ds4_session *s,
         int          first_token,
@@ -68956,6 +69005,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
          * than their first few tokens. Periodically spend one ordinary target
          * token to refresh the break-even estimate under current conditions. */
         const double decode_t0 = now_sec();
+        const uint32_t refresh_pos = (uint32_t)s->checkpoint.len;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         const double current_ms =
             (now_sec() - decode_t0) * 1000.0 + s->last_sample_ms;
@@ -68963,6 +69013,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
             0.5 * s->dflash_baseline_ms + 0.5 * current_ms;
         s->dflash_cycles_since_baseline = 0;
         accepted[0] = first_token;
+        ds4_session_dflash_dump_rows(s, refresh_pos, accepted, 1);
         return 1;
     }
 
@@ -69289,28 +69340,14 @@ static int ds4_session_eval_dflash_speculative_argmax(
      * its host-side scan of the vocabulary. */
     s->dflash_greedy_next = target_top[n_accept - 1];
 
-    /* Training-data harvest (diagnostic): append one record per accepted
-     * position — the captured aux features the draft conditions on, the
-     * verified token, and its absolute position.  The greedy stream itself
-     * provides the prediction labels at training time. */
+    /* Training-data harvest (diagnostic). */
     do {
-        static FILE *dump_fp;
-        static int dump_state;
-        if (dump_state == 0) {
-            const char *dump_path = getenv("DS4_DFLASH_DUMP");
-            if (dump_path != NULL && dump_path[0] != '\0') {
-                dump_fp = fopen(dump_path, "ab");
-                if (dump_fp != NULL && ftell(dump_fp) == 0) {
-                    const uint32_t header[4] = {
-                        0x44344446u, /* "D4DF" */
-                        1u, DS4_DFLASH_N_AUX, DS4_N_EMBD,
-                    };
-                    fwrite(header, sizeof(header), 1, dump_fp);
-                }
-            }
-            dump_state = dump_fp != NULL ? 1 : -1;
+        static int dump_enabled = -1;
+        if (dump_enabled < 0) {
+            const char *dp = getenv("DS4_DFLASH_DUMP");
+            dump_enabled = dp != NULL && dp[0] != '\0' ? 1 : 0;
         }
-        if (dump_state != 1) break;
+        if (!dump_enabled) break;
         /* Sidecar: per-cycle draft proposals and confidences, the golden
          * reference for validating a retrained draft's forward pass. */
         static FILE *cycle_fp;
@@ -69334,30 +69371,7 @@ static int ds4_session_eval_dflash_speculative_argmax(
             fwrite(target_top, sizeof(int32_t), DS4_DFLASH_BLOCK_SIZE,
                    cycle_fp);
         }
-        const uint32_t feat_elems = DS4_DFLASH_N_AUX * DS4_N_EMBD;
-        float *feat = malloc((size_t)feat_elems * sizeof(float));
-        uint16_t *half = malloc((size_t)feat_elems * sizeof(uint16_t));
-        if (!feat || !half) { free(feat); free(half); break; }
-        for (int r = 0; r < n_accept; r++) {
-            if (!ds4_gpu_tensor_read(
-                    s->dflash_graph.features,
-                    (uint64_t)r * feat_elems * sizeof(float),
-                    feat, (uint64_t)feat_elems * sizeof(float))) {
-                break;
-            }
-            for (uint32_t i = 0; i < feat_elems; i++) {
-                /* f32 -> f16 via the compiler's conversion */
-                _Float16 h = (_Float16)feat[i];
-                memcpy(&half[i], &h, sizeof(uint16_t));
-            }
-            const uint32_t rec_pos = pos0 + (uint32_t)r;
-            const int32_t rec_token = accepted[r];
-            fwrite(&rec_pos, sizeof(rec_pos), 1, dump_fp);
-            fwrite(&rec_token, sizeof(rec_token), 1, dump_fp);
-            fwrite(half, sizeof(uint16_t), feat_elems, dump_fp);
-        }
-        free(feat);
-        free(half);
+        ds4_session_dflash_dump_rows(s, pos0, accepted, n_accept);
     } while (0);
 
     const double verify_done = now_sec();
