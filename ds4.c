@@ -69311,6 +69311,29 @@ static int ds4_session_eval_dflash_speculative_argmax(
             dump_state = dump_fp != NULL ? 1 : -1;
         }
         if (dump_state != 1) break;
+        /* Sidecar: per-cycle draft proposals and confidences, the golden
+         * reference for validating a retrained draft's forward pass. */
+        static FILE *cycle_fp;
+        if (cycle_fp == NULL) {
+            const char *dump_path = getenv("DS4_DFLASH_DUMP");
+            char side[1024];
+            snprintf(side, sizeof(side), "%s.cycles", dump_path);
+            cycle_fp = fopen(side, "ab");
+        }
+        if (cycle_fp != NULL) {
+            const uint32_t cpos = pos0;
+            const uint32_t cdraft = generated_draft;
+            const int32_t cfirst = first_token;
+            fwrite(&cpos, sizeof(cpos), 1, cycle_fp);
+            fwrite(&cdraft, sizeof(cdraft), 1, cycle_fp);
+            fwrite(&cfirst, sizeof(cfirst), 1, cycle_fp);
+            fwrite(draft_top, sizeof(int32_t), DS4_DFLASH_BLOCK_SIZE,
+                   cycle_fp);
+            fwrite(draft_top2, sizeof(int32_t), DS4_DFLASH_BLOCK_SIZE,
+                   cycle_fp);
+            fwrite(target_top, sizeof(int32_t), DS4_DFLASH_BLOCK_SIZE,
+                   cycle_fp);
+        }
         const uint32_t feat_elems = DS4_DFLASH_N_AUX * DS4_N_EMBD;
         float *feat = malloc((size_t)feat_elems * sizeof(float));
         uint16_t *half = malloc((size_t)feat_elems * sizeof(uint16_t));
