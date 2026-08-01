@@ -1,6 +1,3 @@
 [submodule "cutlass"]
 	path = cutlass
 	url = https://github.com/NVIDIA/cutlass.git
-[submodule "upstream-ds4"]
-	path = upstream-ds4
-	url = https://github.com/antirez/ds4.git
