@@ -656,6 +656,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = DS4_THINK_MAX;
+        } else if (!strcmp(arg, "--think-ultra")) {
+            c.gen.think_mode = DS4_THINK_ULTRA;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--backend")) {
@@ -4381,9 +4383,11 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
-    } else if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
-               think_mode == DS4_THINK_MAX) {
-        ds4_chat_append_max_effort_prefix(w->engine, out);
+    } else {
+        /* Use the context-adjusted tier: the prompt must carry the
+         * prefix the run will actually use.  Appending is a no-op for
+         * the unprefixed tiers, so no per-tier test is needed. */
+        ds4_chat_append_effort_prefix(w->engine, out, think_mode);
     }
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
 }

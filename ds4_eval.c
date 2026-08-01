@@ -1651,6 +1651,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.think_mode = DS4_THINK_MAX;
+        } else if (!strcmp(arg, "--think-ultra")) {
+            c.think_mode = DS4_THINK_ULTRA;
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--plain")) {
@@ -2456,7 +2458,8 @@ static int eval_auto_context_size(ds4_engine *engine,
     int ctx = EVAL_MAX_CONTEXT;
     int max_prompt = 0;
     int max_case = -1;
-    const int min_ctx = cfg->think_mode == DS4_THINK_MAX ?
+    const int min_ctx = (cfg->think_mode == DS4_THINK_MAX ||
+                         cfg->think_mode == DS4_THINK_ULTRA) ?
                         (int)ds4_think_max_min_context() : 1;
 
     /* Think Max downgrades to normal thinking under its minimum context.  Size
@@ -2482,14 +2485,15 @@ static int eval_auto_context_size(ds4_engine *engine,
 }
 
 static void eval_warn_think_max_downgraded(const eval_config *cfg) {
-    if (cfg->think_mode != DS4_THINK_MAX ||
-        ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == DS4_THINK_MAX) {
-        return;
-    }
+    const ds4_think_mode effective =
+        ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
+    if (effective == cfg->think_mode) return;
     fprintf(stderr,
-            "ds4-eval: warning: --think-max needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+            "ds4-eval: warning: --think-%s needs --ctx >= %u; ctx=%d uses %s instead\n",
+            cfg->think_mode == DS4_THINK_ULTRA ? "ultra" : "max",
             ds4_think_max_min_context(),
-            cfg->ctx_size);
+            cfg->ctx_size,
+            ds4_think_mode_name(effective));
 }
 
 static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens, int max_prompt_case) {

@@ -206,6 +206,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
+    opt(fp, c, "--think-ultra", "Use Think Ultra, DeepSeek 0731 'max' effort, when context allows.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
@@ -290,7 +291,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think, /think-max, /think-ultra, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
