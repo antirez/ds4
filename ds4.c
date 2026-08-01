@@ -409,6 +409,12 @@ static const char DS4_REASONING_EFFORT_ULTRA_PREFIX[] =
  * to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
+/* Runtime-settable so an operator can lower or raise the floor without a
+ * rebuild.  The default is DeepSeek's recommendation and is what every tool
+ * uses unless --think-effort-min-ctx says otherwise.  Set once during argument
+ * parsing, before any request is served. */
+static uint32_t g_think_effort_min_context = DS4_THINK_MAX_MIN_CONTEXT;
+
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
@@ -48065,7 +48071,11 @@ const char *ds4_think_max_prefix(void) {
 }
 
 uint32_t ds4_think_max_min_context(void) {
-    return DS4_THINK_MAX_MIN_CONTEXT;
+    return g_think_effort_min_context;
+}
+
+void ds4_think_set_effort_min_context(uint32_t min_context) {
+    g_think_effort_min_context = min_context;
 }
 
 /* Step the tier down ONE level when the context is too small, so ULTRA in a
@@ -48073,7 +48083,7 @@ uint32_t ds4_think_max_min_context(void) {
  * unprefixed tier. */
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
     const uint32_t ctx = (uint32_t)(ctx_size > 0 ? ctx_size : 0);
-    if (ctx >= DS4_THINK_MAX_MIN_CONTEXT) return mode;
+    if (ctx >= g_think_effort_min_context) return mode;
     if (mode == DS4_THINK_ULTRA) return DS4_THINK_MAX;
     if (mode == DS4_THINK_MAX) return DS4_THINK_HIGH;
     return mode;

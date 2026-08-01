@@ -12901,6 +12901,14 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--think-effort-min-ctx")) {
+            const int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --think-effort-min-ctx must be >= 0");
+                exit(2);
+            }
+            ds4_think_set_effort_min_context((uint32_t)v);
         } else if (!strcmp(arg, "--reasoning-effort-map")) {
             const char *name = need_arg(&i, argc, argv, arg);
             if (!parse_reasoning_effort_map_name(name, &g_reasoning_effort_map)) {

@@ -208,6 +208,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
     opt(fp, c, "--think-ultra", "Use Think Ultra, DeepSeek 0731 'max' effort, when context allows.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    opt(fp, c, "--think-effort-min-ctx N", "Context floor for the prefixed think tiers. Default: 393216");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");

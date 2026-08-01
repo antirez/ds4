@@ -1653,6 +1653,13 @@ static eval_config parse_options(int argc, char **argv) {
             c.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--think-ultra")) {
             c.think_mode = DS4_THINK_ULTRA;
+        } else if (!strcmp(arg, "--think-effort-min-ctx")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0) {
+                fprintf(stderr, "ds4-eval: --think-effort-min-ctx must be >= 0\n");
+                exit(2);
+            }
+            ds4_think_set_effort_min_context((uint32_t)v);
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--plain")) {
