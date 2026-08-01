@@ -952,7 +952,8 @@ ds4>
 
 The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
-conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
+conversation. Useful commands are `/help`, `/think`, `/think-max`,
+`/think-ultra`, `/nothink`,
 `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
 and returns to `ds4>`.
 
@@ -1273,11 +1274,39 @@ the saved prefix instead of processing the whole prompt again.
 
 ## Thinking Modes
 
-DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+DeepSeek V4 Flash has a non-thinking mode plus three reasoning-effort tiers,
+rendered as a plain-text prefix at the very start of the conversation. The
+0731 release added the top one; the tier names in the ds4 source are historical
+and do not line up 1:1 with DeepSeek's own names:
+
+| ds4 tier | DeepSeek name | prompt prefix |
+|---|---|---|
+| `DS4_THINK_NONE` | - | non-thinking, no prefix |
+| `DS4_THINK_HIGH` | `low` | none (this is DeepSeek's default) |
+| `DS4_THINK_MAX` | `high` | "Reasoning Effort: Absolute maximum ..." |
+| `DS4_THINK_ULTRA` | `max` | "Reasoning Effort: Beyond maximum ..." |
+
+The server defaults to the unprefixed thinking tier, matching DeepSeek's own
+`low` default. Wire `reasoning_effort` names map on as follows:
+
+| `reasoning_effort` | `deepseek` map (default) | `legacy` map |
+|---|---|---|
+| `minimal`, `low`, `medium` | high | high |
+| `high`, `xhigh` | max | high |
+| `max` | ultra | max |
+| `none` | none | none |
+
+`--reasoning-effort-map legacy` restores the pre-0731 ds4 mapping exactly, for
+prompts that were tuned against it. Unknown names are rejected with HTTP 400 in
+both maps.
+
+The prefixed tiers are only applied when the context is at least
+`--think-effort-min-ctx` (default 393216, the model card recommendation);
+below that the tier steps down one level (ultra to max, max to high), so a
+small context loses one notch of effort rather than all of it.
+
+On the command line the tiers are `--think`, `--think-max` and `--think-ultra`
+(`/think`, `/think-max`, `/think-ultra` in the REPL).
 
 For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
 non-thinking model alias such as `deepseek-chat`.

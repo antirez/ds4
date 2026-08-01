@@ -342,9 +342,11 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
-    para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
-    para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
+    para(fp, c, "Chat requests default to thinking with no effort prefix, matching DeepSeek's own 'low' default.");
+    opt(fp, c, "--reasoning-effort-map MAP", "How wire effort names map to tiers: deepseek (default) or legacy.");
+    para(fp, c, "deepseek: minimal/low/medium -> high, high/xhigh -> max, max -> ultra.");
+    para(fp, c, "legacy: the pre-0731 ds4 table, where only max reached a prefixed tier.");
+    para(fp, c, "The prefixed tiers require --ctx >= --think-effort-min-ctx (default 393216); below it each steps down one tier.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
     fputc('\n', fp);
