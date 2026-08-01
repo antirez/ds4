@@ -19550,6 +19550,9 @@ static bool metal_graph_capture_prefix_attn_state(
         uint32_t       il,
         uint32_t       slot) {
     if (!g->spec_capture_prefixes) return true;
+    /* Leading layers without an attention compressor (ratio 0) carry no
+     * frontier; mirror spec_frontier_snapshot/commit which skip them. */
+    if (ds4_layer_compress_ratio(il) == 0) return true;
     if (slot >= DS4_SPEC_PREFIX_SLOTS ||
         !g->spec_prefix1_attn_state_kv[il] ||
         !g->spec_prefix1_attn_state_score[il]) {
@@ -19569,6 +19572,9 @@ static bool metal_graph_capture_prefix_index_state(
         uint32_t       il,
         uint32_t       slot) {
     if (!g->spec_capture_prefixes) return true;
+    /* Index-compressor frontiers exist only on ratio-4 layers;
+     * mirror spec_frontier_snapshot/commit which skip the rest. */
+    if (ds4_layer_compress_ratio(il) != 4) return true;
     if (slot >= DS4_SPEC_PREFIX_SLOTS ||
         !g->spec_prefix1_index_state_kv[il] ||
         !g->spec_prefix1_index_state_score[il]) {
