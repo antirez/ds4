@@ -305,6 +305,120 @@ static uint32_t cuda_stream_expert_cache_configured_budget(void) {
     return budget;
 }
 
+/* Pooled/slab allocator for the expert LRU's device buffers.
+ *
+ * cuda_stream_expert_cache_install()/_clear_entry() below used to call
+ * cudaMalloc/cudaFree directly on every miss/eviction -- fine at a budget
+ * generous enough to reach a steady hit rate, but at a too-small budget
+ * (well under the per-token expert working-set size) the cache thrashes:
+ * install, evict, install, evict, every call, with zero hit-rate benefit
+ * to offset the cudaMalloc/cudaFree round-trip cost each time -- a
+ * measured throughput regression versus running with no cache at all.
+ *
+ * Fix: a small pool of free device buffers keyed by exact byte size.
+ * There are only a handful of distinct sizes in play (gate/up share one
+ * size per layer's slab class -- IQ2_XXS-uniform, Q4_K-uniform, or
+ * whatever other single quant size class a given loaded model uses --
+ * and down has its own per-class size), so a short linear-scan array of
+ * size classes (bounded, generous headroom
+ * over the real handful) is simpler and just as fast as a hash table at
+ * this scale. On a miss/eviction, a freed buffer of the right size is
+ * pushed onto its class's free list instead of being cudaFree'd; on the
+ * next install needing that same size, it's popped back off instead of
+ * cudaMalloc'd. Actual cudaMalloc only happens the first time a size
+ * class needs more buffers than have ever been freed back to it -- i.e.
+ * exactly the steady-state entry count the cache converges to, not once
+ * per eviction. Mirrors Metal's own slab pool design (a fixed-size-class
+ * MTLBuffer pool) at the level that matters here (amortizing allocator
+ * churn), without requiring CUDA to adopt Metal's single-size-class
+ * *cache* design -- this pool serves multiple size classes side by side,
+ * matching the existing per-entry (non-uniform-size) CUDA cache shape.
+ *
+ * The pool only ever *returns* memory to the driver via
+ * cuda_stream_expert_pool_release_all(), called alongside every existing
+ * cuda_stream_expert_cache_clear_all() call site (model swap, streaming
+ * mode toggle, budget change) -- all rare, whole-cache-reset events, never
+ * per-token/per-eviction -- so real teardown still frees everything back
+ * to the driver; only the hot miss/eviction path is changed. */
+enum { CUDA_STREAM_EXPERT_POOL_MAX_CLASSES = 16 };
+
+typedef struct {
+    uint64_t bytes;
+    char   **free_list;
+    uint32_t free_count;
+    uint32_t free_cap;
+} cuda_stream_expert_pool_class;
+
+static cuda_stream_expert_pool_class
+    g_cuda_expert_pool_classes[CUDA_STREAM_EXPERT_POOL_MAX_CLASSES];
+static uint32_t g_cuda_expert_pool_class_count;
+
+static cuda_stream_expert_pool_class *cuda_stream_expert_pool_class_for(uint64_t bytes) {
+    for (uint32_t i = 0; i < g_cuda_expert_pool_class_count; i++) {
+        if (g_cuda_expert_pool_classes[i].bytes == bytes) {
+            return &g_cuda_expert_pool_classes[i];
+        }
+    }
+    if (g_cuda_expert_pool_class_count >= CUDA_STREAM_EXPERT_POOL_MAX_CLASSES) {
+        return NULL;  /* more distinct sizes than expected: caller falls back to raw cudaMalloc/Free */
+    }
+    cuda_stream_expert_pool_class *c =
+        &g_cuda_expert_pool_classes[g_cuda_expert_pool_class_count++];
+    c->bytes = bytes;
+    c->free_list = NULL;
+    c->free_count = 0;
+    c->free_cap = 0;
+    return c;
+}
+
+static char *cuda_stream_expert_pool_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    cuda_stream_expert_pool_class *c = cuda_stream_expert_pool_class_for(bytes);
+    if (c && c->free_count > 0) {
+        return c->free_list[--c->free_count];
+    }
+    char *ptr = NULL;
+    if (cudaMalloc((void **)&ptr, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return ptr;
+}
+
+static void cuda_stream_expert_pool_free(uint64_t bytes, char *ptr) {
+    if (!ptr) return;
+    cuda_stream_expert_pool_class *c = cuda_stream_expert_pool_class_for(bytes);
+    if (!c) {
+        (void)cudaFree(ptr);
+        return;
+    }
+    if (c->free_count == c->free_cap) {
+        const uint32_t new_cap = c->free_cap ? c->free_cap * 2u : 16u;
+        char **grown = (char **)realloc(c->free_list, (size_t)new_cap * sizeof(char *));
+        if (!grown) {
+            (void)cudaFree(ptr);
+            return;
+        }
+        c->free_list = grown;
+        c->free_cap = new_cap;
+    }
+    c->free_list[c->free_count++] = ptr;
+}
+
+static void cuda_stream_expert_pool_release_all(void) {
+    for (uint32_t i = 0; i < g_cuda_expert_pool_class_count; i++) {
+        cuda_stream_expert_pool_class *c = &g_cuda_expert_pool_classes[i];
+        for (uint32_t j = 0; j < c->free_count; j++) {
+            if (c->free_list[j]) (void)cudaFree(c->free_list[j]);
+        }
+        free(c->free_list);
+        c->free_list = NULL;
+        c->free_count = 0;
+        c->free_cap = 0;
+    }
+    g_cuda_expert_pool_class_count = 0;
+}
+
 static void cuda_stream_expert_cache_clear_entry(uint32_t layer, uint32_t expert) {
     if (layer >= CUDA_STREAM_EXPERT_CACHE_MAX_LAYER ||
         expert >= CUDA_STREAM_EXPERT_CACHE_MAX_EXPERT) {
@@ -312,9 +426,9 @@ static void cuda_stream_expert_cache_clear_entry(uint32_t layer, uint32_t expert
     }
     cuda_stream_expert_cache_entry *e = &g_cuda_expert_cache[layer][expert];
     if (!e->valid) return;
-    if (e->gate_ptr) (void)cudaFree(e->gate_ptr);
-    if (e->up_ptr) (void)cudaFree(e->up_ptr);
-    if (e->down_ptr) (void)cudaFree(e->down_ptr);
+    if (e->gate_ptr) cuda_stream_expert_pool_free(e->gate_expert_bytes, e->gate_ptr);
+    if (e->up_ptr) cuda_stream_expert_pool_free(e->gate_expert_bytes, e->up_ptr);
+    if (e->down_ptr) cuda_stream_expert_pool_free(e->down_expert_bytes, e->down_ptr);
     memset(e, 0, sizeof(*e));
     if (g_cuda_expert_cache_entry_count > 0) g_cuda_expert_cache_entry_count--;
 }
@@ -326,6 +440,13 @@ static void cuda_stream_expert_cache_clear_all(void) {
         }
     }
     g_cuda_expert_cache_entry_count = 0;
+    /* Every clear_entry() above returned its buffers to the pool rather
+     * than freeing them -- this whole-cache reset is a rare event
+     * (model swap, streaming mode toggle, budget change), never a
+     * per-token/per-eviction one, so it's the right place to actually give
+     * the memory back to the driver instead of leaving it parked in the
+     * pool indefinitely. */
+    cuda_stream_expert_pool_release_all();
 }
 
 static void cuda_stream_expert_cache_prune_global(void) {
@@ -440,12 +561,14 @@ static int cuda_stream_expert_cache_install(
     cuda_stream_expert_cache_entry *e = &g_cuda_expert_cache[layer][expert];
     if (e->valid) cuda_stream_expert_cache_clear_entry(layer, expert);
 
-    char *gate_ptr = NULL;
-    char *up_ptr = NULL;
-    char *down_ptr = NULL;
-    int ok = cudaMalloc((void **)&gate_ptr, (size_t)gate_expert_bytes) == cudaSuccess &&
-             cudaMalloc((void **)&up_ptr, (size_t)gate_expert_bytes) == cudaSuccess &&
-             cudaMalloc((void **)&down_ptr, (size_t)down_expert_bytes) == cudaSuccess;
+    /* Pull from the size-keyed pool instead of a raw cudaMalloc per
+     * install -- see the pool's own block comment above
+     * cuda_stream_expert_pool_class_for() for why this is the fix for the
+     * too-small-budget thrash regression. */
+    char *gate_ptr = cuda_stream_expert_pool_alloc(gate_expert_bytes);
+    char *up_ptr = cuda_stream_expert_pool_alloc(gate_expert_bytes);
+    char *down_ptr = cuda_stream_expert_pool_alloc(down_expert_bytes);
+    int ok = gate_ptr != NULL && up_ptr != NULL && down_ptr != NULL;
     if (ok) {
         ok = cuda_ok(cudaMemcpy(gate_ptr, gate_src, (size_t)gate_expert_bytes,
                                 cudaMemcpyDeviceToDevice),
@@ -458,9 +581,9 @@ static int cuda_stream_expert_cache_install(
                      "expert cache install down");
     }
     if (!ok) {
-        if (gate_ptr) (void)cudaFree(gate_ptr);
-        if (up_ptr) (void)cudaFree(up_ptr);
-        if (down_ptr) (void)cudaFree(down_ptr);
+        if (gate_ptr) cuda_stream_expert_pool_free(gate_expert_bytes, gate_ptr);
+        if (up_ptr) cuda_stream_expert_pool_free(gate_expert_bytes, up_ptr);
+        if (down_ptr) cuda_stream_expert_pool_free(down_expert_bytes, down_ptr);
         (void)cudaGetLastError();
         return 0;
     }
