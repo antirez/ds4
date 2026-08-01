@@ -209,6 +209,14 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         uint32_t                           n_experts);
 void ds4_gpu_print_memory_report(const char *label);
 
+/* DS4_CUDA_STREAM_STATS=1 diagnostic: per-generation totals for the CUDA SSD
+ * streaming selected-expert fetch path (expert fetches, cache hits/misses,
+ * bytes read from the mapped model file vs served from a persistent cache).
+ * Self-gated on the env var; a no-op call otherwise. CUDA-only counters
+ * (mirrors the intent of Metal's --expert-profile / g_stream_expert_cache_hits,
+ * which already has real per-expert-id LRU hit/miss tracking of its own). */
+void ds4_gpu_print_cuda_stream_stats(void);
+
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
  * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial
  * block output in the TP slab: it closes the current encoder, makes the GPU

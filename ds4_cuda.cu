@@ -149,6 +149,55 @@ typedef struct {
 
 static cuda_stream_selected_cache g_stream_selected_cache;
 
+/*
+ * DS4_CUDA_STREAM_STATS=1 diagnostic counters. Closes the CUDA-side
+ * instrumentation gap versus Metal's --expert-profile / g_stream_expert_cache_hits
+ * family: CUDA's SSD-streaming selected-expert path
+ * (cuda_stream_selected_cache_begin_load, below) has never had per-generation
+ * fetch/hit/miss/byte counters. These are cheap host-side atomics incremented
+ * at the exact fetch decision points traced for the P3a expert-cache-sweep
+ * diagnosis: every call unconditionally invalidates any prior staged content
+ * (see cuda_stream_selected_cache_invalidate() immediately below) and then
+ * copies every selected expert's gate/up/down bytes fresh from the mapped
+ * model file view via cuda_model_copy_to_device_streamed() -- there is no
+ * lookup against a persistent, expert-id-keyed cache anywhere in this path
+ * (unlike ds4_metal.m's g_stream_expert_cache, a real per-(layer,expert) LRU).
+ * So "hits"/"bytes_from_cache" are wired here for symmetry with the Metal
+ * counters and to make that absence an empirically-reportable zero rather
+ * than an assertion -- not because a hit path exists today.
+ */
+static uint64_t g_cuda_stream_stats_fetch_calls;     /* begin_load invocations */
+static uint64_t g_cuda_stream_stats_expert_fetches;  /* distinct (layer,expert) loads */
+static uint64_t g_cuda_stream_stats_cache_hits;       /* always 0 today; see above */
+static uint64_t g_cuda_stream_stats_cache_misses;     /* == expert_fetches today */
+static uint64_t g_cuda_stream_stats_bytes_from_file;  /* bytes pread via mapped view */
+static uint64_t g_cuda_stream_stats_bytes_from_cache; /* always 0 today; see above */
+
+extern "C" void ds4_gpu_print_cuda_stream_stats(void) {
+    if (getenv("DS4_CUDA_STREAM_STATS") == NULL) return;
+    const uint64_t lookups =
+        g_cuda_stream_stats_cache_hits + g_cuda_stream_stats_cache_misses;
+    const double hit_rate = lookups ?
+        (double)g_cuda_stream_stats_cache_hits / (double)lookups : 0.0;
+    const uint64_t total_bytes =
+        g_cuda_stream_stats_bytes_from_file + g_cuda_stream_stats_bytes_from_cache;
+    const double bytes_per_fetch = g_cuda_stream_stats_expert_fetches ?
+        (double)total_bytes / (double)g_cuda_stream_stats_expert_fetches : 0.0;
+    fprintf(stderr,
+            "ds4: CUDA streaming expert-cache stats: fetch_calls=%llu "
+            "expert_fetches=%llu hits=%llu misses=%llu hit_rate=%.3f "
+            "bytes_from_file=%.3f GiB bytes_from_cache=%.3f GiB "
+            "bytes_per_fetch=%.1f KiB\n",
+            (unsigned long long)g_cuda_stream_stats_fetch_calls,
+            (unsigned long long)g_cuda_stream_stats_expert_fetches,
+            (unsigned long long)g_cuda_stream_stats_cache_hits,
+            (unsigned long long)g_cuda_stream_stats_cache_misses,
+            hit_rate,
+            (double)g_cuda_stream_stats_bytes_from_file / (1024.0 * 1024.0 * 1024.0),
+            (double)g_cuda_stream_stats_bytes_from_cache / (1024.0 * 1024.0 * 1024.0),
+            bytes_per_fetch / 1024.0);
+}
+
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
@@ -23027,6 +23076,7 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
+    g_cuda_stream_stats_fetch_calls++;
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_src =
@@ -23054,6 +23104,37 @@ static int cuda_stream_selected_cache_begin_load(
                     "stream down expert copy")) {
             cuda_stream_selected_cache_invalidate();
             return 0;
+        }
+        /*
+         * Every reachable branch above returns before this point on any
+         * failure, so a completed iteration is always a real fetch of
+         * gate+up+down bytes straight from the mapped model view -- there is
+         * no lookup against a persistent per-expert cache anywhere in this
+         * function (cuda_stream_selected_cache_invalidate() at function
+         * entry unconditionally discards whatever the device buffers held
+         * from the previous call), so every completed iteration is counted
+         * as one expert fetch and one cache miss; hits/bytes_from_cache stay
+         * at zero because no code path here ever serves bytes without this
+         * copy.
+         */
+        g_cuda_stream_stats_expert_fetches++;
+        g_cuda_stream_stats_cache_misses++;
+        g_cuda_stream_stats_bytes_from_file +=
+            table->gate_expert_bytes * 2ull + table->down_expert_bytes;
+        {
+            const char *dbg = getenv("DS4_DEBUG_STREAM_CACHE_LAYER");
+            if (dbg && dbg[0] && (uint32_t)atoi(dbg) == table->layer && i == 0) {
+                unsigned char hostbuf[32];
+                (void)cudaMemcpy(hostbuf, g_stream_selected_cache.gate_ptr + gate_dst,
+                                  sizeof(hostbuf), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "ds4: [dbgcache] gate cache_slot=0 global_expert=%llu "
+                                "gate_src_off=%llu first32bytes=",
+                        (unsigned long long)expert, (unsigned long long)gate_src);
+                for (size_t bi = 0; bi < sizeof(hostbuf); bi++) {
+                    fprintf(stderr, "%02x", hostbuf[bi]);
+                }
+                fprintf(stderr, "\n");
+            }
         }
     }
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,

@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
@@ -663,6 +664,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    ds4_gpu_print_cuda_stream_stats();
 
     ds4_session_free(session);
     return 0;

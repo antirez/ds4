@@ -15062,6 +15062,14 @@ static bool ds4_gpu_q4_selected_paths_allowed(void) {
     return ds4_gpu_q4_non_streaming_opt_in_enabled();
 }
 
+/* CUDA-only diagnostic (see ds4_gpu.h); Metal already has its own real
+ * per-(layer,expert) LRU hit/miss instrumentation (g_stream_expert_cache_hits
+ * and friends, printed from ds4_gpu_print_memory_report /
+ * DS4_METAL_STREAMING_EXPERT_LAYER_STATS above), so this is a no-op stub for
+ * build symmetry only. */
+void ds4_gpu_print_cuda_stream_stats(void) {
+}
+
 int ds4_gpu_pro_q4_expert_table_auto_available(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     return (g_ssd_streaming_mode ||
