@@ -1303,6 +1303,45 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                 (uint32_t)low_dim);
         return cuda_ok(cudaGetLastError(), "attention_output_low_q8 splitk sum launch");
     }
+    /* Restore the prequantized integer decode path for the attention
+     * output projection (grouped_q8_0_a_preq_warp8_kernel). ef8d923
+     * dropped it together with the matmul_q8_0 preq decode kernels,
+     * leaving the fp32 paths below as the only option.
+     * Quality mode keeps the fp32 path to preserve numeric precision. */
+    if (!g_quality_mode) {
+        const uint64_t x_rows = (uint64_t)n_groups;
+        const uint64_t xq_bytes = x_rows * blocks_a * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output low q8 prequant");
+        if (tmp) {
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const int use_dp4a = 1;
+            dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
+            quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                    xq, xscale, (const float *)heads->ptr, group_dim, blocks_a);
+            if (cuda_ok(cudaGetLastError(),
+                        "attention_output_low_q8 prequant launch")) {
+                const uint32_t rows_per_block = g_quality_mode ? 8u : 32u;
+                dim3 grid_a(((unsigned)low_dim + rows_per_block - 1u) / rows_per_block,
+                            1, 1);
+                grouped_q8_0_a_preq_warp8_kernel<<<grid_a, rows_per_block * 32u>>>(
+                        (float *)low->ptr,
+                        out_a,
+                        xq,
+                        xscale,
+                        group_dim,
+                        rank,
+                        n_groups,
+                        1,
+                        blocks_a,
+                        use_dp4a);
+                if (cuda_ok(cudaGetLastError(),
+                            "attention_output_low_q8 launch")) return 1;
+            }
+        }
+    }
     if ((group_dim & 31u) == 0u && group_dim <= 4096u && (rank % 64u) == 0u) {
         const unsigned rows_per_block = 64u;
         grouped_q8_0_a_f32_sharedx_rows_w32_2row_kernel<<<

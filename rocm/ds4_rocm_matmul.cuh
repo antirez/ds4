@@ -330,6 +330,43 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
     if (n_tok == 1) {
+        /* Prefer the prequantized integer decode path: quantize x to Q8
+         * once, then run Q8xQ8 dot products (dp4a). The fp32 shared-input
+         * path below is kept as a fallback for shapes the integer path
+         * does not cover. ef8d923 (ROCm GLM 5.2 support) dropped this
+         * decode-only fast path, halving DeepSeek decode throughput.
+         * Quality mode keeps the fp32 path to preserve numeric precision,
+         * matching the historical q8_prequant_decode semantics. */
+        if (!g_quality_mode) {
+            const uint64_t xq_bytes = blocks * 32u;
+            const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+            const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+            void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 prequant decode");
+            if (tmp) {
+                int8_t *xq = (int8_t *)tmp;
+                float *xscale = (float *)((char *)tmp + scale_offset);
+                dim3 qgrid((unsigned)blocks, 1, 1);
+                quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                        xq, xscale, (const float *)x->ptr, in_dim, blocks);
+                if (cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) {
+                    const uint32_t rows_per_block = g_quality_mode ? 8u : 1u;
+                    matmul_q8_0_preq_rows_w32_kernel<<<
+                            ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                            rows_per_block * 32u>>>(
+                            (float *)out->ptr,
+                            reinterpret_cast<const unsigned char *>(wptr),
+                            xq,
+                            xscale,
+                            in_dim,
+                            out_dim,
+                            blocks,
+                            rows_per_block,
+                            1);
+                    if (cuda_ok(cudaGetLastError(),
+                                "matmul_q8_0 preq rows launch")) return 1;
+                }
+            }
+        }
         const bool extended_sharedx =
             in_dim > 8192u &&
             in_dim <= 16384u &&
@@ -606,6 +643,43 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset, weight0_bytes, "q8_0_pair0");
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
+    /* Restore the prequantized integer decode path for paired Q8
+     * projections (matmul_q8_0_pair_preq_warp8_kernel), dropped by
+     * ef8d923 together with the other Q8 preq decode kernels.
+     * Quality mode keeps the fp32 path to preserve numeric precision. */
+    if (!g_quality_mode) {
+        const uint64_t xq_bytes = blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair prequant");
+        if (tmp) {
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const int use_dp4a = 1;
+            dim3 qgrid((unsigned)blocks, 1, 1);
+            quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                    xq, xscale, (const float *)x->ptr, in_dim, blocks);
+            if (cuda_ok(cudaGetLastError(),
+                        "matmul_q8_0 pair quantize launch")) {
+                const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+                matmul_q8_0_pair_preq_warp8_kernel<<<
+                        ((unsigned)max_out + 7u) / 8u, 256>>>(
+                        (float *)out0->ptr,
+                        (float *)out1->ptr,
+                        reinterpret_cast<const unsigned char *>(w0),
+                        reinterpret_cast<const unsigned char *>(w1),
+                        xq,
+                        xscale,
+                        in_dim,
+                        out0_dim,
+                        out1_dim,
+                        blocks,
+                        use_dp4a);
+                if (cuda_ok(cudaGetLastError(),
+                            "matmul_q8_0 pair preq launch")) return 1;
+            }
+        }
+    }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
         const unsigned rows_per_block = 32u;
@@ -674,6 +748,48 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, label ? label : "q8_0_hc_expand");
     if (!wptr) return 0;
+    /* Restore the prequantized integer decode path for the HC expand
+     * projection (matmul_q8_0_hc_expand_preq_rows_w32_kernel), dropped
+     * by ef8d923 together with the other Q8 preq decode kernels.
+     * Quality mode keeps the fp32 path to preserve numeric precision. */
+    if (!g_quality_mode) {
+        const uint64_t xq_bytes = blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 hc expand prequant");
+        if (tmp) {
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const int use_dp4a = 1;
+            quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
+                    xq, xscale, (const float *)x->ptr, in_dim, blocks);
+            if (cuda_ok(cudaGetLastError(),
+                        "matmul_q8_0_hc_expand quantize launch")) {
+                const uint32_t rows_per_block = g_quality_mode ? 8u : 16u;
+                matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<
+                        ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                        rows_per_block * 32u>>>(
+                        (float *)out_hc->ptr,
+                        (float *)block_out->ptr,
+                        block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
+                        (const float *)residual_hc->ptr,
+                        (const float *)split->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        xq,
+                        xscale,
+                        in_dim,
+                        out_dim,
+                        n_embd,
+                        n_hc,
+                        blocks,
+                        rows_per_block,
+                        block_add ? 1 : 0,
+                        use_dp4a);
+                if (cuda_ok(cudaGetLastError(),
+                            "matmul_q8_0_hc_expand rows launch")) return 1;
+            }
+        }
+    }
     if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
         const unsigned rows_per_block = 32u;
         const unsigned threads = rows_per_block * 32u;
