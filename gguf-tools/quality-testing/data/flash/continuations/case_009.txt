@@ -1,0 +1,5 @@
+Here are three invariants for a special-token table used in a tokenizer:
+
+---
+
+### 1. **Un

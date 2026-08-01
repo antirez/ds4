@@ -1,0 +1,1 @@
+Per spiegare la differenza tra **latenza** e **throughput**, è utile usare una metafora

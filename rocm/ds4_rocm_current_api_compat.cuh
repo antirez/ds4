@@ -1,48 +1,3 @@
-extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
-    if (!event_value) return 0;
-    *event_value = 0;
-    if (!g_selected_readback_event) {
-        cudaError_t err =
-            cudaEventCreateWithFlags(&g_selected_readback_event,
-                                     cudaEventDisableTiming);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "selected readback event creation failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return 0;
-        }
-    }
-    cudaError_t err = cudaEventRecord(g_selected_readback_event, 0);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "selected readback event record failed: %s\n",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    *event_value = ++g_selected_readback_event_value;
-    return 1;
-}
-
-extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
-    if (event_value == 0 || !g_selected_readback_event) return 0;
-    cudaError_t err = cudaEventSynchronize(g_selected_readback_event);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "selected readback wait failed for %s: %s\n",
-                label ? label : "selected-id readback",
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    return 1;
-}
-
-extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
-    return ds4_gpu_commit_and_wait_selected_readback(event_value, label);
-}
-
 extern "C" int ds4_gpu_tensor_read_after_selected_event(
         const ds4_gpu_tensor *tensor,
         uint64_t offset,
@@ -168,6 +123,14 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_routed_moe_selected_override_n = 0;
     g_stream_selected_cache.loaded = 0;
     g_stream_batch_selected_cache.loaded = 0;
+}
+
+extern "C" void ds4_gpu_set_glm_model(bool enabled) {
+    (void)enabled;
+}
+
+extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
+    (void)enabled;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -304,6 +267,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
         uint32_t                          n_selected) {
     if (!table) return 0;
     return cuda_stream_layer_expert_cache_seed_selected(table->model_map,
+                                                        table->model_size,
                                                         table->layer,
                                                         selected,
                                                         n_tokens,
@@ -327,11 +291,19 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    (void)table;
-    (void)expert_ids;
-    (void)expert_priorities;
-    (void)n_experts;
-    return 1;
+    if (!table) return 0;
+    return cuda_stream_resident_seed_experts(table->model_map,
+                                             table->model_size,
+                                             table->layer,
+                                             expert_ids,
+                                             expert_priorities,
+                                             n_experts,
+                                             table->n_total_expert,
+                                             table->gate_offset,
+                                             table->up_offset,
+                                             table->down_offset,
+                                             table->gate_expert_bytes,
+                                             table->down_expert_bytes);
 }
 
 extern "C" int ds4_gpu_routed_moe_set_selected_override(

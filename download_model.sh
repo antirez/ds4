@@ -1,17 +1,23 @@
 #!/bin/sh
 set -e
 
+GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
+GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 REPO="antirez/deepseek-v4-gguf"
-Q2_IMATRIX_REPO="audreyt/CyberNeurova-DeepSeek-V4-Flash-abliterated-GGUF"
-Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
-Q2_IMATRIX_FILE="cyberneurova-DeepSeek-V4-Flash-abliterated-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-aligned.gguf"
-Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf"
-Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
-Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
+Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
+Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
 PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-DSpark-support.gguf"
+GLM_UNSLOTH_Q4_REMOTE_BASE="UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL"
+GLM_UNSLOTH_Q4_LOCAL_BASE="GLM-5.2-UD-Q4_K_XL"
+GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
+GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
+GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
+GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -23,7 +29,7 @@ TOKEN=${HF_TOKEN:-}
 
 usage() {
     cat <<EOF
-DeepSeek V4 GGUF downloader
+DwarfStar GGUF downloader
 
 Usage:
   ./download_model.sh q2-imatrix [--token TOKEN]
@@ -34,11 +40,16 @@ Usage:
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
   ./download_model.sh pro-q4-split [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
+  ./download_model.sh dspark-support [--token TOKEN]
+  ./download_model.sh glm-unsloth-q4 [--token TOKEN]
+  ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
+  ./download_model.sh glm-antirez-q2 [--token TOKEN]
+  ./download_model.sh glm-antirez-q4 [--token TOKEN]
 
 Targets:
 
   q2-imatrix
-       CyberNeurova abliterated 2-bit routed experts, about 81 GB on disk.
+       2-bit routed experts, about 81 GB on disk.
        Recommended model for 96 and 128 GB RAM machines.
 
   q2-q4-imatrix
@@ -68,9 +79,29 @@ Targets:
        Downloads both PRO Q4 split files into the download directory. About
        838 GB total. This target does not update ./ds4flash.gguf.
 
-  mtp  Optional legacy one-step speculative decoding component, about 3.5 GB on
-       disk. It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but
-       must be enabled explicitly with --mtp when running ds4 or ds4-server.
+  mtp  Optional speculative decoding component, about 3.5 GB on disk.
+       It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but must be
+       enabled explicitly with --mtp when running ds4 or ds4-server.
+
+  dspark-support
+       Optional DSpark speculative decoding support GGUF, about 6 GB. Enable it
+       with --dspark and --mtp when running ds4 or ds4-server.
+
+  glm-unsloth-q4
+       GLM 5.2 Unsloth UD-Q4_K_XL quant from unsloth/GLM-5.2-GGUF.
+       Downloads all 11 shards and links ./ds4flash.gguf to the first shard.
+
+  glm-antirez-iq2xxs
+       GLM 5.2 antirez routed IQ2_XXS GGUF from antirez/GLM-5.2-GGUF.
+       Includes Q2_K block 78 and is intended for reduced-memory testing.
+
+  glm-antirez-q2
+       GLM 5.2 antirez routed Q2_K GGUF from antirez/GLM-5.2-GGUF.
+       About 262 GB on disk.
+
+  glm-antirez-q4
+       GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
+       About 434 GB on disk.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -90,8 +121,12 @@ Then the default commands work:
 After downloading mtp, enable it explicitly, for example:
   ./ds4 --mtp <download directory>/$MTP_FILE --mtp-draft 2
 
-PRO files are downloaded with the official Hugging Face downloader because
-they are too large for the curl path used by the smaller GGUF files.
+After downloading DSpark support, enable it explicitly in greedy mode:
+  ./ds4 --dspark --mtp <download directory>/$DSPARK_SUPPORT_FILE --temp 0
+
+PRO and GLM files are downloaded with the official Hugging Face downloader
+because they are too large, sharded, or nested for the curl path used by the
+smaller DeepSeek Flash GGUF files.
 EOF
 }
 
@@ -104,24 +139,47 @@ MODEL=$1
 shift
 MODEL_FILES=
 LINK_MODEL=1
+FORCE_HF_DOWNLOAD=0
+FLATTEN_DOWNLOADS=0
 
 case "$MODEL" in
-    q2-imatrix) MODEL_REPO=$Q2_IMATRIX_REPO; MODEL_FILE=$Q2_IMATRIX_FILE ;;
-    q2-q4-imatrix) MODEL_REPO=$REPO; MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
-    q4-imatrix) MODEL_REPO=$REPO; MODEL_FILE=$Q4_IMATRIX_FILE ;;
-    q2) MODEL_REPO=$REPO; MODEL_FILE=$Q2_FILE ;;
-    q4) MODEL_REPO=$REPO; MODEL_FILE=$Q4_FILE ;;
-    pro) MODEL_REPO=$REPO; MODEL_FILE=$PRO_FILE ;;
-    pro-imatrix) MODEL_REPO=$REPO; MODEL_FILE=$PRO_IMATRIX_FILE ;;
-    pro-q2-imatrix) MODEL_REPO=$REPO; MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
-    pro-q4-layers00-30) MODEL_REPO=$REPO; MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
-    pro-q4-layers31-output) MODEL_REPO=$REPO; MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
+    q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
+    q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
+    q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
+    pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
+    pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
+    pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
     pro-q4-split)
-        MODEL_REPO=$REPO
         MODEL_FILES="$PRO_Q4_LAYERS00_30_FILE $PRO_Q4_LAYERS31_OUTPUT_FILE"
         LINK_MODEL=0
         ;;
-    mtp) MODEL_REPO=$REPO; MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
+    mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
+    dspark-support) MODEL_FILE=$DSPARK_SUPPORT_FILE; LINK_MODEL=0 ;;
+    glm-unsloth-q4)
+        REPO=$GLM_UNSLOTH_REPO
+        MODEL_FILE=$GLM_UNSLOTH_Q4_FIRST_FILE
+        MODEL_FILES=
+        for part in 00001 00002 00003 00004 00005 00006 00007 00008 00009 00010 00011; do
+            MODEL_FILES="$MODEL_FILES $GLM_UNSLOTH_Q4_REMOTE_BASE-${part}-of-00011.gguf"
+        done
+        FORCE_HF_DOWNLOAD=1
+        FLATTEN_DOWNLOADS=1
+        ;;
+    glm-antirez-q2)
+        REPO=$GLM_ANTIREZ_REPO
+        MODEL_FILE=$GLM_ANTIREZ_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-antirez-iq2xxs)
+        REPO=$GLM_ANTIREZ_REPO
+        MODEL_FILE=$GLM_ANTIREZ_IQ2XXS_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-antirez-q4)
+        REPO=$GLM_ANTIREZ_REPO
+        MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -157,6 +215,9 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
 fi
 
 needs_hf_download() {
+    if [ "${FORCE_HF_DOWNLOAD:-0}" -eq 1 ]; then
+        return 0
+    fi
     case "$1" in
         "$PRO_Q2_IMATRIX_FILE"|"$PRO_Q4_LAYERS00_30_FILE"|"$PRO_Q4_LAYERS31_OUTPUT_FILE")
             return 0
@@ -172,15 +233,31 @@ find_hf_command() {
         printf '%s\n' hf
         return 0
     fi
+    for dir in "$HOME"/Library/Python/*/bin "$HOME"/.local/bin; do
+        if [ -x "$dir/hf" ]; then
+            printf '%s\n' "$dir/hf"
+            return 0
+        fi
+    done
     return 1
+}
+
+local_download_name() {
+    if [ "${FLATTEN_DOWNLOADS:-0}" -eq 1 ]; then
+        basename "$1"
+    else
+        printf '%s\n' "$1"
+    fi
 }
 
 download_one_hf() {
     file=$1
-    out="$OUT_DIR/$file"
+    local_file=$(local_download_name "$file")
+    out="$OUT_DIR/$local_file"
+    hf_out="$OUT_DIR/$file"
     part="$out.part"
 
-    mkdir -p "$OUT_DIR"
+    mkdir -p "$(dirname "$out")"
 
     if [ -s "$out" ]; then
         echo "Already downloaded: $out"
@@ -190,13 +267,13 @@ download_one_hf() {
     if [ -e "$part" ]; then
         echo "Found curl partial download: $part" >&2
         echo "The Hugging Face downloader cannot resume curl .part files." >&2
-        echo "Move or remove that partial download before retrying this PRO target." >&2
+        echo "Move or remove that partial download before retrying this target." >&2
         exit 1
     fi
 
     HF_CMD=$(find_hf_command || true)
     if [ -z "$HF_CMD" ]; then
-        echo "PRO downloads require the official Hugging Face CLI." >&2
+        echo "Large GGUF downloads require the official Hugging Face CLI." >&2
         echo "Install it with:" >&2
         echo "  python3 -m pip install -U huggingface_hub hf_xet" >&2
         exit 1
@@ -213,6 +290,11 @@ download_one_hf() {
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi
 
+    if [ "$hf_out" != "$out" ] && [ -s "$hf_out" ]; then
+        mv "$hf_out" "$out"
+        rmdir "$(dirname "$hf_out")" 2>/dev/null || true
+    fi
+
     if [ ! -s "$out" ]; then
         echo "Hugging Face download finished but expected file is missing: $out" >&2
         exit 1
@@ -220,19 +302,19 @@ download_one_hf() {
 }
 
 download_one() {
-    repo=$1
-    file=$2
-    out="$OUT_DIR/$file"
+    file=$1
+    local_file=$(local_download_name "$file")
+    out="$OUT_DIR/$local_file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$repo/resolve/main/$file"
+    url="https://huggingface.co/$REPO/resolve/main/$file"
 
     if needs_hf_download "$file"; then
         download_one_hf "$file"
         return
     fi
 
-    mkdir -p "$OUT_DIR"
+    mkdir -p "$(dirname "$out")"
 
     if [ -e "$aria2_part" ]; then
         echo "Found incomplete aria2 download sidecar: $aria2_part" >&2
@@ -246,7 +328,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$repo"
+    echo "from https://huggingface.co/$REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
@@ -260,18 +342,21 @@ download_one() {
 
 if [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do
-        download_one "$MODEL_REPO" "$file"
+        download_one "$file"
     done
 else
-    download_one "$MODEL_REPO" "$MODEL_FILE"
+    download_one "$MODEL_FILE"
 fi
 
 if [ "$MODEL" = "mtp" ]; then
     echo
-    echo "MTP is an optional legacy one-step component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
+    echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-    echo "Converted DeepSpec/DSpark GGUFs are recognized separately by the loader and use Metal target-verified block drafting."
+elif [ "$MODEL" = "dspark-support" ]; then
+    echo
+    echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DSPARK_SUPPORT_FILE --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

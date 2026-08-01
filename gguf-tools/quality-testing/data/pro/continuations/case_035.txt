@@ -1,0 +1,1 @@
+Un **ring buffer** (o buffer circolare) è una struttura dati di dimensione fissa che funziona

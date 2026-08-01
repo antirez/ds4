@@ -1,0 +1,1 @@
+Speculative decoding preserves the exact greedy output by using the draft model only as a *proposal* mechanism, while the

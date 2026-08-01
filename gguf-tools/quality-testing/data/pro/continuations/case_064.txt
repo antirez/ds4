@@ -1,0 +1,1 @@
+Here’s a clear breakdown of the difference between **latency** and **throughput**, using a simple analogy and

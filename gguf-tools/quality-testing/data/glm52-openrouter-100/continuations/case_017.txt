@@ -1,0 +1,1 @@
+La decodifica speculativa (speculative decoding) può mantenere un output esattamente identico a quello

@@ -1,0 +1,1 @@
+Spiega perche array ordinati rendono piu veloce la ricerca di appartenenza.

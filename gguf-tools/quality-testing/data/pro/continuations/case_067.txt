@@ -1,0 +1,1 @@
+The discrepancy between mmap page residency and virtual address space size occurs because they measure fundamentally different things. Here's why they

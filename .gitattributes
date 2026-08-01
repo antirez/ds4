@@ -1,0 +1,3 @@
+# Preserve hosted-model continuation bytes exactly; these fixtures may contain
+# model-generated trailing whitespace that is meaningful to tokenizer scoring.
+gguf-tools/quality-testing/data/*/continuations/*.txt -diff

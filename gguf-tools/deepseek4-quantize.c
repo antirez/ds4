@@ -36,8 +36,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #if defined(_WIN32)
 #error "deepseek4-quantize.c currently targets POSIX systems"
@@ -47,15 +45,7 @@
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
-#define DS4_KV_GENERAL_ALIGNMENT          "general.alignment"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
-
-#define DS4_KV_DSPARK_N_MTP_LAYERS       "deepseek4.dspark.n_mtp_layers"
-#define DS4_KV_DSPARK_BLOCK_SIZE         "deepseek4.dspark.block_size"
-#define DS4_KV_DSPARK_NOISE_TOKEN_ID     "deepseek4.dspark.noise_token_id"
-#define DS4_KV_DSPARK_MARKOV_RANK        "deepseek4.dspark.markov_rank"
-#define DS4_KV_DSPARK_TARGET_LAYER_ID    "deepseek4.dspark.target_layer_ids"
-#define DS4_DSPARK_TARGET_LAYER_COUNT    3
 
 typedef enum {
     GGUF_TYPE_UINT8   = 0,
@@ -140,24 +130,6 @@ static bool str_ends(const char *s, const char *suffix) {
 static char *read_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) die_errno("open", path);
-    if (fseeko(fp, 0, SEEK_END) != 0) die_errno("seek", path);
-    off_t n = ftello(fp);
-    if (n < 0) die_errno("tell", path);
-    if (fseeko(fp, 0, SEEK_SET) != 0) die_errno("seek", path);
-    char *buf = xmalloc((size_t)n + 1);
-    if (n && fread(buf, 1, (size_t)n, fp) != (size_t)n) die_errno("read", path);
-    buf[n] = '\0';
-    fclose(fp);
-    if (len_out) *len_out = (size_t)n;
-    return buf;
-}
-
-static char *read_optional_file(const char *path, size_t *len_out) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        if (errno == ENOENT) return NULL;
-        die_errno("open", path);
-    }
     if (fseeko(fp, 0, SEEK_END) != 0) die_errno("seek", path);
     off_t n = ftello(fp);
     if (n < 0) die_errno("tell", path);
@@ -898,32 +870,42 @@ static void imatrix_free(imatrix_store *im) {
  * GGUF tensor mapping and quantization policy
  */
 
+typedef enum { EXP_SCOPE_LAYER, EXP_SCOPE_MTP } expert_scope;
 typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
 typedef struct {
     bool is_expert;
-    bool is_mtp;
+    expert_scope scope;
     int layer;
     expert_part part;
 } expert_tensor;
 
-static bool parse_expert_tensor_as(const char *name, const char *fmt, bool is_mtp, expert_tensor *out) {
+static expert_tensor parse_expert_tensor(const char *name) {
+    expert_tensor e = {0};
     int layer = -1;
     char kind[16];
     int rest = 0;
-    if (sscanf(name, fmt, &layer, kind, &rest) != 2 || rest != (int)strlen(name)) return false;
-    if (strcmp(kind, "gate") != 0 && strcmp(kind, "down") != 0 && strcmp(kind, "up") != 0) return false;
-    out->is_expert = true;
-    out->is_mtp = is_mtp;
-    out->layer = layer;
-    out->part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
-    return true;
-}
-
-static expert_tensor parse_expert_tensor(const char *name) {
-    expert_tensor e = {0};
-    if (parse_expert_tensor_as(name, "blk.%d.ffn_%15[^_]_exps.weight%n", false, &e)) return e;
-    if (parse_expert_tensor_as(name, "mtp.%d.ffn_%15[^_]_exps.weight%n", true, &e)) return e;
+    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+        && rest == (int)strlen(name))
+    {
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            e.is_expert = true;
+            e.scope = EXP_SCOPE_LAYER;
+            e.layer = layer;
+            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+        }
+    }
+    if (!e.is_expert &&
+        sscanf(name, "mtp.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2 &&
+        rest == (int)strlen(name))
+    {
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            e.is_expert = true;
+            e.scope = EXP_SCOPE_MTP;
+            e.layer = layer;
+            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+        }
+    }
     return e;
 }
 
@@ -935,16 +917,6 @@ static const char *expert_part_name(expert_part p) {
         default: die("bad expert part");
     }
     return "";
-}
-
-static void expert_hf_prefix(char *buf, size_t cap,
-                             const expert_tensor *e, int xid,
-                             const char *wid) {
-    if (e->is_mtp) {
-        snprintf(buf, cap, "mtp.%d.ffn.experts.%d.%s", e->layer, xid, wid);
-    } else {
-        snprintf(buf, cap, "layers.%d.ffn.experts.%d.%s", e->layer, xid, wid);
-    }
 }
 
 typedef struct {
@@ -992,201 +964,32 @@ static const name_map layer_map[] = {
     { "ffn_up_shexp.weight",              "ffn.shared_experts.w3.weight" },
     { "ffn_down_shexp.weight",            "ffn.shared_experts.w2.weight" },
     { "ffn_gate_inp.weight",              "ffn.gate.weight" },
-    { "ffn_gate_exps.weight",             "ffn.experts.*.w1.weight" },
-    { "ffn_up_exps.weight",               "ffn.experts.*.w3.weight" },
-    { "ffn_down_exps.weight",             "ffn.experts.*.w2.weight" },
     { "exp_probs_b.bias",                 "ffn.gate.bias" },
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
 };
-
-
-static const name_map dspark_mtp_map[] = {
-    { "main_proj.weight",                 "main_proj.weight" },
-    { "main_norm.weight",                 "main_norm.weight" },
-    { "norm.weight",                      "norm.weight" },
-    { "markov_head.markov_w1.weight",     "markov_head.markov_w1.weight" },
-    { "markov_head.markov_w2.weight",     "markov_head.markov_w2.weight" },
-    { "confidence_head.proj.weight",      "confidence_head.proj.weight" },
-    { "hc_head_base.weight",              "hc_head_base" },
-    { "hc_head_fn.weight",                "hc_head_fn" },
-    { "hc_head_scale.weight",             "hc_head_scale" },
-};
-
-static char *hf_name_for_mapped_layer(
-        const char     *gguf_name,
-        const char     *gguf_prefix,
-        const char     *hf_prefix,
-        const name_map *extra_map,
-        size_t          extra_map_len) {
-    int layer = -1;
-    char scan_fmt[32];
-    snprintf(scan_fmt, sizeof(scan_fmt), "%s.%%d.", gguf_prefix);
-    if (sscanf(gguf_name, scan_fmt, &layer) != 1) return NULL;
-
-    const char *rest = strchr(gguf_name + strlen(gguf_prefix) + 1, '.');
-    if (!rest) die("bad layer tensor name");
-    rest++;
-
-    for (size_t i = 0; i < extra_map_len; i++) {
-        if (strcmp(rest, extra_map[i].gguf) == 0) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%s.%d.%s", hf_prefix, layer, extra_map[i].hf);
-            return xstrdup(buf);
-        }
-    }
-    for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
-        if (strcmp(rest, layer_map[i].gguf) == 0) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%s.%d.%s", hf_prefix, layer, layer_map[i].hf);
-            return xstrdup(buf);
-        }
-    }
-    return NULL;
-}
 
 static char *hf_name_for_regular(const char *gguf_name) {
     for (size_t i = 0; i < sizeof(top_map) / sizeof(top_map[0]); i++) {
         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
     }
-
-    char *hf_name = hf_name_for_mapped_layer(gguf_name, "blk", "layers", NULL, 0);
-    if (hf_name) return hf_name;
-
-    hf_name = hf_name_for_mapped_layer(gguf_name, "mtp", "mtp",
-                                       dspark_mtp_map,
-                                       sizeof(dspark_mtp_map) / sizeof(dspark_mtp_map[0]));
-    if (hf_name) return hf_name;
-
-    fprintf(stderr, "error: cannot map GGUF tensor to HF tensor: %s\n", gguf_name);
-    exit(1);
-}
-
-static void expect_hf_name(const char *gguf, const char *want) {
-    char *got = hf_name_for_regular(gguf);
-    if (strcmp(got, want) != 0) {
-        fprintf(stderr, "error: map %s -> %s, expected %s\n", gguf, got, want);
+    int layer = -1;
+    const char *p = gguf_name;
+    if (sscanf(p, "blk.%d.", &layer) != 1) {
+        fprintf(stderr, "error: cannot map GGUF tensor to HF tensor: %s\n", gguf_name);
         exit(1);
     }
-    free(got);
-}
-
-typedef struct {
-    uint32_t block_size;
-    uint32_t noise_token_id;
-    uint32_t markov_rank;
-    uint32_t n_mtp_layers;
-    uint32_t target_layer_ids[DS4_DSPARK_TARGET_LAYER_COUNT];
-} dspark_metadata;
-
-typedef enum {
-    DS4_DSPARK_HF_NONE = 0,
-    DS4_DSPARK_HF_MARKOV,
-    DS4_DSPARK_HF_NONSEQ,
-} dspark_hf_layout;
-
-static const char *dspark_hf_layout_name(dspark_hf_layout layout) {
-    switch (layout) {
-    case DS4_DSPARK_HF_MARKOV: return "markov";
-    case DS4_DSPARK_HF_NONSEQ: return "nonseq";
-    case DS4_DSPARK_HF_NONE:
-    default: return "none";
-    }
-}
-
-static bool is_mtp_tensor_name(const char *name) {
-    return str_starts(name, "mtp.");
-}
-
-static bool is_dspark_special_tensor(const char *name) {
-    return strstr(name, ".main_proj.weight") != NULL ||
-           strstr(name, ".main_norm.weight") != NULL ||
-           strstr(name, ".attn_norm.weight") != NULL ||
-           strstr(name, ".attn_q_a_norm.weight") != NULL ||
-           strstr(name, ".attn_kv_a_norm.weight") != NULL ||
-           strstr(name, ".ffn_norm.weight") != NULL ||
-           strstr(name, ".markov_head.markov_w1.weight") != NULL ||
-           strstr(name, ".markov_head.markov_w2.weight") != NULL ||
-           strstr(name, ".confidence_head.proj.weight") != NULL;
-}
-
-static bool is_dspark_kv_key(const char *key) {
-    return strcmp(key, DS4_KV_DSPARK_N_MTP_LAYERS) == 0 ||
-           strcmp(key, DS4_KV_DSPARK_BLOCK_SIZE) == 0 ||
-           strcmp(key, DS4_KV_DSPARK_NOISE_TOKEN_ID) == 0 ||
-           strcmp(key, DS4_KV_DSPARK_MARKOV_RANK) == 0 ||
-           strncmp(key, DS4_KV_DSPARK_TARGET_LAYER_ID, strlen(DS4_KV_DSPARK_TARGET_LAYER_ID)) == 0;
-}
-
-static dspark_hf_layout dspark_hf_layout_guess(bool has_main_proj,
-                                               bool has_markov_w1,
-                                               bool has_confidence_proj,
-                                               bool markov_rank_set,
-                                               uint32_t markov_rank) {
-    if (!has_main_proj) return DS4_DSPARK_HF_NONE;
-    if (has_markov_w1 && has_confidence_proj) return DS4_DSPARK_HF_MARKOV;
-    if (!has_markov_w1 && !has_confidence_proj && markov_rank_set && markov_rank == 0) {
-        return DS4_DSPARK_HF_NONSEQ;
-    }
-    return DS4_DSPARK_HF_NONE;
-}
-
-static dspark_hf_layout db_dspark_hf_layout(const st_db *db, bool markov_rank_set, uint32_t markov_rank) {
-    return dspark_hf_layout_guess(db_has(db, "mtp.0.main_proj.weight"),
-                                  db_has(db, "mtp.2.markov_head.markov_w1.weight"),
-                                  db_has(db, "mtp.2.confidence_head.proj.weight"),
-                                  markov_rank_set,
-                                  markov_rank);
-}
-
-static dspark_metadata dspark_metadata_defaults(void) {
-    dspark_metadata m = {
-        .block_size = 5,
-        .noise_token_id = 128799,
-        .markov_rank = 256,
-        .n_mtp_layers = 3,
-        .target_layer_ids = {40, 41, 42},
-    };
-    return m;
-}
-
-static void dspark_metadata_apply_hf_config_path(dspark_metadata *m, const char *cfg_path, bool *markov_rank_set) {
-    size_t len = 0;
-    char *jtext = read_optional_file(cfg_path, &len);
-    if (!jtext) return;
-    json_doc d = json_parse_text(jtext, len);
-    int block = json_obj_get(&d, 0, "dspark_block_size");
-    int noise = json_obj_get(&d, 0, "dspark_noise_token_id");
-    int rank = json_obj_get(&d, 0, "dspark_markov_rank");
-    int n_mtp = json_obj_get(&d, 0, "n_mtp_layers");
-    int layers = json_obj_get(&d, 0, "dspark_target_layer_ids");
-    if (block >= 0) m->block_size = (uint32_t)json_i64(&d, block);
-    if (noise >= 0) m->noise_token_id = (uint32_t)json_i64(&d, noise);
-    if (rank >= 0) {
-        m->markov_rank = (uint32_t)json_i64(&d, rank);
-        if (markov_rank_set) *markov_rank_set = true;
-    }
-    if (n_mtp >= 0) m->n_mtp_layers = (uint32_t)json_i64(&d, n_mtp);
-    if (layers >= 0 && d.v[layers].type == JT_ARRAY) {
-        int n = 0;
-        for (int i = layers + 1; i < d.len && d.v[i].parent == layers && n < DS4_DSPARK_TARGET_LAYER_COUNT;) {
-            m->target_layer_ids[n++] = (uint32_t)json_i64(&d, i);
-            i = json_skip(&d, i);
+    const char *rest = strchr(p + 4, '.');
+    if (!rest) die("bad layer tensor name");
+    rest++;
+    for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
+        if (strcmp(rest, layer_map[i].gguf) == 0) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "layers.%d.%s", layer, layer_map[i].hf);
+            return xstrdup(buf);
         }
     }
-    json_free(&d);
-    free(jtext);
-}
-
-static dspark_metadata dspark_metadata_from_hf_config(const char *hf_dir, bool *markov_rank_set) {
-    if (markov_rank_set) *markov_rank_set = false;
-    dspark_metadata m = dspark_metadata_defaults();
-    char *root_cfg_path = path_join(hf_dir, "config.json");
-    dspark_metadata_apply_hf_config_path(&m, root_cfg_path, markov_rank_set);
-    free(root_cfg_path);
-    char *inference_cfg_path = path_join(hf_dir, "inference/config.json");
-    dspark_metadata_apply_hf_config_path(&m, inference_cfg_path, markov_rank_set);
-    free(inference_cfg_path);
-    return m;
+    fprintf(stderr, "error: cannot map GGUF tensor to HF tensor: %s\n", gguf_name);
+    exit(1);
 }
 
 typedef struct {
@@ -1211,25 +1014,12 @@ static bool is_attention_tensor(const char *name) {
     return strstr(name, ".attn") || strstr(name, "attn_") || strstr(name, ".indexer") || strstr(name, "indexer_");
 }
 
-static bool is_norm_tensor(const char *name) {
-    return strcmp(name, "output_norm.weight") == 0 ||
-           strstr(name, "_norm.weight") != NULL ||
-           strstr(name, ".norm.weight") != NULL;
-}
-
 static bool is_shared_expert(const char *name) {
     return strstr(name, "_shexp.") != NULL;
 }
+
 static bool is_output_tensor(const char *name) {
     return str_starts(name, "output.");
-}
-
-static bool is_loader_plain_f16_tensor(const char *name) {
-    return strcmp(name, "output_hc_fn.weight") == 0 ||
-           strstr(name, ".hc_attn_fn.weight") != NULL ||
-           strstr(name, ".hc_ffn_fn.weight") != NULL ||
-           strstr(name, ".hc_head_fn.weight") != NULL ||
-           strstr(name, ".ffn_gate_inp.weight") != NULL;
 }
 
 typedef struct {
@@ -1241,20 +1031,6 @@ typedef struct {
     uint64_t new_offset;
     size_t size;
 } tensor_meta;
-
-typedef struct gguf_file {
-    char *path;
-    uint32_t version;
-    uint64_t n_kv;
-    uint64_t n_tensors;
-    uint8_t *kv_raw;
-    size_t kv_raw_len;
-    size_t alignment;
-    int n_experts;
-    size_t data_offset;
-    tensor_meta *tensors;
-    hmap tensor_map;
-} gguf_file;
 
 static int tensor_n_dims(const tensor_meta *t) {
     int n = t->n_dims;
@@ -1279,19 +1055,6 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
         tmpl->type != DS4Q_TYPE_BF16 && !ds4q_can_quantize(tmpl->type)) {
         return tmpl->type;
     }
-    if (is_mtp_tensor_name(name) && is_dspark_special_tensor(name)) {
-        if (strstr(name, ".confidence_head.proj.weight")) return DS4Q_TYPE_F32;
-        if (strstr(name, ".main_proj.weight")) return DS4Q_TYPE_Q8_0;
-        if (strstr(name, ".main_norm.weight") || strstr(name, ".attn_norm.weight") ||
-            strstr(name, ".attn_q_a_norm.weight") || strstr(name, ".attn_kv_a_norm.weight") ||
-            strstr(name, ".ffn_norm.weight")) return DS4Q_TYPE_F32;
-        if (strstr(name, ".markov_head.markov_w1.weight") ||
-            strstr(name, ".markov_head.markov_w2.weight")) {
-            return tmpl->type == DS4Q_TYPE_F32 ? DS4Q_TYPE_F32 : DS4Q_TYPE_F16;
-        }
-    }
-    if (is_loader_plain_f16_tensor(name)) return DS4Q_TYPE_F16;
-    if (is_norm_tensor(name)) return DS4Q_TYPE_F32;
     if (tensor_n_dims(tmpl) <= 1) return tmpl->type;
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
@@ -1301,148 +1064,6 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
     if (p->dense != DS4Q_TYPE_COUNT) return p->dense;
     return tmpl->type;
 }
-
-static void expect_policy_type(const quant_policy *p, const char *name, ds4q_type tmpl_type, ds4q_type want) {
-    tensor_meta tmpl = {
-        .name = (char *)name,
-        .n_dims = 2,
-        .ne = {4096, 4096, 1, 1},
-        .type = tmpl_type,
-    };
-    ds4q_type got = policy_type(p, name, &tmpl);
-    if (got != want) {
-        fprintf(stderr, "error: policy %s -> %s, expected %s\n",
-                name, ds4q_type_name(got), ds4q_type_name(want));
-        exit(1);
-    }
-}
-
-static void self_test_dspark_only_args(void);
-static ds4q_type dspark_template_for_name(const char *name, ds4q_type hf_type);
-
-static void expect_dspark_template_type(const char *name, ds4q_type hf_type, ds4q_type want) {
-    ds4q_type got = dspark_template_for_name(name, hf_type);
-    if (got != want) {
-        fprintf(stderr, "error: DSpark template %s -> %s, expected %s\n",
-                name, ds4q_type_name(got), ds4q_type_name(want));
-        exit(1);
-    }
-}
-
-
-static void self_test_dspark_map(void) {
-    expect_hf_name("mtp.0.hc_attn_base.weight", "mtp.0.hc_attn_base");
-    expect_hf_name("mtp.0.main_proj.weight", "mtp.0.main_proj.weight");
-    expect_hf_name("mtp.2.markov_head.markov_w1.weight", "mtp.2.markov_head.markov_w1.weight");
-    expect_hf_name("mtp.2.confidence_head.proj.weight", "mtp.2.confidence_head.proj.weight");
-    expert_tensor routed = parse_expert_tensor("mtp.2.ffn_down_exps.weight");
-    if (!routed.is_expert || !routed.is_mtp || routed.layer != 2 || routed.part != EXP_W2) {
-        die("bad DSpark MTP routed expert parse");
-    }
-    char eprefix[256];
-    expert_hf_prefix(eprefix, sizeof(eprefix), &routed, 7, expert_part_name(routed.part));
-    if (strcmp(eprefix, "mtp.2.ffn.experts.7.w2") != 0) {
-        die("bad DSpark MTP expert HF prefix");
-    }
-    quant_policy pol = {0};
-    pol.dense = DS4Q_TYPE_Q4_K;
-    expect_policy_type(&pol, "mtp.0.main_proj.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_Q8_0);
-    expect_policy_type(&pol, "mtp.2.markov_head.markov_w1.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_policy_type(&pol, "mtp.2.confidence_head.proj.weight", DS4Q_TYPE_F32, DS4Q_TYPE_F32);
-    expect_policy_type(&pol, "mtp.2.hc_head_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_policy_type(&pol, "mtp.0.hc_attn_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_policy_type(&pol, "mtp.0.ffn_gate_inp.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_policy_type(&pol, "blk.0.hc_ffn_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_policy_type(&pol, "output_hc_fn.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_policy_type(&pol, "blk.0.attn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_policy_type(&pol, "blk.0.attn_q_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_policy_type(&pol, "blk.0.attn_kv_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_policy_type(&pol, "blk.0.ffn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    pol.dense = DS4Q_TYPE_COUNT;
-    expect_policy_type(&pol, "mtp.0.main_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_policy_type(&pol, "mtp.0.attn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_policy_type(&pol, "mtp.0.ffn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.hc_attn_base.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.hc_attn_scale.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.attn_sinks.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.attn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.attn_q_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.attn_kv_a_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.hc_ffn_base.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.hc_ffn_scale.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.ffn_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.exp_probs_b.bias", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.2.main_norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.2.norm.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.0.ffn_gate_inp.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F16);
-    expect_dspark_template_type("mtp.2.hc_head_base.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.2.hc_head_scale.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    expect_dspark_template_type("mtp.2.confidence_head.proj.weight", DS4Q_TYPE_BF16, DS4Q_TYPE_F32);
-    if (dspark_hf_layout_guess(true, true, true, false, 0) != DS4_DSPARK_HF_MARKOV) {
-        die("official DSpark HF layout not detected");
-    }
-    if (dspark_hf_layout_guess(true, false, false, true, 0) != DS4_DSPARK_HF_NONSEQ) {
-        die("nonseq DSpark HF layout not detected");
-    }
-    if (dspark_hf_layout_guess(true, false, false, false, 0) != DS4_DSPARK_HF_NONE) {
-        die("main-proj-only DSpark layout detected without markov_rank=0 metadata");
-    }
-    char tmpdir[] = "/tmp/ds4q-config-XXXXXX";
-    char *dir = mkdtemp(tmpdir);
-    if (!dir) die_errno("mkdtemp", tmpdir);
-    char *cfg_path = path_join(dir, "config.json");
-    FILE *cfp = fopen(cfg_path, "wb");
-    if (!cfp) die_errno("create config", cfg_path);
-    fputs("{\"dspark_block_size\":7,\"dspark_noise_token_id\":9,\"dspark_markov_rank\":0,"
-          "\"n_mtp_layers\":3,\"dspark_target_layer_ids\":[5,6,7]}", cfp);
-    if (fclose(cfp) != 0) die_errno("close config", cfg_path);
-    bool rank_set = false;
-    dspark_metadata fm = dspark_metadata_from_hf_config(dir, &rank_set);
-    if (!rank_set || fm.block_size != 7 || fm.noise_token_id != 9 || fm.markov_rank != 0 ||
-        fm.n_mtp_layers != 3 || fm.target_layer_ids[0] != 5 || fm.target_layer_ids[2] != 7) {
-        die("bad DSpark root config metadata parse");
-    }
-    unlink(cfg_path);
-    free(cfg_path);
-    rmdir(dir);
-    char tmpdir_inference[] = "/tmp/ds4q-config-merge-XXXXXX";
-    char *dir_inference = mkdtemp(tmpdir_inference);
-    if (!dir_inference) die_errno("mkdtemp", tmpdir_inference);
-    char *root_cfg_path = path_join(dir_inference, "config.json");
-    FILE *root_cfp = fopen(root_cfg_path, "wb");
-    if (!root_cfp) die_errno("create root config", root_cfg_path);
-    fputs("{\"num_nextn_predict_layers\":1}", root_cfp);
-    if (fclose(root_cfp) != 0) die_errno("close root config", root_cfg_path);
-    char *inf_dir = path_join(dir_inference, "inference");
-    if (mkdir(inf_dir, 0700) != 0) die_errno("mkdir", inf_dir);
-    char *inf_cfg_path = path_join(inf_dir, "config.json");
-    FILE *inf_cfp = fopen(inf_cfg_path, "wb");
-    if (!inf_cfp) die_errno("create inference config", inf_cfg_path);
-    fputs("{\"dspark_block_size\":8,\"dspark_noise_token_id\":11,\"dspark_markov_rank\":0,"
-          "\"n_mtp_layers\":3,\"dspark_target_layer_ids\":[40,41,42]}", inf_cfp);
-    if (fclose(inf_cfp) != 0) die_errno("close inference config", inf_cfg_path);
-    rank_set = false;
-    fm = dspark_metadata_from_hf_config(dir_inference, &rank_set);
-    if (!rank_set || fm.block_size != 8 || fm.noise_token_id != 11 || fm.markov_rank != 0 ||
-        fm.n_mtp_layers != 3 || fm.target_layer_ids[0] != 40 || fm.target_layer_ids[2] != 42) {
-        die("bad DSpark inference config metadata merge");
-    }
-    unlink(inf_cfg_path);
-    unlink(root_cfg_path);
-    rmdir(inf_dir);
-    rmdir(dir_inference);
-    free(inf_cfg_path);
-    free(inf_dir);
-    free(root_cfg_path);
-    dspark_metadata dm = dspark_metadata_defaults();
-    if (dm.block_size != 5 || dm.noise_token_id != 128799 || dm.markov_rank != 256 ||
-        dm.n_mtp_layers != 3 || dm.target_layer_ids[0] != 40) {
-        die("bad DSpark metadata defaults");
-    }
-    self_test_dspark_only_args();
-    puts("dspark_map: OK");
-}
-
 
 static ds4q_type parse_type(const char *raw) {
     char wanted[64];
@@ -1479,21 +1100,6 @@ typedef struct {
     uint8_t *data;
     size_t size;
 } byte_buf;
-
-static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name);
-static byte_buf read_gguf_tensor_data_range(const gguf_file *g, const tensor_meta *t,
-                                            uint64_t rel_offset, size_t size);
-
-typedef enum {
-    MODEL_SOURCE_HF,
-    MODEL_SOURCE_GGUF,
-} model_source_kind;
-
-typedef struct {
-    model_source_kind kind;
-    st_db *hf;
-    gguf_file *gguf;
-} model_source;
 
 static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat) {
     if (ncols <= 0 || n % ncols != 0) die("bad ncols for tensor conversion");
@@ -1558,108 +1164,45 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
     return nbytes;
 }
 
-static int64_t meta_nelements(const tensor_meta *t) {
-    int64_t n = 1;
-    for (int i = 0; i < t->n_dims; i++) n *= t->ne[i];
-    return n;
-}
-
-static const tensor_meta *gguf_find_tensor(const gguf_file *g, const char *name) {
-    int idx = hmap_get(&g->tensor_map, name);
-    if (idx < 0) {
-        fprintf(stderr, "error: tensor not found in source GGUF: %s\n", name);
+static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
+    int nd = tensor_n_dims(tmpl);
+    if (info->n_dims != nd) {
+        fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
     }
-    return &g->tensors[idx];
-}
-
-static void check_same_gguf_shape(const char *name, const tensor_meta *src, const tensor_meta *tmpl) {
-    const int snd = tensor_n_dims(src);
-    const int tnd = tensor_n_dims(tmpl);
-    if (snd != tnd) {
-        fprintf(stderr, "error: source/template rank mismatch for %s\n", name);
-        exit(1);
-    }
-    for (int i = 0; i < tnd; i++) {
-        if (src->ne[i] != tmpl->ne[i]) {
-            fprintf(stderr, "error: source/template shape mismatch for %s\n", name);
+    for (int i = 0; i < nd; i++) {
+        if (tmpl->ne[i] != info->shape[nd - 1 - i]) {
+            fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
             exit(1);
         }
     }
 }
 
-static float *gguf_tensor_to_f32(const byte_buf *src, const tensor_meta *meta, int64_t *n_out) {
-    const int64_t ncols = meta->ne[0];
-    const int64_t n = meta_nelements(meta);
-    if (ncols <= 0 || n % ncols != 0) die("bad GGUF tensor shape for dequantization");
-    const int64_t nrows = n / ncols;
-    float *out = xmalloc((size_t)n * sizeof(float));
-
-    if (meta->type == DS4Q_TYPE_F32) {
-        if (src->size != (size_t)n * sizeof(float)) die("bad GGUF F32 byte size");
-        memcpy(out, src->data, src->size);
-    } else if (meta->type == DS4Q_TYPE_F16) {
-        if (src->size != (size_t)n * sizeof(uint16_t)) die("bad GGUF F16 byte size");
-        for (int64_t i = 0; i < n; i++) {
-            out[i] = ds4q_f16_to_f32(load_u16_le(src->data + (size_t)i * 2));
-        }
-    } else if (meta->type == DS4Q_TYPE_BF16) {
-        if (src->size != (size_t)n * sizeof(uint16_t)) die("bad GGUF BF16 byte size");
-        for (int64_t i = 0; i < n; i++) {
-            out[i] = ds4q_bf16_to_f32(load_u16_le(src->data + (size_t)i * 2));
-        }
-    } else if (meta->type == DS4Q_TYPE_Q8_0) {
-        if (ncols % ds4q_block_size(DS4Q_TYPE_Q8_0) != 0) die("bad Q8_0 column count");
-        const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q8_0, ncols);
-        if (src->size != (size_t)nrows * row_size) die("bad GGUF Q8_0 byte size");
-        const uint8_t *p = src->data;
-        for (int64_t r = 0; r < nrows; r++) {
-            float *row = out + (size_t)r * (size_t)ncols;
-            for (int64_t b = 0; b < ncols / 32; b++) {
-                const float d = ds4q_f16_to_f32(load_u16_le(p));
-                p += sizeof(uint16_t);
-                const int8_t *qs = (const int8_t *)p;
-                for (int j = 0; j < 32; j++) row[(size_t)b * 32u + (size_t)j] = d * (float)qs[j];
-                p += 32;
-            }
-        }
-    } else {
-        fprintf(stderr, "error: cannot dequantize source GGUF tensor type %s\n", ds4q_type_name(meta->type));
-        exit(1);
-    }
-    if (n_out) *n_out = n;
-    return out;
-}
-
-static bool reversed_shape_matches(const st_info *info, const tensor_meta *tmpl, int nd) {
-    if (info->n_dims != nd) return false;
-    for (int i = 0; i < nd; i++) {
-        if (tmpl->ne[i] != info->shape[nd - 1 - i]) return false;
-    }
-    return true;
-}
-
-static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
-    if (reversed_shape_matches(info, tmpl, tmpl->n_dims)) return;
-    if (reversed_shape_matches(info, tmpl, tensor_n_dims(tmpl))) return;
-    if (info->n_dims != tmpl->n_dims && info->n_dims != tensor_n_dims(tmpl)) {
+static void check_reversed_shape_exact(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
+    int nd = tmpl->n_dims;
+    if (info->n_dims != nd) {
         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
     }
-    fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
-    exit(1);
+    for (int i = 0; i < nd; i++) {
+        if (tmpl->ne[i] != info->shape[nd - 1 - i]) {
+            fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
+            exit(1);
+        }
+    }
 }
 
-static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                    ds4q_type target, const imatrix_store *imatrix) {
-    char *hf_name = hf_name_for_regular(gguf_name);
+static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char *hf_name,
+                                    const tensor_meta *tmpl, ds4q_type target,
+                                    const imatrix_store *imatrix,
+                                    bool exact_rank) {
     tensor_entry *te = db_tensor(db, hf_name, NULL);
-    check_reversed_shape(gguf_name, &te->info, tmpl);
+    if (exact_rank) check_reversed_shape_exact(gguf_name, &te->info, tmpl);
+    else check_reversed_shape(gguf_name, &te->info, tmpl);
     if (target == DS4Q_TYPE_I32) {
         st_value sv = db_read(db, hf_name);
         byte_buf b = i64_to_i32(&sv);
         st_value_free(&sv);
-        free(hf_name);
         return b;
     }
     if (!is_quantizable_target(target)) die("unsupported regular target type");
@@ -1685,31 +1228,14 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const tens
     const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
     free(f32);
-    free(hf_name);
     return b;
 }
 
-static byte_buf generate_regular_gguf(const gguf_file *src, const char *gguf_name,
-                                      const tensor_meta *tmpl, ds4q_type target,
-                                      const imatrix_store *imatrix) {
-    const tensor_meta *src_meta = gguf_find_tensor(src, gguf_name);
-    check_same_gguf_shape(gguf_name, src_meta, tmpl);
-    if (target == src_meta->type) {
-        byte_buf b = read_gguf_tensor_data(src, src->path, gguf_name);
-        if (b.size != tensor_nbytes(target, tmpl->ne, tmpl->n_dims)) die("source copy size mismatch");
-        return b;
-    }
-    if (target == DS4Q_TYPE_I32) die("cannot convert GGUF source tensor to I32");
-    if (!is_quantizable_target(target)) die("unsupported regular target type");
-
-    byte_buf raw = read_gguf_tensor_data(src, src->path, gguf_name);
-    int64_t n = 0;
-    float *f32 = gguf_tensor_to_f32(&raw, src_meta, &n);
-    free(raw.data);
-    const char *names[1] = { gguf_name };
-    const float *imat = imatrix_find(imatrix, names, 1, tmpl->ne[0], -1, 0);
-    byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
-    free(f32);
+static byte_buf generate_regular(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                                 ds4q_type target, const imatrix_store *imatrix) {
+    char *hf_name = hf_name_for_regular(gguf_name);
+    byte_buf b = generate_regular_hf(db, gguf_name, hf_name, tmpl, target, imatrix, false);
+    free(hf_name);
     return b;
 }
 
@@ -1733,16 +1259,27 @@ typedef struct {
 
 static void generate_one_expert(expert_job *j, int xid) {
     char prefix[256];
-    expert_hf_prefix(prefix, sizeof(prefix), &j->expert, xid, j->wid);
+    if (j->expert.scope == EXP_SCOPE_MTP) {
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    } else {
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    }
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
     snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
     st_value w = db_read(j->db, weight_name);
-    st_value s = db_read(j->db, scale_name);
-    if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
     int64_t n = 0;
-    float *f32 = dequant_fp4_weight(&w, &s, &n);
+    float *f32 = NULL;
+    if (strcmp(w.dtype, "I8") == 0) {
+        st_value s = db_read(j->db, scale_name);
+        if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
+        f32 = dequant_fp4_weight(&w, &s, &n);
+        st_value_free(&s);
+    } else {
+        if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] != j->ncols) die("expert shape mismatch");
+        f32 = tensor_to_f32(&w, &n);
+    }
     const char *names[3] = { j->gguf_name, weight_name, NULL };
     const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
@@ -1751,7 +1288,6 @@ static void generate_one_expert(expert_job *j, int xid) {
     free(q.data);
     free(f32);
     st_value_free(&w);
-    st_value_free(&s);
 }
 
 static void *expert_worker(void *arg) {
@@ -1765,7 +1301,8 @@ static void *expert_worker(void *arg) {
         pthread_mutex_lock(&j->lock);
         int done = ++j->done;
         if (done % 32 == 0 || done == j->n_experts) {
-            fprintf(stderr, "generate_expert_tensor: layer %d %s %d/%d experts\n",
+            fprintf(stderr, "generate_expert_tensor: %s %d %s %d/%d experts\n",
+                    j->expert.scope == EXP_SCOPE_MTP ? "stage" : "layer",
                     j->expert.layer, j->wid, done, j->n_experts);
         }
         pthread_mutex_unlock(&j->lock);
@@ -1773,9 +1310,9 @@ static void *expert_worker(void *arg) {
     return NULL;
 }
 
-static byte_buf generate_expert_hf(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
-                                   ds4q_type target, int n_experts, int n_threads,
-                                   const imatrix_store *imatrix) {
+static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
+                                ds4q_type target, int n_experts, int n_threads,
+                                const imatrix_store *imatrix) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
@@ -1788,7 +1325,8 @@ static byte_buf generate_expert_hf(st_db *db, const char *gguf_name, const tenso
     int worker_count = n_threads > 0 ? n_threads : 8;
     if (worker_count < 1) worker_count = 1;
     if (worker_count > n_experts) worker_count = n_experts;
-    fprintf(stderr, "generate_expert_tensor: layer %d %s using %d worker%s\n",
+    fprintf(stderr, "generate_expert_tensor: %s %d %s using %d worker%s\n",
+            e.scope == EXP_SCOPE_MTP ? "stage" : "layer",
             e.layer, wid, worker_count, worker_count == 1 ? "" : "s");
     expert_job job = {
         .db = db, .gguf_name = gguf_name, .tmpl = tmpl, .target = target,
@@ -1805,118 +1343,13 @@ static byte_buf generate_expert_hf(st_db *db, const char *gguf_name, const tenso
     return out;
 }
 
-typedef struct {
-    const gguf_file *src;
-    const char *gguf_name;
-    const tensor_meta *src_meta;
-    const tensor_meta *tmpl;
-    ds4q_type target;
-    int n_experts;
-    const imatrix_store *imatrix;
-    expert_tensor expert;
-    int64_t ncols;
-    int64_t nrows;
-    size_t src_per_expert;
-    size_t dst_per_expert;
-    byte_buf *out;
-    int next;
-    int done;
-    pthread_mutex_t lock;
-} gguf_expert_job;
-
-static void generate_one_expert_gguf(gguf_expert_job *j, int xid) {
-    byte_buf raw = read_gguf_tensor_data_range(j->src, j->src_meta,
-                                               (uint64_t)xid * (uint64_t)j->src_per_expert,
-                                               j->src_per_expert);
-    tensor_meta one = *j->src_meta;
-    one.n_dims = 2;
-    one.ne[0] = j->ncols;
-    one.ne[1] = j->nrows;
-    for (int i = 2; i < DS4Q_MAX_DIMS; i++) one.ne[i] = 1;
-    one.size = j->src_per_expert;
-
-    int64_t n = 0;
-    float *f32 = gguf_tensor_to_f32(&raw, &one, &n);
-    free(raw.data);
-    const char *names[1] = { j->gguf_name };
-    const float *imat = imatrix_find(j->imatrix, names, 1, j->ncols, xid, j->n_experts);
-    byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
-    if (q.size != j->dst_per_expert) die("expert quantized size mismatch");
-    memcpy(j->out->data + (size_t)xid * j->dst_per_expert, q.data, q.size);
-    free(q.data);
-    free(f32);
-}
-
-static void *gguf_expert_worker(void *arg) {
-    gguf_expert_job *j = arg;
-    for (;;) {
-        pthread_mutex_lock(&j->lock);
-        int xid = j->next++;
-        pthread_mutex_unlock(&j->lock);
-        if (xid >= j->n_experts) break;
-        generate_one_expert_gguf(j, xid);
-        pthread_mutex_lock(&j->lock);
-        int done = ++j->done;
-        if (done % 32 == 0 || done == j->n_experts) {
-            fprintf(stderr, "generate_expert_tensor_from_gguf: layer %d %d/%d experts\n",
-                    j->expert.layer, done, j->n_experts);
-        }
-        pthread_mutex_unlock(&j->lock);
-    }
-    return NULL;
-}
-
-static byte_buf generate_expert_gguf(const gguf_file *src, const char *gguf_name, const tensor_meta *tmpl,
-                                     ds4q_type target, int n_experts, int n_threads,
-                                     const imatrix_store *imatrix) {
-    expert_tensor e = parse_expert_tensor(gguf_name);
-    if (!e.is_expert) die("not an expert tensor");
-    if (!is_quantizable_target(target)) die("unsupported expert target type");
-    const tensor_meta *src_meta = gguf_find_tensor(src, gguf_name);
-    check_same_gguf_shape(gguf_name, src_meta, tmpl);
-    if (src_meta->n_dims < 3 || src_meta->ne[2] != n_experts) die("source expert tensor shape mismatch");
-    const int64_t ncols = tmpl->ne[0];
-    const int64_t nrows = tmpl->ne[1];
-    const size_t src_per_expert = (size_t)nrows * ds4q_row_size(src_meta->type, ncols);
-    const size_t dst_per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
-    if (src_per_expert * (size_t)n_experts != src_meta->size) die("source expert size mismatch");
-
-    byte_buf out = { .size = dst_per_expert * (size_t)n_experts, .data = xmalloc(dst_per_expert * (size_t)n_experts) };
-    ds4q_quantize_init(target);
-    int worker_count = n_threads > 0 ? n_threads : 8;
-    if (worker_count < 1) worker_count = 1;
-    if (worker_count > n_experts) worker_count = n_experts;
-    fprintf(stderr, "generate_expert_tensor_from_gguf: layer %d using %d worker%s\n",
-            e.layer, worker_count, worker_count == 1 ? "" : "s");
-    gguf_expert_job job = {
-        .src = src, .gguf_name = gguf_name, .src_meta = src_meta, .tmpl = tmpl, .target = target,
-        .n_experts = n_experts, .imatrix = imatrix, .expert = e,
-        .ncols = ncols, .nrows = nrows, .src_per_expert = src_per_expert,
-        .dst_per_expert = dst_per_expert, .out = &out,
-    };
-    pthread_mutex_init(&job.lock, NULL);
-    pthread_t *threads = xcalloc((size_t)worker_count, sizeof(threads[0]));
-    for (int i = 1; i < worker_count; i++) pthread_create(&threads[i], NULL, gguf_expert_worker, &job);
-    gguf_expert_worker(&job);
-    for (int i = 1; i < worker_count; i++) pthread_join(threads[i], NULL);
-    pthread_mutex_destroy(&job.lock);
-    free(threads);
-    return out;
-}
-
-static byte_buf generate_tensor(model_source *source, const char *name, const tensor_meta *tmpl,
+static byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
                                 const imatrix_store *imatrix) {
     if (parse_expert_tensor(name).is_expert) {
-        if (source->kind == MODEL_SOURCE_GGUF) {
-            return generate_expert_gguf(source->gguf, name, tmpl, target, n_experts, n_threads, imatrix);
-        }
-        return generate_expert_hf(source->hf, name, tmpl, target, n_experts, n_threads, imatrix);
+        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
     }
-    if (source->kind == MODEL_SOURCE_GGUF) {
-        return generate_regular_gguf(source->gguf, name, tmpl, target, imatrix);
-    }
-    return generate_regular_hf(source->hf, name, tmpl, target, imatrix);
+    return generate_regular(db, name, tmpl, target, imatrix);
 }
 
 /* =====
@@ -1932,6 +1365,19 @@ typedef struct {
     size_t end;
 } byte_span;
 
+typedef struct {
+    char *path;
+    uint32_t version;
+    uint64_t n_kv;
+    uint64_t n_tensors;
+    uint8_t *kv_raw;
+    size_t kv_raw_len;
+    size_t alignment;
+    int n_experts;
+    size_t data_offset;
+    tensor_meta *tensors;
+    hmap tensor_map;
+} gguf_file;
 
 typedef struct {
     tensor_meta *tensors;
@@ -1941,8 +1387,6 @@ typedef struct {
     size_t data_offset;
     size_t tensor_bytes;
     size_t alignment;
-    bool write_dspark;
-    dspark_metadata dspark;
 } output_context;
 
 static size_t gguf_scalar_size(uint32_t type) {
@@ -2022,11 +1466,6 @@ static bool is_imatrix_kv_key(const char *key) {
     return str_starts(key, "quantize.imatrix.");
 }
 
-
-static size_t extra_alignment_kv_size(void) {
-    return gguf_string_size(DS4_KV_GENERAL_ALIGNMENT) + 4 + 4;
-}
-
 static size_t extra_imatrix_kv_size(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     size_t n = 0;
@@ -2040,13 +1479,6 @@ static size_t extra_imatrix_kv_size(const imatrix_store *im) {
 static uint64_t extra_imatrix_kv_count(const imatrix_store *im) {
     if (!imatrix_enabled(im)) return 0;
     return 2 + (im->dataset ? 1 : 0) + (im->chunks > 0 ? 1 : 0);
-}
-
-static void write_alignment_kv(FILE *fp, size_t alignment) {
-    if (alignment > UINT32_MAX) die("GGUF alignment does not fit in uint32");
-    write_gguf_string(fp, DS4_KV_GENERAL_ALIGNMENT);
-    write_u32(fp, GGUF_TYPE_UINT32);
-    write_u32(fp, (uint32_t)alignment);
 }
 
 static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
@@ -2071,63 +1503,7 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     }
 }
 
-
-static size_t gguf_kv_scalar_size(uint32_t type) {
-    return 4 + gguf_scalar_size(type);
-}
-
-
-static size_t gguf_kv_u32_size(const char *key) {
-    return gguf_string_size(key) + gguf_kv_scalar_size(GGUF_TYPE_UINT32);
-}
-
-static uint64_t extra_dspark_kv_count(bool enabled) {
-    if (!enabled) return 0;
-    return 4 + DS4_DSPARK_TARGET_LAYER_COUNT;
-}
-
-static size_t extra_dspark_kv_size(bool enabled) {
-    if (!enabled) return 0;
-    size_t n = 0;
-    n += gguf_kv_u32_size(DS4_KV_DSPARK_N_MTP_LAYERS);
-    n += gguf_kv_u32_size(DS4_KV_DSPARK_BLOCK_SIZE);
-    n += gguf_kv_u32_size(DS4_KV_DSPARK_NOISE_TOKEN_ID);
-    n += gguf_kv_u32_size(DS4_KV_DSPARK_MARKOV_RANK);
-    for (int i = 0; i < DS4_DSPARK_TARGET_LAYER_COUNT; i++) {
-        char key[64];
-        snprintf(key, sizeof(key), "%s.%d", DS4_KV_DSPARK_TARGET_LAYER_ID, i);
-        n += gguf_kv_u32_size(key);
-    }
-    return n;
-}
-
-static void write_dspark_kvs(FILE *fp, const dspark_metadata *m) {
-    write_gguf_string(fp, DS4_KV_DSPARK_N_MTP_LAYERS);
-    write_u32(fp, GGUF_TYPE_UINT32);
-    write_u32(fp, m->n_mtp_layers);
-
-    write_gguf_string(fp, DS4_KV_DSPARK_BLOCK_SIZE);
-    write_u32(fp, GGUF_TYPE_UINT32);
-    write_u32(fp, m->block_size);
-
-    write_gguf_string(fp, DS4_KV_DSPARK_NOISE_TOKEN_ID);
-    write_u32(fp, GGUF_TYPE_UINT32);
-    write_u32(fp, m->noise_token_id);
-
-    write_gguf_string(fp, DS4_KV_DSPARK_MARKOV_RANK);
-    write_u32(fp, GGUF_TYPE_UINT32);
-    write_u32(fp, m->markov_rank);
-
-    for (int i = 0; i < DS4_DSPARK_TARGET_LAYER_COUNT; i++) {
-        char key[64];
-        snprintf(key, sizeof(key), "%s.%d", DS4_KV_DSPARK_TARGET_LAYER_ID, i);
-        write_gguf_string(fp, key);
-        write_u32(fp, GGUF_TYPE_UINT32);
-        write_u32(fp, m->target_layer_ids[i]);
-    }
-}
-
-static gguf_file load_gguf_metadata(const char *path, bool drop_dspark_kvs) {
+static gguf_file load_gguf_metadata(const char *path) {
     gguf_file g = {0};
     g.path = xstrdup(path);
     FILE *fp = fopen(path, "rb");
@@ -2166,12 +1542,12 @@ static gguf_file load_gguf_metadata(const char *path, bool drop_dspark_kvs) {
         if (rec_end < 0 || rec_end < rec_start) die("GGUF ftell failed");
 
         /*
-         * Template GGUFs may already carry provenance from a previous run.
-         * Always drop imatrix keys because the current run rewrites them.
-         * Drop DSpark keys only when this run will rewrite DSpark metadata;
-         * source/template reuse without DSpark rewriting must preserve them.
+         * Template GGUFs may already carry imatrix provenance from a previous
+         * quantization.  Drop those keys and write the current run's keys later,
+         * otherwise the output can contain duplicate GGUF metadata with stale
+         * and new values.
          */
-        if (!is_imatrix_kv_key(key) && !(drop_dspark_kvs && is_dspark_kv_key(key))) {
+        if (!is_imatrix_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -2221,149 +1597,6 @@ static gguf_file load_gguf_metadata(const char *path, bool drop_dspark_kvs) {
     return g;
 }
 
-static void gguf_replace_tensors_start(gguf_file *g) {
-    for (uint64_t i = 0; i < g->n_tensors; i++) free(g->tensors[i].name);
-    free(g->tensors);
-    g->tensors = NULL;
-    g->n_tensors = 0;
-    g->data_offset = 0;
-    hmap_free(&g->tensor_map);
-}
-
-static void gguf_add_tensor_meta(gguf_file *g, const char *name, int n_dims, const int64_t *ne, ds4q_type type) {
-    g->tensors = xrealloc(g->tensors, (size_t)(g->n_tensors + 1) * sizeof(g->tensors[0]));
-    tensor_meta *t = &g->tensors[g->n_tensors++];
-    memset(t, 0, sizeof(*t));
-    t->name = xstrdup(name);
-    t->n_dims = n_dims;
-    for (int i = 0; i < n_dims; i++) t->ne[i] = ne[i];
-    t->type = type;
-    t->size = tensor_nbytes(type, t->ne, t->n_dims);
-}
-
-static ds4q_type template_type_for_hf_dtype(const char *dtype) {
-    if (strcmp(dtype, "F32") == 0) return DS4Q_TYPE_F32;
-    if (strcmp(dtype, "BF16") == 0) return DS4Q_TYPE_BF16;
-    if (strcmp(dtype, "F8_E4M3") == 0) return DS4Q_TYPE_F16;
-    if (strcmp(dtype, "I8") == 0) return DS4Q_TYPE_Q4_K;
-    if (strcmp(dtype, "I64") == 0) return DS4Q_TYPE_I32;
-    fprintf(stderr, "error: unsupported HF dtype for DSpark template: %s\n", dtype);
-    exit(1);
-}
-
-static bool is_dspark_required_stage_tensor(const char *rest) {
-    return strcmp(rest, "hc_attn_fn.weight") == 0 ||
-           strcmp(rest, "hc_attn_scale.weight") == 0 ||
-           strcmp(rest, "hc_attn_base.weight") == 0 ||
-           strcmp(rest, "attn_norm.weight") == 0 ||
-           strcmp(rest, "attn_q_a.weight") == 0 ||
-           strcmp(rest, "attn_q_a_norm.weight") == 0 ||
-           strcmp(rest, "attn_q_b.weight") == 0 ||
-           strcmp(rest, "attn_kv.weight") == 0 ||
-           strcmp(rest, "attn_kv_a_norm.weight") == 0 ||
-           strcmp(rest, "attn_sinks.weight") == 0 ||
-           strcmp(rest, "attn_output_a.weight") == 0 ||
-           strcmp(rest, "attn_output_b.weight") == 0 ||
-           strcmp(rest, "hc_ffn_fn.weight") == 0 ||
-           strcmp(rest, "hc_ffn_scale.weight") == 0 ||
-           strcmp(rest, "hc_ffn_base.weight") == 0 ||
-           strcmp(rest, "ffn_norm.weight") == 0 ||
-           strcmp(rest, "ffn_gate_inp.weight") == 0 ||
-           strcmp(rest, "exp_probs_b.bias") == 0 ||
-           strcmp(rest, "ffn_gate_shexp.weight") == 0 ||
-           strcmp(rest, "ffn_up_shexp.weight") == 0 ||
-           strcmp(rest, "ffn_down_shexp.weight") == 0;
-}
-
-static bool is_dspark_routed_stage_tensor(const char *rest) {
-    return strcmp(rest, "ffn_gate_exps.weight") == 0 ||
-           strcmp(rest, "ffn_up_exps.weight") == 0 ||
-           strcmp(rest, "ffn_down_exps.weight") == 0;
-}
-
-static bool is_dspark_loader_f32_tensor(const char *name) {
-    return strstr(name, ".main_norm.weight") ||
-           (strstr(name, ".norm.weight") && str_starts(name, "mtp.")) ||
-           strstr(name, ".attn_norm.weight") ||
-           strstr(name, ".attn_q_a_norm.weight") ||
-           strstr(name, ".attn_kv_a_norm.weight") ||
-           strstr(name, ".hc_attn_scale.weight") ||
-           strstr(name, ".hc_attn_base.weight") ||
-           strstr(name, ".attn_sinks.weight") ||
-           strstr(name, ".hc_ffn_scale.weight") ||
-           strstr(name, ".hc_ffn_base.weight") ||
-           strstr(name, ".ffn_norm.weight") ||
-           strstr(name, ".exp_probs_b.bias") ||
-           strstr(name, ".hc_head_base.weight") ||
-           strstr(name, ".hc_head_scale.weight") ||
-           strstr(name, ".confidence_head.proj.weight");
-}
-
-static ds4q_type dspark_template_for_name(const char *name, ds4q_type hf_type) {
-    if (is_dspark_loader_f32_tensor(name)) return DS4Q_TYPE_F32;
-    if (strstr(name, ".markov_head.markov_w1.weight") ||
-        strstr(name, ".markov_head.markov_w2.weight")) return DS4Q_TYPE_F16;
-    if (strstr(name, ".hc_head_fn.weight") ||
-        strstr(name, ".hc_attn_fn.weight") ||
-        strstr(name, ".hc_ffn_fn.weight") ||
-        strstr(name, ".ffn_gate_inp.weight")) return DS4Q_TYPE_F16;
-    if (is_attention_projection(name) || is_shared_expert(name)) return DS4Q_TYPE_Q8_0;
-    if (parse_expert_tensor(name).is_expert) return DS4Q_TYPE_Q4_K;
-    return hf_type;
-}
-
-static void gguf_add_regular_from_hf(gguf_file *g, st_db *db, const char *gguf_name) {
-    char *hf_name = hf_name_for_regular(gguf_name);
-    tensor_entry *te = db_tensor(db, hf_name, NULL);
-    int nd = te->info.n_dims;
-    int64_t ne[DS4Q_MAX_DIMS] = {0};
-    for (int i = 0; i < nd; i++) ne[i] = te->info.shape[nd - 1 - i];
-    ds4q_type hf_type = template_type_for_hf_dtype(te->info.dtype);
-    gguf_add_tensor_meta(g, gguf_name, nd, ne, dspark_template_for_name(gguf_name, hf_type));
-    free(hf_name);
-}
-
-static void gguf_add_expert_from_hf(gguf_file *g, st_db *db, const char *gguf_name, int n_experts) {
-    expert_tensor e = parse_expert_tensor(gguf_name);
-    if (!e.is_expert) die("internal error: expected routed expert tensor");
-    char prefix[256];
-    expert_hf_prefix(prefix, sizeof(prefix), &e, 0, expert_part_name(e.part));
-    char weight_name[320];
-    snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
-    tensor_entry *te = db_tensor(db, weight_name, NULL);
-    if (te->info.n_dims != 2) die("bad DSpark routed expert rank");
-    int64_t ne[3] = { te->info.shape[1] * 2, te->info.shape[0], n_experts };
-    gguf_add_tensor_meta(g, gguf_name, 3, ne, DS4Q_TYPE_Q4_K);
-}
-
-static void gguf_add_dspark_stage(gguf_file *g, st_db *db, uint32_t stage, int n_experts) {
-    char name[256];
-    for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
-        const char *rest = layer_map[i].gguf;
-        if (!is_dspark_required_stage_tensor(rest) && !is_dspark_routed_stage_tensor(rest)) continue;
-        snprintf(name, sizeof(name), "mtp.%u.%s", stage, rest);
-        if (is_dspark_routed_stage_tensor(rest)) gguf_add_expert_from_hf(g, db, name, n_experts);
-        else gguf_add_regular_from_hf(g, db, name);
-    }
-}
-
-static void gguf_use_dspark_mtp_template(gguf_file *g, st_db *db, int n_experts, dspark_hf_layout layout) {
-    if (layout == DS4_DSPARK_HF_NONE) die("--dspark-only requires DSpark HF tensors");
-    gguf_replace_tensors_start(g);
-    gguf_add_regular_from_hf(g, db, "mtp.0.main_proj.weight");
-    gguf_add_regular_from_hf(g, db, "mtp.0.main_norm.weight");
-    for (uint32_t s = 0; s < DS4_DSPARK_TARGET_LAYER_COUNT; s++) gguf_add_dspark_stage(g, db, s, n_experts);
-    gguf_add_regular_from_hf(g, db, "mtp.2.norm.weight");
-    gguf_add_regular_from_hf(g, db, "mtp.2.hc_head_base.weight");
-    gguf_add_regular_from_hf(g, db, "mtp.2.hc_head_fn.weight");
-    gguf_add_regular_from_hf(g, db, "mtp.2.hc_head_scale.weight");
-    if (layout == DS4_DSPARK_HF_MARKOV) {
-        gguf_add_regular_from_hf(g, db, "mtp.2.markov_head.markov_w1.weight");
-        gguf_add_regular_from_hf(g, db, "mtp.2.markov_head.markov_w2.weight");
-        gguf_add_regular_from_hf(g, db, "mtp.2.confidence_head.proj.weight");
-    }
-}
-
 static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
     int idx = hmap_get(&g->tensor_map, name);
     if (idx < 0) {
@@ -2380,20 +1613,6 @@ static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, cons
     return b;
 }
 
-static byte_buf read_gguf_tensor_data_range(const gguf_file *g, const tensor_meta *t,
-                                            uint64_t rel_offset, size_t size) {
-    if (rel_offset > t->size || size > t->size - rel_offset) die("GGUF tensor range out of bounds");
-    byte_buf b = { .size = size, .data = xmalloc(size) };
-    FILE *fp = fopen(g->path, "rb");
-    if (!fp) die_errno("open GGUF", g->path);
-    if (fseeko(fp, (off_t)(g->data_offset + t->old_offset + rel_offset), SEEK_SET) != 0) {
-        die_errno("seek GGUF", g->path);
-    }
-    if (size && fread(b.data, 1, size, fp) != size) die_errno("read GGUF tensor range", g->path);
-    fclose(fp);
-    return b;
-}
-
 static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; i++) {
@@ -2403,15 +1622,11 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
-static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
-                                           const imatrix_store *im, bool write_dspark,
-                                           const dspark_metadata *dspark) {
+static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = 1 + extra_imatrix_kv_count(im) + extra_dspark_kv_count(write_dspark);
+    out.n_kv_extra = extra_imatrix_kv_count(im);
     out.alignment = tmpl->alignment;
-    out.write_dspark = write_dspark;
-    if (write_dspark && dspark) out.dspark = *dspark;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
     size_t off = 0;
@@ -2431,9 +1646,7 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
-                    extra_alignment_kv_size() + extra_imatrix_kv_size(im) +
-                    extra_dspark_kv_size(write_dspark) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -2447,7 +1660,7 @@ static void write_padding(FILE *fp, size_t n) {
     }
 }
 
-static void write_full_gguf(model_source *source, const gguf_file *tmpl, const output_context *out_ctx,
+static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
                             const imatrix_store *imatrix) {
     FILE *fp = fopen(out_path, "wb");
@@ -2457,9 +1670,7 @@ static void write_full_gguf(model_source *source, const gguf_file *tmpl, const o
     write_u64(fp, tmpl->n_tensors);
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
-    write_alignment_kv(fp, out_ctx->alignment);
     write_imatrix_kvs(fp, imatrix);
-    if (out_ctx->write_dspark) write_dspark_kvs(fp, &out_ctx->dspark);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -2477,91 +1688,19 @@ static void write_full_gguf(model_source *source, const gguf_file *tmpl, const o
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(source, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
             exit(1);
         }
-        if (fwrite(data.data, 1, data.size, fp) != data.size) die("write tensor data failed");
-        const size_t padded = ds4q_pad(data.size, out_ctx->alignment);
+        if (fwrite(data.data, 1, data.size, fp) != data.size) die_errno("write tensor", out_path);
+        size_t padded = ds4q_pad(data.size, out_ctx->alignment);
         write_padding(fp, padded - data.size);
+        fprintf(stderr, "       generated %.2f MiB\n", (double)data.size / 1048576.0);
         free(data.data);
     }
     fclose(fp);
-}
-
-static void free_gguf_file(gguf_file *g);
-
-static uint64_t count_gguf_kv_prefix_in_file(const char *path, const char *prefix) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) die_errno("open GGUF", path);
-    char magic[4];
-    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) || memcmp(magic, "GGUF", 4) != 0) {
-        die("bad GGUF self-test file");
-    }
-    (void)read_u32_le_fp(fp, "GGUF version");
-    (void)read_u64_le_fp(fp, "GGUF tensor count");
-    uint64_t n_kv = read_u64_le_fp(fp, "GGUF KV count");
-    uint64_t count = 0;
-    for (uint64_t i = 0; i < n_kv; i++) {
-        char *key = read_gguf_string_fp(fp);
-        uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
-        if (str_starts(key, prefix)) count++;
-        skip_gguf_value_fp(fp, type);
-        free(key);
-    }
-    fclose(fp);
-    return count;
-}
-
-static void write_dspark_metadata_template(const char *path, const dspark_metadata *m) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) die_errno("create GGUF self-test template", path);
-    if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
-    write_u32(fp, 3);
-    write_u64(fp, 0);
-    write_u64(fp, extra_dspark_kv_count(true));
-    write_dspark_kvs(fp, m);
-    if (fclose(fp) != 0) die_errno("close GGUF self-test template", path);
-}
-
-static void self_test_dspark_kv_rewrite_no_duplicates(void) {
-    char tmpl_path[] = "/tmp/ds4q-dspark-template-XXXXXX";
-    int tmpl_fd = mkstemp(tmpl_path);
-    if (tmpl_fd < 0) die_errno("mkstemp", tmpl_path);
-    close(tmpl_fd);
-    char out_path[] = "/tmp/ds4q-dspark-output-XXXXXX";
-    int out_fd = mkstemp(out_path);
-    if (out_fd < 0) die_errno("mkstemp", out_path);
-    close(out_fd);
-
-    dspark_metadata old_meta = dspark_metadata_defaults();
-    old_meta.markov_rank = 64;
-    write_dspark_metadata_template(tmpl_path, &old_meta);
-
-    gguf_file preserved = load_gguf_metadata(tmpl_path, false);
-    if (preserved.n_kv != extra_dspark_kv_count(true)) {
-        die("DSpark metadata should be preserved when not rewriting it");
-    }
-    free_gguf_file(&preserved);
-
-    gguf_file tmpl = load_gguf_metadata(tmpl_path, true);
-    if (tmpl.n_kv != 0) die("DSpark metadata should be dropped before rewrite");
-    quant_policy policy = {0};
-    imatrix_store im = {0};
-    dspark_metadata new_meta = dspark_metadata_defaults();
-    new_meta.markov_rank = 0;
-    output_context out = build_output_context(&tmpl, &policy, &im, true, &new_meta);
-    write_full_gguf(NULL, &tmpl, &out, out_path, 0, 1, &im);
-    if (count_gguf_kv_prefix_in_file(out_path, "deepseek4.dspark.") != extra_dspark_kv_count(true)) {
-        die("rewritten DSpark metadata should not contain duplicate keys");
-    }
-
-    free(out.tensors);
-    free_gguf_file(&tmpl);
-    unlink(tmpl_path);
-    unlink(out_path);
 }
 
 static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
@@ -2587,9 +1726,32 @@ static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
  * CLI
  */
 
+#define DSPARK_DEFAULT_BLOCK_SIZE 5u
+#define DSPARK_DEFAULT_MARKOV_RANK 256u
+#define DSPARK_DEFAULT_NOISE_TOKEN_ID 128799u
+#define DSPARK_MAX_TARGET_LAYERS 8
+
+typedef struct {
+    uint32_t block_size;
+    uint32_t markov_rank;
+    uint32_t noise_token_id;
+    uint32_t target_layers[DSPARK_MAX_TARGET_LAYERS];
+    uint32_t target_layer_count;
+} dspark_support_options;
+
+static void dspark_support_defaults(dspark_support_options *o) {
+    memset(o, 0, sizeof(*o));
+    o->block_size = DSPARK_DEFAULT_BLOCK_SIZE;
+    o->markov_rank = DSPARK_DEFAULT_MARKOV_RANK;
+    o->noise_token_id = DSPARK_DEFAULT_NOISE_TOKEN_ID;
+    o->target_layers[0] = 40;
+    o->target_layers[1] = 41;
+    o->target_layers[2] = 42;
+    o->target_layer_count = 3;
+}
+
 typedef struct {
     char *hf_dir;
-    char *source_gguf;
     char *template_gguf;
     char *out_gguf;
     char *compare_gguf;
@@ -2598,28 +1760,719 @@ typedef struct {
     quant_policy policy;
     int n_experts;
     int n_threads;
-    size_t alignment;
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
-    bool dspark_only;
-    bool self_test_dspark_map;
+    bool dspark_manifest;
+    bool dspark_support;
+    dspark_support_options dspark;
 } params;
 
+typedef struct {
+    char **names;
+    int len;
+    int cap;
+} str_list;
+
+static void str_list_push(str_list *l, char *s) {
+    if (l->len == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 4096;
+        l->names = xrealloc(l->names, (size_t)l->cap * sizeof(l->names[0]));
+    }
+    l->names[l->len++] = s;
+}
+
+static void str_list_free(str_list *l) {
+    for (int i = 0; i < l->len; i++) free(l->names[i]);
+    free(l->names);
+    memset(l, 0, sizeof(*l));
+}
+
+static str_list load_index_weight_names(const char *hf_dir) {
+    char *index_path = path_join(hf_dir, "model.safetensors.index.json");
+    size_t len = 0;
+    char *text = read_file(index_path, &len);
+    json_doc d = json_parse_text(text, len);
+    int weight_map = json_obj_get(&d, 0, "weight_map");
+    if (weight_map < 0 || d.v[weight_map].type != JT_OBJECT) {
+        die("safetensors index has no weight_map");
+    }
+
+    str_list names = {0};
+    for (int k = 1; k < d.len; k++) {
+        if (d.v[k].parent != weight_map || d.v[k].type != JT_STRING) continue;
+        str_list_push(&names, json_strdup_tok(&d, k));
+    }
+
+    free(index_path);
+    free(text);
+    free(d.v);
+    return names;
+}
+
+typedef struct {
+    const char *hf;
+    const char *gguf;
+    const char *action;
+} dspark_name_rule;
+
+static char *fmt_stage_name(int stage, const char *suffix) {
+    int n = snprintf(NULL, 0, "mtp.%d.%s", stage, suffix);
+    if (n < 0) die("snprintf failed");
+    char *out = xmalloc((size_t)n + 1);
+    snprintf(out, (size_t)n + 1, "mtp.%d.%s", stage, suffix);
+    return out;
+}
+
+static bool parse_mtp_name(const char *name, int *stage, const char **rest) {
+    if (!str_starts(name, "mtp.")) return false;
+    char *end = NULL;
+    long v = strtol(name + 4, &end, 10);
+    if (end == name + 4 || !end || *end != '.' || v < 0 || v > INT_MAX) return false;
+    *stage = (int)v;
+    *rest = end + 1;
+    return true;
+}
+
+static const dspark_name_rule dspark_stage_rules[] = {
+    {"hc_attn_base", "hc_attn_base.weight", "emit"},
+    {"hc_attn_fn", "hc_attn_fn.weight", "emit"},
+    {"hc_attn_scale", "hc_attn_scale.weight", "emit"},
+    {"hc_ffn_base", "hc_ffn_base.weight", "emit"},
+    {"hc_ffn_fn", "hc_ffn_fn.weight", "emit"},
+    {"hc_ffn_scale", "hc_ffn_scale.weight", "emit"},
+    {"hc_head_base", "hc_head_base.weight", "emit"},
+    {"hc_head_fn", "hc_head_fn.weight", "emit"},
+    {"hc_head_scale", "hc_head_scale.weight", "emit"},
+
+    {"attn.attn_sink", "attn_sinks.weight", "emit"},
+    {"attn.wq_a.weight", "attn_q_a.weight", "emit"},
+    {"attn.wq_a.scale", "attn_q_a.weight", "consume_scale"},
+    {"attn.q_norm.weight", "attn_q_a_norm.weight", "emit"},
+    {"attn.wq_b.weight", "attn_q_b.weight", "emit"},
+    {"attn.wq_b.scale", "attn_q_b.weight", "consume_scale"},
+    {"attn.wkv.weight", "attn_kv.weight", "emit"},
+    {"attn.wkv.scale", "attn_kv.weight", "consume_scale"},
+    {"attn.kv_norm.weight", "attn_kv_a_norm.weight", "emit"},
+    {"attn.wo_a.weight", "attn_output_a.weight", "emit"},
+    {"attn.wo_a.scale", "attn_output_a.weight", "consume_scale"},
+    {"attn.wo_b.weight", "attn_output_b.weight", "emit"},
+    {"attn.wo_b.scale", "attn_output_b.weight", "consume_scale"},
+    {"attn_norm.weight", "attn_norm.weight", "emit"},
+
+    {"ffn.gate.weight", "ffn_gate_inp.weight", "emit"},
+    {"ffn.gate.bias", "exp_probs_b.bias", "emit"},
+    {"ffn_norm.weight", "ffn_norm.weight", "emit"},
+    {"ffn.shared_experts.w1.weight", "ffn_gate_shexp.weight", "emit"},
+    {"ffn.shared_experts.w1.scale", "ffn_gate_shexp.weight", "consume_scale"},
+    {"ffn.shared_experts.w3.weight", "ffn_up_shexp.weight", "emit"},
+    {"ffn.shared_experts.w3.scale", "ffn_up_shexp.weight", "consume_scale"},
+    {"ffn.shared_experts.w2.weight", "ffn_down_shexp.weight", "emit"},
+    {"ffn.shared_experts.w2.scale", "ffn_down_shexp.weight", "consume_scale"},
+
+    {"main_proj.weight", "main_proj.weight", "emit"},
+    {"main_proj.scale", "main_proj.weight", "consume_scale"},
+    {"main_norm.weight", "main_norm.weight", "emit"},
+    {"norm.weight", "norm.weight", "emit"},
+    {"markov_head.markov_w1.weight", "markov_head.markov_w1.weight", "emit"},
+    {"markov_head.markov_w2.weight", "markov_head.markov_w2.weight", "emit"},
+    {"confidence_head.proj.weight", "confidence_head.proj.weight", "emit"},
+};
+
+static char *map_dspark_hf_name(const char *hf_name, const char **action_out) {
+    int stage = 0;
+    const char *rest = NULL;
+    if (!parse_mtp_name(hf_name, &stage, &rest)) {
+        *action_out = "skip_non_dspark";
+        return NULL;
+    }
+
+    for (size_t i = 0; i < sizeof(dspark_stage_rules) / sizeof(dspark_stage_rules[0]); i++) {
+        if (strcmp(rest, dspark_stage_rules[i].hf) == 0) {
+            *action_out = dspark_stage_rules[i].action;
+            return fmt_stage_name(stage, dspark_stage_rules[i].gguf);
+        }
+    }
+
+    int expert = -1;
+    char wid[8] = {0};
+    char field[16] = {0};
+    int n = 0;
+    if (sscanf(rest, "ffn.experts.%d.%7[^.].%15s%n", &expert, wid, field, &n) == 3 &&
+        rest[n] == '\0' && expert >= 0) {
+        const char *gguf = NULL;
+        if (strcmp(wid, "w1") == 0) gguf = "ffn_gate_exps.weight";
+        else if (strcmp(wid, "w3") == 0) gguf = "ffn_up_exps.weight";
+        else if (strcmp(wid, "w2") == 0) gguf = "ffn_down_exps.weight";
+        if (gguf && strcmp(field, "weight") == 0) {
+            *action_out = "pack_expert";
+            return fmt_stage_name(stage, gguf);
+        }
+        if (gguf && strcmp(field, "scale") == 0) {
+            *action_out = "consume_expert_scale";
+            return fmt_stage_name(stage, gguf);
+        }
+    }
+
+    *action_out = "unknown_dspark";
+    return NULL;
+}
+
+static void print_dspark_manifest(const char *hf_dir) {
+    str_list names = load_index_weight_names(hf_dir);
+    uint64_t total = 0;
+    uint64_t dspark = 0;
+    uint64_t emit = 0;
+    uint64_t consume = 0;
+    uint64_t pack = 0;
+    uint64_t unknown = 0;
+    int max_stage = -1;
+
+    printf("action\tstage\thf_name\tgguf_name\n");
+    for (int i = 0; i < names.len; i++) {
+        const char *hf = names.names[i];
+        total++;
+        int stage = -1;
+        const char *rest = NULL;
+        bool is_mtp = parse_mtp_name(hf, &stage, &rest);
+        if (is_mtp) {
+            dspark++;
+            if (stage > max_stage) max_stage = stage;
+        }
+
+        const char *action = NULL;
+        char *gguf = map_dspark_hf_name(hf, &action);
+        if (strcmp(action, "emit") == 0) emit++;
+        else if (strstr(action, "consume")) consume++;
+        else if (strcmp(action, "pack_expert") == 0) pack++;
+        else if (strcmp(action, "unknown_dspark") == 0) unknown++;
+
+        if (is_mtp) {
+            printf("%s\t%d\t%s\t%s\n", action, stage, hf, gguf ? gguf : "");
+        }
+        free(gguf);
+    }
+
+    printf("# total_index_tensors=%" PRIu64 "\n", total);
+    printf("# dspark_tensors=%" PRIu64 "\n", dspark);
+    printf("# dspark_stages=%d\n", max_stage >= 0 ? max_stage + 1 : 0);
+    printf("# emit_tensors=%" PRIu64 "\n", emit);
+    printf("# packed_expert_tensors=%" PRIu64 "\n", pack);
+    printf("# consumed_aux_tensors=%" PRIu64 "\n", consume);
+    printf("# unknown_dspark_tensors=%" PRIu64 "\n", unknown);
+    str_list_free(&names);
+}
+
+typedef enum {
+    DSPARK_PLAN_REGULAR,
+    DSPARK_PLAN_EXPERT,
+} dspark_plan_kind;
+
+typedef enum {
+    DSPARK_ROLE_F32,
+    DSPARK_ROLE_PLAIN,
+    DSPARK_ROLE_DENSE,
+    DSPARK_ROLE_ROUTED,
+} dspark_tensor_role;
+
+typedef struct {
+    tensor_meta meta;
+    char *hf_name;
+    dspark_plan_kind kind;
+    dspark_tensor_role role;
+    int stage;
+    int n_experts;
+    expert_part expert_part;
+} dspark_tensor_plan;
+
+typedef struct {
+    dspark_tensor_plan *tensors;
+    int len;
+    int cap;
+    int stages;
+    uint64_t n_kv;
+    size_t kv_bytes;
+    size_t tensor_bytes;
+    size_t meta_size;
+    size_t data_offset;
+    size_t alignment;
+} dspark_support_plan;
+
+static bool parse_dspark_hf_expert(const char *hf_name, int *stage_out,
+                                   int *expert_out, expert_part *part_out,
+                                   bool *is_scale_out) {
+    int stage = 0;
+    const char *rest = NULL;
+    if (!parse_mtp_name(hf_name, &stage, &rest)) return false;
+
+    int expert = -1;
+    char wid[8] = {0};
+    char field[16] = {0};
+    int n = 0;
+    if (sscanf(rest, "ffn.experts.%d.%7[^.].%15s%n", &expert, wid, field, &n) != 3 ||
+        rest[n] != '\0' || expert < 0) {
+        return false;
+    }
+
+    expert_part part = EXP_NONE;
+    if (strcmp(wid, "w1") == 0) part = EXP_W1;
+    else if (strcmp(wid, "w2") == 0) part = EXP_W2;
+    else if (strcmp(wid, "w3") == 0) part = EXP_W3;
+    if (part == EXP_NONE) return false;
+
+    bool is_scale = false;
+    if (strcmp(field, "weight") == 0) {
+        is_scale = false;
+    } else if (strcmp(field, "scale") == 0) {
+        is_scale = true;
+    } else {
+        return false;
+    }
+
+    if (stage_out) *stage_out = stage;
+    if (expert_out) *expert_out = expert;
+    if (part_out) *part_out = part;
+    if (is_scale_out) *is_scale_out = is_scale;
+    return true;
+}
+
+static bool name_has_any(const char *name, const char *const *needles, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (strstr(name, needles[i])) return true;
+    }
+    return false;
+}
+
+static dspark_tensor_role dspark_tensor_role_for_name(const char *name) {
+    if (parse_expert_tensor(name).is_expert) return DSPARK_ROLE_ROUTED;
+    static const char *const plain[] = {
+        "hc_attn_fn.weight",
+        "hc_ffn_fn.weight",
+        "hc_head_fn.weight",
+    };
+    if (name_has_any(name, plain, sizeof(plain) / sizeof(plain[0]))) {
+        return DSPARK_ROLE_PLAIN;
+    }
+    static const char *const f32[] = {
+        "_base.weight",
+        "_scale.weight",
+        "_norm.weight",
+        ".norm.weight",
+        "attn_sinks.weight",
+        "exp_probs_b.bias",
+    };
+    if (name_has_any(name, f32, sizeof(f32) / sizeof(f32[0]))) {
+        return DSPARK_ROLE_F32;
+    }
+    return DSPARK_ROLE_DENSE;
+}
+
+static ds4q_type dspark_default_type(const tensor_meta *t, dspark_tensor_role role,
+                                     expert_part part) {
+    if (role == DSPARK_ROLE_F32) return DS4Q_TYPE_F32;
+    if (role == DSPARK_ROLE_PLAIN) return DS4Q_TYPE_F16;
+    if (role == DSPARK_ROLE_ROUTED) {
+        return part == EXP_W2 ? DS4Q_TYPE_Q2_K : DS4Q_TYPE_IQ2_XXS;
+    }
+    if (t->n_dims > 1 && t->ne[0] % ds4q_block_size(DS4Q_TYPE_Q8_0) == 0) {
+        return DS4Q_TYPE_Q8_0;
+    }
+    return DS4Q_TYPE_F16;
+}
+
+static ds4q_type dspark_policy_type(const quant_policy *p, const char *name,
+                                    const tensor_meta *t, dspark_tensor_role role,
+                                    expert_part part) {
+    for (int i = 0; i < p->n_overrides; i++) {
+        if (strcmp(name, p->overrides[i].prefix) == 0 || str_starts(name, p->overrides[i].prefix)) {
+            return p->overrides[i].type;
+        }
+    }
+    if (role == DSPARK_ROLE_ROUTED) {
+        if (part == EXP_W1 && p->routed_w1 != DS4Q_TYPE_COUNT) return p->routed_w1;
+        if (part == EXP_W2 && p->routed_w2 != DS4Q_TYPE_COUNT) return p->routed_w2;
+        if (part == EXP_W3 && p->routed_w3 != DS4Q_TYPE_COUNT) return p->routed_w3;
+        return dspark_default_type(t, role, part);
+    }
+    if (role == DSPARK_ROLE_DENSE) {
+        if (is_shared_expert(name) && p->shared != DS4Q_TYPE_COUNT) return p->shared;
+        if (is_attention_projection(name) && p->attention_proj != DS4Q_TYPE_COUNT) return p->attention_proj;
+        if (is_attention_tensor(name) && p->attention != DS4Q_TYPE_COUNT) return p->attention;
+        if (p->dense != DS4Q_TYPE_COUNT) return p->dense;
+    }
+    return dspark_default_type(t, role, part);
+}
+
+static int dspark_plan_find(const dspark_support_plan *p, const char *name) {
+    for (int i = 0; i < p->len; i++) {
+        if (strcmp(p->tensors[i].meta.name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static dspark_tensor_plan *dspark_plan_push(dspark_support_plan *p) {
+    if (p->len == p->cap) {
+        p->cap = p->cap ? p->cap * 2 : 128;
+        p->tensors = xrealloc(p->tensors, (size_t)p->cap * sizeof(p->tensors[0]));
+    }
+    dspark_tensor_plan *tp = &p->tensors[p->len++];
+    memset(tp, 0, sizeof(*tp));
+    return tp;
+}
+
+static void dspark_shape_reversed_from_info(tensor_meta *m, const st_info *info) {
+    if (info->n_dims < 1 || info->n_dims > DS4Q_MAX_DIMS) die("bad DSpark tensor rank");
+    m->n_dims = info->n_dims;
+    for (int i = 0; i < info->n_dims; i++) {
+        m->ne[i] = info->shape[info->n_dims - 1 - i];
+    }
+}
+
+static void dspark_plan_set_size(dspark_tensor_plan *tp) {
+    if (tp->meta.type != DS4Q_TYPE_I32 && !is_quantizable_target(tp->meta.type)) {
+        die("unsupported DSpark planned tensor type");
+    }
+    if (ds4q_can_quantize(tp->meta.type) &&
+        tp->meta.ne[0] % ds4q_block_size(tp->meta.type) != 0) {
+        fprintf(stderr,
+                "error: DSpark tensor %s ne[0]=%" PRId64
+                " is not divisible by %s block size\n",
+                tp->meta.name,
+                tp->meta.ne[0],
+                ds4q_type_name(tp->meta.type));
+        exit(1);
+    }
+    tp->meta.size = tensor_nbytes(tp->meta.type, tp->meta.ne, tp->meta.n_dims);
+}
+
+static void dspark_plan_add_regular(dspark_support_plan *plan,
+                                    st_db *db,
+                                    const quant_policy *policy,
+                                    const char *hf_name,
+                                    const char *gguf_name,
+                                    int stage) {
+    if (dspark_plan_find(plan, gguf_name) >= 0) return;
+
+    tensor_entry *te = db_tensor(db, hf_name, NULL);
+    dspark_tensor_plan *tp = dspark_plan_push(plan);
+    tp->kind = DSPARK_PLAN_REGULAR;
+    tp->stage = stage;
+    tp->hf_name = xstrdup(hf_name);
+    tp->meta.name = xstrdup(gguf_name);
+    dspark_shape_reversed_from_info(&tp->meta, &te->info);
+    tp->role = dspark_tensor_role_for_name(gguf_name);
+    tp->meta.type = dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, EXP_NONE);
+    dspark_plan_set_size(tp);
+}
+
+static void dspark_plan_add_expert(dspark_support_plan *plan,
+                                   st_db *db,
+                                   const quant_policy *policy,
+                                   const char *hf_name,
+                                   const char *gguf_name,
+                                   int stage,
+                                   int expert,
+                                   expert_part part) {
+    tensor_entry *te = db_tensor(db, hf_name, NULL);
+    if (te->info.n_dims != 2) die("DSpark expert tensor must be 2D");
+    const int64_t nrows = te->info.shape[0];
+    int64_t ncols = te->info.shape[1];
+    if (strcmp(te->info.dtype, "I8") == 0) ncols *= 2;
+
+    int idx = dspark_plan_find(plan, gguf_name);
+    dspark_tensor_plan *tp = NULL;
+    if (idx >= 0) {
+        tp = &plan->tensors[idx];
+        if (tp->kind != DSPARK_PLAN_EXPERT ||
+            tp->meta.ne[0] != ncols ||
+            tp->meta.ne[1] != nrows ||
+            tp->expert_part != part) {
+            fprintf(stderr, "error: inconsistent DSpark expert shape for %s\n", gguf_name);
+            exit(1);
+        }
+    } else {
+        tp = dspark_plan_push(plan);
+        tp->kind = DSPARK_PLAN_EXPERT;
+        tp->stage = stage;
+        tp->expert_part = part;
+        tp->meta.name = xstrdup(gguf_name);
+        tp->meta.n_dims = 3;
+        tp->meta.ne[0] = ncols;
+        tp->meta.ne[1] = nrows;
+        tp->meta.ne[2] = 0;
+        tp->role = DSPARK_ROLE_ROUTED;
+        tp->meta.type = dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, part);
+    }
+    if (expert + 1 > tp->n_experts) tp->n_experts = expert + 1;
+    if (stage + 1 > plan->stages) plan->stages = stage + 1;
+}
+
+static int dspark_plan_cmp(const void *a, const void *b) {
+    const dspark_tensor_plan *ta = a;
+    const dspark_tensor_plan *tb = b;
+    return strcmp(ta->meta.name, tb->meta.name);
+}
+
+static size_t gguf_kv_size_string(const char *key, const char *value) {
+    return gguf_string_size(key) + 4 + gguf_string_size(value);
+}
+
+static size_t gguf_kv_size_u32(const char *key) {
+    return gguf_string_size(key) + 4 + 4;
+}
+
+static size_t gguf_kv_size_u32_array(const char *key, uint32_t n) {
+    return gguf_string_size(key) + 4 + 4 + 8 + (size_t)n * 4;
+}
+
+static void write_gguf_kv_string(FILE *fp, const char *key, const char *value) {
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_STRING);
+    write_gguf_string(fp, value);
+}
+
+static void write_gguf_kv_u32(FILE *fp, const char *key, uint32_t value) {
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u32(fp, value);
+}
+
+static void write_gguf_kv_u32_array(FILE *fp, const char *key, const uint32_t *values, uint32_t n) {
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_ARRAY);
+    write_u32(fp, GGUF_TYPE_UINT32);
+    write_u64(fp, n);
+    for (uint32_t i = 0; i < n; i++) write_u32(fp, values[i]);
+}
+
+static void dspark_plan_finalize(dspark_support_plan *plan,
+                                 const dspark_support_options *opt) {
+    qsort(plan->tensors, (size_t)plan->len, sizeof(plan->tensors[0]), dspark_plan_cmp);
+    plan->alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
+    plan->n_kv = 9;
+    plan->kv_bytes =
+        gguf_kv_size_string("general.architecture", "deepseek4-dspark") +
+        gguf_kv_size_string("general.name", "DeepSeek V4 Flash DSpark support") +
+        gguf_kv_size_u32("general.alignment") +
+        gguf_kv_size_u32("dspark.block_size") +
+        gguf_kv_size_u32("dspark.markov_rank") +
+        gguf_kv_size_u32("dspark.noise_token_id") +
+        gguf_kv_size_u32_array("dspark.target_layer_ids", opt->target_layer_count) +
+        gguf_kv_size_u32("dspark.stage_count") +
+        gguf_kv_size_u32("dspark.n_layers");
+
+    size_t tensor_info = 0;
+    size_t off = 0;
+    for (int i = 0; i < plan->len; i++) {
+        dspark_tensor_plan *tp = &plan->tensors[i];
+        if (tp->kind == DSPARK_PLAN_EXPERT) {
+            if (tp->n_experts <= 0) die("DSpark expert tensor has no experts");
+            tp->meta.ne[2] = tp->n_experts;
+            dspark_plan_set_size(tp);
+        }
+        tp->meta.new_offset = off;
+        off += ds4q_pad(tp->meta.size, plan->alignment);
+        tensor_info += gguf_string_size(tp->meta.name) + 4 + (size_t)tp->meta.n_dims * 8 + 4 + 8;
+    }
+    plan->tensor_bytes = off;
+    plan->meta_size = 4 + 4 + 8 + 8 + plan->kv_bytes + tensor_info;
+    plan->data_offset = ds4q_pad(plan->meta_size, plan->alignment);
+}
+
+static dspark_support_plan build_dspark_support_plan(st_db *db,
+                                                     const quant_policy *policy,
+                                                     const dspark_support_options *opt,
+                                                     int requested_n_experts) {
+    (void)opt;
+    dspark_support_plan plan = {0};
+    str_list names = load_index_weight_names(db->hf_dir);
+    uint64_t unknown = 0;
+
+    for (int i = 0; i < names.len; i++) {
+        const char *hf = names.names[i];
+        int stage = -1;
+        const char *rest = NULL;
+        if (!parse_mtp_name(hf, &stage, &rest)) continue;
+        if (stage + 1 > plan.stages) plan.stages = stage + 1;
+
+        const char *action = NULL;
+        char *gguf = map_dspark_hf_name(hf, &action);
+        if (strcmp(action, "emit") == 0) {
+            dspark_plan_add_regular(&plan, db, policy, hf, gguf, stage);
+        } else if (strcmp(action, "pack_expert") == 0) {
+            int expert = -1;
+            expert_part part = EXP_NONE;
+            bool is_scale = false;
+            if (!parse_dspark_hf_expert(hf, &stage, &expert, &part, &is_scale) || is_scale) {
+                die("bad DSpark expert manifest mapping");
+            }
+            dspark_plan_add_expert(&plan, db, policy, hf, gguf, stage, expert, part);
+        } else if (strcmp(action, "unknown_dspark") == 0) {
+            unknown++;
+        }
+        free(gguf);
+    }
+    str_list_free(&names);
+    if (unknown != 0) {
+        fprintf(stderr, "error: DSpark support plan has %" PRIu64 " unknown tensors\n", unknown);
+        exit(1);
+    }
+    if (plan.len == 0) die("no DSpark tensors found in HF index");
+
+    if (requested_n_experts > 0) {
+        for (int i = 0; i < plan.len; i++) {
+            dspark_tensor_plan *tp = &plan.tensors[i];
+            if (tp->kind != DSPARK_PLAN_EXPERT) continue;
+            if (tp->n_experts != requested_n_experts) {
+                fprintf(stderr,
+                        "error: --n-experts %d does not match DSpark tensor %s experts=%d\n",
+                        requested_n_experts,
+                        tp->meta.name,
+                        tp->n_experts);
+                exit(1);
+            }
+        }
+    }
+    dspark_plan_finalize(&plan, opt);
+    return plan;
+}
+
+static void print_dspark_support_plan(const dspark_support_plan *plan,
+                                      const dspark_support_options *opt) {
+    size_t type_counts[DS4Q_TYPE_COUNT] = {0};
+    size_t expert_tensors = 0;
+    for (int i = 0; i < plan->len; i++) {
+        ds4q_type type = plan->tensors[i].meta.type;
+        if (type >= 0 && type < DS4Q_TYPE_COUNT) type_counts[type]++;
+        if (plan->tensors[i].kind == DSPARK_PLAN_EXPERT) expert_tensors++;
+    }
+    printf("dspark_support: stages=%d block=%u markov_rank=%u noise_token=%u target_layers=",
+           plan->stages,
+           opt->block_size,
+           opt->markov_rank,
+           opt->noise_token_id);
+    for (uint32_t i = 0; i < opt->target_layer_count; i++) {
+        printf("%s%u", i == 0 ? "" : ",", opt->target_layers[i]);
+    }
+    printf("\n");
+    printf("n_tensors: %d\n", plan->len);
+    printf("expert_tensors: %zu\n", expert_tensors);
+    printf("meta_bytes: %zu\n", plan->data_offset);
+    printf("tensor_bytes_padded: %zu\n", plan->tensor_bytes);
+    printf("approx_file_bytes: %zu\n", plan->data_offset + plan->tensor_bytes);
+    printf("tensor_types:");
+    for (int i = 0; i < DS4Q_TYPE_COUNT; i++) {
+        if (type_counts[i]) printf(" %s=%zu", ds4q_type_name((ds4q_type)i), type_counts[i]);
+    }
+    printf("\n");
+}
+
+static byte_buf generate_dspark_tensor(st_db *db, const dspark_tensor_plan *tp,
+                                       int n_threads, const imatrix_store *imatrix) {
+    if (tp->kind == DSPARK_PLAN_EXPERT) {
+        return generate_expert(db,
+                               tp->meta.name,
+                               &tp->meta,
+                               tp->meta.type,
+                               tp->n_experts,
+                               n_threads,
+                               imatrix);
+    }
+    return generate_regular_hf(db,
+                               tp->meta.name,
+                               tp->hf_name,
+                               &tp->meta,
+                               tp->meta.type,
+                               imatrix,
+                               true);
+}
+
+static void write_dspark_support_gguf(st_db *db,
+                                      const dspark_support_plan *plan,
+                                      const dspark_support_options *opt,
+                                      const char *out_path,
+                                      int n_threads,
+                                      const imatrix_store *imatrix) {
+    FILE *fp = fopen(out_path, "wb");
+    if (!fp) die_errno("open output", out_path);
+    if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
+    write_u32(fp, 3);
+    write_u64(fp, (uint64_t)plan->len);
+    write_u64(fp, plan->n_kv);
+    write_gguf_kv_string(fp, "general.architecture", "deepseek4-dspark");
+    write_gguf_kv_string(fp, "general.name", "DeepSeek V4 Flash DSpark support");
+    write_gguf_kv_u32(fp, "general.alignment", (uint32_t)plan->alignment);
+    write_gguf_kv_u32(fp, "dspark.block_size", opt->block_size);
+    write_gguf_kv_u32(fp, "dspark.markov_rank", opt->markov_rank);
+    write_gguf_kv_u32(fp, "dspark.noise_token_id", opt->noise_token_id);
+    write_gguf_kv_u32_array(fp, "dspark.target_layer_ids", opt->target_layers, opt->target_layer_count);
+    write_gguf_kv_u32(fp, "dspark.stage_count", (uint32_t)plan->stages);
+    write_gguf_kv_u32(fp, "dspark.n_layers", (uint32_t)plan->stages);
+
+    for (int i = 0; i < plan->len; i++) {
+        const tensor_meta *t = &plan->tensors[i].meta;
+        write_gguf_string(fp, t->name);
+        write_u32(fp, (uint32_t)t->n_dims);
+        for (int j = 0; j < t->n_dims; j++) write_u64(fp, (uint64_t)t->ne[j]);
+        write_u32(fp, (uint32_t)t->type);
+        write_u64(fp, t->new_offset);
+    }
+    long pos = ftell(fp);
+    if (pos < 0) die("ftell failed");
+    if ((size_t)pos > plan->data_offset) die("DSpark GGUF metadata larger than planned");
+    write_padding(fp, plan->data_offset - (size_t)pos);
+
+    for (int i = 0; i < plan->len; i++) {
+        const dspark_tensor_plan *tp = &plan->tensors[i];
+        fprintf(stderr, "[%4d/%4d] %s -> %s\n",
+                i + 1,
+                plan->len,
+                tp->meta.name,
+                ds4q_type_name(tp->meta.type));
+        byte_buf data = generate_dspark_tensor(db, tp, n_threads, imatrix);
+        if (data.size != tp->meta.size) {
+            fprintf(stderr,
+                    "error: generated size mismatch for %s: got %zu expected %zu\n",
+                    tp->meta.name,
+                    data.size,
+                    tp->meta.size);
+            exit(1);
+        }
+        if (fwrite(data.data, 1, data.size, fp) != data.size) die_errno("write tensor", out_path);
+        size_t padded = ds4q_pad(data.size, plan->alignment);
+        write_padding(fp, padded - data.size);
+        fprintf(stderr, "       generated %.2f MiB\n", (double)data.size / 1048576.0);
+        free(data.data);
+    }
+    fclose(fp);
+}
+
+static void free_dspark_support_plan(dspark_support_plan *plan) {
+    for (int i = 0; i < plan->len; i++) {
+        free(plan->tensors[i].meta.name);
+        free(plan->tensors[i].hf_name);
+    }
+    free(plan->tensors);
+    memset(plan, 0, sizeof(*plan));
+}
+
 static void usage(const char *argv0) {
-    printf("usage: %s (--hf DIR | --source-gguf MODEL.gguf) --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
-    printf("\nDeepSeek V4 Flash/Pro safetensors/GGUF -> GGUF quantizer in plain C.\n\n");
+    printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
-    printf("  --source-gguf FILE     source GGUF to re-quantize from, e.g. an abliterated Q8_0 GGUF\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
     printf("  --out FILE             output GGUF path\n");
-    printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
-    printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
+    printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
+    printf("  --compare-tensor NAME  regenerate one tensor, checksum, optionally byte-compare, and exit\n");
     printf("  --overwrite            replace --out if it already exists\n");
-    printf("  --dry-run              print output plan without reading HF tensor data\n");
-    printf("  --self-test-dspark-map validate DSpark HF map, policy, and metadata defaults\n");
-    printf("  --dspark-only          replace template tensors with official DSpark MTP tensors\n");
+    printf("  --dry-run              print output plan; DSpark support mode reads shard headers only\n");
+    printf("  --dspark-manifest      print DSpark HF->GGUF tensor-name manifest and exit\n");
+    printf("  --dspark-support       write a standalone DSpark support GGUF from mtp.* tensors\n");
+    printf("  --dspark-block-size N  DSpark draft block size metadata, default 5\n");
+    printf("  --dspark-markov-rank N DSpark Markov rank metadata, default 256\n");
+    printf("  --dspark-noise-token-id N  DSpark noise token id metadata, default 128799\n");
+    printf("  --dspark-target-layers CSV DSpark target layer ids metadata, default 40,41,42\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
@@ -2633,10 +2486,9 @@ static void usage(const char *argv0) {
     printf("  --output TYPE          output.* tensor type\n");
     printf("  --dense TYPE           remaining 2D+ non-routed tensor type\n");
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
-    printf("  --alignment N          write GGUF tensor-data alignment, default from template\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
-    printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
+    printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {
@@ -2645,6 +2497,42 @@ static char *need_value(int argc, char **argv, int *i, const char *arg) {
         exit(1);
     }
     return argv[*i];
+}
+
+static uint32_t parse_u32_arg(const char *s, const char *arg) {
+    if (!s || !s[0]) {
+        fprintf(stderr, "error: %s needs a positive integer\n", arg);
+        exit(1);
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v > UINT32_MAX) {
+        fprintf(stderr, "error: bad integer for %s: %s\n", arg, s);
+        exit(1);
+    }
+    return (uint32_t)v;
+}
+
+static void parse_dspark_target_layers_arg(dspark_support_options *o,
+                                           const char *s,
+                                           const char *arg) {
+    if (!s || !s[0]) die("empty DSpark target layer list");
+    char *tmp = xstrdup(s);
+    uint32_t n = 0;
+    for (char *p = tmp; p && *p;) {
+        char *comma = strchr(p, ',');
+        if (comma) *comma = '\0';
+        if (n >= DSPARK_MAX_TARGET_LAYERS) {
+            fprintf(stderr, "error: %s supports at most %d layers\n", arg, DSPARK_MAX_TARGET_LAYERS);
+            exit(1);
+        }
+        o->target_layers[n++] = parse_u32_arg(p, arg);
+        p = comma ? comma + 1 : NULL;
+    }
+    if (n == 0) die("empty DSpark target layer list");
+    o->target_layer_count = n;
+    free(tmp);
 }
 
 static bool file_exists(const char *path) {
@@ -2661,6 +2549,7 @@ static params parse_args(int argc, char **argv) {
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
     p.n_experts = 0;
     p.n_threads = 8;
+    dspark_support_defaults(&p.dspark);
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -2669,8 +2558,6 @@ static params parse_args(int argc, char **argv) {
             exit(0);
         } else if (strcmp(arg, "--hf") == 0) {
             p.hf_dir = need_value(argc, argv, &i, arg);
-        } else if (strcmp(arg, "--source-gguf") == 0) {
-            p.source_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
@@ -2681,12 +2568,20 @@ static params parse_args(int argc, char **argv) {
             p.compare_tensor = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--overwrite") == 0) {
             p.overwrite = true;
-        } else if (strcmp(arg, "--self-test-dspark-map") == 0) {
-            p.self_test_dspark_map = true;
-        } else if (strcmp(arg, "--dspark-only") == 0) {
-            p.dspark_only = true;
         } else if (strcmp(arg, "--dry-run") == 0) {
             p.dry_run = true;
+        } else if (strcmp(arg, "--dspark-manifest") == 0) {
+            p.dspark_manifest = true;
+        } else if (strcmp(arg, "--dspark-support") == 0) {
+            p.dspark_support = true;
+        } else if (strcmp(arg, "--dspark-block-size") == 0) {
+            p.dspark.block_size = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+        } else if (strcmp(arg, "--dspark-markov-rank") == 0) {
+            p.dspark.markov_rank = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+        } else if (strcmp(arg, "--dspark-noise-token-id") == 0) {
+            p.dspark.noise_token_id = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+        } else if (strcmp(arg, "--dspark-target-layers") == 0) {
+            parse_dspark_target_layers_arg(&p.dspark, need_value(argc, argv, &i, arg), arg);
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
@@ -2719,11 +2614,6 @@ static params parse_args(int argc, char **argv) {
             *eq = '\0';
             p.policy.overrides = xrealloc(p.policy.overrides, (size_t)(p.policy.n_overrides + 1) * sizeof(p.policy.overrides[0]));
             p.policy.overrides[p.policy.n_overrides++] = (type_override){ xstrdup(spec), parse_type(eq + 1) };
-        } else if (strcmp(arg, "--alignment") == 0) {
-            char *end = NULL;
-            unsigned long long v = strtoull(need_value(argc, argv, &i, arg), &end, 10);
-            if (!v || (end && *end)) die("bad --alignment value");
-            p.alignment = (size_t)v;
         } else if (strcmp(arg, "--n-experts") == 0) {
             p.n_experts = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--threads") == 0) {
@@ -2733,25 +2623,23 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
-    if (p.self_test_dspark_map) return p;
-    if ((p.hf_dir != NULL) == (p.source_gguf != NULL)) die("exactly one of --hf or --source-gguf is required");
+    if (!p.hf_dir) die("--hf is required");
+    if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
+    if (p.dspark_manifest) return p;
+    if (p.dspark_support) {
+        if (!p.dry_run && !p.compare_tensor && !p.out_gguf) {
+            die("--out is required unless --dry-run or --compare-tensor is used");
+        }
+        if (!p.compare_tensor && p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) {
+            die("output exists; use --overwrite");
+        }
+        return p;
+    }
     if (!p.template_gguf) die("--template is required");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
-}
-
-static void self_test_dspark_only_args(void) {
-    char *argv[] = {
-        "deepseek4-quantize",
-        "--self-test-dspark-map",
-        "--dspark-only",
-    };
-    params p = parse_args((int)(sizeof(argv) / sizeof(argv[0])), argv);
-    if (!p.self_test_dspark_map || !p.dspark_only) {
-        die("bad --dspark-only self-test parsing");
-    }
 }
 
 static void free_gguf_file(gguf_file *g) {
@@ -2763,7 +2651,30 @@ static void free_gguf_file(gguf_file *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static void compare_one_tensor(model_source *source, const gguf_file *tmpl, const output_context *out_ctx,
+static void print_byte_compare(const byte_buf *generated, const byte_buf *reference) {
+    size_t mismatches = 0;
+    size_t first = SIZE_MAX;
+    const size_t n = generated->size < reference->size ? generated->size : reference->size;
+    for (size_t i = 0; i < n; i++) {
+        if (generated->data[i] != reference->data[i]) {
+            if (first == SIZE_MAX) first = i;
+            mismatches++;
+        }
+    }
+    if (generated->size != reference->size) {
+        if (first == SIZE_MAX) first = n;
+        mismatches += generated->size > reference->size
+            ? generated->size - reference->size
+            : reference->size - generated->size;
+    }
+    if (!mismatches) {
+        printf("byte_compare: OK\n");
+    } else {
+        printf("byte_compare: FAIL mismatches=%zu first=%zu\n", mismatches, first);
+    }
+}
+
+static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                                const params *p, const imatrix_store *imatrix) {
     int idx = hmap_get(&tmpl->tensor_map, p->compare_tensor);
     if (idx < 0) {
@@ -2772,9 +2683,9 @@ static void compare_one_tensor(model_source *source, const gguf_file *tmpl, cons
     }
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
-    byte_buf generated = generate_tensor(source, p->compare_tensor, &tmpl->tensors[idx],
+    byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
                                          out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
-    gguf_file ref = load_gguf_metadata(p->compare_gguf, false);
+    gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
     printf("type: %s\n", ds4q_type_name(out_ctx->tensors[idx].type));
@@ -2782,40 +2693,96 @@ static void compare_one_tensor(model_source *source, const gguf_file *tmpl, cons
     printf("reference_bytes: %zu\n", reference.size);
     printf("generated_fnv1a64: %016" PRIx64 "\n", fnv1a64_bytes(generated.data, generated.size));
     printf("reference_fnv1a64: %016" PRIx64 "\n", fnv1a64_bytes(reference.data, reference.size));
-    size_t mismatches = 0;
-    size_t first = SIZE_MAX;
-    const size_t n = generated.size < reference.size ? generated.size : reference.size;
-    for (size_t i = 0; i < n; i++) {
-        if (generated.data[i] != reference.data[i]) {
-            if (first == SIZE_MAX) first = i;
-            mismatches++;
-        }
-    }
-    if (generated.size != reference.size) {
-        if (first == SIZE_MAX) first = n;
-        mismatches += generated.size > reference.size ? generated.size - reference.size : reference.size - generated.size;
-    }
-    if (!mismatches) {
-        printf("byte_compare: OK\n");
-    } else {
-        printf("byte_compare: FAIL mismatches=%zu first=%zu\n", mismatches, first);
-    }
+    print_byte_compare(&generated, &reference);
     free(generated.data);
     free(reference.data);
     free_gguf_file(&ref);
 }
 
+static void compare_dspark_support_tensor(st_db *db, const dspark_support_plan *plan,
+                                          const params *p, const imatrix_store *imatrix) {
+    int idx = dspark_plan_find(plan, p->compare_tensor);
+    if (idx < 0) {
+        fprintf(stderr, "error: tensor not found in DSpark support plan: %s\n", p->compare_tensor);
+        exit(1);
+    }
+    const dspark_tensor_plan *tp = &plan->tensors[idx];
+    fprintf(stderr, "regenerating DSpark support tensor %s as %s\n",
+            p->compare_tensor, ds4q_type_name(tp->meta.type));
+    byte_buf generated = generate_dspark_tensor(db, tp, p->n_threads, imatrix);
+    if (generated.size != tp->meta.size) {
+        fprintf(stderr,
+                "error: generated size mismatch for %s: got %zu expected %zu\n",
+                tp->meta.name,
+                generated.size,
+                tp->meta.size);
+        exit(1);
+    }
+
+    printf("tensor: %s\n", p->compare_tensor);
+    printf("kind: %s\n", tp->kind == DSPARK_PLAN_EXPERT ? "expert" : "regular");
+    printf("stage: %d\n", tp->stage);
+    printf("type: %s\n", ds4q_type_name(tp->meta.type));
+    printf("generated_bytes: %zu\n", generated.size);
+    printf("generated_fnv1a64: %016" PRIx64 "\n",
+           fnv1a64_bytes(generated.data, generated.size));
+
+    if (p->compare_gguf) {
+        gguf_file ref = load_gguf_metadata(p->compare_gguf);
+        byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
+        printf("reference_bytes: %zu\n", reference.size);
+        printf("reference_fnv1a64: %016" PRIx64 "\n",
+               fnv1a64_bytes(reference.data, reference.size));
+        print_byte_compare(&generated, &reference);
+        free(reference.data);
+        free_gguf_file(&ref);
+    } else {
+        printf("byte_compare: SKIP no --compare-gguf\n");
+    }
+
+    free(generated.data);
+}
+
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
-    if (p.self_test_dspark_map) {
-        self_test_dspark_map();
-        self_test_dspark_kv_rewrite_no_duplicates();
+    if (p.dspark_manifest) {
+        print_dspark_manifest(p.hf_dir);
+        for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
+        free(p.policy.overrides);
         return 0;
     }
+
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
-    gguf_file tmpl = load_gguf_metadata(p.template_gguf, false);
+    if (p.dspark_support) {
+        st_db db;
+        db_open(&db, p.hf_dir);
+        dspark_support_plan plan =
+            build_dspark_support_plan(&db, &p.policy, &p.dspark, p.n_experts);
+        print_dspark_support_plan(&plan, &p.dspark);
+        if (p.dry_run) {
+            /* Plan only: build_dspark_support_plan reads shard headers, not tensor payloads. */
+        } else if (p.compare_tensor) {
+            compare_dspark_support_tensor(&db, &plan, &p, &imatrix);
+        } else {
+            write_dspark_support_gguf(&db,
+                                      &plan,
+                                      &p.dspark,
+                                      p.out_gguf,
+                                      p.n_threads,
+                                      &imatrix);
+            fprintf(stderr, "wrote %s\n", p.out_gguf);
+        }
+        free_dspark_support_plan(&plan);
+        db_close(&db);
+        imatrix_free(&imatrix);
+        for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
+        free(p.policy.overrides);
+        return 0;
+    }
+
+    gguf_file tmpl = load_gguf_metadata(p.template_gguf);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
@@ -2827,64 +2794,24 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
-    st_db db = {0};
-    gguf_file source_gguf = {0};
-    model_source source = {0};
-    bool write_dspark = false;
-    dspark_metadata dspark_meta = dspark_metadata_defaults();
-
-    if (p.hf_dir) {
-        bool markov_rank_set = false;
-        dspark_meta = dspark_metadata_from_hf_config(p.hf_dir, &markov_rank_set);
-        db_open(&db, p.hf_dir);
-        dspark_hf_layout dspark_layout = db_dspark_hf_layout(&db, markov_rank_set, dspark_meta.markov_rank);
-        if (dspark_layout != DS4_DSPARK_HF_NONE) {
-            write_dspark = true;
-            fprintf(stderr, "DSpark HF %s layout detected; writing deepseek4.dspark.* metadata\n",
-                    dspark_hf_layout_name(dspark_layout));
-        }
-        if (p.dspark_only) write_dspark = true;
-        if (write_dspark) {
-            free_gguf_file(&tmpl);
-            tmpl = load_gguf_metadata(p.template_gguf, true);
-        }
-        if (p.dspark_only) {
-            gguf_use_dspark_mtp_template(&tmpl, &db, p.n_experts, dspark_layout);
-        }
-        source.kind = MODEL_SOURCE_HF;
-        source.hf = &db;
-    }
-
-    if (p.alignment) tmpl.alignment = p.alignment;
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, write_dspark, &dspark_meta);
+    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) {
-        if (p.hf_dir) db_close(&db);
-        imatrix_free(&imatrix);
-        free_gguf_file(&tmpl);
-        free(out_ctx.tensors);
-        return 0;
-    }
+    if (p.dry_run) return 0;
 
-    if (!p.hf_dir) {
-        source_gguf = load_gguf_metadata(p.source_gguf, false);
-        source.kind = MODEL_SOURCE_GGUF;
-        source.gguf = &source_gguf;
-    }
+    st_db db;
+    db_open(&db, p.hf_dir);
     if (p.compare_tensor) {
-        compare_one_tensor(&source, &tmpl, &out_ctx, &p, &imatrix);
-        if (p.hf_dir) db_close(&db);
-        else free_gguf_file(&source_gguf);
+        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
+        db_close(&db);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&source, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
-    if (p.hf_dir) db_close(&db);
-    else free_gguf_file(&source_gguf);
+    db_close(&db);
     imatrix_free(&imatrix);
     free_gguf_file(&tmpl);
     free(out_ctx.tensors);

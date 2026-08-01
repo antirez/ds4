@@ -883,11 +883,11 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
-        xqb = sxq;
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    if (xq_blocks <= 16u) xqb = sxq;
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -951,11 +951,11 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
     __shared__ uint8_t s_iq2_signs[128];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
-        xqb = sxq;
     }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    if (xq_blocks <= 16u) xqb = sxq;
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -1327,9 +1327,11 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     if (row >= expert_mid_dim) return;
@@ -1420,9 +1422,11 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < 64u; rr++) {
@@ -1517,9 +1521,11 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
@@ -2064,13 +2070,15 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
     #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
         const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -2089,13 +2097,15 @@ __global__ static void moe_down_sum6_qwarp32_ptrs_kernel(
         const cuda_block_q8_K *midq,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
     #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
         const char *down_base = down_slots[slot];
         if (!down_base) continue;
         const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)row * down_row_bytes);
@@ -2124,7 +2134,8 @@ __global__ static void moe_down_sum6_qwarp32_ptrs_batch_kernel(
     if (row >= out_dim || tok >= n_tokens) return;
     float total = 0.0f;
     #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
         int32_t compact_i = selected[(uint64_t)tok * n_expert + slot];
         if (compact_i < 0) compact_i = 0;
         const char *down_base = down_slots[(uint32_t)compact_i];
@@ -2139,6 +2150,84 @@ __global__ static void moe_down_sum6_qwarp32_ptrs_batch_kernel(
     if (lane == 0) out[(uint64_t)tok * out_dim + row] = total;
 }
 
+/* GLM's routed-IQ2 layout uses IQ2_XXS for the down projection as well as
+ * gate/up.  One 8-lane subgroup owns an output row and accumulates all routed
+ * experts for a token.  This mirrors the Q2_K direct-sum path above while
+ * using the existing IQ2_XXS x Q8_K dot primitive. */
+__global__ static void moe_down_iq2_sum_qwarp32_batch_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+        if (expert_i < 0) expert_i = 0;
+        const cuda_block_iq2_xxs *wr =
+            (const cuda_block_iq2_xxs *)(down_base +
+                (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+                (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq =
+            midq + ((uint64_t)tok * n_expert + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+}
+
+__global__ static void moe_down_iq2_sum_qwarp32_ptrs_batch_kernel(
+        float *out,
+        const char * const *down_slots,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t compact_i = selected[(uint64_t)tok * n_expert + slot];
+        if (compact_i < 0) compact_i = 0;
+        const char *down = down_slots[(uint32_t)compact_i];
+        if (!down) continue;
+        const cuda_block_iq2_xxs *wr =
+            (const cuda_block_iq2_xxs *)(down +
+                (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq =
+            midq + ((uint64_t)tok * n_expert + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+}
+
 __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
@@ -2147,13 +2236,15 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
-        uint32_t out_dim) {
+        uint32_t out_dim,
+        uint32_t n_expert) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
     #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -3234,7 +3325,8 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint64_t down_expert_bytes,
-        uint64_t down_row_bytes) {
+        uint64_t down_row_bytes,
+        uint32_t n_expert) {
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
@@ -3246,11 +3338,12 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
     float acc = 0.0f;
     const uint32_t nb = expert_mid_dim >> 8u;
 #pragma unroll
-    for (uint32_t slot = 0; slot < 6u; slot++) {
-        int32_t expert_i = selected[(uint64_t)tok * 6u + slot];
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
         if (expert_i < 0) expert_i = 0;
         const unsigned char *dr = (const unsigned char *)down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const float *mr = mid + ((uint64_t)tok * 6u + slot) * expert_mid_dim;
+        const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
         for (uint32_t b = 0; b < nb; b++) {
             const unsigned char *db = dr + (uint64_t)b * 84u;
             float d, dmin;
@@ -3260,6 +3353,135 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
             for (uint32_t kk = 0; kk < 8u; kk++) {
                 const uint32_t i = lane + (kk << 5u);
                 acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * mr[mbase + i];
+            }
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+__global__ static void moe_gate_up_mid_q2K_rows_w32_ptrs_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char * const *gate_slots,
+        const char * const *up_slots,
+        const uint8_t *pair_missing,
+        uint32_t want_missing,
+        const float *x,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t active_mask,
+        float clamp,
+        int store_gate_up) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim || rows_per_block == 0u) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    if ((active_mask & (1u << slot)) == 0u) return;
+    if (pair_missing &&
+        ((uint32_t)(pair_missing[pair] != 0) != want_missing)) {
+        return;
+    }
+    int32_t compact_i = selected[(uint64_t)tok * n_expert + slot];
+    if (compact_i < 0) compact_i = 0;
+    const char *gate_base = gate_slots[(uint32_t)compact_i];
+    const char *up_base = up_slots[(uint32_t)compact_i];
+    if (!gate_base || !up_base) return;
+    const float *xr = x + (uint64_t)tok * expert_in_dim;
+    const unsigned char *gr =
+        (const unsigned char *)gate_base + (uint64_t)row * gate_row_bytes;
+    const unsigned char *ur =
+        (const unsigned char *)up_base + (uint64_t)row * gate_row_bytes;
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    const uint32_t nb = expert_in_dim >> 8u;
+    for (uint32_t b = 0; b < nb; b++) {
+        const unsigned char *gb = gr + (uint64_t)b * 84u;
+        const unsigned char *ub = ur + (uint64_t)b * 84u;
+        float gd, gdmin, ud, udmin;
+        q2_K_scale_broadcast_w32(gb, &gd, &gdmin);
+        q2_K_scale_broadcast_w32(ub, &ud, &udmin);
+        const uint64_t xbase = (uint64_t)b * 256u;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8u; kk++) {
+            const uint32_t i = lane + (kk << 5u);
+            const float xv = xr[xbase + i];
+            gate += q2_K_dequant_256_scaled_w32(gb, lane, kk, gd, gdmin) * xv;
+            up += q2_K_dequant_256_scaled_w32(ub, lane, kk, ud, udmin) * xv;
+        }
+    }
+
+    gate = warp_sum_f32(gate);
+    up = warp_sum_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        if (store_gate_up) {
+            gate_out[off] = gate;
+            up_out[off] = up;
+        }
+        mid_out[off] =
+            moe_silu_oldhip(gate) * up *
+            weights[(uint64_t)tok * n_expert + slot];
+    }
+}
+
+__global__ static void moe_down_q2K_sum_rows_w32_ptrs_batch_kernel(
+        float *out,
+        const char * const *down_slots,
+        const float *mid,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_row_bytes,
+        uint32_t n_expert) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens || rows_per_block == 0u) return;
+
+    float acc = 0.0f;
+    const uint32_t nb = expert_mid_dim >> 8u;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t compact_i = selected[(uint64_t)tok * n_expert + slot];
+        if (compact_i < 0) compact_i = 0;
+        const char *down_base = down_slots[(uint32_t)compact_i];
+        if (!down_base) continue;
+        const unsigned char *dr =
+            (const unsigned char *)down_base + (uint64_t)row * down_row_bytes;
+        const float *mr =
+            mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
+        for (uint32_t b = 0; b < nb; b++) {
+            const unsigned char *db = dr + (uint64_t)b * 84u;
+            float d, dmin;
+            q2_K_scale_broadcast_w32(db, &d, &dmin);
+            const uint64_t mbase = (uint64_t)b * 256u;
+#pragma unroll
+            for (uint32_t kk = 0; kk < 8u; kk++) {
+                const uint32_t i = lane + (kk << 5u);
+                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) *
+                       mr[mbase + i];
             }
         }
     }
@@ -3284,6 +3506,7 @@ __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
         uint32_t expert_mid_dim,
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
+        uint32_t n_expert,
         float clamp) {
     extern __shared__ float shx[];
     const uint32_t tid = threadIdx.x;
@@ -3315,7 +3538,7 @@ __global__ static void moe_gate_up_mid_q2K_expert_batch_sharedx_kernel(
                 const uint32_t u = j >> 8u;
                 const uint32_t k = j & 255u;
                 if (pair[u] != UINT32_MAX) {
-                    const uint32_t tok = pair[u] / 6u;
+                    const uint32_t tok = pair[u] / n_expert;
                     shx[j] = x[(uint64_t)tok * expert_in_dim + xbase + k];
                 } else {
                     shx[j] = 0.0f;
@@ -3384,6 +3607,7 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         uint32_t out_dim,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
+        uint32_t n_expert,
         uint32_t n_tokens = 0u) {
     extern __shared__ float shmid[];
     const uint32_t tid = threadIdx.x;
@@ -3442,16 +3666,16 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
                     if (OUT_F16) {
                         uint64_t dst = (uint64_t)pair[u] * out_dim + row;
                         if (SLOT_MAJOR) {
-                            const uint32_t tok = pair[u] / 6u;
-                            const uint32_t slot = pair[u] - tok * 6u;
+                            const uint32_t tok = pair[u] / n_expert;
+                            const uint32_t slot = pair[u] - tok * n_expert;
                             dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
                         }
                         down_out_h[dst] = __float2half(acc[u]);
                     } else {
                         uint64_t dst = (uint64_t)pair[u] * out_dim + row;
                         if (SLOT_MAJOR) {
-                            const uint32_t tok = pair[u] / 6u;
-                            const uint32_t slot = pair[u] - tok * 6u;
+                            const uint32_t tok = pair[u] / n_expert;
+                            const uint32_t slot = pair[u] - tok * n_expert;
                             dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
                         }
                         down_out[dst] = acc[u];
@@ -3695,6 +3919,7 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
         uint32_t expert_mid_dim,
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
+        uint32_t n_expert,
         float clamp) {
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
@@ -3752,7 +3977,7 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                 const uint32_t pair = shPair[pair_row];
                 uint32_t v = 0u;
                 if (pair != UINT32_MAX) {
-                    const uint32_t token = pair / 6u;
+                    const uint32_t token = pair / n_expert;
                     const uint64_t xoff = (uint64_t)token * expert_in_dim + k0 + kk2 * 2u;
                     v = *reinterpret_cast<const uint32_t *>(x_h + xoff);
                 }
@@ -3766,7 +3991,7 @@ __global__ static void moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel(
                 const uint32_t kk = rem - mm * BK;
                 const uint32_t pair = shPair[mt * BM + mm];
                 if (pair != UINT32_MAX) {
-                    const uint32_t token = pair / 6u;
+                    const uint32_t token = pair / n_expert;
                     shA[j] = __float2half(x[(uint64_t)token * expert_in_dim + k0 + kk]);
                 } else {
                     shA[j] = __float2half(0.0f);
@@ -3931,6 +4156,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         uint32_t out_dim,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
+        uint32_t n_expert,
         uint32_t n_tokens = 0u) {
     extern __shared__ unsigned char raw_sh[];
     half *shA = reinterpret_cast<half *>(raw_sh);
@@ -4023,8 +4249,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         if (pair != UINT32_MAX) {
             const uint32_t row0 = n0 + nn;
             const uint32_t row1 = n0 + BN + nn;
-            const uint32_t tok = pair / 6u;
-            const uint32_t slot = pair - tok * 6u;
+            const uint32_t tok = pair / n_expert;
+            const uint32_t slot = pair - tok * n_expert;
             if (row0 < out_dim) {
                 if (OUT_F16) {
                     uint64_t dst = (uint64_t)pair * out_dim + row0;

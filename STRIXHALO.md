@@ -118,7 +118,7 @@ make strix-halo -j"$(nproc)"
 Use the standard IQ2XXS/Q2K/Q8 imatrix GGUF:
 
 ```text
-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 ```
 
 Avoid the mixed IQ2/IQ4 or IQ2/Q4 GGUFs on this machine for now. They put much
@@ -130,7 +130,7 @@ clean DS4 failure.
 Run it normally:
 
 ```sh
-./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 ```
 
 The ROCm build uses the Strix Halo backend automatically.

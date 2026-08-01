@@ -1,0 +1,1 @@
+Un **trie** (chiamato anche albero digitale o albero di prefissi) rappresenta un

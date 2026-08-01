@@ -1,0 +1,1 @@
+At the most fundamental level, both a **mutex** and an **atomic counter** are mechanisms used in concurrent programming to

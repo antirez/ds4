@@ -1,0 +1,4 @@
+Let's build up to online softmax step by step using simple variables.
+
+## 1. Standard Softmax Problem
+

@@ -33,6 +33,21 @@ The C runner consumes `official.vec` directly:
 ./ds4_test --logprob-vectors
 ```
 
+GLM 5.2 OpenRouter vectors are kept in a separate directory:
+
+```sh
+OPENROUTER_API_KEY=... ./tests/test-vectors/fetch_openrouter_glm_vectors.py
+
+DS4_TEST_MODEL=models/GLM-5.2-UD-Q4_K_XL.gguf \
+DS4_TEST_VECTOR_FILE=tests/test-vectors/glm-openrouter/official.vec \
+  ./ds4_test --logprob-vectors
+```
+
+The same fetcher also writes `tests/test-vectors/glm-openrouter/manifest.tsv`
+for `gguf-tools/quality-testing/score_official`.  By default it routes to
+OpenRouter `parasail/fp8` with strict parameter matching so top-logprob slices
+are present in the fixture.
+
 It also consumes the local golden fixture:
 
 ```sh
@@ -46,7 +61,7 @@ layer-batched decode reuses expert-cache buffers before the command buffer has
 completed:
 
 ```sh
-DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+DS4_TEST_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
   ./ds4_test --metal-ssd-streaming-cache-pressure
 ```
 

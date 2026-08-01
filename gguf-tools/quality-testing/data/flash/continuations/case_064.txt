@@ -1,0 +1,2 @@
+This is a fundamental concept in computer science, networking, and system design. The simplest analogy is a **water pipe**.
+

@@ -84,6 +84,89 @@ typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 
+kernel void kernel_add_rms_norm_mul_f32_4(
+        constant ds4_metal_args_norm & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * weight,
+        device       char * sum_dst,
+        device       char * norm_dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) shmem_f32[tiisg] = 0.0f;
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+    device const float4 *a = (device const float4 *)
+        (src0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+    device const float4 *b = (device const float4 *)
+        (src1 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+    device const float4 *w = (device const float4 *)
+        (weight + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
+    device float4 *sum = (device float4 *)
+        (sum_dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    device float4 *norm = (device float4 *)
+        (norm_dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+
+    float sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        const float4 v = a[i00] + b[i00];
+        sum[i00] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) shmem_f32[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = simd_sum(shmem_f32[tiisg]);
+
+    const float mean = sumf / args.ne00;
+    const float scale = 1.0f / sqrt(mean + args.eps);
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        norm[i00] = (sum[i00] * scale) * w[i00];
+    }
+}
+
+// RMSNorm reduction used when the following F16 matmul applies the row scale
+// while staging its RHS tile.
+kernel void kernel_rms_norm_scale_f32_4(
+        constant ds4_metal_args_norm & args,
+        device const char * src0,
+        device       float * dst_scale,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) shmem_f32[tiisg] = 0.0f;
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+    device const float4 *x = (device const float4 *)
+        (src0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+
+    float sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        sumf += dot(x[i00], x[i00]);
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) shmem_f32[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = simd_sum(shmem_f32[tiisg]);
+
+    const float mean = sumf / args.ne00;
+    const float scale = 1.0f / sqrt(mean + args.eps);
+    if (tpitg.x == 0) dst_scale[i01] = scale;
+}
+
 struct ds4_metal_args_qkv_rms_norm {
     int32_t  q_n;
     int32_t  q_n4;

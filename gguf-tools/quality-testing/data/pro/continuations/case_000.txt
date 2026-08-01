@@ -1,0 +1,3 @@
+Let me explain B-tree insertion with a focus on the splitting process and the special case of root splitting.
+
+## B-T

@@ -1,0 +1,1 @@
+Un **trie** (pronunciato "try"), noto anche come albero di prefissi (prefix tree

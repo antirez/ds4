@@ -1,0 +1,1 @@
+A **trie** (pronounced "try", derived from the word "re**trie**val") is a tree

@@ -1,0 +1,1 @@
+To understand why RMSNorm (Root Mean Square Normalization) requires both a **sum of squares pass** and a **

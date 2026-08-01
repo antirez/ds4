@@ -1,0 +1,1 @@
+Binary search finds the insertion point in a sorted array by repeatedly dividing the search interval in half. The goal is to find

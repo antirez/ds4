@@ -1,0 +1,5 @@
+Here's pseudocode for a binary heap push (insert) operation:
+
+```
+function push(heap, value):
+    //

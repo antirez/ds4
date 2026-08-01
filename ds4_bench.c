@@ -1,15 +1,16 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu_args.h"
 #include "ds4_help.h"
 
 /* Purpose-built throughput benchmark.
  *
  * The benchmark walks one fixed token sequence to configurable context
  * frontiers, measuring only the newest prefill interval at each frontier.  It
- * then snapshots the live session in memory, performs a fixed greedy decode
- * run without allowing EOS, restores the snapshot, and continues to the next
- * frontier.  Snapshot save/restore time is intentionally outside both timing
- * windows.
+ * then snapshots the live session in memory when the payload is small enough,
+ * performs a fixed greedy decode run without allowing EOS, restores the
+ * snapshot or replays the prefix, and continues to the next frontier.  Snapshot
+ * save/restore time is intentionally outside both timing windows.
  */
 
 #include <errno.h>
@@ -22,6 +23,8 @@
 #include <string.h>
 #include <time.h>
 
+#define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
+
 typedef struct {
     const char *model_path;
     const char *prompt_path;
@@ -29,6 +32,8 @@ typedef struct {
     const char *system;
     const char *csv_path;
     const char *expert_profile_path;
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
     ds4_backend backend;
     int threads;
     int ctx_start;
@@ -40,6 +45,7 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
@@ -49,12 +55,38 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_full_layers_set;
+    bool cuda_tensor_parallel;
+    bool show_output;
 } bench_config;
 
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static uint64_t bench_snapshot_max_bytes(void) {
+    const char *env = getenv("DS4_BENCH_SNAPSHOT_MAX_BYTES");
+    if (!env || env[0] == '\0') return DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES;
+    if (!strcmp(env, "unlimited") || !strcmp(env, "UNLIMITED") ||
+        !strcmp(env, "inf") || !strcmp(env, "INF")) {
+        return UINT64_MAX;
+    }
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (env[0] == '\0' || !end || *end != '\0') {
+        fprintf(stderr,
+                "ds4-bench: invalid DS4_BENCH_SNAPSHOT_MAX_BYTES=%s; using default %llu\n",
+                env,
+                (unsigned long long)DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES);
+        return DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES;
+    }
+    return (uint64_t)v;
+}
+
+static double bytes_to_gib(uint64_t bytes) {
+    return (double)bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
 static void usage(FILE *fp, const char *topic) {
@@ -241,6 +273,12 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
 #endif
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
+            c.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -260,6 +298,10 @@ static bench_config parse_options(int argc, char **argv) {
             }
             c.ssd_streaming_cache_experts = experts;
             c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
+            int v = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.ssd_streaming_full_layers = (uint32_t)v;
+            c.ssd_streaming_full_layers_set = true;
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -284,6 +326,8 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--show-output")) {
+            c.show_output = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -441,11 +485,13 @@ static int next_frontier(const bench_config *c, int cur) {
 
 static void log_context_memory(ds4_backend backend,
                                int         ctx_size,
-                               uint32_t    prefill_chunk) {
+                               uint32_t    prefill_chunk,
+                               bool        ssd_streaming) {
     ds4_context_memory m =
-        ds4_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
+        ds4_context_memory_estimate_with_prefill_mode(backend,
+                                                      ctx_size,
+                                                      prefill_chunk,
+                                                      ssd_streaming);
     fprintf(stderr,
             "ds4-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -508,20 +554,44 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
+    /* Hint the packer at the largest ctx this bench run will exercise
+     * so per-layer KV bytes are priced for the real session size, not
+     * a stale 4096 default. Single-tier and CPU paths ignore this. */
+    int placement_ctx_hint = cfg.ctx_max;
+    if (cfg.ctx_alloc > placement_ctx_hint) placement_ctx_hint = cfg.ctx_alloc;
+
+    ds4_gpu_config gpu_cfg = {0};
+    bool skip_cuda = false;
+    const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
+    if (have_gpu_config) {
+        char gpu_err[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg,
+                               &gpu_cfg, &skip_cuda,
+                               gpu_err, sizeof(gpu_err)) != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", gpu_err);
+            return 2;
+        }
+        cfg.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+    }
+
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .context_size = cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
     };
@@ -531,8 +601,25 @@ int main(int argc, char **argv) {
         return 2;
     }
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) return 1;
-    log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
+    if (have_gpu_config && !skip_cuda) {
+        const bool was_auto =
+            (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
+            (!cfg.gpu_vram_arg && cfg.gpu_devices_arg);
+        char layout[256];
+        if (format_gpu_layout_line(&gpu_cfg, was_auto,
+                                   layout, sizeof(layout)) > 0) {
+            fprintf(stdout, "%s\n", layout);
+            fflush(stdout);
+        }
+        if (ds4_engine_create_with_gpu_config(
+                &engine, &opt, &gpu_cfg) != 0) return 1;
+    } else if (ds4_engine_open(&engine, &opt) != 0) {
+        return 1;
+    }
+    log_context_memory(opt.backend,
+                       cfg.ctx_alloc,
+                       ds4_engine_prefill_chunk(engine),
+                       cfg.ssd_streaming);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
@@ -581,12 +668,14 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
     ds4_session_snapshot snap = {0};
+    const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
+    bool warned_large_snapshot = false;
     char err[256];
     int previous = 0;
     int rc = 0;
@@ -613,15 +702,41 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (cfg.gen_tokens > 0 && !distributed) {
-            if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+        const bool need_restore_after_generation =
+            cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
+        bool have_snapshot = false;
+        if (need_restore_after_generation && !distributed &&
+            getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
+            const uint64_t payload_bytes = ds4_session_payload_bytes(session);
+            const bool large_snapshot_forced =
+                getenv("DS4_BENCH_FORCE_SNAPSHOT") != NULL;
+            if (payload_bytes > snapshot_max_bytes && !large_snapshot_forced) {
+                if (!warned_large_snapshot) {
+                    fprintf(stderr,
+                            "ds4-bench: session payload snapshot is %.2f GiB, above the %.2f GiB benchmark limit; "
+                            "replaying prefixes instead (set DS4_BENCH_FORCE_SNAPSHOT=1 to force snapshots)\n",
+                            bytes_to_gib(payload_bytes),
+                            bytes_to_gib(snapshot_max_bytes));
+                    warned_large_snapshot = true;
+                }
+            } else if (payload_bytes > 0) {
+                if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                have_snapshot = true;
             }
         }
 
         const double gen_t0 = bench_now_sec();
+        double gen_first_sec = 0.0;
+        double gen_steady_sec = 0.0;
+        int gen_done = 0;
+        int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
+            ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
+            : NULL;
+        int gen_token_count = 0;
         for (int i = 0; i < cfg.gen_tokens; i++) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -634,20 +749,40 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            const double token_t0 = bench_now_sec();
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            const double token_t1 = bench_now_sec();
+            if (i == 0) gen_first_sec = token_t1 - token_t0;
+            else gen_steady_sec += token_t1 - token_t0;
+            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
+            gen_done++;
         }
         const double gen_t1 = bench_now_sec();
+        if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+            fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
+            for (int i = 0; i < gen_token_count; i++) {
+                size_t tlen = 0;
+                char *txt = ds4_token_text(engine, gen_token_buf[i], &tlen);
+                if (txt) {
+                    fwrite(txt, 1, tlen, stderr);
+                    free(txt);
+                }
+            }
+            fprintf(stderr, "\"\n");
+            fflush(stderr);
+        }
+        free(gen_token_buf);
         if (rc != 0) break;
 
-        if (cfg.gen_tokens == 0) {
-            /* Pure prefill benchmark: leave the live session at the frontier. */
-        } else if (distributed) {
+        if (!need_restore_after_generation) {
+            /* Nothing later depends on the frontier state. */
+        } else if (distributed || !have_snapshot) {
             if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: distributed replay restore at %d failed: %s\n", frontier, err);
+                fprintf(stderr, "ds4-bench: replay restore at %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
@@ -660,14 +795,18 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
-                cfg.gen_tokens,
-                gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                gen_done,
+                gen_sec > 0.0 ? (double)gen_done / gen_sec : 0.0,
+                gen_first_sec * 1000.0,
+                gen_steady_tokens,
+                gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
+                (unsigned long long)(have_snapshot ? snap.len : 0));
         fflush(out);
 
         previous = frontier;

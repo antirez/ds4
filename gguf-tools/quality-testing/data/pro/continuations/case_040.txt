@@ -1,0 +1,3 @@
+When a user reports generation slowing at long context, here are the first five measurements to take:
+
+## 1. **

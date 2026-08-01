@@ -1,0 +1,1 @@
+La differenza principale tra **righe KV (Key-Value) raw** (grezze) e **rig
