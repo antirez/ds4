@@ -12902,12 +12902,9 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--think-effort-min-ctx")) {
-            const int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (v < 0) {
-                server_log(DS4_LOG_DEFAULT,
-                           "ds4-server: --think-effort-min-ctx must be >= 0");
-                exit(2);
-            }
+            /* 0 disables the gate entirely, so this must accept zero:
+             * parse_int_arg() rejects v <= 0 and would exit(2) first. */
+            const int v = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
             ds4_think_set_effort_min_context((uint32_t)v);
         } else if (!strcmp(arg, "--reasoning-effort-map")) {
             const char *name = need_arg(&i, argc, argv, arg);
@@ -14593,6 +14590,13 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(ds4_think_max_min_context() == 4096);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 32768) == DS4_THINK_ULTRA);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 2048) == DS4_THINK_MAX);
+    /* 0 disables the gate: every tier must survive at any context. */
+    ds4_think_set_effort_min_context(0);
+    TEST_ASSERT(ds4_think_max_min_context() == 0);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 1) == DS4_THINK_ULTRA);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 0) == DS4_THINK_ULTRA);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 1) == DS4_THINK_MAX);
+
     ds4_think_set_effort_min_context((uint32_t)floor_ctx);
     TEST_ASSERT(ds4_think_max_min_context() == (uint32_t)floor_ctx);
 }
