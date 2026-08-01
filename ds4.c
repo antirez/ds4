@@ -35,6 +35,8 @@
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <libproc.h>
+#include <sys/resource.h>
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -46792,6 +46794,113 @@ static int generate_glm_metal_argmax(
     return 0;
 }
 
+/*
+ * SSD-streaming measurement mode (COMET fase S1): when
+ * DS4_STREAMING_MEASURE_INVALIDATE is set, the routed-expert file pages are
+ * dropped from the unified page cache after every decoded token, so each
+ * expert-cache miss and each bypass-layer read pays the SSD the way it would
+ * on a memory-constrained machine.  msync(MS_INVALIDATE) is used because it
+ * is the only primitive that actually evicts clean file-backed pages on
+ * Darwin (madvise variants leave them cached).  Attention/dense weights and
+ * the resident views are intentionally left alone: a real 48 GB machine
+ * would keep those hot.
+ */
+/* Returns the invalidation interval in decoded tokens (0 = mode disabled).
+ * The env value is the interval: "1" invalidates after every token (strict,
+ * ~40 ms/token of msync overhead on the 91 GB model), "8" amortizes the
+ * overhead while leaving a reuse window comparable to the page-cache slack
+ * a memory-constrained machine would grant anyway. */
+static int metal_graph_stream_measure_invalidate_interval(void) {
+    const char *v = getenv("DS4_STREAMING_MEASURE_INVALIDATE");
+    if (!v || !v[0] || strcmp(v, "0") == 0) return 0;
+    const int n = atoi(v);
+    return n > 0 ? n : 1;
+}
+
+static void metal_graph_stream_measure_invalidate(const ds4_model   *model,
+                                                  const ds4_weights *weights) {
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096ull;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        const ds4_tensor *t[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+        for (int i = 0; i < 3; i++) {
+            if (!t[i] || t[i]->bytes == 0) continue;
+            uint64_t start = t[i]->abs_offset & ~(page - 1u);
+            uint64_t end = t[i]->abs_offset + t[i]->bytes;
+            if (end > model->size) end = model->size;
+            if (end <= start) continue;
+            /* Best effort: a failed invalidation only makes the measure
+             * optimistic, and the disk-read accounting exposes that. */
+            (void)msync((void *)(model->map + start), (size_t)(end - start),
+                        MS_INVALIDATE);
+        }
+    }
+}
+
+/* Diagnostic for the measurement mode: how much of the routed-expert file
+ * range is still resident right after an invalidation pass.  Pages that
+ * survive msync(MS_INVALIDATE) are effectively pinned (e.g. wired for
+ * no-copy Metal buffers) and the measurement cannot make them pay the SSD. */
+static void metal_graph_stream_measure_report_residency(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const char        *label) {
+    const long page_long = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_long > 0 ? (uint64_t)page_long : 4096ull;
+    char *vec = NULL;
+    size_t vec_cap = 0;
+    uint64_t res_slab = 0, tot_slab = 0, res_byp = 0, tot_byp = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        const ds4_tensor *t[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+        const bool uniform = weights_streaming_layer_experts_uniform(weights, il);
+        for (int i = 0; i < 3; i++) {
+            if (!t[i] || t[i]->bytes == 0) continue;
+            uint64_t start = t[i]->abs_offset & ~(page - 1u);
+            uint64_t end = t[i]->abs_offset + t[i]->bytes;
+            if (end > model->size) end = model->size;
+            if (end <= start) continue;
+            const size_t len = (size_t)(end - start);
+            const size_t npages = (len + page - 1u) / page;
+            if (npages > vec_cap) {
+                char *nv = realloc(vec, npages);
+                if (!nv) { free(vec); return; }
+                vec = nv;
+                vec_cap = npages;
+            }
+            if (mincore((void *)(model->map + start), len, vec) != 0) continue;
+            uint64_t res = 0;
+            for (size_t p = 0; p < npages; p++) res += (uint64_t)(vec[p] & 1);
+            if (uniform) { res_slab += res * page; tot_slab += len; }
+            else         { res_byp  += res * page; tot_byp  += len; }
+        }
+    }
+    free(vec);
+    fprintf(stderr,
+            "ds4: measure mode: residency %s: slab %.2f/%.2f GiB (%.0f%%), "
+            "bypass %.2f/%.2f GiB (%.0f%%)\n",
+            label,
+            (double)res_slab / (double)(1ull << 30),
+            (double)tot_slab / (double)(1ull << 30),
+            tot_slab ? 100.0 * (double)res_slab / (double)tot_slab : 0.0,
+            (double)res_byp / (double)(1ull << 30),
+            (double)tot_byp / (double)(1ull << 30),
+            tot_byp ? 100.0 * (double)res_byp / (double)tot_byp : 0.0);
+}
+
+/* Disk bytes actually read by this process (page-ins included), for the
+ * decode-phase accounting of the measurement mode. 0 when unavailable. */
+static uint64_t metal_graph_stream_process_disk_bytes_read(void) {
+#if defined(__APPLE__)
+    struct rusage_info_v4 ri;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) == 0) {
+        return ri.ri_diskio_bytesread;
+    }
+#endif
+    return 0;
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
@@ -46929,6 +47038,22 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
 
+    const int measure_interval =
+        ssd_streaming ? metal_graph_stream_measure_invalidate_interval() : 0;
+    const bool measure_invalidate = measure_interval > 0;
+    uint64_t measure_disk_read0 = 0;
+    double measure_msync_s = 0.0;
+    if (measure_invalidate) {
+        metal_graph_stream_measure_invalidate(model, weights);
+        measure_disk_read0 = metal_graph_stream_process_disk_bytes_read();
+        fprintf(stderr,
+                "ds4: measure mode: invalidating routed-expert pages every "
+                "%d decoded token(s) (prefill warmth dropped)\n",
+                measure_interval);
+        metal_graph_stream_measure_report_residency(model, weights,
+                                                    "after initial purge");
+    }
+
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
@@ -46963,6 +47088,11 @@ static int generate_metal_graph_raw_swa(
             const double t_eval1 = now_sec();
             fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
         }
+        if (measure_invalidate && (n_decode_eval + 1) % measure_interval == 0) {
+            const double t_m0 = now_sec();
+            metal_graph_stream_measure_invalidate(model, weights);
+            measure_msync_s += now_sec() - t_m0;
+        }
         n_decode_eval++;
         pos++;
     }
@@ -46976,6 +47106,23 @@ static int generate_metal_graph_raw_swa(
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+
+    if (measure_invalidate) {
+        const uint64_t disk_read1 = metal_graph_stream_process_disk_bytes_read();
+        const double read_gib =
+            (double)(disk_read1 - measure_disk_read0) / (double)(1ull << 30);
+        fprintf(stderr,
+                "ds4: measure mode: decode disk reads %.2f GiB over %d tokens "
+                "(%.1f MiB/token), msync overhead %.2f ms/token\n",
+                read_gib,
+                n_generated,
+                n_generated > 0 ? read_gib * 1024.0 / (double)n_generated : 0.0,
+                n_generated > 0 ? measure_msync_s * 1000.0 / (double)n_generated
+                                : 0.0);
+        metal_graph_stream_measure_invalidate(model, weights);
+        metal_graph_stream_measure_report_residency(model, weights,
+                                                    "after final purge");
+    }
 
     if (memory_report) ds4_gpu_print_memory_report("before graph free");
     free(logits);
