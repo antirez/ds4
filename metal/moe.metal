@@ -4021,9 +4021,9 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     }
 
     device float *dst_gate_f32 =
-        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)idx * args.ne0;
     device float *dst_up_f32 =
-        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)idx * args.ne0;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *dst_mid_f32 =
         (device float *)(dst_mid + pair_row * act.mid_row_stride);

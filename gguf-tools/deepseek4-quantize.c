@@ -2229,11 +2229,21 @@ static void dspark_shape_reversed_from_info(tensor_meta *m, const st_info *info)
     }
 }
 
+static bool dspark_is_preserved_mxfp4(const dspark_tensor_plan *tp) {
+    return tp->meta.type == DS4Q_TYPE_MXFP4 &&
+           tp->kind == DSPARK_PLAN_EXPERT &&
+           tp->role == DSPARK_ROLE_ROUTED &&
+           tp->expert_part != EXP_NONE;
+}
+
 static void dspark_plan_set_size(dspark_tensor_plan *tp) {
-    if (tp->meta.type != DS4Q_TYPE_I32 && !is_quantizable_target(tp->meta.type)) {
+    const bool preserved_mxfp4 = dspark_is_preserved_mxfp4(tp);
+    if (tp->meta.type != DS4Q_TYPE_I32 &&
+        !is_quantizable_target(tp->meta.type) &&
+        !preserved_mxfp4) {
         die("unsupported DSpark planned tensor type");
     }
-    if (ds4q_can_quantize(tp->meta.type) &&
+    if ((ds4q_can_quantize(tp->meta.type) || preserved_mxfp4) &&
         tp->meta.ne[0] % ds4q_block_size(tp->meta.type) != 0) {
         fprintf(stderr,
                 "error: DSpark tensor %s ne[0]=%" PRId64
@@ -2244,6 +2254,48 @@ static void dspark_plan_set_size(dspark_tensor_plan *tp) {
         exit(1);
     }
     tp->meta.size = tensor_nbytes(tp->meta.type, tp->meta.ne, tp->meta.n_dims);
+}
+
+static void dspark_validate_preserved_mxfp4_source(st_db *db,
+                                                    const char *weight_name,
+                                                    const st_info *weight) {
+    if (strcmp(weight->dtype, "I8") != 0 || weight->n_dims != 2) {
+        die("DSpark MXFP4 preservation requires a packed 2D I8 expert weight");
+    }
+    const int64_t nrows = weight->shape[0];
+    const int64_t packed_cols = weight->shape[1];
+    if (nrows <= 0 || packed_cols <= 0 || packed_cols > INT64_MAX / 2 ||
+        (packed_cols * 2) % ds4q_block_size(DS4Q_TYPE_MXFP4) != 0) {
+        die("DSpark MXFP4 expert dimensions are invalid");
+    }
+    if ((uint64_t)nrows > UINT64_MAX / (uint64_t)packed_cols ||
+        weight->end < weight->begin ||
+        weight->end - weight->begin != (uint64_t)nrows * (uint64_t)packed_cols) {
+        die("DSpark MXFP4 expert weight payload size mismatch");
+    }
+
+    char *scale_name = xstrdup(weight_name);
+    const size_t suffix = strlen(".weight");
+    const size_t name_len = strlen(scale_name);
+    if (name_len <= suffix || strcmp(scale_name + name_len - suffix, ".weight") != 0) {
+        die("DSpark MXFP4 expert weight has no .weight suffix");
+    }
+    strcpy(scale_name + name_len - suffix, ".scale");
+    tensor_entry *scale_entry = db_tensor(db, scale_name, NULL);
+    const st_info *scale = &scale_entry->info;
+    const int64_t nblocks = packed_cols / 16;
+    if (strcmp(scale->dtype, "F8_E8M0") != 0 || scale->n_dims != 2) {
+        die("DSpark MXFP4 preservation requires a paired 2D F8_E8M0 scale");
+    }
+    if (scale->shape[0] != nrows || scale->shape[1] != nblocks) {
+        die("DSpark MXFP4 expert scale shape mismatch");
+    }
+    if ((uint64_t)nrows > UINT64_MAX / (uint64_t)nblocks ||
+        scale->end < scale->begin ||
+        scale->end - scale->begin != (uint64_t)nrows * (uint64_t)nblocks) {
+        die("DSpark MXFP4 expert scale payload size mismatch");
+    }
+    free(scale_name);
 }
 
 static void dspark_plan_add_regular(dspark_support_plan *plan,
@@ -2278,7 +2330,11 @@ static void dspark_plan_add_expert(dspark_support_plan *plan,
     if (te->info.n_dims != 2) die("DSpark expert tensor must be 2D");
     const int64_t nrows = te->info.shape[0];
     int64_t ncols = te->info.shape[1];
-    if (strcmp(te->info.dtype, "I8") == 0) ncols *= 2;
+    if (nrows <= 0 || ncols <= 0) die("DSpark expert tensor dimensions are invalid");
+    if (strcmp(te->info.dtype, "I8") == 0) {
+        if (ncols > INT64_MAX / 2) die("DSpark packed expert width is too large");
+        ncols *= 2;
+    }
 
     int idx = dspark_plan_find(plan, gguf_name);
     dspark_tensor_plan *tp = NULL;
@@ -2303,6 +2359,9 @@ static void dspark_plan_add_expert(dspark_support_plan *plan,
         tp->meta.ne[2] = 0;
         tp->role = DSPARK_ROLE_ROUTED;
         tp->meta.type = dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, part);
+    }
+    if (tp->meta.type == DS4Q_TYPE_MXFP4) {
+        dspark_validate_preserved_mxfp4_source(db, hf_name, &te->info);
     }
     if (expert + 1 > tp->n_experts) tp->n_experts = expert + 1;
     if (stage + 1 > plan->stages) plan->stages = stage + 1;
