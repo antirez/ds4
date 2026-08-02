@@ -893,6 +893,7 @@ void server::gen_begin(session_slot *sl) {
     pulsar_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
 
     int cold_store_len = 0;
+    g->cold_store_is_anchor = false;
     if (cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
@@ -902,8 +903,12 @@ void server::gen_begin(session_slot *sl) {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     pulsar_token_user(s->engine),
                                                     pulsar_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (anchor >= s->kv.opt.min_tokens) {
+            cold_store_len = anchor;
+            g->cold_store_is_anchor = true;
+        } else {
+            cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        }
     }
     g->cold_store_len = cold_store_len;
     g->suppressed_continued_last = -1;
@@ -997,7 +1002,7 @@ void server::gen_step_prefill(session_slot *sl) {
 
     if (cold) {
         s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
+        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, g->cold_store_is_anchor ? "sys-prefix" : "cold")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {
@@ -1041,7 +1046,7 @@ void server::gen_stream_begin(session_slot *sl) {
                server_now_sec() - g->t0);
     if (g->cold_store_len == g->prompt_for_sync->len) {
         s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, "cold")) {
+        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, g->cold_store_is_anchor ? "sys-prefix" : "cold")) {
             kv_cache_note_store(&s->kv, g->cold_store_len);
             g->suppressed_continued_last = -1;
         } else {

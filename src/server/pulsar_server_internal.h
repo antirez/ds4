@@ -1144,6 +1144,7 @@ typedef enum {
     KV_REASON_CONTINUED = PULSAR_KVSTORE_REASON_CONTINUED,
     KV_REASON_EVICT     = PULSAR_KVSTORE_REASON_EVICT,
     KV_REASON_SHUTDOWN  = PULSAR_KVSTORE_REASON_SHUTDOWN,
+    KV_REASON_SYS_PREFIX = PULSAR_KVSTORE_REASON_SYS_PREFIX,
 } kv_cache_reason;
 
 typedef struct trace_cache_diag {
@@ -1228,6 +1229,11 @@ struct gen_state {
     char req_flags[64];
     server_prefill_progress progress; /* stable address: callback userdata */
     int cold_store_len;
+    bool cold_store_is_anchor; /* cold_store_len is a chat_anchor_pos preamble
+                                * cut (shared system prompt + tools, before the
+                                * task message) -> stored as "sys-prefix" so
+                                * eviction keeps the one file every new
+                                * conversation can text-prefix restore from */
     int suppressed_continued_last;
     pulsar_tokens cold_prefix;
 

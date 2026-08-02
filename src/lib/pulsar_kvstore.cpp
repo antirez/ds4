@@ -62,6 +62,13 @@
  * survive comparable continued entries, while still allowing pressure and poor
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+/* Shared-preamble checkpoints (sys-prefix, agent-system) are the highest-value
+ * bytes in the cache: one file seeds EVERY new conversation with the same
+ * system prompt, but it sits at hits=0 until the first restart/eviction needs
+ * it — exactly when naive LRU has already evicted it. Score it high enough to
+ * be evicted last, but not infinitely: checkpoints for retired system prompts
+ * must still cycle out eventually. */
+#define KV_CACHE_SYS_PREFIX_SCORE_FACTOR 8.0
 
 namespace pulsar {
 namespace {
@@ -1078,6 +1085,7 @@ uint8_t pulsar_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "shutdown")) return PULSAR_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return PULSAR_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return PULSAR_KVSTORE_REASON_AGENT_SESSION;
+    if (!strcmp(reason, "sys-prefix")) return PULSAR_KVSTORE_REASON_SYS_PREFIX;
     return PULSAR_KVSTORE_REASON_UNKNOWN;
 }
 
@@ -1164,7 +1172,7 @@ bool pulsar_kvstore_read_header(FILE *fp, pulsar_kvstore_entry *e,
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
-    e->reason = h[5] <= PULSAR_KVSTORE_REASON_AGENT_SESSION ? h[5] :
+    e->reason = h[5] <= PULSAR_KVSTORE_REASON_SYS_PREFIX ? h[5] :
                 (uint8_t)PULSAR_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
@@ -1244,7 +1252,10 @@ double pulsar_kvstore_entry_eviction_score(
     }
     double score = (effective_hits + 1.0) *
                    (double)e->tokens / (double)e->file_size;
-    if (pulsar::kv_cache_reason_is_anchor(e->reason))
+    if (e->reason == PULSAR_KVSTORE_REASON_SYS_PREFIX ||
+        e->reason == PULSAR_KVSTORE_REASON_AGENT_SYSTEM)
+        score *= KV_CACHE_SYS_PREFIX_SCORE_FACTOR;
+    else if (pulsar::kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (pulsar::kv_cache_incoming_supersedes_continued(e, incoming)) {
         double h = effective_hits > 0.0 ?

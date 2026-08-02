@@ -26,6 +26,11 @@ typedef enum {
     PULSAR_KVSTORE_REASON_SHUTDOWN  = 4,
     PULSAR_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     PULSAR_KVSTORE_REASON_AGENT_SESSION = 6,
+    /* Truncated shared-preamble checkpoint (system prompt + tools, cut before
+     * the first task message): the one snapshot every NEW conversation with
+     * the same preamble can text-prefix restore from. Same concept as
+     * AGENT_SYSTEM but written by the server's cold-anchor path. */
+    PULSAR_KVSTORE_REASON_SYS_PREFIX    = 7,
 } pulsar_kvstore_reason;
 
 typedef enum {

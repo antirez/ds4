@@ -3721,6 +3721,51 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
 
 
 
+/* A sys-prefix checkpoint (truncated shared preamble) must outlive ordinary
+ * cold anchors under budget pressure: it is the one file every NEW
+ * conversation with the same system prompt can text-prefix restore from, and
+ * it sits at hits=0 until the first restart needs it. */
+static void test_kv_cache_eviction_prefers_sys_prefix_over_cold(void) {
+    char tmpl[] = "/tmp/ds4-kv-sys-prefix-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *sys_sha  = "3333333333333333333333333333333333333333";
+    const char *cold_sha = "4444444444444444444444444444444444444444";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, sys_sha, KV_REASON_SYS_PREFIX, 2048, 0, now, 2048);
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 2048, 0, now, 2048);
+
+    char sys_name[44], cold_name[44];
+    snprintf(sys_name, sizeof(sys_name), "%.40s.kv", sys_sha);
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    char *sys_path = path_join(dir, sys_name);
+    char *cold_path = path_join(dir, cold_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(sys_path, F_OK) == 0);
+    TEST_ASSERT(access(cold_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(sys_path);
+    unlink(cold_path);
+    free(sys_path);
+    free(cold_path);
+    rmdir(dir);
+
+    TEST_ASSERT(pulsar_kvstore_reason_code("sys-prefix") ==
+                PULSAR_KVSTORE_REASON_SYS_PREFIX);
+}
+
+
+
 static void test_kv_cache_eviction_makes_room_before_store(void) {
     char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -4944,6 +4989,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_prefers_sys_prefix_over_cold();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
