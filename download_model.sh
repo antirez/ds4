@@ -5,8 +5,12 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+Q2_IMATRIX_0731_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+Q4_IMATRIX_0731_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
+Q2_Q4_IMATRIX_0731_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+MXFP4_IMATRIX_0731_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
 PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
@@ -33,8 +37,12 @@ DwarfStar GGUF downloader
 
 Usage:
   ./download_model.sh q2-imatrix [--token TOKEN]
+  ./download_model.sh q2-imatrix-0731 [--token TOKEN]
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
+  ./download_model.sh q2-q4-imatrix-0731 [--token TOKEN]
   ./download_model.sh q4-imatrix [--token TOKEN]
+  ./download_model.sh q4-imatrix-0731 [--token TOKEN]
+  ./download_model.sh mxfp4-imatrix-0731 [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -52,15 +60,28 @@ Targets:
        2-bit routed experts, about 81 GB on disk.
        Recommended model for 96 and 128 GB RAM machines.
 
+  q2-imatrix-0731
+       Dated 0731 build of q2-imatrix. 2-bit routed experts.
+
   q2-q4-imatrix
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
        using q4 routed experts. About 98 GB on disk. Good for higher
        quality inference for 128 GB MacBooks. Works on DGX Spark but loading
        may struggle compared to q2-imatrix.
 
+  q2-q4-imatrix-0731
+       Dated 0731 build of q2-q4-imatrix. Mixed Flash quant with q4 last 6 layers.
+
   q4-imatrix
        4-bit routed experts, about 153 GB on disk.
        Recommended model for machines with 256 GB RAM or more.
+
+  q4-imatrix-0731
+       Dated 0731 build of q4-imatrix. 4-bit routed experts.
+
+  mxfp4-imatrix-0731
+       Dated 0731 build of MXFP4 experts quant. About 153 GB on disk.
+       Only available as a dated build; no undated counterpart exists.
 
   pro-q2-imatrix
        DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
@@ -144,8 +165,12 @@ FLATTEN_DOWNLOADS=0
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
+    q2-imatrix-0731) MODEL_FILE=$Q2_IMATRIX_0731_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
+    q2-q4-imatrix-0731) MODEL_FILE=$Q2_Q4_IMATRIX_0731_FILE ;;
     q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
+    q4-imatrix-0731) MODEL_FILE=$Q4_IMATRIX_0731_FILE ;;
+    mxfp4-imatrix-0731) MODEL_FILE=$MXFP4_IMATRIX_0731_FILE ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
     pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
