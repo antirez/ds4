@@ -61017,57 +61017,28 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
     }
 
-    bool final_logits_ok = false;
-    if (ok && commit_drafts == draft_n) {
-        const double read_t0 = stats_enabled ? now_sec() : 0.0;
-        final_logits_ok =
-            metal_graph_read_spec_logits_row(&s->graph,
-                                             (uint32_t)(draft_n - 1),
-                                             row_logits);
-        if (stats_enabled) {
-            s->dspark_stats.verify_read_ms += (now_sec() - read_t0) * 1000.0;
-        }
-    }
-
-    if (ok && commit_drafts == draft_n && final_logits_ok) {
-        if (tp_verify_sent &&
-            !ds4_tp_send_verify_commit(e->tp.ctx, 1, 0)) {
-            snprintf(err, errlen, "tp: verify commit send failed");
-            s->checkpoint_valid = false;
-            spec_frontier_free(&frontier);
-            DS4_DSPARK_STATS_FINISH();
-            return -1;
-        }
-        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        int emitted_drafts = 0;
-        for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
-            accepted[n_accept++] = drafts[i];
-            emitted_drafts++;
-            if (drafts[i] == eos_token) break;
-        }
-        s->checkpoint_valid = true;
-        ds4_session_dspark_capture_note_checkpoint(s);
-        if (stats_enabled) {
-            s->dspark_stats.full_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted_drafts;
-            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
-                                      (uint32_t)emitted_drafts);
-        }
-        ds4_session_dspark_scheduler_note(
-                s,
-                (uint32_t)emitted_drafts,
-                false,
-                DS4_DSPARK_SCHED_EXTRA_MS());
-        if (spec_log) {
-            fprintf(stderr,
-                    "ds4: DSpark spec accept drafted=%d accepted=%d\n",
-                    draft_n,
-                    n_accept);
-        }
-        spec_frontier_free(&frontier);
-        DS4_DSPARK_STATS_FINISH();
-        return n_accept;
-    }
+    /* Greedy-identity fix: the verify batch's compressor-frontier writes
+     * come from a batched multi-token GEMM (ds4_gpu_matmul_f16_pair_tensor),
+     * which is numerically distinct from ordinary single-token decode's
+     * fused projection+store kernel
+     * (ds4_gpu_matmul_f16_pair_compressor_store_tensor). Previously, a full
+     * accept (commit_drafts == draft_n) took a fast path that committed the
+     * batch-verify's KV/compressor-frontier state directly, so accepted
+     * tokens' state silently diverged from what plain decode would have
+     * produced -- this eventually flips an argmax tie on longer
+     * generations, breaking --temp 0 greedy-identity vs. no-drafter decode.
+     * There is no separate fast-accept branch any more: every accept (full
+     * or partial) falls through to the rollback+replay path below, which
+     * re-derives each accepted token's KV/compressor state one token at a
+     * time through the same single-token decode kernel
+     * (metal_graph_eval_token_raw_swa) plain greedy decode uses, so the
+     * post-accept state -- and the logits read off it -- are bit-identical
+     * to pure decode for the same tokens. This costs one extra fused
+     * single-token kernel launch (plus its surrounding forward pass) per
+     * accepted token per block; on a net-loss drafter workload this makes
+     * DSpark's already-negative throughput case worse, but correctness
+     * comes first. When there is no drafter, draft_n is never reached (the
+     * caller returns earlier), so this path has zero effect. */
 
     if (verifier_may_have_mutated) {
         s->checkpoint.len = start;
