@@ -1,0 +1,35 @@
+#!/bin/bash
+# claude-pulsar — launch Claude Code against the local pulsar stack.
+#
+# Main model      : pulsar-server (Anthropic /v1/messages, 1M ctx) via the
+#                   model router, which sends haiku-class background traffic
+#                   to the small/fast box instead.
+# Context window  : Claude Code sizes the window from the model NAME it
+#                   believes it is using; pulsar-server ignores the client's
+#                   model string entirely, so we ask for "sonnet[1m]" to get
+#                   1M-token accounting (and a late auto-compact trigger)
+#                   while pulsar serves whatever model it has loaded.
+#
+# Usage: claude-pulsar [claude args...]
+#
+# Env overrides:
+#   CLAUDE_PULSAR_URL    router (or pulsar) base URL   [default http://sparky:8100]
+#   CLAUDE_PULSAR_MODEL  model alias to request        [default sonnet[1m]]
+
+set -u
+
+BASE_URL="${CLAUDE_PULSAR_URL:-http://sparky:8100}"
+MODEL="${CLAUDE_PULSAR_MODEL:-sonnet[1m]}"
+
+if ! curl -sf --max-time 5 "${BASE_URL}/v1/models" >/dev/null 2>&1; then
+    echo "claude-pulsar: warning: ${BASE_URL}/v1/models not answering" >&2
+    echo "  (is pulsar-model-router / pulsar-server up?)" >&2
+fi
+
+unset ANTHROPIC_API_KEY
+export ANTHROPIC_BASE_URL="$BASE_URL"
+export ANTHROPIC_AUTH_TOKEN="local"
+export ANTHROPIC_MODEL="$MODEL"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+exec claude "$@"
