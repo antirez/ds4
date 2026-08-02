@@ -270,7 +270,7 @@ bool server::send_root(int fd) {
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
         "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
-        "\"/v1/responses\",\"/metrics\"]}\n",
+        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\"]}\n",
         PULSAR_VERSION_STR);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -451,6 +451,34 @@ void *client_main(void *arg) {
                 server_served_model_id(s)))
     {
         s->send_model(fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* Anthropic token counting (POST /v1/messages/count_tokens): render and
+     * tokenize exactly as /v1/messages would — same template, tool schemas,
+     * tool-memory replay, think mode — and return the count without creating
+     * a job or touching the session banks. Deliberately no context-length
+     * rejection: clients (Claude Code) call this to decide whether a prompt
+     * fits, so an over-window prompt must still count. */
+    if (!strcmp(hr.method, "POST") &&
+        !strcmp(hr.path, "/v1/messages/count_tokens"))
+    {
+        request creq;
+        char cerr[160];
+        if (!parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
+                                     pulsar_session_ctx(s->sess), &creq,
+                                     cerr, sizeof(cerr)))
+        {
+            http_error(fd, s->enable_cors, 400, cerr);
+            http_request_free(&hr);
+            goto done;
+        }
+        buf cb = {0};
+        buf_printf(&cb, "{\"input_tokens\":%d}\n", creq.prompt.len);
+        http_response(fd, s->enable_cors, 200, "application/json", cb.ptr);
+        buf_free(&cb);
+        request_free(&creq);
         http_request_free(&hr);
         goto done;
     }

@@ -2869,6 +2869,53 @@ static void test_api_sampling_presence_flags(void) {
 
 
 
+/* Anthropic count_tokens invariants (the /v1/messages/count_tokens endpoint
+ * returns r->prompt.len from this same parse): identical bodies count
+ * identically, more conversation counts strictly more, and advertising tools
+ * grows the rendered prompt. Parse-only; engine used just to tokenize. */
+static void test_anthropic_count_tokens_parse(void) {
+    pulsar_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    char err[160];
+    request r;
+
+    const char *one_turn =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"max_tokens\":64}";
+    TEST_ASSERT(parse_anthropic_request(engine, NULL, one_turn,
+        128, 32768, &r, err, sizeof(err)));
+    const int n_one = r.prompt.len;
+    TEST_ASSERT(n_one > 0);
+    request_free(&r);
+
+    TEST_ASSERT(parse_anthropic_request(engine, NULL, one_turn,
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.prompt.len == n_one);
+    request_free(&r);
+
+    TEST_ASSERT(parse_anthropic_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"assistant\",\"content\":\"hello there\"},"
+        "{\"role\":\"user\",\"content\":\"tell me more about lobsters\"}],"
+        "\"max_tokens\":64}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.prompt.len > n_one);
+    request_free(&r);
+
+    TEST_ASSERT(parse_anthropic_request(engine, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"max_tokens\":64,"
+        "\"tools\":[{\"name\":\"get_weather\","
+        "\"description\":\"Get the current weather for a location\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":"
+        "{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}}]}",
+        128, 32768, &r, err, sizeof(err)));
+    TEST_ASSERT(r.prompt.len > n_one);
+    request_free(&r);
+}
+
+
+
 /* min_p range validation at parse: an out-of-range min_p (min_p < 0 or
  * min_p > 1) disables the filter (0.0), following top_p's out-of-range
  * convention in the engine samplers; unvalidated, min_p > 1 silently
@@ -2945,6 +2992,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--tensor-equivalence", "tensor-equivalence", "fast/quality prompt-logit and greedy equivalence", test_mpp_equivalence},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
+    {"--api-count-tokens", "api-count-tokens", "anthropic count_tokens parse: deterministic, monotonic, tools counted", test_anthropic_count_tokens_parse},
 #endif
     {"--sampler", "sampler", "sampler byte-exactness vs re-derived reference", test_sampler_dist_equivalence},
     {"--sampler-prefilter", "sampler-prefilter", "min-p prefilter: survivor set/order identity vs old-sum reference + boundary teeth", test_sampler_prefilter_equivalence},
