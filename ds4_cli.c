@@ -216,6 +216,7 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "vulkan")) return DS4_BACKEND_CUDA;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
 #else
@@ -1939,6 +1940,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
 #ifdef DS4_ROCM_BUILD
         } else if (!strcmp(arg, "--rocm")) {
             c.engine.backend = DS4_BACKEND_CUDA;

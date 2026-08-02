@@ -1,0 +1,41 @@
+#version 460 core
+/* Decode matmul_q8_0: no shared memory, no subgroup ops.
+ * Each thread reads ONE Q8_0 block iteratively, reads from x_buf directly.
+ * Workgroup: ceil(out_dim/256) × 1 × 1.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf   { float x_buf[]; };
+layout(set = 0, binding = 1) buffer WBuf   { uint  w_buf[]; };
+layout(set = 0, binding = 2) buffer OutBuf  { float out_buf[]; };
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint blocks_per_row;
+} pc;
+
+int extract_i8(uint word, uint byte_i) {
+    uint shifted = word >> (byte_i * 8u);
+    uint raw = shifted & 0xFFu;
+    return raw < 128u ? int(raw) : int(raw) - 256;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.out_dim) return;
+    double sum = 0.0;
+    uint b = 0u;
+    for (; b < pc.blocks_per_row; b++) {
+        uint blk_off = (row * pc.blocks_per_row + b) * 9u;
+        float d = uintBitsToFloat(w_buf[blk_off]);
+        uint base = b * 32u;
+        for (uint w = 0u; w < 8u; w++) {
+            uint word = w_buf[blk_off + 1u + w];
+            uint b4 = base + w * 4u;
+            for (uint j = 0u; j < 4u && (b4 + j) < pc.in_dim; j++) {
+                int q = extract_i8(word, j);
+                sum += double(x_buf[b4 + j]) * double(d * float(q));
+            }
+        }
+    }
+    out_buf[row] = float(sum);
+}

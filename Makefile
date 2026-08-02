@@ -38,6 +38,10 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+VULKAN_CXX ?= g++
+VULKAN_CXXFLAGS ?= -O3 -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include $(NATIVE_CPU_FLAG)
+VULKAN_LDLIBS ?= -lm -pthread /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+VULKAN_SRCS := $(wildcard vulkan/shaders/*.comp)
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
@@ -47,7 +51,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm vulkan
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -108,6 +112,7 @@ help:
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make vulkan              Build with Vulkan backend (Strix Halo)"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
@@ -132,9 +137,20 @@ strix-halo:
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
-		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+		DS4_LINK_LIBS="-lamdhip64 -lm -pthread -lhipblas -lhipblaslt"
 
 rocm: strix-halo
+
+# -----------------------------------------------------------------------
+# Vulkan backend (Strix Halo / Radeon 8060S)
+# -----------------------------------------------------------------------
+vulkan:
+	cd vulkan/shaders && python3 compile.py
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_vulkan.o" \
+		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
+		DS4_LINK="$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD" \
+		DS4_LINK_LIBS="$(VULKAN_LDLIBS)"
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -254,6 +270,9 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
+
+ds4_vulkan.o: vulkan/vulkan_backend.cpp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp
+	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/vulkan_backend.cpp
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

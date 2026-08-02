@@ -10919,7 +10919,7 @@ static void layer_routed_moe_one(
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
  * large temporaries come from the persistent scratch arena. */
-static void layer_routed_moe_one_prealloc(
+void layer_routed_moe_one_prealloc(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -28982,6 +28982,18 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
                                                false) != 0;
+    }
+    if (!ok && n_tokens == 1) {
+        /* CPU fallback: one token at a time */
+        int ds4_gpu_routed_moe_cpu(void *out, const ds4_model *model,
+            const ds4_layer_weights *layer, const float *x,
+            int token, uint32_t il, float clamp);
+        float *o = (float*)ds4_gpu_tensor_contents(metal_graph_batch_routed_out(g));
+        const float *x0 = (const float*)ds4_gpu_tensor_contents(metal_graph_batch_ffn_norm(g));
+        int tok = (int)pos0;
+        ds4_gpu_routed_moe_cpu(o, model, layer, x0 + (uint64_t)tok * DS4_N_EMBD,
+                                tok, il, DS4_SWIGLU_CLAMP_EXP);
+        ok = true;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -59932,7 +59944,15 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    int r = ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    static int first_call = 1;
+    if (first_call) {
+        first_call = 0;
+        fprintf(stderr, "LOGITS[0..7]=%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f (token=%d)\n",
+            s->logits[0], s->logits[1], s->logits[2], s->logits[3],
+            s->logits[4], s->logits[5], s->logits[6], s->logits[7], token);
+    }
+    return r;
 }
 
 #ifndef DS4_NO_GPU
@@ -64888,4 +64908,38 @@ int ds4_session_ctx(ds4_session *s) {
 
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
+}
+
+/* MoE CPU fallback - calls layer_routed_moe_one_prealloc with simple parameters */
+int ds4_gpu_routed_moe_cpu(void *out, const ds4_model *model,
+    const ds4_layer_weights *layer, const float *x,
+    int token, uint32_t il, float clamp)
+{
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const bool routed_q8_0 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q8_0;
+    const uint64_t q8_x_blocks = expert_in_dim / 32u;
+    const uint64_t q8_mid_blocks = down_in_dim / 32u;
+    float *mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
+    block_q8_K *xq = routed_q8_0 ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(xq[0]));
+    block_q8_K *midq = routed_q8_0 ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(midq[0]));
+    int8_t *q8_xq = routed_q8_0 ? xmalloc((size_t)q8_x_blocks * 32u) : NULL;
+    float *q8_xscale = routed_q8_0 ? xmalloc((size_t)q8_x_blocks * sizeof(q8_xscale[0])) : NULL;
+    int8_t *q8_midq = routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * q8_mid_blocks * 32u) : NULL;
+    float *q8_midscale = routed_q8_0 ? xmalloc((size_t)DS4_N_EXPERT_USED * q8_mid_blocks * sizeof(q8_midscale[0])) : NULL;
+
+    layer_routed_moe_one_prealloc((float*)out, model, layer, x,
+                                   il, token, clamp, mid_all, xq, midq,
+                                   q8_xq, q8_xscale, q8_midq, q8_midscale);
+    free(mid_all);
+    free(xq);
+    free(midq);
+    free(q8_xq);
+    free(q8_xscale);
+    free(q8_midq);
+    free(q8_midscale);
+    return 1;
 }
