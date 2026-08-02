@@ -68,10 +68,10 @@ To skip the router entirely (single backend, small-fast lands on pulsar too):
 
 ## Gaps / notes
 
-- pulsar-server has no `/v1/messages/count_tokens`; Claude Code tolerates the
-  404 (token accounting comes from response `usage`, which pulsar reports
-  exactly, including cache read/creation splits). Upstream PR #630 is the
-  shape to port if it ever matters.
+- `/v1/messages/count_tokens` is implemented server-side (same render +
+  tokenize path as `/v1/messages`, no job/bank involvement, no context-length
+  rejection), so Claude Code's pre-flight sizing gets exact counts. Response
+  `usage` was already exact, including cache read/creation splits.
 - Claude Code sends `cache_control` blocks and `anthropic-beta` headers
   (context-1m etc.); both backends ignore them harmlessly.
 - The router treats non-POST requests (e.g. `GET /v1/models`) as main-bound.
