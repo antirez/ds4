@@ -731,15 +731,35 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
+    /* The IQ2 dictionary is staged UNCONDITIONALLY.  It used to live inside the
+     * `xq_blocks <= 16` activation-staging branch below, but the dot reads
+     * s_iq2_grid/s_iq2_signs on EVERY path -- so an xq_blocks > 16 layer decoded
+     * its weights against uninitialised shared memory.  Unreachable at the
+     * shipped v5mx shape (n_embd 4096 => xq_blocks exactly 16, so the guard held
+     * by one block) and latent rather than live, but it is one bad dim away from
+     * silent garbage, and the two IQ2 *down* kernels already stage it
+     * unconditionally -- this pair was the outlier, not the rule. */
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    /* ONE barrier on every path; xq_blocks is block-uniform so hoisting it out
+     * of the branch is free.
+     *
+     * COST, measured with ptxas -v at sm_120f: this kernel goes 96 -> 121
+     * registers, because the dictionary loops now always execute and their
+     * addressing stays live across the barrier.  smem is unchanged (39,552 B)
+     * and occupancy is unchanged -- at 256 threads both 96 and 121 regs hold
+     * 2 blocks/SM (65,536 / (121*256) = 2.12), and 2*39,552 < 102,400 -- so this
+     * stays clear of the occupancy cliff that made the NT=16 widen a regression
+     * (see 21e992a).  Not measured end-to-end. */
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     if (row >= expert_mid_dim) return;
@@ -817,15 +837,20 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
+    /* Staged unconditionally -- see the note in the row32 kernel above: the dot
+     * reads the dictionary on every path, so gating its stage on activation
+     * staging left xq_blocks > 16 reading uninitialised shared memory. */
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    __syncthreads();            /* one barrier on every path -- see the row32 note */
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
