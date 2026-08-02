@@ -4,22 +4,24 @@
 # Main model      : pulsar-server (Anthropic /v1/messages, 1M ctx) via the
 #                   model router, which sends haiku-class background traffic
 #                   to the small/fast box instead.
-# Context window  : Claude Code sizes the window from the model NAME it
-#                   believes it is using; pulsar-server ignores the client's
-#                   model string entirely, so we ask for "sonnet[1m]" to get
-#                   1M-token accounting (and a late auto-compact trigger)
-#                   while pulsar serves whatever model it has loaded.
+# Context window  : Claude Code sizes the window from the requested model
+#                   name's [1m] suffix — verified (header dump, 2026-08-01)
+#                   to work on CUSTOM names too: "deepseek-v4-flash[1m]"
+#                   sends model=deepseek-v4-flash WITH the context-1m beta,
+#                   i.e. 1M-token accounting and a late auto-compact trigger.
+#                   Without the suffix Claude Code assumes a small window —
+#                   keep [1m] on any model name you substitute.
 #
 # Usage: claude-pulsar [claude args...]
 #
 # Env overrides:
 #   CLAUDE_PULSAR_URL    router (or pulsar) base URL   [default http://sparky:8100]
-#   CLAUDE_PULSAR_MODEL  model alias to request        [default sonnet[1m]]
+#   CLAUDE_PULSAR_MODEL  model alias to request        [default deepseek-v4-flash[1m]]
 
 set -u
 
 BASE_URL="${CLAUDE_PULSAR_URL:-http://sparky:8100}"
-MODEL="${CLAUDE_PULSAR_MODEL:-sonnet[1m]}"
+MODEL="${CLAUDE_PULSAR_MODEL:-deepseek-v4-flash[1m]}"
 
 if ! curl -sf --max-time 5 "${BASE_URL}/v1/models" >/dev/null 2>&1; then
     echo "claude-pulsar: warning: ${BASE_URL}/v1/models not answering" >&2

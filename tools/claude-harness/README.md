@@ -35,10 +35,13 @@ paying a full re-prefill on the next real turn.
 ## The 1M context window
 
 Claude Code sizes its context window (and the auto-compact trigger) from the
-model **name** it believes it is serving. There is no context-window override
-env var. `sonnet[1m]` is a recognized alias that forces 1M-token accounting;
-pulsar-server never validates the client's model string, so the request is
-served by whatever model is loaded while Claude Code budgets for 1M.
+requested model name's `[1m]` suffix. There is no context-window override env
+var. Verified by header dump (2026-08-01): the suffix works on **custom**
+names — requesting `deepseek-v4-flash[1m]` sends `model=deepseek-v4-flash`
+on the wire *with* the `context-1m-2025-08-07` beta (1M accounting), while
+the bare name omits it (Claude Code then assumes a small default window).
+pulsar-server never validates the client's model string, so any name works
+server-side; keep the `[1m]` suffix on whatever display name you pick.
 
 Known caveat: Claude Code strips the `[1m]` suffix when resolving subagent
 models (anthropics/claude-code#45169), so subagents assume a 200K window and
