@@ -3,6 +3,25 @@
 // Included from ds4_cuda.cu before more specialized modules; these helpers are
 // intentionally kept static in the single translation unit.
 
+/*
+ * Return the mask for the power-of-two logical subgroup containing
+ * linear_lane. CUDA hardware uses 32-lane warps, while gfx9 uses 64-lane
+ * wavefronts and packs two logical DS4 wave32 groups into one wavefront.
+ * Keeping this calculation in one helper avoids accidentally addressing the
+ * wrong half of a wave64 in shuffle reductions.
+ */
+__device__ static MASK_T ds4_subgroup_mask(uint32_t linear_lane, uint32_t width) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const uint32_t wave_width = (uint32_t)__builtin_amdgcn_wavefrontsize();
+#else
+    const uint32_t wave_width = (uint32_t)warpSize;
+#endif
+    if (width >= wave_width) return (MASK_T)FULL_WARP_MASK;
+    const MASK_T low = ((MASK_T)1u << width) - (MASK_T)1u;
+    const uint32_t wave_lane = linear_lane & (wave_width - 1u);
+    return low << (wave_lane & ~(width - 1u));
+}
+
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;

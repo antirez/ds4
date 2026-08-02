@@ -4,7 +4,11 @@
 // private/static while we gradually split the custom ROCm backend into modules.
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#if defined(DS4_GFX906)
+#include "ds4_rocm_wmma_gfx906.cuh"
+#else
 #include <rocwmma/rocwmma.hpp>
+#endif
 #endif
 
 __device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p) {
@@ -679,6 +683,7 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
+#if !defined(DS4_GFX906)
 __launch_bounds__(128, 2)
 __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         float *out,
@@ -780,6 +785,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         }
     }
 }
+#endif
 
 template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
 __global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(

@@ -4,7 +4,11 @@
 // ds4_rocm_moe_launch.cuh so host policy/glue can keep using these static kernels directly.
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#if defined(DS4_GFX906)
+#include "ds4_rocm_wmma_gfx906.cuh"
+#else
 #include <rocwmma/rocwmma.hpp>
+#endif
 #endif
 
 __device__ static float dev_f16_to_f32(uint16_t v) {
@@ -463,7 +467,7 @@ __device__ static void dev_dot_q2_K_q8_K_block8(
 }
 
 __device__ static float half_warp_sum_f32(float v, uint32_t lane16) {
-    uint32_t mask = 0xffffu << (threadIdx.x & 16u);
+    const MASK_T mask = ds4_subgroup_mask(threadIdx.x, 16u);
     for (int offset = 8; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(static_cast<MASK_T>(mask), v, offset, 16);
     }
@@ -472,7 +476,7 @@ __device__ static float half_warp_sum_f32(float v, uint32_t lane16) {
 }
 
 __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
-    uint32_t mask = 0xffu << (threadIdx.x & 24u);
+    const MASK_T mask = ds4_subgroup_mask(threadIdx.x, 8u);
     for (int offset = 4; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(static_cast<MASK_T>(mask), v, offset, 8);
     }

@@ -445,6 +445,28 @@ __device__ __forceinline__ static float attention_dot_f32_vec4_oldhip(const floa
     return s;
 }
 
+__device__ __forceinline__ static float attention_dot_f32_vec4_coop_oldhip_w32(
+        const float *a, const float *b, uint32_t n, uint32_t lane) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    const uint32_t n4 = n >> 2u;
+    const float4 *a4 = (const float4 *)a;
+    const float4 *b4 = (const float4 *)b;
+    for (uint32_t i = lane; i < n4; i += 32u) {
+        const float4 av = a4[i];
+        const float4 bv = b4[i];
+        s0 += av.x * bv.x;
+        s1 += av.y * bv.y;
+        s2 += av.z * bv.z;
+        s3 += av.w * bv.w;
+    }
+    s0 = attention_warp_sum_oldhip_w32(s0);
+    s1 = attention_warp_sum_oldhip_w32(s1);
+    s2 = attention_warp_sum_oldhip_w32(s2);
+    s3 = attention_warp_sum_oldhip_w32(s3);
+    return (s0 + s1) + (s2 + s3);
+}
+
+template <bool COOPERATIVE_DOT = false>
 __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
         float *heads,
         const float *q,
@@ -469,30 +491,63 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
     const float scale = rsqrtf((float)head_dim);
 
     float local_max = sinks[h];
-    for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
-        const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
-        const float *kv = raw_kv + (uint64_t)row * head_dim;
-        float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
-        if (!use_vec4) {
-            for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
-        }
-        s *= scale;
-        scores[r] = s;
-        local_max = fmaxf(local_max, s);
-    }
-    for (uint32_t c = tid; c < n_comp; c += blockDim.x) {
-        float s = -3.4e38f;
-        if (!(use_mask && comp_mask && comp_mask[c] <= -5.0e29f)) {
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
-            if (!use_vec4) {
-                for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+    if (COOPERATIVE_DOT) {
+        const uint32_t lane = tid & 31u;
+        const uint32_t group = tid >> 5u;
+        const uint32_t groups = blockDim.x >> 5u;
+        for (uint32_t rr = group; rr < n_rows; rr += groups) {
+            const bool raw = rr < n_raw;
+            const uint32_t logical_row = raw ? rr : rr - n_raw;
+            const bool valid = raw || !(use_mask && comp_mask &&
+                                        comp_mask[logical_row] <= -5.0e29f);
+            float s = -3.4e38f;
+            if (valid) {
+                const uint32_t row = raw && raw_cap
+                    ? ((raw_start + logical_row) % raw_cap) : logical_row;
+                const float *kv = (raw ? raw_kv : comp_kv) +
+                                  (uint64_t)row * head_dim;
+                float dot = use_vec4
+                    ? attention_dot_f32_vec4_coop_oldhip_w32(qh, kv, head_dim, lane)
+                    : 0.0f;
+                if (!use_vec4) {
+                    for (uint32_t i = lane; i < head_dim; i += 32u)
+                        dot += qh[i] * kv[i];
+                    dot = attention_warp_sum_oldhip_w32(dot);
+                }
+                s = dot * scale;
+                if (!raw && use_mask && comp_mask) s += comp_mask[logical_row];
             }
-            s = dot * scale;
-            if (use_mask && comp_mask) s += comp_mask[c];
+            if (lane == 0u) {
+                scores[rr] = s;
+                local_max = fmaxf(local_max, s);
+            }
         }
-        scores[n_raw + c] = s;
-        local_max = fmaxf(local_max, s);
+    } else {
+        for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
+            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+            const float *kv = raw_kv + (uint64_t)row * head_dim;
+            float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+            if (!use_vec4) {
+                for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
+            }
+            s *= scale;
+            scores[r] = s;
+            local_max = fmaxf(local_max, s);
+        }
+        for (uint32_t c = tid; c < n_comp; c += blockDim.x) {
+            float s = -3.4e38f;
+            if (!(use_mask && comp_mask && comp_mask[c] <= -5.0e29f)) {
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+                if (!use_vec4) {
+                    for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+                }
+                s = dot * scale;
+                if (use_mask && comp_mask) s += comp_mask[c];
+            }
+            scores[n_raw + c] = s;
+            local_max = fmaxf(local_max, s);
+        }
     }
     const float max_score = attention_block_max_oldhip_w32(local_max);
 
@@ -717,7 +772,7 @@ __global__ static void attention_decode_mixed_kernel(
                 if (kvrow) {
                     float dot = 0.0f;
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
-                    const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                    const MASK_T mask = ds4_subgroup_mask(threadIdx.x, 8u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
                     }
@@ -962,7 +1017,7 @@ __global__ static void attention_indexed_mixed_kernel(
                     : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
                 float dot = 0.0f;
                 for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
-                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                const MASK_T mask = ds4_subgroup_mask(threadIdx.x, 8u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                     dot += __shfl_down_sync(static_cast<MASK_T>(mask), dot, off, 8);
                 }
@@ -1146,7 +1201,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(FULL_WARP_MASK, score, 0, 32);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -1257,7 +1312,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         const float *score_row = scores + warp * 768u;
         for (uint32_t i = lane; i < n_score; i += 32u) max_s = fmaxf(max_s, score_row[i]);
         max_s = warp_max_f32(max_s);
-        max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0);
+        max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0, 32);
     }
     float den = 0.0f;
     if (valid_head) {
@@ -1269,7 +1324,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         }
         den = warp_sum_f32(den);
         den += expf(sinks[head] - max_s);
-        den = __shfl_sync(FULL_WARP_MASK, den, 0);
+        den = __shfl_sync(FULL_WARP_MASK, den, 0, 32);
     }
 
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1422,7 +1477,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(FULL_WARP_MASK, score, 0, 32);
 
                 max_s = fmaxf(max_s, score);
             }
@@ -1458,7 +1513,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(FULL_WARP_MASK, score, 0, 32);
 
                 const float row_scale = expf(score - max_s);
                 sum_s += row_scale;

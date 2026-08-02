@@ -4,8 +4,15 @@
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
+#if defined(DS4_GFX906)
+// gfx906 (Vega 20) lacks MFMA matrix cores and rocWMMA refuses to compile for
+// it (static_assert "Unsupported architecture"). Use our device-side shim that
+// emulates the small rocWMMA subset ds4 uses via __shfl width=32 wave32 lanes.
+#include "rocm/ds4_rocm_wmma_gfx906.cuh"
+#else
 #include <rocwmma/rocwmma-version.hpp>
 #include <rocwmma/rocwmma.hpp>
+#endif
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t

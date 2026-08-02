@@ -1550,9 +1550,9 @@ static int cuda_stream_resident_make_room(
 
     size_t free_b = 0;
     size_t total_b = 0;
-    const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
     while (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         (void)total_b;
+        const uint64_t reserve = cuda_stream_resident_free_reserve_bytes();
         if ((uint64_t)free_b >= reserve &&
             bytes <= (uint64_t)free_b - reserve) {
             return 1;
@@ -4742,12 +4742,13 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
     char *end = NULL;
     errno = 0;
     unsigned long v = strtoul(env, &end, 10);
-    if (end == env || errno != 0) return def;
+    if (end == env || *end != '\0' || errno != 0 || v > UINT32_MAX) return def;
     return cuda_rows_per_block_or_default((uint32_t)v, def);
 }
 
 struct ds4_rocm_runtime_config {
     int initialized;
+    int q8_prequant_decode;
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
@@ -4756,6 +4757,12 @@ struct ds4_rocm_runtime_config {
     int glm_grouped_qk_low;
     int q8_decode_sharedx_64k;
     int graph_dump;
+    int router_wave64;
+    int attention_cooperative_dot;
+    uint32_t q8_decode_rpb;
+    uint32_t f16_pair_decode_rpb;
+    uint32_t q8_hc_decode_rpb;
+    uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
     uint32_t moe_decode_gate_rpb;
     uint32_t moe_decode_down_rpb;
@@ -4766,6 +4773,18 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
+#if defined(DS4_GFX906)
+        /* Vega 20 has substantially higher one-token Q8 throughput when the
+         * activation is quantized once and reused by all output rows.  The
+         * F32-input path can also expose asynchronous wave64 corruption, so
+         * keep this enabled in quality mode; the environment switch remains
+         * available for controlled diagnostics.  Other architectures retain
+         * the upstream dispatch. */
+        g_rocm_cfg.q8_prequant_decode =
+            !cuda_env_present(getenv("DS4_ROCM_DISABLE_Q8_PREQUANT_DECODE"));
+#else
+        g_rocm_cfg.q8_prequant_decode = 0;
+#endif
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
@@ -4805,6 +4824,35 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
+#if defined(DS4_GFX906)
+        g_rocm_cfg.router_wave64 =
+            !cuda_env_present(getenv("DS4_ROCM_DISABLE_ROUTER_WAVE64"));
+        g_rocm_cfg.attention_cooperative_dot =
+            !cuda_env_present(getenv("DS4_ROCM_DISABLE_ATTENTION_COOP_DOT"));
+#else
+        g_rocm_cfg.router_wave64 = 0;
+        g_rocm_cfg.attention_cooperative_dot = 0;
+#endif
+        uint32_t q8_decode_default = g_quality_mode ? 8u : 1u;
+#if defined(DS4_GFX906)
+        /* Pack two independent software-wave32 rows into each hardware wave64.
+         * Row arithmetic and reduction order remain unchanged. */
+        if (!g_quality_mode) q8_decode_default = 2u;
+#endif
+        g_rocm_cfg.q8_decode_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_Q8_DECODE_RPB",
+                                               q8_decode_default);
+        uint32_t f16_pair_default = 32u;
+#if defined(DS4_GFX906)
+        /* A 1024-thread block exposes too few workgroups for the 60 CUs in
+         * Vega 20 at the 256/512/1024-row decode shapes. */
+        f16_pair_default = 8u;
+#endif
+        g_rocm_cfg.f16_pair_decode_rpb =
+            cuda_rows_per_block_env_or_default("DS4_ROCM_F16_PAIR_DECODE_RPB",
+                                               f16_pair_default);
+        g_rocm_cfg.q8_hc_decode_rpb = g_quality_mode ? 8u : 16u;
+        g_rocm_cfg.attn_out_low_decode_rpb = g_quality_mode ? 8u : 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
             moe_decode_rpb_env != NULL && moe_decode_rpb_env[0] != '\0';
@@ -5506,7 +5554,21 @@ static int cuda_stream_model_cache_prepare_memory(
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
+    uint64_t mb = 1792;
+    const char *env = getenv("DS4_ROCM_WEIGHT_ARENA_CHUNK_MB");
+    if (!env || !env[0]) env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0) mb = (uint64_t)v;
+    }
+    if (mb < 256) mb = 256;
+    if (mb > 8192) mb = 8192;
+    uint64_t bytes = mb * 1048576ull;
+    if (need > bytes / 2u) {
+        const uint64_t align = 64ull * 1048576ull;
+        return (need + align - 1u) & ~(align - 1u);
+    }
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -5662,6 +5724,15 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
+    if (cuda_stream_cache_stats_on()) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "model arena map %-18s off=%.3f GiB bytes=%.2f MiB total=%.2f GiB ranges=%zu\n",
+                what ? what : "weights",
+                (double)offset / 1073741824.0,
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0,
+                g_model_ranges.size());
+    }
     cuda_model_load_progress_note(g_model_range_bytes);
     return (const char *)dev;
 }
