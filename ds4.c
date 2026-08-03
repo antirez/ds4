@@ -346,6 +346,71 @@ int ds4_gpu_attention_decode_heads_rope_tensor(
             n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16, n_comp,
             comp_mask, use_mask, n_head, head_dim);
 }
+/* Fused batched-decode entry points are implemented in ds4_cuda.cu only.
+ * The fused session-batch path is runtime-gated on the CUDA backend, so
+ * these stubs are never reached on Metal builds; ..._supported returning 0
+ * just reports the path as unavailable. */
+int ds4_gpu_attention_decode_multi_supported(
+        uint32_t                n_comp,
+        uint32_t                comp_kv_f16) {
+    (void)n_comp; (void)comp_kv_f16; return 0;
+}
+int ds4_gpu_attention_decode_heads_multi_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_attn_seqview *seqs,
+        uint32_t                n_seqs,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
+    (void)q; (void)seqs; (void)n_seqs; (void)comp_kv_f16;
+    (void)n_head; (void)head_dim; return 0;
+}
+int ds4_gpu_head_rms_norm_rope_tail_multi_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const uint32_t   *pos,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps) {
+    (void)x; (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot;
+    (void)pos; (void)n_ctx_orig; (void)inverse; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; (void)eps; return 0;
+}
+int ds4_gpu_rope_tail_multi_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const uint32_t   *pos,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    (void)x; (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot;
+    (void)pos; (void)n_ctx_orig; (void)inverse; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor;
+    (void)beta_fast; (void)beta_slow; return 0;
+}
 int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) { (void)t; return -1; }
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
