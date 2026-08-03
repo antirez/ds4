@@ -2359,6 +2359,33 @@ static const char *cuda_model_range_ptr_from_fd(
         const char *what) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
+    /* ds4.c's load-time BF16/Q6_K/F32 -> F16 dense-tensor conversion
+     * (model_convert_dense_bf16_q6k) grows the host mapping past the real
+     * on-disk file size to hold converted tensor bytes that only ever
+     * existed as BF16/Q6_K/F32 on disk. g_model_file_size (from an fstat
+     * on the same fd, captured once in ds4_gpu_set_model_fd) still
+     * reflects the real file's length, so any offset at or beyond it is
+     * necessarily inside that conversion extension -- there is nothing to
+     * read from disk there via direct/O_DIRECT file I/O; the converted
+     * bytes are already correctly resident in the host mapping, so just
+     * use it directly instead of attempting a doomed file read. */
+    if (g_model_file_size != 0 && offset >= g_model_file_size) {
+        const char *ptr = cuda_model_ptr(model_map, offset);
+        /* Also record this as an already-"cached" range (mirroring what
+         * every other successful resolution path below does via
+         * g_model_ranges.push_back()): ds4_gpu_cache_model_range() ->
+         * cuda_model_range_is_cached() requires a covering entry here
+         * before it will report success, and on hardware where
+         * cudaHostRegister isn't supported (this build's GB10 target),
+         * neither of that function's own fast-path checks
+         * (g_model_device_owned / g_model_registered) are true, so
+         * without this entry every caller that separately re-checks
+         * "is this range ready" (as opposed to just resolving a pointer)
+         * would see a false cache-miss for the conversion extension. */
+        g_model_ranges.push_back({model_map, offset, bytes, (char *)ptr, NULL, NULL, 0, 0, 0});
+        g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+        return ptr;
+    }
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {

@@ -3902,18 +3902,50 @@ static void tensor_family_key(ds4_str name, char *buf, size_t bufsz) {
     buf[n] = '\0';
 }
 
-/* Dialect compat: convert dense (non-routed-expert) GGUF BF16/Q6_K tensors
- * to F16 in place at load time, so the rest of ds4 -- which only binds
- * F16/F32/Q8_0/Q4_K/Q4_0 for dense tensors -- never has to know this file
- * used BF16/Q6_K for them.
+/* Structural test for "this tensor is a load-time dense F16-conversion
+ * candidate", shared by both scan passes in model_convert_dense_bf16_q6k()
+ * below.
  *
- * Scope: only tensors with ndim <= 2. Every dense role ds4 binds (token
- * embeddings, the output head, attention/FFN projections, LoRA factors) is
- * <=2D; routed MoE expert tensors are always 3D (in, mid, n_expert). This
- * makes the ndim<=2 filter a safe, purely structural way to skip routed
- * experts without any name matching -- critically, it also leaves GLM's
- * genuine Q6_K *routed* experts (which must stay quantized/streamed, not
- * blown up to F16) untouched, since those are 3D too.
+ * BF16/Q6_K: always eligible for ndim <= 2 (see that function's own
+ * comment for why ndim<=2 safely excludes routed experts in every model
+ * family, including GLM's genuine Q6_K routed experts).
+ *
+ * F32: eligible only for ndim == 2 (never ndim == 1 -- every 1D F32
+ * tensor in every validate path, deepseek4 FLASH/PRO, GLM, MTP, and
+ * DSpark alike, is a norm/bias/scale vector that must stay F32) and only
+ * when compiled for the DeepSeek4 (non-GLM) family. Checked directly
+ * against source: in `weights_validate_layout()` (deepseek4, non-GLM)
+ * every 2D tensor is either hardcoded DS4_TENSOR_F16 or
+ * dense-quant/routed-expert -- never F32 -- so converting any 2D F32
+ * tensor there to F16 is exhaustively safe. `weights_validate_glm_dsa_layout()`
+ * (GLM) is the opposite: `ffn_gate_inp` and `indexer_proj` are *required*
+ * as literal 2D F32 there, so this must not run for GLM builds. MTP's
+ * validator (`mtp_weights_validate_layout()`) uses `tensor_expect_plain_layout()`
+ * (F16-or-F32, so F32->F16 is harmless) for its 2D hc tensors and Q8_0 for
+ * its dense weights -- never a hard 2D F32 requirement either, so a
+ * DeepSeek4-family build converting an MTP support GGUF is also safe. */
+static bool tensor_is_dense_conversion_candidate(uint32_t type, uint32_t ndim) {
+    if (ndim > 2) return false;
+    if (type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q6_K) return true;
+    if (type == DS4_TENSOR_F32 && ndim == 2 &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return true;
+    }
+    return false;
+}
+
+/* Dialect compat: convert dense (non-routed-expert) GGUF BF16/Q6_K tensors,
+ * and (DeepSeek4-family builds only) 2D F32 tensors bound as F16, to F16 in
+ * place at load time, so the rest of ds4 -- which only binds F16/F32/
+ * Q8_0/Q4_K/Q4_0 for dense tensors -- never has to know this file used
+ * BF16/Q6_K/F32 for them.
+ *
+ * Scope: see tensor_is_dense_conversion_candidate() above for the exact,
+ * source-checked eligibility rule per type. Routed MoE expert tensors are
+ * always 3D (in, mid, n_expert), so the ndim<=2 half of that rule alone
+ * already keeps every routed-expert family (including GLM's genuine Q6_K
+ * *routed* experts, which must stay quantized/streamed, not blown up to
+ * F16) untouched with no name matching needed.
  *
  * Mechanism: the model file is mapped once in model_open before this runs,
  * so tensor bytes normally live at model_map + tensor->abs_offset with no
@@ -3931,8 +3963,7 @@ static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
     uint64_t extra_bytes = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
-        if (t->ndim > 2) continue;
-        if (t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q6_K) {
+        if (tensor_is_dense_conversion_candidate(t->type, t->ndim)) {
             extra_bytes += t->elements * 2u;
         }
     }
@@ -3991,8 +4022,7 @@ static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         ds4_tensor *t = &m->tensors[i];
-        if (t->ndim > 2) continue;
-        if (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_Q6_K) continue;
+        if (!tensor_is_dense_conversion_candidate(t->type, t->ndim)) continue;
 
         const uint32_t orig_type = t->type;
         const char *orig_type_name = tensor_type_name(orig_type);
@@ -4005,10 +4035,23 @@ static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
             for (uint64_t e = 0; e < t->elements; e++) {
                 dst[e] = f32_to_f16_clamped(bf16_to_f32(src[e]), &clamp_here);
             }
-        } else {
+        } else if (orig_type == DS4_TENSOR_Q6_K) {
             const block_q6_K *src =
                 (const block_q6_K *)((const char *)m->map + t->abs_offset);
             convert_row_q6_K_to_f16(src, dst, t->elements, &clamp_here);
+        } else {
+            /* DS4_TENSOR_F32, 2D, DeepSeek4-family only (see
+             * tensor_is_dense_conversion_candidate()). These are small
+             * hyper-connection routing tensors near unity scale, so
+             * narrowing to F16 is expected to be loss-free in practice;
+             * the clamp guard and count below still apply, and a nonzero
+             * count here is reported loudly since it would mean an actual
+             * out-of-F16-range value was truncated, not just narrowed. */
+            const float *src =
+                (const float *)((const char *)m->map + t->abs_offset);
+            for (uint64_t e = 0; e < t->elements; e++) {
+                dst[e] = f32_to_f16_clamped(src[e], &clamp_here);
+            }
         }
 
         t->type = DS4_TENSOR_F16;
@@ -4042,9 +4085,11 @@ static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
     for (uint32_t fi = 0; fi < n_fam; fi++) {
         if (fam[fi].clamp != 0) {
             fprintf(stderr,
-                "ds4: tensor family %s (%s, %u tensor%s) dialect compat: "
-                "dequantized to f16 at load -- %" PRIu64 " value%s clamped "
-                "to +-65504 (unexpected for weights, investigate)\n",
+                "ds4: *** WARNING *** tensor family %s (%s, %u tensor%s) "
+                "dialect compat: dequantized to f16 at load -- %" PRIu64
+                " value%s clamped to +-65504 -- weights should NEVER hit "
+                "the F16 clamp; this is a correctness red flag, investigate "
+                "before trusting this model's output\n",
                 fam[fi].key, fam[fi].type_name, fam[fi].count,
                 fam[fi].count == 1 ? "" : "s",
                 fam[fi].clamp, fam[fi].clamp == 1 ? "" : "s");
@@ -4680,9 +4725,15 @@ static bool tensor_type_is_glm_dense_quant(uint32_t type) {
 }
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
+    /* F16 included alongside the native quant types because
+     * model_convert_dense_bf16_q6k() (ds4_model load time) converts BF16/
+     * Q6_K dense tensors in these same roles to F16 before this ever runs;
+     * without it, a converted tensor would fail validation here even
+     * though it is now a perfectly ordinary F16 tensor. */
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_F16;
 }
 
 static void tensor_expect_glm_dense_quant_layout(
