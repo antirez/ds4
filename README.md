@@ -145,6 +145,37 @@ weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
+`./download_model.sh mtp` fetches the optional speculative decoding support
+GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
+but must be enabled explicitly with `--mtp`. The current MTP/speculative
+decoding path is still experimental: it is correctness-gated and currently
+provides at most a slight speedup, not a meaningful generation-speed win.
+
+### Community GGUF dialects
+
+Community DeepSeek V4 Flash GGUFs produced by the llama.cpp conversion
+tooling (for example
+`bullerwins/DeepSeek-V4-Flash-0731-MXFP4_MOE-Q8_0`) load directly. Those
+files often omit some `deepseek4.*` metadata keys and use slightly
+different tensor names. When a key is missing, the loader derives it and
+prints a one-line notice:
+
+* `deepseek4.vocab_size`: taken from the `tokenizer.ggml.tokens` array length.
+* `deepseek4.attention.output_lora_rank`, `deepseek4.attention.output_group_count`:
+  derived from the output projection tensor shapes.
+* `deepseek4.hash_layer_count`, `deepseek4.hyper_connection.count`: derived
+  from the tensors present in the file.
+* `deepseek4.hyper_connection.sinkhorn_iterations`,
+  `deepseek4.attention.compress_rope_freq_base`,
+  `deepseek4.hyper_connection.epsilon`: fall back to the compiled model
+  shape defaults.
+
+Tensor names are matched against a table of known aliases (canonical name
+first, alias only if it is absent), covering the hyper-connection heads,
+attention/indexer compressor tensors, and a few others. Every alias is
+verified against the donor conversion code and shape-checked at the
+binding site; nothing is aliased blind.
+
 GLM 5.2 support is limited to the GGUF files tested by this branch:
 
 ```sh
