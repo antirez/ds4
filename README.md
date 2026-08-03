@@ -176,6 +176,10 @@ attention/indexer compressor tensors, and a few others. Every alias is
 verified against the donor conversion code and shape-checked at the
 binding site; nothing is aliased blind.
 
+Community files may also store dense (non-routed-expert) tensors as BF16,
+F32, or Q6_K. Those are converted to F16 in place at load time; routed
+expert quantization is unaffected.
+
 GLM 5.2 support is limited to the GGUF files tested by this branch:
 
 ```sh
