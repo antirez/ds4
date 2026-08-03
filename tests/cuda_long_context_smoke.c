@@ -19,6 +19,22 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
+static int check_managed_kv_override(void) {
+    const uint64_t small = 1ull * 1024ull * 1024ull * 1024ull;
+    unsetenv("DS4_CUDA_FORCE_MANAGED_KV");
+    if (ds4_gpu_should_use_managed_kv_cache(small, small) != 0) return 1;
+    if (setenv("DS4_CUDA_FORCE_MANAGED_KV", "1", 1) != 0 ||
+        ds4_gpu_should_use_managed_kv_cache(small, small) != 1) {
+        return 1;
+    }
+    if (setenv("DS4_CUDA_FORCE_MANAGED_KV", "0", 1) != 0 ||
+        ds4_gpu_should_use_managed_kv_cache(small, small) != 0) {
+        return 1;
+    }
+    unsetenv("DS4_CUDA_FORCE_MANAGED_KV");
+    return 0;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -158,7 +174,8 @@ static int check_decode_attention_overflow_path(void) {
 
 int main(void) {
     if (!ds4_gpu_init()) return 1;
-    int rc = check_large_topk();
+    int rc = check_managed_kv_override();
+    if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
