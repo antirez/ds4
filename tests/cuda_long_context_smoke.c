@@ -31,6 +31,10 @@ static int check_managed_kv_override(void) {
         ds4_gpu_should_use_managed_kv_cache(small, small) != 0) {
         return 1;
     }
+    if (setenv("DS4_CUDA_FORCE_MANAGED_KV", "true", 1) != 0 ||
+        ds4_gpu_should_use_managed_kv_cache(small, small) != 0) {
+        return 1;
+    }
     unsetenv("DS4_CUDA_FORCE_MANAGED_KV");
     return 0;
 }
