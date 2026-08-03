@@ -176,6 +176,10 @@ static uint64_t g_cuda_stream_stats_bytes_from_cache; /* always 0 today; see abo
 
 static uint32_t cuda_stream_expert_cache_configured_budget(void);
 static uint32_t g_cuda_expert_cache_entry_count_getter(void);
+static uint64_t cuda_stream_expert_cache_budget_bytes(void);
+static uint64_t cuda_stream_expert_cache_counted_bytes(void);
+static uint64_t cuda_stream_expert_pool_parked_bytes_total(void);
+static uint64_t cuda_pinned_host_bytes_total(void);
 
 extern "C" void ds4_gpu_print_cuda_stream_stats(void) {
     if (getenv("DS4_CUDA_STREAM_STATS") == NULL) return;
@@ -201,6 +205,25 @@ extern "C" void ds4_gpu_print_cuda_stream_stats(void) {
             (double)g_cuda_stream_stats_bytes_from_cache / (1024.0 * 1024.0 * 1024.0),
             bytes_per_fetch / 1024.0,
             cuda_stream_expert_cache_configured_budget(),
+            g_cuda_expert_cache_entry_count_getter());
+    /* True memory footprint self-report (cache-budget accounting):
+     * budget = nominal dynamic-cache byte budget (experts * slab bytes);
+     * counted = bytes held by valid entries at their actual per-entry
+     * sizes; parked = pool free-list buffers; device_total is what the
+     * budget must bound; pinned_host is the persistent cudaMallocHost
+     * staging, reported separately and NOT part of the device budget. */
+    const uint64_t counted = cuda_stream_expert_cache_counted_bytes();
+    const uint64_t parked = cuda_stream_expert_pool_parked_bytes_total();
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    fprintf(stderr,
+            "ds4: CUDA streaming expert-cache memory: budget=%.3f GiB "
+            "counted=%.3f GiB pool_parked=%.3f GiB device_total=%.3f GiB "
+            "pinned_host=%.3f GiB entries=%u\n",
+            (double)cuda_stream_expert_cache_budget_bytes() / gib,
+            (double)counted / gib,
+            (double)parked / gib,
+            (double)(counted + parked) / gib,
+            (double)cuda_pinned_host_bytes_total() / gib,
             g_cuda_expert_cache_entry_count_getter());
 }
 
@@ -292,8 +315,36 @@ static uint32_t g_cuda_expert_cache_entry_count;
 static uint64_t g_cuda_expert_cache_clock;
 /* --ssd-streaming-cache-experts N (already resolved from NGB by ds4.c). */
 static uint32_t g_cuda_expert_cache_budget_experts;
-/* Informational only on CUDA -- see block comment above. */
+/* Slab size class from ds4.c; on CUDA it does not gate which layers may
+ * cache (see block comment above) but it DOES define the nominal byte
+ * budget: budget_experts * expert_bytes is exactly the "dynamic cache"
+ * byte figure ds4.c plans and logs at startup, so it is the number the
+ * device-side cache must stay under. */
 static uint64_t g_cuda_expert_cache_expert_bytes;
+/* Actual device bytes held by valid cache entries (sum of each entry's
+ * gate+up+down cudaMalloc request sizes). Charged on install, credited on
+ * clear. This is what a count-only budget misses: routed layers off the
+ * slab size class cache entries LARGER than expert_bytes, so N entries *
+ * expert_bytes under-states real device consumption. */
+static uint64_t g_cuda_expert_cache_device_bytes;
+/* Device bytes parked on the pool's free lists (freed entries whose
+ * buffers were retained for reuse). Real device memory, previously
+ * invisible to any accounting. */
+static uint64_t g_cuda_expert_pool_parked_bytes;
+
+static uint64_t cuda_stream_expert_cache_budget_bytes(void) {
+    if (g_cuda_expert_cache_expert_bytes == 0) return 0;
+    return (uint64_t)g_cuda_expert_cache_budget_experts *
+           g_cuda_expert_cache_expert_bytes;
+}
+
+static uint64_t cuda_stream_expert_cache_counted_bytes(void) {
+    return g_cuda_expert_cache_device_bytes;
+}
+
+static uint64_t cuda_stream_expert_pool_parked_bytes_total(void) {
+    return g_cuda_expert_pool_parked_bytes;
+}
 
 static uint32_t cuda_stream_expert_cache_configured_budget(void) {
     if (!g_ssd_streaming_mode) return 0;
@@ -375,6 +426,9 @@ static char *cuda_stream_expert_pool_alloc(uint64_t bytes) {
     if (bytes == 0) return NULL;
     cuda_stream_expert_pool_class *c = cuda_stream_expert_pool_class_for(bytes);
     if (c && c->free_count > 0) {
+        g_cuda_expert_pool_parked_bytes -=
+            bytes <= g_cuda_expert_pool_parked_bytes ?
+            bytes : g_cuda_expert_pool_parked_bytes;
         return c->free_list[--c->free_count];
     }
     char *ptr = NULL;
@@ -403,6 +457,26 @@ static void cuda_stream_expert_pool_free(uint64_t bytes, char *ptr) {
         c->free_cap = new_cap;
     }
     c->free_list[c->free_count++] = ptr;
+    g_cuda_expert_pool_parked_bytes += bytes;
+}
+
+/* Give parked pool buffers back to the driver until at least `want` bytes
+ * have been released (or the pool is empty). Used by the byte-budget
+ * enforcement below: parked buffers are the cheapest memory to reclaim --
+ * no cached expert data is lost. */
+static void cuda_stream_expert_pool_trim(uint64_t want) {
+    uint64_t released = 0;
+    for (uint32_t i = 0; i < g_cuda_expert_pool_class_count && released < want; i++) {
+        cuda_stream_expert_pool_class *c = &g_cuda_expert_pool_classes[i];
+        while (c->free_count > 0 && released < want) {
+            char *ptr = c->free_list[--c->free_count];
+            if (ptr) (void)cudaFree(ptr);
+            released += c->bytes;
+            g_cuda_expert_pool_parked_bytes -=
+                c->bytes <= g_cuda_expert_pool_parked_bytes ?
+                c->bytes : g_cuda_expert_pool_parked_bytes;
+        }
+    }
 }
 
 static void cuda_stream_expert_pool_release_all(void) {
@@ -417,6 +491,7 @@ static void cuda_stream_expert_pool_release_all(void) {
         c->free_cap = 0;
     }
     g_cuda_expert_pool_class_count = 0;
+    g_cuda_expert_pool_parked_bytes = 0;
 }
 
 static void cuda_stream_expert_cache_clear_entry(uint32_t layer, uint32_t expert) {
@@ -429,6 +504,13 @@ static void cuda_stream_expert_cache_clear_entry(uint32_t layer, uint32_t expert
     if (e->gate_ptr) cuda_stream_expert_pool_free(e->gate_expert_bytes, e->gate_ptr);
     if (e->up_ptr) cuda_stream_expert_pool_free(e->gate_expert_bytes, e->up_ptr);
     if (e->down_ptr) cuda_stream_expert_pool_free(e->down_expert_bytes, e->down_ptr);
+    {
+        const uint64_t entry_bytes =
+            e->gate_expert_bytes * 2u + e->down_expert_bytes;
+        g_cuda_expert_cache_device_bytes -=
+            entry_bytes <= g_cuda_expert_cache_device_bytes ?
+            entry_bytes : g_cuda_expert_cache_device_bytes;
+    }
     memset(e, 0, sizeof(*e));
     if (g_cuda_expert_cache_entry_count > 0) g_cuda_expert_cache_entry_count--;
 }
@@ -440,6 +522,7 @@ static void cuda_stream_expert_cache_clear_all(void) {
         }
     }
     g_cuda_expert_cache_entry_count = 0;
+    g_cuda_expert_cache_device_bytes = 0;
     /* Every clear_entry() above returned its buffers to the pool rather
      * than freeing them -- this whole-cache reset is a rare event
      * (model swap, streaming mode toggle, budget change), never a
@@ -449,27 +532,67 @@ static void cuda_stream_expert_cache_clear_all(void) {
     cuda_stream_expert_pool_release_all();
 }
 
-static void cuda_stream_expert_cache_prune_global(void) {
-    const uint32_t budget = cuda_stream_expert_cache_configured_budget();
-    if (budget == 0 || g_cuda_expert_cache_entry_count <= budget) return;
-    while (g_cuda_expert_cache_entry_count > budget) {
-        uint32_t victim_layer = UINT32_MAX;
-        uint32_t victim_expert = UINT32_MAX;
-        uint64_t oldest = UINT64_MAX;
-        for (uint32_t l = 0; l < CUDA_STREAM_EXPERT_CACHE_MAX_LAYER; l++) {
-            for (uint32_t x = 0; x < CUDA_STREAM_EXPERT_CACHE_MAX_EXPERT; x++) {
-                cuda_stream_expert_cache_entry *e = &g_cuda_expert_cache[l][x];
-                if (!e->valid) continue;
-                if (e->last_used < oldest) {
-                    oldest = e->last_used;
-                    victim_layer = l;
-                    victim_expert = x;
-                }
+static int cuda_stream_expert_cache_evict_lru_one(void) {
+    uint32_t victim_layer = UINT32_MAX;
+    uint32_t victim_expert = UINT32_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t l = 0; l < CUDA_STREAM_EXPERT_CACHE_MAX_LAYER; l++) {
+        for (uint32_t x = 0; x < CUDA_STREAM_EXPERT_CACHE_MAX_EXPERT; x++) {
+            cuda_stream_expert_cache_entry *e = &g_cuda_expert_cache[l][x];
+            if (!e->valid) continue;
+            if (e->last_used < oldest) {
+                oldest = e->last_used;
+                victim_layer = l;
+                victim_expert = x;
             }
         }
-        if (victim_layer == UINT32_MAX || victim_expert == UINT32_MAX) break;
-        cuda_stream_expert_cache_clear_entry(victim_layer, victim_expert);
     }
+    if (victim_layer == UINT32_MAX || victim_expert == UINT32_MAX) return 0;
+    cuda_stream_expert_cache_clear_entry(victim_layer, victim_expert);
+    return 1;
+}
+
+/* Bring actual device-side cache consumption (valid entries + parked pool
+ * buffers + `incoming` bytes about to be allocated) under the nominal byte
+ * budget, trimming parked pool buffers first (data-lossless), then evicting
+ * LRU entries. `incoming`==0 is the plain post-hoc prune. This is the fix
+ * for the count-only budget: entries from routed layers off the slab size
+ * class are larger than expert_bytes, so a count cap alone lets actual
+ * consumption overshoot the nominal GB figure. */
+static void cuda_stream_expert_cache_enforce_bytes(uint64_t incoming) {
+    const uint64_t budget_bytes = cuda_stream_expert_cache_budget_bytes();
+    if (budget_bytes == 0) return;
+    for (;;) {
+        /* Parked pool buffers up to `incoming` bytes are treated as
+         * reusable slack: the incoming install will pop them back off the
+         * free lists instead of cudaMalloc'ing, so charging them AND the
+         * incoming bytes would double-count and force a trim-then-malloc
+         * churn cycle on every miss at cap -- exactly the alloc/free
+         * thrash the pool exists to prevent. Size-class mismatch can make
+         * this reuse assumption optimistic by at most one entry's bytes
+         * for one install; the next enforcement call sees the real totals
+         * and corrects. */
+        const uint64_t parked = g_cuda_expert_pool_parked_bytes;
+        const uint64_t reusable = parked < incoming ? parked : incoming;
+        const uint64_t predicted =
+            g_cuda_expert_cache_device_bytes + incoming + (parked - reusable);
+        if (predicted <= budget_bytes) break;
+        if (parked > incoming) {
+            cuda_stream_expert_pool_trim(parked - incoming);
+            continue;
+        }
+        if (!cuda_stream_expert_cache_evict_lru_one()) break;
+    }
+}
+
+static void cuda_stream_expert_cache_prune_global(void) {
+    const uint32_t budget = cuda_stream_expert_cache_configured_budget();
+    if (budget != 0) {
+        while (g_cuda_expert_cache_entry_count > budget) {
+            if (!cuda_stream_expert_cache_evict_lru_one()) break;
+        }
+    }
+    cuda_stream_expert_cache_enforce_bytes(0);
 }
 
 static int cuda_stream_expert_cache_entry_matches(
@@ -561,6 +684,14 @@ static int cuda_stream_expert_cache_install(
     cuda_stream_expert_cache_entry *e = &g_cuda_expert_cache[layer][expert];
     if (e->valid) cuda_stream_expert_cache_clear_entry(layer, expert);
 
+    /* Make room BEFORE allocating so actual device consumption never
+     * transiently exceeds the nominal byte budget. Pool-sourced buffers
+     * are already counted as parked, so this slightly over-reserves when
+     * the pool can serve the request -- at worst one extra LRU eviction,
+     * never an overshoot. */
+    cuda_stream_expert_cache_enforce_bytes(
+            gate_expert_bytes * 2u + down_expert_bytes);
+
     /* Pull from the size-keyed pool instead of a raw cudaMalloc per
      * install -- see the pool's own block comment above
      * cuda_stream_expert_pool_class_for() for why this is the fix for the
@@ -602,6 +733,8 @@ static int cuda_stream_expert_cache_install(
     e->use_count = 1;
     e->valid = 1;
     g_cuda_expert_cache_entry_count++;
+    g_cuda_expert_cache_device_bytes +=
+        gate_expert_bytes * 2u + down_expert_bytes;
     cuda_stream_expert_cache_prune_global();
     return 1;
 }
@@ -844,6 +977,24 @@ static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
+
+/* Total persistent pinned-host (cudaMallocHost) staging held right now:
+ * the 4-deep model upload stage pool, the 4-deep streaming selected-expert
+ * stage pool, and any cross-device bounce buffers. Transient load-time
+ * staging (freed before serving) is deliberately excluded. Reported by
+ * ds4_gpu_print_cuda_stream_stats() as a separate category from the device
+ * expert-cache budget. */
+static uint64_t cuda_pinned_host_bytes_total(void) {
+    uint64_t total = 0;
+    total += 4ull * g_model_stage_bytes;
+    total += 4ull * g_stream_selected_stage_bytes;
+    for (int i = 0; i < DS4_MAX_GPUS; i++) {
+        for (int j = 0; j < DS4_MAX_GPUS; j++) {
+            total += (uint64_t)g_xdev_bounce_bytes[i][j];
+        }
+    }
+    return total;
+}
 
 static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
@@ -23463,6 +23614,14 @@ static int cuda_stream_selected_cache_begin_load(
     }
 
     g_cuda_stream_stats_fetch_calls++;
+    /* Periodic self-report on the DS4_CUDA_STREAM_STATS channel (print is
+     * a no-op unless the env var is set). One fetch_call per routed layer
+     * per token, so 4096 is roughly every ~90 decode tokens -- frequent
+     * enough to watch the cache's true footprint on a live server, quiet
+     * enough not to swamp the log. */
+    if ((g_cuda_stream_stats_fetch_calls & 4095ull) == 0ull) {
+        ds4_gpu_print_cuda_stream_stats();
+    }
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_abs =
