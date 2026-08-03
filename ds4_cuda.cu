@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <fcntl.h>
 #include <stdio.h>
