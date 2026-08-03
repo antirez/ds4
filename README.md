@@ -266,6 +266,14 @@ GLM 5.2 on ROCm. In this mode the non-routed model weights stay resident, while
 routed MoE experts are kept in an in-memory cache and loaded from the GGUF file
 on cache misses.
 
+### CUDA long-context KV override
+
+CUDA automatically uses managed memory for very large KV allocations. On a
+single GPU where model weights fit in VRAM but a long-context KV cache prevents
+session creation, `DS4_CUDA_FORCE_MANAGED_KV=1` forces only the KV allocation
+into CUDA managed memory. This is useful for long-context experiments and may
+reduce decode throughput when the KV pages are not resident.
+
 Streaming is not as fast as fitting the full model in RAM. It still needs memory
 for non-routed weights, KV cache, graph scratch, activations, and the routed
 expert cache. It is useful because routed experts dominate model size and modern

@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
@@ -2488,6 +2489,11 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
+
+    /* Long-context runs can fit model weights in VRAM but still need the
+     * long-lived KV allocation to fault through host memory. Keep this opt-in
+     * so ordinary CUDA sessions retain device-only KV performance. */
+    if (getenv("DS4_CUDA_FORCE_MANAGED_KV") != NULL) return 1;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
