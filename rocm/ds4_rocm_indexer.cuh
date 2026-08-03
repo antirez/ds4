@@ -1130,3 +1130,112 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
     indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
+
+/* DSpark markov chain step (ROCm port of the CUDA kernel):
+ * out = argmax_i(logits[i] + dot(w2[i], w1[prev])) over the vocab, entirely
+ * on-device. w1/w2 are q8_0 with 34-byte blocks (half scale + 32 int8). */
+__global__ static void dspark_markov_argmax_kernel(
+        unsigned long long *out_key,
+        const float *logits,
+        const unsigned char *w1_row,
+        const unsigned char *w2,
+        uint32_t vocab,
+        uint32_t rank_blocks) {
+    __shared__ float state[256];
+    const uint32_t tid = threadIdx.x;
+    if (tid < rank_blocks * 32u) {
+        const uint32_t b = tid >> 5, k = tid & 31u;
+        const unsigned char *blk = w1_row + (uint64_t)b * 34u;
+        const float d = __half2float(*(const __half *)blk);
+        state[tid] = d * (float)((const int8_t *)(blk + 2))[k];
+    }
+    __syncthreads();
+
+    float best_v = -INFINITY;
+    uint32_t best_i = 0;
+    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < vocab;
+         i += gridDim.x * blockDim.x) {
+        const unsigned char *row = w2 + (uint64_t)i * rank_blocks * 34u;
+        float acc = 0.0f;
+        for (uint32_t b = 0; b < rank_blocks; b++) {
+            const unsigned char *blk = row + (uint64_t)b * 34u;
+            const float d = __half2float(*(const __half *)blk);
+            const int8_t *q = (const int8_t *)(blk + 2);
+            float s = 0.0f;
+            #pragma unroll
+            for (uint32_t k = 0; k < 32u; k++) s += (float)q[k] * state[b * 32u + k];
+            acc += d * s;
+        }
+        const float v = logits[i] + acc;
+        if (topk_score_better(v, i, best_v, best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+
+    __shared__ float vals[256];
+    __shared__ uint32_t idxs[256];
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            if (topk_score_better(vals[tid + stride], idxs[tid + stride],
+                                  vals[tid], idxs[tid])) {
+                vals[tid] = vals[tid + stride];
+                idxs[tid] = idxs[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        /* Monotonic float key; ~idx in the low bits makes ties resolve to
+         * the smaller index under atomicMax (matches topk_score_better). */
+        const unsigned int f = __float_as_uint(vals[0]);
+        const unsigned int fkey = (f & 0x80000000u) ? ~f : (f | 0x80000000u);
+        const unsigned long long key =
+            ((unsigned long long)fkey << 32) | (unsigned int)(~idxs[0]);
+        atomicMax(out_key, key);
+    }
+}
+
+extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits_row,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w1_offset,
+        uint64_t              w2_offset,
+        uint32_t              prev_token,
+        uint32_t              vocab,
+        uint32_t              rank) {
+    if (!out_idx || !logits_row || !model_map || vocab == 0 ||
+        rank == 0 || (rank & 31u) != 0u || rank > 256u ||
+        out_idx->bytes < sizeof(unsigned long long) ||
+        logits_row->bytes < (uint64_t)vocab * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t rank_blocks = rank / 32u;
+    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
+    if (w1_offset > model_size ||
+        (uint64_t)prev_token * row_bytes + row_bytes > model_size - w1_offset ||
+        w2_offset > model_size ||
+        (uint64_t)vocab * row_bytes > model_size - w2_offset) {
+        return 0;
+    }
+    const unsigned char *w1_row = (const unsigned char *)cuda_model_range_ptr(
+            model_map, w1_offset + (uint64_t)prev_token * row_bytes,
+            row_bytes, "markov_w1_row");
+    const unsigned char *w2 = (const unsigned char *)cuda_model_range_ptr(
+            model_map, w2_offset, (uint64_t)vocab * row_bytes, "markov_w2");
+    if (!w1_row || !w2) return 0;
+    if (!cuda_ok(cudaMemsetAsync(out_idx->ptr, 0, sizeof(unsigned long long)),
+                 "dspark markov out clear")) {
+        return 0;
+    }
+    dspark_markov_argmax_kernel<<<128, 256>>>(
+            (unsigned long long *)out_idx->ptr,
+            (const float *)logits_row->ptr,
+            w1_row, w2, vocab, rank_blocks);
+    return cuda_ok(cudaGetLastError(), "dspark markov argmax launch");
+}
