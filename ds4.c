@@ -5532,8 +5532,21 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
-        fprintf(stderr, "ds4: required int32/uint32 array metadata key is missing: %s\n", key);
-        exit(1);
+        /* Dialect compat: ds4_expected_layer_compress_ratio() below is already
+         * the exact per-layer pattern every present compress_ratios array is
+         * validated against -- when the array itself is missing, use that
+         * expected pattern directly rather than dying. This isn't a guess, it's
+         * literally the ground truth this function otherwise checks the file
+         * against. */
+        fprintf(stderr,
+                "ds4: metadata key %s missing -- dialect compat, using compiled "
+                "per-layer compress ratio pattern for %s\n",
+                key, DS4_MODEL_SHAPE_NAME);
+        memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g_ds4_compress_ratios[il] = ds4_expected_layer_compress_ratio(il);
+        }
+        return;
     }
     if (arr.len < DS4_N_LAYER) {
         ds4_die("deepseek4.attention.compress_ratios is shorter than the layer count");
@@ -5624,6 +5637,112 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
 }
 
+/* =========================================================================
+ * deepseek4 GGUF dialect compat.
+ * =========================================================================
+ *
+ * Some community DeepSeek-V4 GGUF conversions omit metadata keys that
+ * antirez's reference converter (and llama.cpp's own, @5f55650
+ * src/models/deepseek4.cpp::load_arch_hparams -- which requires exactly the
+ * same keys via ml.get_key(..., required=true) with no fallback of its own)
+ * both write unconditionally. For every deepseek4 shape ds4 currently
+ * supports (DS4_SHAPE_FLASH / DS4_SHAPE_PRO above) these are architecture
+ * constants, not per-checkpoint choices, so when a key is missing we recover
+ * it -- in order of preference -- from (1) tensor shapes/presence already in
+ * the file, which llama.cpp's own tensor-creation code ties directly to the
+ * hparam, or (2), only where no tensor encodes the value at all, the exact
+ * constant ds4 already hardcodes and validates every present key against for
+ * the identified shape. Every fallback prints a one-line notice so a run is
+ * honest about dialect compat being active; if the file's shape can't be
+ * identified from its own (present, required) keys, this falls straight
+ * through to the ordinary required-key die below -- nothing is guessed.
+ */
+
+static bool deepseek4_tensor_dim0(const ds4_model *m, const char *name, uint64_t *out) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    if (!t || t->ndim < 1) return false;
+    *out = t->dim[0];
+    return true;
+}
+
+/* llama.cpp creates (src/models/deepseek4.cpp):
+ *   wo_a (attn_output_a) = {n_head * n_embd_head / o_groups, o_lora_rank * o_groups}
+ *   wo_b (attn_output_b) = {o_groups * o_lora_rank,          n_embd}
+ * so both output_group_count and output_lora_rank are exactly recoverable from
+ * the two tensors' dim0 given n_head/n_embd_head (already-required keys). */
+static bool deepseek4_compat_output_lora(const ds4_model *m, uint32_t n_head, uint32_t n_head_dim,
+                                          uint32_t *out_group, uint32_t *out_lora_o) {
+    uint64_t dim_a = 0, dim_b = 0;
+    if (!deepseek4_tensor_dim0(m, "blk.0.attn_output_a.weight", &dim_a)) return false;
+    if (!deepseek4_tensor_dim0(m, "blk.0.attn_output_b.weight", &dim_b)) return false;
+    uint64_t prod = (uint64_t)n_head * n_head_dim;
+    if (dim_a == 0 || prod % dim_a != 0) return false;
+    uint64_t groups = prod / dim_a;
+    if (groups == 0 || dim_b % groups != 0) return false;
+    *out_group = (uint32_t)groups;
+    *out_lora_o = (uint32_t)(dim_b / groups);
+    return true;
+}
+
+/* llama.cpp creates hc_attn_fn = {hc_mult * n_embd, (2 + hc_mult) * hc_mult},
+ * so hyper_connection.count == hc_mult == dim0(hc_attn_fn) / n_embd. */
+static bool deepseek4_compat_hc_count(const ds4_model *m, uint32_t n_embd, uint32_t *out_hc) {
+    uint64_t dim0 = 0;
+    if (!deepseek4_tensor_dim0(m, "blk.0.hc_attn_fn", &dim0)) return false;
+    if (n_embd == 0 || dim0 % n_embd != 0) return false;
+    *out_hc = (uint32_t)(dim0 / n_embd);
+    return true;
+}
+
+/* llama.cpp only creates blk.<i>.ffn_gate_tid2eid for i < hash_layer_count
+ * ("if ((uint32_t) i < hparams.dsv4_hash_layer_count)"), so the count of
+ * present tensors in the contiguous run starting at layer 0 recovers the
+ * exact hash_layer_count. */
+static bool deepseek4_compat_hash_layer_count(const ds4_model *m, uint32_t n_layer, uint32_t *out) {
+    uint32_t count = 0;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (!tensor_by_namef(m, "blk.%u.ffn_gate_tid2eid", il)) break;
+        count++;
+    }
+    *out = count;
+    return true;
+}
+
+/* No tensor shape encodes the Sinkhorn iteration count -- it is a pure
+ * algorithm hyperparameter -- so guess the shape from block_count alone (it
+ * is currently unique across every deepseek4 profile ds4 supports) and use
+ * that shape's own compiled n_hc_sinkhorn_iter as the only traceable source
+ * left, per the "documented architecture constant" fallback tier. */
+static const ds4_shape *deepseek4_shape_guess(uint32_t n_layer) {
+    if (n_layer == DS4_SHAPE_FLASH.n_layer) return &DS4_SHAPE_FLASH;
+    if (n_layer == DS4_SHAPE_PRO.n_layer)   return &DS4_SHAPE_PRO;
+    return NULL;
+}
+
+static uint32_t deepseek4_compat_u32(const ds4_model *m, const char *key, uint32_t fallback,
+                                      bool have_fallback, const char *note) {
+    uint32_t v = 0;
+    if (model_get_u32(m, key, &v)) return v;
+    if (!have_fallback) {
+        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    fprintf(stderr, "ds4: metadata key %s missing -- dialect compat, using %s = %u\n", key, note, fallback);
+    return fallback;
+}
+
+/* Float analog of deepseek4_compat_u32, used only for keys read after the
+ * model shape has already been selected (so DS4_* macros below already name
+ * the shape's own compiled value -- always a valid fallback at that point). */
+static float deepseek4_compat_f32_shape_default(const ds4_model *m, const char *key, float fallback,
+                                                  const char *note) {
+    float v = 0.0f;
+    if (model_get_f32_compat(m, key, &v)) return v;
+    fprintf(stderr, "ds4: metadata key %s missing -- dialect compat, using %s = %.9g\n",
+            key, note, (double)fallback);
+    return fallback;
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_deepseek4_model(const ds4_model *m) {
@@ -5636,13 +5755,28 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_value_dim = required_u32(m, "deepseek4.attention.value_length");
     const uint32_t n_rot = required_u32(m, "deepseek4.rope.dimension_count");
     const uint32_t n_lora_q = required_u32(m, "deepseek4.attention.q_lora_rank");
-    const uint32_t n_lora_o = required_u32(m, "deepseek4.attention.output_lora_rank");
-    const uint32_t n_out_group = required_u32(m, "deepseek4.attention.output_group_count");
+
+    uint32_t compat_out_group = 0, compat_lora_o = 0;
+    bool have_output_lora_compat =
+        deepseek4_compat_output_lora(m, n_head, n_head_dim, &compat_out_group, &compat_lora_o);
+    const uint32_t n_lora_o = deepseek4_compat_u32(m, "deepseek4.attention.output_lora_rank",
+                                                    compat_lora_o, have_output_lora_compat,
+                                                    "dim0(blk.0.attn_output_b.weight) / output_group_count");
+    const uint32_t n_out_group = deepseek4_compat_u32(m, "deepseek4.attention.output_group_count",
+                                                        compat_out_group, have_output_lora_compat,
+                                                        "n_head*key_length / dim0(blk.0.attn_output_a.weight)");
+
     const uint32_t n_expert = required_u32(m, "deepseek4.expert_count");
     const uint32_t n_expert_used = required_u32(m, "deepseek4.expert_used_count");
     const uint32_t n_ff_exp = required_u32(m, "deepseek4.expert_feed_forward_length");
     const uint32_t n_expert_shared = required_u32(m, "deepseek4.expert_shared_count");
-    const uint32_t n_hash_layer = required_u32(m, "deepseek4.hash_layer_count");
+
+    uint32_t compat_hash_layer = 0;
+    bool have_hash_layer_compat = deepseek4_compat_hash_layer_count(m, n_layer, &compat_hash_layer);
+    const uint32_t n_hash_layer = deepseek4_compat_u32(m, "deepseek4.hash_layer_count",
+                                                          compat_hash_layer, have_hash_layer_compat,
+                                                          "count of present blk.<i>.ffn_gate_tid2eid tensors");
+
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
     model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
@@ -5651,8 +5785,18 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_indexer_head = required_u32(m, "deepseek4.attention.indexer.head_count");
     const uint32_t n_indexer_head_dim = required_u32(m, "deepseek4.attention.indexer.key_length");
     const uint32_t n_indexer_top_k = required_u32(m, "deepseek4.attention.indexer.top_k");
-    const uint32_t n_hc = required_u32(m, "deepseek4.hyper_connection.count");
-    const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek4.hyper_connection.sinkhorn_iterations");
+    uint32_t compat_hc = 0;
+    bool have_hc_compat = deepseek4_compat_hc_count(m, n_embd, &compat_hc);
+    const uint32_t n_hc = deepseek4_compat_u32(m, "deepseek4.hyper_connection.count",
+                                                 compat_hc, have_hc_compat,
+                                                 "dim0(blk.0.hc_attn_fn) / embedding_length");
+
+    const ds4_shape *deepseek4_shape_hint = deepseek4_shape_guess(n_layer);
+    const uint32_t n_hc_sinkhorn_iter = deepseek4_compat_u32(
+        m, "deepseek4.hyper_connection.sinkhorn_iterations",
+        deepseek4_shape_hint ? deepseek4_shape_hint->n_hc_sinkhorn_iter : 0,
+        deepseek4_shape_hint != NULL,
+        deepseek4_shape_hint ? deepseek4_shape_hint->name : "(unidentified shape)");
 
     ds4_select_shape_from_metadata(n_layer,
                                    n_embd,
@@ -5726,13 +5870,24 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     float rope_yarn_beta_slow = DS4_ROPE_YARN_BETA_SLOW;
     model_get_f32_compat(m, "deepseek4.rope.scaling.yarn_beta_slow", &rope_yarn_beta_slow);
     config_expect_f32("rope.scaling.yarn_beta_slow", rope_yarn_beta_slow, DS4_ROPE_YARN_BETA_SLOW);
-    const float compress_rope_freq_base = required_f32(m, "deepseek4.attention.compress_rope_freq_base");
+    /* Not tensor-derivable (a RoPE base float, not a shape); shape is already
+     * selected above, so DS4_COMPRESS_ROPE_FREQ_BASE below names the compiled
+     * ground-truth value for this exact shape. Where the file also carries
+     * deepseek4.rope.freq_base_swa (unused elsewhere by ds4), it independently
+     * equals this same compiled constant for DeepSeek V4 Flash -- corroboration,
+     * not proof, but not a blind guess either. */
+    const float compress_rope_freq_base = deepseek4_compat_f32_shape_default(
+        m, "deepseek4.attention.compress_rope_freq_base", DS4_COMPRESS_ROPE_FREQ_BASE,
+        "compiled DS4_SHAPE compress_rope_freq_base");
     config_expect_f32("attention.compress_rope_freq_base", compress_rope_freq_base, DS4_COMPRESS_ROPE_FREQ_BASE);
     const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
     const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
-    const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
+    /* Not tensor-derivable (a pure epsilon constant); same compiled-shape
+     * fallback tier as compress_rope_freq_base above. */
+    const float hc_eps = deepseek4_compat_f32_shape_default(
+        m, "deepseek4.hyper_connection.epsilon", DS4_HC_EPS, "compiled DS4_SHAPE hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
