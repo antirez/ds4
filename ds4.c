@@ -2063,6 +2063,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_MXFP4    = 39,
 };
@@ -2445,6 +2446,17 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+/* Some community GGUF conversions store dense (non-routed-expert) tensor
+ * families -- token embeddings, the output head, and a handful of small
+ * attention/FFN projections -- as GGUF BF16 or Q6_K rather than the
+ * F16/F32/Q8_0/Q4_K/Q4_0 dense types ds4 natively binds. Converts those to
+ * F16 in place at load time by growing the model mapping; see the
+ * definition (after the BF16/Q6_K CPU dequant helpers) for the mechanism.
+ * `mmap_flags` must match the flags used for the model's own file mapping
+ * (MAP_SHARED for the graph/no-copy-buffer backends, MAP_PRIVATE otherwise)
+ * so the re-mapped file portion behaves identically to the original. */
+static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags);
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -2493,6 +2505,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    model_convert_dense_bf16_q6k(m, mmap_flags);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -3788,6 +3801,261 @@ static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
     }
 
     return sumf;
+}
+
+/* CPU dequant: block_q6_K -> contiguous float row of length k (k % 256 == 0).
+ * Same accumulation as ds4_vec_dot_q6_K_f32 below, just storing instead of
+ * summing against activations.
+ * ported from llama.cpp (MIT) ggml-quants.c dequantize_row_q6_K @5f55650 */
+static DS4_MAYBE_UNUSED void dequantize_row_q6_K(const block_q6_K *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *sc = x[i].scales;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                const int q1 = ((int)(ql[l + 0]  & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = ((int)(ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = ((int)(ql[l + 0]  >> 4)    | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = ((int)(ql[l + 32] >> 4)    | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                y[n + l + 0]  = d * (float)sc[is + 0] * (float)q1;
+                y[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                y[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                y[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+/* Widen an OCP BF16 value to a plain float: BF16 is exactly the high 16 bits
+ * of an IEEE-754 binary32, so this is a zero-extend + bit-copy, no rounding.
+ * ported from llama.cpp (MIT) ggml-impl.h ggml_bf16_to_fp32 @5f55650 */
+static inline float bf16_to_f32(uint16_t h) {
+    uint32_t bits = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* f32 -> f16 with an explicit clamp to +-65504 (F16_MAX) instead of the
+ * IEEE-754 overflow-to-infinity f32_to_f16() produces: weights should never
+ * exceed F16 range, so a clamp firing is a correctness red flag worth
+ * counting and surfacing, not silently turning into inf downstream. */
+static inline uint16_t f32_to_f16_clamped(float f, uint64_t *clamp_count) {
+    if (f > 65504.0f) {
+        if (clamp_count) (*clamp_count)++;
+        f = 65504.0f;
+    } else if (f < -65504.0f) {
+        if (clamp_count) (*clamp_count)++;
+        f = -65504.0f;
+    }
+    return f32_to_f16(f);
+}
+
+/* Load-time Q6_K -> F16 row conversion for dense (non-routed-expert)
+ * tensors. Reuses dequantize_row_q6_K above (also used, unchanged, by the
+ * pre-existing Q6_K routed-expert dequant path) through a transient float
+ * scratch buffer sized to this one tensor -- the Q6_K dense families this
+ * feeds (attn_q_a/q_b, attn_output_a/b, indexer.attn_q_b) are LoRA-rank
+ * sized, small relative to the model, so the extra float-sized scratch
+ * copy here is not a full-model memory concern. */
+static void convert_row_q6_K_to_f16(const block_q6_K *src, uint16_t *dst,
+                                    uint64_t k, uint64_t *clamp_count) {
+    float *tmp = (float *)malloc((size_t)k * sizeof(float));
+    if (!tmp) ds4_die("out of memory converting a Q6_K dense tensor to F16");
+    dequantize_row_q6_K(src, tmp, (int64_t)k);
+    for (uint64_t i = 0; i < k; i++) {
+        dst[i] = f32_to_f16_clamped(tmp[i], clamp_count);
+    }
+    free(tmp);
+}
+
+/* Fold a per-layer "blk.<N>." index out of a tensor name so every layer of
+ * the same tensor role shares one dialect-compat notice line instead of
+ * spamming once per layer (e.g. 43x for a 43-layer model). Tensors outside
+ * the "blk.<N>." naming convention (top-level tensors like token_embd or
+ * output) key on their own full name unchanged. */
+static void tensor_family_key(ds4_str name, char *buf, size_t bufsz) {
+    static const char prefix[] = "blk.";
+    const size_t plen = sizeof(prefix) - 1;
+    if (name.len > plen && memcmp(name.ptr, prefix, plen) == 0 &&
+        isdigit((unsigned char)name.ptr[plen])) {
+        size_t p = plen;
+        while (p < name.len && isdigit((unsigned char)name.ptr[p])) p++;
+        if (p < name.len && name.ptr[p] == '.') {
+            int n = snprintf(buf, bufsz, "blk.N%.*s",
+                             (int)(name.len - p), name.ptr + p);
+            if (n > 0 && (size_t)n < bufsz) return;
+        }
+    }
+    size_t n = name.len < bufsz - 1 ? name.len : bufsz - 1;
+    memcpy(buf, name.ptr, n);
+    buf[n] = '\0';
+}
+
+/* Dialect compat: convert dense (non-routed-expert) GGUF BF16/Q6_K tensors
+ * to F16 in place at load time, so the rest of ds4 -- which only binds
+ * F16/F32/Q8_0/Q4_K/Q4_0 for dense tensors -- never has to know this file
+ * used BF16/Q6_K for them.
+ *
+ * Scope: only tensors with ndim <= 2. Every dense role ds4 binds (token
+ * embeddings, the output head, attention/FFN projections, LoRA factors) is
+ * <=2D; routed MoE expert tensors are always 3D (in, mid, n_expert). This
+ * makes the ndim<=2 filter a safe, purely structural way to skip routed
+ * experts without any name matching -- critically, it also leaves GLM's
+ * genuine Q6_K *routed* experts (which must stay quantized/streamed, not
+ * blown up to F16) untouched, since those are 3D too.
+ *
+ * Mechanism: the model file is mapped once in model_open before this runs,
+ * so tensor bytes normally live at model_map + tensor->abs_offset with no
+ * separate "converted" storage the rest of ds4 would need to know about.
+ * To keep that invariant (every consumer, CPU and GPU, just does
+ * model_map + offset) while still being able to store newly-converted F16
+ * bytes somewhere, this grows the SAME mapping: reserve an anonymous
+ * address range sized to the original file plus the total conversion
+ * output, remap the file at the front of that reservation (MAP_FIXED into
+ * space we just reserved, so it cannot collide with anything), then map a
+ * writable anonymous extension right after it for the converted tensors.
+ * Every converted ds4_tensor then just gets a new (type=F16, abs_offset,
+ * bytes) inside that same extension -- no other code path changes. */
+static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
+    uint64_t extra_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->ndim > 2) continue;
+        if (t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q6_K) {
+            extra_bytes += t->elements * 2u;
+        }
+    }
+    if (extra_bytes == 0) return;
+
+    const long page_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_l > 0 ? (uint64_t)page_l : 4096u;
+    const uint64_t old_len = align_up(m->size, page_sz);
+    const uint64_t extra_len = align_up(extra_bytes, page_sz);
+    const uint64_t total_len = old_len + extra_len;
+
+    void *reserved = mmap(NULL, (size_t)total_len, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserved == MAP_FAILED) {
+        fprintf(stderr,
+                "ds4: cannot reserve address space for dense BF16/Q6_K "
+                "load-time conversion: %s\n", strerror(errno));
+        exit(1);
+    }
+    if (mmap(reserved, (size_t)old_len, PROT_READ,
+            mmap_flags | MAP_FIXED, m->fd, 0) == MAP_FAILED) {
+        fprintf(stderr,
+                "ds4: cannot remap model file for dense-tensor conversion: "
+                "%s\n", strerror(errno));
+        exit(1);
+    }
+    if (mmap((char *)reserved + old_len, (size_t)extra_len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+        fprintf(stderr,
+                "ds4: cannot map dense-tensor conversion arena: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+
+    /* Deliberately does NOT munmap the original mapping here: every
+     * ds4_tensor's `name` (a ds4_str) is a raw pointer into it, captured by
+     * parse_tensors() above, and tensor_family_key() below (and anything
+     * else that later prints a tensor name) dereferences those pointers.
+     * Leaking the original mapping is a pure virtual-address-space cost
+     * (no extra physical memory beyond the handful of header/name pages
+     * already touched), not a real leak in practice. */
+    m->map = reserved;
+    m->size = total_len;
+
+    uint64_t cursor = old_len;
+
+    typedef struct {
+        char        key[128];
+        const char *type_name;
+        uint32_t    count;
+        uint64_t    clamp;
+    } conv_family;
+    conv_family fam[64];
+    uint32_t n_fam = 0;
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[i];
+        if (t->ndim > 2) continue;
+        if (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_Q6_K) continue;
+
+        const uint32_t orig_type = t->type;
+        const char *orig_type_name = tensor_type_name(orig_type);
+        uint16_t *dst = (uint16_t *)((char *)m->map + cursor);
+        uint64_t clamp_here = 0;
+
+        if (orig_type == DS4_TENSOR_BF16) {
+            const uint16_t *src =
+                (const uint16_t *)((const char *)m->map + t->abs_offset);
+            for (uint64_t e = 0; e < t->elements; e++) {
+                dst[e] = f32_to_f16_clamped(bf16_to_f32(src[e]), &clamp_here);
+            }
+        } else {
+            const block_q6_K *src =
+                (const block_q6_K *)((const char *)m->map + t->abs_offset);
+            convert_row_q6_K_to_f16(src, dst, t->elements, &clamp_here);
+        }
+
+        t->type = DS4_TENSOR_F16;
+        t->abs_offset = cursor;
+        t->bytes = t->elements * 2u;
+        cursor += t->bytes;
+
+        char key[128];
+        tensor_family_key(t->name, key, sizeof(key));
+
+        uint32_t fi = 0;
+        for (; fi < n_fam; fi++) {
+            if (fam[fi].type_name == orig_type_name &&
+                strcmp(fam[fi].key, key) == 0) {
+                break;
+            }
+        }
+        if (fi == n_fam && n_fam < (sizeof(fam) / sizeof(fam[0]))) {
+            snprintf(fam[fi].key, sizeof(fam[fi].key), "%s", key);
+            fam[fi].type_name = orig_type_name;
+            fam[fi].count = 0;
+            fam[fi].clamp = 0;
+            n_fam++;
+        }
+        if (fi < (sizeof(fam) / sizeof(fam[0]))) {
+            fam[fi].count++;
+            fam[fi].clamp += clamp_here;
+        }
+    }
+
+    for (uint32_t fi = 0; fi < n_fam; fi++) {
+        if (fam[fi].clamp != 0) {
+            fprintf(stderr,
+                "ds4: tensor family %s (%s, %u tensor%s) dialect compat: "
+                "dequantized to f16 at load -- %" PRIu64 " value%s clamped "
+                "to +-65504 (unexpected for weights, investigate)\n",
+                fam[fi].key, fam[fi].type_name, fam[fi].count,
+                fam[fi].count == 1 ? "" : "s",
+                fam[fi].clamp, fam[fi].clamp == 1 ? "" : "s");
+        } else {
+            fprintf(stderr,
+                "ds4: tensor family %s (%s, %u tensor%s) dialect compat: "
+                "dequantized to f16 at load\n",
+                fam[fi].key, fam[fi].type_name, fam[fi].count,
+                fam[fi].count == 1 ? "" : "s");
+        }
+    }
 }
 
 static float ds4_vec_dot_q6_K_f32(int n, const block_q6_K *x, const float *y) {
