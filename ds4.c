@@ -5745,6 +5745,44 @@ static bool deepseek4_tensor_dim0(const ds4_model *m, const char *name, uint64_t
     return true;
 }
 
+static bool deepseek4_tensor_dim1(const ds4_model *m, const char *name, uint64_t *out) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    if (!t || t->ndim < 2) return false;
+    *out = t->dim[1];
+    return true;
+}
+
+/* llama.cpp creates token_embd.weight/output.weight as {n_embd, n_vocab}
+ * (dim1 is the vocab-sized axis) and the tokenizer's own token list has
+ * exactly n_vocab entries, so when deepseek4.vocab_size itself is missing
+ * from the header (GA's converter drops it, unlike the preview conversion),
+ * derive it from tokenizer.ggml.tokens' array length -- the authoritative
+ * source, since it is the raw token list, not a shape inference -- and
+ * cross-check against token_embd.weight/output.weight's vocab dimension.
+ * Disagreement means the file itself is inconsistent, so this dies with a
+ * clear message rather than silently guessing which source to trust. */
+static bool deepseek4_compat_vocab_size(const ds4_model *m, uint32_t *out) {
+    ds4_array_ref tokens;
+    if (!model_get_array(m, "tokenizer.ggml.tokens", &tokens)) return false;
+
+    uint64_t tensor_vocab = 0;
+    bool have_tensor_vocab = deepseek4_tensor_dim1(m, "token_embd.weight", &tensor_vocab);
+    if (!have_tensor_vocab) have_tensor_vocab = deepseek4_tensor_dim1(m, "output.weight", &tensor_vocab);
+
+    if (have_tensor_vocab && tensor_vocab != tokens.len) {
+        fprintf(stderr,
+                "ds4: deepseek4.vocab_size is missing and its tensor-derived fallbacks "
+                "disagree -- tokenizer.ggml.tokens has %" PRIu64 " entries but "
+                "token_embd.weight/output.weight's vocab dimension is %" PRIu64
+                "; refusing to guess\n",
+                tokens.len, tensor_vocab);
+        exit(1);
+    }
+
+    *out = (uint32_t)tokens.len;
+    return true;
+}
+
 /* llama.cpp creates (src/models/deepseek4.cpp):
  *   wo_a (attn_output_a) = {n_head * n_embd_head / o_groups, o_lora_rank * o_groups}
  *   wo_b (attn_output_b) = {o_groups * o_lora_rank,          n_embd}
@@ -5828,7 +5866,14 @@ static float deepseek4_compat_f32_shape_default(const ds4_model *m, const char *
 static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
+
+    uint32_t compat_vocab = 0;
+    bool have_vocab_compat = deepseek4_compat_vocab_size(m, &compat_vocab);
+    const uint32_t n_vocab = deepseek4_compat_u32(m, "deepseek4.vocab_size",
+                                                    compat_vocab, have_vocab_compat,
+                                                    "tokenizer.ggml.tokens array length "
+                                                    "(cross-checked against token_embd.weight/"
+                                                    "output.weight's vocab dimension)");
     const uint32_t n_head = required_u32(m, "deepseek4.attention.head_count");
     const uint32_t n_head_kv = required_u32(m, "deepseek4.attention.head_count_kv");
     const uint32_t n_head_dim = required_u32(m, "deepseek4.attention.key_length");
