@@ -4780,6 +4780,30 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* LOCAL PATCH (not upstream): unterminated reasoning is not an answer.
+ *
+ * When generation hits the token cap before </think> arrives, the old behaviour
+ * routed the whole unterminated buffer into content, so a truncated reasoning
+ * chain reached clients looking exactly like a finished reply.  split_reasoning_
+ * content() cannot tell that case apart from a legitimate non-thinking answer
+ * (neither carries a </think>, and the buffer does not retain the opening tag),
+ * so the discrimination has to happen here, where require_thinking_closed
+ * already tells us thinking was expected.
+ *
+ * Routing the buffer to reasoning_content and emptying content makes truncation
+ * self-describing on the wire for every consumer, not just ones that check
+ * finish_reason.  content is set to "" rather than NULL deliberately: the JSON
+ * writer guards NULL, but not every path in this file has been audited for it,
+ * and an empty answer is already unmistakably not an answer. */
+static void ds4_local_unterminated_reasoning(const char *text,
+                                             char **content_out,
+                                             char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (!strncmp(body, "<think>", 7)) body += 7;
+    *reasoning_out = xstrdup(body);
+    *content_out = xstrdup("");
+}
+
 static bool parse_deepseek_generated_message_ex(const char *text,
                                                 bool require_thinking_closed,
                                                 char **content_out,
@@ -4800,7 +4824,7 @@ static bool parse_deepseek_generated_message_ex(const char *text,
         if (!think_end) {
             /* Model did not close thinking, ignore any DSML in reasoning */
             fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
             return true;
         }
         tool_search = think_end + 8;
@@ -4985,7 +5009,7 @@ static bool parse_glm_generated_message_ex(const char *text,
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
             fprintf(stderr, "ds4-server: thinking not closed, ignoring GLM tool calls in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
             return true;
         }
         tool_search = think_end + 8;
