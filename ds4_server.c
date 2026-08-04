@@ -4798,9 +4798,16 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            /* Thinking mode is on but the model never emitted </think> —
+             * typically the response was truncated at max_tokens mid-thought
+             * (see #509). The accumulated text is unfinished reasoning, not a
+             * final answer: surface it as reasoning_content and leave content
+             * empty, matching what the live streaming classifier already does.
+             * Any DSML here is unclosed reasoning too, so it is deliberately
+             * not executed as a tool call. */
+            size_t think_off = !strncmp(text, "<think>", 7) ? 7 : 0;
+            *reasoning_out = xstrdup(text + think_off);
+            *content_out = xstrdup("");
             return true;
         }
         tool_search = think_end + 8;
@@ -15190,6 +15197,30 @@ static void test_thinking_dsml_after_think_close_is_executable(void) {
     tool_calls_free(&calls);
 }
 
+static void test_thinking_unclosed_is_reasoning_not_content(void) {
+    /* Regression for #509: when thinking mode is on and the model is truncated
+     * (e.g. at max_tokens) before it emits </think>, the partial output is
+     * unfinished reasoning. It must surface as reasoning_content with empty
+     * content, not leak into content as if it were the final answer. */
+    const char *generated =
+        "<think>We need to compute 17 * 24. This is a simple multiplication. "
+        "17 * 24 = 17 * (20 + 4) =";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(reasoning && strstr(reasoning, "We need to compute 17 * 24") != NULL);
+    TEST_ASSERT(strstr(reasoning, "<think>") == NULL);
+    TEST_ASSERT(content && content[0] == '\0');
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
@@ -17484,6 +17515,7 @@ static void ds4_server_unit_tests_run(void) {
     test_invalid_glm_tool_error_suffix();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
+    test_thinking_unclosed_is_reasoning_not_content();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_glm_tool_checkpoint_suffix_is_canonical();
     test_tool_checkpoint_minifies_json_parameters();
