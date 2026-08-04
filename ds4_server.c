@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -61,6 +62,27 @@ static void stop_signal_handler(int sig) {
         close(fd);
     }
 }
+
+#ifdef DS4_SERVER_TEST
+typedef enum {
+    TEST_TXN_EVENT_RESTORE = 0,
+    TEST_TXN_EVENT_SYNCHRONIZE,
+    TEST_TXN_EVENT_EXTEND,
+    TEST_TXN_EVENT_DECODE,
+    TEST_TXN_EVENT_OUTPUT_PREFILL,
+    TEST_TXN_EVENT_OUTPUT_OPEN,
+    TEST_TXN_EVENT_OUTPUT_UPDATE,
+    TEST_TXN_EVENT_OUTPUT_FLUSH,
+    TEST_TXN_EVENT_TRACE_OBSERVE,
+    TEST_TXN_EVENT_STATS_OBSERVE,
+    TEST_TXN_EVENT_COMMIT,
+    TEST_TXN_EVENT_ROLLBACK,
+    TEST_TXN_EVENT_OUTPUT,
+    TEST_TXN_EVENT_STATS,
+    TEST_TXN_EVENT_TRACE,
+    TEST_TXN_EVENT_CLEANUP,
+} test_txn_event;
+#endif
 
 typedef struct {
     char *ptr;
@@ -646,7 +668,7 @@ typedef struct {
      * them to a prior assistant tool call.  If that call_id is still known in
      * memory, the live KV is the authoritative prefix, including any hidden
      * thinking that the client did not replay.  These fields carry the parsed
-     * evidence needed by generate_job() to append only the new suffix.
+     * evidence needed by server_txn_run() to append only the new suffix.
      *
      * A tool-output-only request has no stateless prefix to match.  If the live
      * call_id binding is gone by the time the worker executes it, DS4 must ask
@@ -2775,7 +2797,7 @@ static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
  * reasoning state for the assistant call.  Official Responses clients can
  * carry that state with reasoning items / encrypted reasoning content; when
  * they do not, the request is still renderable as visible history.  Mark that
- * condition so generate_job() can prefer live / visible checkpoints and emit a
+ * condition so server_txn_run() can prefer live / visible checkpoints and emit a
  * warning if it must fall back to visible replay instead of aborting the
  * session. */
 static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
@@ -2821,7 +2843,7 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
 
 /* Record the call ids and suffix candidate for a live Responses continuation.
  *
- * This only prepares evidence.  generate_job() later checks that the live
+ * This only prepares evidence.  server_txn_run() later checks that the live
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
@@ -2909,7 +2931,7 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
  * Anthropic's visible replay normally includes the assistant tool_use JSON and
  * the user tool_result.  That replay is still only a description of what the
  * model sampled.  If the incoming tool_result IDs match the live sampled
- * frontier, generate_job() can skip replay matching entirely and append just
+ * frontier, server_txn_run() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
 static void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
@@ -2990,7 +3012,26 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                     goto bad;
                 }
                 tool_choice_none = !strcmp(choice, "none");
+                /* Like the Responses parser: "required" and forced function
+                 * targets need constrained decoding we don't implement, so
+                 * reject instead of silently downgrading to auto. */
+                if (!tool_choice_none && strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
+                    free(choice);
+                    free(key);
+                    chat_msgs_free(&msgs);
+                    free(tool_schemas);
+                    request_free(r);
+                    return false;
+                }
                 free(choice);
+            } else if (*p == '{') {
+                snprintf(err, errlen, "forced tool_choice not supported");
+                free(key);
+                chat_msgs_free(&msgs);
+                free(tool_schemas);
+                request_free(r);
+                return false;
             } else if (!json_skip_value(&p)) {
                 free(key);
                 goto bad;
@@ -3465,7 +3506,7 @@ fail:
  *     can render plain reasoning summaries/content, but it cannot decrypt
  *     reasoning.encrypted_content.  If live state is unavailable and the replay
  *     only contains visible messages/tool calls, later validation marks it as a
- *     lower-fidelity replay; generate_job() logs that and continues from the
+ *     lower-fidelity replay; server_txn_run() logs that and continues from the
  *     visible transcript rather than killing a recoverable agent session.
  *
  * Reasoning items are merged into the next assistant message so
@@ -4497,6 +4538,18 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+/* True when the client socket is closed or reset.  A live but idle client
+ * reports EAGAIN; stray unread bytes count as alive.  Never consumes data, so
+ * it is safe to call at any point of the request lifecycle. */
+static bool client_socket_gone(int fd) {
+    if (fd < 0) return true;
+    char b;
+    ssize_t n = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0) return false;
+    if (n == 0) return true;
+    return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+}
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -4831,7 +4884,11 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     }
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
-    const char *raw_block_start = start;
+    /* Capture the raw block from the trimmed-content boundary, not from the
+     * marker match: any whitespace separator the model sampled between the
+     * content and the block lives in the KV cache, so byte-exact replay must
+     * include it even when it is not the canonical "\n\n". */
+    const char *raw_block_start = text + content_len;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
     const char *tool_calls_end = DS4_TOOL_CALLS_END;
     const char *invoke_start = DS4_INVOKE_START;
@@ -5322,7 +5379,9 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+                         code == 429 ? "Too Many Requests" :
+                         code == 500 ? "Internal Server Error" :
+                         code == 503 ? "Service Unavailable" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -5346,7 +5405,28 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
     buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    buf_puts(&b, ",\"type\":\"");
+    buf_puts(&b, code >= 500 ? "api_error" :
+                 code == 429 ? "rate_limit_error" : "invalid_request_error");
+    buf_puts(&b, "\"}}\n");
+    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* Anthropic SDKs classify errors by the {"type":"error","error":{...}}
+ * envelope; give /v1/messages clients that shape instead of the OpenAI one. */
+static bool http_error_api(int fd, bool enable_cors, int code, const char *msg,
+                           api_style api) {
+    if (api != API_ANTHROPIC) return http_error(fd, enable_cors, code, msg);
+    buf b = {0};
+    buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
+    buf_puts(&b, code >= 500 ? "api_error" :
+                 code == 429 ? "rate_limit_error" :
+                 code == 529 ? "overloaded_error" : "invalid_request_error");
+    buf_puts(&b, "\",\"message\":");
+    json_escape(&b, msg);
+    buf_puts(&b, "}}\n");
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -8180,6 +8260,7 @@ typedef struct {
     size_t len;
     size_t bytes;
     int refs;
+    int invokes;
     uint64_t seen;
     tool_memory_entry *entries;
 } tool_memory_block;
@@ -8234,6 +8315,9 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* True when this frontier ends in an assistant tool-call turn rather than
+     * a final answer; only used to label the cache hit source. */
+    bool tool_turn;
 } visible_live_state;
 
 struct server_slot {
@@ -8259,6 +8343,453 @@ struct server_slot {
 
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
+
+/* Operational counters for GET /stats.  Guarded by server.mu; every field is
+ * cheap to maintain because it piggybacks on decisions the request path
+ * already makes. */
+typedef struct {
+    uint64_t requests;
+    uint64_t queue_rejected;
+    uint64_t queue_dropped_disconnected;
+    uint64_t prefill_cancelled;
+    uint64_t cache_memory_token;
+    uint64_t cache_memory_text;
+    uint64_t cache_responses_visible;
+    uint64_t cache_responses_tool_output;
+    uint64_t cache_anthropic_tool_output;
+    uint64_t cache_thinking_visible;
+    uint64_t cache_tool_visible;
+    uint64_t cache_disk_text;
+    uint64_t cache_cold;
+    uint64_t prompt_tokens;
+    uint64_t cached_tokens;
+    uint64_t generated_tokens;
+    double last_prefill_tps;
+    double last_decode_tps;
+} server_stats;
+
+/* Client threads serialize this value copy and never inspect the mutable model
+ * session.  Only the worker publishes live_tokens; the remaining fields are
+ * sampled under server.mu at the same publication point. */
+typedef struct {
+    server_stats counters;
+    int queue_depth;
+    int clients;
+    int live_tokens;
+    int ctx_size;
+    bool busy;
+    uint64_t version;
+} server_stats_snapshot;
+
+typedef enum {
+    SERVER_TXN_PHASE_ADMITTED = 0,
+    SERVER_TXN_PHASE_RESTORE,
+    SERVER_TXN_PHASE_SYNCHRONIZE,
+    SERVER_TXN_PHASE_EXTEND,
+    SERVER_TXN_PHASE_DECODE,
+    SERVER_TXN_PHASE_SETTLE,
+    SERVER_TXN_PHASE_TERMINALIZE,
+    SERVER_TXN_PHASE_DONE,
+} server_txn_phase;
+
+typedef enum {
+    SERVER_TXN_COMPLETED = 0,
+    SERVER_TXN_REJECTED,
+    SERVER_TXN_CANCELLED,
+    SERVER_TXN_FAILED,
+} server_txn_class;
+
+typedef enum {
+    SERVER_TXN_REASON_NONE = 0,
+    SERVER_TXN_REASON_STOP,
+    SERVER_TXN_REASON_LENGTH,
+    SERVER_TXN_REASON_TOOL_CALLS,
+    SERVER_TXN_REASON_CONTINUATION_UNAVAILABLE,
+    SERVER_TXN_REASON_CLIENT_GONE,
+    SERVER_TXN_REASON_CANCELLED,
+    SERVER_TXN_REASON_SHUTDOWN,
+    SERVER_TXN_REASON_RESTORE_FAILED,
+    SERVER_TXN_REASON_SYNC_FAILED,
+    SERVER_TXN_REASON_DECODE_FAILED,
+    SERVER_TXN_REASON_OUTPUT_FAILED,
+    SERVER_TXN_REASON_COMMIT_FAILED,
+    SERVER_TXN_REASON_INTERNAL,
+} server_txn_reason;
+
+typedef enum {
+    SERVER_TXN_FINISH_NONE = 0,
+    SERVER_TXN_FINISH_STOP,
+    SERVER_TXN_FINISH_LENGTH,
+    SERVER_TXN_FINISH_TOOL_CALLS,
+    SERVER_TXN_FINISH_ERROR,
+} server_txn_finish;
+
+typedef enum {
+    SERVER_SESSION_UNCHANGED = 0,
+    SERVER_SESSION_VALID_PREFIX,
+    SERVER_SESSION_COMMITTED,
+    SERVER_SESSION_INVALIDATED,
+} server_session_disposition;
+
+typedef enum {
+    SERVER_WIRE_UNTOUCHED = 0,
+    SERVER_WIRE_STARTED,
+    SERVER_WIRE_IRREVERSIBLE,
+    SERVER_WIRE_COMPLETE,
+    SERVER_WIRE_BROKEN,
+} server_wire_disposition;
+
+enum {
+    SERVER_TXN_SECONDARY_ROLLBACK = 1u << 0,
+    SERVER_TXN_SECONDARY_CHECKPOINT = 1u << 1,
+    SERVER_TXN_SECONDARY_OUTPUT = 1u << 2,
+    SERVER_TXN_SECONDARY_TRACE = 1u << 3,
+    SERVER_TXN_SECONDARY_STATS = 1u << 4,
+    SERVER_TXN_SECONDARY_CLEANUP = 1u << 5,
+};
+
+typedef struct {
+    server_txn_class class;
+    server_txn_phase decided_at;
+    server_txn_reason reason;
+    server_txn_finish finish;
+    server_session_disposition session;
+    server_wire_disposition wire;
+    uint32_t secondary;
+    int prompt_tokens;
+    int cached_tokens;
+    int generated_tokens;
+    char detail[160];
+} server_txn_outcome;
+
+typedef enum {
+    SERVER_TXN_STEP_CONTINUE = 0,
+    SERVER_TXN_STEP_TERMINAL,
+} server_txn_step_status;
+
+typedef struct {
+    server_txn_step_status status;
+    server_txn_class class;
+    server_txn_reason reason;
+    server_txn_finish finish;
+    server_session_disposition session;
+    server_wire_disposition wire;
+    int prompt_tokens;
+    int cached_tokens;
+    int generated_tokens;
+    const char *detail;
+    uint32_t secondary;
+} server_txn_step_result;
+
+typedef struct {
+    bool ok;
+    server_session_disposition session;
+    server_wire_disposition wire;
+    server_txn_class failure_class;
+    server_txn_reason failure_reason;
+    const char *failure_detail;
+    uint32_t secondary;
+} server_txn_settle_result;
+
+typedef struct {
+    bool ok;
+    server_wire_disposition wire;
+    uint32_t secondary;
+} server_txn_output_result;
+
+typedef struct server_txn server_txn;
+
+typedef enum {
+    SERVER_OUTPUT_PREFILL_TICK = 0,
+    SERVER_OUTPUT_STREAM_OPEN,
+    SERVER_OUTPUT_STREAM_UPDATE,
+    SERVER_OUTPUT_STREAM_FLUSH,
+} server_output_operation;
+
+typedef struct {
+    server_output_operation operation;
+    const char *text;
+    size_t text_len;
+    size_t safe_len;
+    double now;
+    bool *headers_sent;
+    double *last_keepalive;
+} server_output_observation;
+
+typedef enum {
+    SERVER_TRACE_BEGIN = 0,
+    SERVER_TRACE_EVENT,
+    SERVER_TRACE_PIECE,
+} server_trace_operation;
+
+typedef struct {
+    server_trace_operation operation;
+    const char *text;
+    size_t text_len;
+} server_trace_observation;
+
+typedef struct {
+    bool ok;
+    uint64_t trace_id;
+} server_trace_result;
+
+typedef enum {
+    SERVER_STATS_QUEUED_DROP = 0,
+    SERVER_STATS_ADMIT,
+    SERVER_STATS_CACHE,
+    SERVER_STATS_PREFILL_CANCEL,
+    SERVER_STATS_PROGRESS,
+    SERVER_STATS_PREFILL_DONE,
+} server_statistics_operation;
+
+typedef struct {
+    server_statistics_operation operation;
+    const char *cache_source;
+    int prompt_tokens;
+    int cached_tokens;
+    int live_tokens;
+    double elapsed;
+} server_statistics_observation;
+
+typedef struct {
+    void *ctx;
+    server_txn_step_result (*advance)(void *ctx,
+                                      const server_txn_outcome *outcome,
+                                      server_txn_phase phase);
+    server_txn_settle_result (*settle)(
+        void *ctx, const server_txn_outcome *outcome, bool commit);
+    bool (*cleanup)(void *ctx, const server_txn_outcome *outcome);
+} server_session_adapter;
+
+typedef struct {
+    void *ctx;
+    server_txn_output_result (*apply)(
+        void *ctx, const server_output_observation *observation);
+    server_txn_output_result (*finish)(
+        void *ctx, const server_txn_outcome *outcome);
+} server_output_adapter;
+
+typedef struct {
+    void *ctx;
+    server_trace_result (*record)(
+        void *ctx, const server_trace_observation *observation);
+    bool (*finish)(void *ctx, const server_txn_outcome *outcome);
+} server_trace_adapter;
+
+typedef struct {
+    void *ctx;
+    bool (*record)(
+        void *ctx, const server_statistics_observation *observation);
+    bool (*finish)(void *ctx, const server_txn_outcome *outcome);
+} server_statistics_adapter;
+
+typedef struct {
+    server_session_adapter session;
+    server_output_adapter output;
+    server_trace_adapter trace;
+    server_statistics_adapter stats;
+} server_txn_adapters;
+
+struct server_txn {
+    server_txn_outcome outcome;
+    server_txn_adapters adapters;
+    server_txn_phase phase;
+    bool failure_latched;
+    bool terminalizing;
+    bool terminalized;
+    bool settle_done;
+    bool output_done;
+    bool trace_done;
+    bool stats_done;
+    bool cleanup_done;
+};
+
+static void server_txn_init(server_txn *tx,
+                            const server_txn_adapters *adapters) {
+    memset(tx, 0, sizeof(*tx));
+    if (adapters) tx->adapters = *adapters;
+    tx->phase = SERVER_TXN_PHASE_ADMITTED;
+    tx->outcome.decided_at = SERVER_TXN_PHASE_ADMITTED;
+}
+
+static void server_txn_complete(server_txn *tx, server_txn_reason reason,
+                                server_txn_finish finish) {
+    if (!tx || tx->failure_latched || tx->terminalizing) return;
+    tx->outcome.class = SERVER_TXN_COMPLETED;
+    tx->outcome.decided_at = tx->phase;
+    tx->outcome.reason = reason;
+    tx->outcome.finish = finish;
+}
+
+static bool server_txn_fail_once(server_txn *tx, server_txn_phase phase,
+                                 server_txn_class class,
+                                 server_txn_reason reason,
+                                 server_session_disposition session,
+                                 const char *detail) {
+    if (!tx || tx->failure_latched) return false;
+    tx->failure_latched = true;
+    tx->outcome.class = class;
+    tx->outcome.decided_at = phase;
+    tx->outcome.reason = reason;
+    if (tx->outcome.finish == SERVER_TXN_FINISH_NONE) {
+        tx->outcome.finish = SERVER_TXN_FINISH_ERROR;
+    }
+    tx->outcome.session = session;
+    snprintf(tx->outcome.detail, sizeof(tx->outcome.detail), "%s",
+             detail ? detail : "");
+    return true;
+}
+
+static server_txn_outcome server_txn_terminalize(server_txn *tx) {
+    if (tx->terminalized || tx->terminalizing) return tx->outcome;
+    tx->terminalizing = true;
+    tx->phase = SERVER_TXN_PHASE_TERMINALIZE;
+    if (tx->outcome.reason == SERVER_TXN_REASON_NONE) {
+        server_txn_fail_once(tx, SERVER_TXN_PHASE_TERMINALIZE,
+                             SERVER_TXN_FAILED, SERVER_TXN_REASON_INTERNAL,
+                             SERVER_SESSION_INVALIDATED,
+                             "transaction reached terminalization without an outcome");
+    }
+
+    const bool commit = tx->outcome.class == SERVER_TXN_COMPLETED;
+    if (!tx->settle_done) {
+        tx->settle_done = true;
+        server_txn_settle_result result = {
+            .ok = false,
+            .session = tx->outcome.session,
+            .wire = tx->outcome.wire,
+        };
+        if (tx->adapters.session.settle) {
+            result = tx->adapters.session.settle(
+                tx->adapters.session.ctx, &tx->outcome, commit);
+        }
+        tx->outcome.secondary |= result.secondary;
+        tx->outcome.wire = result.wire;
+        if (result.failure_reason != SERVER_TXN_REASON_NONE) {
+            if (!server_txn_fail_once(
+                    tx, SERVER_TXN_PHASE_SETTLE,
+                    result.failure_class, result.failure_reason,
+                    result.session, result.failure_detail) &&
+                result.failure_reason == SERVER_TXN_REASON_OUTPUT_FAILED) {
+                tx->outcome.secondary |= SERVER_TXN_SECONDARY_OUTPUT;
+            }
+        }
+        if (result.ok) {
+            tx->outcome.session = result.session;
+        } else {
+            tx->outcome.session = SERVER_SESSION_INVALIDATED;
+            if (commit) {
+                server_txn_fail_once(tx, SERVER_TXN_PHASE_SETTLE,
+                                     SERVER_TXN_FAILED,
+                                     SERVER_TXN_REASON_COMMIT_FAILED,
+                                     SERVER_SESSION_INVALIDATED,
+                                     "session commit failed");
+            } else {
+                tx->outcome.secondary |= SERVER_TXN_SECONDARY_ROLLBACK;
+            }
+        }
+    }
+
+    if (!tx->output_done) {
+        tx->output_done = true;
+        if (tx->outcome.wire != SERVER_WIRE_BROKEN) {
+            server_txn_output_result result = {
+                .ok = false,
+                .wire = tx->outcome.wire,
+            };
+            if (tx->adapters.output.finish) {
+                result = tx->adapters.output.finish(
+                    tx->adapters.output.ctx, &tx->outcome);
+            }
+            tx->outcome.secondary |= result.secondary;
+            tx->outcome.wire = result.wire;
+            if (!result.ok) {
+                tx->outcome.wire = SERVER_WIRE_BROKEN;
+                if (!server_txn_fail_once(tx, SERVER_TXN_PHASE_TERMINALIZE,
+                                          SERVER_TXN_FAILED,
+                                          SERVER_TXN_REASON_OUTPUT_FAILED,
+                                          tx->outcome.session,
+                                          "terminal output failed")) {
+                    tx->outcome.secondary |= SERVER_TXN_SECONDARY_OUTPUT;
+                }
+            }
+        }
+    }
+
+    if (!tx->trace_done) {
+        tx->trace_done = true;
+        if (!tx->adapters.trace.finish ||
+            !tx->adapters.trace.finish(tx->adapters.trace.ctx, &tx->outcome)) {
+            tx->outcome.secondary |= SERVER_TXN_SECONDARY_TRACE;
+        }
+    }
+    if (!tx->cleanup_done) {
+        tx->cleanup_done = true;
+        if (!tx->adapters.session.cleanup ||
+            !tx->adapters.session.cleanup(
+                tx->adapters.session.ctx, &tx->outcome)) {
+            tx->outcome.secondary |= SERVER_TXN_SECONDARY_CLEANUP;
+        }
+    }
+    if (!tx->stats_done) {
+        tx->stats_done = true;
+        if (!tx->adapters.stats.finish ||
+            !tx->adapters.stats.finish(tx->adapters.stats.ctx, &tx->outcome)) {
+            tx->outcome.secondary |= SERVER_TXN_SECONDARY_STATS;
+        }
+    }
+
+    tx->phase = SERVER_TXN_PHASE_DONE;
+    tx->terminalized = true;
+    tx->terminalizing = false;
+    return tx->outcome;
+}
+
+static server_txn_outcome
+server_txn_run_adapters(const server_txn_adapters *adapters) {
+    static const server_txn_phase phases[] = {
+        SERVER_TXN_PHASE_RESTORE,
+        SERVER_TXN_PHASE_SYNCHRONIZE,
+        SERVER_TXN_PHASE_EXTEND,
+        SERVER_TXN_PHASE_DECODE,
+    };
+    server_txn tx;
+    server_txn_init(&tx, adapters);
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+        tx.phase = phases[i];
+        if (!tx.adapters.session.advance) {
+            server_txn_fail_once(&tx, tx.phase, SERVER_TXN_FAILED,
+                                 SERVER_TXN_REASON_INTERNAL,
+                                 SERVER_SESSION_INVALIDATED,
+                                 "session adapter has no phase runner");
+            break;
+        }
+        const server_txn_step_result step =
+            tx.adapters.session.advance(
+                tx.adapters.session.ctx, &tx.outcome, tx.phase);
+        tx.outcome.secondary |= step.secondary;
+        tx.outcome.wire = step.wire;
+        tx.outcome.prompt_tokens = step.prompt_tokens;
+        tx.outcome.cached_tokens = step.cached_tokens;
+        tx.outcome.generated_tokens = step.generated_tokens;
+        if (step.status == SERVER_TXN_STEP_CONTINUE) continue;
+        if (step.class == SERVER_TXN_COMPLETED) {
+            server_txn_complete(&tx, step.reason, step.finish);
+            tx.outcome.session = step.session;
+        } else {
+            server_txn_fail_once(&tx, tx.phase, step.class, step.reason,
+                                 step.session, step.detail);
+        }
+        break;
+    }
+    if (tx.outcome.reason == SERVER_TXN_REASON_NONE) {
+        server_txn_fail_once(&tx, tx.phase, SERVER_TXN_FAILED,
+                             SERVER_TXN_REASON_INTERNAL,
+                             SERVER_SESSION_INVALIDATED,
+                             "session adapter finished without an outcome");
+    }
+    return server_txn_terminalize(&tx);
+}
 
 struct server {
     ds4_engine *engine;
@@ -8290,11 +8821,20 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
+    bool stats_refresh_requested;
     int clients;
+    int queue_depth;
+    int max_queue;
+    bool busy;
+    double started_at;
+    server_stats stats;
+    server_stats_snapshot stats_snapshot;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    pthread_t worker_thread;
+    bool worker_bound;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -8303,11 +8843,28 @@ struct server {
 struct job {
     int fd;
     request req;
+    server_txn_outcome outcome;
+    bool outcome_ready;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static void server_publish_stats_snapshot(server *s, int live_tokens) {
+    if (s->worker_bound && !pthread_equal(s->worker_thread, pthread_self())) {
+        die("worker ownership violation while publishing session statistics");
+    }
+    pthread_mutex_lock(&s->mu);
+    s->stats_snapshot.counters = s->stats;
+    s->stats_snapshot.queue_depth = s->queue_depth;
+    s->stats_snapshot.clients = s->clients;
+    s->stats_snapshot.live_tokens = live_tokens;
+    s->stats_snapshot.ctx_size = s->ctx_size;
+    s->stats_snapshot.busy = s->busy;
+    s->stats_snapshot.version++;
+    pthread_mutex_unlock(&s->mu);
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -8384,6 +8941,18 @@ static tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
     return v == raxNotFound ? NULL : v;
 }
 
+/* Number of invoke elements inside one remembered DSML block.  A block is
+ * only replayable into a message that carries exactly this many calls. */
+static int dsml_count_invokes(const char *dsml) {
+    int n = 0;
+    for (const char *p = dsml; (p = strstr(p, DS4_INVOKE_START)) != NULL;
+         p += strlen(DS4_INVOKE_START)) n++;
+    if (n > 0) return n;
+    for (const char *p = dsml; (p = strstr(p, DS4_INVOKE_START_SHORT)) != NULL;
+         p += strlen(DS4_INVOKE_START_SHORT)) n++;
+    return n;
+}
+
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
                                                        const char *dsml,
                                                        size_t len) {
@@ -8395,6 +8964,7 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
     b->dsml = xstrndup(dsml, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
+    b->invokes = dsml_count_invokes(b->dsml);
     if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
         free(b->dsml);
         free(b);
@@ -8527,6 +9097,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_text = NULL;
     st->visible_len = 0;
     st->live_tokens = 0;
+    st->tool_turn = false;
     st->valid = false;
 }
 
@@ -8544,13 +9115,15 @@ static void thinking_live_clear(server *s, server_slot *slot) {
 }
 
 static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text) {
+                                   const char *visible_text,
+                                   bool tool_turn) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
     slot->thinking_live.visible_text = xstrdup(visible_text);
     slot->thinking_live.visible_len = strlen(visible_text);
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
+    slot->thinking_live.tool_turn = tool_turn;
     slot->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -8740,7 +9313,14 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
             }
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
-        if (exact && matched) {
+        /* Replaying a block into a message that carries fewer calls than the
+         * block has invokes would duplicate the missing invokes into the
+         * rendered prompt (e.g. a client that splits one turn's parallel
+         * calls across two assistant messages).  Such messages fall back to
+         * canonical JSON rendering. */
+        const bool complete = matched &&
+            (matched->invokes <= 0 || matched->invokes == calls->len);
+        if (exact && matched && complete) {
             calls->raw_tool_text = xstrdup(matched->dsml);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
@@ -9117,6 +9697,23 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    /* Agent requests replay every historical tool-call id on every turn.
+     * tool_memory_remember() already holds them in RAM, so only scan the
+     * cache directory for ids that are actually missing (the common case is
+     * none, except right after a server restart). */
+    int missing = 0;
+    for (int i = 0; i < wanted.len; i++) {
+        if (tool_memory_has_id(s, wanted.v[i])) {
+            free(wanted.v[i]);
+        } else {
+            wanted.v[missing++] = wanted.v[i];
+        }
+    }
+    wanted.len = missing;
+    if (wanted.len == 0) {
+        id_list_free(&wanted);
+        return;
+    }
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
@@ -9306,11 +9903,11 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
+static bool kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
-    if (!s || !slot) return;
+    if (!s || !slot) return true;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
+    if (!tokens) return true;
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -9340,13 +9937,16 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
+    bool ok;
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+        ok = kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len,
+                                             reason, visible_text, visible_ext,
+                                             visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        ok = kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
     }
+    return ok;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -9412,17 +10012,17 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
-    if (!s || !slot) return;
-    kv_disk_cache *kc = &s->kv;
+static bool kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+    if (!s || !slot) return true;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
+    if (!tokens) return true;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
-    if (target == 0) return;
+    if (target == 0) return true;
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
-        (void)kc;
         kv_cache_slot_note_store(slot, target);
+        return true;
     }
+    return false;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -9437,10 +10037,12 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  bool *loaded_consumed_out,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (loaded_consumed_out) *loaded_consumed_out = false;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -9453,6 +10055,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_consumed_out) *loaded_consumed_out = lr.consumed;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -9461,11 +10064,13 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             uint8_t *loaded_ext_flags_out,
+                             bool *loaded_consumed_out) {
     return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
+                                  loaded_consumed_out,
                                   req && req->api == API_RESPONSES);
 }
 
@@ -9942,6 +10547,27 @@ static void trace_finish(
     pthread_mutex_unlock(&s->trace_mu);
 }
 
+static void server_trace_adapter_event(
+        const server_trace_adapter *adapter, uint32_t *secondary,
+        const char *fmt, ...) {
+    char message[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(message, sizeof(message), fmt, ap);
+    va_end(ap);
+    size_t len = n > 0 ? (size_t)n : 0;
+    if (len >= sizeof(message)) len = sizeof(message) - 1;
+    const server_trace_observation observation = {
+        .operation = SERVER_TRACE_EVENT,
+        .text = message,
+        .text_len = len,
+    };
+    if (!adapter || !adapter->record ||
+        !adapter->record(adapter->ctx, &observation).ok) {
+        if (secondary) *secondary |= SERVER_TXN_SECONDARY_TRACE;
+    }
+}
+
 typedef struct {
     server *srv;
     server_slot *slot;
@@ -9965,8 +10591,27 @@ typedef struct {
     bool enable_cors;
     bool headers_sent;
     bool stream_failed;
+    server_wire_disposition *wire;
+    uint32_t *secondary;
+    server_output_adapter output;
+    server_statistics_adapter stats;
     double last_keepalive;
 } server_prefill_progress;
+
+/* Cooperative prefill cancellation: ds4_session_sync() polls this at chunk
+ * boundaries and stops with a valid token prefix.  Cancels on shutdown, on a
+ * failed SSE keepalive write, and on a disconnected client socket, so a gone
+ * client cannot burn minutes of prefill for a response nobody will read. */
+static bool server_sync_cancel_cb(void *ud) {
+    server_prefill_progress *p = ud;
+    if (g_stop_requested) return true;
+    if (p->stream_failed) return true;
+    if (client_socket_gone(p->fd)) {
+        p->stream_failed = true;
+        return true;
+    }
+    return false;
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -10413,34 +11058,32 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (!is_chunk && !is_display) return;
 
     double now = now_sec();
-    /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
-     * response headers the first time the callback fires and then emit a
-     * comment line (`:` prefix, ignored by SSE clients) every few seconds.
-     * Best-effort: if the client has already gone away, the writes fail
-     * silently and the outer code will discover the closed socket the next
-     * time it tries to stream a real event. */
+    /* Keep the HTTP/SSE connection alive through the output adapter while the
+     * worker is inside session synchronization. */
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
-        if (!p->headers_sent) {
-            p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
-                p->last_keepalive = now;
-            } else {
-                p->stream_failed = true;
-            }
-        } else if (now - p->last_keepalive >= 5.0) {
-            static const char ka[] = ": prefill\n\n";
-            if (send_all(p->fd, ka, sizeof(ka) - 1)) {
-                p->last_keepalive = now;
-            } else {
-                p->stream_failed = true;
-            }
+        const server_output_observation observation = {
+            .operation = SERVER_OUTPUT_PREFILL_TICK,
+            .now = now,
+            .headers_sent = &p->headers_sent,
+            .last_keepalive = &p->last_keepalive,
+        };
+        server_txn_output_result result = {
+            .ok = false,
+            .wire = p->wire ? *p->wire : SERVER_WIRE_UNTOUCHED,
+        };
+        if (p->output.apply) {
+            result = p->output.apply(p->output.ctx, &observation);
         }
+        if (p->wire) *p->wire = result.wire;
+        if (!result.ok) p->stream_failed = true;
     }
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            if (!kv_cache_maybe_store_continued(p->srv, p->slot) && p->secondary) {
+                *p->secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+            }
         }
         return;
     }
@@ -10481,11 +11124,22 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        if (!kv_cache_maybe_store_continued(p->srv, p->slot) && p->secondary) {
+            *p->secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+        }
+    }
+    if (p->srv && p->stats.record) {
+        const server_statistics_observation observation = {
+            .operation = SERVER_STATS_PROGRESS,
+            .live_tokens = ds4_session_pos(p->slot->session),
+        };
+        if (!p->stats.record(p->stats.ctx, &observation) && p->secondary) {
+            *p->secondary |= SERVER_TXN_SECONDARY_STATS;
+        }
     }
 }
 
-static void send_prefill_failure_response(server *s, const job *j,
+static bool send_prefill_failure_response(server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
@@ -10496,17 +11150,18 @@ static void send_prefill_failure_response(server *s, const job *j,
                        "ds4-server: %s ctx=%s%s%s prefill failed after stream closed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
                        flags && flags[0] ? flags : "", err);
-            return;
+            return false;
         }
-        if (!sse_error_event(j->fd, &j->req, err)) {
+        bool ok = sse_error_event(j->fd, &j->req, err);
+        if (!ok) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
                        flags && flags[0] ? flags : "", err);
         }
-        return;
+        return ok;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    return http_error_api(j->fd, s->enable_cors, 500, err, j->req.api);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -10593,18 +11248,57 @@ static char *build_toolless_thinking_visible_text(const request *r,
 
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
+                                         const server_trace_adapter *trace,
+                                         uint32_t *secondary,
+                                         const char *content) {
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, slot, visible);
+    thinking_live_remember(s, slot, visible, false);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session), strlen(visible));
-    trace_event(s, trace_id,
-                "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(slot->session), strlen(visible));
+    server_trace_adapter_event(
+        trace, secondary,
+        "thinking live checkpoint remembered: live=%d visible=%zu",
+        ds4_session_pos(slot->session), strlen(visible));
     free(visible);
+}
+
+/* Chat/completions and Anthropic have no protocol object that binds the next
+ * request to this live tool-call frontier, and the sampled bytes (hidden
+ * reasoning, exact DSML spelling) never token-match the client's replay.  But
+ * the text the next request will render for this turn is predictable: it is
+ * the same prompt_text + suffix that canonicalize_tool_checkpoint() builds.
+ * Remember it as a visible key for the live frontier so the next request
+ * continues in memory instead of taking the evict-store + disk-restore round
+ * trip on every agent turn. */
+static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
+                                             const job *j,
+                                             const char *ctx,
+                                             const server_trace_adapter *trace,
+                                             uint32_t *secondary,
+                                             const char *content,
+                                             const char *reasoning,
+                                             const tool_calls *calls) {
+    if (!j->req.prompt_text || !j->req.prompt_text[0]) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", true);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), visible.len);
+    server_trace_adapter_event(
+        trace, secondary,
+        "tool live checkpoint remembered: live=%d visible=%zu",
+        ds4_session_pos(slot->session), visible.len);
+    buf_free(&visible);
+    free(suffix);
 }
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -10612,11 +11306,15 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * tool id.  If a client sends a tool call without an id we know, the fallback
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
-static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
+static bool canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content,
+                                         const server_txn_adapters *effects,
+                                         uint32_t *secondary,
+                                         server_wire_disposition *wire,
+                                         const char *content,
                                          const char *reasoning, const tool_calls *calls) {
-    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
+    if (!calls || calls->len == 0 || !j->req.prompt_text) return true;
+    bool ok = true;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
@@ -10646,9 +11344,10 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     free(live_text);
 
     if (common < j->req.prompt.len) {
-        trace_event(s, trace_id,
-                    "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
-                    common, j->req.prompt.len, live_len, canonical.len);
+        server_trace_adapter_event(
+            effects ? &effects->trace : NULL, secondary,
+            "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
+            common, j->req.prompt.len, live_len, canonical.len);
         goto done;
     }
 
@@ -10662,19 +11361,22 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
                    ctx, common, live_len, canonical.len);
-        trace_event(s, trace_id,
-                    "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
-                    common, live_len, canonical.len);
+        server_trace_adapter_event(
+            effects ? &effects->trace : NULL, secondary,
+            "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
+            common, live_len, canonical.len);
     } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
         /* The generated DSML suffix and the canonical prompt share a prefix,
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
          * a very long conversation from token zero. */
         char *path = NULL;
+        bool path_consumed = false;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL,
+                                            &path_consumed, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -10719,6 +11421,10 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             .fd = j->fd,
             .stream = j->req.stream,
             .enable_cors = s->enable_cors,
+            .wire = wire,
+            .secondary = secondary,
+            .output = effects ? effects->output : (server_output_adapter) {0},
+            .stats = effects ? effects->stats : (server_statistics_adapter) {0},
             /* Tool checkpoint rebuild only runs after the response stream is
              * already in flight, so the SSE headers were sent long ago.
              * Pre-arm the flag so the progress callback only emits keepalive
@@ -10728,34 +11434,47 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        if (server_session_sync(s, slot, sync_prompt,
-                                sync_err, sizeof(sync_err)) == 0) {
+        ds4_session_set_cancel(slot->session, server_sync_cancel_cb, &rebuild_progress);
+        if (server_session_sync(s, slot, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_cancel(slot->session, NULL, NULL);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
+            if (path_consumed && path && unlink(path) != 0 && errno != ENOENT &&
+                secondary) {
+                *secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+            }
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
                            "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
                            rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
-                trace_event(s, trace_id,
-                            "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
-                            common, live_len, canonical.len, loaded, path ? path : "");
+                server_trace_adapter_event(
+                    effects ? &effects->trace : NULL, secondary,
+                    "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
+                    common, live_len, canonical.len, loaded,
+                    path ? path : "");
             } else {
                 server_log(DS4_LOG_KVCACHE,
                            "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
                            rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
-                trace_event(s, trace_id,
-                            "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
-                            common, live_len, canonical.len, err);
+                server_trace_adapter_event(
+                    effects ? &effects->trace : NULL, secondary,
+                    "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
+                    common, live_len, canonical.len, err);
             }
         } else {
+            ds4_session_set_cancel(slot->session, NULL, NULL);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
                        canonical.len, sync_err);
-            trace_event(s, trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
+            server_trace_adapter_event(
+                effects ? &effects->trace : NULL, secondary,
+                "tool checkpoint canonicalization failed after rebuild request: %s",
+                sync_err);
+            ok = false;
         }
         ds4_tokens_free(&effective);
         free(path);
@@ -10763,13 +11482,17 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
-        trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
+        server_trace_adapter_event(
+            effects ? &effects->trace : NULL, secondary,
+            "tool checkpoint canonicalization failed: %s", err);
+        ok = false;
     }
 
 done:
     ds4_tokens_free(&canonical);
     buf_free(&rendered);
     free(suffix_text);
+    return ok;
 }
 
 static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
@@ -10780,6 +11503,430 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
         return false;
     }
     return true;
+}
+
+typedef enum {
+    PRODUCTION_REPLY_NONE = 0,
+    PRODUCTION_REPLY_RESPONSES_CONFLICT,
+    PRODUCTION_REPLY_ANTHROPIC_CONFLICT,
+    PRODUCTION_REPLY_PREFILL_ERROR,
+    PRODUCTION_REPLY_NORMAL,
+} production_reply;
+
+typedef struct production_txn {
+    server *srv;
+    server_slot *slot;
+    job *job;
+    uint64_t response_seq;
+    server_txn_adapters effects;
+    production_reply reply;
+    server_wire_disposition wire;
+    server_txn_class first_failure_class;
+    server_txn_reason first_failure_reason;
+    server_session_disposition first_failure_session;
+    char first_failure_detail[160];
+    uint32_t phase_secondary;
+    bool normal_ready;
+    bool callbacks_attached;
+    bool count_generated;
+    bool counted_request;
+    bool session_entered;
+    bool responses_protocol;
+    bool structured_stream;
+    bool openai_live_chat;
+    bool responses_live_chat;
+    bool responses_live_continuation;
+    bool anthropic_live_continuation;
+    bool thinking_live_continuation;
+    bool disk_cache_consume;
+    bool recovered_tool_parse_failure;
+    bool saw_tool_start;
+    bool saw_tool_end;
+    int cached;
+    int prompt_tokens;
+    int completion;
+    size_t plain_stream_pos;
+    double started_at;
+    double decode_started_at;
+    uint64_t trace_id;
+    trace_cache_diag trace_cache;
+    char cache_source[32];
+    int disk_cached;
+    long responses_created_at;
+    const char *final_finish;
+    const ds4_tokens *prompt_for_sync;
+    char err[160];
+    char ctx_span[48];
+    char req_flags[64];
+    char response_id[96];
+    char *disk_cache_path;
+    ds4_tokens effective_prompt;
+    server_prefill_progress progress;
+    anthropic_stream anthropic_live;
+    openai_stream openai_live;
+    responses_stream responses_live;
+    thinking_state thinking;
+    buf text;
+    tool_calls parsed_calls;
+    char *parsed_content;
+    char *parsed_reasoning;
+} production_txn;
+
+static server_txn_step_result production_session_advance(
+    void *ctx, const server_txn_outcome *outcome, server_txn_phase phase);
+static server_txn_settle_result production_session_settle(
+    void *ctx, const server_txn_outcome *outcome, bool commit);
+static bool production_session_cleanup(
+    void *ctx, const server_txn_outcome *outcome);
+static server_txn_output_result production_output_finish(
+    void *ctx, const server_txn_outcome *outcome);
+static server_txn_output_result production_output_apply(
+    void *ctx, const server_output_observation *observation);
+static bool production_trace_finish(
+    void *ctx, const server_txn_outcome *outcome);
+static server_trace_result production_trace_record(
+    void *ctx, const server_trace_observation *observation);
+static bool production_statistics_finish(
+    void *ctx, const server_txn_outcome *outcome);
+static bool production_statistics_record(
+    void *ctx, const server_statistics_observation *observation);
+
+static bool production_latch_failure(
+        production_txn *p, server_txn_class class,
+        server_txn_reason reason, server_session_disposition session,
+        const char *detail) {
+    if (p->first_failure_reason != SERVER_TXN_REASON_NONE) {
+        if (reason == SERVER_TXN_REASON_OUTPUT_FAILED) {
+            p->phase_secondary |= SERVER_TXN_SECONDARY_OUTPUT;
+        }
+        return false;
+    }
+    p->first_failure_class = class;
+    p->first_failure_reason = reason;
+    p->first_failure_session = session;
+    snprintf(p->first_failure_detail, sizeof(p->first_failure_detail), "%s",
+             detail ? detail : "");
+    return true;
+}
+
+static server_txn_reason production_peer_gone_reason(void) {
+    return g_stop_requested ? SERVER_TXN_REASON_SHUTDOWN :
+                              SERVER_TXN_REASON_CLIENT_GONE;
+}
+
+static server_session_disposition production_live_session(
+        const production_txn *p) {
+    return ds4_session_is_valid(p->slot->session) ?
+        SERVER_SESSION_VALID_PREFIX : SERVER_SESSION_INVALIDATED;
+}
+
+static void production_observe_trace(
+        production_txn *p, server_trace_operation operation,
+        const char *text, size_t text_len) {
+    if (!p->effects.trace.record) {
+        p->phase_secondary |= SERVER_TXN_SECONDARY_TRACE;
+        return;
+    }
+    const server_trace_observation observation = {
+        .operation = operation,
+        .text = text,
+        .text_len = text_len,
+    };
+    const server_trace_result result =
+        p->effects.trace.record(p->effects.trace.ctx, &observation);
+    if (operation == SERVER_TRACE_BEGIN) p->trace_id = result.trace_id;
+    if (!result.ok) p->phase_secondary |= SERVER_TXN_SECONDARY_TRACE;
+}
+
+static void production_observe_trace_event(
+        production_txn *p, const char *fmt, ...) {
+    char message[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(message, sizeof(message), fmt, ap);
+    va_end(ap);
+    size_t len = n > 0 ? (size_t)n : 0;
+    if (len >= sizeof(message)) len = sizeof(message) - 1;
+    production_observe_trace(p, SERVER_TRACE_EVENT, message, len);
+}
+
+static void production_observe_stats(
+        production_txn *p,
+        const server_statistics_observation *observation) {
+    if (!p->effects.stats.record ||
+        !p->effects.stats.record(p->effects.stats.ctx, observation)) {
+        p->phase_secondary |= SERVER_TXN_SECONDARY_STATS;
+    }
+}
+
+static server_txn_output_result production_output_apply(
+        void *ctx, const server_output_observation *observation) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    job *j = p->job;
+    bool ok = true;
+
+    if (p->wire == SERVER_WIRE_BROKEN) {
+        return (server_txn_output_result) {
+            .ok = true,
+            .wire = SERVER_WIRE_BROKEN,
+        };
+    }
+
+    switch (observation->operation) {
+        case SERVER_OUTPUT_PREFILL_TICK:
+            if (!observation->headers_sent || !observation->last_keepalive) {
+                snprintf(p->err, sizeof(p->err),
+                         "prefill output state is unavailable");
+                ok = false;
+                break;
+            }
+            if (!*observation->headers_sent) {
+                *observation->headers_sent = true;
+                p->wire = SERVER_WIRE_IRREVERSIBLE;
+                if (sse_headers(j->fd, s->enable_cors)) {
+                    *observation->last_keepalive = observation->now;
+                } else {
+                    ok = false;
+                }
+            } else if (observation->now - *observation->last_keepalive >= 5.0) {
+                static const char keepalive[] = ": prefill\n\n";
+                p->wire = SERVER_WIRE_IRREVERSIBLE;
+                if (send_all(j->fd, keepalive, sizeof(keepalive) - 1)) {
+                    *observation->last_keepalive = observation->now;
+                } else {
+                    ok = false;
+                }
+            }
+            break;
+
+        case SERVER_OUTPUT_STREAM_OPEN:
+            if (!j->req.stream) break;
+            if (!p->progress.headers_sent) p->wire = SERVER_WIRE_IRREVERSIBLE;
+            if (!p->progress.headers_sent &&
+                !sse_headers(j->fd, s->enable_cors)) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: %s ctx=%s%s%s sse headers failed",
+                           j->req.kind == REQ_CHAT ? "chat" : "completion",
+                           p->ctx_span,
+                           p->req_flags[0] ? " " : "",
+                           p->req_flags);
+                snprintf(p->err, sizeof(p->err), "SSE headers failed");
+                ok = false;
+                break;
+            }
+            p->progress.headers_sent = true;
+            if (j->req.api == API_ANTHROPIC &&
+                !anthropic_sse_start_live(j->fd, &j->req, p->response_id,
+                                          p->prompt_tokens,
+                                          &p->anthropic_live)) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s anthropic stream start failed",
+                           p->ctx_span);
+                snprintf(p->err, sizeof(p->err),
+                         "Anthropic stream start failed");
+                ok = false;
+                break;
+            }
+            if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
+                !sse_chunk(j->fd, &j->req, p->response_id, NULL, NULL)) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: chat ctx=%s openai role chunk failed",
+                           p->ctx_span);
+                snprintf(p->err, sizeof(p->err),
+                         "OpenAI role chunk failed");
+                ok = false;
+                break;
+            }
+            if (p->openai_live_chat) {
+                openai_stream_start(&j->req, &p->openai_live);
+            }
+            if (p->responses_live_chat) {
+                responses_stream_init(&j->req, &p->responses_live);
+                p->responses_live.active = true;
+                if (!responses_sse_created(j->fd, &j->req,
+                                           &p->responses_live,
+                                           p->responses_created_at)) {
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: chat ctx=%s%s%s responses created event failed",
+                               p->ctx_span,
+                               p->req_flags[0] ? " " : "",
+                               p->req_flags);
+                    snprintf(p->err, sizeof(p->err),
+                             "Responses created event failed");
+                    ok = false;
+                    break;
+                }
+            }
+            p->wire = SERVER_WIRE_IRREVERSIBLE;
+            break;
+
+        case SERVER_OUTPUT_STREAM_UPDATE:
+            if (!j->req.stream) break;
+            if (!p->structured_stream &&
+                observation->safe_len > p->plain_stream_pos) {
+                char *delta = xstrndup(
+                    observation->text + p->plain_stream_pos,
+                    observation->safe_len - p->plain_stream_pos);
+                ok = sse_chunk(j->fd, &j->req, p->response_id, delta, NULL);
+                free(delta);
+                if (ok) p->plain_stream_pos = observation->safe_len;
+            }
+            if (ok && j->req.api == API_ANTHROPIC) {
+                ok = anthropic_sse_stream_update(
+                    j->fd, s, &j->req, p->response_id,
+                    &p->anthropic_live, observation->text,
+                    observation->safe_len, false);
+            }
+            if (ok && p->openai_live_chat) {
+                ok = openai_sse_stream_update(
+                    j->fd, s, &j->req, p->response_id,
+                    &p->openai_live, observation->text,
+                    observation->safe_len, false);
+            }
+            if (ok && p->responses_live_chat) {
+                ok = responses_sse_stream_update(
+                    j->fd, &j->req, &p->responses_live,
+                    observation->text, observation->safe_len, false);
+            }
+            if (!ok) {
+                snprintf(p->err, sizeof(p->err),
+                         "client stream write failed");
+            }
+            break;
+
+        case SERVER_OUTPUT_STREAM_FLUSH:
+            if (j->req.stream && !p->structured_stream &&
+                observation->text_len > p->plain_stream_pos) {
+                char *tail = xstrndup(
+                    observation->text + p->plain_stream_pos,
+                    observation->text_len - p->plain_stream_pos);
+                ok = sse_chunk(j->fd, &j->req, p->response_id, tail, NULL);
+                free(tail);
+                if (ok) p->plain_stream_pos = observation->text_len;
+                else snprintf(p->err, sizeof(p->err),
+                              "client stream write failed");
+            }
+            break;
+    }
+
+    if (!ok) {
+        p->wire = SERVER_WIRE_BROKEN;
+        production_latch_failure(
+            p, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+            production_live_session(p), p->err);
+    }
+    return (server_txn_output_result) {
+        .ok = ok,
+        .wire = p->wire,
+    };
+}
+
+static server_trace_result production_trace_record(
+        void *ctx, const server_trace_observation *observation) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    uint64_t trace_id = p->trace_id;
+    if (observation->operation == SERVER_TRACE_BEGIN) {
+        trace_id = trace_begin(
+            s, p->job, p->cached, p->prompt_tokens, &p->trace_cache,
+            p->cache_source, p->disk_cached, p->disk_cache_path);
+    } else if (observation->operation == SERVER_TRACE_EVENT) {
+        trace_event(s, p->trace_id, "%.*s", (int)observation->text_len,
+                    observation->text ? observation->text : "");
+    } else {
+        trace_piece(s, p->trace_id, observation->text,
+                    observation->text_len);
+    }
+    return (server_trace_result) {
+        .ok = !s->trace || !ferror(s->trace),
+        .trace_id = trace_id,
+    };
+}
+
+static bool production_statistics_record(
+        void *ctx, const server_statistics_observation *observation) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    if (observation->operation == SERVER_STATS_QUEUED_DROP) {
+        pthread_mutex_lock(&s->mu);
+        s->stats.queue_dropped_disconnected++;
+        pthread_mutex_unlock(&s->mu);
+    } else if (observation->operation == SERVER_STATS_ADMIT) {
+        pthread_mutex_lock(&s->mu);
+        s->busy = true;
+        s->stats.requests++;
+        pthread_mutex_unlock(&s->mu);
+        server_publish_stats_snapshot(s, observation->live_tokens);
+    } else if (observation->operation == SERVER_STATS_CACHE) {
+        pthread_mutex_lock(&s->mu);
+        const char *source = observation->cache_source;
+        if (!strcmp(source, "memory-token")) s->stats.cache_memory_token++;
+        else if (!strcmp(source, "memory-text")) s->stats.cache_memory_text++;
+        else if (!strcmp(source, "responses-visible")) s->stats.cache_responses_visible++;
+        else if (!strcmp(source, "responses-tool-output")) s->stats.cache_responses_tool_output++;
+        else if (!strcmp(source, "anthropic-tool-output")) s->stats.cache_anthropic_tool_output++;
+        else if (!strcmp(source, "thinking-visible")) s->stats.cache_thinking_visible++;
+        else if (!strcmp(source, "tool-visible")) s->stats.cache_tool_visible++;
+        else if (!strcmp(source, "disk-text")) s->stats.cache_disk_text++;
+        else s->stats.cache_cold++;
+        s->stats.prompt_tokens += (uint64_t)observation->prompt_tokens;
+        s->stats.cached_tokens +=
+            (uint64_t)(observation->cached_tokens > 0 ?
+                       observation->cached_tokens : 0);
+        pthread_mutex_unlock(&s->mu);
+    } else if (observation->operation == SERVER_STATS_PREFILL_CANCEL) {
+        pthread_mutex_lock(&s->mu);
+        s->stats.prefill_cancelled++;
+        pthread_mutex_unlock(&s->mu);
+    } else if (observation->operation == SERVER_STATS_PROGRESS) {
+        server_publish_stats_snapshot(s, observation->live_tokens);
+    } else if (observation->operation == SERVER_STATS_PREFILL_DONE &&
+               observation->prompt_tokens > observation->cached_tokens &&
+               observation->elapsed > 0.0) {
+        pthread_mutex_lock(&s->mu);
+        s->stats.last_prefill_tps =
+            (double)(observation->prompt_tokens -
+                     observation->cached_tokens) / observation->elapsed;
+        pthread_mutex_unlock(&s->mu);
+    }
+    return true;
+}
+
+static server_txn_step_result production_continue(production_txn *p) {
+    return (server_txn_step_result) {
+        .status = SERVER_TXN_STEP_CONTINUE,
+        .wire = p->wire,
+        .prompt_tokens = p->prompt_tokens,
+        .cached_tokens = p->cached,
+        .generated_tokens = p->completion,
+        .secondary = p->phase_secondary,
+    };
+}
+
+static server_txn_step_result production_terminal(
+        production_txn *p, server_txn_class class,
+        server_txn_reason reason, server_txn_finish finish,
+        server_session_disposition session, const char *detail) {
+    if (p->first_failure_reason != SERVER_TXN_REASON_NONE) {
+        class = p->first_failure_class;
+        reason = p->first_failure_reason;
+        session = p->first_failure_session;
+        detail = p->first_failure_detail;
+    }
+    return (server_txn_step_result) {
+        .status = SERVER_TXN_STEP_TERMINAL,
+        .class = class,
+        .reason = reason,
+        .finish = finish,
+        .session = session,
+        .wire = p->wire,
+        .prompt_tokens = p->prompt_tokens,
+        .cached_tokens = p->cached,
+        .generated_tokens = p->completion,
+        .detail = detail,
+        .secondary = p->phase_secondary,
+    };
 }
 
 static void server_generation_enter(server *s) {
@@ -10954,16 +12101,42 @@ static uint64_t server_next_sequence(server *s) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
-static void generate_job(server *s, server_slot *slot, job *j) {
-    char err[160];
-    err[0] = '\0';
+static server_txn_step_result production_restore(
+        production_txn *p, const server_txn_outcome *outcome) {
+    server *s = p->srv;
+    server_slot *slot = p->slot;
+    job *j = p->job;
+    (void)outcome;
+    if (client_socket_gone(j->fd)) {
+        const server_txn_reason reason = production_peer_gone_reason();
+        const char *detail = reason == SERVER_TXN_REASON_SHUTDOWN ?
+            "shutdown requested" : "client disconnected while queued";
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: dropping queued request: %s", detail);
+        const server_statistics_observation stats = {
+            .operation = SERVER_STATS_QUEUED_DROP,
+        };
+        production_observe_stats(p, &stats);
+        return production_terminal(
+            p, SERVER_TXN_CANCELLED, reason, SERVER_TXN_FINISH_ERROR,
+            SERVER_SESSION_UNCHANGED, detail);
+    }
+    if (s->worker_bound && !pthread_equal(s->worker_thread, pthread_self())) {
+        die("worker ownership violation while executing a session transaction");
+    }
+    p->counted_request = true;
+    p->session_entered = true;
+    const server_statistics_observation admitted = {
+        .operation = SERVER_STATS_ADMIT,
+        .live_tokens = ds4_session_pos(slot->session),
+    };
+    production_observe_stats(p, &admitted);
+
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
+    trace_cache_capture(&p->trace_cache, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
-    ds4_tokens effective_prompt = {0};
-    const ds4_tokens *prompt_for_sync = &j->req.prompt;
+    p->prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
@@ -10978,7 +12151,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
      * fallback when the live state is absent or no longer describes the
      * request. */
     int cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                      &effective_prompt);
+                                                      &p->effective_prompt);
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
@@ -10991,22 +12164,22 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     }
     if (cached == 0) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
+                                                    &p->effective_prompt,
                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
     if (cached > 0) {
         responses_live_continuation = true;
-        prompt_for_sync = &effective_prompt;
+        p->prompt_for_sync = &p->effective_prompt;
     } else {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
+                                                    &p->effective_prompt,
                                                     &anthropic_live_match_ids);
         if (cached > 0) {
             anthropic_live_continuation = true;
             cache_source = "anthropic-tool-output";
-            prompt_for_sync = &effective_prompt;
+            p->prompt_for_sync = &p->effective_prompt;
         }
     }
     if (cached == 0 && responses_protocol &&
@@ -11016,17 +12189,21 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * live frontier no longer matches.  Since the request did not replay
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
-        ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Responses continuation state is not available; retry by replaying the full input history");
-        return;
+        p->reply = PRODUCTION_REPLY_RESPONSES_CONFLICT;
+        return production_terminal(
+            p, SERVER_TXN_REJECTED,
+            SERVER_TXN_REASON_CONTINUATION_UNAVAILABLE,
+            SERVER_TXN_FINISH_ERROR, SERVER_SESSION_UNCHANGED,
+            "Responses continuation state is not available; retry by replaying the full input history");
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
-        ds4_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
-        return;
+        p->reply = PRODUCTION_REPLY_ANTHROPIC_CONFLICT;
+        return production_terminal(
+            p, SERVER_TXN_REJECTED,
+            SERVER_TXN_REASON_CONTINUATION_UNAVAILABLE,
+            SERVER_TXN_FINISH_ERROR, SERVER_SESSION_UNCHANGED,
+            "Anthropic continuation state is not available; retry by replaying the full messages history");
     } else if (cached == 0) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
@@ -11034,24 +12211,27 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (cached == 0) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                &effective_prompt);
+                                                &p->effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
-            cache_source = "thinking-visible";
+            pthread_mutex_lock(&s->tool_mu);
+            cache_source = slot->thinking_live.tool_turn ?
+                           "tool-visible" : "thinking-visible";
+            pthread_mutex_unlock(&s->tool_mu);
             thinking_live_continuation = true;
-            prompt_for_sync = &effective_prompt;
+            p->prompt_for_sync = &p->effective_prompt;
         }
     }
     int disk_cached = 0;
-    char *disk_cache_path = NULL;
+    bool disk_cache_consume = false;
     uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
-                                                  &effective_prompt);
+                                                  &p->effective_prompt);
         if (text_cached > 0) {
             cached = text_cached;
             cache_source = "memory-text";
-            prompt_for_sync = &effective_prompt;
+            p->prompt_for_sync = &p->effective_prompt;
         }
     }
     if (cached == 0 && old_pos > 0) {
@@ -11059,24 +12239,34 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   trace_cache_miss_reason(&cache_diag));
+                   trace_cache_miss_reason(&p->trace_cache));
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+        if (!kv_cache_store_current(s, slot, "evict")) {
+            p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+        }
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
-                                        &disk_cache_path,
-                                        &disk_cache_ext_flags);
+        disk_cached = kv_cache_try_load(s, slot, &j->req, &p->effective_prompt,
+                                        &p->disk_cache_path,
+                                        &disk_cache_ext_flags,
+                                        &disk_cache_consume);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
-            prompt_for_sync = &effective_prompt;
+            p->prompt_for_sync = &p->effective_prompt;
         }
+    }
+    /* Restart the continued-store cadence from the continuation point, so the
+     * threshold-crossing rule measures the step from where this prefill
+     * actually resumes instead of firing a near-duplicate store on the first
+     * chunk after a hit. */
+    if (cached > 0 && s->kv.continued_last_store_tokens < cached) {
+        s->kv.continued_last_store_tokens = cached;
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
@@ -11088,7 +12278,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
-    const int prompt_tokens = prompt_for_sync->len;
+    const int prompt_tokens = p->prompt_for_sync->len;
+    const server_statistics_observation cache_stats = {
+        .operation = SERVER_STATS_CACHE,
+        .cache_source = cache_source,
+        .prompt_tokens = prompt_tokens,
+        .cached_tokens = cached,
+    };
+    production_observe_stats(p, &cache_stats);
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -11096,11 +12293,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
-    uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
-                                    cache_source, disk_cached, disk_cache_path);
-    char ctx_span[48];
-    request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
-    server_prefill_progress progress = {
+    request_ctx_span(p->ctx_span, sizeof(p->ctx_span), cached, prompt_tokens);
+    p->progress = (server_prefill_progress) {
         .srv = s,
         .slot = slot,
         .kind = j->req.kind,
@@ -11112,11 +12306,25 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .wire = &p->wire,
+        .secondary = &p->phase_secondary,
+        .output = p->effects.output,
+        .stats = p->effects.stats,
     };
-    snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
-    char req_flags[64];
-    log_flags(req_flags, sizeof(req_flags), responses_protocol,
+    snprintf(p->progress.ctx, sizeof(p->progress.ctx), "%s", p->ctx_span);
+    log_flags(p->req_flags, sizeof(p->req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
+    p->responses_protocol = responses_protocol;
+    p->responses_live_continuation = responses_live_continuation;
+    p->anthropic_live_continuation = anthropic_live_continuation;
+    p->thinking_live_continuation = thinking_live_continuation;
+    p->disk_cache_consume = disk_cache_consume;
+    p->cached = cached;
+    p->prompt_tokens = prompt_tokens;
+    p->started_at = t0;
+    p->disk_cached = disk_cached;
+    snprintf(p->cache_source, sizeof(p->cache_source), "%s", cache_source);
+    production_observe_trace(p, SERVER_TRACE_BEGIN, NULL, 0);
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
@@ -11149,18 +12357,34 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    cache_source,
                    cached,
                    prompt_tokens);
-        trace_event(s, trace_id,
-                    "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
-                    cache_source, cached);
+        production_observe_trace_event(
+            p,
+            "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
+            cache_source, cached);
     }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
-               ctx_span,
-               req_flags[0] ? " " : "",
-               req_flags);
-    ds4_session_set_progress(slot->session, server_progress_cb, &progress);
-    ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
+               p->ctx_span,
+               p->req_flags[0] ? " " : "",
+               p->req_flags);
+    ds4_session_set_progress(slot->session, server_progress_cb, &p->progress);
+    ds4_session_set_display_progress(slot->session, server_progress_cb,
+                                     &p->progress);
+    ds4_session_set_cancel(slot->session, server_sync_cancel_cb, &p->progress);
+    p->callbacks_attached = true;
+    return production_continue(p);
+}
+
+static server_txn_step_result production_synchronize(
+        production_txn *p, const server_txn_outcome *outcome) {
+    server *s = p->srv;
+    server_slot *slot = p->slot;
+    job *j = p->job;
+    const ds4_tokens *prompt_for_sync = p->prompt_for_sync;
+    const int cached = p->cached;
+    const int prompt_tokens = p->prompt_tokens;
+    (void)outcome;
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -11193,18 +12417,47 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        int sync_rc = server_session_sync(s, slot, &prefix, p->err,
+                                       sizeof(p->err));
+        if (sync_rc != 0) {
             ds4_tokens_free(&prefix);
-            ds4_tokens_free(&effective_prompt);
-            ds4_session_set_progress(slot->session, NULL, NULL);
-            ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
-                                             cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
-            trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
-            return;
+                                                  cold_store_len);
+            if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                /* Cancelled (shutdown or client gone): the session keeps a
+                 * valid prefix and the disk entry is still good. */
+                const server_statistics_observation cancelled = {
+                    .operation = SERVER_STATS_PREFILL_CANCEL,
+                };
+                production_observe_stats(p, &cancelled);
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: prefill cancelled ctx=%s reason=%s",
+                           p->ctx_span,
+                           g_stop_requested ? "shutdown" : "client-gone");
+                production_observe_trace_event(p, "prefill cancelled");
+            } else {
+                kv_cache_discard_failed_disk_entry(s, slot, p->disk_cache_path);
+                production_observe_trace_event(p, "prefill failed: %s",
+                                               p->err);
+                p->reply = PRODUCTION_REPLY_PREFILL_ERROR;
+            }
+            p->wire = p->progress.stream_failed ? SERVER_WIRE_BROKEN :
+                      p->progress.headers_sent ? SERVER_WIRE_IRREVERSIBLE :
+                                                 SERVER_WIRE_UNTOUCHED;
+            return production_terminal(
+                p,
+                sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                    SERVER_TXN_CANCELLED : SERVER_TXN_FAILED,
+                sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                    (g_stop_requested ? SERVER_TXN_REASON_SHUTDOWN :
+                                        SERVER_TXN_REASON_CLIENT_GONE) :
+                    SERVER_TXN_REASON_SYNC_FAILED,
+                SERVER_TXN_FINISH_ERROR,
+                sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                    SERVER_SESSION_VALID_PREFIX : SERVER_SESSION_INVALIDATED,
+                sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                    (g_stop_requested ? "shutdown requested" :
+                                        "client disconnected") : p->err);
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -11214,39 +12467,87 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
             suppressed_continued_last = -1;
+            p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
         }
         ds4_tokens_free(&prefix);
     }
 
-    if (server_session_sync(s, slot, prompt_for_sync,
-                            err, sizeof(err)) != 0) {
-        ds4_tokens_free(&effective_prompt);
-        ds4_session_set_progress(slot->session, NULL, NULL);
-        ds4_session_set_display_progress(slot->session, NULL, NULL);
+    int prompt_sync_rc = server_session_sync(s, slot, prompt_for_sync, p->err,
+                                          sizeof(p->err));
+    if (prompt_sync_rc != 0) {
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
-                                         cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
-        trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
-        return;
+                                              cold_store_len);
+        if (prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            const server_statistics_observation cancelled = {
+                .operation = SERVER_STATS_PREFILL_CANCEL,
+            };
+            production_observe_stats(p, &cancelled);
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: prefill cancelled ctx=%s reason=%s",
+                       p->ctx_span,
+                       g_stop_requested ? "shutdown" : "client-gone");
+            production_observe_trace_event(p, "prefill cancelled");
+        } else {
+            kv_cache_discard_failed_disk_entry(s, slot, p->disk_cache_path);
+            production_observe_trace_event(p, "prefill failed: %s", p->err);
+            p->reply = PRODUCTION_REPLY_PREFILL_ERROR;
+        }
+        p->wire = p->progress.stream_failed ? SERVER_WIRE_BROKEN :
+                  p->progress.headers_sent ? SERVER_WIRE_IRREVERSIBLE :
+                                             SERVER_WIRE_UNTOUCHED;
+        return production_terminal(
+            p,
+            prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                SERVER_TXN_CANCELLED : SERVER_TXN_FAILED,
+            prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                (g_stop_requested ? SERVER_TXN_REASON_SHUTDOWN :
+                                    SERVER_TXN_REASON_CLIENT_GONE) :
+                SERVER_TXN_REASON_SYNC_FAILED,
+            SERVER_TXN_FINISH_ERROR,
+            prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                SERVER_SESSION_VALID_PREFIX : SERVER_SESSION_INVALIDATED,
+            prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED ?
+                (g_stop_requested ? "shutdown requested" :
+                                    "client disconnected") : p->err);
     }
-    free(disk_cache_path);
+    /* The prefill extended past this snapshot, so its deferred consume-unlink
+     * is now safe: the live state supersedes it and the next store persists a
+     * longer prefix.  Keeping it until here means a cancelled or failed tail
+     * prefill can still hit it on retry. */
+    if (p->disk_cache_consume && p->disk_cache_path) {
+        if (unlink(p->disk_cache_path) != 0 && errno != ENOENT) {
+            p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+        }
+    }
+    free(p->disk_cache_path);
+    p->disk_cache_path = NULL;
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
-    if (!responses_live_continuation) responses_live_clear(s, slot);
-    if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
-    if (!thinking_live_continuation) thinking_live_clear(s, slot);
+    if (!p->responses_live_continuation) responses_live_clear(s, slot);
+    if (!p->anthropic_live_continuation) anthropic_live_clear(s, slot);
+    if (!p->thinking_live_continuation) thinking_live_clear(s, slot);
+    ds4_session_set_cancel(slot->session, NULL, NULL);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s, slot);
+    p->callbacks_attached = false;
+    if (!kv_cache_maybe_store_continued(s, slot)) {
+        p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+    }
+    const double prefill_sec = now_sec() - p->started_at;
+    const server_statistics_observation prefill_done = {
+        .operation = SERVER_STATS_PREFILL_DONE,
+        .prompt_tokens = prompt_tokens,
+        .cached_tokens = cached,
+        .elapsed = prefill_sec,
+    };
+    production_observe_stats(p, &prefill_done);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
-               ctx_span,
-               req_flags[0] ? " " : "",
-               req_flags,
-               now_sec() - t0);
+               p->ctx_span,
+               p->req_flags[0] ? " " : "",
+               p->req_flags,
+               prefill_sec);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -11254,88 +12555,100 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             suppressed_continued_last = -1;
         } else {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
-                                             cold_store_len);
+                                                  cold_store_len);
+            p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
         }
     }
-    const uint64_t response_seq = server_next_sequence(s);
-    char id[96];
-    snprintf(id, sizeof(id), "%s-%llu",
+    p->response_seq = server_next_sequence(s);
+    snprintf(p->response_id, sizeof(p->response_id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)response_seq);
+             (unsigned long long)p->response_seq);
 
-    bool structured_stream = request_uses_structured_stream(&j->req);
-    anthropic_stream anthropic_live = {0};
-    openai_stream openai_live = {0};
-    responses_stream responses_live = {0};
-    const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
-    const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
-    long responses_created_at = (long)time(NULL);
+    p->structured_stream = request_uses_structured_stream(&j->req);
+    p->openai_live_chat = request_uses_openai_live_stream(&j->req);
+    p->responses_live_chat = request_uses_responses_live_stream(&j->req);
+    p->responses_created_at = (long)time(NULL);
+    return production_continue(p);
+}
+
+static server_txn_step_result production_extend(
+        production_txn *p, const server_txn_outcome *outcome) {
+    job *j = p->job;
+    (void)outcome;
     if (j->req.stream) {
-        if (progress.stream_failed) {
+        p->wire = p->progress.stream_failed ? SERVER_WIRE_BROKEN :
+                  p->progress.headers_sent ? SERVER_WIRE_IRREVERSIBLE :
+                                             SERVER_WIRE_UNTOUCHED;
+        if (p->progress.stream_failed) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s stream closed during prefill",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-            ds4_tokens_free(&effective_prompt);
-            return;
-        }
-        /* The prefill progress callback may have already sent the SSE headers
-         * to keep the connection alive during a long prefill. Only emit them
-         * here when prefill never fired (e.g. fully cached prompt). */
-        if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s%s%s sse headers failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-            ds4_tokens_free(&effective_prompt);
-            return;
-        }
-        progress.headers_sent = true;
-        if (j->req.api == API_ANTHROPIC &&
-            !anthropic_sse_start_live(j->fd, &j->req, id,
-                                      prompt_tokens, &anthropic_live)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            ds4_tokens_free(&effective_prompt);
-            return;
-        }
-        if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
-            !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
-            server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
-            ds4_tokens_free(&effective_prompt);
-            return;
-        }
-        if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
-        if (responses_live_chat) {
-            responses_stream_init(&j->req, &responses_live);
-            responses_live.active = true;
-            if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
-                server_log(DS4_LOG_GENERATION,
-                           "ds4-server: chat ctx=%s%s%s responses created event failed",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags);
-                responses_stream_free(&responses_live);
-                ds4_tokens_free(&effective_prompt);
-                return;
-            }
+                       p->ctx_span,
+                       p->req_flags[0] ? " " : "",
+                       p->req_flags);
+            production_latch_failure(
+                p, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+                production_live_session(p), "stream closed during prefill");
+            return production_terminal(
+                p, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+                SERVER_TXN_FINISH_ERROR, production_live_session(p),
+                "stream closed during prefill");
         }
     }
 
+    const server_output_observation observation = {
+        .operation = SERVER_OUTPUT_STREAM_OPEN,
+    };
+    server_txn_output_result result = {
+        .ok = false,
+        .wire = p->wire,
+    };
+    if (p->effects.output.apply) {
+        result = p->effects.output.apply(p->effects.output.ctx, &observation);
+    }
+    p->wire = result.wire;
+    if (!result.ok) {
+        if (p->first_failure_reason == SERVER_TXN_REASON_NONE) {
+            production_latch_failure(
+                p, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+                production_live_session(p), "stream open failed");
+        }
+        return production_terminal(
+            p, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+            SERVER_TXN_FINISH_ERROR, production_live_session(p), p->err);
+    }
+
+    return production_continue(p);
+}
+
+static server_txn_step_result production_decode(
+        production_txn *p, const server_txn_outcome *outcome) {
+    server *s = p->srv;
+    server_slot *slot = p->slot;
+    job *j = p->job;
+    const int prompt_tokens = p->prompt_tokens;
+    const bool responses_protocol = p->responses_protocol;
+    bool openai_live_chat = p->openai_live_chat;
+    const char *finish = "error";
+    const char *final_finish = finish;
+    int completion = 0;
+    double decode_t0 = 0.0;
+    buf text = {0};
+    thinking_state thinking = {0};
+    tool_calls parsed_calls = {0};
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    (void)outcome;
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ (response_seq << 1) ^
+        (((uint64_t)time(NULL) << 32) ^ (p->response_seq << 1) ^
          (uint64_t)(uintptr_t)j);
 decode_again:
-    ;
-    buf text = {0};
-    size_t plain_stream_pos = 0;
+    text = (buf) {0};
+    p->plain_stream_pos = 0;
     size_t stop_scan_from = 0;
-    const char *finish = "length";
-    int completion = 0;
+    finish = "length";
+    completion = 0;
     int max_tokens = j->req.max_tokens;
     int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
     bool saw_tool_start = false;
@@ -11346,28 +12659,57 @@ decode_again:
     int next_decode_log = 50;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
-    trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
-    const double decode_t0 = now_sec();
+    production_observe_trace_event(
+        p, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
-    thinking_state thinking = thinking_state_from_prompt(&j->req);
+    thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
     const bool think_tool_recovery_enabled =
         getenv("DS4_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
+    if (ds4_think_mode_enabled(j->req.think_mode) &&
+        (j->req.temperature != DS4_DEFAULT_TEMPERATURE ||
+         j->req.top_p != DS4_DEFAULT_TOP_P ||
+         j->req.min_p != DS4_DEFAULT_MIN_P ||
+         j->req.top_k != 0))
+    {
+        /* Same behavior as the official DeepSeek API, but say so once instead
+         * of silently ignoring the request's sampling parameters. */
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: thinking mode ignores request sampling params "
+                   "(temperature/top_p/top_k/min_p); using defaults");
+    }
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+        /* Streaming clients reveal a disconnect through failed SSE writes;
+         * non-streaming clients write nothing until the end, so poll the
+         * socket instead of decoding minutes of output for a dead peer. */
+        if (!j->req.stream && client_socket_gone(j->fd)) {
+            const server_txn_reason reason = production_peer_gone_reason();
+            snprintf(p->err, sizeof(p->err), "%s",
+                     reason == SERVER_TXN_REASON_SHUTDOWN ?
+                         "shutdown requested" : "client disconnected");
+            production_latch_failure(
+                p, SERVER_TXN_CANCELLED, reason,
+                production_live_session(p), p->err);
+            finish = "error";
+            break;
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s, slot);
+            if (!kv_cache_maybe_store_continued(s, slot)) {
+                p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+            }
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -11407,15 +12749,22 @@ decode_again:
                                                        ds4_token_eos(s->engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+                                                       p->err,
+                                                       sizeof(p->err));
             if (ntok < 0) {
                 finish = "error";
+                production_latch_failure(
+                    p, SERVER_TXN_FAILED, SERVER_TXN_REASON_DECODE_FAILED,
+                    production_live_session(p), p->err);
                 break;
             }
         } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+            if (server_eval_token(s, slot, token, p->err,
+                                 sizeof(p->err)) != 0) {
                 finish = "error";
+                production_latch_failure(
+                    p, SERVER_TXN_FAILED, SERVER_TXN_REASON_DECODE_FAILED,
+                    production_live_session(p), p->err);
                 break;
             }
             toks[0] = token;
@@ -11437,7 +12786,7 @@ decode_again:
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
 
-            trace_piece(s, trace_id, piece, piece_len);
+            production_observe_trace(p, SERVER_TRACE_PIECE, piece, piece_len);
             buf_append(&text, piece, piece_len);
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -11451,52 +12800,37 @@ decode_again:
             size_t stream_len = hit_stop ?
                 stop_pos : stop_list_stream_safe_len(&j->req.stops, text.len);
             if (stream_len > text.len) stream_len = text.len;
-            stream_len = utf8_stream_safe_len(text.ptr, plain_stream_pos,
+            stream_len = utf8_stream_safe_len(text.ptr, p->plain_stream_pos,
                                               stream_len, hit_stop);
             if (!hit_stop && j->req.stops.max_len > 1) {
                 const size_t hold = j->req.stops.max_len - 1;
                 stop_scan_from = text.len > hold ? text.len - hold : 0;
             }
 
-            if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
-                char *delta = xstrndup(text.ptr + plain_stream_pos, stream_len - plain_stream_pos);
-                bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
-                free(delta);
-                if (!ok) {
-                    finish = "error";
-                    snprintf(err, sizeof(err), "client stream write failed");
-                    free(piece);
-                    stop_decode = true;
-                    break;
+            const server_output_observation output = {
+                .operation = SERVER_OUTPUT_STREAM_UPDATE,
+                .text = text.ptr,
+                .text_len = text.len,
+                .safe_len = stream_len,
+            };
+            server_txn_output_result output_result = {
+                .ok = false,
+                .wire = p->wire,
+            };
+            if (p->effects.output.apply) {
+                output_result = p->effects.output.apply(
+                    p->effects.output.ctx, &output);
+            }
+            p->wire = output_result.wire;
+            if (!output_result.ok) {
+                finish = "error";
+                if (p->first_failure_reason == SERVER_TXN_REASON_NONE) {
+                    production_latch_failure(
+                        p, SERVER_TXN_FAILED,
+                        SERVER_TXN_REASON_OUTPUT_FAILED,
+                        production_live_session(p),
+                        "client stream write failed");
                 }
-                plain_stream_pos = stream_len;
-            }
-            if (j->req.stream && j->req.api == API_ANTHROPIC &&
-                !anthropic_sse_stream_update(j->fd, s, &j->req, id,
-                                             &anthropic_live, text.ptr, stream_len,
-                                             false)) {
-                finish = "error";
-                snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            if (openai_live_chat &&
-                !openai_sse_stream_update(j->fd, s, &j->req, id,
-                                          &openai_live, text.ptr, stream_len,
-                                          false)) {
-                finish = "error";
-                snprintf(err, sizeof(err), "client stream write failed");
-                free(piece);
-                stop_decode = true;
-                break;
-            }
-            if (responses_live_chat &&
-                !responses_sse_stream_update(j->fd, &j->req,
-                                             &responses_live, text.ptr, stream_len,
-                                             false)) {
-                finish = "error";
-                snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
                 break;
@@ -11516,9 +12850,13 @@ decode_again:
                         chat_think_tool_recovery(s, slot, &text, &thinking,
                                                  &think_recovery_scan_from,
                                                  &completion, max_tokens,
-                                                 err, sizeof(err)) : 0;
+                                                 p->err, sizeof(p->err)) : 0;
                     if (recovered < 0) {
                         finish = "error";
+                        production_latch_failure(
+                            p, SERVER_TXN_FAILED,
+                            SERVER_TXN_REASON_DECODE_FAILED,
+                            production_live_session(p), p->err);
                         stop_decode = true;
                         break;
                     }
@@ -11526,11 +12864,11 @@ decode_again:
                         server_log(DS4_LOG_WARNING,
                                    "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
                                    "forced </think> after %d generated tokens",
-                                   ctx_span,
-                                   req_flags[0] ? " " : "",
-                                   req_flags,
+                                   p->ctx_span,
+                                   p->req_flags[0] ? " " : "",
+                                   p->req_flags,
                                    completion);
-                        trace_event(s, trace_id,
+                        production_observe_trace_event(p,
                                     "think tool recovery after %d generated tokens",
                                     completion);
                         dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
@@ -11556,25 +12894,29 @@ decode_again:
                         saw_orphan_tool_end = true;
                         server_log(DS4_LOG_WARNING,
                                    "ds4-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                                   ctx_span,
-                                   req_flags[0] ? " " : "",
-                                   req_flags,
+                                   p->ctx_span,
+                                   p->req_flags[0] ? " " : "",
+                                   p->req_flags,
                                    completion);
-                        trace_event(s, trace_id,
+                        production_observe_trace_event(p,
                                     "ignored orphan tool-call end marker after %d generated tokens",
                                     completion);
                     }
                     if (saw_tool_start && !old_start) {
-                        trace_event(s, trace_id, "entered tool-call block after %d generated tokens", completion);
+                        production_observe_trace_event(p,
+                                    "entered tool-call block after %d generated tokens",
+                                    completion);
                     }
                     if (saw_tool_end && !old_end) {
-                        trace_event(s, trace_id, "closed tool-call block after %d generated tokens", completion);
+                        production_observe_trace_event(p,
+                                    "closed tool-call block after %d generated tokens",
+                                    completion);
                     }
                     const size_t marker_hold = 80;
                     size_t hold_from = text.len > marker_hold ? text.len - marker_hold : 0;
                     if (hold_from > tool_scan_from) tool_scan_from = hold_from;
                     if (s->trace && completion >= next_tool_progress) {
-                        trace_event(s, trace_id,
+                        production_observe_trace_event(p,
                                     "progress gen=%d dsml_start=%d dsml_end=%d",
                                     completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
                         next_tool_progress += 128;
@@ -11592,6 +12934,11 @@ decode_again:
                                     decode_t0,
                                     &last_decode_log_t,
                                     &last_decode_log_completion);
+                const server_statistics_observation progress = {
+                    .operation = SERVER_STATS_PROGRESS,
+                    .live_tokens = ds4_session_pos(slot->session),
+                };
+                production_observe_stats(p, &progress);
                 next_decode_log += 50;
             }
 
@@ -11619,7 +12966,10 @@ decode_again:
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
-        snprintf(err, sizeof(err), "shutdown requested");
+        snprintf(p->err, sizeof(p->err), "shutdown requested");
+        production_latch_failure(
+            p, SERVER_TXN_CANCELLED, SERVER_TXN_REASON_SHUTDOWN,
+            production_live_session(p), p->err);
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
@@ -11650,11 +13000,13 @@ decode_again:
                 completed_truncation = true;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
+                           p->ctx_span,
+                           p->req_flags[0] ? " " : "",
+                           p->req_flags,
                            test_calls.len);
-                trace_event(s, trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
+                production_observe_trace_event(p,
+                            "repaired unterminated tool call (%d calls recovered)",
+                            test_calls.len);
             }
             tool_calls_free(&test_calls);
         }
@@ -11664,10 +13016,10 @@ decode_again:
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags);
-                trace_event(s, trace_id,
+                           p->ctx_span,
+                           p->req_flags[0] ? " " : "",
+                           p->req_flags);
+                production_observe_trace_event(p,
                             "unterminated tool call; continuing with model-visible tool error");
                 if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 "unterminated tool call",
@@ -11678,11 +13030,11 @@ decode_again:
                     dsml_recovery_attempted = true;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
+                               p->ctx_span,
+                               p->req_flags[0] ? " " : "",
+                               p->req_flags,
                                recovery_tokens);
-                    trace_event(s, trace_id,
+                    production_observe_trace_event(p,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     buf_free(&repaired);
@@ -11690,11 +13042,18 @@ decode_again:
                     goto decode_again;
                 }
                 finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
+                snprintf(p->err, sizeof(p->err),
+                         "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
+                production_latch_failure(
+                    p, SERVER_TXN_FAILED, SERVER_TXN_REASON_DECODE_FAILED,
+                    production_live_session(p), p->err);
             } else {
                 finish = "error";
-                snprintf(err, sizeof(err), "unterminated tool call");
+                snprintf(p->err, sizeof(p->err), "unterminated tool call");
+                production_latch_failure(
+                    p, SERVER_TXN_FAILED, SERVER_TXN_REASON_DECODE_FAILED,
+                    production_live_session(p), p->err);
             }
         }
         buf_free(&repaired);
@@ -11712,16 +13071,34 @@ decode_again:
                             &last_decode_log_completion);
     }
 
-    if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
-        char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
-        free(tail);
+    const server_output_observation flush = {
+        .operation = SERVER_OUTPUT_STREAM_FLUSH,
+        .text = text.ptr,
+        .text_len = text.len,
+        .safe_len = text.len,
+    };
+    server_txn_output_result flush_result = {
+        .ok = false,
+        .wire = p->wire,
+    };
+    if (p->effects.output.apply) {
+        flush_result = p->effects.output.apply(
+            p->effects.output.ctx, &flush);
+    }
+    p->wire = flush_result.wire;
+    if (!flush_result.ok) {
+        finish = "error";
+        if (p->first_failure_reason == SERVER_TXN_REASON_NONE) {
+            production_latch_failure(
+                p, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+                production_live_session(p), "client stream write failed");
+        }
     }
 
-    tool_calls parsed_calls = {0};
-    char *parsed_content = NULL;
-    char *parsed_reasoning = NULL;
-    const char *final_finish = finish;
+    parsed_calls = (tool_calls) {0};
+    parsed_content = NULL;
+    parsed_reasoning = NULL;
+    final_finish = finish;
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response_for_syntax(
@@ -11731,8 +13108,8 @@ decode_again:
             saw_tool_start,
             ds4_think_mode_enabled(j->req.think_mode),
             &final_finish,
-            err,
-            sizeof(err),
+            p->err,
+            sizeof(p->err),
             &parsed_content,
             &parsed_reasoning,
             &parsed_calls,
@@ -11745,13 +13122,13 @@ decode_again:
             if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
-                const char *detail = err[0] ? err : "invalid tool call";
+                const char *detail = p->err[0] ? p->err : "invalid tool call";
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags);
-                trace_event(s, trace_id,
+                           p->ctx_span,
+                           p->req_flags[0] ? " " : "",
+                           p->req_flags);
+                production_observe_trace_event(p,
                             "invalid tool call; continuing with model-visible tool error");
                 if (continue_after_invalid_dsml(s, slot, &j->req, &thinking,
                                                 detail,
@@ -11762,11 +13139,11 @@ decode_again:
                     dsml_recovery_attempted = true;
                     server_log(DS4_LOG_GENERATION,
                                "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               ctx_span,
-                               req_flags[0] ? " " : "",
-                               req_flags,
+                               p->ctx_span,
+                               p->req_flags[0] ? " " : "",
+                               p->req_flags,
                                recovery_tokens);
-                    trace_event(s, trace_id,
+                    production_observe_trace_event(p,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     free(parsed_content);
@@ -11776,20 +13153,27 @@ decode_again:
                     goto decode_again;
                 }
                 final_finish = "error";
-                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
+                snprintf(p->err, sizeof(p->err),
+                         "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
+                production_latch_failure(
+                    p, SERVER_TXN_FAILED, SERVER_TXN_REASON_DECODE_FAILED,
+                    production_live_session(p), p->err);
             }
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
                 const char *dsml_start = NULL;
-                const char *p;
-                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
-                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
-                        (strncmp(p, "<tool_calls>", 12) == 0) ||
-                        (strncmp(p, "<tool_call>", 11) == 0)) {
-                        dsml_start = p;
+                const char *scan;
+                for (scan = text.ptr;
+                     scan && (size_t)(scan - text.ptr) < text.len - 20;
+                     scan++) {
+                    if ((strncmp(scan, DS4_TOOL_CALLS_START,
+                                 strlen(DS4_TOOL_CALLS_START)) == 0) ||
+                        (strncmp(scan, DS4_TOOL_CALLS_START_SHORT,
+                                 strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
+                        (strncmp(scan, "<tool_calls>", 12) == 0)) {
+                        dsml_start = scan;
                         break;
                     }
                 }
@@ -11801,9 +13185,9 @@ decode_again:
                 size_t text_snippet_len = text.len > 300 ? 300 : text.len;
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
+                           p->ctx_span,
+                           p->req_flags[0] ? " " : "",
+                           p->req_flags,
                            final_finish,
                            text.len,
                            saw_tool_start,
@@ -11812,20 +13196,23 @@ decode_again:
                            text.ptr ? text.ptr : "(null)");
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
+                           p->ctx_span,
+                           p->req_flags[0] ? " " : "",
+                           p->req_flags,
                            (int)dsml_snippet_len,
                            dsml_start ? dsml_start : "(none)");
-                trace_event(s, trace_id,
+                production_observe_trace_event(p,
                             "invalid tool call returned as assistant text finish=%s",
                             final_finish);
             }
         }
         if (parsed_calls.len) {
-            if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
+            if (openai_live_chat) {
+                apply_openai_stream_tool_ids(&parsed_calls, &p->openai_live);
+            }
             if (j->req.api == API_ANTHROPIC && j->req.stream)
-                apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
+                apply_anthropic_stream_tool_ids(&parsed_calls,
+                                                &p->anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
@@ -11833,198 +13220,65 @@ decode_again:
             responses_live_clear(s, slot);
         }
     }
-    log_tool_calls_summary(ctx_span, &parsed_calls,
+    log_tool_calls_summary(p->ctx_span, &parsed_calls,
                            responses_protocol);
 
-    trace_finish(s, trace_id, &j->req, final_finish, completion,
-                 saw_tool_start, saw_tool_end,
-                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                 parsed_reasoning, &parsed_calls, now_sec() - t0);
+    p->reply = PRODUCTION_REPLY_NORMAL;
+    p->normal_ready = true;
+    p->count_generated = true;
+    p->recovered_tool_parse_failure = recovered_tool_parse_failure;
+    p->saw_tool_start = saw_tool_start;
+    p->saw_tool_end = saw_tool_end;
+    p->completion = completion;
+    p->decode_started_at = decode_t0;
+    p->final_finish = final_finish;
+    p->thinking = thinking;
+    p->text = text;
+    p->parsed_calls = parsed_calls;
+    p->parsed_content = parsed_content;
+    p->parsed_reasoning = parsed_reasoning;
+    if (!strcmp(final_finish, "error")) {
+        if (p->first_failure_reason == SERVER_TXN_REASON_NONE) {
+            production_latch_failure(
+                p, SERVER_TXN_FAILED, SERVER_TXN_REASON_DECODE_FAILED,
+                production_live_session(p), p->err);
+        }
+        return production_terminal(
+            p, p->first_failure_class, p->first_failure_reason,
+            SERVER_TXN_FINISH_ERROR, p->first_failure_session, p->err);
+    } else if (!strcmp(final_finish, "tool_calls")) {
+        return production_terminal(
+            p, SERVER_TXN_COMPLETED, SERVER_TXN_REASON_TOOL_CALLS,
+            SERVER_TXN_FINISH_TOOL_CALLS, SERVER_SESSION_VALID_PREFIX, NULL);
+    } else if (!strcmp(final_finish, "length")) {
+        return production_terminal(
+            p, SERVER_TXN_COMPLETED, SERVER_TXN_REASON_LENGTH,
+            SERVER_TXN_FINISH_LENGTH, SERVER_SESSION_VALID_PREFIX, NULL);
+    }
+    return production_terminal(
+        p, SERVER_TXN_COMPLETED, SERVER_TXN_REASON_STOP,
+        SERVER_TXN_FINISH_STOP, SERVER_SESSION_VALID_PREFIX, NULL);
+}
 
-    if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
-            /* Store the post-turn visible transcript plus the live token
-             * frontier.  The next Responses request may replay only this
-             * visible surface, while the real session also contains hidden
-             * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
-                    parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
-            free(visible_suffix);
-        } else {
-            responses_live_clear(s, slot);
-        }
+static server_txn_step_result production_session_advance(
+        void *ctx, const server_txn_outcome *outcome,
+        server_txn_phase phase) {
+    production_txn *p = ctx;
+    switch (phase) {
+        case SERVER_TXN_PHASE_RESTORE:
+            return production_restore(p, outcome);
+        case SERVER_TXN_PHASE_SYNCHRONIZE:
+            return production_synchronize(p, outcome);
+        case SERVER_TXN_PHASE_EXTEND:
+            return production_extend(p, outcome);
+        case SERVER_TXN_PHASE_DECODE:
+            return production_decode(p, outcome);
+        default:
+            return production_terminal(
+                p, SERVER_TXN_FAILED, SERVER_TXN_REASON_INTERNAL,
+                SERVER_TXN_FINISH_ERROR, SERVER_SESSION_INVALIDATED,
+                "production adapter received an invalid phase");
     }
-    if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
-        {
-            anthropic_live_remember(s, slot, &parsed_calls);
-        } else {
-            anthropic_live_clear(s, slot);
-        }
-    }
-
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
-    {
-        /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
-        remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    }
-
-    if (j->req.stream) {
-        bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    &parsed_calls, final_finish, completion);
-        } else if (openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
-                                                 text.ptr ? text.ptr : "", text.len,
-                                                 &parsed_calls, final_finish,
-                                                 prompt_tokens, completion);
-        } else if (responses_live_chat) {
-            /* If parse recovered a malformed tool call back to plain text,
-             * pass parsed_content so the streaming tail can be flushed; in
-             * the normal path parsed_content is the assistant text we already
-             * streamed and the diff is empty. */
-            const char *recover =
-                recovered_tool_parse_failure ? parsed_content : NULL;
-            response_ok = responses_sse_finish_live(j->fd, &j->req, &responses_live,
-                                                    text.ptr ? text.ptr : "", text.len,
-                                                    recover,
-                                                    &parsed_calls, final_finish,
-                                                    prompt_tokens, completion,
-                                                    responses_created_at);
-        } else if (structured_stream) {
-            response_ok = sse_chat_finish(j->fd, &j->req, id,
-                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                          parsed_reasoning,
-                                          &parsed_calls, final_finish,
-                                          prompt_tokens, completion);
-        } else {
-            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
-                          sse_done(j->fd, &j->req, id, prompt_tokens, completion);
-        }
-        if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-        }
-    } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
-    }
-    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-        char flags[80];
-        log_flags(flags, sizeof(flags),
-                  responses_protocol,
-                  true,
-                  thinking.inside,
-                  saw_tool_start,
-                  saw_tool_end);
-        if (!strcmp(final_finish, "error") && err[0]) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
-                       ctx_span,
-                       completion,
-                       flags[0] ? " " : "",
-                       flags,
-                       final_finish,
-                       err,
-                       now_sec() - t0);
-        } else {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
-                       ctx_span,
-                       completion,
-                       flags[0] ? " " : "",
-                       flags,
-                       final_finish,
-                       now_sec() - t0);
-        }
-    } else {
-        char flags[80];
-        log_flags(flags, sizeof(flags),
-                  responses_protocol,
-                  j->req.has_tools,
-                  thinking.inside,
-                  false,
-                  false);
-        if (!strcmp(final_finish, "error") && err[0]) {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       completion,
-                       flags[0] ? " " : "",
-                       flags,
-                       final_finish,
-                       err,
-                       now_sec() - t0);
-        } else {
-            server_log(DS4_LOG_GENERATION,
-                       "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       completion,
-                       flags[0] ? " " : "",
-                       flags,
-                       final_finish,
-                       now_sec() - t0);
-        }
-    }
-    free(parsed_content);
-    free(parsed_reasoning);
-    tool_calls_free(&parsed_calls);
-    anthropic_stream_free(&anthropic_live);
-    openai_stream_free(&openai_live);
-    responses_stream_free(&responses_live);
-    buf_free(&text);
-    ds4_tokens_free(&effective_prompt);
 }
 
 static bool live_state_contains_all(const live_tool_state *state,
@@ -12110,50 +13364,466 @@ static void dispatch_jobs_locked(server *s) {
     }
 }
 
-static bool enqueue(server *s, job *j) {
-    pthread_mutex_lock(&s->mu);
-    if (s->stopping) {
-        pthread_mutex_unlock(&s->mu);
-        return false;
+static server_txn_outcome server_txn_run(server *s, server_slot *slot,
+                                         job *j) {
+    production_txn production = {
+        .srv = s,
+        .slot = slot,
+        .job = j,
+        .wire = SERVER_WIRE_UNTOUCHED,
+    };
+    production.effects = (server_txn_adapters) {
+        .session = {
+            .ctx = &production,
+            .advance = production_session_advance,
+            .settle = production_session_settle,
+            .cleanup = production_session_cleanup,
+        },
+        .output = {
+            .ctx = &production,
+            .apply = production_output_apply,
+            .finish = production_output_finish,
+        },
+        .trace = {
+            .ctx = &production,
+            .record = production_trace_record,
+            .finish = production_trace_finish,
+        },
+        .stats = {
+            .ctx = &production,
+            .record = production_statistics_record,
+            .finish = production_statistics_finish,
+        },
+    };
+    return server_txn_run_adapters(&production.effects);
+}
+
+static server_txn_settle_result production_session_settle(
+        void *ctx, const server_txn_outcome *outcome, bool commit) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    server_slot *slot = p->slot;
+    job *j = p->job;
+    if (p->callbacks_attached) {
+        ds4_session_set_cancel(slot->session, NULL, NULL);
+        ds4_session_set_progress(slot->session, NULL, NULL);
+        ds4_session_set_display_progress(slot->session, NULL, NULL);
+        p->callbacks_attached = false;
     }
-    if (s->tail) s->tail->next = j; else s->head = j;
-    s->tail = j;
-    if (s->batched_mode) {
-        dispatch_jobs_locked(s);
-        pthread_cond_broadcast(&s->cv);
+    if (!p->normal_ready) {
+        return (server_txn_settle_result) {
+            .ok = true,
+            .session = outcome->session,
+            .wire = p->wire,
+            .secondary = p->phase_secondary,
+        };
+    }
+
+    const char *final_finish = p->final_finish ? p->final_finish : "error";
+    bool canonicalization_failed = false;
+    tool_calls *parsed_calls = &p->parsed_calls;
+    const char *parsed_content = p->parsed_content;
+    const char *parsed_reasoning = p->parsed_reasoning;
+    if (commit) {
+        if (j->req.api == API_RESPONSES) {
+            if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+                char *visible_suffix =
+                    build_responses_visible_assistant_suffix(
+                        &j->req, parsed_content ? parsed_content : "",
+                        parsed_reasoning, parsed_calls);
+                buf visible = {0};
+                buf_puts(&visible,
+                         j->req.prompt_text ? j->req.prompt_text : "");
+                buf_puts(&visible, visible_suffix ? visible_suffix : "");
+                responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
+                    parsed_calls->len ? parsed_calls : NULL);
+                buf_free(&visible);
+                free(visible_suffix);
+            } else {
+                responses_live_clear(s, slot);
+            }
+        }
+        if (j->req.api == API_ANTHROPIC) {
+            if (parsed_calls->len && strcmp(final_finish, "error") &&
+                strcmp(final_finish, "length")) {
+                anthropic_live_remember(s, slot, parsed_calls);
+            } else {
+                anthropic_live_clear(s, slot);
+            }
+        }
+
+        if (j->req.kind == REQ_CHAT && parsed_calls->len &&
+            j->req.api != API_RESPONSES &&
+            should_canonicalize_tool_checkpoint(s, parsed_calls)) {
+            if (!canonicalize_tool_checkpoint(
+                    s, slot, j, p->ctx_span, &p->effects,
+                    &p->phase_secondary, &p->wire,
+                    parsed_content ? parsed_content : "", parsed_reasoning,
+                    parsed_calls)) {
+                p->phase_secondary |= SERVER_TXN_SECONDARY_CHECKPOINT;
+                canonicalization_failed = true;
+            }
+            thinking_live_clear(s, slot);
+        } else if (parsed_calls->len) {
+            if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
+                !strcmp(final_finish, "tool_calls")) {
+                remember_tool_visible_checkpoint(
+                    s, slot, j, p->ctx_span, &p->effects.trace,
+                    &p->phase_secondary,
+                    parsed_content ? parsed_content : "", parsed_reasoning,
+                    parsed_calls);
+            } else {
+                thinking_live_clear(s, slot);
+            }
+        } else if (should_remember_thinking_checkpoint(
+                       &j->req, &p->thinking, final_finish)) {
+            remember_thinking_checkpoint(
+                s, slot, j, p->ctx_span, &p->effects.trace,
+                &p->phase_secondary,
+                parsed_content ? parsed_content : "");
+        } else {
+            thinking_live_clear(s, slot);
+        }
     } else {
-        pthread_cond_signal(&s->cv);
+        /* Rollback: this turn's frontier is not kept, so a live binding
+         * remembered for it must not survive to match a later request. */
+        if (j->req.api == API_RESPONSES) responses_live_clear(s, slot);
+        if (j->req.api == API_ANTHROPIC) anthropic_live_clear(s, slot);
+        thinking_live_clear(s, slot);
     }
-    pthread_mutex_unlock(&s->mu);
+
+    server_session_disposition disposition = outcome->session;
+    if (commit) {
+        if (!ds4_session_is_valid(slot->session)) {
+            disposition = SERVER_SESSION_INVALIDATED;
+        } else {
+            disposition = canonicalization_failed ?
+                SERVER_SESSION_VALID_PREFIX : SERVER_SESSION_COMMITTED;
+        }
+    } else if (p->session_entered) {
+        disposition = production_live_session(p);
+    }
+    return (server_txn_settle_result) {
+        .ok = true,
+        .session = disposition,
+        .wire = p->wire,
+        .failure_class = p->first_failure_class,
+        .failure_reason = outcome->class == SERVER_TXN_COMPLETED ?
+            p->first_failure_reason : SERVER_TXN_REASON_NONE,
+        .failure_detail = p->first_failure_detail,
+        .secondary = p->phase_secondary,
+    };
+}
+
+static server_txn_output_result production_output_finish(
+        void *ctx, const server_txn_outcome *outcome) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    job *j = p->job;
+    bool ok = true;
+
+    if (p->reply == PRODUCTION_REPLY_NONE) {
+        return (server_txn_output_result) {.ok = true, .wire = p->wire};
+    }
+
+    p->wire = SERVER_WIRE_IRREVERSIBLE;
+    if (p->reply == PRODUCTION_REPLY_RESPONSES_CONFLICT) {
+        ok = http_error(
+            j->fd, s->enable_cors, 409,
+            "Responses continuation state is not available; retry by replaying the full input history");
+    } else if (p->reply == PRODUCTION_REPLY_ANTHROPIC_CONFLICT) {
+        ok = http_error_api(
+            j->fd, s->enable_cors, 409,
+            "Anthropic continuation state is not available; retry by replaying the full messages history",
+            API_ANTHROPIC);
+    } else if (p->reply == PRODUCTION_REPLY_PREFILL_ERROR) {
+        ok = send_prefill_failure_response(
+            s, j, &p->progress, p->ctx_span, p->req_flags, p->err);
+    } else if (p->reply == PRODUCTION_REPLY_NORMAL) {
+        const char *final_finish = p->final_finish ? p->final_finish : "error";
+        const char *parsed_content = p->parsed_content;
+        const char *parsed_reasoning = p->parsed_reasoning;
+        tool_calls *parsed_calls = &p->parsed_calls;
+        buf *text = &p->text;
+        if (j->req.stream) {
+            if (j->req.api == API_ANTHROPIC) {
+                ok = anthropic_sse_finish_live(
+                    j->fd, s, &j->req, p->response_id,
+                    &p->anthropic_live,
+                    text->ptr ? text->ptr : "", text->len, parsed_calls,
+                    final_finish, p->completion);
+            } else if (p->openai_live_chat) {
+                ok = openai_sse_finish_live(
+                    j->fd, s, &j->req, p->response_id,
+                    &p->openai_live,
+                    text->ptr ? text->ptr : "", text->len, parsed_calls,
+                    final_finish, p->prompt_tokens, p->completion);
+            } else if (p->responses_live_chat) {
+                const char *recover = p->recovered_tool_parse_failure ?
+                                      parsed_content : NULL;
+                ok = responses_sse_finish_live(
+                    j->fd, &j->req, &p->responses_live,
+                    text->ptr ? text->ptr : "", text->len, recover,
+                    parsed_calls, final_finish, p->prompt_tokens,
+                    p->completion, p->responses_created_at);
+            } else if (p->structured_stream) {
+                ok = sse_chat_finish(
+                    j->fd, &j->req, p->response_id,
+                    parsed_content ? parsed_content :
+                                     (text->ptr ? text->ptr : ""),
+                    parsed_reasoning, parsed_calls, final_finish,
+                    p->prompt_tokens, p->completion);
+            } else {
+                ok = sse_chunk(j->fd, &j->req, p->response_id, NULL,
+                               final_finish) &&
+                     sse_done(j->fd, &j->req, p->response_id,
+                              p->prompt_tokens, p->completion);
+            }
+            if (!ok) {
+                server_log(
+                    DS4_LOG_DEFAULT,
+                    "ds4-server: %s ctx=%s%s%s final stream failed",
+                    j->req.kind == REQ_CHAT ? "chat" : "completion",
+                    p->ctx_span, p->req_flags[0] ? " " : "",
+                    p->req_flags);
+            }
+        } else if (outcome->reason == SERVER_TXN_REASON_CLIENT_GONE) {
+            p->wire = SERVER_WIRE_UNTOUCHED;
+            return (server_txn_output_result) {.ok = true, .wire = p->wire};
+        } else if (j->req.api == API_ANTHROPIC) {
+            ok = anthropic_final_response(
+                j->fd, s->enable_cors, &j->req, p->response_id,
+                parsed_content ? parsed_content :
+                                 (text->ptr ? text->ptr : ""),
+                parsed_reasoning, parsed_calls, final_finish,
+                p->prompt_tokens, p->completion);
+        } else if (j->req.api == API_RESPONSES) {
+            ok = responses_final_response(
+                j->fd, s->enable_cors, &j->req, p->response_id,
+                parsed_content ? parsed_content :
+                                 (text->ptr ? text->ptr : ""),
+                parsed_reasoning, parsed_calls, final_finish,
+                p->prompt_tokens, p->completion);
+        } else {
+            ok = final_response(
+                j->fd, s->enable_cors, &j->req, p->response_id,
+                parsed_content ? parsed_content :
+                                 (text->ptr ? text->ptr : ""),
+                parsed_reasoning, parsed_calls, final_finish,
+                p->prompt_tokens, p->completion);
+        }
+    }
+
+    p->wire = ok ? SERVER_WIRE_COMPLETE : SERVER_WIRE_BROKEN;
+    return (server_txn_output_result) {.ok = ok, .wire = p->wire};
+}
+
+static bool production_statistics_finish(
+        void *ctx, const server_txn_outcome *outcome) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    server_slot *slot = p->slot;
+    if (p->count_generated) {
+        const double decode_sec = now_sec() - p->decode_started_at;
+        pthread_mutex_lock(&s->mu);
+        s->stats.generated_tokens += (uint64_t)p->completion;
+        if (p->completion > 0 && decode_sec > 0.0) {
+            s->stats.last_decode_tps = (double)p->completion / decode_sec;
+        }
+        pthread_mutex_unlock(&s->mu);
+        p->count_generated = false;
+    }
+    if (p->counted_request) {
+        pthread_mutex_lock(&s->mu);
+        s->busy = false;
+        pthread_mutex_unlock(&s->mu);
+        p->counted_request = false;
+    }
+    (void)outcome;
+    const int live_tokens = p->session_entered ?
+        ds4_session_pos(slot->session) : s->stats_snapshot.live_tokens;
+    server_publish_stats_snapshot(s, live_tokens);
     return true;
 }
 
-static job *dequeue(server *s) {
+static bool production_trace_finish(
+        void *ctx, const server_txn_outcome *outcome) {
+    production_txn *p = ctx;
+    server *s = p->srv;
+    if (!p->trace_id) return true;
+    const char *finish = p->final_finish;
+    if (!finish) finish = outcome->class == SERVER_TXN_COMPLETED ? "stop" : "error";
+    trace_event(
+        s, p->trace_id,
+        "terminal class=%d reason=%d phase=%d session=%d wire=%d secondary=0x%x",
+        (int)outcome->class, (int)outcome->reason,
+        (int)outcome->decided_at, (int)outcome->session,
+        (int)outcome->wire, outcome->secondary);
+    trace_finish(
+        s, p->trace_id, &p->job->req, finish, p->completion,
+        p->saw_tool_start, p->saw_tool_end,
+        p->parsed_content ? p->parsed_content :
+            (p->text.ptr ? p->text.ptr : ""),
+        p->parsed_reasoning, &p->parsed_calls,
+        now_sec() - p->started_at);
+    return !s->trace || !ferror(s->trace);
+}
+
+static bool production_session_cleanup(
+        void *ctx, const server_txn_outcome *outcome) {
+    production_txn *p = ctx;
+    server_slot *slot = p->slot;
+    job *j = p->job;
+    if (p->callbacks_attached) {
+        ds4_session_set_cancel(slot->session, NULL, NULL);
+        ds4_session_set_progress(slot->session, NULL, NULL);
+        ds4_session_set_display_progress(slot->session, NULL, NULL);
+        p->callbacks_attached = false;
+    }
+    if (p->normal_ready) {
+        const char *final_finish = p->final_finish ? p->final_finish : "error";
+        char flags[80];
+        log_flags(flags, sizeof(flags), p->responses_protocol,
+                  j->req.has_tools,
+                  p->thinking.inside,
+                  j->req.has_tools ? p->saw_tool_start : false,
+                  j->req.has_tools ? p->saw_tool_end : false);
+        const char *terminal_error = outcome->detail[0] ?
+            outcome->detail : p->err;
+        if (!strcmp(final_finish, "error") && terminal_error[0]) {
+            server_log(
+                DS4_LOG_GENERATION,
+                "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
+                j->req.kind == REQ_CHAT ? "chat" : "completion",
+                p->ctx_span, p->completion, flags[0] ? " " : "", flags,
+                final_finish, terminal_error, now_sec() - p->started_at);
+        } else {
+            server_log(
+                DS4_LOG_GENERATION,
+                "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
+                j->req.kind == REQ_CHAT ? "chat" : "completion",
+                p->ctx_span, p->completion, flags[0] ? " " : "", flags,
+                final_finish, now_sec() - p->started_at);
+        }
+    }
+    free(p->parsed_content);
+    p->parsed_content = NULL;
+    free(p->parsed_reasoning);
+    p->parsed_reasoning = NULL;
+    tool_calls_free(&p->parsed_calls);
+    anthropic_stream_free(&p->anthropic_live);
+    openai_stream_free(&p->openai_live);
+    responses_stream_free(&p->responses_live);
+    buf_free(&p->text);
+    ds4_tokens_free(&p->effective_prompt);
+    free(p->disk_cache_path);
+    p->disk_cache_path = NULL;
+    (void)outcome;
+    return true;
+}
+
+enum { ENQUEUE_OK = 0, ENQUEUE_STOPPING, ENQUEUE_FULL };
+
+static int enqueue(server *s, job *j) {
     pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-    if (!s->head) {
+    if (s->stopping) {
+        pthread_mutex_unlock(&s->mu);
+        return ENQUEUE_STOPPING;
+    }
+    if (s->max_queue > 0 && s->queue_depth >= s->max_queue) {
+        s->stats.queue_rejected++;
+        s->stats_refresh_requested = true;
+        pthread_cond_signal(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        return ENQUEUE_FULL;
+    }
+    if (s->tail) s->tail->next = j; else s->head = j;
+    s->tail = j;
+    s->queue_depth++;
+    const int waiting = s->queue_depth;
+    const bool busy = s->busy;
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    if (waiting > 1 || busy) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: request queued behind %d job(s)%s",
+                   waiting - 1, busy ? " (worker busy)" : "");
+    }
+    return ENQUEUE_OK;
+}
+
+static job *dequeue(server *s, int live_tokens) {
+    for (;;) {
+        pthread_mutex_lock(&s->mu);
+        while (!s->head && !s->stopping && !s->stats_refresh_requested) {
+            pthread_cond_wait(&s->cv, &s->mu);
+        }
+        if (s->head) {
+            job *j = s->head;
+            s->head = j->next;
+            if (!s->head) s->tail = NULL;
+            if (s->queue_depth > 0) s->queue_depth--;
+            pthread_mutex_unlock(&s->mu);
+            j->next = NULL;
+            return j;
+        }
+        if (s->stats_refresh_requested) {
+            s->stats_refresh_requested = false;
+            pthread_mutex_unlock(&s->mu);
+            server_publish_stats_snapshot(s, live_tokens);
+            continue;
+        }
         pthread_mutex_unlock(&s->mu);
         return NULL;
     }
-    job *j = s->head;
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
-    pthread_mutex_unlock(&s->mu);
-    j->next = NULL;
-    return j;
 }
 
-static void *worker_main(void *arg) {
-    server *s = arg;
-    for (;;) {
-        job *j = dequeue(s);
-        if (!j) break;
-        generate_job(s, &s->slots[0], j);
-        pthread_mutex_lock(&j->mu);
+static bool job_publish_terminal_outcome(job *j,
+                                         const server_txn_outcome *outcome) {
+    bool published = false;
+    pthread_mutex_lock(&j->mu);
+    if (!j->outcome_ready) {
+        j->outcome = *outcome;
+        j->outcome_ready = true;
         j->done = true;
         pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        published = true;
     }
+    pthread_mutex_unlock(&j->mu);
+    return published;
+}
+
+/* Non-batched serving: one worker owns slot 0, which is the whole resident
+ * session.  Batched serving uses slot_worker_main() per slot instead. */
+static void *worker_main(void *arg) {
+    server *s = arg;
+    server_slot *slot = &s->slots[0];
+    s->worker_thread = pthread_self();
+    s->worker_bound = true;
+    server_publish_stats_snapshot(s, ds4_session_pos(slot->session));
+    for (;;) {
+        job *j = dequeue(s, ds4_session_pos(slot->session));
+        if (!j) break;
+        server_txn_outcome outcome = server_txn_run(s, slot, j);
+        if (!job_publish_terminal_outcome(j, &outcome)) {
+            /* The terminalizer is idempotent, so a duplicate publish means an
+             * engine bug; the first outcome already reached the client, so
+             * dropping the duplicate is safer than killing a loaded server. */
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: dropped duplicate terminal outcome for an admitted request");
+        }
+    }
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (s->kv.enabled && tokens && tokens->len >= s->kv.opt.min_tokens) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
+                   tokens->len);
+        if (!kv_cache_store_current(s, slot, "shutdown")) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: shutdown KV persist failed; next start will re-prefill");
+        }
+    }
+    server_publish_stats_snapshot(s, ds4_session_pos(slot->session));
     return NULL;
 }
 
@@ -12173,7 +13843,11 @@ static void *slot_worker_main(void *arg) {
         slot->assigned = NULL;
         pthread_mutex_unlock(&s->mu);
 
-        generate_job(s, slot, j);
+        server_txn_outcome outcome = server_txn_run(s, slot, j);
+        if (!job_publish_terminal_outcome(j, &outcome)) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: dropped duplicate terminal outcome for an admitted request");
+        }
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12226,11 +13900,39 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
-static bool read_http_request(int fd, http_request *r) {
+/* True when the header block contains `name` and its value contains `value`
+ * (both case-insensitive). */
+static bool header_value_contains(const char *h, size_t n,
+                                  const char *name, const char *value) {
+    const size_t name_len = strlen(name);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && strncasecmp(line, name, name_len) == 0 &&
+            line[name_len] == ':')
+        {
+            char v[128];
+            size_t vlen = len - name_len - 1;
+            if (vlen >= sizeof(v)) vlen = sizeof(v) - 1;
+            memcpy(v, line + name_len + 1, vlen);
+            v[vlen] = '\0';
+            for (size_t k = 0; v[k]; k++) v[k] = (char)tolower((unsigned char)v[k]);
+            return strstr(v, value) != NULL;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
+static bool read_http_request(int fd, http_request *r, const char **errmsg) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
     const size_t max_body = 64 * 1024 * 1024;
+    if (errmsg) *errmsg = "bad HTTP request";
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -12252,6 +13954,19 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    if (header_value_contains(b.ptr, (size_t)hend, "Transfer-Encoding", "chunked")) {
+        /* Chunked bodies used to be silently read as Content-Length: 0 and
+         * fail JSON parsing with a misleading error. */
+        if (errmsg) *errmsg = "chunked transfer encoding is not supported; send Content-Length";
+        goto fail;
+    }
+    if (header_value_contains(b.ptr, (size_t)hend, "Expect", "100-continue")) {
+        /* curl-style clients wait up to a second for this interim response
+         * before sending a large POST body. */
+        static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        if (!send_all(fd, cont, sizeof(cont) - 1)) goto fail;
+    }
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -12352,9 +14067,92 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+/* Both handlers run on the client thread, so they answer immediately even
+ * while the worker is deep inside a multi-minute prefill. */
+static bool send_health(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"status\":\"ok\",\"model\":");
+    json_escape(&b, ds4_engine_model_name(s->engine));
+    buf_printf(&b, ",\"uptime_s\":%.0f}\n", now_sec() - s->started_at);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool send_stats(server *s, int fd) {
+    pthread_mutex_lock(&s->mu);
+    const server_stats_snapshot snapshot = s->stats_snapshot;
+    pthread_mutex_unlock(&s->mu);
+    const server_stats st = snapshot.counters;
+    const uint64_t cache_hits = st.cache_memory_token + st.cache_memory_text +
+                                st.cache_responses_visible +
+                                st.cache_responses_tool_output +
+                                st.cache_anthropic_tool_output +
+                                st.cache_thinking_visible +
+                                st.cache_tool_visible + st.cache_disk_text;
+    buf b = {0};
+    buf_printf(&b,
+        "{\"uptime_s\":%.0f,"
+        "\"busy\":%s,"
+        "\"queue_depth\":%d,"
+        "\"clients\":%d,"
+        "\"live_tokens\":%d,"
+        "\"ctx_size\":%d,"
+        "\"requests\":%llu,"
+        "\"queue_rejected\":%llu,"
+        "\"queue_dropped_disconnected\":%llu,"
+        "\"prefill_cancelled\":%llu,"
+        "\"prompt_tokens\":%llu,"
+        "\"cached_tokens\":%llu,"
+        "\"generated_tokens\":%llu,"
+        "\"last_prefill_tps\":%.2f,"
+        "\"last_decode_tps\":%.2f,"
+        "\"cache\":{"
+            "\"hits\":%llu,"
+            "\"cold\":%llu,"
+            "\"memory_token\":%llu,"
+            "\"memory_text\":%llu,"
+            "\"responses_visible\":%llu,"
+            "\"responses_tool_output\":%llu,"
+            "\"anthropic_tool_output\":%llu,"
+            "\"thinking_visible\":%llu,"
+            "\"tool_visible\":%llu,"
+            "\"disk_text\":%llu}}\n",
+        now_sec() - s->started_at,
+        snapshot.busy ? "true" : "false",
+        snapshot.queue_depth,
+        snapshot.clients,
+        snapshot.live_tokens,
+        snapshot.ctx_size,
+        (unsigned long long)st.requests,
+        (unsigned long long)st.queue_rejected,
+        (unsigned long long)st.queue_dropped_disconnected,
+        (unsigned long long)st.prefill_cancelled,
+        (unsigned long long)st.prompt_tokens,
+        (unsigned long long)st.cached_tokens,
+        (unsigned long long)st.generated_tokens,
+        st.last_prefill_tps,
+        st.last_decode_tps,
+        (unsigned long long)cache_hits,
+        (unsigned long long)st.cache_cold,
+        (unsigned long long)st.cache_memory_token,
+        (unsigned long long)st.cache_memory_text,
+        (unsigned long long)st.cache_responses_visible,
+        (unsigned long long)st.cache_responses_tool_output,
+        (unsigned long long)st.cache_anthropic_tool_output,
+        (unsigned long long)st.cache_thinking_visible,
+        (unsigned long long)st.cache_tool_visible,
+        (unsigned long long)st.cache_disk_text);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
+    s->stats_refresh_requested = true;
+    pthread_cond_signal(&s->cv);
     pthread_cond_broadcast(&s->clients_cv);
     pthread_mutex_unlock(&s->mu);
 }
@@ -12368,8 +14166,9 @@ static void *client_main(void *arg) {
     free(ca);
 
     http_request hr = {0};
-    if (!read_http_request(fd, &hr)) {
-        http_error(fd, s->enable_cors, 400, "bad HTTP request");
+    const char *read_err = NULL;
+    if (!read_http_request(fd, &hr, &read_err)) {
+        http_error(fd, s->enable_cors, 400, read_err ? read_err : "bad HTTP request");
         goto done;
     }
 
@@ -12381,6 +14180,20 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/health") || !strcmp(hr.path, "/v1/health")))
+    {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/stats") || !strcmp(hr.path, "/v1/stats")))
+    {
+        send_stats(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -12416,10 +14229,12 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    const bool anthropic_endpoint = !strcmp(hr.path, "/v1/messages");
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
     http_request_free(&hr);
     if (!ok) {
-        http_error(fd, s->enable_cors, 400, err);
+        http_error_api(fd, s->enable_cors, 400, err,
+                       anthropic_endpoint ? API_ANTHROPIC : API_OPENAI);
         goto done;
     }
     if (!req.model_from_request) {
@@ -12441,9 +14256,15 @@ static void *client_main(void *arg) {
     pthread_cond_init(&j.cv, NULL);
 
     pthread_mutex_lock(&j.mu);
-    if (!enqueue(s, &j)) {
+    const int enq = enqueue(s, &j);
+    if (enq != ENQUEUE_OK) {
         pthread_mutex_unlock(&j.mu);
-        http_error(fd, s->enable_cors, 503, "server shutting down");
+        if (enq == ENQUEUE_FULL) {
+            http_error_api(fd, s->enable_cors, 429,
+                           "server request queue is full; retry later", j.req.api);
+        } else {
+            http_error_api(fd, s->enable_cors, 503, "server shutting down", j.req.api);
+        }
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -12494,6 +14315,10 @@ static void configure_client_socket(int fd) {
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Per-token SSE writes are tiny; without this Nagle adds latency jitter
+     * whenever the client is not on loopback. */
+    int yes = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 }
 
 static void set_client_socket_nonblocking(int fd) {
@@ -12521,6 +14346,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    int max_queue;
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -12728,6 +14554,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--max-queue")) {
+            c.max_queue = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -12957,6 +14785,9 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.max_queue = cfg.max_queue;
+    s.started_at = now_sec();
+    s.stats_snapshot.ctx_size = cfg.ctx_size;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13094,11 +14925,15 @@ int main(int argc, char **argv) {
         ca->fd = fd;
         pthread_mutex_lock(&s.mu);
         s.clients++;
+        s.stats_refresh_requested = true;
+        pthread_cond_signal(&s.cv);
         pthread_mutex_unlock(&s.mu);
         pthread_t th;
         if (pthread_create(&th, NULL, client_main, ca) != 0) {
             pthread_mutex_lock(&s.mu);
             s.clients--;
+            s.stats_refresh_requested = true;
+            pthread_cond_signal(&s.cv);
             pthread_cond_broadcast(&s.clients_cv);
             pthread_mutex_unlock(&s.mu);
             free(ca);
@@ -13518,6 +15353,903 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static void test_stats_uses_published_snapshot(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    s.started_at = now_sec();
+    s.stats_snapshot.version = 7;
+    s.stats_snapshot.busy = true;
+    s.stats_snapshot.queue_depth = 3;
+    s.stats_snapshot.clients = 4;
+    s.stats_snapshot.live_tokens = 1234;
+    s.stats_snapshot.ctx_size = 524288;
+    s.stats_snapshot.counters.requests = 9;
+    s.stats_snapshot.counters.cache_memory_token = 2;
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_stats(&s, sv[0]));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"busy\":true") != NULL);
+        TEST_ASSERT(strstr(out, "\"queue_depth\":3") != NULL);
+        TEST_ASSERT(strstr(out, "\"clients\":4") != NULL);
+        TEST_ASSERT(strstr(out, "\"live_tokens\":1234") != NULL);
+        TEST_ASSERT(strstr(out, "\"ctx_size\":524288") != NULL);
+        TEST_ASSERT(strstr(out, "\"requests\":9") != NULL);
+        TEST_ASSERT(strstr(out, "\"hits\":2") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_dequeue_prioritizes_jobs_then_publishes_idle_stats(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.worker_thread = pthread_self();
+    s.worker_bound = true;
+    s.stats_snapshot.version = 4;
+    s.clients = 3;
+    s.stats.requests = 8;
+    s.max_queue = 1;
+
+    job queued;
+    memset(&queued, 0, sizeof(queued));
+    s.head = &queued;
+    s.tail = &queued;
+    s.queue_depth = 1;
+
+    job rejected;
+    memset(&rejected, 0, sizeof(rejected));
+    TEST_ASSERT(enqueue(&s, &rejected) == ENQUEUE_FULL);
+    TEST_ASSERT(s.stats_refresh_requested);
+    TEST_ASSERT(s.stats.queue_rejected == 1);
+    s.stopping = true;
+
+    TEST_ASSERT(dequeue(&s, 456) == &queued);
+    TEST_ASSERT(s.queue_depth == 0);
+    TEST_ASSERT(s.stats_refresh_requested);
+    TEST_ASSERT(s.stats_snapshot.version == 4);
+
+    TEST_ASSERT(dequeue(&s, 456) == NULL);
+    TEST_ASSERT(!s.stats_refresh_requested);
+    TEST_ASSERT(s.stats_snapshot.version == 5);
+    TEST_ASSERT(s.stats_snapshot.live_tokens == 456);
+    TEST_ASSERT(s.stats_snapshot.clients == 3);
+    TEST_ASSERT(s.stats_snapshot.counters.requests == 8);
+    TEST_ASSERT(s.stats_snapshot.counters.queue_rejected == 1);
+
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_production_txn_terminalizes_queued_disconnect(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    s.ctx_size = 1024;
+    s.stats_snapshot.ctx_size = 1024;
+    s.stats_snapshot.live_tokens = 77;
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        pthread_mutex_destroy(&s.mu);
+        return;
+    }
+    close(sv[1]);
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+
+    server_slot slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.srv = &s;
+    s.slots = &slot;
+    s.slot_count = 1;
+
+    server_txn_outcome outcome = server_txn_run(&s, &slot, &j);
+    TEST_ASSERT(outcome.class == SERVER_TXN_CANCELLED);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_CLIENT_GONE);
+    TEST_ASSERT(outcome.session == SERVER_SESSION_UNCHANGED);
+    TEST_ASSERT(outcome.wire == SERVER_WIRE_UNTOUCHED);
+    TEST_ASSERT(s.stats.queue_dropped_disconnected == 1);
+    TEST_ASSERT(s.stats.requests == 0);
+    TEST_ASSERT(!s.busy);
+    TEST_ASSERT(s.stats_snapshot.live_tokens == 77);
+    close(sv[0]);
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_production_txn_shutdown_beats_queued_disconnect(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    s.stats_snapshot.live_tokens = 77;
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        pthread_mutex_destroy(&s.mu);
+        return;
+    }
+    close(sv[1]);
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+
+    server_slot slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.srv = &s;
+    s.slots = &slot;
+    s.slot_count = 1;
+
+    const sig_atomic_t saved_stop = g_stop_requested;
+    g_stop_requested = 1;
+    server_txn_outcome outcome = server_txn_run(&s, &slot, &j);
+    g_stop_requested = saved_stop;
+
+    TEST_ASSERT(outcome.class == SERVER_TXN_CANCELLED);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_SHUTDOWN);
+    TEST_ASSERT(outcome.session == SERVER_SESSION_UNCHANGED);
+    TEST_ASSERT(outcome.wire == SERVER_WIRE_UNTOUCHED);
+    TEST_ASSERT(s.stats.queue_dropped_disconnected == 1);
+    close(sv[0]);
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_production_settle_rollback_clears_live_bindings(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    server_slot slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.srv = &s;
+    s.slots = &slot;
+    s.slot_count = 1;
+
+    slot.responses_live.visible_text = xstrdup("turn");
+    slot.responses_live.visible_len = 4;
+    slot.responses_live.valid = true;
+    slot.thinking_live.visible_text = xstrdup("turn");
+    slot.thinking_live.visible_len = 4;
+    slot.thinking_live.valid = true;
+    slot.anthropic_live.valid = true;
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.req.api = API_RESPONSES;
+    production_txn p;
+    memset(&p, 0, sizeof(p));
+    p.srv = &s;
+    p.slot = &slot;
+    p.job = &j;
+    p.normal_ready = true;
+    p.wire = SERVER_WIRE_UNTOUCHED;
+    const server_txn_outcome outcome = {
+        .class = SERVER_TXN_FAILED,
+        .reason = SERVER_TXN_REASON_DECODE_FAILED,
+        .session = SERVER_SESSION_VALID_PREFIX,
+    };
+
+    server_txn_settle_result r = production_session_settle(&p, &outcome, false);
+    TEST_ASSERT(r.ok);
+    TEST_ASSERT(r.session == SERVER_SESSION_VALID_PREFIX);
+    TEST_ASSERT(!slot.responses_live.valid);
+    TEST_ASSERT(!slot.thinking_live.valid);
+    TEST_ASSERT(slot.anthropic_live.valid);
+
+    j.req.api = API_ANTHROPIC;
+    r = production_session_settle(&p, &outcome, false);
+    TEST_ASSERT(r.ok);
+    TEST_ASSERT(!slot.anthropic_live.valid);
+
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+static void test_job_terminal_outcome_is_published_once(void) {
+    job j;
+    memset(&j, 0, sizeof(j));
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    const server_txn_outcome first = {
+        .class = SERVER_TXN_COMPLETED,
+        .reason = SERVER_TXN_REASON_STOP,
+        .finish = SERVER_TXN_FINISH_STOP,
+        .session = SERVER_SESSION_COMMITTED,
+        .wire = SERVER_WIRE_COMPLETE,
+    };
+    const server_txn_outcome second = {
+        .class = SERVER_TXN_FAILED,
+        .reason = SERVER_TXN_REASON_INTERNAL,
+    };
+    TEST_ASSERT(job_publish_terminal_outcome(&j, &first));
+    TEST_ASSERT(!job_publish_terminal_outcome(&j, &second));
+    TEST_ASSERT(j.done);
+    TEST_ASSERT(j.outcome_ready);
+    TEST_ASSERT(j.outcome.reason == SERVER_TXN_REASON_STOP);
+    TEST_ASSERT(j.outcome.finish == SERVER_TXN_FINISH_STOP);
+    pthread_cond_destroy(&j.cv);
+    pthread_mutex_destroy(&j.mu);
+}
+
+typedef struct {
+    const server_txn_adapters *adapters;
+    int settle_calls;
+    int output_calls;
+    int output_apply_calls;
+    int trace_calls;
+    int trace_record_calls;
+    int stats_calls;
+    int stats_record_calls;
+    int cleanup_calls;
+    server_txn_phase phases[8];
+    int phase_count;
+    server_txn_phase fail_phase;
+    server_txn_class fail_class;
+    server_txn_reason fail_reason;
+    server_session_disposition fail_session;
+    bool fail_settle;
+    bool fail_output;
+    int fail_output_operation;
+    bool fail_trace;
+    bool fail_trace_record;
+    bool fail_stats;
+    bool fail_stats_record;
+    bool fail_cleanup;
+    uint32_t settle_secondary;
+    server_txn_reason settle_failure_reason;
+    server_wire_disposition wire;
+    test_txn_event events[32];
+    int event_count;
+} test_txn_effects;
+
+static server_txn_output_result test_txn_output_apply(
+    void *ctx, const server_output_observation *observation);
+static server_trace_result test_txn_trace_record(
+    void *ctx, const server_trace_observation *observation);
+static bool test_txn_stats_record(
+    void *ctx, const server_statistics_observation *observation);
+
+static void test_txn_record(test_txn_effects *effects,
+                            test_txn_event event) {
+    TEST_ASSERT(effects->event_count <
+                (int)(sizeof(effects->events) / sizeof(effects->events[0])));
+    if (effects->event_count <
+        (int)(sizeof(effects->events) / sizeof(effects->events[0]))) {
+        effects->events[effects->event_count++] = event;
+    }
+}
+
+static void test_txn_expect_events(const test_txn_effects *effects,
+                                   const test_txn_event *expected,
+                                   int expected_count) {
+    TEST_ASSERT(effects->event_count == expected_count);
+    int count = effects->event_count < expected_count ?
+                effects->event_count : expected_count;
+    for (int i = 0; i < count; i++) {
+        TEST_ASSERT(effects->events[i] == expected[i]);
+    }
+}
+
+static server_txn_step_result test_txn_advance(void *ctx,
+                                                const server_txn_outcome *outcome,
+                                                server_txn_phase phase) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    uint32_t secondary = 0;
+    test_txn_record(
+        effects, (test_txn_event)(TEST_TXN_EVENT_RESTORE +
+                                  phase - SERVER_TXN_PHASE_RESTORE));
+    if (effects->phase_count < (int)(sizeof(effects->phases) /
+                                     sizeof(effects->phases[0]))) {
+        effects->phases[effects->phase_count++] = phase;
+    }
+    if (phase == effects->fail_phase) {
+        return (server_txn_step_result) {
+            .status = SERVER_TXN_STEP_TERMINAL,
+            .class = effects->fail_class,
+            .reason = effects->fail_reason,
+            .session = effects->fail_session,
+            .wire = effects->wire,
+            .detail = "scripted phase failure",
+            .secondary = secondary,
+        };
+    }
+    if (phase == SERVER_TXN_PHASE_RESTORE && effects->adapters) {
+        const server_trace_observation trace = {
+            .operation = SERVER_TRACE_BEGIN,
+        };
+        server_trace_result trace_result = effects->adapters->trace.record(
+            effects->adapters->trace.ctx, &trace);
+        if (!trace_result.ok) secondary |= SERVER_TXN_SECONDARY_TRACE;
+        const server_statistics_observation stats = {
+            .operation = SERVER_STATS_ADMIT,
+        };
+        if (!effects->adapters->stats.record(
+                effects->adapters->stats.ctx, &stats)) {
+            secondary |= SERVER_TXN_SECONDARY_STATS;
+        }
+    }
+    if (phase == SERVER_TXN_PHASE_SYNCHRONIZE && effects->adapters) {
+        const server_output_observation output = {
+            .operation = SERVER_OUTPUT_PREFILL_TICK,
+        };
+        server_txn_output_result output_result =
+            effects->adapters->output.apply(
+                effects->adapters->output.ctx, &output);
+        if (!output_result.ok) {
+            return (server_txn_step_result) {
+                .status = SERVER_TXN_STEP_TERMINAL,
+                .class = SERVER_TXN_FAILED,
+                .reason = SERVER_TXN_REASON_OUTPUT_FAILED,
+                .finish = SERVER_TXN_FINISH_ERROR,
+                .session = SERVER_SESSION_VALID_PREFIX,
+                .wire = output_result.wire,
+                .detail = "scripted prefill output failure",
+                .secondary = secondary,
+            };
+        }
+        const server_statistics_observation stats = {
+            .operation = SERVER_STATS_CACHE,
+        };
+        if (!effects->adapters->stats.record(
+                effects->adapters->stats.ctx, &stats)) {
+            secondary |= SERVER_TXN_SECONDARY_STATS;
+        }
+    }
+    if (phase == SERVER_TXN_PHASE_EXTEND && effects->adapters) {
+        const server_output_observation output = {
+            .operation = SERVER_OUTPUT_STREAM_OPEN,
+        };
+        server_txn_output_result output_result =
+            effects->adapters->output.apply(
+                effects->adapters->output.ctx, &output);
+        if (!output_result.ok) {
+            return (server_txn_step_result) {
+                .status = SERVER_TXN_STEP_TERMINAL,
+                .class = SERVER_TXN_FAILED,
+                .reason = SERVER_TXN_REASON_OUTPUT_FAILED,
+                .finish = SERVER_TXN_FINISH_ERROR,
+                .session = SERVER_SESSION_VALID_PREFIX,
+                .wire = output_result.wire,
+                .detail = "scripted stream-open failure",
+                .secondary = secondary,
+            };
+        }
+    }
+    if (phase == SERVER_TXN_PHASE_DECODE) {
+        if (effects->adapters) {
+            const server_trace_observation trace = {
+                .operation = SERVER_TRACE_EVENT,
+                .text = "decode",
+                .text_len = 6,
+            };
+            server_trace_result trace_result = effects->adapters->trace.record(
+                effects->adapters->trace.ctx, &trace);
+            if (!trace_result.ok) secondary |= SERVER_TXN_SECONDARY_TRACE;
+            const server_trace_observation piece = {
+                .operation = SERVER_TRACE_PIECE,
+                .text = "x",
+                .text_len = 1,
+            };
+            trace_result = effects->adapters->trace.record(
+                effects->adapters->trace.ctx, &piece);
+            if (!trace_result.ok) secondary |= SERVER_TXN_SECONDARY_TRACE;
+            const server_output_observation output = {
+                .operation = SERVER_OUTPUT_STREAM_UPDATE,
+                .text = "x",
+                .text_len = 1,
+                .safe_len = 1,
+            };
+            server_txn_output_result output_result =
+                effects->adapters->output.apply(
+                    effects->adapters->output.ctx, &output);
+            if (!output_result.ok) {
+                return (server_txn_step_result) {
+                    .status = SERVER_TXN_STEP_TERMINAL,
+                    .class = SERVER_TXN_FAILED,
+                    .reason = SERVER_TXN_REASON_OUTPUT_FAILED,
+                    .finish = SERVER_TXN_FINISH_ERROR,
+                    .session = SERVER_SESSION_VALID_PREFIX,
+                    .wire = output_result.wire,
+                    .detail = "scripted stream-update failure",
+                    .secondary = secondary,
+                };
+            }
+            const server_output_observation flush = {
+                .operation = SERVER_OUTPUT_STREAM_FLUSH,
+                .text = "x",
+                .text_len = 1,
+                .safe_len = 1,
+            };
+            output_result = effects->adapters->output.apply(
+                effects->adapters->output.ctx, &flush);
+            if (!output_result.ok) {
+                return (server_txn_step_result) {
+                    .status = SERVER_TXN_STEP_TERMINAL,
+                    .class = SERVER_TXN_FAILED,
+                    .reason = SERVER_TXN_REASON_OUTPUT_FAILED,
+                    .finish = SERVER_TXN_FINISH_ERROR,
+                    .session = SERVER_SESSION_VALID_PREFIX,
+                    .wire = output_result.wire,
+                    .detail = "scripted stream-flush failure",
+                    .secondary = secondary,
+                };
+            }
+            const server_statistics_observation stats = {
+                .operation = SERVER_STATS_PROGRESS,
+            };
+            if (!effects->adapters->stats.record(
+                    effects->adapters->stats.ctx, &stats)) {
+                secondary |= SERVER_TXN_SECONDARY_STATS;
+            }
+            const server_statistics_observation prefill_done = {
+                .operation = SERVER_STATS_PREFILL_DONE,
+            };
+            if (!effects->adapters->stats.record(
+                    effects->adapters->stats.ctx, &prefill_done)) {
+                secondary |= SERVER_TXN_SECONDARY_STATS;
+            }
+        }
+        return (server_txn_step_result) {
+            .status = SERVER_TXN_STEP_TERMINAL,
+            .class = SERVER_TXN_COMPLETED,
+            .reason = SERVER_TXN_REASON_STOP,
+            .finish = SERVER_TXN_FINISH_STOP,
+            .session = SERVER_SESSION_COMMITTED,
+            .wire = SERVER_WIRE_IRREVERSIBLE,
+            .secondary = secondary,
+        };
+    }
+    return (server_txn_step_result) {
+        .status = SERVER_TXN_STEP_CONTINUE,
+        .wire = effects->wire,
+        .secondary = secondary,
+    };
+}
+
+static server_txn_settle_result
+test_txn_settle(void *ctx, const server_txn_outcome *outcome, bool commit) {
+    test_txn_effects *effects = ctx;
+    effects->settle_calls++;
+    test_txn_record(effects, commit ? TEST_TXN_EVENT_COMMIT :
+                                      TEST_TXN_EVENT_ROLLBACK);
+    return (server_txn_settle_result) {
+        .ok = !effects->fail_settle,
+        .session = commit ?
+            (effects->settle_secondary & SERVER_TXN_SECONDARY_CHECKPOINT ?
+                SERVER_SESSION_VALID_PREFIX : SERVER_SESSION_COMMITTED) :
+            outcome->session,
+        .wire = effects->settle_failure_reason ==
+                    SERVER_TXN_REASON_OUTPUT_FAILED ?
+                SERVER_WIRE_BROKEN : outcome->wire,
+        .failure_class = SERVER_TXN_FAILED,
+        .failure_reason = effects->settle_failure_reason,
+        .failure_detail = "scripted settlement output failure",
+        .secondary = effects->settle_secondary,
+    };
+}
+
+static server_txn_output_result test_txn_output_apply(
+        void *ctx, const server_output_observation *observation) {
+    test_txn_effects *effects = ctx;
+    effects->output_apply_calls++;
+    const test_txn_event events[] = {
+        TEST_TXN_EVENT_OUTPUT_PREFILL,
+        TEST_TXN_EVENT_OUTPUT_OPEN,
+        TEST_TXN_EVENT_OUTPUT_UPDATE,
+        TEST_TXN_EVENT_OUTPUT_FLUSH,
+    };
+    test_txn_record(effects, events[observation->operation]);
+    const bool fail = effects->fail_output_operation ==
+                      (int)observation->operation + 1;
+    effects->wire = fail ? SERVER_WIRE_BROKEN : SERVER_WIRE_IRREVERSIBLE;
+    return (server_txn_output_result) {
+        .ok = !fail,
+        .wire = effects->wire,
+    };
+}
+
+static server_trace_result test_txn_trace_record(
+        void *ctx, const server_trace_observation *observation) {
+    (void)observation;
+    test_txn_effects *effects = ctx;
+    effects->trace_record_calls++;
+    test_txn_record(effects, TEST_TXN_EVENT_TRACE_OBSERVE);
+    return (server_trace_result) {
+        .ok = !effects->fail_trace_record,
+        .trace_id = 1,
+    };
+}
+
+static bool test_txn_stats_record(
+        void *ctx, const server_statistics_observation *observation) {
+    (void)observation;
+    test_txn_effects *effects = ctx;
+    effects->stats_record_calls++;
+    test_txn_record(effects, TEST_TXN_EVENT_STATS_OBSERVE);
+    return !effects->fail_stats_record;
+}
+
+static server_txn_output_result test_txn_output(
+        void *ctx, const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->output_calls++;
+    test_txn_record(effects, TEST_TXN_EVENT_OUTPUT);
+    return (server_txn_output_result) {
+        .ok = !effects->fail_output,
+        .wire = effects->fail_output ? SERVER_WIRE_IRREVERSIBLE :
+                                       SERVER_WIRE_COMPLETE,
+    };
+}
+
+static bool test_txn_trace(void *ctx, const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->trace_calls++;
+    test_txn_record(effects, TEST_TXN_EVENT_TRACE);
+    return !effects->fail_trace;
+}
+
+static bool test_txn_stats(void *ctx, const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->stats_calls++;
+    test_txn_record(effects, TEST_TXN_EVENT_STATS);
+    return !effects->fail_stats;
+}
+
+static bool test_txn_cleanup(void *ctx,
+                             const server_txn_outcome *outcome) {
+    (void)outcome;
+    test_txn_effects *effects = ctx;
+    effects->cleanup_calls++;
+    test_txn_record(effects, TEST_TXN_EVENT_CLEANUP);
+    return !effects->fail_cleanup;
+}
+
+static void test_txn_terminalizer_is_idempotent(void) {
+    test_txn_effects effects = {0};
+    const server_txn_adapters adapters = {
+        .session = {
+            .ctx = &effects,
+            .advance = test_txn_advance,
+            .settle = test_txn_settle,
+            .cleanup = test_txn_cleanup,
+        },
+        .output = {.ctx = &effects, .finish = test_txn_output},
+        .trace = {.ctx = &effects, .finish = test_txn_trace},
+        .stats = {.ctx = &effects, .finish = test_txn_stats},
+    };
+    server_txn tx;
+    server_txn_init(&tx, &adapters);
+    server_txn_complete(&tx, SERVER_TXN_REASON_STOP, SERVER_TXN_FINISH_STOP);
+
+    server_txn_outcome first = server_txn_terminalize(&tx);
+    server_txn_outcome second = server_txn_terminalize(&tx);
+
+    TEST_ASSERT(first.class == SERVER_TXN_COMPLETED);
+    TEST_ASSERT(first.reason == SERVER_TXN_REASON_STOP);
+    TEST_ASSERT(first.finish == SERVER_TXN_FINISH_STOP);
+    TEST_ASSERT(first.session == SERVER_SESSION_COMMITTED);
+    TEST_ASSERT(first.wire == SERVER_WIRE_COMPLETE);
+    TEST_ASSERT(first.class == second.class);
+    TEST_ASSERT(first.decided_at == second.decided_at);
+    TEST_ASSERT(first.reason == second.reason);
+    TEST_ASSERT(first.finish == second.finish);
+    TEST_ASSERT(first.session == second.session);
+    TEST_ASSERT(first.wire == second.wire);
+    TEST_ASSERT(first.secondary == second.secondary);
+    TEST_ASSERT(!strcmp(first.detail, second.detail));
+    TEST_ASSERT(effects.settle_calls == 1);
+    TEST_ASSERT(effects.output_calls == 1);
+    TEST_ASSERT(effects.trace_calls == 1);
+    TEST_ASSERT(effects.stats_calls == 1);
+    TEST_ASSERT(effects.cleanup_calls == 1);
+    const test_txn_event expected[] = {
+        TEST_TXN_EVENT_COMMIT,
+        TEST_TXN_EVENT_OUTPUT,
+        TEST_TXN_EVENT_TRACE,
+        TEST_TXN_EVENT_CLEANUP,
+        TEST_TXN_EVENT_STATS,
+    };
+    test_txn_expect_events(&effects, expected,
+                           (int)(sizeof(expected) / sizeof(expected[0])));
+}
+
+static server_txn_outcome test_txn_run_script(test_txn_effects *effects) {
+    const server_txn_adapters adapters = {
+        .session = {
+            .ctx = effects,
+            .advance = test_txn_advance,
+            .settle = test_txn_settle,
+            .cleanup = test_txn_cleanup,
+        },
+        .output = {
+            .ctx = effects,
+            .apply = test_txn_output_apply,
+            .finish = test_txn_output,
+        },
+        .trace = {
+            .ctx = effects,
+            .record = test_txn_trace_record,
+            .finish = test_txn_trace,
+        },
+        .stats = {
+            .ctx = effects,
+            .record = test_txn_stats_record,
+            .finish = test_txn_stats,
+        },
+    };
+    effects->adapters = &adapters;
+    return server_txn_run_adapters(&adapters);
+}
+
+static void test_txn_scripted_success_order(void) {
+    test_txn_effects effects = {0};
+    server_txn_outcome outcome = test_txn_run_script(&effects);
+    TEST_ASSERT(outcome.class == SERVER_TXN_COMPLETED);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_STOP);
+    const test_txn_event expected[] = {
+        TEST_TXN_EVENT_RESTORE,
+        TEST_TXN_EVENT_TRACE_OBSERVE,
+        TEST_TXN_EVENT_STATS_OBSERVE,
+        TEST_TXN_EVENT_SYNCHRONIZE,
+        TEST_TXN_EVENT_OUTPUT_PREFILL,
+        TEST_TXN_EVENT_STATS_OBSERVE,
+        TEST_TXN_EVENT_EXTEND,
+        TEST_TXN_EVENT_OUTPUT_OPEN,
+        TEST_TXN_EVENT_DECODE,
+        TEST_TXN_EVENT_TRACE_OBSERVE,
+        TEST_TXN_EVENT_TRACE_OBSERVE,
+        TEST_TXN_EVENT_OUTPUT_UPDATE,
+        TEST_TXN_EVENT_OUTPUT_FLUSH,
+        TEST_TXN_EVENT_STATS_OBSERVE,
+        TEST_TXN_EVENT_STATS_OBSERVE,
+        TEST_TXN_EVENT_COMMIT,
+        TEST_TXN_EVENT_OUTPUT,
+        TEST_TXN_EVENT_TRACE,
+        TEST_TXN_EVENT_CLEANUP,
+        TEST_TXN_EVENT_STATS,
+    };
+    test_txn_expect_events(&effects, expected,
+                           (int)(sizeof(expected) / sizeof(expected[0])));
+}
+
+static void test_txn_scripted_phase_outcomes(void) {
+    const struct {
+        server_txn_phase phase;
+        server_txn_class class;
+        server_txn_reason reason;
+        server_session_disposition session;
+    } cases[] = {
+        {SERVER_TXN_PHASE_RESTORE, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_RESTORE_FAILED, SERVER_SESSION_INVALIDATED},
+        {SERVER_TXN_PHASE_SYNCHRONIZE, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_SYNC_FAILED, SERVER_SESSION_INVALIDATED},
+        {SERVER_TXN_PHASE_SYNCHRONIZE, SERVER_TXN_CANCELLED,
+         SERVER_TXN_REASON_CANCELLED, SERVER_SESSION_VALID_PREFIX},
+        {SERVER_TXN_PHASE_DECODE, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_DECODE_FAILED, SERVER_SESSION_INVALIDATED},
+        {SERVER_TXN_PHASE_EXTEND, SERVER_TXN_FAILED,
+         SERVER_TXN_REASON_OUTPUT_FAILED, SERVER_SESSION_VALID_PREFIX},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        test_txn_effects effects = {
+            .fail_phase = cases[i].phase,
+            .fail_class = cases[i].class,
+            .fail_reason = cases[i].reason,
+            .fail_session = cases[i].session,
+        };
+        server_txn_outcome outcome = test_txn_run_script(&effects);
+        TEST_ASSERT(outcome.class == cases[i].class);
+        TEST_ASSERT(outcome.reason == cases[i].reason);
+        TEST_ASSERT(outcome.decided_at == cases[i].phase);
+        TEST_ASSERT(outcome.session == cases[i].session);
+        TEST_ASSERT(effects.settle_calls == 1);
+        TEST_ASSERT(effects.output_calls == 1);
+        TEST_ASSERT(effects.trace_calls == 1);
+        TEST_ASSERT(effects.stats_calls == 1);
+        TEST_ASSERT(effects.cleanup_calls == 1);
+    }
+}
+
+static void test_txn_scripted_failure_precedence(void) {
+    test_txn_effects effects = {
+        .fail_phase = SERVER_TXN_PHASE_DECODE,
+        .fail_class = SERVER_TXN_FAILED,
+        .fail_reason = SERVER_TXN_REASON_DECODE_FAILED,
+        .fail_session = SERVER_SESSION_INVALIDATED,
+        .fail_settle = true,
+        .fail_output = true,
+        .fail_trace = true,
+        .fail_stats = true,
+        .fail_cleanup = true,
+    };
+    server_txn_outcome outcome = test_txn_run_script(&effects);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_DECODE_FAILED);
+    TEST_ASSERT(outcome.decided_at == SERVER_TXN_PHASE_DECODE);
+    TEST_ASSERT(outcome.session == SERVER_SESSION_INVALIDATED);
+    TEST_ASSERT(outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_ROLLBACK);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_OUTPUT);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_TRACE);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_STATS);
+    TEST_ASSERT(outcome.secondary & SERVER_TXN_SECONDARY_CLEANUP);
+    const test_txn_event expected[] = {
+        TEST_TXN_EVENT_RESTORE,
+        TEST_TXN_EVENT_TRACE_OBSERVE,
+        TEST_TXN_EVENT_STATS_OBSERVE,
+        TEST_TXN_EVENT_SYNCHRONIZE,
+        TEST_TXN_EVENT_OUTPUT_PREFILL,
+        TEST_TXN_EVENT_STATS_OBSERVE,
+        TEST_TXN_EVENT_EXTEND,
+        TEST_TXN_EVENT_OUTPUT_OPEN,
+        TEST_TXN_EVENT_DECODE,
+        TEST_TXN_EVENT_ROLLBACK,
+        TEST_TXN_EVENT_OUTPUT,
+        TEST_TXN_EVENT_TRACE,
+        TEST_TXN_EVENT_CLEANUP,
+        TEST_TXN_EVENT_STATS,
+    };
+    test_txn_expect_events(&effects, expected,
+                           (int)(sizeof(expected) / sizeof(expected[0])));
+}
+
+static void test_txn_scripted_commit_and_output_failures(void) {
+    test_txn_effects commit = {.fail_settle = true};
+    server_txn_outcome commit_outcome = test_txn_run_script(&commit);
+    TEST_ASSERT(commit_outcome.reason == SERVER_TXN_REASON_COMMIT_FAILED);
+    TEST_ASSERT(commit_outcome.finish == SERVER_TXN_FINISH_STOP);
+    TEST_ASSERT(commit_outcome.session == SERVER_SESSION_INVALIDATED);
+
+    test_txn_effects output = {.fail_output = true};
+    server_txn_outcome output_outcome = test_txn_run_script(&output);
+    TEST_ASSERT(output_outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(output_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(output.output_calls == 1);
+
+    test_txn_effects checkpoint = {
+        .settle_secondary = SERVER_TXN_SECONDARY_CHECKPOINT,
+    };
+    server_txn_outcome checkpoint_outcome = test_txn_run_script(&checkpoint);
+    TEST_ASSERT(checkpoint_outcome.reason == SERVER_TXN_REASON_STOP);
+    TEST_ASSERT(checkpoint_outcome.secondary & SERVER_TXN_SECONDARY_CHECKPOINT);
+    TEST_ASSERT(checkpoint_outcome.session == SERVER_SESSION_VALID_PREFIX);
+
+    test_txn_effects settle_output = {
+        .settle_failure_reason = SERVER_TXN_REASON_OUTPUT_FAILED,
+    };
+    server_txn_outcome settle_output_outcome =
+        test_txn_run_script(&settle_output);
+    TEST_ASSERT(settle_output_outcome.reason ==
+                SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(settle_output_outcome.decided_at == SERVER_TXN_PHASE_SETTLE);
+    TEST_ASSERT(settle_output_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(settle_output.output_calls == 0);
+}
+
+static void test_txn_scripted_operational_adapter_failures(void) {
+    test_txn_effects prefill = {
+        .fail_output_operation = SERVER_OUTPUT_PREFILL_TICK + 1,
+    };
+    server_txn_outcome prefill_outcome = test_txn_run_script(&prefill);
+    TEST_ASSERT(prefill_outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(prefill_outcome.decided_at == SERVER_TXN_PHASE_SYNCHRONIZE);
+    TEST_ASSERT(prefill_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(prefill.output_apply_calls == 1);
+
+    test_txn_effects open = {
+        .fail_output_operation = SERVER_OUTPUT_STREAM_OPEN + 1,
+    };
+    server_txn_outcome open_outcome = test_txn_run_script(&open);
+    TEST_ASSERT(open_outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(open_outcome.decided_at == SERVER_TXN_PHASE_EXTEND);
+    TEST_ASSERT(open_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(open.output_apply_calls == 2);
+
+    test_txn_effects update = {
+        .fail_output_operation = SERVER_OUTPUT_STREAM_UPDATE + 1,
+    };
+    server_txn_outcome update_outcome = test_txn_run_script(&update);
+    TEST_ASSERT(update_outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(update_outcome.decided_at == SERVER_TXN_PHASE_DECODE);
+    TEST_ASSERT(update_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(update.output_apply_calls == 3);
+
+    test_txn_effects flush = {
+        .fail_output_operation = SERVER_OUTPUT_STREAM_FLUSH + 1,
+    };
+    server_txn_outcome flush_outcome = test_txn_run_script(&flush);
+    TEST_ASSERT(flush_outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(flush_outcome.decided_at == SERVER_TXN_PHASE_DECODE);
+    TEST_ASSERT(flush_outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(flush.output_apply_calls == 4);
+
+    test_txn_effects observations = {
+        .fail_trace_record = true,
+        .fail_stats_record = true,
+    };
+    server_txn_outcome observations_outcome =
+        test_txn_run_script(&observations);
+    TEST_ASSERT(observations_outcome.reason == SERVER_TXN_REASON_STOP);
+    TEST_ASSERT(observations_outcome.secondary & SERVER_TXN_SECONDARY_TRACE);
+    TEST_ASSERT(observations_outcome.secondary & SERVER_TXN_SECONDARY_STATS);
+    TEST_ASSERT(observations.trace_record_calls == 3);
+    TEST_ASSERT(observations.stats_record_calls == 4);
+}
+
+static void test_production_failure_latch_preserves_causal_order(void) {
+    const sig_atomic_t saved_stop = g_stop_requested;
+    g_stop_requested = 0;
+    TEST_ASSERT(production_peer_gone_reason() ==
+                SERVER_TXN_REASON_CLIENT_GONE);
+    g_stop_requested = 1;
+    TEST_ASSERT(production_peer_gone_reason() == SERVER_TXN_REASON_SHUTDOWN);
+    g_stop_requested = saved_stop;
+
+    production_txn shutdown_first = {0};
+    TEST_ASSERT(production_latch_failure(
+        &shutdown_first, SERVER_TXN_CANCELLED, SERVER_TXN_REASON_SHUTDOWN,
+        SERVER_SESSION_VALID_PREFIX, "shutdown requested"));
+    TEST_ASSERT(!production_latch_failure(
+        &shutdown_first, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+        SERVER_SESSION_VALID_PREFIX, "client stream write failed"));
+    TEST_ASSERT(shutdown_first.first_failure_reason ==
+                SERVER_TXN_REASON_SHUTDOWN);
+    TEST_ASSERT(shutdown_first.phase_secondary &
+                SERVER_TXN_SECONDARY_OUTPUT);
+
+    production_txn output_first = {0};
+    TEST_ASSERT(production_latch_failure(
+        &output_first, SERVER_TXN_FAILED, SERVER_TXN_REASON_OUTPUT_FAILED,
+        SERVER_SESSION_VALID_PREFIX, "client stream write failed"));
+    TEST_ASSERT(!production_latch_failure(
+        &output_first, SERVER_TXN_CANCELLED, SERVER_TXN_REASON_SHUTDOWN,
+        SERVER_SESSION_VALID_PREFIX, "shutdown requested"));
+    TEST_ASSERT(output_first.first_failure_reason ==
+                SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(!(output_first.phase_secondary &
+                  SERVER_TXN_SECONDARY_OUTPUT));
+}
+
+static void test_txn_broken_wire_is_never_finalized_again(void) {
+    test_txn_effects effects = {0};
+    const server_txn_adapters adapters = {
+        .session = {
+            .ctx = &effects,
+            .advance = test_txn_advance,
+            .settle = test_txn_settle,
+            .cleanup = test_txn_cleanup,
+        },
+        .output = {.ctx = &effects, .finish = test_txn_output},
+        .trace = {.ctx = &effects, .finish = test_txn_trace},
+        .stats = {.ctx = &effects, .finish = test_txn_stats},
+    };
+    server_txn tx;
+    server_txn_init(&tx, &adapters);
+    tx.phase = SERVER_TXN_PHASE_DECODE;
+    server_txn_fail_once(&tx, tx.phase, SERVER_TXN_FAILED,
+                         SERVER_TXN_REASON_OUTPUT_FAILED,
+                         SERVER_SESSION_VALID_PREFIX,
+                         "stream write failed");
+    tx.outcome.wire = SERVER_WIRE_BROKEN;
+    server_txn_outcome outcome = server_txn_terminalize(&tx);
+    TEST_ASSERT(outcome.reason == SERVER_TXN_REASON_OUTPUT_FAILED);
+    TEST_ASSERT(outcome.wire == SERVER_WIRE_BROKEN);
+    TEST_ASSERT(effects.output_calls == 0);
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -15476,6 +18208,102 @@ static void test_tool_memory_replays_sampled_dsml(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_tool_memory_attach_requires_all_block_invokes(void) {
+    const char *generated =
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls sampled = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &sampled));
+    TEST_ASSERT(sampled.len == 2);
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    assign_tool_call_ids(&s, &sampled, API_OPENAI);
+    tool_memory_remember(&s, &sampled);
+
+    /* A message replaying only one of the block's two calls must not attach
+     * the raw block: rendering it would duplicate the other invoke. */
+    chat_msgs partial = {0};
+    chat_msg one = {0};
+    one.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup(sampled.v[0].id);
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(&one.calls, tc);
+    chat_msgs_push(&partial, one);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&s, &partial, &stats);
+    TEST_ASSERT(partial.v[0].calls.raw_tool_text == NULL);
+    TEST_ASSERT(stats.canonical == 1);
+    TEST_ASSERT(stats.mem == 0);
+
+    /* A message carrying both calls attaches the block as before. */
+    chat_msgs full = {0};
+    chat_msg both = {0};
+    both.role = xstrdup("assistant");
+    for (int i = 0; i < 2; i++) {
+        tool_call c = {0};
+        c.id = xstrdup(sampled.v[i].id);
+        c.name = xstrdup("bash");
+        c.arguments = xstrdup("{}");
+        tool_calls_push(&both.calls, c);
+    }
+    chat_msgs_push(&full, both);
+    tool_replay_stats stats2 = {0};
+    tool_memory_attach_to_messages(&s, &full, &stats2);
+    TEST_ASSERT(full.v[0].calls.raw_tool_text != NULL);
+    TEST_ASSERT(stats2.mem == 1);
+    TEST_ASSERT(stats2.canonical == 0);
+
+    chat_msgs_free(&partial);
+    chat_msgs_free(&full);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&sampled);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_raw_dsml_capture_keeps_sampled_separator(void) {
+    /* A single-newline separator is not the canonical "\n\n", but the model
+     * sampled it, so byte-exact replay must include it in the raw block. */
+    const char *generated =
+        "done\n"
+        DS4_TOOL_CALLS_START "\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(content && !strcmp(content, "done"));
+    TEST_ASSERT(calls.raw_tool_text != NULL);
+    TEST_ASSERT(calls.raw_tool_text[0] == '\n');
+    TEST_ASSERT(!strncmp(calls.raw_tool_text + 1, DS4_TOOL_CALLS_START,
+                         strlen(DS4_TOOL_CALLS_START)));
+    /* content + raw block must reassemble the sampled bytes exactly. */
+    TEST_ASSERT(strlen(content) + strlen(calls.raw_tool_text) == strlen(generated));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     const char *sampled_dsml =
         "\n\n" DS4_TOOL_CALLS_START "\n"
@@ -16474,7 +19302,7 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
-static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+static void test_kv_cache_continued_uses_step_thresholds(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
@@ -16482,11 +19310,16 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 
+    /* A full step must pass since the last store, from wherever it was. */
     kc.continued_last_store_tokens = 4096;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 14336) == 14336);
 
+    /* Unaligned resume positions (disk hits) get waypoints too. */
     kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 34816) == 34816);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 45374) == 45374);
 
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
@@ -16495,7 +19328,7 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.opt.boundary_align_tokens = 0;
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30480) == 30480);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -16915,6 +19748,47 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_evicts_stale_anchor_before_fresh_waypoint(void) {
+    /* Observed in production: the newest continued waypoints of the live
+     * conversation (hits=0 because they were written minutes ago) were
+     * evicted while stale never-hit anchors survived on the reason bonus.
+     * A stale anchor must lose to a fresh waypoint of equal density. */
+    char tmpl[] = "/tmp/ds4-kv-stale-anchor-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *anchor_sha = "1111111111111111111111111111111111111111";
+    const char *waypoint_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    uint64_t stale = now - 30u * 24u * 3600u;
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, stale, 2048);
+    test_kv_stub_file(dir, waypoint_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+
+    char anchor_name[44], waypoint_name[44];
+    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
+    snprintf(waypoint_name, sizeof(waypoint_name), "%.40s.kv", waypoint_sha);
+    char *anchor_path = path_join(dir, anchor_name);
+    char *waypoint_path = path_join(dir, waypoint_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(anchor_path, F_OK) != 0);
+    TEST_ASSERT(access(waypoint_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(anchor_path);
+    unlink(waypoint_path);
+    free(anchor_path);
+    free(waypoint_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_makes_room_before_store(void) {
     char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -17086,9 +19960,10 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+    /* A fresh never-hit entry gets the freshness grace: it scores like a
+     * once-hit file, (1+1) * tokens/size, and never below the (0+1) floor. */
+    TEST_ASSERT(f_on == 2.0 * (double)fresh.tokens / (double)fresh.file_size);
+    TEST_ASSERT(f_on >= 1.0 * (double)fresh.tokens / (double)fresh.file_size);
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -17429,6 +20304,20 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_stats_uses_published_snapshot();
+    test_dequeue_prioritizes_jobs_then_publishes_idle_stats();
+    test_production_txn_terminalizes_queued_disconnect();
+    test_production_txn_shutdown_beats_queued_disconnect();
+    test_production_settle_rollback_clears_live_bindings();
+    test_job_terminal_outcome_is_published_once();
+    test_txn_terminalizer_is_idempotent();
+    test_txn_scripted_success_order();
+    test_txn_scripted_phase_outcomes();
+    test_txn_scripted_failure_precedence();
+    test_txn_scripted_commit_and_output_failures();
+    test_txn_scripted_operational_adapter_failures();
+    test_production_failure_latch_preserves_causal_order();
+    test_txn_broken_wire_is_never_finalized_again();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();
@@ -17488,6 +20377,8 @@ static void ds4_server_unit_tests_run(void) {
     test_glm_tool_checkpoint_suffix_is_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
+    test_tool_memory_attach_requires_all_block_invokes();
+    test_raw_dsml_capture_keeps_sampled_separator();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
@@ -17524,7 +20415,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
-    test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_uses_step_thresholds();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
@@ -17533,6 +20424,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_evicts_stale_anchor_before_fresh_waypoint();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
