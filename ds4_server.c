@@ -944,18 +944,18 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
-static bool server_model_alias_known(const char *id) {
-    return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
-            !strcmp(id, "deepseek-v4-pro") ||
-            !strcmp(id, "glm-5.2") ||
-            !strcmp(id, "glm-5.2-chat") ||
-            !strcmp(id, "glm-5.2-no-think") ||
-            !strcmp(id, "glm-5.2-nothink") ||
-            !strcmp(id, "glm-5.2-reasoner") ||
-            !strcmp(id, "zai/glm-5.2") ||
-            !strcmp(id, "zai/glm-5.2-chat") ||
-            !strcmp(id, "zai/glm-5.2-reasoner"));
+static bool server_model_id_available(bool is_glm, const char *loaded_id,
+                                      const char *id) {
+    if (!id) return false;
+    if (!is_glm) return loaded_id && !strcmp(id, loaded_id);
+    return !strcmp(id, "glm-5.2") ||
+           !strcmp(id, "glm-5.2-chat") ||
+           !strcmp(id, "glm-5.2-no-think") ||
+           !strcmp(id, "glm-5.2-nothink") ||
+           !strcmp(id, "glm-5.2-reasoner") ||
+           !strcmp(id, "zai/glm-5.2") ||
+           !strcmp(id, "zai/glm-5.2-chat") ||
+           !strcmp(id, "zai/glm-5.2-reasoner");
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -12324,6 +12324,12 @@ static void append_model_json(buf *b, const server *s, const char *id) {
 }
 
 static bool send_model(server *s, int fd, const char *id) {
+    const bool is_glm = ds4_engine_is_glm_dsa(s->engine);
+    const char *loaded_id = server_model_id_from_engine(s->engine);
+    if (!server_model_id_available(is_glm, loaded_id, id)) {
+        return http_error(fd, s->enable_cors, 404, "unknown model");
+    }
+
     buf b = {0};
     append_model_json(&b, s, id);
     buf_putc(&b, '\n');
@@ -12332,21 +12338,28 @@ static bool send_model(server *s, int fd, const char *id) {
     return ok;
 }
 
-static bool send_models(server *s, int fd) {
-    buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
-    } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
+static void append_models_json(buf *b, const char **ids, size_t count,
+                               const char *name, int ctx, int default_tokens) {
+    buf_puts(b, "{\"object\":\"list\",\"data\":[");
+    for (size_t i = 0; i < count; i++) {
+        if (i) buf_putc(b, ',');
+        append_model_json_values(b, ids[i], name, ctx, default_tokens);
     }
-    buf_puts(&b, "]}\n");
+    buf_puts(b, "]}\n");
+}
+
+static bool send_models(server *s, int fd) {
+    const char *ids[3] = {server_model_id_from_engine(s->engine)};
+    size_t count = 1;
+    if (ds4_engine_is_glm_dsa(s->engine)) {
+        ids[1] = "glm-5.2-chat";
+        ids[2] = "glm-5.2-reasoner";
+        count = 3;
+    }
+
+    buf b = {0};
+    append_models_json(&b, ids, count, ds4_engine_model_name(s->engine),
+                       s->ctx_size, s->default_tokens);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -12387,8 +12400,7 @@ static void *client_main(void *arg) {
     const char *model_path_prefix = "/v1/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
-        !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        !strncmp(hr.path, model_path_prefix, model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -14456,8 +14468,23 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+}
+
+static void test_model_metadata_availability(void) {
+    TEST_ASSERT(server_model_id_available(false, "deepseek-v4-flash",
+                                          "deepseek-v4-flash"));
+    TEST_ASSERT(!server_model_id_available(false, "deepseek-v4-flash",
+                                           "deepseek-v4-pro"));
+    TEST_ASSERT(server_model_id_available(false, "deepseek-v4-pro",
+                                          "deepseek-v4-pro"));
+    TEST_ASSERT(!server_model_id_available(false, "deepseek-v4-pro",
+                                           "deepseek-v4-flash"));
+    TEST_ASSERT(server_model_id_available(true, "glm-5.2", "glm-5.2"));
+    TEST_ASSERT(server_model_id_available(true, "glm-5.2", "glm-5.2-chat"));
+    TEST_ASSERT(server_model_id_available(true, "glm-5.2", "glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_id_available(true, "glm-5.2", "zai/glm-5.2-chat"));
+    TEST_ASSERT(!server_model_id_available(true, "glm-5.2",
+                                           "deepseek-v4-flash"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -16298,6 +16325,38 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_models_list_uses_loaded_family(void) {
+    buf b = {0};
+    const char *flash_ids[] = {"deepseek-v4-flash"};
+    append_models_json(&b, flash_ids, 1, "DeepSeek V4 Flash", 100000, 100000);
+
+    const char *flash = strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"");
+    TEST_ASSERT(flash != NULL);
+    TEST_ASSERT(strstr(flash, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") == NULL);
+    buf_free(&b);
+
+    const char *pro_ids[] = {"deepseek-v4-pro"};
+    append_models_json(&b, pro_ids, 1, "DeepSeek V4 Pro", 100000, 100000);
+    const char *pro = strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"");
+    TEST_ASSERT(pro != NULL);
+    TEST_ASSERT(strstr(pro, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") == NULL);
+    buf_free(&b);
+
+    const char *glm_ids[] = {"glm-5.2", "glm-5.2-chat", "glm-5.2-reasoner"};
+    append_models_json(&b, glm_ids, 3, "GLM 5.2", 100000, 100000);
+    const char *glm = strstr(b.ptr, "\"id\":\"glm-5.2\"");
+    TEST_ASSERT(glm != NULL);
+    TEST_ASSERT(strstr(glm, "\"name\":\"GLM 5.2\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"glm-5.2-chat\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"glm-5.2-reasoner\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") == NULL);
+
+    buf_free(&b);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -17435,6 +17494,7 @@ static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
+    test_model_metadata_availability();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
@@ -17516,6 +17576,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
+    test_models_list_uses_loaded_family();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();

@@ -1014,16 +1014,18 @@ MTP speculative decoding is disabled while native session batching is active.
 Supported endpoints:
 
 - `GET /v1/models`
-- `GET /v1/models/deepseek-v4-flash`
-- `GET /v1/models/deepseek-v4-pro`
+- `GET /v1/models/<available-model-id>`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
 
-The Flash and PRO model endpoints are compatibility aliases. They both report
-the model currently loaded from the GGUF passed with `-m`; the endpoint name does
-not select a different model.
+The model metadata endpoints never advertise an unloaded physical variant. A
+Flash GGUF exposes only `deepseek-v4-flash`, while a Pro GGUF exposes only
+`deepseek-v4-pro`. GLM exposes `glm-5.2`, `glm-5.2-chat`, and
+`glm-5.2-reasoner`, which select behavior for the same loaded GLM GGUF. The
+request `model` field may control thinking through such aliases, but it never
+loads or switches the GGUF used for inference.
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
