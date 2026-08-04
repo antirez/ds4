@@ -2390,6 +2390,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
+        /* Preserve the serial F32 row arithmetic on supported Metal paths. */
+        bool                    exact_rows,
         bool                   *mid_is_f16,
         bool                    force_resident);
 

@@ -307,7 +307,7 @@ int main(void) {
         expert_bytes, row_bytes, DIM, DIM, DIM,
         selected_batch_tensor, weights_batch_tensor,
         N_TOTAL_EXPERT, N_EXPERT, 7.0f, x_batch_tensor,
-        0u, BATCH_TOKENS, &mid_is_f16, true);
+        0u, BATCH_TOKENS, false, &mid_is_f16, true);
     ok = ok && mid_is_f16;
     ok = ok && ds4_gpu_tensor_read(
         mid_batch_tensor, 0, mid_batch_storage,

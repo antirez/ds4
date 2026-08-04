@@ -37516,10 +37516,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
+        bool                    exact_rows,
         bool                   *mid_is_f16,
         bool                    force_resident) {
-    (void)force_resident;
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    (void)force_resident;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
      * expert range and rebase ids in the kernels. */
     uint32_t first_expert = 0;
@@ -37855,6 +37856,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * write/read. --quality keeps the older F32 intermediate.
          */
         const bool request_mid_f16 =
+            !exact_rows &&
             !g_quality_mode &&
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr;
@@ -38168,7 +38170,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             !use_q4_batch_expert_table &&
             !use_mm_id &&
             n_expert == 6 &&
-            n_tokens <= 4u &&
+            (n_tokens <= 4u || (exact_rows && n_tokens <= 5u)) &&
             down_sum6_pipeline != nil;
         int ok = 0;
         if (use_iq2_batch_selected_addr) {
