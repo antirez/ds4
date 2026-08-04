@@ -8448,6 +8448,7 @@ struct server {
     int slot_count;
     int ctx_size;
     bool batched_mode;
+    int thinking_grace_tokens;
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -11624,6 +11625,8 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    const int thinking_grace = s->thinking_grace_tokens;
+    bool thinking_grace_used = false;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -11715,6 +11718,33 @@ decode_again:
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             thinking_state_feed(&thinking, piece, piece_len);
+
+            /* Thinking grace.  Stopping in the middle of a thinking block
+             * does more damage than returning a truncated reply: it also
+             * poisons the session checkpoint.  Without a closing marker
+             * `thinking_live` never becomes valid, so the checkpoint is keyed
+             * on the raw token-text -- which embeds the hidden reasoning the
+             * client never replays -- and can therefore never be a prefix of a
+             * future request.  The file is born dead: hundreds of MiB written
+             * on every session switch and never read back.  Grant a bounded
+             * extension once, always within the remaining context room, so the
+             * block has a chance to close. */
+            if (!thinking_grace_used && thinking_grace > 0 &&
+                thinking.inside && completion >= max_tokens) {
+                int extra = thinking_grace;
+                if (max_tokens + extra > room) extra = room - max_tokens;
+                if (extra > 0) {
+                    max_tokens += extra;
+                    thinking_grace_used = true;
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: thinking grace granted extra=%d "
+                               "max_tokens=%d completion=%d",
+                               extra, max_tokens, completion);
+                    trace_event(s, trace_id,
+                                "thinking grace granted: extra=%d max=%d",
+                                extra, max_tokens);
+                }
+            }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
@@ -12949,6 +12979,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int thinking_grace_tokens;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -13161,6 +13192,9 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--thinking-grace-tokens")) {
+            c.thinking_grace_tokens =
+                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -13378,6 +13412,7 @@ int main(int argc, char **argv) {
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    s.thinking_grace_tokens = cfg.thinking_grace_tokens;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
