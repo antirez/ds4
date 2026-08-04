@@ -32157,6 +32157,10 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                                     (uint64_t)draft * logits_bytes,
                                     logits_bytes);
             uint64_t gpu_key = 0;
+            /* reverse the w2 scan per draft so consecutive steps hit the
+             * L3-resident tail of the previous step (measured -8% on
+             * gfx1151; argmax output is direction-independent) */
+            ds4_gpu_dspark_markov_set_reverse((int)(draft & 1u));
             bool gpu_ok = row_view &&
                 ds4_gpu_dspark_markov_argmax_tensor(
                     g->dspark_draft_tokens,

@@ -228,7 +228,7 @@ static int routed_moe_q2_float_down_launch(
     }
 
     const uint32_t down_tile = 4u;
-    const uint32_t down_rpb = 16u;
+    const uint32_t down_rpb = 32u;
     const uint32_t down_threads = down_rpb * 32u;
     const size_t down_shmem = (size_t)down_tile * 256u * sizeof(float);
     const int use_f16_down = (out_dim & 1u) == 0u;

@@ -287,6 +287,43 @@ __global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint
     if (tid == 0u) *out_idx = sm_idx[0];
 }
 
+/* Batched argmax: one block per row, same first-max-wins tie-break as
+ * indexer_topk_kernel with top_k=1 (used by DSpark verify row tops). */
+__global__ static void argmax_rows_kernel(uint32_t *selected, const float *scores,
+                                            uint32_t n_comp, uint32_t n_tokens) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ uint32_t sm_idx[THREADS];
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t tid = threadIdx.x;
+    float local_v = -INFINITY;
+    uint32_t local_i = 0;
+    for (uint32_t i = tid; i < n_comp; i += THREADS) {
+        const float v = row[i];
+        if (v > local_v) {
+            local_v = v;
+            local_i = i;
+        }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    __syncthreads();
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const uint32_t ir = sm_idx[tid + s];
+            if (vr > sm_val[tid] || (vr == sm_val[tid] && ir < sm_idx[tid])) {
+                sm_val[tid] = vr;
+                sm_idx[tid] = ir;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) selected[t] = sm_idx[0];
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -865,6 +902,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
+    if (top_k == 1u) {
+        /* DSpark verify row tops: a batched parallel argmax, not the
+         * single-threaded insertion-sort fallback (was ~13 ms per call). */
+        argmax_rows_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+                                               (const float *)scores->ptr,
+                                               n_comp, n_tokens);
+        return cuda_ok(cudaGetLastError(), "indexer topk argmax-rows launch");
+    }
     if (top_k == 512u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
@@ -1140,21 +1185,25 @@ __global__ static void dspark_markov_argmax_kernel(
         const unsigned char *w1_row,
         const unsigned char *w2,
         uint32_t vocab,
-        uint32_t rank_blocks) {
+        uint32_t rank_blocks,
+        uint32_t reverse) {
     __shared__ float state[256];
     const uint32_t tid = threadIdx.x;
-    if (tid < rank_blocks * 32u) {
-        const uint32_t b = tid >> 5, k = tid & 31u;
+    for (uint32_t t = tid * 2u; t < rank_blocks * 32u; t += blockDim.x * 2u) {
+        const uint32_t b = t >> 5, k = t & 31u;
         const unsigned char *blk = w1_row + (uint64_t)b * 34u;
         const float d = __half2float(*(const __half *)blk);
-        state[tid] = d * (float)((const int8_t *)(blk + 2))[k];
+        const uint16_t packed = *(const uint16_t *)(blk + 2 + k);
+        state[t] = d * (float)(int8_t)(packed & 0xffu);
+        state[t + 1u] = d * (float)(int8_t)(packed >> 8u);
     }
     __syncthreads();
 
     float best_v = -INFINITY;
     uint32_t best_i = 0;
-    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < vocab;
-         i += gridDim.x * blockDim.x) {
+    for (uint32_t i0 = blockIdx.x * blockDim.x + tid; i0 < vocab;
+         i0 += gridDim.x * blockDim.x) {
+        const uint32_t i = reverse ? (vocab - 1u - i0) : i0;
         const unsigned char *row = w2 + (uint64_t)i * rank_blocks * 34u;
         float acc = 0.0f;
         for (uint32_t b = 0; b < rank_blocks; b++) {
@@ -1163,7 +1212,13 @@ __global__ static void dspark_markov_argmax_kernel(
             const int8_t *q = (const int8_t *)(blk + 2);
             float s = 0.0f;
             #pragma unroll
-            for (uint32_t k = 0; k < 32u; k++) s += (float)q[k] * state[b * 32u + k];
+            for (uint32_t k = 0; k < 32u; k += 2u) {
+                const uint16_t packed = *(const uint16_t *)(q + k);
+                s += (float)(int8_t)(packed & 0xffu) *
+                      state[b * 32u + k];
+                s += (float)(int8_t)(packed >> 8u) *
+                      state[b * 32u + k + 1u];
+            }
             acc += d * s;
         }
         const float v = logits[i] + acc;
@@ -1173,8 +1228,8 @@ __global__ static void dspark_markov_argmax_kernel(
         }
     }
 
-    __shared__ float vals[256];
-    __shared__ uint32_t idxs[256];
+    __shared__ float vals[768];
+    __shared__ uint32_t idxs[768];
     vals[tid] = best_v;
     idxs[tid] = best_i;
     __syncthreads();
@@ -1199,7 +1254,23 @@ __global__ static void dspark_markov_argmax_kernel(
     }
 }
 
-extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
+static int g_markov_reverse = 0;
+/* 1 row per thread: 4096 warps x 32 threads sweeps the vocab in one pass
+ * (measured 110 us vs 183 us at 128x256 on gfx1151; more blocks = better
+ * latency hiding, small blocks pack 12/CU via LDS). */
+static int g_markov_grid = 4096;
+static int g_markov_block = 32;
+
+extern "C" void ds4_gpu_dspark_markov_set_reverse(int rev) {
+    g_markov_reverse = rev;
+}
+
+extern "C" void ds4_gpu_dspark_markov_set_shape(int grid, int block) {
+    g_markov_grid = grid;
+    g_markov_block = block;
+}
+
+int ds4_gpu_dspark_markov_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits_row,
         const void           *model_map,
@@ -1233,9 +1304,9 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
                  "dspark markov out clear")) {
         return 0;
     }
-    dspark_markov_argmax_kernel<<<128, 256>>>(
+    dspark_markov_argmax_kernel<<<g_markov_grid, g_markov_block>>>(
             (unsigned long long *)out_idx->ptr,
             (const float *)logits_row->ptr,
-            w1_row, w2, vocab, rank_blocks);
+            w1_row, w2, vocab, rank_blocks, g_markov_reverse);
     return cuda_ok(cudaGetLastError(), "dspark markov argmax launch");
 }

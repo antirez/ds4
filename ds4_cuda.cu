@@ -11697,6 +11697,12 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
+static int g_cuda_markov_reverse = 0;
+
+extern "C" void ds4_gpu_dspark_markov_set_reverse(int rev) {
+    g_cuda_markov_reverse = rev;
+}
+
 extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits_row,

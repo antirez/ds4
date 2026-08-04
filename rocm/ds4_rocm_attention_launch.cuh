@@ -385,13 +385,33 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
     float *oh = heads + ((uint64_t)tok * n_head + h) * head_dim;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < n_raw; r++) {
-            const uint32_t row = (raw_start + r) % raw_cap;
-            acc += raw_kv[(uint64_t)row * head_dim + d] * sh_scores[r];
+    if ((head_dim & 3u) == 0u) {
+        for (uint32_t d = threadIdx.x * 4u; d < head_dim;
+             d += blockDim.x * 4u) {
+            float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t row = (raw_start + r) % raw_cap;
+                const float4 kv = ((const float4 *)(raw_kv +
+                    (uint64_t)row * head_dim + d))[0];
+                const float weight = sh_scores[r];
+                acc.x += kv.x * weight;
+                acc.y += kv.y * weight;
+                acc.z += kv.z * weight;
+                acc.w += kv.w * weight;
+            }
+            ((float4 *)oh)[d >> 2u] = make_float4(
+                acc.x / denom, acc.y / denom,
+                acc.z / denom, acc.w / denom);
         }
-        oh[d] = acc / denom;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t row = (raw_start + r) % raw_cap;
+                acc += raw_kv[(uint64_t)row * head_dim + d] * sh_scores[r];
+            }
+            oh[d] = acc / denom;
+        }
     }
 }
 
@@ -1157,7 +1177,10 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
+            /* Small batches (DSpark verify n<=16) waste up to 6x ALU on the
+             * fixed 32-wide token tile; pick the narrowest tile that fits.
+             * Per-token accumulation order is unchanged (bit-identical). */
+            const uint32_t tile = n_tokens <= 8u ? 8u : (n_tokens <= 16u ? 16u : 32u);
             const uint32_t block_tile = 16u;
             cuda_launch_grouped_q8_a_sharedx((float *)low->ptr,
                                              out_a,
