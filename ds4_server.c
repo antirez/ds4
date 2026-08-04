@@ -11931,6 +11931,31 @@ decode_again:
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
+    /* Generation ended with the thinking block still open.  The damage is
+     * not only the truncated reply: `thinking_live` never becomes valid, so
+     * the session checkpoint is keyed on the raw token-text, which embeds
+     * hidden reasoning and can never be a prefix of a future request.  The
+     * file is born dead -- hundreds of MiB written per session switch, never
+     * read back -- and until now the condition was only visible indirectly, as
+     * `key=token-text` instead of `key=thinking-visible`. */
+    if (thinking.inside && strcmp(finish, "error") != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: generation ended inside a thinking block "
+                   "(finish=%s completion=%d max_tokens=%d grace=%s): reply is cut "
+                   "mid-reasoning and the session KV checkpoint will be keyed on raw "
+                   "token-text, so no client replay can ever match it; raise max_tokens "
+                   "or --thinking-grace-tokens",
+                   finish, completion, max_tokens,
+                   thinking_grace <= 0 ? "off" :
+                   (thinking_grace_used ? "exhausted" : "unused"));
+        trace_event(s, trace_id,
+                    "thinking block still open at end of generation: finish=%s "
+                    "completion=%d max=%d grace=%s",
+                    finish, completion, max_tokens,
+                    thinking_grace <= 0 ? "off" :
+                    (thinking_grace_used ? "exhausted" : "unused"));
+    }
+
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
