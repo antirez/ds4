@@ -222,6 +222,19 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
+/* Direct-I/O observability for the streamed-model read path.
+ * state: 0 = unavailable (env off / open failed / non-Linux), 1 = engaged,
+ * 2 = permanently disabled after an errno fallback (EINVAL/EFAULT/ENOTSUP).
+ * disable_errno: the errno behind an open failure or state 2, else 0. */
+int ds4_gpu_direct_io_state(void);
+int ds4_gpu_direct_io_disable_errno(void);
+void ds4_gpu_direct_io_counters(uint64_t *fallback_einval,
+                                uint64_t *fallback_efault,
+                                uint64_t *fallback_enotsup,
+                                uint64_t *fallback_other,
+                                uint64_t *widened_reads,
+                                uint64_t *widen_wasted_bytes);
+
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
  * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial
  * block output in the TP slab: it closes the current encoder, makes the GPU
