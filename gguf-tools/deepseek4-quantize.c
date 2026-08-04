@@ -428,6 +428,11 @@ typedef struct {
     size_t nbytes;
 } st_value;
 
+typedef struct {
+    uint8_t *data;
+    size_t size;
+} byte_buf;
+
 static void st_value_free(st_value *v) {
     free(v->dtype);
     free(v->data);
@@ -735,6 +740,72 @@ static float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64
         }
     }
     if (n_out) *n_out = out_dim * in_dim;
+    return out;
+}
+
+/*
+ * DeepSeek stores each pair of consecutive E2M1 values in one byte.  GGUF's
+ * MXFP4 block stores values 0..15 in the low nibbles and values 16..31 in the
+ * high nibbles, preceded by the block's unchanged UE8M0 scale.  Repack the
+ * codes without passing through floating point so the released expert weights
+ * remain exact.
+ */
+static byte_buf repack_fp4_weight_mxfp4(const st_value *w, const st_value *scale) {
+    if (strcmp(w->dtype, "I8") != 0 || strcmp(scale->dtype, "F8_E8M0") != 0) {
+        die("MXFP4 preservation requires packed I8 weights and F8_E8M0 scales");
+    }
+    if (w->n_dims != 2 || scale->n_dims != 2) die("MXFP4 source tensor must be 2D");
+
+    const int64_t out_dim = w->shape[0];
+    const int64_t packed_in = w->shape[1];
+    const int64_t in_dim = packed_in * 2;
+    if (out_dim <= 0 || in_dim <= 0 || (in_dim % 32) != 0) {
+        die("MXFP4 source dimensions are invalid");
+    }
+    const int64_t n_blocks = in_dim / 32;
+    if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) {
+        die("MXFP4 source scale shape mismatch");
+    }
+    if (w->nbytes != (size_t)out_dim * (size_t)packed_in ||
+        scale->nbytes != (size_t)out_dim * (size_t)n_blocks) {
+        die("MXFP4 source payload size mismatch");
+    }
+
+    const size_t block_bytes = ds4q_row_size(DS4Q_TYPE_MXFP4, 32);
+    if (block_bytes != 17) die("unexpected GGUF MXFP4 block size");
+    byte_buf out = {
+        .size = (size_t)out_dim * (size_t)n_blocks * block_bytes,
+        .data = xmalloc((size_t)out_dim * (size_t)n_blocks * block_bytes),
+    };
+
+    for (int64_t r = 0; r < out_dim; r++) {
+        for (int64_t b = 0; b < n_blocks; b++) {
+            const size_t block_index = (size_t)r * (size_t)n_blocks + (size_t)b;
+            const uint8_t *src = w->data + block_index * 16;
+            uint8_t *dst = out.data + block_index * block_bytes;
+            dst[0] = scale->data[block_index];
+
+            for (int i = 0; i < 16; i++) {
+                const int lo_index = i;
+                const int hi_index = 16 + i;
+                const uint8_t lo_byte = src[lo_index / 2];
+                const uint8_t hi_byte = src[hi_index / 2];
+                const uint8_t lo = (lo_index & 1) ? lo_byte >> 4 : lo_byte & 0x0f;
+                const uint8_t hi = (hi_index & 1) ? hi_byte >> 4 : hi_byte & 0x0f;
+                dst[1 + i] = lo | (uint8_t)(hi << 4);
+            }
+
+            /* Verify every source code and scale after the layout transform. */
+            if (dst[0] != scale->data[block_index]) die("MXFP4 scale repack mismatch");
+            for (int i = 0; i < 32; i++) {
+                const uint8_t src_byte = src[i / 2];
+                const uint8_t src_code = (i & 1) ? src_byte >> 4 : src_byte & 0x0f;
+                const uint8_t dst_byte = dst[1 + (i & 15)];
+                const uint8_t dst_code = i < 16 ? dst_byte & 0x0f : dst_byte >> 4;
+                if (src_code != dst_code) die("MXFP4 code repack mismatch");
+            }
+        }
+    }
     return out;
 }
 
@@ -1092,14 +1163,15 @@ static bool is_quantizable_target(ds4q_type type) {
     return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 || ds4q_can_quantize(type);
 }
 
+static bool target_uses_imatrix(ds4q_type type) {
+    return type == DS4Q_TYPE_Q2_K ||
+           type == DS4Q_TYPE_Q4_K ||
+           type == DS4Q_TYPE_IQ2_XXS;
+}
+
 /* =====
  * Tensor generation
  */
-
-typedef struct {
-    uint8_t *data;
-    size_t size;
-} byte_buf;
 
 static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat) {
     if (ncols <= 0 || n % ncols != 0) die("bad ncols for tensor conversion");
@@ -1224,8 +1296,11 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
         f32 = tensor_to_f32(&w, &n);
         st_value_free(&w);
     }
-    const char *names[2] = { gguf_name, hf_name };
-    const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    const float *imat = NULL;
+    if (target_uses_imatrix(target)) {
+        const char *names[2] = { gguf_name, hf_name };
+        imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    }
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
     free(f32);
     return b;
@@ -1269,6 +1344,20 @@ static void generate_one_expert(expert_job *j, int xid) {
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
     snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
     st_value w = db_read(j->db, weight_name);
+    if (j->target == DS4Q_TYPE_MXFP4) {
+        if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) {
+            die("MXFP4 expert shape mismatch");
+        }
+        st_value s = db_read(j->db, scale_name);
+        byte_buf q = repack_fp4_weight_mxfp4(&w, &s);
+        if (q.size != j->per_expert) die("MXFP4 expert packed size mismatch");
+        memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
+        free(q.data);
+        st_value_free(&s);
+        st_value_free(&w);
+        return;
+    }
+
     int64_t n = 0;
     float *f32 = NULL;
     if (strcmp(w.dtype, "I8") == 0) {
@@ -1280,8 +1369,11 @@ static void generate_one_expert(expert_job *j, int xid) {
         if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] != j->ncols) die("expert shape mismatch");
         f32 = tensor_to_f32(&w, &n);
     }
-    const char *names[3] = { j->gguf_name, weight_name, NULL };
-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    const float *imat = NULL;
+    if (target_uses_imatrix(j->target)) {
+        const char *names[2] = { j->gguf_name, weight_name };
+        imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    }
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
@@ -1315,7 +1407,9 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
                                 const imatrix_store *imatrix) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
-    if (!is_quantizable_target(target)) die("unsupported expert target type");
+    if (target != DS4Q_TYPE_MXFP4 && !is_quantizable_target(target)) {
+        die("unsupported expert target type");
+    }
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
@@ -1637,8 +1731,15 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         dst->name = src->name;
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
-        if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
-        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        const bool preserved_mxfp4 =
+            type == DS4Q_TYPE_MXFP4 && parse_expert_tensor(src->name).is_expert;
+        if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type) && !preserved_mxfp4) {
+            die("unsupported planned tensor type");
+        }
+        if ((ds4q_can_quantize(type) || preserved_mxfp4) &&
+            src->ne[0] % ds4q_block_size(type) != 0) {
+            die("ne[0] not divisible by block size");
+        }
         dst->type = type;
         dst->size = tensor_nbytes(type, src->ne, src->n_dims);
         dst->new_offset = off;
@@ -2489,6 +2590,7 @@ static void usage(const char *argv0) {
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
+    printf("MXFP4 is supported only for lossless repacking of packed routed experts.\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {

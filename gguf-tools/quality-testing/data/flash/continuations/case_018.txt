@@ -1,1 +1,1 @@
-Questa è un'ottima domanda che tocca un aspetto fondamentale dell'ottimizzazione dell'inferenza
+Per capire perché il **prefill** (elaborazione del prompt) può essere più veloce del **decode

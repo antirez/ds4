@@ -21,6 +21,7 @@ static int g_cublas_ready;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
+static int g_glm_model;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
@@ -4748,6 +4749,7 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
 
 struct ds4_rocm_runtime_config {
     int initialized;
+    int q8_prequant_decode;
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
@@ -4756,6 +4758,9 @@ struct ds4_rocm_runtime_config {
     int glm_grouped_qk_low;
     int q8_decode_sharedx_64k;
     int graph_dump;
+    uint32_t q8_decode_rpb;
+    uint32_t q8_hc_decode_rpb;
+    uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
     uint32_t moe_decode_gate_rpb;
     uint32_t moe_decode_down_rpb;
@@ -4766,6 +4771,18 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
+        const char *dsv4_prequant_env =
+            getenv("DS4_ROCM_DSV4_PREQUANT_DECODE");
+        /*
+         * DeepSeek V4 used the prequantized Q8 decode kernels before ROCm
+         * GLM support landed.  They are substantially faster on gfx1151.
+         * Keep GLM and --quality on the current full-F32 activation path.
+         * An explicit =0 remains available as a diagnostic rollback.
+         */
+        g_rocm_cfg.q8_prequant_decode =
+            !g_quality_mode &&
+            (dsv4_prequant_env == NULL ||
+             cuda_env_present(dsv4_prequant_env));
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
@@ -4805,6 +4822,9 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
+        g_rocm_cfg.q8_decode_rpb = 1u;
+        g_rocm_cfg.q8_hc_decode_rpb = 16u;
+        g_rocm_cfg.attn_out_low_decode_rpb = 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
             moe_decode_rpb_env != NULL && moe_decode_rpb_env[0] != '\0';
@@ -4828,6 +4848,10 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.initialized = 1;
     }
     return &g_rocm_cfg;
+}
+
+static bool cuda_q8_prequant_decode_enabled(void) {
+    return !g_glm_model && cuda_runtime_config()->q8_prequant_decode;
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
@@ -5506,7 +5530,18 @@ static int cuda_stream_model_cache_prepare_memory(
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
+    const uint64_t default_bytes = 1792ull * 1048576ull;
+    /*
+     * Two allocations larger than half the default arena can never share it.
+     * Allocate those spans tightly for DeepSeek instead of stranding the
+     * remainder of every arena.  This matters for Q4 expert spans (1152 MiB),
+     * where the default policy otherwise wastes 640 MiB per tensor span.
+     *
+     * Keep GLM on its existing allocation policy.
+     */
+    if (!g_glm_model && need > default_bytes / 2u) return need;
+
+    uint64_t bytes = default_bytes;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);

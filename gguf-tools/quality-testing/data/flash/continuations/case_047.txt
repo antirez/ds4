@@ -1,1 +1,1 @@
-Here is the difference between **raw KV rows** and **compressed KV rows** in the context of storage engines (
+To understand the difference between raw KV (Key-Value) rows and compressed KV rows, it helps to first clarify what

@@ -1,1 +1,5 @@
-Ecco lo pseudocodice per inserire un elemento in un heap binario (min-heap o max-he
+# Pseudocodice per inserire un elemento in un heap binario
+
+## Funzione principale: INSERT
+
+```

@@ -16,6 +16,13 @@ static int rocm_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;
 }
 
+/* Decode-island graph capture is CUDA-only for now; ROCm decodes eagerly. */
+extern "C" int ds4_gpu_decode_graphs_supported(void) { return 0; }
+extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus != 1) {
         fprintf(stderr, "ds4: ROCm supports one GPU per process\n");

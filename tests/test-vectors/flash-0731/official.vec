@@ -1,0 +1,48 @@
+# ds4-official-logprob-vectors-v1
+# checkpoint 0731
+# case <id> <ctx> <steps> <prompt-file>
+# step <index> <selected-hex> <top-count>
+# top <token-hex> <official-logprob>
+
+case short_italian_fact 16384 4 tests/test-vectors/flash-0731/prompts/short_italian_fact.txt
+step 0 416461 1
+top 416461 0
+step 1 204c6f76 1
+top 204c6f76 0
+step 2 656c 1
+top 656c 0
+step 3 616365 1
+top 616365 0
+end
+
+case short_code_completion 4096 1 tests/test-vectors/flash-0731/prompts/short_code_completion.txt
+step 0 72657475726e 1
+top 72657475726e 0
+end
+
+case short_reasoning_plain 4096 1 tests/test-vectors/flash-0731/prompts/short_reasoning_plain.txt
+step 0 3136 1
+top 3136 0
+end
+
+case long_memory_archive 16384 4 tests/test-vectors/flash-0731/prompts/long_memory_archive.txt
+step 0 436f6d706f6e656e74 1
+top 436f6d706f6e656e74 0
+step 1 2067616d6d61 1
+top 2067616d6d61 0
+step 2 207265706f727473 1
+top 207265706f727473 0
+step 3 20616e6f6d616c696573 1
+top 20616e6f6d616c696573 0
+end
+
+case long_code_audit 16384 4 tests/test-vectors/flash-0731/prompts/long_code_audit.txt
+step 0 546865 1
+top 546865 0
+step 1 206d6f7374 1
+top 206d6f7374 0
+step 2 20696d706f7274616e74 1
+top 20696d706f7274616e74 0
+step 3 20636f6465 1
+top 20636f6465 0
+end

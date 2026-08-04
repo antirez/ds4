@@ -95,6 +95,10 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
+                                    const char *model_path);
+int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
+                                 uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
@@ -200,6 +204,7 @@ int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
         uint32_t                          n_tokens,
         uint32_t                          n_seed_tokens,
         uint32_t                          n_selected);
+int ds4_gpu_stream_expert_cache_finish_pending_batch(void);
 int ds4_gpu_stream_expert_cache_release_layer_cache(void);
 #endif
 int ds4_gpu_stream_expert_cache_seed_experts(
@@ -207,6 +212,14 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+#ifdef __APPLE__
+/* Seed from mapped weights with blits appended to the active command buffer. */
+int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts);
+#endif
 void ds4_gpu_print_memory_report(const char *label);
 
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
@@ -719,6 +732,20 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* CUDA batch path: fold an input RMS normalization into the FP16 activation
+ * conversion used by the following projection. Returns 0 without touching
+ * out when the optimized path is unavailable. */
+int ds4_gpu_matmul_f16_rms_fold_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   norm_eps);
 
 /* Exact multi-row form of the DeepSeek 4096x256 F16 router projection. */
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(
@@ -2595,6 +2622,34 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
+ * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
+ * fork's per-layer decode graph capture.  The key identifies a captured
+ * island: layer, island index, and the activation buffers whose addresses
+ * the captured kernels bake in.  ds4_cuda.cu mirrors this struct
+ * byte-for-byte (it does not include this header); keep both in sync. */
+typedef struct ds4_decode_graph_key {
+    uint32_t il;
+    uint32_t island;    /* 0: layer top to pre-rope; 1: attn-out to layer end */
+    uint32_t variant;
+    uint32_t _pad;
+    void    *cur_hc;
+    void    *after_attn_hc;
+    void    *after_ffn_hc;
+    void    *attn_norm;
+} ds4_decode_graph_key;
+
+int  ds4_gpu_decode_graphs_supported(void);
+/* 1: replayed (island already executed; skip encoding it)
+ * 0: capturing (encode the island, then call _end)
+ * -1: run eagerly */
+int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
+/* 0: capture committed and launched; -1: capture failed (entry retired;
+ * the caller must re-encode the island eagerly -- no work was executed). */
+int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
+void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
+void ds4_gpu_decode_graphs_invalidate(void);
 
 #ifdef __cplusplus
 }

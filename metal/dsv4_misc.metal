@@ -70,7 +70,7 @@ struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t window;
     uint32_t ratio;
     uint32_t comp_kv_f16;
-    uint32_t pad0;
+    uint32_t n_splits;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_row_stride;
@@ -5448,6 +5448,190 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
     dst4[lane + 32] = o1 * inv_s;
     dst4[lane + 64] = o2 * inv_s;
     dst4[lane + 96] = o3 * inv_s;
+}
+
+// Long-context decode specialization of the indexed mixed-attention path.
+//
+// The ordinary heads8 kernel reuses each K/V row across eight heads, but only
+// launches one threadgroup per head group. Long-context decode therefore has
+// too little parallel work while each group scans its raw and selected rows.
+// This kernel retains the same eight-head reuse while splitting that row
+// sequence across args.n_splits workgroups. A second kernel merges the online
+// softmax partials and applies the attention sink.
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_split(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device       char *tmp,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint rows_per_block = 16u;
+    constexpr uint vecs_per_row = 128u;
+
+    const uint token = tgpig.x;
+    const uint head = tgpig.y * 8u + (uint)sg;
+    const uint split = tgpig.z;
+    const uint n_splits = args.n_splits;
+    if (token >= args.n_tokens || head >= args.n_head ||
+        n_splits < 2u || n_splits > 31u || split >= n_splits) {
+        return;
+    }
+
+    device const float4 *q4 = (device const float4 *)(q +
+        (uint64_t)token * args.q_token_stride +
+        (uint64_t)head  * args.q_head_stride);
+    const half4 q0 = (half4)q4[lane +  0];
+    const half4 q1 = (half4)q4[lane + 32];
+    const half4 q2 = (half4)q4[lane + 64];
+    const half4 q3 = (half4)q4[lane + 96];
+
+    float M = -FLT_MAX/2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ?
+        qpos + 1u - args.window : 0u;
+    const uint raw_first = max(first_raw_pos, window_first);
+    const uint raw_last = min(qpos, raw_last_pos);
+    const uint raw_count = raw_first <= raw_last ?
+        raw_last - raw_first + 1u : 0u;
+    const uint total_rows = raw_count + args.top_k;
+    const uint rows_per_split =
+        (total_rows + n_splits - 1u) / n_splits;
+    const uint split_first = min(split * rows_per_split, total_rows);
+    const uint split_last = min(split_first + rows_per_split, total_rows);
+    const uint visible = min((qpos + 1u) / args.ratio, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk +
+        (uint64_t)token * args.topk_token_stride);
+
+    for (uint seq0 = split_first; seq0 < split_last;
+         seq0 += rows_per_block) {
+        const uint n_rows = min(rows_per_block, split_last - seq0);
+        for (uint off = (uint)tid;
+             off < n_rows * vecs_per_row;
+             off += 256u) {
+            const uint r = off / vecs_per_row;
+            const uint c = off - r * vecs_per_row;
+            const uint seq = seq0 + r;
+            half4 value = half4(0.0h);
+            if (seq < raw_count) {
+                const uint pos = raw_first + seq;
+                const uint logical = pos - first_raw_pos;
+                const uint row = (args.raw_start + logical) % args.raw_cap;
+                device const float4 *src = (device const float4 *)(raw_kv +
+                    (uint64_t)row * args.raw_row_stride);
+                value = (half4)src[c];
+            } else {
+                const int32_t idx = row_topk[seq - raw_count];
+                if (idx >= 0 && (uint)idx < visible) {
+                    value = dsv4_load_cache_h4(comp_kv,
+                                               args.comp_row_stride,
+                                               (uint)idx,
+                                               c,
+                                               args.comp_kv_f16 != 0u);
+                }
+            }
+            kv_shared[off] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < n_rows; r++) {
+            const uint seq = seq0 + r;
+            bool valid = true;
+            if (seq >= raw_count) {
+                const int32_t idx = row_topk[seq - raw_count];
+                valid = idx >= 0 && (uint)idx < visible;
+            }
+            if (valid) {
+                dsv4_attend_shared_h4_row_at(kv_shared,
+                                             r,
+                                             q0, q1, q2, q3,
+                                             args.scale,
+                                             lane,
+                                             M, S,
+                                             o0, o1, o2, o3);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
+    const uint64_t row = (uint64_t)token * args.n_head + head;
+    device float4 *partials = (device float4 *)tmp;
+    partials[(row * vecs_per_row + lane +  0u) * n_splits + split] = o0;
+    partials[(row * vecs_per_row + lane + 32u) * n_splits + split] = o1;
+    partials[(row * vecs_per_row + lane + 64u) * n_splits + split] = o2;
+    partials[(row * vecs_per_row + lane + 96u) * n_splits + split] = o3;
+
+    if (lane == 0u) {
+        device float *stats = (device float *)(partials +
+            n_rows * vecs_per_row * n_splits);
+        const uint64_t stat = (row * n_splits + split) * 2u;
+        stats[stat + 0u] = S;
+        stats[stat + 1u] = M;
+    }
+}
+
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_split_reduce(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *tmp,
+        device const char *sinks,
+        device       char *dst,
+        uint tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint vecs_per_row = 128u;
+    const uint n_splits = args.n_splits;
+    const uint64_t n_rows = (uint64_t)args.n_tokens * args.n_head;
+    const uint64_t row = tgpig;
+    if (row >= n_rows || n_splits < 2u || n_splits > 31u) {
+        return;
+    }
+
+    device const float4 *partials = (device const float4 *)tmp;
+    device const float *stats = (device const float *)(partials +
+        n_rows * vecs_per_row * n_splits);
+    float part_sum = 0.0f;
+    float part_max = -FLT_MAX/2.0f;
+    if ((uint)lane < n_splits) {
+        const uint64_t stat = (row * n_splits + (uint)lane) * 2u;
+        part_sum = stats[stat + 0u];
+        part_max = stats[stat + 1u];
+    } else if ((uint)lane == n_splits) {
+        const uint head = (uint)(row % args.n_head);
+        part_sum = 1.0f;
+        part_max = ((device const float *)sinks)[head];
+    }
+
+    const float global_max = simd_max(part_max);
+    const float part_scale = part_sum > 0.0f ?
+        exp(part_max - global_max) : 0.0f;
+    const float total_sum = simd_sum(part_sum * part_scale);
+    const float inv_sum = total_sum > 0.0f ? 1.0f / total_sum : 0.0f;
+
+    device float4 *out = (device float4 *)dst + row * vecs_per_row;
+    for (uint i = (uint)sg; i < vecs_per_row; i += 4u) {
+        float4 value = float4(0.0f);
+        if ((uint)lane < n_splits) {
+            value = partials[(row * vecs_per_row + i) * n_splits +
+                             (uint)lane] * part_scale;
+        }
+        value = simd_sum(value);
+        if (lane == 0u) {
+            out[i] = value * inv_sum;
+        }
+    }
 }
 
 static inline float dsv4_indexer_dot128_shared_q(

@@ -1,1 +1,1 @@
-This is a fascinating question that gets to the heart of how modern graphics APIs like Metal, Vulkan, and DirectX
+To understand why one large metal buffer can be worse than multiple overlapping views, we have to look at how **GPU memory

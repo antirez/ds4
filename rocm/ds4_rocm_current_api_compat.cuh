@@ -126,7 +126,7 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_glm_model(bool enabled) {
-    (void)enabled;
+    g_glm_model = enabled ? 1 : 0;
 }
 
 extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
@@ -279,6 +279,10 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
                                                         table->down_offset,
                                                         table->gate_expert_bytes,
                                                         table->down_expert_bytes);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_finish_pending_batch(void) {
+    return cuda_stream_batch_selected_finish_pending_missing();
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_release_layer_cache(void) {

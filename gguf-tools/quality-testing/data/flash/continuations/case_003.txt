@@ -1,1 +1,1 @@
-This is an excellent question because it gets to the heart of why **RMSNorm** (Root Mean Square Normalization)
+To understand why **RMSNorm** (Root Mean Square Layer Normalization) needs both a **sum of squares** and

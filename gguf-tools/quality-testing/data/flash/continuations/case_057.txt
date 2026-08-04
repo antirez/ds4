@@ -1,1 +1,1 @@
-Certamente. Ecco una descrizione chiara della differenza tra righe KV (Key-Value) raw e
+Per comprendere la differenza tra **righe KV raw** e **righe KV compresse**, dobbiamo

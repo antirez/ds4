@@ -146,6 +146,14 @@ def main():
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--nonce", default="")
     parser.add_argument(
+        "--same-prompt", action="store_true",
+        help="send one identical prompt and seed in every request",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int,
+        help="override each case's completion limit",
+    )
+    parser.add_argument(
         "--case", choices=[case[0] for case in CASES],
         help="repeat one case shape instead of cycling through mixed lengths",
     )
@@ -160,7 +168,14 @@ def main():
         case = next((c for c in CASES if c[0] == args.case), None)
         if case is None:
             case = CASES[i % len(CASES)]
-        name, filler_words, payload = make_payload(case, i, nonce, args.stream)
+        case_number = 0 if args.same_prompt else i
+        name, filler_words, payload = make_payload(
+            case, case_number, nonce, args.stream
+        )
+        if args.max_tokens is not None:
+            if args.max_tokens < 0:
+                parser.error("--max-tokens must be non-negative")
+            payload["max_tokens"] = args.max_tokens
         for copy in range(2):
             requests.append(payload)
             metadata.append((i, copy, name, filler_words))
@@ -187,6 +202,28 @@ def main():
             print("MISMATCH pair=%d case=%s" % (i, metadata[2 * i][2]), file=sys.stderr)
             print("  A=%s" % (json.dumps(a, ensure_ascii=True)[:1000]), file=sys.stderr)
             print("  B=%s" % (json.dumps(b, ensure_ascii=True)[:1000]), file=sys.stderr)
+            for label, result in (("A", a), ("B", b)):
+                matches = [
+                    index for index, candidate in enumerate(results)
+                    if index not in (2 * i, 2 * i + 1)
+                    and comparable(candidate) == comparable(result)
+                ]
+                if matches:
+                    print(
+                        "  %s also returned by requests=%s" % (label, matches),
+                        file=sys.stderr,
+                    )
+    if args.same_prompt:
+        mismatches = [
+            index for index, result in enumerate(results[1:], start=1)
+            if comparable(result) != comparable(results[0])
+        ]
+        if mismatches:
+            failures += 1
+            print(
+                "MISMATCH identical prompt requests=%s" % mismatches,
+                file=sys.stderr,
+            )
 
     latencies = [result["elapsed"] for result in results]
     known_tokens = [

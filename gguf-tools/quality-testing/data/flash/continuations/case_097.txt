@@ -1,1 +1,1 @@
-La capitale del Giappone è Tokyo.
+La capitale del Giappone è **Tokyo**.

@@ -1,1 +1,1 @@
-Ti spiegherò il funzionamento di un **ring buffer** (o buffer circolare) e le tec
+Un **ring buffer** (o buffer circolare) è una struttura dati FIFO (First In, First Out)

@@ -1,1 +1,1 @@
-This is a great question that gets at the core of how modern LLMs generate text. Both **temperature** and **
+To understand the tradeoffs between **top-p sampling** and **temperature-zero decoding**, it helps to first clarify what they

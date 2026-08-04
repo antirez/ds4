@@ -1,1 +1,1 @@
-In un database distribuito, la **consistenza eventuale** (o *eventual consistency*) è un modello
+La **consistenza eventuale** (in inglese *eventual consistency*) è un modello di coerenza

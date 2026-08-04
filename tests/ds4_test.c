@@ -5333,13 +5333,15 @@ static bool test_logprob_vector_case_disabled(const char *path,
      * slightly lower local perplexity on the A/B check we ran, so DS4 keeps that
      * implementation and only excludes this brittle API fixture for now.
      */
-    return !strcmp(path, "tests/test-vectors/official.vec") &&
+    return !strcmp(path, "tests/test-vectors/flash-pre-0731/official.vec") &&
            !strcmp(vc->id, "long_memory_archive");
 }
 
 static void test_official_logprob_vectors_run(const char *case_filter) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/official.vec";
+    if (!path || !path[0]) {
+        path = "tests/test-vectors/flash-0731/official.vec";
+    }
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
@@ -5616,7 +5618,9 @@ static void test_local_golden_case_run(ds4_engine *engine,
 
 static void test_local_golden_vectors(void) {
     const char *path = getenv("DS4_TEST_LOCAL_GOLDEN_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/local-golden.vec";
+    if (!path || !path[0]) {
+        path = "tests/test-vectors/flash-0731/local-golden.vec";
+    }
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
@@ -5931,7 +5935,9 @@ static bool test_mpp_eq_case_selected(const char *id) {
 
 static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/official.vec";
+    if (!path || !path[0]) {
+        path = "tests/test-vectors/flash-0731/official.vec";
+    }
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return 0;
@@ -6746,8 +6752,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
     puts("  DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
-    puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
-    puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
+    puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
+    puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");

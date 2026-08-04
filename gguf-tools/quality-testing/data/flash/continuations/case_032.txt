@@ -1,1 +1,1 @@
-Certamente. La differenza fondamentale tra un **mutex** (mutual exclusion) e un **contatore atom
+Per capire la differenza tra un **mutex** e un **contatore atomico**, dobbiamo prima
