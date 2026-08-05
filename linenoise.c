@@ -127,6 +127,13 @@
 #define HISTORY_FOLD_MULTILINE_LINES 16     // Min lines to fold shorter history.
 #define HISTORY_FOLD_CONTEXT 96             // Context chars kept around history folds.
 #define PASTE_MAX_BYTES LINENOISE_MAX_LINE
+/* U+21B5 stands in for hard newlines: the editor treats the buffer as one
+ * logical line, so a literal newline would desync the refresh cursor math.
+ * The glyph is East Asian Neutral, exactly one column on every terminal, and
+ * carries no escape sequence, so refreshSingleLine() can still slice the
+ * rendered text by characters when scrolling horizontally. */
+#define LINENOISE_NEWLINE_MARKER "\xe2\x86\xb5"
+#define LINENOISE_NEWLINE_MARKER_LEN 3
 static char *unsupported_term[] = {"dumb","cons25","emacs",NULL};
 static linenoiseCompletionCallback *completionCallback = NULL;
 static linenoiseHintsCallback *hintsCallback = NULL;
@@ -1104,39 +1111,60 @@ static int linenoiseGetRenderFolds(struct linenoiseState *l, struct linenoiseFol
     return fs->count != 0;
 }
 
+/* Rendered byte length of the buffer range [start,end), that is the same bytes
+ * except that every hard newline expands to the newline marker. Byte offsets
+ * are not preserved by the substitution, so translating an edit position into
+ * a render position requires scanning instead of subtracting. */
+static size_t renderPlainLen(const char *buf, size_t start, size_t end) {
+    size_t len = 0, j;
+
+    for (j = start; j < end; j++)
+        len += buf[j] == '\n' ? LINENOISE_NEWLINE_MARKER_LEN : 1;
+    return len;
+}
+
+/* Copy [start,end) into out with the same substitution, returning the number
+ * of bytes written, that is renderPlainLen() of the same range. */
+static size_t renderPlainCopy(const char *buf, size_t start, size_t end, char *out) {
+    size_t n = 0, j;
+
+    for (j = start; j < end; j++) {
+        if (buf[j] == '\n') {
+            memcpy(out+n,LINENOISE_NEWLINE_MARKER,LINENOISE_NEWLINE_MARKER_LEN);
+            n += LINENOISE_NEWLINE_MARKER_LEN;
+        } else {
+            out[n++] = buf[j];
+        }
+    }
+    return n;
+}
+
 /* Return the freshly allocated string content that is actually displayed in
  * the user prompt. It can be the actual edited line, or a special version
  * where pasted or multiline history ranges are replaced by their folded
- * "[...]" style versions. outpos is l->pos translated into this rendered
- * buffer. */
+ * "[...]" style versions. Newlines outside the folds are shown as markers.
+ * outpos is l->pos translated into this rendered buffer. */
 static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *outlen, size_t *outpos) {
     struct linenoiseFolds fs;
     size_t len, pos, src, dst;
     char *r;
     int j, pos_set = 0;
 
-    if (!linenoiseGetRenderFolds(l,&fs)) {
-        /* Keep the refresh code simple: it always owns a temporary render
-         * buffer, even when the render is identical to the real edit buffer. */
-        r = malloc(l->len+1);
-        if (r == NULL) return -1;
-        memcpy(r,l->buf,l->len);
-        r[l->len] = '\0';
-        *out = r;
-        *outlen = l->len;
-        *outpos = l->pos;
-        return 0;
-    }
+    /* An empty fold set is not a special case: the loops below then just
+     * render the whole buffer as one gap. */
+    linenoiseGetRenderFolds(l,&fs);
 
-    /* Gaps are copied as-is, folded ranges are replaced by their markers.
-     * The bytes inside each [start,end) range stay in l->buf but are not
-     * emitted to the terminal. */
-    len = l->len;
+    /* Gaps are copied with their newlines substituted, folded ranges are
+     * replaced by their placeholder. The bytes inside each [start,end) range
+     * stay in l->buf but are not emitted to the terminal. */
+    len = 0;
+    src = 0;
     for (j = 0; j < fs.count; j++) {
         struct linenoiseFold *f = fs.fold+j;
-        len -= f->end - f->start;
-        len += f->displaylen;
+        len += renderPlainLen(l->buf,src,f->start) + f->displaylen;
+        src = f->end;
     }
+    len += renderPlainLen(l->buf,src,l->len);
     r = malloc(len+1);
     if (r == NULL) return -1;
 
@@ -1144,14 +1172,12 @@ static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *o
     pos = 0;
     for (j = 0; j < fs.count; j++) {
         struct linenoiseFold *f = fs.fold+j;
-        size_t gap = f->start - src;
 
         if (!pos_set && l->pos <= f->start) {
-            pos = dst + (l->pos - src);
+            pos = dst + renderPlainLen(l->buf,src,l->pos);
             pos_set = 1;
         }
-        memcpy(r+dst,l->buf+src,gap);
-        dst += gap;
+        dst += renderPlainCopy(l->buf,src,f->start,r+dst);
 
         if (!pos_set && l->pos < f->end) {
             pos = dst + f->displaylen;
@@ -1165,8 +1191,8 @@ static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *o
         }
         src = f->end;
     }
-    if (!pos_set) pos = dst + (l->pos - src);
-    memcpy(r+dst,l->buf+src,l->len-src);
+    if (!pos_set) pos = dst + renderPlainLen(l->buf,src,l->pos);
+    renderPlainCopy(l->buf,src,l->len,r+dst);
     r[len] = '\0';
 
     *out = r;
@@ -1692,8 +1718,13 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
                              memchr(c, '\r', clen) != NULL;
 
         if (linenoiseEditInsertNoRefresh(l,c,clen) == -1) return 0;
+        /* The shortcut below appends the raw bytes and accounts for their
+         * width with utf8StrWidth(), which counts a newline as zero columns.
+         * A buffer that already holds newlines renders them as one-column
+         * markers instead, so it must take the full refresh path. */
         if (!needs_refresh && !mlmode && !linenoiseStatusActive(l) &&
             !l->oldstatusrows && !hintsCallback &&
+            memchr(l->buf,'\n',l->len) == NULL &&
             (maskmode || l->fold_count == 0))
         {
             size_t bufwidth = utf8StrWidth(l->buf,l->len);
