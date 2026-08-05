@@ -161,9 +161,125 @@ static void test_think(void) {
     expect("think without color",
            render_opt("<think>hidden</think>visible\n", false, true, false, 0),
            "hidden\nvisible\n");
-    expect("markdown is inert inside think",
+    expect("thinking renders bold in grey",
            render_opt("<think>**not bold**</think>ok\n", true, true, false, 0),
-           "\x1b[90m**not bold**\x1b[0m\nok\n");
+           "\x1b[1;90mnot bold\x1b[0m\nok\n");
+}
+
+/* Everything a think block emits must be greyscale: SGR 90 plus the plain
+ * attributes.  Any hue (30-37, 91-97, or an extended 38;5;N color) means the
+ * answer palette leaked into the reasoning. */
+static void check_muted(const char *what, const char *s) {
+    for (const char *p = strchr(s, 0x1b); p; p = strchr(p, 0x1b)) {
+        p++;
+        if (*p != '[') continue;
+        p++;
+        for (;;) {
+            int v = 0;
+            bool digits = false;
+            while (*p >= '0' && *p <= '9') {
+                v = v * 10 + (*p - '0');
+                digits = true;
+                p++;
+            }
+            if (digits && v != 0 && v != 1 && v != 2 && v != 3 && v != 4 &&
+                v != 22 && v != 23 && v != 24 && v != 90) {
+                char msg[80];
+                snprintf(msg, sizeof(msg), "%s: SGR %d is not muted", what, v);
+                fail(msg, s, "only 0/1/2/3/4/22/23/24/90");
+                return;
+            }
+            if (*p == ';') {
+                p++;
+                continue;
+            }
+            break;
+        }
+        if (*p) p++;
+    }
+}
+
+/* Render a corpus that stays inside the think block from the first byte, the
+ * way a thinking model streams before it closes the tag. */
+static char *render_thinking(const char *in, int cols) {
+    return render_opt(in, true, true, true, cols);
+}
+
+static void test_think_markdown(void) {
+    expect("thinking bold", render_thinking("**x**\n", 0),
+           "\x1b[1;90mx\x1b[0m\x1b[90m\n\x1b[0m");
+    expect("thinking italic", render_thinking("*x*\n", 0),
+           "\x1b[3;90mx\x1b[0m\x1b[90m\n\x1b[0m");
+    expect("thinking inline code", render_thinking("`x`\n", 0),
+           "\x1b[2;90mx\x1b[0m\x1b[90m\n\x1b[0m");
+    expect("thinking heading", render_thinking("# T\n", 0),
+           "\x1b[1;4;90mT\x1b[0m\x1b[90m\n\x1b[0m");
+    expect("thinking bullet", render_thinking("- x\n", 0),
+           "\x1b[2;90m\xe2\x80\xa2\x1b[0m \x1b[90mx\n\x1b[0m");
+    expect("thinking quote", render_thinking("> x\n", 0),
+           "\x1b[2;90m\xe2\x94\x82 \x1b[0m\x1b[90mx\n\x1b[0m");
+    /* Fenced code keeps its markers but drops syntax colors while thinking. */
+    expect("thinking fence is not highlighted",
+           render_thinking("```c\nreturn 0;\n```\n", 0),
+           "\x1b[90m```\x1b[0m\x1b[90mc\n\x1b[0m"
+           "\x1b[90mreturn 0;\x1b[0m\n\x1b[90m```\n\x1b[0m");
+
+    static const char corpus[] =
+        "# 标题\n"
+        "**bold** *it* `code`\n"
+        "- bullet\n"
+        "1. ordered\n"
+        "> quote\n"
+        "---\n"
+        "| a | 描述 |\n"
+        "| --- | ---: |\n"
+        "| 1 | 中文 |\n"
+        "```c\nint x = 1;\n```\n";
+    char *got = render_thinking(corpus, 40);
+    if (got) {
+        check_muted("think corpus", got);
+        check_utf8_integrity("think corpus utf8", got);
+        if (!strstr(got, "\xe2\x94\x8c"))
+            fail("thinking table is drawn", got, "box drawing");
+        /* The table body must still line up under the muted palette. */
+        const char *box = strstr(got, "\xe2\x94\x8c");
+        if (box) {
+            int w0 = line_width(box, 0);
+            for (int i = 1; i < 5; i++) {
+                if (line_width(box, i) != w0) {
+                    fail("thinking table alignment", got, "equal widths");
+                    break;
+                }
+            }
+        }
+        free(got);
+    }
+}
+
+/* Neither side of the boundary may inherit the other's state. */
+static void test_think_boundary(void) {
+    expect("open bold in think does not reach the answer",
+           render_opt("<think>**bold</think>plain\n", true, true, false, 0),
+           "\x1b[1;90mbold\x1b[0m\nplain\n");
+    expect("open bold in the answer does not reach think",
+           render_opt("a **b<think>c</think>d\n", true, true, false, 0),
+           "a \x1b[1mb\x1b[0m\x1b[90mc\x1b[0m\nd\n");
+    expect_contains("unterminated table flushes at </think>",
+                    render_opt("<think>| a |\n| --- |\n| 1 |</think>after\n",
+                               true, true, false, 0),
+                    "\xe2\x94\x94");
+    expect_contains("text after the flushed table is answer text",
+                    render_opt("<think>| a |\n| --- |\n| 1 |</think>after\n",
+                               true, true, false, 0),
+                    "after\n");
+    expect("open fence in think does not reach the answer",
+           render_opt("<think>```\ncode</think>text\n", true, true, false, 0),
+           "\x1b[90m```\x1b[0m\x1b[90m\n\x1b[0m"
+           "\x1b[90mcode\x1b[0m\ntext\n");
+    /* Interrupting inside a think table still prints what arrived. */
+    expect_contains("unterminated think table flushes at finish",
+                    render_thinking("| a |\n| --- |\n| 1 |", 0),
+                    "\xe2\x94\x94");
 }
 
 static void test_headings_lists(void) {
@@ -425,6 +541,8 @@ int main(void) {
     test_inline();
     test_utf8();
     test_think();
+    test_think_markdown();
+    test_think_boundary();
     test_headings_lists();
     test_fences();
     test_tables();

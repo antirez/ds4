@@ -9,7 +9,10 @@
  *
  * The inline machine, the UTF-8 accumulator, and the fenced-block highlighter
  * follow the agent renderer in ds4_agent.c; the line-start dispatch and the
- * table layout are new. */
+ * table layout are new.
+ *
+ * <think> blocks run through the same pipeline with a muted palette, so
+ * reasoning keeps its structure without ever using hue. */
 
 #include "ds4_render.h"
 
@@ -27,6 +30,13 @@
 
 #define DS4R_GREY  "\x1b[38;5;244m"
 #define DS4R_RESET "\x1b[0m"
+
+/* Thinking text is rendered with the same markdown pipeline as the answer, but
+ * every style maps to a grey variant: reasoning must stay in the background and
+ * never compete with the answer for attention.  No hue is ever emitted inside a
+ * think block, only SGR 90 plus bold/italic/underline/dim. */
+#define DS4R_THINK      "\x1b[90m"
+#define DS4R_THINK_DIM  "\x1b[2;90m"
 
 static void ds4r_render_byte(ds4r *r, char c);
 static void ds4r_md_feed(ds4r *r, char c);
@@ -269,9 +279,42 @@ static unsigned ds4r_attr_key(const ds4r *r) {
     return k;
 }
 
+/* Decorations the renderer draws itself: bullets, quote bars, rules, and table
+ * frames. */
+static const char *ds4r_deco_color(const ds4r *r) {
+    return r->in_think ? DS4R_THINK_DIM : DS4R_GREY;
+}
+
 static void ds4r_set_attrs(ds4r *r) {
     if (r->in_think) {
-        ds4r_seq(r, "\x1b[90m");
+        /* One combined sequence so the grey base survives every attribute. */
+        char seq[16];
+        size_t n = 0;
+        seq[n++] = '\x1b';
+        seq[n++] = '[';
+        if (!r->md_code_block) {
+            if (r->md_bold || r->md_heading) {
+                seq[n++] = '1';
+                seq[n++] = ';';
+            }
+            if (r->md_italic) {
+                seq[n++] = '3';
+                seq[n++] = ';';
+            }
+            if (r->md_heading_underline) {
+                seq[n++] = '4';
+                seq[n++] = ';';
+            }
+            if (r->md_inline_code) {
+                seq[n++] = '2';
+                seq[n++] = ';';
+            }
+        }
+        seq[n++] = '9';
+        seq[n++] = '0';
+        seq[n++] = 'm';
+        seq[n] = '\0';
+        ds4r_seq(r, seq);
         return;
     }
     if (r->md_code_block) {
@@ -345,11 +388,31 @@ static void ds4r_emit_styled(ds4r *r, const char *color, const char *text) {
     if (color) ds4r_seq(r, DS4R_RESET);
 }
 
-/* Fence markers are shown without markdown attributes. */
+/* Fence markers are shown without markdown attributes.  Inside a think block
+ * they still carry the muted base color, so the fence does not flash at answer
+ * brightness in the middle of dim text. */
 static void ds4r_put_plain(ds4r *r, char c) {
+    bool bold = r->md_bold;
+    bool italic = r->md_italic;
+    bool code = r->md_inline_code;
+    bool block = r->md_code_block;
+    bool heading = r->md_heading;
+    bool underline = r->md_heading_underline;
+
     ds4r_flush_utf8(r);
-    ds4r_reset_color(r);
-    ds4r_out(r, &c, 1);
+    r->md_bold = false;
+    r->md_italic = false;
+    r->md_inline_code = false;
+    r->md_code_block = false;
+    r->md_heading = false;
+    r->md_heading_underline = false;
+    ds4r_put(r, &c, 1);
+    r->md_bold = bold;
+    r->md_italic = italic;
+    r->md_inline_code = code;
+    r->md_code_block = block;
+    r->md_heading = heading;
+    r->md_heading_underline = underline;
 }
 
 static int ds4r_columns(const ds4r *r) {
@@ -824,14 +887,14 @@ static void ds4r_code_emit_line(ds4r *r, bool with_newline) {
     ds4r_flush_utf8(r);
     ds4r_reset_color(r);
     if (r->code_line_len) {
-        if (r->md_syntax) {
+        if (r->md_syntax && !r->in_think) {
             ds4r_str out = {0};
             ds4r_syntax_emit_line(r, &out, r->code_line, r->code_line_len);
             if (!out.oom && out.p) ds4r_out(r, out.p, out.len);
             else ds4r_out(r, r->code_line, r->code_line_len);
             ds4r_str_free(&out);
         } else {
-            ds4r_seq(r, "\x1b[38;5;75m");
+            ds4r_seq(r, r->in_think ? DS4R_THINK : "\x1b[38;5;75m");
             ds4r_out(r, r->code_line, r->code_line_len);
             ds4r_seq(r, DS4R_RESET);
         }
@@ -949,7 +1012,8 @@ static void ds4r_md_feed(ds4r *r, char c) {
     if (r->md_fence_info) {
         if (c == '\n') {
             r->md_fence_lang[r->md_fence_lang_len] = '\0';
-            r->md_syntax = ds4r_syntax_for_lang(r->md_fence_lang);
+            r->md_syntax = r->in_think ? NULL :
+                ds4r_syntax_for_lang(r->md_fence_lang);
             ds4r_put_plain(r, '\n');
             r->md_fence_info = false;
             r->md_code_line_start = true;
@@ -1107,7 +1171,8 @@ static bool ds4r_is_align_cell(const char *s, ds4r_align *out) {
  * With out == NULL the function only measures.  bold_init keeps a header cell
  * bold across nested **markers**. */
 static int ds4r_cell_scan(const char *s, int limit, bool ellipsis,
-                          bool bold_init, bool color, ds4r_str *out) {
+                          bool bold_init, bool color, bool muted,
+                          ds4r_str *out) {
     bool bold = bold_init;
     bool italic = false;
     bool code = false;
@@ -1120,7 +1185,9 @@ static int ds4r_cell_scan(const char *s, int limit, bool ellipsis,
     while (i < len) {
         if (s[i] == '`') {
             code = !code;
-            if (out && color) ds4r_str_addz(out, code ? "\x1b[36m" : "\x1b[39m");
+            if (out && color)
+                ds4r_str_addz(out, muted ? (code ? "\x1b[2m" : "\x1b[22m") :
+                                           (code ? "\x1b[36m" : "\x1b[39m"));
             i++;
             continue;
         }
@@ -1152,7 +1219,7 @@ static int ds4r_cell_scan(const char *s, int limit, bool ellipsis,
         i += n;
     }
     if (out && color) {
-        if (code) ds4r_str_addz(out, "\x1b[39m");
+        if (code) ds4r_str_addz(out, muted ? "\x1b[22m" : "\x1b[39m");
         if (italic) ds4r_str_addz(out, "\x1b[23m");
         if (bold) ds4r_str_addz(out, "\x1b[22m");
     }
@@ -1166,7 +1233,7 @@ static int ds4r_cell_scan(const char *s, int limit, bool ellipsis,
 static void ds4r_table_border(ds4r *r, ds4r_str *out, const int *colw,
                               int ncols, int pad, const char *left,
                               const char *mid, const char *right) {
-    if (r->use_color) ds4r_str_addz(out, DS4R_GREY);
+    if (r->use_color) ds4r_str_addz(out, ds4r_deco_color(r));
     ds4r_str_addz(out, left);
     for (int c = 0; c < ncols; c++) {
         ds4r_str_repeat(out, "\xe2\x94\x80", colw[c] + 2 * pad);
@@ -1177,7 +1244,7 @@ static void ds4r_table_border(ds4r *r, ds4r_str *out, const int *colw,
 }
 
 static void ds4r_table_bar(ds4r *r, ds4r_str *out) {
-    if (r->use_color) ds4r_str_addz(out, DS4R_GREY);
+    if (r->use_color) ds4r_str_addz(out, ds4r_deco_color(r));
     ds4r_str_addz(out, "\xe2\x94\x82");
     if (r->use_color) ds4r_str_addz(out, DS4R_RESET);
 }
@@ -1188,10 +1255,14 @@ static void ds4r_table_row(ds4r *r, ds4r_str *out, char **cells, int ncells,
     for (int c = 0; c < ncols; c++) {
         const char *text = (c < ncells && cells[c]) ? cells[c] : "";
         ds4r_str cell = {0};
-        int want = ds4r_cell_scan(text, INT_MAX, false, header, false, NULL);
+        bool muted = r->in_think;
+        int want = ds4r_cell_scan(text, INT_MAX, false, header, false, muted,
+                                  NULL);
         int w = want <= colw[c] ?
-            ds4r_cell_scan(text, INT_MAX, false, header, r->use_color, &cell) :
-            ds4r_cell_scan(text, colw[c] - 1, true, header, r->use_color, &cell);
+            ds4r_cell_scan(text, INT_MAX, false, header, r->use_color, muted,
+                           &cell) :
+            ds4r_cell_scan(text, colw[c] - 1, true, header, r->use_color, muted,
+                           &cell);
         int slack = colw[c] - w;
         if (slack < 0) slack = 0;
         int before = align[c] == DS4R_ALIGN_RIGHT ? slack :
@@ -1199,7 +1270,9 @@ static void ds4r_table_row(ds4r *r, ds4r_str *out, char **cells, int ncells,
 
         ds4r_table_bar(r, out);
         ds4r_str_pad(out, pad + before);
+        if (muted && r->use_color) ds4r_str_addz(out, DS4R_THINK);
         if (cell.p) ds4r_str_add(out, cell.p, cell.len);
+        if (muted && r->use_color) ds4r_str_addz(out, DS4R_RESET);
         ds4r_str_pad(out, slack - before + pad);
         ds4r_str_free(&cell);
     }
@@ -1277,7 +1350,8 @@ static bool ds4r_table_render(ds4r *r) {
         for (int c = 0; c < ncols; c++) {
             const char *text = cells[i * (size_t)ncols + (size_t)c];
             if (!text) continue;
-            int w = ds4r_cell_scan(text, INT_MAX, false, false, false, NULL);
+            int w = ds4r_cell_scan(text, INT_MAX, false, false, false, false,
+                                   NULL);
             if (w > colw[c]) colw[c] = w;
         }
     }
@@ -1411,7 +1485,7 @@ static void ds4r_table_byte(ds4r *r, char c) {
  * ============================================================================ */
 
 static void ds4r_line_begin(ds4r *r) {
-    if (!r->format_markdown || r->in_think || r->md_code_block) {
+    if (!r->format_markdown || r->md_code_block) {
         r->line_mode = DS4R_LINE_OFF;
         return;
     }
@@ -1462,7 +1536,7 @@ static void ds4r_scan_rule(ds4r *r) {
     if (cols < 4) cols = 4;
     ds4r_str out = {0};
     ds4r_str_repeat(&out, "\xe2\x94\x80", cols);
-    if (!out.oom && out.p) ds4r_emit_styled(r, DS4R_GREY, out.p);
+    if (!out.oom && out.p) ds4r_emit_styled(r, ds4r_deco_color(r), out.p);
     ds4r_str_free(&out);
 }
 
@@ -1499,7 +1573,7 @@ static void ds4r_scan_byte(ds4r *r, char c) {
         }
         if (c == '>') {
             ds4r_scan_emit_indent(r);
-            ds4r_emit_styled(r, DS4R_GREY, "\xe2\x94\x82 ");
+            ds4r_emit_styled(r, ds4r_deco_color(r), "\xe2\x94\x82 ");
             r->line_len = 0;
             r->indent_len = 0;
             r->scan = DS4R_SCAN_QUOTE;
@@ -1534,7 +1608,7 @@ static void ds4r_scan_byte(ds4r *r, char c) {
         if (c == ' ' || c == '\t') {
             if (r->marker_run == 1 && r->marker_ch != '_') {
                 ds4r_scan_emit_indent(r);
-                ds4r_emit_styled(r, DS4R_GREY, "\xe2\x80\xa2");
+                ds4r_emit_styled(r, ds4r_deco_color(r), "\xe2\x80\xa2");
                 ds4r_out(r, " ", 1);
                 ds4r_scan_done(r);
                 return;
@@ -1586,7 +1660,7 @@ static void ds4r_scan_byte(ds4r *r, char c) {
             memcpy(marker, r->line_buf + r->indent_len, n);
             marker[n] = '\0';
             ds4r_scan_emit_indent(r);
-            ds4r_emit_styled(r, DS4R_GREY, marker);
+            ds4r_emit_styled(r, ds4r_deco_color(r), marker);
             ds4r_out(r, " ", 1);
             ds4r_scan_done(r);
             return;
@@ -1605,7 +1679,7 @@ static void ds4r_scan_byte(ds4r *r, char c) {
 }
 
 static void ds4r_render_byte(ds4r *r, char c) {
-    if (!r->format_markdown || r->in_think) {
+    if (!r->format_markdown) {
         ds4r_md_emit_mark_literals(r);
         ds4r_write_char_raw(r, c);
         return;
@@ -1635,9 +1709,35 @@ static bool ds4r_is_partial_prefix(const char *p, size_t n, const char *prefix) 
     return n < plen && memcmp(prefix, p, n) == 0;
 }
 
-static void ds4r_drop_line_state(ds4r *r) {
-    if (r->line_mode == DS4R_LINE_TABLE) ds4r_table_flush(r);
+/* Close every construct that is still open and print what was held back.  Used
+ * at both think boundaries and at the end of a reply, so no table, fence, or
+ * attribute can leak from thinking into the answer or the other way round. */
+static void ds4r_md_flush_state(ds4r *r) {
+    if (!r->format_markdown) return;
     if (r->line_mode == DS4R_LINE_SCAN) ds4r_scan_flush(r);
+    if (r->line_mode == DS4R_LINE_TABLE) ds4r_table_flush(r);
+    /* A closing fence can be the last thing the model emits, with no following
+     * byte to push the pending backticks through. */
+    if (r->md_mark == DS4R_MARK_BACKTICK && r->md_mark_len >= 3)
+        ds4r_md_commit_backticks(r);
+    else
+        ds4r_md_emit_mark_literals(r);
+    if (r->md_code_block && r->code_line_len) ds4r_code_emit_line(r, false);
+    ds4r_flush_utf8(r);
+    r->md_bold = false;
+    r->md_italic = false;
+    r->md_inline_code = false;
+    r->md_heading = false;
+    r->md_heading_underline = false;
+    r->md_code_block = false;
+    r->md_fence_info = false;
+    r->md_code_line_start = false;
+    r->md_code_in_ml_comment = false;
+    r->md_syntax = NULL;
+    r->md_fence_lang_len = 0;
+    r->md_fence_lang[0] = '\0';
+    ds4r_md_clear_mark(r);
+    ds4r_table_reset(r);
     r->line_mode = DS4R_LINE_OFF;
 }
 
@@ -1659,13 +1759,18 @@ static void ds4r_think_process(ds4r *r, const char *text, size_t len,
         const char *cur = buf + i;
         const size_t rem = total - i;
         if (ds4r_has_prefix(cur, rem, think_open)) {
-            ds4r_drop_line_state(r);
+            ds4r_md_flush_state(r);
             ds4r_flush_utf8(r);
+            ds4r_reset_color(r);
             r->in_think = true;
+            ds4r_line_begin(r);
             i += strlen(think_open);
             continue;
         }
         if (ds4r_has_prefix(cur, rem, think_close)) {
+            /* Flush while still inside the block so anything held back is
+             * printed with the muted palette, then start the answer clean. */
+            ds4r_md_flush_state(r);
             ds4r_flush_utf8(r);
             r->in_think = false;
             ds4r_reset_color(r);
@@ -1743,33 +1848,7 @@ void ds4r_write(ds4r *r, const char *text, size_t len) {
 
 void ds4r_finish(ds4r *r) {
     if (r->format_thinking) ds4r_think_process(r, NULL, 0, true);
-    if (r->format_markdown) {
-        if (r->line_mode == DS4R_LINE_SCAN) ds4r_scan_flush(r);
-        if (r->line_mode == DS4R_LINE_TABLE) ds4r_table_flush(r);
-        /* A closing fence can be the last thing the model emits, with no
-         * following byte to push the pending backticks through. */
-        if (r->md_mark == DS4R_MARK_BACKTICK && r->md_mark_len >= 3)
-            ds4r_md_commit_backticks(r);
-        else
-            ds4r_md_emit_mark_literals(r);
-        if (r->md_code_block && r->code_line_len) ds4r_code_emit_line(r, false);
-        ds4r_flush_utf8(r);
-        r->md_bold = false;
-        r->md_italic = false;
-        r->md_inline_code = false;
-        r->md_heading = false;
-        r->md_heading_underline = false;
-        r->md_code_block = false;
-        r->md_fence_info = false;
-        r->md_code_line_start = false;
-        r->md_code_in_ml_comment = false;
-        r->md_syntax = NULL;
-        r->md_fence_lang_len = 0;
-        r->md_fence_lang[0] = '\0';
-        ds4r_md_clear_mark(r);
-        ds4r_table_reset(r);
-        r->line_mode = DS4R_LINE_OFF;
-    }
+    ds4r_md_flush_state(r);
     ds4r_flush_utf8(r);
     ds4r_reset_color(r);
     fflush(r->fp);
