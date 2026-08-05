@@ -259,6 +259,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "--plain, --no-markdown", "Print raw model text instead of rendered markdown.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
