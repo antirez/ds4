@@ -65546,3 +65546,24 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+/* Metal's raw SWA cache is a ring buffer of raw_cap rows indexed by
+ * pos % raw_cap (see metal_graph_encode_token_raw_swa()). ds4_session_rewind()
+ * only truncates checkpoint.len; it does not shift or revalidate that ring.
+ * A live-prefix rewind is only safe to reuse those rows verbatim while the
+ * discarded tokens have not yet wrapped a row the rewound tail still needs --
+ * i.e. while (old_pos - new_pos) stays under (raw_cap - raw_window), the
+ * margin the graph already reserves so chunked prefill doesn't evict
+ * window-relevant rows mid-chunk. Returns 0 ("no budget, do not rewind") for
+ * GLM, whose dense KV cache has no such ring and is gated separately via
+ * ds4_engine_is_glm_dsa(), and for CPU-only builds with no raw cache. */
+uint32_t ds4_session_raw_rewind_budget(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (!s || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return 0;
+    if (s->graph.raw_cap <= s->graph.raw_window) return 0;
+    return s->graph.raw_cap - s->graph.raw_window;
+#else
+    (void)s;
+    return 0;
+#endif
+}

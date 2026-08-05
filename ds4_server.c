@@ -11170,9 +11170,18 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0) {
+        const bool is_glm = ds4_engine_is_glm_dsa(s->engine);
+        /* GLM's dense KV cache can always rewind: ds4_session_glm_cap_dense_cache()
+         * keeps it consistent. Flash's raw SWA cache is a ring buffer instead
+         * (see ds4_session_raw_rewind_budget()), so only rewind it while the
+         * discarded tail is still guaranteed not to have wrapped a row the
+         * rewound tail will need. */
+        const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
+        const bool can_rewind = is_glm ||
+            (raw_budget > 0 && j->req.prompt.len < old_pos &&
+             (uint32_t)(old_pos - j->req.prompt.len) < raw_budget);
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
+            can_rewind, old_pos, j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
@@ -11181,8 +11190,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             cache_source = "memory-rewind";
             cache_diag.rewind_to = rewind_to;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, rewind_to);
+                       "ds4-server: rewound %s live prefix from %d to %d; final prompt token will be reevaluated",
+                       is_glm ? "GLM" : "Flash", old_pos, rewind_to);
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";
