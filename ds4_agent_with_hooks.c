@@ -13,5 +13,12 @@
 #undef ds4_chat_append_message
 #undef main
 
+/* ds4.h was included while the interposition macros were active, so declare
+ * the original functions explicitly for the wrapper implementation below. */
+void ds4_chat_append_message(ds4_engine *, ds4_tokens *, const char *, const char *);
+void ds4_chat_append_assistant_prefix(ds4_engine *, ds4_tokens *, ds4_think_mode);
+void ds4_tokens_push(ds4_tokens *, int);
+bool ds4_token_is_stop_for_think_mode(ds4_engine *, int, ds4_think_mode);
+
 #include "ds4_hooks.c"
 #include "ds4_agent_hooks.c"
