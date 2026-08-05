@@ -10410,6 +10410,7 @@ static void runtime_help(void) {
     puts("  Ctrl+X       Edit the first queued prompt.");
     puts("  ESC          Interrupt and send queued prompt immediately.");
     puts("  Ctrl+D       Exit from an empty prompt.");
+    puts("  Paste twice  Paste the same text again to expand its placeholder.");
 }
 
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {

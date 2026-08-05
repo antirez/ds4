@@ -586,6 +586,15 @@ The agent is the most stateful component.  Test it manually, not only by build.
   test multiline prompt editing, history navigation, queued prompt display,
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
+- Paste, in both `ds4` and `ds4-agent`:
+  a short snippet of a few lines must appear inline with newlines shown as `↵`;
+  a long or many line paste must collapse to `[Pasted text #1 +N lines]` with the
+  `(paste again to expand)` hint, which must disappear as soon as anything else
+  is typed.  Pasting the same text again must expand that placeholder in place,
+  without duplicating the text, and pasting a file too tall for the terminal
+  twice must beep and keep the placeholder instead of flooding the prompt.
+  Seventeen consecutive pastes must all still be there on submit, and history
+  recall of a folded prompt must submit the real text.
 
 ## 14. Download Script And Model Files
 
