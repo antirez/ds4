@@ -17,6 +17,17 @@
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
 
+/* Payload codecs.  Header byte 21 carries the codec; byte 22 carries
+ * log2(chunk_size) for codec == LZ4.  Bytes 7 and 20 are used by upstream
+ * for model_id and KV_CACHE_PAYLOAD_ABI respectively. */
+#define DS4_KVSTORE_CODEC_NONE 0u
+#define DS4_KVSTORE_CODEC_LZ4  1u   /* lz4-HC1 + byte-4 NEON/SSSE3 shuffle */
+
+/* MAX bounds the chunk size read from the header so a tampered file cannot
+ * trigger a gigabyte allocation.  See misc/COMPRESSED_KV_CACHE.md. */
+#define DS4_KVSTORE_DEFAULT_CHUNK_BYTES (16u * 1024u * 1024u)   /* log2 = 24 */
+#define DS4_KVSTORE_MAX_CHUNK_BYTES     (64u * 1024u * 1024u)   /* log2 = 26 */
+
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
     DS4_KVSTORE_REASON_COLD      = 1,
@@ -49,6 +60,8 @@ typedef struct {
     uint32_t hits;
     uint32_t ctx_size;
     uint8_t ext_flags;
+    uint8_t codec;          /* DS4_KVSTORE_CODEC_NONE for v1 files or v2-uncompressed */
+    uint32_t chunk_size;    /* raw bytes per chunk when codec == LZ4 */
     uint64_t created_at;
     uint64_t last_used;
     uint64_t payload_bytes;
@@ -62,6 +75,10 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* 0 disables compression (writes uncompressed v2 files); >=1 enables lz4
+     * with that many compressor threads.  ds4_kvstore_default_options sets the
+     * default from the online CPU count, matching ds4_threads_init in ds4.c. */
+    int compression_threads;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -203,6 +220,7 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,
+                             uint8_t codec, uint8_t chunk_size_log2,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes);
@@ -213,5 +231,38 @@ char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
+
+/* Streaming LZ4 cookie wrappers for the payload region.  Both return a FILE *
+ * around the raw file handle; closing the wrapper with fclose() patches the
+ * framing header and does NOT close the underlying file (the caller owns it).
+ * The reader peeks the 12-byte framing eagerly when uncompressed_total_out is
+ * non-NULL so the load site learns the uncompressed payload size before any
+ * decompression happens.  See misc/COMPRESSED_KV_CACHE.md. */
+FILE *kv_lz4_writer_open(FILE *out, uint32_t chunk_size, int n_workers);
+FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
+                         uint32_t chunk_size, int n_workers,
+                         uint64_t *uncompressed_total_out);
+
+/* Write the payload region for `staged` into `fp`, which must be positioned at
+ * the payload start.  n_workers == 0 writes a raw payload; >=1 wraps it in the
+ * LZ4 codec.  On success sets *codec_out, *chunk_log2_out, and *on_disk_out
+ * (payload bytes written, excluding any trailer) for the header patch-back.
+ * Returns true on success; save_err carries the reason on failure. */
+bool ds4_kvstore_write_payload_region(FILE *fp,
+                                      const ds4_session_payload_file *staged,
+                                      int n_workers, uint32_t chunk_bytes,
+                                      uint8_t *codec_out, uint8_t *chunk_log2_out,
+                                      uint64_t *on_disk_out,
+                                      char *save_err, size_t save_err_len);
+
+/* Load the payload region from `fp`, positioned at the payload start, into
+ * `session`.  codec, payload_bytes, and chunk_size come from the file header.
+ * Always leaves `fp` positioned just past the payload region (independent of
+ * codec or stdio read-ahead) so a trailing record loads at the right offset.
+ * Returns 0 on success; load_err carries the reason on failure. */
+int ds4_kvstore_load_payload_region(ds4_session *session, FILE *fp,
+                                    uint8_t codec, uint64_t payload_bytes,
+                                    uint32_t chunk_size, int n_workers,
+                                    char *load_err, size_t load_err_len);
 
 #endif
