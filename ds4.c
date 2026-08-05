@@ -382,14 +382,30 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #define DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE (160000.0f)
 #define DS4_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
 
-static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
+/* Official DeepSeek-V4 "high" reasoning_effort prefix (deepseek-ai/DeepSeek-V4-Flash-0731,
+ * encoding/README.md). This was previously misnamed *_MAX_PREFIX and was the only
+ * prefix ever injected (for DS4_THINK_MAX), leaving DS4_THINK_HIGH with no prefix
+ * at all -- i.e. every non-"max" request silently rendered as official "low". */
+static const char DS4_REASONING_EFFORT_HIGH_PREFIX[] =
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
-/* DeepSeek recommends Think Max only with at least a 384K-token context window.
- * Below that size we keep ordinary thinking to avoid injecting a prompt that
- * asks for a reasoning budget the allocated context is not meant to hold. */
+/* Official DeepSeek-V4 "max" reasoning_effort prefix. Was previously unreachable:
+ * DS4_THINK_MAX rendered the "high" text above instead. Note the em dash (U+2014)
+ * right after "Beyond maximum" -- verified byte-for-byte against the primary source. */
+static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
+    "Reasoning Effort: Beyond maximum \xe2\x80\x94 exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
+/* Previously this gated Think Max behind a 384K *context* minimum, citing DeepSeek's
+ * recommendation as if it were an input-context requirement. It is not: the 0731
+ * model card recommends "a maximum output length of 384K tokens" for the high/max
+ * tiers -- an output-budget guideline, not a precondition for the tier to render at
+ * all. Kept as a documented no-op (see ds4_think_mode_for_context below) rather than
+ * removing the function, since ds4_server.c calls it from four request-handling
+ * sites and a caller-side output-length advisory may still want this constant. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
@@ -36860,6 +36876,8 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
+    } else if (think_mode == DS4_THINK_HIGH) {
+        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_HIGH_PREFIX, out);
     } else if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
@@ -48107,6 +48125,10 @@ const char *ds4_think_mode_name(ds4_think_mode mode) {
     return "unknown";
 }
 
+const char *ds4_think_high_prefix(void) {
+    return DS4_REASONING_EFFORT_HIGH_PREFIX;
+}
+
 const char *ds4_think_max_prefix(void) {
     return DS4_REASONING_EFFORT_MAX_PREFIX;
 }
@@ -48115,10 +48137,12 @@ uint32_t ds4_think_max_min_context(void) {
     return DS4_THINK_MAX_MIN_CONTEXT;
 }
 
+/* No-op pass-through: see the comment on DS4_THINK_MAX_MIN_CONTEXT. Kept for the
+ * four ds4_server.c call sites and to preserve API surface; ds4_think_max_min_context()
+ * remains available for callers that want to advise clients on the model card's
+ * actual output-length guideline. */
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
-    if (mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
-        return DS4_THINK_HIGH;
-    }
+    (void)ctx_size;
     return mode;
 }
 

@@ -2464,7 +2464,8 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
 
     buf out = {0};
     buf_puts(&out, "<｜begin▁of▁sentence｜>");
-    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
+    if (think_mode == DS4_THINK_HIGH) buf_puts(&out, ds4_think_high_prefix());
+    else if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;
@@ -14661,7 +14662,10 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
+    /* ds4_think_mode_for_context() is a documented pass-through (see ds4.c): the
+     * 384K figure in ds4_think_max_min_context() is the model card's *output*
+     * length guideline, not an input-context precondition for the tier to apply. */
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_MAX);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
 }
@@ -14714,6 +14718,33 @@ static void test_render_think_max_prompt_prefix(void) {
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
     TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_high_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_think_high_prompt_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    /* Regression test for the bug where DS4_THINK_HIGH rendered no prefix at
+     * all, silently downgrading every non-"max" reasoning_effort request to
+     * official DeepSeek "low". */
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
+    TEST_ASSERT(strstr(prompt, ds4_think_high_prefix()) != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
     TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(prompt, "</think>") == NULL);
 
@@ -17786,6 +17817,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
+    test_render_think_high_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
