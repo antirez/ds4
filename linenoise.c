@@ -993,6 +993,8 @@ static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
 struct linenoiseFold {
     size_t start;
     size_t end;
+    int id;             /* Placeholder number, or 0 for unnumbered folds. */
+    int hinted;         /* Show the "paste again to expand" suffix. */
     char display[64];
     size_t displaylen;
 };
@@ -1027,17 +1029,37 @@ static int shouldFoldHistoryText(const char *buf, size_t len) {
            lines >= HISTORY_FOLD_MULTILINE_LINES;
 }
 
-/* Fill f->display with the text shown instead of the folded range. */
+/* Fill f->display with the text shown instead of the folded range. Folds
+ * created by a paste on the current line carry a number the user can refer
+ * to; folds reconstructed from history have no number, since they were never
+ * pasted here. */
 static void foldSetRenderedText(struct linenoiseFold *f, const char *buf) {
     size_t hidden = f->end - f->start;
     size_t lines = foldCountLines(buf + f->start, hidden);
+    const char *hint = f->hinted ? " (paste again to expand)" : "";
     int n;
 
-    if (lines > 1)
-        n = snprintf(f->display,sizeof(f->display),"[... %zu pasted lines ...]",lines);
-    else
-        n = snprintf(f->display,sizeof(f->display),"[... %zu pasted chars ...]",hidden);
+    /* Text ending with a newline still has that many lines: the final
+     * newline closes the last line instead of opening an empty one. */
+    if (lines > 1 && buf[f->end-1] == '\n') lines--;
+
+    if (f->id > 0) {
+        if (lines > 1)
+            n = snprintf(f->display,sizeof(f->display),
+                         "[Pasted text #%d +%zu lines]%s",f->id,lines,hint);
+        else
+            n = snprintf(f->display,sizeof(f->display),
+                         "[Pasted text #%d +%zu chars]%s",f->id,hidden,hint);
+    } else {
+        if (lines > 1)
+            n = snprintf(f->display,sizeof(f->display),"[... %zu lines ...]",lines);
+        else
+            n = snprintf(f->display,sizeof(f->display),"[... %zu chars ...]",hidden);
+    }
+    /* snprintf() reports the untruncated length: never trust it past the
+     * buffer, or the render would read out of bounds. */
     if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(f->display)) n = (int)sizeof(f->display)-1;
     f->displaylen = (size_t)n;
 }
 
@@ -1047,6 +1069,7 @@ static void foldSetRenderedText(struct linenoiseFold *f, const char *buf) {
  * contains newlines. */
 static int linenoiseBuildHistoryFold(struct linenoiseState *l, struct linenoiseFold *f) {
     f->start = f->end = f->displaylen = 0;
+    f->id = f->hinted = 0;
     if (l->len == 0 || maskmode) return 0;
     if (!shouldFoldHistoryText(l->buf,l->len)) return 0;
 
@@ -1106,6 +1129,8 @@ static int linenoiseGetRenderFolds(struct linenoiseState *l, struct linenoiseFol
         f = fs->fold + fs->count++;
         f->start = start;
         f->end = end;
+        f->id = l->fold_id[j];
+        f->hinted = f->id > 0 && f->id == l->fold_hint_id;
         foldSetRenderedText(f,l->buf);
     }
     return fs->count != 0;
@@ -1231,25 +1256,45 @@ static size_t linenoiseEditPrevLen(struct linenoiseState *l, size_t pos) {
     return utf8PrevCharLen(l->buf,pos);
 }
 
-/* Add a fold range, keeping the array sorted by start offset. */
-static void linenoiseFoldAdd(struct linenoiseState *l, size_t start, size_t end) {
+/* Add a fold range with an explicit number, keeping the array sorted by start
+ * offset. Return 1 if the fold was stored. The number is kept beside the range
+ * because the array order follows the offsets, not the creation order. */
+static int linenoiseFoldInsert(struct linenoiseState *l, size_t start, size_t end, int id) {
     int j;
 
-    if (start >= end || l->fold_count == LINENOISE_MAX_FOLDS) return;
+    if (start >= end || l->fold_count == LINENOISE_MAX_FOLDS) return 0;
     j = l->fold_count;
     while (j > 0 && start < l->fold_start[j-1]) {
         l->fold_start[j] = l->fold_start[j-1];
         l->fold_end[j] = l->fold_end[j-1];
+        l->fold_id[j] = l->fold_id[j-1];
         j--;
     }
     l->fold_start[j] = start;
     l->fold_end[j] = end;
+    l->fold_id[j] = id;
     l->fold_count++;
+    return 1;
 }
 
-/* Clear all remembered fold ranges. */
+/* Add a fold for text just pasted on this line, giving it the next
+ * placeholder number. Return the assigned number, or 0 if there was no free
+ * fold slot. Numbers are never reused or reassigned, so expanding "#1" leaves
+ * the next paste as "#2" instead of renumbering what is on screen. */
+static int linenoiseFoldAdd(struct linenoiseState *l, size_t start, size_t end) {
+    int id = l->fold_next_id+1;
+
+    if (!linenoiseFoldInsert(l,start,end,id)) return 0;
+    l->fold_next_id = id;
+    return id;
+}
+
+/* Clear all remembered fold ranges. Numbering restarts from #1 with the next
+ * edited line, like a fresh prompt. */
 static void linenoiseFoldClear(struct linenoiseState *l) {
     l->fold_count = 0;
+    l->fold_next_id = 0;
+    l->fold_hint_id = 0;
 }
 
 /* Remove one remembered fold range. */
@@ -1258,6 +1303,8 @@ static void linenoiseFoldRemove(struct linenoiseState *l, int j) {
             sizeof(size_t)*(l->fold_count-j-1));
     memmove(l->fold_end+j,l->fold_end+j+1,
             sizeof(size_t)*(l->fold_count-j-1));
+    memmove(l->fold_id+j,l->fold_id+j+1,
+            sizeof(int)*(l->fold_count-j-1));
     l->fold_count--;
 }
 
@@ -1902,7 +1949,7 @@ void linenoiseEditHistoryNext(struct linenoiseState *l, int dir) {
          * If the recalled entry needs folding, create one display fold now
          * so text typed after recall remains outside the folded range. */
         if (linenoiseBuildHistoryFold(l,&f))
-            linenoiseFoldAdd(l,f.start,f.end);
+            linenoiseFoldInsert(l,f.start,f.end,0);
         refreshLine(l);
     }
 }
