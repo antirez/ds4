@@ -57271,20 +57271,40 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 /* Estimate for the disk KV cache's eviction scoring (see
  * ds4_kvstore_entry_eviction_score()): the fixed, checkpoint-length-independent
- * portion of a saved session payload. session_payload_live_tensor_bytes()
- * caps the persisted raw SWA cache at raw_window rows regardless of how many
- * tokens the checkpoint actually holds (session_raw_live_rows()), so every
- * checkpoint beyond raw_window tokens -- the common case for anything past
- * the disk cache's default min_tokens floor -- pays roughly this many bytes
- * of raw-cache overhead no matter its length. GLM's dense KV cache scales
- * with checkpoint length instead and has no equivalent fixed cost. */
+ * portion of a saved session payload. Mirrors session_payload_live_tensor_bytes()'s
+ * per-layer terms, keeping only the ones that don't scale with checkpoint
+ * length:
+ * - the raw SWA cache, capped at raw_window rows regardless of how many
+ *   tokens the checkpoint actually holds (session_raw_live_rows()), so every
+ *   checkpoint beyond raw_window tokens -- the common case for anything past
+ *   the disk cache's default min_tokens floor -- pays roughly this many bytes
+ *   of raw-cache overhead no matter its length;
+ * - each compressed layer's attention/index *state* (layer_attn_state_bytes(),
+ *   layer_index_state_bytes()), which depends only on that layer's fixed
+ *   compress ratio, not on the number of compressed rows actually stored
+ *   (g->layer_n_comp[]/layer_n_index_comp[] scale with tokens and are
+ *   deliberately excluded here).
+ * GLM's dense KV cache scales with checkpoint length instead and has no
+ * equivalent fixed cost. */
 uint64_t ds4_engine_checkpoint_fixed_overhead_bytes(ds4_engine *e, int ctx_size) {
 #ifndef DS4_NO_GPU
     if (!e || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return 0;
     uint32_t raw_window = DS4_N_SWA;
     if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
     if (raw_window == 0) raw_window = 1;
-    return (uint64_t)DS4_N_LAYER * raw_window * DS4_N_HEAD_DIM * sizeof(float);
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bytes += (uint64_t)raw_window * DS4_N_HEAD_DIM * sizeof(float);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        bytes += layer_attn_state_bytes(ratio);
+        bytes += layer_attn_state_bytes(ratio);
+        if (ratio == 4) {
+            bytes += layer_index_state_bytes(ratio);
+            bytes += layer_index_state_bytes(ratio);
+        }
+    }
+    return bytes;
 #else
     (void)e;
     (void)ctx_size;
