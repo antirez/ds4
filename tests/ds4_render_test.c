@@ -45,7 +45,7 @@ static void fail(const char *what, const char *got, const char *want) {
 }
 
 static char *render_once(const char *in, size_t len, bool color, bool thinking,
-                         bool in_think, bool bytewise) {
+                         bool in_think, int cols, bool bytewise) {
     char *buf = NULL;
     size_t n = 0;
     FILE *fp = open_memstream(&buf, &n);
@@ -57,6 +57,7 @@ static char *render_once(const char *in, size_t len, bool color, bool thinking,
     ds4r r;
     ds4r_init(&r, fp, color, thinking);
     if (in_think) ds4r_set_in_think(&r, true);
+    if (cols) ds4r_set_columns(&r, cols);
     if (bytewise) {
         for (size_t i = 0; i < len; i++) ds4r_write(&r, in + i, 1);
     } else {
@@ -70,10 +71,10 @@ static char *render_once(const char *in, size_t len, bool color, bool thinking,
 
 /* Render in both chunkings and return the whole-string result. */
 static char *render_opt(const char *in, bool color, bool thinking,
-                        bool in_think) {
+                        bool in_think, int cols) {
     size_t len = strlen(in);
-    char *whole = render_once(in, len, color, thinking, in_think, false);
-    char *split = render_once(in, len, color, thinking, in_think, true);
+    char *whole = render_once(in, len, color, thinking, in_think, cols, false);
+    char *split = render_once(in, len, color, thinking, in_think, cols, true);
     if (whole && split && strcmp(whole, split) != 0)
         fail("chunking is not stable", split, whole);
     free(split);
@@ -81,7 +82,7 @@ static char *render_opt(const char *in, bool color, bool thinking,
 }
 
 static char *render(const char *in) {
-    return render_opt(in, true, false, false);
+    return render_opt(in, true, false, false, 0);
 }
 
 static void expect(const char *what, char *got, const char *want) {
@@ -137,18 +138,50 @@ static void test_utf8(void) {
 
 static void test_think(void) {
     expect("think block",
-           render_opt("<think>hidden</think>visible\n", true, true, false),
+           render_opt("<think>hidden</think>visible\n", true, true, false, 0),
            "\x1b[90mhidden\x1b[0m\nvisible\n");
     /* The CLI starts inside the think block when thinking is enabled. */
     expect("implicit think open",
-           render_opt("reasoning</think>answer\n", true, true, true),
+           render_opt("reasoning</think>answer\n", true, true, true, 0),
            "\x1b[90mreasoning\x1b[0m\nanswer\n");
     expect("think without color",
-           render_opt("<think>hidden</think>visible\n", false, true, false),
+           render_opt("<think>hidden</think>visible\n", false, true, false, 0),
            "hidden\nvisible\n");
     expect("markdown is inert inside think",
-           render_opt("<think>**not bold**</think>ok\n", true, true, false),
+           render_opt("<think>**not bold**</think>ok\n", true, true, false, 0),
            "\x1b[90m**not bold**\x1b[0m\nok\n");
+}
+
+static void test_headings_lists(void) {
+    expect("h1", render("# Title\n"), "\x1b[1m\x1b[4mTitle\x1b[0m\n");
+    expect("h3", render("### Sub\n"), "\x1b[1mSub\x1b[0m\n");
+    expect("not a heading", render("#tag\n"), "#tag\n");
+    expect("bullet", render("- item\n"),
+           "\x1b[38;5;244m\xe2\x80\xa2\x1b[0m item\n");
+    expect("indented bullet", render("  * item\n"),
+           "  \x1b[38;5;244m\xe2\x80\xa2\x1b[0m item\n");
+    expect("ordered", render("1. one\n"),
+           "\x1b[38;5;244m1.\x1b[0m one\n");
+    expect("bold at line start", render("**b** x\n"),
+           "\x1b[1mb\x1b[0m x\n");
+    expect("quote", render("> hi\n"),
+           "\x1b[38;5;244m\xe2\x94\x82 \x1b[0mhi\n");
+    expect("nested quote", render(">> hi\n"),
+           "\x1b[38;5;244m\xe2\x94\x82 \x1b[0m\x1b[38;5;244m\xe2\x94\x82 \x1b[0mhi\n");
+    expect("dash text is not a rule", render("- - x\n"),
+           "\x1b[38;5;244m\xe2\x80\xa2\x1b[0m - x\n");
+
+    char *rule = render_opt("---\n", true, false, false, 20);
+    expect("horizontal rule", rule,
+           "\x1b[38;5;244m"
+           "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+           "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+           "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+           "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+           "\x1b[0m\n");
+    expect("star rule is a rule", render_opt("***\n", true, false, false, 6),
+           "\x1b[38;5;244m\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+           "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\x1b[0m\n");
 }
 
 static void test_fences(void) {
@@ -189,7 +222,7 @@ static void test_plain_passthrough(void) {
         "| 1 | 2 |\n"
         "```c\nint main(void) { return 0; }\n```\n"
         "中文 mixed 内容 🚀\n";
-    char *got = render_opt(corpus, false, false, false);
+    char *got = render_opt(corpus, false, false, false, 0);
     if (got && strcmp(got, corpus) != 0)
         fail("color=false passthrough", got, corpus);
     free(got);
@@ -217,6 +250,7 @@ int main(void) {
     test_inline();
     test_utf8();
     test_think();
+    test_headings_lists();
     test_fences();
     test_plain_passthrough();
     test_plain_mode();

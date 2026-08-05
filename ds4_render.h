@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#define DS4R_LINE_BUF   96      /* line-start scratch: indent plus markers */
 #define DS4R_FENCE_LANG 32
 
 typedef struct ds4r_syntax ds4r_syntax;
@@ -26,6 +27,21 @@ typedef enum {
     DS4R_MARK_BACKTICK,
 } ds4r_mark;
 
+typedef enum {
+    DS4R_LINE_OFF = 0,      /* mid line: bytes go to the inline parser */
+    DS4R_LINE_SCAN,         /* classifying the start of a logical line */
+} ds4r_line_mode;
+
+typedef enum {
+    DS4R_SCAN_INDENT = 0,
+    DS4R_SCAN_HASH,
+    DS4R_SCAN_MARKER,       /* run of '-', '*', '_' or '+' */
+    DS4R_SCAN_MARKER_TAIL,  /* spaces after a rule-length marker run */
+    DS4R_SCAN_NUMBER,
+    DS4R_SCAN_NUMBER_DOT,
+    DS4R_SCAN_QUOTE,        /* just emitted a '>' prefix */
+} ds4r_scan_state;
+
 typedef struct {
     FILE *fp;
     bool use_color;         /* ANSI attributes may be emitted */
@@ -35,6 +51,7 @@ typedef struct {
     bool color_open;        /* a non-default attribute is currently set */
     bool last_output_newline;
     unsigned attr_key;      /* attribute set the open escape stands for */
+    int cols_override;      /* 0: ask the terminal */
 
     /* <think> marker reassembly across writes. */
     char pending[16];
@@ -51,6 +68,8 @@ typedef struct {
     bool md_bold;
     bool md_italic;
     bool md_inline_code;
+    bool md_heading;
+    bool md_heading_underline;
 
     /* Fenced code blocks. */
     bool md_code_block;
@@ -63,6 +82,15 @@ typedef struct {
     char *code_line;
     size_t code_line_len;
     size_t code_line_cap;
+
+    /* Line-start classification. */
+    ds4r_line_mode line_mode;
+    ds4r_scan_state scan;
+    char line_buf[DS4R_LINE_BUF];
+    size_t line_len;
+    size_t indent_len;      /* bytes of line_buf that precede the marker run */
+    size_t marker_run;
+    char marker_ch;
 } ds4r;
 
 /* color enables both ANSI attributes and markdown rendering; use
@@ -70,6 +98,7 @@ typedef struct {
 void ds4r_init(ds4r *r, FILE *fp, bool color, bool format_thinking);
 void ds4r_set_markdown(ds4r *r, bool enabled);
 void ds4r_set_in_think(ds4r *r, bool in_think);
+void ds4r_set_columns(ds4r *r, int cols);   /* 0 restores terminal detection */
 void ds4r_write(ds4r *r, const char *text, size_t len);
 void ds4r_finish(ds4r *r);
 void ds4r_free(ds4r *r);

@@ -1,12 +1,14 @@
 /* Streaming Markdown renderer for terminal chat output.  See ds4_render.h.
  *
- * ds4r_write() strips the <think> markers and feeds the rest to
- * ds4r_md_feed(), which handles the inline constructs: bold, italic, inline
- * code, and fenced code blocks.  Bytes that cannot be classified yet are held
- * back: marker runs and partial UTF-8 sequences.
+ * The parser is a byte pump with three layers.  ds4r_write() strips <think>
+ * markers, ds4r_render_byte() classifies logical line starts (headings, lists,
+ * quotes, rules), and ds4r_md_feed() handles the inline constructs (bold,
+ * italic, inline code, fenced blocks).  Everything that cannot be decided from
+ * the bytes seen so far is held in a small buffer: marker runs and partial
+ * UTF-8 sequences.
  *
  * The inline machine, the UTF-8 accumulator, and the fenced-block highlighter
- * follow the agent renderer in ds4_agent.c. */
+ * follow the agent renderer in ds4_agent.c; the line-start dispatch is new. */
 
 #include "ds4_render.h"
 
@@ -18,10 +20,14 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#define DS4R_GREY  "\x1b[38;5;244m"
 #define DS4R_RESET "\x1b[0m"
 
 static void ds4r_render_byte(ds4r *r, char c);
 static void ds4r_md_feed(ds4r *r, char c);
+static void ds4r_scan_byte(ds4r *r, char c);
+static void ds4r_scan_flush(ds4r *r);
+static void ds4r_line_begin(ds4r *r);
 
 static size_t ds4r_utf8_need(unsigned char c) {
     if (c < 0x80) return 1;
@@ -62,6 +68,10 @@ static void ds4r_str_add(ds4r_str *s, const char *b, size_t n) {
 
 static void ds4r_str_addz(ds4r_str *s, const char *z) {
     ds4r_str_add(s, z, strlen(z));
+}
+
+static void ds4r_str_repeat(ds4r_str *s, const char *unit, int times) {
+    for (int i = 0; i < times; i++) ds4r_str_addz(s, unit);
 }
 
 static void ds4r_str_free(ds4r_str *s) {
@@ -113,8 +123,9 @@ static unsigned ds4r_attr_key(const ds4r *r) {
     if (r->in_think) k |= 1u;
     if (r->md_code_block) k |= 2u;
     if (r->md_inline_code) k |= 4u;
-    if (r->md_bold) k |= 8u;
+    if (r->md_bold || r->md_heading) k |= 8u;
     if (r->md_italic) k |= 16u;
+    if (r->md_heading_underline) k |= 32u;
     return k;
 }
 
@@ -128,8 +139,9 @@ static void ds4r_set_attrs(ds4r *r) {
         return;
     }
     if (r->md_inline_code) ds4r_seq(r, "\x1b[36m");
-    if (r->md_bold) ds4r_seq(r, "\x1b[1m");
+    if (r->md_bold || r->md_heading) ds4r_seq(r, "\x1b[1m");
     if (r->md_italic) ds4r_seq(r, "\x1b[3m");
+    if (r->md_heading_underline) ds4r_seq(r, "\x1b[4m");
 }
 
 /* Emit one complete character with the attributes it must be shown in. */
@@ -183,11 +195,30 @@ static void ds4r_write_char_raw(ds4r *r, char c) {
     r->utf8_pending_need = need;
 }
 
+/* Bytes the renderer generates itself (rules, bullets, quote bars) carry their
+ * own color, so any streaming attribute is closed first. */
+static void ds4r_emit_styled(ds4r *r, const char *color, const char *text) {
+    ds4r_flush_utf8(r);
+    ds4r_reset_color(r);
+    if (color) ds4r_seq(r, color);
+    ds4r_out(r, text, strlen(text));
+    if (color) ds4r_seq(r, DS4R_RESET);
+}
+
 /* Fence markers are shown without markdown attributes. */
 static void ds4r_put_plain(ds4r *r, char c) {
     ds4r_flush_utf8(r);
     ds4r_reset_color(r);
     ds4r_out(r, &c, 1);
+}
+
+static int ds4r_columns(const ds4r *r) {
+    if (r->cols_override > 0) return r->cols_override;
+    struct winsize ws;
+    int fd = r->fp ? fileno(r->fp) : -1;
+    if (fd >= 0 && ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
 }
 
 /* ============================================================================
@@ -763,6 +794,14 @@ static bool ds4r_space_byte(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
+static void ds4r_md_end_line(ds4r *r) {
+    r->md_heading = false;
+    r->md_heading_underline = false;
+    ds4r_write_char_raw(r, '\n');
+    ds4r_flush_utf8(r);
+    ds4r_line_begin(r);
+}
+
 /* Consume one byte of markdown-aware output.  Backticks and stars are held
  * until the parser knows whether they form a marker; ordinary text goes to the
  * raw writer with the current attributes. */
@@ -827,13 +866,210 @@ static void ds4r_md_feed(ds4r *r, char c) {
         r->md_mark_len = 1;
         return;
     }
+    if (c == '\n') {
+        ds4r_md_end_line(r);
+        return;
+    }
     ds4r_write_char_raw(r, c);
+}
+
+/* ============================================================================
+ * Line-start dispatch
+ * ============================================================================ */
+
+static void ds4r_line_begin(ds4r *r) {
+    if (!r->format_markdown || r->in_think || r->md_code_block) {
+        r->line_mode = DS4R_LINE_OFF;
+        return;
+    }
+    r->line_mode = DS4R_LINE_SCAN;
+    r->scan = DS4R_SCAN_INDENT;
+    r->line_len = 0;
+    r->indent_len = 0;
+    r->marker_run = 0;
+}
+
+/* Give up on the classification: replay everything the scanner held back. */
+static void ds4r_scan_flush(ds4r *r) {
+    char head[DS4R_LINE_BUF];
+    char tail[DS4R_LINE_BUF];
+    size_t hn = r->indent_len;
+    size_t tn = r->line_len - r->indent_len;
+    size_t run = r->marker_run;
+    char mc = r->marker_ch;
+
+    memcpy(head, r->line_buf, hn);
+    memcpy(tail, r->line_buf + hn, tn);
+    r->line_mode = DS4R_LINE_OFF;
+    r->line_len = 0;
+    r->indent_len = 0;
+    r->marker_run = 0;
+
+    for (size_t i = 0; i < hn; i++) ds4r_render_byte(r, head[i]);
+    for (size_t i = 0; i < run; i++) ds4r_render_byte(r, mc);
+    for (size_t i = 0; i < tn; i++) ds4r_render_byte(r, tail[i]);
+}
+
+/* Emit the indentation of a line whose marker the renderer replaces. */
+static void ds4r_scan_emit_indent(ds4r *r) {
+    for (size_t i = 0; i < r->indent_len; i++)
+        ds4r_write_char_raw(r, r->line_buf[i]);
+}
+
+static void ds4r_scan_done(ds4r *r) {
+    r->line_mode = DS4R_LINE_OFF;
+    r->line_len = 0;
+    r->indent_len = 0;
+    r->marker_run = 0;
+}
+
+static void ds4r_scan_rule(ds4r *r) {
+    int cols = ds4r_columns(r);
+    if (cols > 80) cols = 80;
+    if (cols < 4) cols = 4;
+    ds4r_str out = {0};
+    ds4r_str_repeat(&out, "\xe2\x94\x80", cols);
+    if (!out.oom && out.p) ds4r_emit_styled(r, DS4R_GREY, out.p);
+    ds4r_str_free(&out);
+}
+
+static void ds4r_scan_byte(ds4r *r, char c) {
+    switch (r->scan) {
+    case DS4R_SCAN_INDENT:
+        if (c == ' ' || c == '\t') {
+            if (r->line_len + 16 < DS4R_LINE_BUF) {
+                r->line_buf[r->line_len++] = c;
+                r->indent_len = r->line_len;
+                return;
+            }
+            break;
+        }
+        if (c == '#') {
+            r->scan = DS4R_SCAN_HASH;
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        if (c == '-' || c == '*' || c == '+' || c == '_') {
+            r->scan = DS4R_SCAN_MARKER;
+            r->marker_ch = c;
+            r->marker_run = 1;
+            return;
+        }
+        if (c == '>') {
+            ds4r_scan_emit_indent(r);
+            ds4r_emit_styled(r, DS4R_GREY, "\xe2\x94\x82 ");
+            r->line_len = 0;
+            r->indent_len = 0;
+            r->scan = DS4R_SCAN_QUOTE;
+            return;
+        }
+        if (c >= '0' && c <= '9') {
+            r->scan = DS4R_SCAN_NUMBER;
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        break;
+
+    case DS4R_SCAN_HASH:
+        if (c == '#' && r->line_len - r->indent_len < 6) {
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        if (c == ' ') {
+            ds4r_scan_emit_indent(r);
+            r->md_heading = true;
+            r->md_heading_underline = r->line_len - r->indent_len <= 2;
+            ds4r_scan_done(r);
+            return;
+        }
+        break;
+
+    case DS4R_SCAN_MARKER:
+        if (c == r->marker_ch) {
+            r->marker_run++;
+            return;
+        }
+        if (c == ' ' || c == '\t') {
+            if (r->marker_run == 1 && r->marker_ch != '_') {
+                ds4r_scan_emit_indent(r);
+                ds4r_emit_styled(r, DS4R_GREY, "\xe2\x80\xa2");
+                ds4r_out(r, " ", 1);
+                ds4r_scan_done(r);
+                return;
+            }
+            if (r->marker_run >= 3 && r->line_len + 4 < DS4R_LINE_BUF) {
+                r->scan = DS4R_SCAN_MARKER_TAIL;
+                r->line_buf[r->line_len++] = c;
+                return;
+            }
+            break;
+        }
+        if (c == '\n' && r->marker_run >= 3) {
+            ds4r_scan_rule(r);
+            ds4r_scan_done(r);
+            ds4r_render_byte(r, '\n');
+            return;
+        }
+        break;
+
+    case DS4R_SCAN_MARKER_TAIL:
+        if ((c == ' ' || c == '\t') && r->line_len + 4 < DS4R_LINE_BUF) {
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        if (c == '\n') {
+            ds4r_scan_rule(r);
+            ds4r_scan_done(r);
+            ds4r_render_byte(r, '\n');
+            return;
+        }
+        break;
+
+    case DS4R_SCAN_NUMBER:
+        if (c >= '0' && c <= '9' && r->line_len + 6 < DS4R_LINE_BUF) {
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        if (c == '.' || c == ')') {
+            r->scan = DS4R_SCAN_NUMBER_DOT;
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        break;
+
+    case DS4R_SCAN_NUMBER_DOT:
+        if (c == ' ') {
+            char marker[DS4R_LINE_BUF];
+            size_t n = r->line_len - r->indent_len;
+            memcpy(marker, r->line_buf + r->indent_len, n);
+            marker[n] = '\0';
+            ds4r_scan_emit_indent(r);
+            ds4r_emit_styled(r, DS4R_GREY, marker);
+            ds4r_out(r, " ", 1);
+            ds4r_scan_done(r);
+            return;
+        }
+        break;
+
+    case DS4R_SCAN_QUOTE:
+        r->scan = DS4R_SCAN_INDENT;
+        if (c == ' ') return;    /* the space after '>' belongs to the marker */
+        ds4r_scan_byte(r, c);
+        return;
+    }
+
+    ds4r_scan_flush(r);
+    ds4r_render_byte(r, c);
 }
 
 static void ds4r_render_byte(ds4r *r, char c) {
     if (!r->format_markdown || r->in_think) {
         ds4r_md_emit_mark_literals(r);
         ds4r_write_char_raw(r, c);
+        return;
+    }
+    if (r->line_mode == DS4R_LINE_SCAN) {
+        ds4r_scan_byte(r, c);
         return;
     }
     ds4r_md_feed(r, c);
@@ -851,6 +1087,11 @@ static bool ds4r_has_prefix(const char *p, size_t n, const char *prefix) {
 static bool ds4r_is_partial_prefix(const char *p, size_t n, const char *prefix) {
     size_t plen = strlen(prefix);
     return n < plen && memcmp(prefix, p, n) == 0;
+}
+
+static void ds4r_drop_line_state(ds4r *r) {
+    if (r->line_mode == DS4R_LINE_SCAN) ds4r_scan_flush(r);
+    r->line_mode = DS4R_LINE_OFF;
 }
 
 /* Hide the think markers, grey the thinking text, and never emit a control tag
@@ -871,6 +1112,7 @@ static void ds4r_think_process(ds4r *r, const char *text, size_t len,
         const char *cur = buf + i;
         const size_t rem = total - i;
         if (ds4r_has_prefix(cur, rem, think_open)) {
+            ds4r_drop_line_state(r);
             ds4r_flush_utf8(r);
             r->in_think = true;
             i += strlen(think_open);
@@ -881,6 +1123,7 @@ static void ds4r_think_process(ds4r *r, const char *text, size_t len,
             r->in_think = false;
             ds4r_reset_color(r);
             if (!r->last_output_newline) ds4r_out(r, "\n", 1);
+            ds4r_line_begin(r);
             i += strlen(think_close);
             continue;
         }
@@ -908,14 +1151,21 @@ void ds4r_init(ds4r *r, FILE *fp, bool color, bool format_thinking) {
     r->format_markdown = color;
     r->format_thinking = format_thinking;
     r->last_output_newline = true;
+    ds4r_line_begin(r);
 }
 
 void ds4r_set_markdown(ds4r *r, bool enabled) {
     r->format_markdown = enabled && r->use_color;
+    ds4r_line_begin(r);
 }
 
 void ds4r_set_in_think(ds4r *r, bool in_think) {
     r->in_think = in_think;
+    ds4r_line_begin(r);
+}
+
+void ds4r_set_columns(ds4r *r, int cols) {
+    r->cols_override = cols;
 }
 
 bool ds4r_at_line_start(const ds4r *r) {
@@ -926,6 +1176,7 @@ void ds4r_newline(ds4r *r) {
     ds4r_flush_utf8(r);
     ds4r_reset_color(r);
     ds4r_out(r, "\n", 1);
+    ds4r_line_begin(r);
 }
 
 void ds4r_write(ds4r *r, const char *text, size_t len) {
@@ -946,6 +1197,7 @@ void ds4r_write(ds4r *r, const char *text, size_t len) {
 void ds4r_finish(ds4r *r) {
     if (r->format_thinking) ds4r_think_process(r, NULL, 0, true);
     if (r->format_markdown) {
+        if (r->line_mode == DS4R_LINE_SCAN) ds4r_scan_flush(r);
         /* A closing fence can be the last thing the model emits, with no
          * following byte to push the pending backticks through. */
         if (r->md_mark == DS4R_MARK_BACKTICK && r->md_mark_len >= 3)
@@ -957,6 +1209,8 @@ void ds4r_finish(ds4r *r) {
         r->md_bold = false;
         r->md_italic = false;
         r->md_inline_code = false;
+        r->md_heading = false;
+        r->md_heading_underline = false;
         r->md_code_block = false;
         r->md_fence_info = false;
         r->md_code_line_start = false;
@@ -965,6 +1219,7 @@ void ds4r_finish(ds4r *r) {
         r->md_fence_lang_len = 0;
         r->md_fence_lang[0] = '\0';
         ds4r_md_clear_mark(r);
+        r->line_mode = DS4R_LINE_OFF;
     }
     ds4r_flush_utf8(r);
     ds4r_reset_color(r);
