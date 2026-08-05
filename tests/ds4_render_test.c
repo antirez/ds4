@@ -44,8 +44,23 @@ static void fail(const char *what, const char *got, const char *want) {
     g_failures++;
 }
 
-static char *render_once(const char *in, size_t len, bool color, bool thinking,
-                         bool in_think, int cols, bool bytewise) {
+/* Mirrors the CLI option matrix: markdown mode plus the thinking override. */
+typedef struct {
+    bool color;
+    bool thinking;
+    bool in_think;
+    bool markdown;      /* false: --markdown off */
+    bool tables;        /* false: --markdown basic */
+    bool think_markdown;/* false: --think-plain */
+    int cols;
+} ropt;
+
+static ropt ropt_full(void) {
+    ropt o = {true, false, false, true, true, true, 0};
+    return o;
+}
+
+static char *render_once(const char *in, size_t len, ropt o, bool bytewise) {
     char *buf = NULL;
     size_t n = 0;
     FILE *fp = open_memstream(&buf, &n);
@@ -55,9 +70,12 @@ static char *render_once(const char *in, size_t len, bool color, bool thinking,
         return NULL;
     }
     ds4r r;
-    ds4r_init(&r, fp, color, thinking);
-    if (in_think) ds4r_set_in_think(&r, true);
-    if (cols) ds4r_set_columns(&r, cols);
+    ds4r_init(&r, fp, o.color, o.thinking);
+    if (o.in_think) ds4r_set_in_think(&r, true);
+    if (!o.markdown) ds4r_set_markdown(&r, false);
+    if (!o.tables) ds4r_set_tables(&r, false);
+    if (!o.think_markdown) ds4r_set_think_markdown(&r, false);
+    if (o.cols) ds4r_set_columns(&r, o.cols);
     if (bytewise) {
         for (size_t i = 0; i < len; i++) ds4r_write(&r, in + i, 1);
     } else {
@@ -70,19 +88,35 @@ static char *render_once(const char *in, size_t len, bool color, bool thinking,
 }
 
 /* Render in both chunkings and return the whole-string result. */
-static char *render_opt(const char *in, bool color, bool thinking,
-                        bool in_think, int cols) {
+static char *render_ropt(const char *in, ropt o) {
     size_t len = strlen(in);
-    char *whole = render_once(in, len, color, thinking, in_think, cols, false);
-    char *split = render_once(in, len, color, thinking, in_think, cols, true);
+    char *whole = render_once(in, len, o, false);
+    char *split = render_once(in, len, o, true);
     if (whole && split && strcmp(whole, split) != 0)
         fail("chunking is not stable", split, whole);
     free(split);
     return whole;
 }
 
+static char *render_opt(const char *in, bool color, bool thinking,
+                        bool in_think, int cols) {
+    ropt o = ropt_full();
+    o.color = color;
+    o.thinking = thinking;
+    o.in_think = in_think;
+    o.cols = cols;
+    return render_ropt(in, o);
+}
+
 static char *render(const char *in) {
     return render_opt(in, true, false, false, 0);
+}
+
+/* --markdown basic: everything but table layout. */
+static char *render_basic(const char *in) {
+    ropt o = ropt_full();
+    o.tables = false;
+    return render_ropt(in, o);
 }
 
 static void expect(const char *what, char *got, const char *want) {
@@ -478,7 +512,9 @@ static const char g_corpus[] =
 /* Chunk boundaries must not change the result, whatever the tokenizer emits. */
 static void test_chunk_sweep(void) {
     size_t len = strlen(g_corpus);
-    char *want = render_once(g_corpus, len, true, false, false, 40, false);
+    ropt sweep = ropt_full();
+    sweep.cols = 40;
+    char *want = render_once(g_corpus, len, sweep, false);
     if (!want) return;
     check_utf8_integrity("corpus utf8 integrity", want);
     for (size_t step = 1; step <= 7; step++) {
@@ -525,6 +561,71 @@ static void test_plain_mode(void) {
     free(buf);
 }
 
+/* --markdown basic streams table rows as ordinary text: no buffering, no box,
+ * but the inline pass still applies inside the row. */
+static void test_basic_mode(void) {
+    expect("basic mode leaves table rows unboxed",
+           render_basic("| a | **b** |\n| --- | --- |\n| 1 | 2 |\n"),
+           "| a | \x1b[1mb\x1b[0m |\n| --- | --- |\n| 1 | 2 |\n");
+    expect("basic mode still renders headings",
+           render_basic("## H\n"), "\x1b[1m\x1b[4mH\x1b[0m\n");
+    expect("basic mode still renders bullets",
+           render_basic("- x\n"),
+           "\x1b[38;5;244m\xe2\x80\xa2\x1b[0m x\n");
+    expect_contains("basic mode still highlights fenced code",
+                    render_basic("```c\nreturn 0;\n```\n"),
+                    "\x1b[38;5;214mreturn");
+    /* Thinking follows the same rule: muted inline, no boxes. */
+    ropt o = ropt_full();
+    o.tables = false;
+    o.thinking = true;
+    o.in_think = true;
+    expect("basic mode thinking table stays text",
+           render_ropt("| a | **b** |\n", o),
+           "\x1b[90m| a | \x1b[0m\x1b[1;90mb\x1b[0m\x1b[90m |\n\x1b[0m");
+}
+
+/* --think-plain: reasoning falls back to the legacy single-grey passthrough
+ * while the answer keeps its rendering. */
+static void test_think_plain(void) {
+    ropt o = ropt_full();
+    o.thinking = true;
+    o.think_markdown = false;
+    expect("think-plain keeps reasoning flat",
+           render_ropt("<think># H\n**x** | a |</think>**y**\n", o),
+           "\x1b[90m# H\n**x** | a |\x1b[0m\n\x1b[1my\x1b[0m\n");
+    o.in_think = true;
+    expect("think-plain from the first byte",
+           render_ropt("**x**\n", o), "\x1b[90m**x**\n\x1b[0m");
+}
+
+/* --markdown off is the pre-feature behavior: raw text, grey thinking. */
+static void test_off_mode(void) {
+    static const char corpus[] =
+        "# Heading\n"
+        "Text with **bold**, *italic*, `code`, and a * b.\n"
+        "- bullet\n"
+        "1. ordered\n"
+        "> quote\n"
+        "---\n"
+        "| a | 描述 |\n"
+        "| --- | ---: |\n"
+        "| 1 | 中文 |\n"
+        "```c\nint x = 1;\n```\n"
+        "tail 🚀\n";
+    ropt o = ropt_full();
+    o.markdown = false;
+    char *got = render_ropt(corpus, o);
+    if (got && strcmp(got, corpus) != 0)
+        fail("markdown off passthrough", got, corpus);
+    free(got);
+
+    o.thinking = true;
+    o.in_think = true;
+    expect("markdown off keeps thinking grey",
+           render_ropt("**x**\n", o), "\x1b[90m**x**\n\x1b[0m");
+}
+
 static void test_widths(void) {
     if (ds4r_wcwidth('a') != 1) fail("wcwidth ascii", "x", "1");
     if (ds4r_wcwidth(0x4E2D) != 2) fail("wcwidth han", "x", "2");
@@ -550,6 +651,9 @@ int main(void) {
     test_plain_passthrough();
     test_chunk_sweep();
     test_plain_mode();
+    test_basic_mode();
+    test_think_plain();
+    test_off_mode();
     test_widths();
     if (g_failures) {
         printf("ds4-render-test: %d failure(s)\n", g_failures);

@@ -90,13 +90,30 @@ typedef struct {
     bool metal_graph_prompt_test;
 } cli_generation_options;
 
+/* How much of the markdown pipeline runs on a terminal.  BASIC leaves table
+ * rows as ordinary text so nothing is ever buffered while streaming. */
+typedef enum {
+    CLI_MARKDOWN_OFF = 0,
+    CLI_MARKDOWN_BASIC,
+    CLI_MARKDOWN_FULL,
+} cli_markdown_mode;
+
+static const char *cli_markdown_mode_name(cli_markdown_mode mode) {
+    switch (mode) {
+    case CLI_MARKDOWN_OFF: return "off";
+    case CLI_MARKDOWN_BASIC: return "basic";
+    default: return "full";
+    }
+}
+
 typedef struct {
     ds4_engine_options engine;
     ds4_dist_options *dist;
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
-    bool plain_output;      /* --plain: no markdown rendering on a terminal */
+    cli_markdown_mode markdown;
+    bool think_plain;       /* --think-plain: reasoning stays flat grey */
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -214,6 +231,15 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
         exit(2);
     }
     return v;
+}
+
+static cli_markdown_mode parse_markdown_mode(const char *s) {
+    if (!strcmp(s, "off")) return CLI_MARKDOWN_OFF;
+    if (!strcmp(s, "basic")) return CLI_MARKDOWN_BASIC;
+    if (!strcmp(s, "full")) return CLI_MARKDOWN_FULL;
+    fprintf(stderr, "ds4: invalid value for --markdown: %s\n", s);
+    fprintf(stderr, "ds4: valid markdown modes are: off, basic, full\n");
+    exit(2);
 }
 
 static ds4_backend parse_backend(const char *s) {
@@ -384,16 +410,20 @@ typedef struct {
     ds4r render;
 } token_printer;
 
-static void token_printer_init(token_printer *p,
-                               ds4_engine     *engine,
-                               FILE           *fp,
-                               bool            format_thinking,
-                               bool            plain) {
+static void token_printer_init(token_printer  *p,
+                               ds4_engine      *engine,
+                               FILE            *fp,
+                               bool             format_thinking,
+                               const cli_config *cfg) {
     memset(p, 0, sizeof(*p));
     p->engine = engine;
     p->fp = fp;
     ds4r_init(&p->render, fp, isatty(fileno(fp)) != 0, format_thinking);
-    if (plain) ds4r_set_markdown(&p->render, false);
+    if (cfg->markdown == CLI_MARKDOWN_OFF)
+        ds4r_set_markdown(&p->render, false);
+    if (cfg->markdown != CLI_MARKDOWN_FULL)
+        ds4r_set_tables(&p->render, false);
+    if (cfg->think_plain) ds4r_set_think_markdown(&p->render, false);
     /* Thinking models start their reply inside the reasoning block, without
      * emitting the opening tag. */
     if (format_thinking) ds4r_set_in_think(&p->render, true);
@@ -466,7 +496,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
     token_printer printer;
     token_printer_init(&printer, engine, stdout,
-                       ds4_think_mode_enabled(think_mode), cfg->plain_output);
+                       ds4_think_mode_enabled(think_mode), cfg);
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
@@ -1164,7 +1194,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             token_printer printer;
             token_printer_init(&printer, engine, stdout,
                                ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-                               cfg->plain_output);
+                               cfg);
             cli_prefill_progress progress = {
                 .base_tokens = 0,
                 .input_tokens = prompt.len,
@@ -1200,6 +1230,7 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
+    puts("  /markdown MODE Set output rendering: off, basic, or full.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
@@ -1390,7 +1421,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
     token_printer printer;
     token_printer_init(&printer, engine, stdout,
-                       ds4_think_mode_enabled(think_mode), cfg->plain_output);
+                       ds4_think_mode_enabled(think_mode), cfg);
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
@@ -1561,6 +1592,23 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE);
             puts("Thinking mode: none.");
+        } else if (!strncmp(cmd, "/markdown", 9) &&
+                   (cmd[9] == '\0' || isspace((unsigned char)cmd[9]))) {
+            char *arg = trim_inplace(cmd + 9);
+            if (!arg[0]) {
+                printf("Markdown: %s.\n", cli_markdown_mode_name(cfg->markdown));
+            } else if (!strcmp(arg, "off")) {
+                cfg->markdown = CLI_MARKDOWN_OFF;
+                puts("Markdown: off.");
+            } else if (!strcmp(arg, "basic")) {
+                cfg->markdown = CLI_MARKDOWN_BASIC;
+                puts("Markdown: basic.");
+            } else if (!strcmp(arg, "full")) {
+                cfg->markdown = CLI_MARKDOWN_FULL;
+                puts("Markdown: full.");
+            } else {
+                fprintf(stderr, "ds4: /markdown takes off, basic, or full\n");
+            }
         } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
@@ -1686,6 +1734,7 @@ static cli_config parse_options(int argc, char **argv) {
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
+        .markdown = CLI_MARKDOWN_FULL,
         .gen = {
             .prompt = NULL,
             .system = "You are a helpful assistant",
@@ -1759,8 +1808,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
-        } else if (!strcmp(arg, "--plain") || !strcmp(arg, "--no-markdown")) {
-            c.plain_output = true;
+        } else if (!strcmp(arg, "--markdown")) {
+            c.markdown = parse_markdown_mode(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--plain")) {
+            c.markdown = CLI_MARKDOWN_OFF;
+        } else if (!strcmp(arg, "--think-plain")) {
+            c.think_plain = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {

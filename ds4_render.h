@@ -48,6 +48,8 @@ typedef struct {
     FILE *fp;
     bool use_color;         /* ANSI attributes may be emitted */
     bool format_markdown;   /* markdown constructs are rendered */
+    bool format_tables;     /* pipe tables are laid out as boxes */
+    bool think_markdown;    /* thinking uses the muted markdown palette */
     bool format_thinking;   /* <think> blocks are filtered */
     bool in_think;
     bool color_open;        /* a non-default attribute is currently set */
@@ -103,10 +105,15 @@ typedef struct {
     bool tbl_raw;           /* buffer cap hit: pass the rest of the table through */
 } ds4r;
 
-/* color enables both ANSI attributes and markdown rendering; use
- * ds4r_set_markdown() to keep colors but print markdown source verbatim. */
+/* color enables ANSI attributes, markdown rendering, table layout, and the
+ * muted thinking palette; the setters below narrow that down.
+ * ds4r_set_markdown(false) keeps colors but prints markdown source verbatim,
+ * ds4r_set_tables(false) lets table lines flow through as ordinary text, and
+ * ds4r_set_think_markdown(false) restores plain single-grey thinking. */
 void ds4r_init(ds4r *r, FILE *fp, bool color, bool format_thinking);
 void ds4r_set_markdown(ds4r *r, bool enabled);
+void ds4r_set_tables(ds4r *r, bool enabled);
+void ds4r_set_think_markdown(ds4r *r, bool enabled);
 void ds4r_set_in_think(ds4r *r, bool in_think);
 void ds4r_set_columns(ds4r *r, int cols);   /* 0 restores terminal detection */
 void ds4r_write(ds4r *r, const char *text, size_t len);

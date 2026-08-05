@@ -38,6 +38,7 @@
 #define DS4R_THINK      "\x1b[90m"
 #define DS4R_THINK_DIM  "\x1b[2;90m"
 
+static bool ds4r_markdown_active(const ds4r *r);
 static void ds4r_render_byte(ds4r *r, char c);
 static void ds4r_md_feed(ds4r *r, char c);
 static void ds4r_scan_byte(ds4r *r, char c);
@@ -1485,7 +1486,7 @@ static void ds4r_table_byte(ds4r *r, char c) {
  * ============================================================================ */
 
 static void ds4r_line_begin(ds4r *r) {
-    if (!r->format_markdown || r->md_code_block) {
+    if (!ds4r_markdown_active(r) || r->md_code_block) {
         r->line_mode = DS4R_LINE_OFF;
         return;
     }
@@ -1551,7 +1552,7 @@ static void ds4r_scan_byte(ds4r *r, char c) {
             }
             break;
         }
-        if (c == '|') {
+        if (c == '|' && r->format_tables) {
             r->line_mode = DS4R_LINE_TABLE;
             r->tbl_scan = false;
             ds4r_table_append(r, r->line_buf, r->line_len);
@@ -1678,8 +1679,12 @@ static void ds4r_scan_byte(ds4r *r, char c) {
     ds4r_render_byte(r, c);
 }
 
+static bool ds4r_markdown_active(const ds4r *r) {
+    return r->format_markdown && (!r->in_think || r->think_markdown);
+}
+
 static void ds4r_render_byte(ds4r *r, char c) {
-    if (!r->format_markdown) {
+    if (!ds4r_markdown_active(r)) {
         ds4r_md_emit_mark_literals(r);
         ds4r_write_char_raw(r, c);
         return;
@@ -1801,6 +1806,8 @@ void ds4r_init(ds4r *r, FILE *fp, bool color, bool format_thinking) {
     r->fp = fp;
     r->use_color = color;
     r->format_markdown = color;
+    r->format_tables = color;
+    r->think_markdown = color;
     r->format_thinking = format_thinking;
     r->last_output_newline = true;
     ds4r_line_begin(r);
@@ -1808,6 +1815,15 @@ void ds4r_init(ds4r *r, FILE *fp, bool color, bool format_thinking) {
 
 void ds4r_set_markdown(ds4r *r, bool enabled) {
     r->format_markdown = enabled && r->use_color;
+    ds4r_line_begin(r);
+}
+
+void ds4r_set_tables(ds4r *r, bool enabled) {
+    r->format_tables = enabled;
+}
+
+void ds4r_set_think_markdown(ds4r *r, bool enabled) {
+    r->think_markdown = enabled;
     ds4r_line_begin(r);
 }
 

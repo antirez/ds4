@@ -259,7 +259,9 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
-    opt(fp, c, "--plain, --no-markdown", "Print raw model text instead of rendered markdown.");
+    opt(fp, c, "--markdown MODE", "Terminal rendering: off, basic, or full. Default: full");
+    opt(fp, c, "--plain", "Alias for --markdown off.");
+    opt(fp, c, "--think-plain", "Keep thinking text flat grey instead of rendering it.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
@@ -293,6 +295,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/help", "Show interactive commands.");
     opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
+    opt(fp, c, "/markdown MODE", "Switch terminal rendering: off, basic, or full.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
