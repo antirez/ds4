@@ -121,8 +121,8 @@
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE (1024*1024)      // That will get dynamically allocated
 #define LINENOISE_INITIAL_BUFLEN 4096
-#define PASTE_FOLD_THRESHOLD 200            // Min bytes to fold a single-line paste.
-#define PASTE_FOLD_CONTEXT 8                // Context chars kept around generic folds.
+#define PASTE_FOLD_THRESHOLD 200            // Min bytes to fold a paste.
+#define PASTE_FOLD_LINES 5                  // Max lines shown inline unfolded.
 #define HISTORY_FOLD_THRESHOLD 4096         // Min bytes to fold single-line history.
 #define HISTORY_FOLD_MULTILINE_LINES 16     // Min lines to fold shorter history.
 #define HISTORY_FOLD_CONTEXT 96             // Context chars kept around history folds.
@@ -1028,10 +1028,13 @@ static size_t foldCountLines(const char *buf, size_t len) {
     return lines;
 }
 
-/* Return true if the text should be folded: if it contains newlines or is at
- * least PASTE_FOLD_THRESHOLD bytes long. */
+/* Return true if the text should be folded, that is if showing it inline
+ * would take over the prompt: long text, or more than PASTE_FOLD_LINES lines.
+ * A short snippet is easier to review as itself than as a placeholder, and
+ * its newlines are rendered as markers on the single prompt line. */
 static int shouldFoldText(const char *buf, size_t len) {
-    return memchr(buf, '\n', len) != NULL || len >= PASTE_FOLD_THRESHOLD;
+    return len >= PASTE_FOLD_THRESHOLD ||
+           foldCountLines(buf,len) > PASTE_FOLD_LINES;
 }
 
 /* History recall should not aggressively hide normal prompts.  A single-line
@@ -2180,37 +2183,30 @@ static int pasteBufferReserve(char **buf, size_t *cap, size_t len, size_t need) 
     return 0;
 }
 
-/* Append bytes to the temporary paste buffer, growing both it and l->buf as
- * needed. Return -1 if the paste is too large or allocation fails. */
-static int pasteBufferAppend(struct linenoiseState *l, char **buf, size_t *cap,
-                             size_t *len, const char *s, size_t slen, size_t maxlen) {
-    size_t needed;
-
-    if (*len > maxlen || slen > maxlen-*len) return -1;
+/* Append bytes to the temporary paste buffer. Return -1 if the paste is too
+ * large or allocation fails. Whether the edit buffer can hold the result is
+ * not decided here: the paste is collected first, because identical bytes may
+ * expand an existing fold instead of being inserted at all. */
+static int pasteBufferAppend(char **buf, size_t *cap, size_t *len,
+                             const char *s, size_t slen) {
     if (*len > SIZE_MAX-slen) return -1;
-    needed = *len+slen;
-    if (l->len > SIZE_MAX-needed) return -1;
-    if (linenoiseEditGrow(l,l->len+needed) == -1) return -1;
     if (pasteBufferReserve(buf,cap,*len,slen) == -1) return -1;
     memcpy(*buf+*len,s,slen);
-    *len = needed;
+    *len += slen;
     return 0;
 }
 
 /* Read a bracketed paste until ESC[201~ and insert the real bytes. If folding
- * is needed, remember the inserted range so only rendering is shortened. */
+ * is needed, remember the inserted range so only rendering is shortened. The
+ * paste is dropped, with a beep, only when it is over PASTE_MAX_BYTES or the
+ * edit buffer cannot hold it: running out of fold slots just leaves the text
+ * unfolded rather than silently losing it. */
 static void linenoiseEditPaste(struct linenoiseState *l) {
     static const char END[] = "\x1b[201~";
     const size_t ENDLEN = sizeof(END)-1;
     char *buf = NULL;
     size_t cap = 0, len = 0, match = 0;
-    size_t maxlen = l->buflen_max ? l->buflen_max : l->buflen;
     int overflowed = 0;
-
-    maxlen = maxlen > l->len ? maxlen - l->len : 0;
-    if (maxlen > PASTE_MAX_BYTES) maxlen = PASTE_MAX_BYTES;
-    /* Once all fold slots are used, consume later pastes without storing them. */
-    if (l->fold_count == LINENOISE_MAX_FOLDS) maxlen = 0;
 
     while (1) {
         char c;
@@ -2227,7 +2223,7 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
 
         if (match > 0) {
             if (!overflowed &&
-                pasteBufferAppend(l,&buf,&cap,&len,END,match,maxlen) == -1)
+                pasteBufferAppend(&buf,&cap,&len,END,match) == -1)
                 overflowed = 1;
             match = 0;
             if (c == END[0]) {
@@ -2236,8 +2232,7 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
             }
         }
 
-        if (!overflowed &&
-            pasteBufferAppend(l,&buf,&cap,&len,&c,1,maxlen) == -1)
+        if (!overflowed && pasteBufferAppend(&buf,&cap,&len,&c,1) == -1)
             overflowed = 1;
     }
 
@@ -2279,7 +2274,10 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
         }
     }
 
-    if (!maskmode && shouldFoldText(buf,len)) {
+    /* The real bytes always enter the buffer first, then the range is marked
+     * as folded, and only then we repaint: raw pasted newlines must never
+     * reach the terminal. */
+    {
         size_t start = l->pos;
         if (linenoiseEditInsertNoRefresh(l,buf,len) == -1) {
             free(buf);
@@ -2288,10 +2286,9 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
         }
         /* Point the inline hint at the fold just created, so the newest
          * placeholder is the one advertising how to expand it. */
-        l->fold_hint_id = linenoiseFoldAdd(l,start,start+len);
+        if (!maskmode && shouldFoldText(buf,len))
+            l->fold_hint_id = linenoiseFoldAdd(l,start,start+len);
         refreshLine(l);
-    } else {
-        linenoiseEditInsert(l,buf,len);
     }
     free(buf);
 }
