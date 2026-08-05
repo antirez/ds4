@@ -5319,6 +5319,117 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
     dst4[lane + 96] = o3 * inv_s;
 }
 
+// Each simdgroup owns two heads and updates both from one staged K/V row.
+// This doubles row reuse without increasing the 256-thread workgroup.
+kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
+        constant ds4_metal_args_dsv4_indexed_attention &args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device char *dst,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tgpig.x;
+    const uint head0 = tgpig.y*16u + (uint)sg;
+    const uint head1 = head0 + 8u;
+    if (token >= args.n_tokens || head0 >= args.n_head) return;
+
+    device const float4 *qa = (device const float4 *)(q +
+        (uint64_t)token*args.q_token_stride +
+        (uint64_t)head0*args.q_head_stride);
+    half4 qa0 = (half4)qa[lane + 0];
+    half4 qa1 = (half4)qa[lane + 32];
+    half4 qa2 = (half4)qa[lane + 64];
+    half4 qa3 = (half4)qa[lane + 96];
+    half4 qb0 = half4(0.0h), qb1 = half4(0.0h);
+    half4 qb2 = half4(0.0h), qb3 = half4(0.0h);
+    if (head1 < args.n_head) {
+        device const float4 *qb = (device const float4 *)(q +
+            (uint64_t)token*args.q_token_stride +
+            (uint64_t)head1*args.q_head_stride);
+        qb0 = (half4)qb[lane + 0];
+        qb1 = (half4)qb[lane + 32];
+        qb2 = (half4)qb[lane + 64];
+        qb3 = (half4)qb[lane + 96];
+    }
+
+    float Ma = -FLT_MAX/2.0f, Sa = 0.0f;
+    float Mb = -FLT_MAX/2.0f, Sb = 0.0f;
+    float4 ao0 = 0.0f, ao1 = 0.0f, ao2 = 0.0f, ao3 = 0.0f;
+    float4 bo0 = 0.0f, bo1 = 0.0f, bo2 = 0.0f, bo3 = 0.0f;
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ?
+        qpos + 1u - args.window : 0u;
+    const uint first = max(first_raw_pos, window_first);
+    const uint last = min(qpos, raw_last_pos);
+    if (first <= last) {
+        for (uint pos = first; pos <= last; pos++) {
+            const uint logical = pos - first_raw_pos;
+            const uint row = (args.raw_start + logical)%args.raw_cap;
+            device const float4 *src = (device const float4 *)(raw_kv +
+                (uint64_t)row*args.raw_row_stride);
+            if (tid < 128) kv_shared[tid] = (half4)src[tid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dsv4_attend_shared_h4_row(kv_shared, qa0, qa1, qa2, qa3,
+                args.scale, lane, Ma, Sa, ao0, ao1, ao2, ao3);
+            if (head1 < args.n_head) {
+                dsv4_attend_shared_h4_row(kv_shared, qb0, qb1, qb2, qb3,
+                    args.scale, lane, Mb, Sb, bo0, bo1, bo2, bo3);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const uint visible = min((qpos + 1u)/args.ratio, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk +
+        (uint64_t)token*args.topk_token_stride);
+    for (uint i = 0; i < args.top_k; i++) {
+        const int32_t idx = row_topk[i];
+        if (idx < 0) continue;
+        if ((uint)idx >= visible) break;
+        if (tid < 128) {
+            kv_shared[tid] = dsv4_load_cache_h4(comp_kv,
+                args.comp_row_stride, (uint)idx, tid, args.comp_kv_f16 != 0u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dsv4_attend_shared_h4_row(kv_shared, qa0, qa1, qa2, qa3,
+            args.scale, lane, Ma, Sa, ao0, ao1, ao2, ao3);
+        if (head1 < args.n_head) {
+            dsv4_attend_shared_h4_row(kv_shared, qb0, qb1, qb2, qb3,
+                args.scale, lane, Mb, Sb, bo0, bo1, bo2, bo3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dsv4_attend_sink(((device const float *)sinks)[head0],
+        Ma, Sa, ao0, ao1, ao2, ao3);
+    const float ia = Sa == 0.0f ? 0.0f : 1.0f/Sa;
+    device float4 *da = (device float4 *)(dst +
+        (uint64_t)token*args.dst_token_stride +
+        (uint64_t)head0*args.dst_head_stride);
+    da[lane + 0] = ao0*ia; da[lane + 32] = ao1*ia;
+    da[lane + 64] = ao2*ia; da[lane + 96] = ao3*ia;
+    if (head1 < args.n_head) {
+        dsv4_attend_sink(((device const float *)sinks)[head1],
+            Mb, Sb, bo0, bo1, bo2, bo3);
+        const float ib = Sb == 0.0f ? 0.0f : 1.0f/Sb;
+        device float4 *db = (device float4 *)(dst +
+            (uint64_t)token*args.dst_token_stride +
+            (uint64_t)head1*args.dst_head_stride);
+        db[lane + 0] = bo0*ib; db[lane + 32] = bo1*ib;
+        db[lane + 64] = bo2*ib; db[lane + 96] = bo3*ib;
+    }
+}
+
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
 // visible amount of time repeatedly staging the same K/V row for the eight

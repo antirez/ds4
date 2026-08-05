@@ -240,31 +240,38 @@ decoding, which is useful for comparisons and correctness checks.
 
 ## Speed
 
-*Warning: some of those numbers may no longer be updated, because of the optimization
-efforts that improved the runtime speed without updating the benchmark
-results.*
+The current q2 results use `ds4-bench` with the standard *Promessi sposi*
+input, 2048-token context steps, and 128 greedy generation tokens at every
+frontier. Each prefill number is for the next 2048-token chunk. The complete
+sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
+[gb10.csv](speed-bench/gb10.csv).
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+| Machine | Backend | Context | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| MacBook Pro M5 Max, 128 GB | Metal | 2048 | 790.18 t/s | 39.35 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 16384 | 572.53 t/s | 36.14 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 32768 | 557.04 t/s | 34.36 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 65536 | 398.50 t/s | 27.64 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 2048 | 825.76 t/s | 18.05 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 16384 | 872.44 t/s | 15.10 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 32768 | 855.94 t/s | 14.43 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 65536 | 822.98 t/s | 13.84 t/s |
+
+Older measurements for machines and model variants not rerun in this pass are
+kept for reference. They used the earlier CLI prompt procedure and are not
+directly comparable with the table above.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
 | MacBook Pro M3 Max, 128 GB | q2 | short | 58.52 t/s | 26.68 t/s |
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
-| MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
-| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-![M3 Max t/s](speed-bench/m3_max_ts.svg)
+![M5 Max t/s](speed-bench/m5_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
 
 ## Running models larger than RAM
