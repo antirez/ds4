@@ -843,7 +843,7 @@ static void request_free(request *r) {
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
-    return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+    return effort;
 }
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
@@ -852,14 +852,18 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low") ||
-        !strcmp(s, "minimal"))
-    {
-        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
-         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
-         * must use "none" instead. */
+    if (!strcmp(s, "xhigh") || !strcmp(s, "high") || !strcmp(s, "medium")) {
+        /* Not official DeepSeek-V4 reasoning_effort values (only "low",
+         * "high" and "max" are); treated as aliases for "high" absent any
+         * more specific guidance. */
         *out = DS4_THINK_HIGH;
+        return true;
+    }
+    if (!strcmp(s, "low") || !strcmp(s, "minimal")) {
+        /* Per DeepSeek-V4's own encoding spec, "low" is the default
+         * reasoning_effort and gets no prompt prefix at all -- distinct from
+         * "none", which disables thinking mode entirely. */
+        *out = DS4_THINK_LOW;
         return true;
     }
     if (!strcmp(s, "none")) {
@@ -2464,6 +2468,9 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
 
     buf out = {0};
     buf_puts(&out, "<｜begin▁of▁sentence｜>");
+    /* DS4_THINK_LOW deliberately falls through with no prefix: per DeepSeek-V4's
+     * own encoding spec it's the default reasoning_effort and has no prompt
+     * text, unlike "high"/"max". Thinking is still enabled for LOW. */
     if (think_mode == DS4_THINK_HIGH) buf_puts(&out, ds4_think_high_prefix());
     else if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
     buf_puts(&out, system.ptr ? system.ptr : "");
@@ -14656,7 +14663,14 @@ static void test_request_defaults_use_min_p_filtering(void) {
 
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
+    /* Per DeepSeek-V4's own encoding spec, only "low"/"high"/"max" are real
+     * reasoning_effort values, and "low" is the default with no prompt text
+     * (see issue #660: mapping "low" to DS4_THINK_HIGH made it silently as
+     * verbose as "high", not the model's normal default behavior). "medium"
+     * and "xhigh" are not official DeepSeek values; treated as "high" aliases
+     * absent more specific guidance. */
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == DS4_THINK_LOW);
     TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
@@ -14668,6 +14682,15 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_MAX);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
+
+    /* LOW is "thinking enabled, no prefix" -- distinct from NONE (thinking
+     * disabled) and from HIGH/MAX (thinking enabled, with a prefix). */
+    TEST_ASSERT(ds4_think_mode_enabled(DS4_THINK_LOW));
+    TEST_ASSERT(!ds4_think_mode_enabled(DS4_THINK_NONE));
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_LOW) == DS4_THINK_LOW);
+    TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_LOW) == DS4_THINK_NONE);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_HIGH) == DS4_THINK_HIGH);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_MAX) == DS4_THINK_MAX);
 }
 
 static void test_model_alias_thinking_controls(void) {
@@ -14744,6 +14767,34 @@ static void test_render_think_high_prompt_prefix(void) {
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
     TEST_ASSERT(strstr(prompt, ds4_think_high_prefix()) != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
+    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+/* Regression test for issue #660 ("low" reasoning_effort thinks forever):
+ * DS4_THINK_LOW must render no prefix at all (matching DeepSeek-V4's own
+ * spec, where "low" is the default and has no prompt text), while still
+ * enabling thinking mode -- distinct from DS4_THINK_NONE, which disables
+ * thinking entirely and closes </think> immediately. */
+static void test_render_think_low_prompt_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
+    TEST_ASSERT(strstr(prompt, ds4_think_high_prefix()) == NULL);
     TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) == NULL);
     TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(prompt, "</think>") == NULL);
@@ -17818,6 +17869,7 @@ static void ds4_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_high_prompt_prefix();
+    test_render_think_low_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

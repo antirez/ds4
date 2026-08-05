@@ -24,6 +24,7 @@ typedef enum {
 
 typedef enum {
     DS4_THINK_NONE,
+    DS4_THINK_LOW,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
 } ds4_think_mode;

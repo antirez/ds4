@@ -36862,6 +36862,7 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
+    case DS4_THINK_LOW:  return NULL;
     case DS4_THINK_NONE: return NULL;
     }
     return NULL;
@@ -36870,6 +36871,12 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
+    /* DS4_THINK_LOW intentionally falls through both branches below and
+     * pushes no prefix at all: per DeepSeek-V4's own encoding spec, "low" is
+     * the default reasoning_effort and its prompt prefix is "none" -- only
+     * "high" and "max" get an explicit prefix. Thinking is still enabled for
+     * LOW (see ds4_think_mode_enabled()); only the extra prompt text is
+     * absent. */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
@@ -48113,12 +48120,13 @@ static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
+    return mode == DS4_THINK_LOW || mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
 }
 
 const char *ds4_think_mode_name(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_NONE: return "none";
+    case DS4_THINK_LOW:  return "low";
     case DS4_THINK_HIGH: return "high";
     case DS4_THINK_MAX:  return "max";
     }
