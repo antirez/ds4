@@ -721,6 +721,21 @@ failed:
     return 80;
 }
 
+/* Try to get the number of rows in the current terminal, or assume 24 if it
+ * fails. Unlike getColumns() there is no escape sequence fallback: the only
+ * user is the guard refusing to expand a paste that would not fit, and a
+ * conservative guess there simply keeps the placeholder folded. */
+static int getRows(void) {
+    struct winsize ws;
+
+    /* Test mode: use LINENOISE_ROWS env var for fixed height. */
+    char *rows_env = getenv("LINENOISE_ROWS");
+    if (rows_env) return atoi(rows_env);
+
+    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_row == 0) return 24;
+    return ws.ws_row;
+}
+
 /* Clear the screen. Used to handle ctrl+l */
 void linenoiseClearScreen(void) {
     if (write(STDOUT_FILENO,"\x1b[H\x1b[2J",7) <= 0) {
@@ -1321,10 +1336,16 @@ static int linenoiseRangeOverlapsFold(struct linenoiseState *l, size_t pos, size
 }
 
 /* Adjust fold ranges after an insertion. If insertion somehow lands inside a
- * fold, remove that fold because it no longer maps to an unchanged range. */
+ * fold, remove that fold because it no longer maps to an unchanged range.
+ *
+ * This is also where the inline "paste again" hint dies: it is an aid shown
+ * right after a paste, and every path that changes the buffer content passes
+ * through here, through linenoiseAdjustFoldsAfterDelete() or through
+ * linenoiseFoldClear(). Moving the cursor around leaves it alone. */
 static void linenoiseAdjustFoldsAfterInsert(struct linenoiseState *l, size_t pos, size_t len) {
     int j = 0;
 
+    l->fold_hint_id = 0;
     while (j < l->fold_count) {
         if (pos <= l->fold_start[j]) {
             l->fold_start[j] += len;
@@ -1344,6 +1365,7 @@ static void linenoiseAdjustFoldsAfterDelete(struct linenoiseState *l, size_t pos
     size_t end = pos + len;
     int j = 0;
 
+    l->fold_hint_id = 0;
     while (j < l->fold_count) {
         if (end <= l->fold_start[j]) {
             l->fold_start[j] -= len;
@@ -1355,6 +1377,55 @@ static void linenoiseAdjustFoldsAfterDelete(struct linenoiseState *l, size_t pos
             linenoiseFoldRemove(l,j);
         }
     }
+}
+
+/* Number of terminal rows the prompt currently needs, mirroring the row math
+ * of refreshMultiLine() plus the status footer. Return -1 if the buffer can't
+ * be rendered. */
+static int linenoiseRenderRows(struct linenoiseState *l) {
+    char *render = NULL;
+    size_t render_len, render_pos, cols = l->cols ? l->cols : 80;
+    size_t width;
+
+    if (linenoiseRenderBuffer(l,&render,&render_len,&render_pos) == -1) return -1;
+    width = utf8StrWidth(l->prompt,l->plen) + utf8StrWidth(render,render_len);
+    free(render);
+    return (int)((width+cols-1)/cols) + linenoiseStatusRows(l);
+}
+
+/* Return the index of the fold hiding exactly the given text, or -1. A fold is
+ * never partially edited: the cursor jumps over it and any overlapping edit
+ * drops the whole entry, so an exact byte compare is enough. When more than
+ * one fold matches, the most recently created one wins. */
+static int linenoiseFoldMatch(struct linenoiseState *l, const char *buf, size_t len) {
+    int j, best = -1;
+
+    for (j = 0; j < l->fold_count; j++) {
+        if (l->fold_end[j]-l->fold_start[j] != len) continue;
+        if (memcmp(l->buf+l->fold_start[j],buf,len) != 0) continue;
+        if (best == -1 || l->fold_id[j] > l->fold_id[best]) best = j;
+    }
+    return best;
+}
+
+/* Reveal the text hidden by fold j. The expanded text is shown as one long
+ * logical line, so refuse when it would not fit on screen: a file pasted twice
+ * by mistake must not blow the prompt past the terminal. Two rows are kept
+ * free so the prompt still has room to grow. Return 1 on success, or 0 with
+ * the fold left untouched. */
+static int linenoiseFoldExpand(struct linenoiseState *l, int j) {
+    size_t start = l->fold_start[j], end = l->fold_end[j];
+    int id = l->fold_id[j];
+    int rows;
+
+    linenoiseFoldRemove(l,j);
+    rows = linenoiseRenderRows(l);
+    if (rows < 0 || rows > getRows()-2) {
+        linenoiseFoldInsert(l,start,end,id);
+        return 0;
+    }
+    if (l->fold_hint_id == id) l->fold_hint_id = 0;
+    return 1;
 }
 
 /* Helper of refreshSingleLine() and refreshMultiLine() to show hints
@@ -2192,6 +2263,22 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
         len = w;
     }
 
+    /* Pasting the very same text again expands its placeholder instead of
+     * inserting a second copy: this is how the user sees what is hidden.
+     * The cursor is already at the end of the revealed range, exactly where
+     * an ordinary paste of the same text would have left it. */
+    if (!maskmode) {
+        int j = linenoiseFoldMatch(l,buf,len);
+        if (j != -1) {
+            if (linenoiseFoldExpand(l,j))
+                refreshLine(l);
+            else
+                linenoiseBeep();
+            free(buf);
+            return;
+        }
+    }
+
     if (!maskmode && shouldFoldText(buf,len)) {
         size_t start = l->pos;
         if (linenoiseEditInsertNoRefresh(l,buf,len) == -1) {
@@ -2199,7 +2286,9 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
             linenoiseBeep();
             return;
         }
-        linenoiseFoldAdd(l,start,start+len);
+        /* Point the inline hint at the fold just created, so the newest
+         * placeholder is the one advertising how to expand it. */
+        l->fold_hint_id = linenoiseFoldAdd(l,start,start+len);
         refreshLine(l);
     } else {
         linenoiseEditInsert(l,buf,len);
@@ -2254,10 +2343,14 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
     }
 
     switch(c) {
-    case ENTER:    /* enter */
+    case ENTER: {  /* enter */
+        int hinted = l->fold_hint_id != 0;
         history_len--;
         free(history[history_len]);
         if (mlmode) linenoiseEditMoveEnd(l);
+        /* The accepted line stays frozen on screen above the answer, so drop
+         * the transient "paste again" hint before the last repaint. */
+        l->fold_hint_id = 0;
         if (hintsCallback) {
             /* Force a refresh without hints to leave the previous
              * line as the user typed it after a newline. */
@@ -2265,8 +2358,11 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             hintsCallback = NULL;
             refreshLine(l);
             hintsCallback = hc;
+        } else if (hinted) {
+            refreshLine(l);
         }
         return strdup(l->buf);
+    }
     case CTRL_C:     /* ctrl-c */
         errno = EAGAIN;
         return NULL;
@@ -2302,6 +2398,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             memmove(l->buf + prevstart + currlen, l->buf + prevstart, prevlen);
             memcpy(l->buf + prevstart, tmp, currlen);
             if (l->pos + currlen <= l->len) l->pos += currlen;
+            l->fold_hint_id = 0; /* Content changed without moving any fold. */
             refreshLine(l);
         }
         break;
