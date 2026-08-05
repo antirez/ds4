@@ -9337,8 +9337,10 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 #ifdef DS4_SERVER_TEST
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
                                       uint64_t now,
+                                      uint64_t fixed_overhead_bytes,
                                       const ds4_kvstore_eviction_context *incoming) {
-    return ds4_kvstore_entry_eviction_score(e, live, now, incoming);
+    return ds4_kvstore_entry_eviction_score(e, live, now, fixed_overhead_bytes,
+                                            incoming);
 }
 #endif
 
@@ -13138,6 +13140,8 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        s.kv.fixed_overhead_bytes =
+            ds4_engine_checkpoint_fixed_overhead_bytes(engine, cfg.ctx_size);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -17431,13 +17435,45 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
     kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
 
-    double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
-    double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
+    double s_on = kv_entry_eviction_score(&stale, NULL, now, 0, NULL);
+    double f_on = kv_entry_eviction_score(&fresh, NULL, now, 0, NULL);
     TEST_ASSERT(s_on < f_on);
 
     /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
      * regardless of how old another entry's hit history is. */
     TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+}
+
+/* Regression test for issue #444: a short checkpoint and a long checkpoint
+ * from the same growing conversation, both never hit, with the exact same
+ * marginal (per-token) storage cost but a shared fixed overhead (e.g. the
+ * engine's raw SWA cache, persisted at a checkpoint-length-independent row
+ * count -- see ds4_engine_checkpoint_fixed_overhead_bytes()) baked into both
+ * file sizes. Plain tokens/file_size scores the short one lower purely
+ * because the shared fixed cost is a larger fraction of its total size, so
+ * it would always be evicted first even though both are equally "dense"
+ * once that shared cost is set aside -- exactly the self-defeating cascade
+ * the issue reports (early, still-reusable prefixes evicted first, leaving
+ * only a full snapshot that no longer matches after any mid-prompt edit). */
+static void test_kv_cache_eviction_ignores_shared_fixed_overhead(void) {
+    const uint64_t now = 1000;
+    const uint64_t overhead = 1000;
+    kv_entry small = {.tokens = 1000, .hits = 0, .file_size = 2000, .last_used = now};
+    kv_entry big   = {.tokens = 8000, .hits = 0, .file_size = 9000, .last_used = now};
+
+    double small_plain = kv_entry_eviction_score(&small, NULL, now, 0, NULL);
+    double big_plain = kv_entry_eviction_score(&big, NULL, now, 0, NULL);
+    TEST_ASSERT(small_plain < big_plain);
+
+    double small_adj = kv_entry_eviction_score(&small, NULL, now, overhead, NULL);
+    double big_adj = kv_entry_eviction_score(&big, NULL, now, overhead, NULL);
+    TEST_ASSERT(fabs(small_adj - big_adj) < 1e-9);
+
+    /* An overhead estimate that would swallow the whole file must not divide
+     * by zero or go negative. */
+    kv_entry tiny = {.tokens = 10, .hits = 0, .file_size = 50, .last_used = now};
+    double tiny_adj = kv_entry_eviction_score(&tiny, NULL, now, 1000000, NULL);
+    TEST_ASSERT(tiny_adj > 0.0 && isfinite(tiny_adj));
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -17893,6 +17929,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_ignores_shared_fixed_overhead();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }

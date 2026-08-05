@@ -77,6 +77,11 @@ typedef struct {
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
+    /* Estimated fixed, checkpoint-length-independent bytes present in every
+     * saved payload (see ds4_kvstore_entry_eviction_score()). 0 means
+     * "unknown/not applicable" and preserves plain tokens/file_size scoring,
+     * so callers that don't set this (e.g. ds4-agent) are unaffected. */
+    uint64_t fixed_overhead_bytes;
 } ds4_kvstore;
 
 typedef struct {
@@ -152,6 +157,7 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
 double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
+                                        uint64_t fixed_overhead_bytes,
                                         const ds4_kvstore_eviction_context *incoming);
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
