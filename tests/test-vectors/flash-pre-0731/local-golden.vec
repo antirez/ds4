@@ -1,5 +1,5 @@
 # ds4-local-golden-v1
-# Generated from a known-sane local Metal Flash run.
+# DeepSeek V4 Flash pre-0731, captured from the undated Q2 imatrix GGUF.
 # case <id> <mode> <ctx> <frontier> <prompt-file> <top-count>
 # top <rank> <token-id> <logit>
 case long_story_4096 text 5000 4096 tests/long_context_story_prompt.txt 64

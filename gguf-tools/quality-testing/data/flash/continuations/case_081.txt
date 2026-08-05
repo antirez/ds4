@@ -1,3 +1,4 @@
-Here are a few ways to complete that C comment, depending on the specific lock and what it protects:
+Here are a few ways to complete that comment, depending on the context:
 
-**Most common
+**Generic/Common:**
+```c

@@ -1,1 +1,1 @@
-In un server di rete, **backpressure** (contro-pressione o contropressione) è un me
+**Backpressure** (contro-pressione) in un server di rete è un meccanismo di **controll

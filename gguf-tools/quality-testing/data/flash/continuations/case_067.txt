@@ -1,1 +1,1 @@
-This is an excellent question that gets to the heart of how virtual memory works. The short answer is that **`mm
+The short answer is: **mmap reserves virtual address space, but physical memory (or page residency) is only allocated

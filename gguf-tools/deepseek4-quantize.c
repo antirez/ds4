@@ -153,6 +153,37 @@ static uint64_t read_u64_le_fp(FILE *fp, const char *what) {
     return v;
 }
 
+/* Bytes from the current position to EOF, restoring the position afterwards. */
+static uint64_t bytes_remaining_fp(FILE *fp, const char *what) {
+    off_t cur = ftello(fp);
+    if (cur < 0 || fseeko(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "error: seek failed while sizing %s\n", what);
+        exit(1);
+    }
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, cur, SEEK_SET) != 0) {
+        fprintf(stderr, "error: seek failed while sizing %s\n", what);
+        exit(1);
+    }
+    return end > cur ? (uint64_t)(end - cur) : 0;
+}
+
+/* Read a u64 length prefix and reject it if it claims more than the bytes left
+ * in the file. Without this a crafted length can (a) be so large that
+ * (size_t)len + 1 wraps to 0, so xmalloc() returns a 1-byte buffer that the
+ * following fread() then overflows, or (b) request a multi-GB allocation from a
+ * tiny file. */
+static uint64_t read_checked_len_fp(FILE *fp, const char *what) {
+    uint64_t n = read_u64_le_fp(fp, what);
+    uint64_t remaining = bytes_remaining_fp(fp, what);
+    if (n > remaining) {
+        fprintf(stderr, "error: %s (%" PRIu64 ") exceeds %" PRIu64
+                " bytes remaining in file\n", what, n, remaining);
+        exit(1);
+    }
+    return n;
+}
+
 static uint32_t read_u32_le_fp(FILE *fp, const char *what) {
     uint32_t v;
     if (fread(&v, 1, sizeof(v), fp) != sizeof(v)) {
@@ -428,6 +459,11 @@ typedef struct {
     size_t nbytes;
 } st_value;
 
+typedef struct {
+    uint8_t *data;
+    size_t size;
+} byte_buf;
+
 static void st_value_free(st_value *v) {
     free(v->dtype);
     free(v->data);
@@ -475,7 +511,7 @@ static void shard_load(shard *s) {
     if (s->loaded) return;
     FILE *fp = fopen(s->path, "rb");
     if (!fp) die_errno("open", s->path);
-    uint64_t header_len = read_u64_le_fp(fp, "safetensors header length");
+    uint64_t header_len = read_checked_len_fp(fp, "safetensors header length");
     char *header = xmalloc((size_t)header_len + 1);
     if (fread(header, 1, (size_t)header_len, fp) != (size_t)header_len) die_errno("read header", s->path);
     header[header_len] = '\0';
@@ -657,6 +693,23 @@ static int64_t value_nelements(const st_value *v) {
     return n;
 }
 
+static size_t checked_shape_product(int64_t a, int64_t b, const char *what) {
+    if (a < 0 || b < 0 ||
+        (b != 0 && (a > INT64_MAX / b || (uint64_t)a > SIZE_MAX / (uint64_t)b))) {
+        fprintf(stderr, "error: %s shape is too large\n", what);
+        exit(1);
+    }
+    return (size_t)a * (size_t)b;
+}
+
+static size_t checked_size_product(size_t a, size_t b, const char *what) {
+    if (b != 0 && a > SIZE_MAX / b) {
+        fprintf(stderr, "error: %s allocation is too large\n", what);
+        exit(1);
+    }
+    return a * b;
+}
+
 static float *tensor_to_f32(const st_value *t, int64_t *n_out) {
     const int64_t n = value_nelements(t);
     float *out = xmalloc((size_t)n * sizeof(float));
@@ -691,7 +744,18 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     const int64_t scale_rows = out_dim / block_out;
     const int64_t scale_cols = in_dim / block_in;
     if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
-    float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
+    /* shape and data_offsets are independent header fields; cross-check that the
+     * on-disk buffers (sized from data_offsets by db_read) are actually large
+     * enough for the shape-driven indexing below. Without this, a weight that
+     * declares a large shape but a tiny data_offsets range makes the loops read
+     * past the end of w->data / scale->data (heap-buffer-overflow read). One
+     * byte per element for F8_E4M3 weights and F8_E8M0 scales. */
+    const size_t weight_elems = checked_shape_product(out_dim, in_dim, "FP8 tensor");
+    const size_t scale_elems = checked_shape_product(scale_rows, scale_cols, "FP8 scale");
+    if (w->nbytes < weight_elems || scale->nbytes < scale_elems)
+        die("FP8 tensor data smaller than its declared shape");
+    float *out = xmalloc(checked_size_product(weight_elems, sizeof(float),
+                                              "FP8 output"));
     for (int64_t ob = 0; ob < scale_rows; ob++) {
         for (int64_t ib = 0; ib < scale_cols; ib++) {
             const float s = e8m0_to_f32(scale->data[(size_t)ob * (size_t)scale_cols + (size_t)ib]);
@@ -717,11 +781,23 @@ static float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP4 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t packed_in = w->shape[1];
+    if (packed_in < 0 || packed_in > INT64_MAX / 2) die("FP4 shape is too large");
     const int64_t in_dim = packed_in * 2;
     if (in_dim % 32) die("FP4 in_dim is not divisible by 32");
     const int64_t n_blocks = in_dim / 32;
     if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) die("FP4 scale shape mismatch");
-    float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
+    /* As in dequant_fp8_weight: cross-check the on-disk buffer sizes (from
+     * data_offsets) against the shape-driven indexing so a small data range
+     * under a large declared shape cannot drive an out-of-bounds read. The I8
+     * weight packs two 4-bit values per byte -> out_dim * packed_in bytes; the
+     * F8_E8M0 scale is one byte per block. */
+    const size_t weight_bytes = checked_shape_product(out_dim, packed_in, "FP4 tensor");
+    const size_t scale_bytes = checked_shape_product(out_dim, n_blocks, "FP4 scale");
+    if (w->nbytes < weight_bytes || scale->nbytes < scale_bytes)
+        die("FP4 tensor data smaller than its declared shape");
+    const size_t output_elems = checked_shape_product(out_dim, in_dim, "FP4 output");
+    float *out = xmalloc(checked_size_product(output_elems, sizeof(float),
+                                              "FP4 output"));
     for (int64_t r = 0; r < out_dim; r++) {
         for (int64_t b = 0; b < n_blocks; b++) {
             const float s = e8m0_to_f32(scale->data[(size_t)r * (size_t)n_blocks + (size_t)b]);
@@ -735,6 +811,72 @@ static float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64
         }
     }
     if (n_out) *n_out = out_dim * in_dim;
+    return out;
+}
+
+/*
+ * DeepSeek stores each pair of consecutive E2M1 values in one byte.  GGUF's
+ * MXFP4 block stores values 0..15 in the low nibbles and values 16..31 in the
+ * high nibbles, preceded by the block's unchanged UE8M0 scale.  Repack the
+ * codes without passing through floating point so the released expert weights
+ * remain exact.
+ */
+static byte_buf repack_fp4_weight_mxfp4(const st_value *w, const st_value *scale) {
+    if (strcmp(w->dtype, "I8") != 0 || strcmp(scale->dtype, "F8_E8M0") != 0) {
+        die("MXFP4 preservation requires packed I8 weights and F8_E8M0 scales");
+    }
+    if (w->n_dims != 2 || scale->n_dims != 2) die("MXFP4 source tensor must be 2D");
+
+    const int64_t out_dim = w->shape[0];
+    const int64_t packed_in = w->shape[1];
+    const int64_t in_dim = packed_in * 2;
+    if (out_dim <= 0 || in_dim <= 0 || (in_dim % 32) != 0) {
+        die("MXFP4 source dimensions are invalid");
+    }
+    const int64_t n_blocks = in_dim / 32;
+    if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) {
+        die("MXFP4 source scale shape mismatch");
+    }
+    if (w->nbytes != (size_t)out_dim * (size_t)packed_in ||
+        scale->nbytes != (size_t)out_dim * (size_t)n_blocks) {
+        die("MXFP4 source payload size mismatch");
+    }
+
+    const size_t block_bytes = ds4q_row_size(DS4Q_TYPE_MXFP4, 32);
+    if (block_bytes != 17) die("unexpected GGUF MXFP4 block size");
+    byte_buf out = {
+        .size = (size_t)out_dim * (size_t)n_blocks * block_bytes,
+        .data = xmalloc((size_t)out_dim * (size_t)n_blocks * block_bytes),
+    };
+
+    for (int64_t r = 0; r < out_dim; r++) {
+        for (int64_t b = 0; b < n_blocks; b++) {
+            const size_t block_index = (size_t)r * (size_t)n_blocks + (size_t)b;
+            const uint8_t *src = w->data + block_index * 16;
+            uint8_t *dst = out.data + block_index * block_bytes;
+            dst[0] = scale->data[block_index];
+
+            for (int i = 0; i < 16; i++) {
+                const int lo_index = i;
+                const int hi_index = 16 + i;
+                const uint8_t lo_byte = src[lo_index / 2];
+                const uint8_t hi_byte = src[hi_index / 2];
+                const uint8_t lo = (lo_index & 1) ? lo_byte >> 4 : lo_byte & 0x0f;
+                const uint8_t hi = (hi_index & 1) ? hi_byte >> 4 : hi_byte & 0x0f;
+                dst[1 + i] = lo | (uint8_t)(hi << 4);
+            }
+
+            /* Verify every source code and scale after the layout transform. */
+            if (dst[0] != scale->data[block_index]) die("MXFP4 scale repack mismatch");
+            for (int i = 0; i < 32; i++) {
+                const uint8_t src_byte = src[i / 2];
+                const uint8_t src_code = (i & 1) ? src_byte >> 4 : src_byte & 0x0f;
+                const uint8_t dst_byte = dst[1 + (i & 15)];
+                const uint8_t dst_code = i < 16 ? dst_byte & 0x0f : dst_byte >> 4;
+                if (src_code != dst_code) die("MXFP4 code repack mismatch");
+            }
+        }
+    }
     return out;
 }
 
@@ -1092,14 +1234,15 @@ static bool is_quantizable_target(ds4q_type type) {
     return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 || ds4q_can_quantize(type);
 }
 
+static bool target_uses_imatrix(ds4q_type type) {
+    return type == DS4Q_TYPE_Q2_K ||
+           type == DS4Q_TYPE_Q4_K ||
+           type == DS4Q_TYPE_IQ2_XXS;
+}
+
 /* =====
  * Tensor generation
  */
-
-typedef struct {
-    uint8_t *data;
-    size_t size;
-} byte_buf;
 
 static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t ncols, const float *imat) {
     if (ncols <= 0 || n % ncols != 0) die("bad ncols for tensor conversion");
@@ -1224,8 +1367,11 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
         f32 = tensor_to_f32(&w, &n);
         st_value_free(&w);
     }
-    const char *names[2] = { gguf_name, hf_name };
-    const float *imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    const float *imat = NULL;
+    if (target_uses_imatrix(target)) {
+        const char *names[2] = { gguf_name, hf_name };
+        imat = imatrix_find(imatrix, names, 2, tmpl->ne[0], -1, 0);
+    }
     byte_buf b = f32_to_type(f32, n, target, tmpl->ne[0], imat);
     free(f32);
     return b;
@@ -1269,6 +1415,20 @@ static void generate_one_expert(expert_job *j, int xid) {
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
     snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
     st_value w = db_read(j->db, weight_name);
+    if (j->target == DS4Q_TYPE_MXFP4) {
+        if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) {
+            die("MXFP4 expert shape mismatch");
+        }
+        st_value s = db_read(j->db, scale_name);
+        byte_buf q = repack_fp4_weight_mxfp4(&w, &s);
+        if (q.size != j->per_expert) die("MXFP4 expert packed size mismatch");
+        memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
+        free(q.data);
+        st_value_free(&s);
+        st_value_free(&w);
+        return;
+    }
+
     int64_t n = 0;
     float *f32 = NULL;
     if (strcmp(w.dtype, "I8") == 0) {
@@ -1280,8 +1440,11 @@ static void generate_one_expert(expert_job *j, int xid) {
         if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] != j->ncols) die("expert shape mismatch");
         f32 = tensor_to_f32(&w, &n);
     }
-    const char *names[3] = { j->gguf_name, weight_name, NULL };
-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    const float *imat = NULL;
+    if (target_uses_imatrix(j->target)) {
+        const char *names[2] = { j->gguf_name, weight_name };
+        imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    }
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
     memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
@@ -1315,7 +1478,9 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
                                 const imatrix_store *imatrix) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
-    if (!is_quantizable_target(target)) die("unsupported expert target type");
+    if (target != DS4Q_TYPE_MXFP4 && !is_quantizable_target(target)) {
+        die("unsupported expert target type");
+    }
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
@@ -1407,7 +1572,7 @@ static size_t gguf_scalar_size(uint32_t type) {
 }
 
 static char *read_gguf_string_fp(FILE *fp) {
-    uint64_t n = read_u64_le_fp(fp, "GGUF string length");
+    uint64_t n = read_checked_len_fp(fp, "GGUF string length");
     char *s = xmalloc((size_t)n + 1);
     if (n && fread(s, 1, (size_t)n, fp) != (size_t)n) die("short GGUF string read");
     s[n] = '\0';
@@ -1637,8 +1802,15 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         dst->name = src->name;
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
-        if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
-        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        const bool preserved_mxfp4 =
+            type == DS4Q_TYPE_MXFP4 && parse_expert_tensor(src->name).is_expert;
+        if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type) && !preserved_mxfp4) {
+            die("unsupported planned tensor type");
+        }
+        if ((ds4q_can_quantize(type) || preserved_mxfp4) &&
+            src->ne[0] % ds4q_block_size(type) != 0) {
+            die("ne[0] not divisible by block size");
+        }
         dst->type = type;
         dst->size = tensor_nbytes(type, src->ne, src->n_dims);
         dst->new_offset = off;
@@ -2489,6 +2661,7 @@ static void usage(const char *argv0) {
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
     printf("\nTYPE examples: f16, f32, bf16, q8_0, q8_K, q4_k, q2_k, iq2_xxs\n");
+    printf("MXFP4 is supported only for lossless repacking of packed routed experts.\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {

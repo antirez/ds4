@@ -1,1 +1,3 @@
-A hash table is a data structure that maps keys to values using a hash function. The hash function computes an index (
+To understand how a hash table handles collisions, it helps to first understand the problem. 
+
+A hash table uses a **

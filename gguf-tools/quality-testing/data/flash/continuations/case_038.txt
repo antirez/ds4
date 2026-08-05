@@ -1,1 +1,1 @@
-Questa è un'ottima domanda che tocca un aspetto cruciale dell'ottimizzazione dei modelli
+Per capire perché raggruppare gli esperti MoE (Mixture of Experts) accelera il

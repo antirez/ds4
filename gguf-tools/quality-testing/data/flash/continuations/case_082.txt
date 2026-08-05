@@ -1,1 +1,3 @@
-Il vantaggio principale della cache è **la velocità di accesso ai dati**, che riduce i tempi di
+Il vantaggio principale della cache è **la velocità**.
+
+(If you need a more complete sentence, you could also

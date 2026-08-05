@@ -1,1 +1,1 @@
-This is an excellent question that gets to the heart of why tokenization is a critical, non-trivial step in modern
+A tokenizer should treat special tags carefully because they are **structural markers** that carry meaning beyond the raw text, and

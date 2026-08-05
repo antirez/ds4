@@ -1,1 +1,1 @@
-Ecco cinque misure iniziali per affrontare un problema di decoding lento in contesti lunghi (long
+Ecco cinque misure iniziali per affrontare un decode lento a contesto lungo (long-context),

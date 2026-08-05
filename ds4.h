@@ -158,6 +158,8 @@ typedef struct {
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
+    /* Number of independently allocated session graphs/caches to reserve. */
+    int placement_session_count_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
     bool first_token_test;

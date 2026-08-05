@@ -128,7 +128,7 @@ understood by the converter:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-manifest > /tmp/dspark-manifest.tsv
 ```
 
@@ -142,9 +142,9 @@ it does not require a base-model GGUF template:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-support \
-  --out DeepSeek-V4-Flash-DSpark-support.gguf
+  --out DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
 
 `--dspark-support --dry-run` reads safetensors shard headers to derive exact
@@ -158,13 +158,13 @@ Before a full write, regenerate one support tensor and record its checksum:
 
 ```sh
 gguf-tools/deepseek4-quantize \
-  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
   --dspark-support \
   --compare-tensor mtp.0.main_proj.weight
 ```
 
 This reads only the payloads needed for that tensor.  Add `--compare-gguf
-DeepSeek-V4-Flash-DSpark-support.gguf` to byte-compare against an existing
+DeepSeek-V4-Flash-DSpark-support-0731.gguf` to byte-compare against an existing
 support GGUF.
 
 ## When No Imatrix Is Given

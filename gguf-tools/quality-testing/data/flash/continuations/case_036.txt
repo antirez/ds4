@@ -1,1 +1,4 @@
-Ecco un piano breve e strutturato per testare il **chunking** (frammentazione) di
+# Piano di Test per il Chunking di Prompt Lunghi
+
+## Obiettivo
+Verificare l'effic
