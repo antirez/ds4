@@ -5414,7 +5414,15 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
 
     free(*content_out);
     free(*reasoning_out);
-    *content_out = xstrdup(text ? text : "");
+    {
+        /* A failed tool-call parse falls back to the raw model text as
+         * assistant content.  If that text leaks truncated/raw DSML markup it
+         * is stored straight back into the session (and later replayed into
+         * compaction).  Strip the DSML so a broken tool block never spills
+         * into visible session content on a normal chat turn. */
+        char *stripped = strip_dsml_markup(text ? text : "");
+        *content_out = stripped ? stripped : xstrdup(text ? text : "");
+    }
     *reasoning_out = NULL;
     tool_calls_free(calls);
 
@@ -15784,9 +15792,49 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     TEST_ASSERT(recovered);
     TEST_ASSERT(!strcmp(finish, "stop"));
     TEST_ASSERT(!strcmp(err, "invalid tool call"));
-    TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) != NULL);
+    TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(content && strstr(content, "trying a tool") != NULL);
     TEST_ASSERT(reasoning == NULL);
     TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_truncated_dsml_fallback_strips_markup(void) {
+    /* Mirrors the real-world leak: a tool block truncated mid-attribute, with
+     * no closing tags.  The parse-failure fallback must strip the raw DSML so
+     * a broken tool block never spills into visible session content. */
+    const char *generated =
+        "<your prose text>\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"grep\">\n"
+        DS4_PARAM_START " name=\"pattern\" string=";
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "tool_calls";
+    bool recovered = false;
+
+    TEST_ASSERT(!parse_generated_message_for_response(generated,
+                                                       true,
+                                                       true,
+                                                       false,
+                                                       &finish,
+                                                       err,
+                                                       sizeof(err),
+                                                       &content,
+                                                       &reasoning,
+                                                       &calls,
+                                                       &recovered));
+    TEST_ASSERT(recovered);
+    TEST_ASSERT(content && strstr(content, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(content && strstr(content, DS4_INVOKE_START) == NULL);
+    TEST_ASSERT(content && strstr(content, "pattern") == NULL);
+    TEST_ASSERT(content && strstr(content, "<your prose text>") != NULL);
 
     free(content);
     free(reasoning);
@@ -18558,6 +18606,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_truncated_dsml_fallback_strips_markup();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
     test_thinking_dsml_is_not_executable_before_think_close();
