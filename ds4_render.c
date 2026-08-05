@@ -2,13 +2,14 @@
  *
  * The parser is a byte pump with three layers.  ds4r_write() strips <think>
  * markers, ds4r_render_byte() classifies logical line starts (headings, lists,
- * quotes, rules), and ds4r_md_feed() handles the inline constructs (bold,
- * italic, inline code, fenced blocks).  Everything that cannot be decided from
- * the bytes seen so far is held in a small buffer: marker runs and partial
- * UTF-8 sequences.
+ * quotes, rules, tables), and ds4r_md_feed() handles the inline constructs
+ * (bold, italic, inline code, fenced blocks).  Everything that cannot be
+ * decided from the bytes seen so far is held in a small buffer: marker runs,
+ * partial UTF-8 sequences, and whole table rows.
  *
  * The inline machine, the UTF-8 accumulator, and the fenced-block highlighter
- * follow the agent renderer in ds4_agent.c; the line-start dispatch is new. */
+ * follow the agent renderer in ds4_agent.c; the line-start dispatch and the
+ * table layout are new. */
 
 #include "ds4_render.h"
 
@@ -20,6 +21,10 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#define DS4R_TBL_MAX_BYTES (64u * 1024u)
+#define DS4R_TBL_MAX_LINES 512u
+#define DS4R_TBL_MAX_COLS  64
+
 #define DS4R_GREY  "\x1b[38;5;244m"
 #define DS4R_RESET "\x1b[0m"
 
@@ -27,7 +32,88 @@ static void ds4r_render_byte(ds4r *r, char c);
 static void ds4r_md_feed(ds4r *r, char c);
 static void ds4r_scan_byte(ds4r *r, char c);
 static void ds4r_scan_flush(ds4r *r);
+static void ds4r_table_byte(ds4r *r, char c);
+static void ds4r_table_flush(ds4r *r);
 static void ds4r_line_begin(ds4r *r);
+
+/* ============================================================================
+ * Character metrics
+ * ============================================================================ */
+
+typedef struct {
+    uint32_t lo;
+    uint32_t hi;
+} ds4r_range;
+
+/* Combining marks and other zero-advance codepoints.  The table is a compact
+ * subset: it covers what shows up in model output rather than the full Unicode
+ * combining property. */
+static const ds4r_range ds4r_zero_ranges[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x05BF, 0x05BF},
+    {0x05C1, 0x05C2}, {0x05C4, 0x05C5}, {0x05C7, 0x05C7}, {0x0610, 0x061A},
+    {0x064B, 0x065F}, {0x0670, 0x0670}, {0x06D6, 0x06DC}, {0x06DF, 0x06E4},
+    {0x06E7, 0x06E8}, {0x06EA, 0x06ED}, {0x0711, 0x0711}, {0x0730, 0x074A},
+    {0x07A6, 0x07B0}, {0x07EB, 0x07F3}, {0x0816, 0x0819}, {0x081B, 0x0823},
+    {0x0825, 0x0827}, {0x0829, 0x082D}, {0x0900, 0x0902}, {0x093A, 0x093A},
+    {0x093C, 0x093C}, {0x0941, 0x0948}, {0x094D, 0x094D}, {0x0951, 0x0957},
+    {0x0E31, 0x0E31}, {0x0E34, 0x0E3A}, {0x0E47, 0x0E4E}, {0x1AB0, 0x1AFF},
+    {0x1DC0, 0x1DFF}, {0x200B, 0x200F}, {0x2060, 0x2064}, {0x20D0, 0x20F0},
+    {0xFE00, 0xFE0F}, {0xFE20, 0xFE2F}, {0xFEFF, 0xFEFF}, {0xE0100, 0xE01EF},
+};
+
+/* East Asian Wide and Fullwidth blocks, plus the emoji ranges that terminals
+ * render double width. */
+static const ds4r_range ds4r_wide_ranges[] = {
+    {0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC},
+    {0x23F0, 0x23F0}, {0x23F3, 0x23F3}, {0x25FD, 0x25FE}, {0x2614, 0x2615},
+    {0x2648, 0x2653}, {0x267F, 0x267F}, {0x2693, 0x2693}, {0x26A1, 0x26A1},
+    {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5}, {0x26CE, 0x26CE},
+    {0x26D4, 0x26D4}, {0x26EA, 0x26EA}, {0x26F2, 0x26F3}, {0x26F5, 0x26F5},
+    {0x26FA, 0x26FA}, {0x26FD, 0x26FD}, {0x2705, 0x2705}, {0x270A, 0x270B},
+    {0x2728, 0x2728}, {0x274C, 0x274C}, {0x274E, 0x274E}, {0x2753, 0x2755},
+    {0x2757, 0x2757}, {0x2795, 0x2797}, {0x27B0, 0x27B0}, {0x27BF, 0x27BF},
+    {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2B55, 0x2B55}, {0x2E80, 0x303E},
+    {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF},
+    {0xA960, 0xA97F}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19},
+    {0xFE30, 0xFE52}, {0xFE54, 0xFE66}, {0xFE68, 0xFE6B}, {0xFF00, 0xFF60},
+    {0xFFE0, 0xFFE6}, {0x16FE0, 0x16FE4}, {0x17000, 0x18AFF},
+    {0x1B000, 0x1B2FF}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF},
+    {0x1F18E, 0x1F18E}, {0x1F191, 0x1F19A}, {0x1F200, 0x1F320},
+    {0x1F32D, 0x1F335}, {0x1F337, 0x1F37C}, {0x1F37E, 0x1F393},
+    {0x1F3A0, 0x1F3CA}, {0x1F3CF, 0x1F3D3}, {0x1F3E0, 0x1F3F0},
+    {0x1F3F4, 0x1F3F4}, {0x1F3F8, 0x1F43E}, {0x1F440, 0x1F440},
+    {0x1F442, 0x1F4FC}, {0x1F4FF, 0x1F53D}, {0x1F54B, 0x1F54E},
+    {0x1F550, 0x1F567}, {0x1F57A, 0x1F57A}, {0x1F595, 0x1F596},
+    {0x1F5A4, 0x1F5A4}, {0x1F5FB, 0x1F64F}, {0x1F680, 0x1F6C5},
+    {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6EB, 0x1F6EC},
+    {0x1F6F4, 0x1F6FC}, {0x1F7E0, 0x1F7EB}, {0x1F90C, 0x1F9FF},
+    {0x1FA70, 0x1FAFF}, {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
+};
+
+static bool ds4r_in_ranges(const ds4r_range *t, size_t n, uint32_t cp) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp < t[mid].lo) hi = mid;
+        else if (cp > t[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+int ds4r_wcwidth(uint32_t cp) {
+    if (cp == 0) return 0;
+    if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+    if (ds4r_in_ranges(ds4r_zero_ranges,
+                       sizeof(ds4r_zero_ranges) / sizeof(ds4r_zero_ranges[0]),
+                       cp))
+        return 0;
+    if (ds4r_in_ranges(ds4r_wide_ranges,
+                       sizeof(ds4r_wide_ranges) / sizeof(ds4r_wide_ranges[0]),
+                       cp))
+        return 2;
+    return 1;
+}
 
 static size_t ds4r_utf8_need(unsigned char c) {
     if (c < 0x80) return 1;
@@ -35,6 +121,52 @@ static size_t ds4r_utf8_need(unsigned char c) {
     if (c >= 0xe0 && c <= 0xef) return 3;
     if (c >= 0xf0 && c <= 0xf4) return 4;
     return 1;
+}
+
+/* Decode one codepoint and report the bytes it used.  Malformed input is
+ * consumed one byte at a time and reported as U+FFFD. */
+static size_t ds4r_utf8_decode(const char *s, size_t len, uint32_t *out) {
+    unsigned char c = (unsigned char)s[0];
+    size_t need = ds4r_utf8_need(c);
+    if (need == 1 || need > len) {
+        *out = c < 0x80 ? c : 0xFFFD;
+        return 1;
+    }
+    uint32_t cp = (uint32_t)(c & (0xff >> (need + 1)));
+    for (size_t i = 1; i < need; i++) {
+        unsigned char cc = (unsigned char)s[i];
+        if ((cc & 0xc0) != 0x80) {
+            *out = 0xFFFD;
+            return 1;
+        }
+        cp = (cp << 6) | (cc & 0x3f);
+    }
+    *out = cp;
+    return need;
+}
+
+int ds4r_visible_width(const char *s, size_t len) {
+    int w = 0;
+    size_t i = 0;
+    while (i < len) {
+        if (s[i] == 0x1b) {
+            size_t j = i + 1;
+            if (j < len && s[j] == '[') {
+                j++;
+                while (j < len && (unsigned char)s[j] >= 0x20 &&
+                       (unsigned char)s[j] <= 0x3f) j++;
+                if (j < len) j++;
+            } else if (j < len) {
+                j++;
+            }
+            i = j;
+            continue;
+        }
+        uint32_t cp = 0;
+        i += ds4r_utf8_decode(s + i, len - i, &cp);
+        w += ds4r_wcwidth(cp);
+    }
+    return w;
 }
 
 /* ============================================================================
@@ -68,6 +200,14 @@ static void ds4r_str_add(ds4r_str *s, const char *b, size_t n) {
 
 static void ds4r_str_addz(ds4r_str *s, const char *z) {
     ds4r_str_add(s, z, strlen(z));
+}
+
+static void ds4r_str_addc(ds4r_str *s, char c) {
+    ds4r_str_add(s, &c, 1);
+}
+
+static void ds4r_str_pad(ds4r_str *s, int n) {
+    for (int i = 0; i < n; i++) ds4r_str_addc(s, ' ');
 }
 
 static void ds4r_str_repeat(ds4r_str *s, const char *unit, int times) {
@@ -874,6 +1014,399 @@ static void ds4r_md_feed(ds4r *r, char c) {
 }
 
 /* ============================================================================
+ * Tables
+ * ============================================================================ */
+
+typedef enum {
+    DS4R_ALIGN_LEFT = 0,
+    DS4R_ALIGN_CENTER,
+    DS4R_ALIGN_RIGHT,
+} ds4r_align;
+
+/* Split one buffered row into trimmed cells.  Returns the cell count and, when
+ * out is not NULL, stores freshly allocated unescaped strings. */
+static int ds4r_row_cells(const char *line, size_t len, char **out, int max) {
+    const char *p = line;
+    const char *end = line + len;
+    while (end > p && (end[-1] == '\n' || end[-1] == '\r' ||
+                       end[-1] == ' ' || end[-1] == '\t')) end--;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    if (p < end && *p == '|') p++;
+    if (end > p && end[-1] == '|') {
+        int backslashes = 0;
+        const char *q = end - 1;
+        while (q > p && q[-1] == '\\') {
+            backslashes++;
+            q--;
+        }
+        if ((backslashes % 2) == 0) end--;      /* unescaped closing pipe */
+    }
+
+    int n = 0;
+    const char *cell = p;
+    bool escaped = false;
+    for (const char *q = p; q <= end; q++) {
+        bool split = q == end;
+        if (!split) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (*q == '\\') {
+                escaped = true;
+                continue;
+            }
+            split = *q == '|';
+        }
+        if (!split) continue;
+        if (n >= max) return -1;
+        if (out) {
+            const char *cs = cell;
+            const char *ce = q;
+            while (cs < ce && (*cs == ' ' || *cs == '\t')) cs++;
+            while (ce > cs && (ce[-1] == ' ' || ce[-1] == '\t')) ce--;
+            char *dst = malloc((size_t)(ce - cs) + 1);
+            if (!dst) return -1;
+            size_t k = 0;
+            for (const char *s = cs; s < ce; s++) {
+                if (*s == '\\' && s + 1 < ce && s[1] == '|') s++;
+                dst[k++] = *s;
+            }
+            dst[k] = '\0';
+            out[n] = dst;
+        }
+        n++;
+        cell = q + 1;
+    }
+    return n;
+}
+
+static bool ds4r_is_align_cell(const char *s, ds4r_align *out) {
+    const char *p = s;
+    bool left = false, right = false;
+    int dashes = 0;
+    if (*p == ':') {
+        left = true;
+        p++;
+    }
+    while (*p == '-') {
+        dashes++;
+        p++;
+    }
+    if (*p == ':') {
+        right = true;
+        p++;
+    }
+    if (*p != '\0' || dashes < 1) return false;
+    *out = left && right ? DS4R_ALIGN_CENTER :
+           right ? DS4R_ALIGN_RIGHT : DS4R_ALIGN_LEFT;
+    return true;
+}
+
+/* Render one cell with inline markdown, stopping after limit visible columns.
+ * With out == NULL the function only measures.  bold_init keeps a header cell
+ * bold across nested **markers**. */
+static int ds4r_cell_scan(const char *s, int limit, bool ellipsis,
+                          bool bold_init, bool color, ds4r_str *out) {
+    bool bold = bold_init;
+    bool italic = false;
+    bool code = false;
+    bool cut = false;
+    int w = 0;
+    size_t len = strlen(s);
+    size_t i = 0;
+
+    if (out && color && bold) ds4r_str_addz(out, "\x1b[1m");
+    while (i < len) {
+        if (s[i] == '`') {
+            code = !code;
+            if (out && color) ds4r_str_addz(out, code ? "\x1b[36m" : "\x1b[39m");
+            i++;
+            continue;
+        }
+        if (s[i] == '*' && !code) {
+            if (i + 1 < len && s[i + 1] == '*') {
+                bold = !bold;
+                if (out && color)
+                    ds4r_str_addz(out, bold ? "\x1b[1m" : "\x1b[22m");
+                i += 2;
+                continue;
+            }
+            italic = !italic;
+            if (out && color)
+                ds4r_str_addz(out, italic ? "\x1b[3m" : "\x1b[23m");
+            i++;
+            continue;
+        }
+        if (s[i] == '\\' && i + 1 < len && !isalnum((unsigned char)s[i + 1]))
+            i++;
+        uint32_t cp = 0;
+        size_t n = ds4r_utf8_decode(s + i, len - i, &cp);
+        int cw = ds4r_wcwidth(cp);
+        if (w + cw > limit) {
+            cut = true;
+            break;
+        }
+        if (out) ds4r_str_add(out, s + i, n);
+        w += cw;
+        i += n;
+    }
+    if (out && color) {
+        if (code) ds4r_str_addz(out, "\x1b[39m");
+        if (italic) ds4r_str_addz(out, "\x1b[23m");
+        if (bold) ds4r_str_addz(out, "\x1b[22m");
+    }
+    if (cut && ellipsis) {
+        if (out) ds4r_str_addz(out, "\xe2\x80\xa6");
+        w += 1;
+    }
+    return w;
+}
+
+static void ds4r_table_border(ds4r *r, ds4r_str *out, const int *colw,
+                              int ncols, int pad, const char *left,
+                              const char *mid, const char *right) {
+    if (r->use_color) ds4r_str_addz(out, DS4R_GREY);
+    ds4r_str_addz(out, left);
+    for (int c = 0; c < ncols; c++) {
+        ds4r_str_repeat(out, "\xe2\x94\x80", colw[c] + 2 * pad);
+        ds4r_str_addz(out, c + 1 == ncols ? right : mid);
+    }
+    if (r->use_color) ds4r_str_addz(out, DS4R_RESET);
+    ds4r_str_addc(out, '\n');
+}
+
+static void ds4r_table_bar(ds4r *r, ds4r_str *out) {
+    if (r->use_color) ds4r_str_addz(out, DS4R_GREY);
+    ds4r_str_addz(out, "\xe2\x94\x82");
+    if (r->use_color) ds4r_str_addz(out, DS4R_RESET);
+}
+
+static void ds4r_table_row(ds4r *r, ds4r_str *out, char **cells, int ncells,
+                           const int *colw, const ds4r_align *align, int ncols,
+                           int pad, bool header) {
+    for (int c = 0; c < ncols; c++) {
+        const char *text = (c < ncells && cells[c]) ? cells[c] : "";
+        ds4r_str cell = {0};
+        int want = ds4r_cell_scan(text, INT_MAX, false, header, false, NULL);
+        int w = want <= colw[c] ?
+            ds4r_cell_scan(text, INT_MAX, false, header, r->use_color, &cell) :
+            ds4r_cell_scan(text, colw[c] - 1, true, header, r->use_color, &cell);
+        int slack = colw[c] - w;
+        if (slack < 0) slack = 0;
+        int before = align[c] == DS4R_ALIGN_RIGHT ? slack :
+                     align[c] == DS4R_ALIGN_CENTER ? slack / 2 : 0;
+
+        ds4r_table_bar(r, out);
+        ds4r_str_pad(out, pad + before);
+        if (cell.p) ds4r_str_add(out, cell.p, cell.len);
+        ds4r_str_pad(out, slack - before + pad);
+        ds4r_str_free(&cell);
+    }
+    ds4r_table_bar(r, out);
+    ds4r_str_addc(out, '\n');
+}
+
+/* Lay out and print the buffered rows.  Returns false when the buffer is not a
+ * usable table, in which case the caller prints the original text. */
+static bool ds4r_table_render(ds4r *r) {
+    const char *buf = r->tbl;
+    size_t len = r->tbl_len;
+    bool ok = false;
+    size_t nrows = 0;
+    size_t *line_off = NULL;
+    size_t *line_len = NULL;
+    int *rowcells = NULL;
+    char **cells = NULL;
+    int *colw = NULL;
+    ds4r_align *align = NULL;
+    int ncols = 0;
+
+    for (size_t i = 0; i < len; i++)
+        if (buf[i] == '\n') nrows++;
+    if (len && buf[len - 1] != '\n') nrows++;
+    if (nrows < 2) return false;
+
+    line_off = malloc(nrows * sizeof(*line_off));
+    line_len = malloc(nrows * sizeof(*line_len));
+    rowcells = malloc(nrows * sizeof(*rowcells));
+    if (!line_off || !line_len || !rowcells) goto done;
+
+    size_t row = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || buf[i] == '\n') {
+            if (i == len && i == start) break;
+            line_off[row] = start;
+            line_len[row] = i - start;
+            row++;
+            start = i + 1;
+            if (row == nrows) break;
+        }
+    }
+    nrows = row;
+    if (nrows < 2) goto done;
+
+    for (size_t i = 0; i < nrows; i++) {
+        rowcells[i] = ds4r_row_cells(buf + line_off[i], line_len[i], NULL,
+                                     DS4R_TBL_MAX_COLS);
+        if (rowcells[i] < 1) goto done;
+        if (rowcells[i] > ncols) ncols = rowcells[i];
+    }
+
+    cells = calloc(nrows * (size_t)ncols, sizeof(*cells));
+    colw = calloc((size_t)ncols, sizeof(*colw));
+    align = calloc((size_t)ncols, sizeof(*align));
+    if (!cells || !colw || !align) goto done;
+    for (size_t i = 0; i < nrows; i++) {
+        if (ds4r_row_cells(buf + line_off[i], line_len[i],
+                           cells + i * (size_t)ncols, ncols) < 1)
+            goto done;
+    }
+
+    /* The second row must be the alignment row, as GitHub Markdown requires. */
+    for (int c = 0; c < rowcells[1]; c++) {
+        ds4r_align a = DS4R_ALIGN_LEFT;
+        if (!ds4r_is_align_cell(cells[(size_t)ncols + (size_t)c], &a))
+            goto done;
+        if (c < ncols) align[c] = a;
+    }
+
+    for (size_t i = 0; i < nrows; i++) {
+        if (i == 1) continue;
+        for (int c = 0; c < ncols; c++) {
+            const char *text = cells[i * (size_t)ncols + (size_t)c];
+            if (!text) continue;
+            int w = ds4r_cell_scan(text, INT_MAX, false, false, false, NULL);
+            if (w > colw[c]) colw[c] = w;
+        }
+    }
+    for (int c = 0; c < ncols; c++)
+        if (colw[c] < 1) colw[c] = 1;
+
+    /* Shrink to the terminal: first the cell padding, then the widest column. */
+    int cols = ds4r_columns(r);
+    int pad = 1;
+    for (;;) {
+        int total = ncols + 1;
+        for (int c = 0; c < ncols; c++) total += colw[c] + 2 * pad;
+        if (total <= cols) break;
+        if (pad > 0) {
+            pad = 0;
+            continue;
+        }
+        int widest = 0;
+        for (int c = 1; c < ncols; c++)
+            if (colw[c] > colw[widest]) widest = c;
+        if (colw[widest] <= 1) goto done;   /* cannot fit: print the source */
+        colw[widest]--;
+    }
+
+    ds4r_str out = {0};
+    ds4r_table_border(r, &out, colw, ncols, pad,
+                      "\xe2\x94\x8c", "\xe2\x94\xac", "\xe2\x94\x90");
+    ds4r_table_row(r, &out, cells, rowcells[0], colw, align, ncols, pad, true);
+    ds4r_table_border(r, &out, colw, ncols, pad,
+                      "\xe2\x94\x9c", "\xe2\x94\xbc", "\xe2\x94\xa4");
+    for (size_t i = 2; i < nrows; i++)
+        ds4r_table_row(r, &out, cells + i * (size_t)ncols, rowcells[i],
+                       colw, align, ncols, pad, false);
+    ds4r_table_border(r, &out, colw, ncols, pad,
+                      "\xe2\x94\x94", "\xe2\x94\xb4", "\xe2\x94\x98");
+    if (!out.oom && out.p) {
+        ds4r_flush_utf8(r);
+        ds4r_reset_color(r);
+        ds4r_out(r, out.p, out.len);
+        ok = true;
+    }
+    ds4r_str_free(&out);
+
+done:
+    if (cells) {
+        for (size_t i = 0; i < nrows * (size_t)ncols; i++) free(cells[i]);
+        free(cells);
+    }
+    free(line_off);
+    free(line_len);
+    free(rowcells);
+    free(colw);
+    free(align);
+    return ok;
+}
+
+static void ds4r_table_reset(ds4r *r) {
+    r->tbl_len = 0;
+    r->tbl_lines = 0;
+    r->tbl_scan = false;
+    r->tbl_raw = false;
+    if (r->tbl) r->tbl[0] = '\0';
+}
+
+static void ds4r_table_flush(ds4r *r) {
+    if (!r->tbl_raw && r->tbl_len && !ds4r_table_render(r)) {
+        ds4r_flush_utf8(r);
+        ds4r_reset_color(r);
+        ds4r_out(r, r->tbl, r->tbl_len);
+    }
+    ds4r_table_reset(r);
+    r->line_mode = DS4R_LINE_OFF;
+    r->line_len = 0;
+    r->indent_len = 0;
+    r->marker_run = 0;
+    ds4r_line_begin(r);
+}
+
+static void ds4r_table_append(ds4r *r, const char *s, size_t n) {
+    if (r->tbl_raw) {
+        ds4r_out(r, s, n);
+        return;
+    }
+    if (r->tbl_len + n > DS4R_TBL_MAX_BYTES ||
+        r->tbl_lines >= DS4R_TBL_MAX_LINES ||
+        !ds4r_bytes_append(&r->tbl, &r->tbl_len, &r->tbl_cap, s, n)) {
+        /* Too large to lay out: print what was buffered and pass the rest of
+         * the table through unchanged. */
+        ds4r_flush_utf8(r);
+        ds4r_reset_color(r);
+        if (r->tbl_len) ds4r_out(r, r->tbl, r->tbl_len);
+        r->tbl_len = 0;
+        r->tbl_raw = true;
+        ds4r_out(r, s, n);
+    }
+}
+
+/* Buffer consecutive rows.  The mode ends on the first line that does not
+ * start with a pipe, which is then re-fed through the normal path. */
+static void ds4r_table_byte(ds4r *r, char c) {
+    if (r->tbl_scan) {
+        if ((c == ' ' || c == '\t') && r->line_len + 1 < DS4R_LINE_BUF) {
+            r->line_buf[r->line_len++] = c;
+            return;
+        }
+        if (c == '|') {
+            r->tbl_scan = false;
+            ds4r_table_append(r, r->line_buf, r->line_len);
+            r->line_len = 0;
+            ds4r_table_append(r, "|", 1);
+            return;
+        }
+        char held[DS4R_LINE_BUF];
+        size_t n = r->line_len;
+        memcpy(held, r->line_buf, n);
+        ds4r_table_flush(r);
+        for (size_t i = 0; i < n; i++) ds4r_render_byte(r, held[i]);
+        ds4r_render_byte(r, c);
+        return;
+    }
+    ds4r_table_append(r, &c, 1);
+    if (c == '\n') {
+        r->tbl_lines++;
+        r->tbl_scan = true;
+        r->line_len = 0;
+    }
+}
+
+/* ============================================================================
  * Line-start dispatch
  * ============================================================================ */
 
@@ -943,6 +1476,15 @@ static void ds4r_scan_byte(ds4r *r, char c) {
                 return;
             }
             break;
+        }
+        if (c == '|') {
+            r->line_mode = DS4R_LINE_TABLE;
+            r->tbl_scan = false;
+            ds4r_table_append(r, r->line_buf, r->line_len);
+            r->line_len = 0;
+            r->indent_len = 0;
+            ds4r_table_append(r, "|", 1);
+            return;
         }
         if (c == '#') {
             r->scan = DS4R_SCAN_HASH;
@@ -1068,6 +1610,10 @@ static void ds4r_render_byte(ds4r *r, char c) {
         ds4r_write_char_raw(r, c);
         return;
     }
+    if (r->line_mode == DS4R_LINE_TABLE) {
+        ds4r_table_byte(r, c);
+        return;
+    }
     if (r->line_mode == DS4R_LINE_SCAN) {
         ds4r_scan_byte(r, c);
         return;
@@ -1090,6 +1636,7 @@ static bool ds4r_is_partial_prefix(const char *p, size_t n, const char *prefix) 
 }
 
 static void ds4r_drop_line_state(ds4r *r) {
+    if (r->line_mode == DS4R_LINE_TABLE) ds4r_table_flush(r);
     if (r->line_mode == DS4R_LINE_SCAN) ds4r_scan_flush(r);
     r->line_mode = DS4R_LINE_OFF;
 }
@@ -1198,6 +1745,7 @@ void ds4r_finish(ds4r *r) {
     if (r->format_thinking) ds4r_think_process(r, NULL, 0, true);
     if (r->format_markdown) {
         if (r->line_mode == DS4R_LINE_SCAN) ds4r_scan_flush(r);
+        if (r->line_mode == DS4R_LINE_TABLE) ds4r_table_flush(r);
         /* A closing fence can be the last thing the model emits, with no
          * following byte to push the pending backticks through. */
         if (r->md_mark == DS4R_MARK_BACKTICK && r->md_mark_len >= 3)
@@ -1219,6 +1767,7 @@ void ds4r_finish(ds4r *r) {
         r->md_fence_lang_len = 0;
         r->md_fence_lang[0] = '\0';
         ds4r_md_clear_mark(r);
+        ds4r_table_reset(r);
         r->line_mode = DS4R_LINE_OFF;
     }
     ds4r_flush_utf8(r);
@@ -1231,4 +1780,8 @@ void ds4r_free(ds4r *r) {
     r->code_line = NULL;
     r->code_line_len = 0;
     r->code_line_cap = 0;
+    free(r->tbl);
+    r->tbl = NULL;
+    r->tbl_len = 0;
+    r->tbl_cap = 0;
 }

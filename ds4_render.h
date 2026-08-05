@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #define DS4R_LINE_BUF   96      /* line-start scratch: indent plus markers */
@@ -30,6 +31,7 @@ typedef enum {
 typedef enum {
     DS4R_LINE_OFF = 0,      /* mid line: bytes go to the inline parser */
     DS4R_LINE_SCAN,         /* classifying the start of a logical line */
+    DS4R_LINE_TABLE,        /* buffering consecutive table rows */
 } ds4r_line_mode;
 
 typedef enum {
@@ -91,6 +93,14 @@ typedef struct {
     size_t indent_len;      /* bytes of line_buf that precede the marker run */
     size_t marker_run;
     char marker_ch;
+
+    /* Table buffering. */
+    char *tbl;
+    size_t tbl_len;
+    size_t tbl_cap;
+    size_t tbl_lines;
+    bool tbl_scan;          /* between rows, deciding whether the table goes on */
+    bool tbl_raw;           /* buffer cap hit: pass the rest of the table through */
 } ds4r;
 
 /* color enables both ANSI attributes and markdown rendering; use
@@ -104,5 +114,9 @@ void ds4r_finish(ds4r *r);
 void ds4r_free(ds4r *r);
 void ds4r_newline(ds4r *r);
 bool ds4r_at_line_start(const ds4r *r);
+
+/* Locale independent character metrics, also used by the table layout. */
+int ds4r_wcwidth(uint32_t cp);
+int ds4r_visible_width(const char *s, size_t len);
 
 #endif /* DS4_RENDER_H */
