@@ -4,6 +4,9 @@ set -e
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 REPO="antirez/deepseek-v4-gguf"
+HEADROOM128_REPO="apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128"
+HEADROOM128_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf"
+HEADROOM128_DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
@@ -32,6 +35,9 @@ usage() {
 DwarfStar GGUF downloader
 
 Usage:
+  ./download_model.sh headroom128 [--token TOKEN]
+  ./download_model.sh preferred [--token TOKEN]
+  ./download_model.sh headroom128-dspark-support [--token TOKEN]
   ./download_model.sh q2-imatrix [--token TOKEN]
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
   ./download_model.sh q4-imatrix [--token TOKEN]
@@ -48,9 +54,15 @@ Usage:
 
 Targets:
 
+  headroom128 / preferred
+       Preferred Flash GGUF for 96/128 GB machines on this fork.
+       apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128
+       (~81 GiB / ~87 GB). Abliterated 0731 DS4 headroom build; links
+       ./ds4flash.gguf.
+
   q2-imatrix
-       2-bit routed experts, about 81 GB on disk.
-       Recommended model for 96 and 128 GB RAM machines.
+       Official antirez 2-bit routed experts, about 81 GB on disk.
+       Alternative stock 0731 imatrix for 96 and 128 GB RAM machines.
 
   q2-q4-imatrix
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
@@ -84,8 +96,13 @@ Targets:
        enabled explicitly with --mtp when running ds4 or ds4-server.
 
   dspark-support
-       Optional DSpark speculative decoding support GGUF, about 6 GB. Enable it
-       with --dspark and --mtp when running ds4 or ds4-server.
+       Official antirez DSpark support GGUF for stock Flash quants, about 6 GB.
+       Enable with --dspark and --mtp when running ds4 or ds4-server.
+
+  headroom128-dspark-support
+       Matching DSpark support GGUF for headroom128 from the same
+       apetersson Headroom128 repo, about 5.6 GiB. Enable with --dspark and
+       --mtp when running the Headroom128 main model.
 
   glm-unsloth-q4
        GLM 5.2 Unsloth UD-Q4_K_XL quant from unsloth/GLM-5.2-GGUF.
@@ -121,7 +138,10 @@ Then the default commands work:
 After downloading mtp, enable it explicitly, for example:
   ./ds4 --mtp <download directory>/$MTP_FILE --mtp-draft 2
 
-After downloading DSpark support, enable it explicitly in greedy mode:
+After downloading Headroom128 DSpark support, enable it explicitly in greedy mode:
+  ./ds4 --dspark -m ./ds4flash.gguf --mtp <download directory>/$HEADROOM128_DSPARK_SUPPORT_FILE --temp 0
+
+After downloading the official antirez DSpark support, enable it explicitly in greedy mode:
   ./ds4 --dspark --mtp <download directory>/$DSPARK_SUPPORT_FILE --temp 0
 
 PRO and GLM files are downloaded with the official Hugging Face downloader
@@ -143,6 +163,16 @@ FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
 
 case "$MODEL" in
+    headroom128|preferred)
+        REPO=$HEADROOM128_REPO
+        MODEL_FILE=$HEADROOM128_FILE
+        MODEL=headroom128
+        ;;
+    headroom128-dspark-support)
+        REPO=$HEADROOM128_REPO
+        MODEL_FILE=$HEADROOM128_DSPARK_SUPPORT_FILE
+        LINK_MODEL=0
+        ;;
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
     q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
@@ -353,10 +383,14 @@ if [ "$MODEL" = "mtp" ]; then
     echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-elif [ "$MODEL" = "dspark-support" ]; then
+elif [ "$MODEL" = "dspark-support" ] || [ "$MODEL" = "headroom128-dspark-support" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DSPARK_SUPPORT_FILE --temp 0"
+    if [ "$MODEL" = "headroom128-dspark-support" ]; then
+        echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$HEADROOM128_DSPARK_SUPPORT_FILE --temp 0"
+    else
+        echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DSPARK_SUPPORT_FILE --temp 0"
+    fi
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
@@ -365,6 +399,14 @@ elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
     echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
+fi
+
+if [ "$MODEL" = "headroom128" ]; then
+    echo
+    echo "Headroom128 has a matching DSpark support GGUF. Download it with:"
+    echo "  ./download_model.sh headroom128-dspark-support"
+    echo "Then enable DSpark explicitly in greedy mode:"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$HEADROOM128_DSPARK_SUPPORT_FILE --temp 0"
 fi
 
 echo

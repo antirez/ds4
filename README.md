@@ -99,16 +99,24 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer the imatrix versions.**
+Download one main model. **Prefer Headroom128 on this fork.**
 The Flash targets below select the final `0731` weights rather than the earlier
 preview checkpoint.
 
 ```sh
-./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
-./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
-./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
+./download_model.sh headroom128   # preferred: apetersson Headroom128 (~81 GiB / ~87 GB)
+./download_model.sh preferred     # alias for headroom128
+./download_model.sh q2-imatrix    # alternative stock antirez 0731 imatrix (~81 GB)
+./download_model.sh q2-q4-imatrix # alternative mixed last-6-layers q4 (~98 GB)
+./download_model.sh q4-imatrix    # >= 256 GB RAM machines, imatrix-tuned q4
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
+
+Preferred weights:
+
+- Repo: [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128)
+- Main GGUF: `DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf`
+- Matching DSpark support: `DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf`
 
 For the full PRO Q4 distributed run, download one half on each machine:
 
@@ -117,9 +125,12 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
+`headroom128` / `preferred` download from
+`https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128`.
+The other Flash/PRO targets download from
+`https://huggingface.co/antirez/deepseek-v4-gguf`. Both paths store files under
+`./gguf/`, resume partial downloads with `curl -C -`, and (for main-model
+targets) update `./ds4flash.gguf` to point at the selected main model.
 The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
 download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
@@ -201,21 +212,34 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
-The released DSpark checkpoint is packaged here as a separate support GGUF of
-about 5.6 GiB. It is not a standalone model. Download it once:
+The released DSpark checkpoint is packaged as a separate support GGUF of about
+5.6–6 GiB. It is not a standalone model. Prefer the matching Headroom128
+support file with the preferred main model:
+
+```sh
+./download_model.sh headroom128
+./download_model.sh headroom128-dspark-support
+
+./ds4 -m ds4flash.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf \
+  --dspark --temp 0
+```
+
+For stock antirez Flash quants (`q2-imatrix`, `q2-q4-imatrix`, `q4-imatrix`),
+download the official support file once:
 
 ```sh
 ./download_model.sh dspark-support
 ```
 
-The same support file can be used with the Flash `q2-imatrix`,
+That official support file pairs with the Flash `q2-imatrix`,
 `q2-q4-imatrix`, and `q4-imatrix` models listed above. For now **DeepSeek
 V4 PRO** is not supported. On Metal, the main model may be resident or use
 `--ssd-streaming`; the support model still adds its own weights and runtime
 state to the memory requirement. DSpark replaces the legacy one-stage MTP
 support model for that run rather than stacking with it.
 
-Run it with greedy decoding:
+Stock antirez greedy example:
 
 ```sh
 ./ds4 -m ds4flash.gguf \
