@@ -586,8 +586,14 @@ The agent is the most stateful component.  Test it manually, not only by build.
   test multiline prompt editing, history navigation, queued prompt display,
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
+- Multi row input, in both `ds4` and `ds4-agent`:
+  Ctrl+J must insert a real line break and keep typing on the next row.  Arrows,
+  Home/End, backspace and Ctrl+W must cross the break with the cursor landing
+  where it looks like it should, and deleting the break must fold the rows back
+  into one without leaving a stale row on screen.  Repeat with a row long enough
+  to wrap, and with the terminal resized while the input spans several rows.
 - Paste, in both `ds4` and `ds4-agent`:
-  a short snippet of a few lines must appear inline with newlines shown as `↵`;
+  a short snippet of a few lines must appear inline as real rows;
   a long or many line paste must collapse to `[Pasted text #1 +N lines]` with the
   `(paste again to expand)` hint, which must disappear as soon as anything else
   is typed.  Pasting the same text again must expand that placeholder in place,

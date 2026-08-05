@@ -10410,6 +10410,7 @@ static void runtime_help(void) {
     puts("  Ctrl+X       Edit the first queued prompt.");
     puts("  ESC          Interrupt and send queued prompt immediately.");
     puts("  Ctrl+D       Exit from an empty prompt.");
+    puts("  Ctrl+J       Insert a newline.");
     puts("  Paste twice  Paste the same text again to expand its placeholder.");
 }
 

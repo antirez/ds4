@@ -1278,6 +1278,7 @@ static void print_repl_help(void) {
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
+    puts("  Ctrl+J         Insert a newline.");
     puts("  Paste twice    Paste the same text again to expand its placeholder.");
 }
 
