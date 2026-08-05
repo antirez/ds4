@@ -7012,6 +7012,17 @@ static int dist_worker_handle_snapshot_load(
         snprintf(err, sizeof(err), "invalid distributed snapshot load header");
     }
 
+    /* Reject a token_count larger than the worker context up front, before the
+     * allocation and the read loop below. token_count is only bounded to
+     * ~UINT32_MAX/4 by the header check above, so without this a peer could
+     * drive a multi-GB malloc and a full-length socket read before the
+     * matching-state check further down (which also tests token_count > ctx_size)
+     * finally rejects the request. */
+    if (!err[0] && begin.token_count > (uint32_t)state->ctx_size) {
+        dist_discard_bytes(upstream->fd, body_bytes);
+        snprintf(err, sizeof(err), "snapshot token count exceeds worker context size");
+    }
+
     int *tokens = NULL;
     if (!err[0]) {
         tokens = malloc((size_t)begin.token_count * sizeof(tokens[0]));

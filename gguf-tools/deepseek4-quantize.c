@@ -153,6 +153,37 @@ static uint64_t read_u64_le_fp(FILE *fp, const char *what) {
     return v;
 }
 
+/* Bytes from the current position to EOF, restoring the position afterwards. */
+static uint64_t bytes_remaining_fp(FILE *fp, const char *what) {
+    off_t cur = ftello(fp);
+    if (cur < 0 || fseeko(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "error: seek failed while sizing %s\n", what);
+        exit(1);
+    }
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, cur, SEEK_SET) != 0) {
+        fprintf(stderr, "error: seek failed while sizing %s\n", what);
+        exit(1);
+    }
+    return end > cur ? (uint64_t)(end - cur) : 0;
+}
+
+/* Read a u64 length prefix and reject it if it claims more than the bytes left
+ * in the file. Without this a crafted length can (a) be so large that
+ * (size_t)len + 1 wraps to 0, so xmalloc() returns a 1-byte buffer that the
+ * following fread() then overflows, or (b) request a multi-GB allocation from a
+ * tiny file. */
+static uint64_t read_checked_len_fp(FILE *fp, const char *what) {
+    uint64_t n = read_u64_le_fp(fp, what);
+    uint64_t remaining = bytes_remaining_fp(fp, what);
+    if (n > remaining) {
+        fprintf(stderr, "error: %s (%" PRIu64 ") exceeds %" PRIu64
+                " bytes remaining in file\n", what, n, remaining);
+        exit(1);
+    }
+    return n;
+}
+
 static uint32_t read_u32_le_fp(FILE *fp, const char *what) {
     uint32_t v;
     if (fread(&v, 1, sizeof(v), fp) != sizeof(v)) {
@@ -480,7 +511,7 @@ static void shard_load(shard *s) {
     if (s->loaded) return;
     FILE *fp = fopen(s->path, "rb");
     if (!fp) die_errno("open", s->path);
-    uint64_t header_len = read_u64_le_fp(fp, "safetensors header length");
+    uint64_t header_len = read_checked_len_fp(fp, "safetensors header length");
     char *header = xmalloc((size_t)header_len + 1);
     if (fread(header, 1, (size_t)header_len, fp) != (size_t)header_len) die_errno("read header", s->path);
     header[header_len] = '\0';
@@ -662,6 +693,23 @@ static int64_t value_nelements(const st_value *v) {
     return n;
 }
 
+static size_t checked_shape_product(int64_t a, int64_t b, const char *what) {
+    if (a < 0 || b < 0 ||
+        (b != 0 && (a > INT64_MAX / b || (uint64_t)a > SIZE_MAX / (uint64_t)b))) {
+        fprintf(stderr, "error: %s shape is too large\n", what);
+        exit(1);
+    }
+    return (size_t)a * (size_t)b;
+}
+
+static size_t checked_size_product(size_t a, size_t b, const char *what) {
+    if (b != 0 && a > SIZE_MAX / b) {
+        fprintf(stderr, "error: %s allocation is too large\n", what);
+        exit(1);
+    }
+    return a * b;
+}
+
 static float *tensor_to_f32(const st_value *t, int64_t *n_out) {
     const int64_t n = value_nelements(t);
     float *out = xmalloc((size_t)n * sizeof(float));
@@ -696,7 +744,18 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     const int64_t scale_rows = out_dim / block_out;
     const int64_t scale_cols = in_dim / block_in;
     if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
-    float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
+    /* shape and data_offsets are independent header fields; cross-check that the
+     * on-disk buffers (sized from data_offsets by db_read) are actually large
+     * enough for the shape-driven indexing below. Without this, a weight that
+     * declares a large shape but a tiny data_offsets range makes the loops read
+     * past the end of w->data / scale->data (heap-buffer-overflow read). One
+     * byte per element for F8_E4M3 weights and F8_E8M0 scales. */
+    const size_t weight_elems = checked_shape_product(out_dim, in_dim, "FP8 tensor");
+    const size_t scale_elems = checked_shape_product(scale_rows, scale_cols, "FP8 scale");
+    if (w->nbytes < weight_elems || scale->nbytes < scale_elems)
+        die("FP8 tensor data smaller than its declared shape");
+    float *out = xmalloc(checked_size_product(weight_elems, sizeof(float),
+                                              "FP8 output"));
     for (int64_t ob = 0; ob < scale_rows; ob++) {
         for (int64_t ib = 0; ib < scale_cols; ib++) {
             const float s = e8m0_to_f32(scale->data[(size_t)ob * (size_t)scale_cols + (size_t)ib]);
@@ -722,11 +781,23 @@ static float *dequant_fp4_weight(const st_value *w, const st_value *scale, int64
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP4 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t packed_in = w->shape[1];
+    if (packed_in < 0 || packed_in > INT64_MAX / 2) die("FP4 shape is too large");
     const int64_t in_dim = packed_in * 2;
     if (in_dim % 32) die("FP4 in_dim is not divisible by 32");
     const int64_t n_blocks = in_dim / 32;
     if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks) die("FP4 scale shape mismatch");
-    float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
+    /* As in dequant_fp8_weight: cross-check the on-disk buffer sizes (from
+     * data_offsets) against the shape-driven indexing so a small data range
+     * under a large declared shape cannot drive an out-of-bounds read. The I8
+     * weight packs two 4-bit values per byte -> out_dim * packed_in bytes; the
+     * F8_E8M0 scale is one byte per block. */
+    const size_t weight_bytes = checked_shape_product(out_dim, packed_in, "FP4 tensor");
+    const size_t scale_bytes = checked_shape_product(out_dim, n_blocks, "FP4 scale");
+    if (w->nbytes < weight_bytes || scale->nbytes < scale_bytes)
+        die("FP4 tensor data smaller than its declared shape");
+    const size_t output_elems = checked_shape_product(out_dim, in_dim, "FP4 output");
+    float *out = xmalloc(checked_size_product(output_elems, sizeof(float),
+                                              "FP4 output"));
     for (int64_t r = 0; r < out_dim; r++) {
         for (int64_t b = 0; b < n_blocks; b++) {
             const float s = e8m0_to_f32(scale->data[(size_t)r * (size_t)n_blocks + (size_t)b]);
@@ -1501,7 +1572,7 @@ static size_t gguf_scalar_size(uint32_t type) {
 }
 
 static char *read_gguf_string_fp(FILE *fp) {
-    uint64_t n = read_u64_le_fp(fp, "GGUF string length");
+    uint64_t n = read_checked_len_fp(fp, "GGUF string length");
     char *s = xmalloc((size_t)n + 1);
     if (n && fread(s, 1, (size_t)n, fp) != (size_t)n) die("short GGUF string read");
     s[n] = '\0';

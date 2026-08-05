@@ -57,7 +57,9 @@ CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
-ifeq ($(strip $(CUDA_ARCH)),sm_121)
+ifneq ($(filter sm_120 sm_120a,$(strip $(CUDA_ARCH))),)
+NVCC_ARCH_FLAGS := -gencode arch=compute_120a,code=sm_120a -DDS4_CUDA_HAVE_MXF4=1
+else ifneq ($(filter sm_121 sm_121a,$(strip $(CUDA_ARCH))),)
 NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=1
 else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
