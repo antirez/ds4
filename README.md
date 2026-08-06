@@ -148,10 +148,10 @@ native tooling can be added later.
 GLM 5.2 support is limited to the GGUF files tested by this branch:
 
 ```sh
-./download_model.sh glm-unsloth-q4  # Unsloth UD-Q4_K_XL, 11 shards
-./download_model.sh glm-antirez-iq2xxs  # antirez routed IQ2_XXS single-file GGUF
-./download_model.sh glm-antirez-q2  # antirez routed Q2_K single-file GGUF
-./download_model.sh glm-antirez-q4  # antirez routed Q4_K single-file GGUF
+./download_model.sh glm-unsloth-q4  # Unsloth UD-Q4_K_XL, 11 shards (~467 GB)
+./download_model.sh glm-antirez-iq2xxs  # antirez routed IQ2_XXS single-file GGUF (~211 GB)
+./download_model.sh glm-antirez-q2  # antirez routed Q2_K single-file GGUF (~262 GB)
+./download_model.sh glm-antirez-q4  # antirez routed Q4_K single-file GGUF (~434 GB)
 ```
 
 The supported GLM layout keeps dense/model-control tensors in the existing
