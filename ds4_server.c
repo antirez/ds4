@@ -10699,6 +10699,71 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     return buf_take(&suffix);
 }
 
+/* Coding agents inject per-turn metadata blocks into the user message content
+ * they send (Kilo Code wraps workspace state in <environment_details>,
+ * OpenCode and Claude Code inject <system-reminder> notes), then rebuild the
+ * next request's history without them.  The live KV keeps the bytes that were
+ * rendered, so the replayed transcript no longer token-matches the sampled
+ * session and every user turn pays a full reprefill.
+ *
+ * This is the same shape as hidden thinking: the live state is richer than
+ * the visible replay.  So the same visible-key continuation applies.  After a
+ * finished turn, remember the transcript the next request is expected to
+ * render -- the current one minus the transient spans -- keyed to the live
+ * token frontier.  A client that replays the blocks verbatim simply never
+ * matches the key and still gets exact token-prefix matching. */
+static const char * const transient_block_tags[] = {
+    "environment_details",      /* Kilo Code / Roo Code workspace state */
+    "system-reminder",          /* OpenCode / Claude Code injected notes */
+};
+
+/* Return a copy of text with every <tag>...</tag> transient span removed, or
+ * NULL when no span was found.  Unterminated blocks stay in place: a wrong
+ * guess only produces a visible key that never matches. */
+static char *strip_transient_blocks(const char *text) {
+    if (!text) return NULL;
+    buf out = {0};
+    bool stripped = false;
+    const char *p = text;
+    while (*p) {
+        const char *open = strchr(p, '<');
+        if (!open) break;
+        const char *close = NULL;
+        for (size_t t = 0; t < sizeof(transient_block_tags) /
+                               sizeof(transient_block_tags[0]); t++)
+        {
+            const char *tag = transient_block_tags[t];
+            const size_t tag_len = strlen(tag);
+            if (strncmp(open + 1, tag, tag_len) || open[1 + tag_len] != '>')
+                continue;
+            char end_tag[64];
+            snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
+            const char *end = strstr(open + 1 + tag_len + 1, end_tag);
+            if (end) close = end + strlen(end_tag);
+            break;
+        }
+        if (!close) {
+            buf_append(&out, p, (size_t)(open - p) + 1);
+            p = open + 1;
+            continue;
+        }
+        /* Clients append these blocks with separator whitespace that vanishes
+         * from the replay together with the block, so drop it from the key
+         * as well. */
+        size_t keep = (size_t)(open - p);
+        while (keep > 0 && isspace((unsigned char)p[keep - 1])) keep--;
+        buf_append(&out, p, keep);
+        stripped = true;
+        p = close;
+    }
+    if (!stripped) {
+        buf_free(&out);
+        return NULL;
+    }
+    buf_puts(&out, p);
+    return buf_take(&out);
+}
+
 /* In thinking mode without tools, old assistant reasoning is intentionally not
  * rendered back into later prompts.  The sampled live graph still contains the
  * reasoning bytes, so the next request would miss the session cache even though
@@ -10739,6 +10804,11 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
+    char *stripped = strip_transient_blocks(visible);
+    if (stripped) {
+        free(visible);
+        visible = stripped;
+    }
     thinking_live_remember(s, slot, visible);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
@@ -10746,6 +10816,52 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(slot->session), strlen(visible));
+    free(visible);
+}
+
+static bool should_remember_transient_checkpoint(const request *r,
+                                                 const thinking_state *thinking,
+                                                 const char *finish) {
+    if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES) return false;
+    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    if (thinking && thinking->inside) return false;
+    return true;
+}
+
+/* Remember a visible key for conversations whose user messages carry transient
+ * client metadata blocks.  The key is the current transcript plus the just
+ * finished assistant turn, with the transient spans stripped: exactly the
+ * bytes the next request will render after the client rebuilds its history
+ * without them.  When nothing was stripped, exact token-prefix matching
+ * already covers the next turn and no key is kept. */
+static void remember_transient_checkpoint(server *s, server_slot *slot, const job *j,
+                                          const char *ctx, uint64_t trace_id,
+                                          const char *content, const char *reasoning,
+                                          const tool_calls *calls) {
+    char *visible = NULL;
+    char *stripped = NULL;
+    if (j->req.prompt_text) {
+        char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+        buf b = {0};
+        buf_puts(&b, j->req.prompt_text);
+        buf_puts(&b, suffix);
+        free(suffix);
+        visible = buf_take(&b);
+        stripped = strip_transient_blocks(visible);
+    }
+    if (!stripped) {
+        thinking_live_clear(s, slot);
+        free(visible);
+        return;
+    }
+    thinking_live_remember(s, slot, stripped);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: transient live checkpoint remembered ctx=%s live=%d visible=%zu stripped=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(visible), strlen(stripped));
+    trace_event(s, trace_id,
+                "transient live checkpoint remembered: live=%d visible=%zu stripped=%zu",
+                ds4_session_pos(slot->session), strlen(visible), strlen(stripped));
+    free(stripped);
     free(visible);
 }
 
@@ -12030,14 +12146,20 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+    }
+    if (!parsed_calls.len &&
+        should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
+    } else if (should_remember_transient_checkpoint(&j->req, &thinking, final_finish)) {
+        /* Runs after canonicalization so the key binds to the final live
+         * frontier.  Internally a no-op (clear) when the prompt carries no
+         * transient client metadata. */
+        remember_transient_checkpoint(s, slot, j, ctx_span, trace_id,
+                                      parsed_content ? parsed_content : "",
+                                      parsed_reasoning,
+                                      parsed_calls.len ? &parsed_calls : NULL);
+    } else {
         thinking_live_clear(s, slot);
     }
 
@@ -16711,6 +16833,124 @@ static void test_thinking_checkpoint_remember_gate(void) {
     request_free(&r);
 }
 
+static void test_strip_transient_blocks(void) {
+    /* NULL means "nothing transient here". */
+    TEST_ASSERT(strip_transient_blocks("plain <b>text</b>") == NULL);
+    TEST_ASSERT(strip_transient_blocks("") == NULL);
+
+    char *s = strip_transient_blocks(
+        "question?<environment_details>cwd=/x</environment_details>");
+    TEST_ASSERT(s && !strcmp(s, "question?"));
+    free(s);
+
+    /* Separator whitespace appended with the block vanishes from the replay
+     * together with it. */
+    s = strip_transient_blocks(
+        "question?\n\n<system-reminder>plan mode</system-reminder>tail");
+    TEST_ASSERT(s && !strcmp(s, "question?tail"));
+    free(s);
+
+    /* Multiple blocks across turns. */
+    s = strip_transient_blocks(
+        "a<environment_details>1</environment_details>"
+        "b<system-reminder>2</system-reminder>c");
+    TEST_ASSERT(s && !strcmp(s, "abc"));
+    free(s);
+
+    /* Unterminated block stays in place. */
+    TEST_ASSERT(strip_transient_blocks("a<environment_details>open") == NULL);
+
+    /* Tag-name prefix is not a match. */
+    TEST_ASSERT(strip_transient_blocks(
+        "<environment_details_x>y</environment_details_x>") == NULL);
+}
+
+static void test_transient_checkpoint_remember_gate(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    thinking_state st = {.inside = false};
+
+    TEST_ASSERT(should_remember_transient_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_transient_checkpoint(&r, &st, "tool_calls"));
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "error"));
+
+    st.inside = true;
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "stop"));
+    st.inside = false;
+
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "stop"));
+    r.api = API_OPENAI;
+    r.kind = REQ_COMPLETION;
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "stop"));
+
+    request_free(&r);
+}
+
+static void test_transient_checkpoint_visible_matches_future_prompt(void) {
+    /* Turn 1: the client appends an <environment_details> block to the user
+     * message.  Turn 2: the client rebuilds history without the block and
+     * appends a fresh one to the new user message.  The stripped visible key
+     * remembered after turn 1 must be a byte prefix of the turn 2 render. */
+    chat_msgs msgs = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup(
+        "List the files<environment_details>cwd=/tmp</environment_details>");
+    chat_msgs_push(&msgs, u1);
+
+    char *prompt_text =
+        render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER", NULL, DS4_THINK_HIGH);
+
+    const char *reasoning = "I should answer briefly.";
+    const char *content = "Two files: a and b.";
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, NULL);
+
+    buf visible = {0};
+    buf_puts(&visible, prompt_text);
+    buf_puts(&visible, suffix);
+    char *stripped = strip_transient_blocks(visible.ptr);
+    TEST_ASSERT(stripped != NULL);
+    TEST_ASSERT(strstr(stripped, "<environment_details>") == NULL);
+
+    chat_msgs history = {0};
+    chat_msg h_u1 = {0};
+    h_u1.role = xstrdup("user");
+    h_u1.content = xstrdup("List the files");
+    chat_msgs_push(&history, h_u1);
+    chat_msg h_a = {0};
+    h_a.role = xstrdup("assistant");
+    h_a.reasoning = xstrdup(reasoning);
+    h_a.content = xstrdup(content);
+    chat_msgs_push(&history, h_a);
+    chat_msg h_u2 = {0};
+    h_u2.role = xstrdup("user");
+    h_u2.content = xstrdup(
+        "Delete them<environment_details>cwd=/tmp turn=2</environment_details>");
+    chat_msgs_push(&history, h_u2);
+
+    char *future_prompt =
+        render_chat_prompt_text(&history, "TOOL_SCHEMA_MARKER", NULL, DS4_THINK_HIGH);
+    const size_t stripped_len = strlen(stripped);
+    TEST_ASSERT(strlen(future_prompt) > stripped_len);
+    TEST_ASSERT(!memcmp(future_prompt, stripped, stripped_len));
+
+    free(future_prompt);
+    free(stripped);
+    buf_free(&visible);
+    free(suffix);
+    request_free(&r);
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&history);
+}
+
 static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_start = false;
     bool saw_end = false;
@@ -17874,6 +18114,9 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
+    test_strip_transient_blocks();
+    test_transient_checkpoint_remember_gate();
+    test_transient_checkpoint_visible_matches_future_prompt();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
