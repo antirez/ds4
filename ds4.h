@@ -90,6 +90,13 @@ typedef struct {
     bool set;
 } ds4_distributed_layers;
 
+/* Distributed transport backend. TCP is the portable default; RDMA is an
+ * opt-in, macOS-only path over Thunderbolt (see ds4_distributed_rdma.c). */
+typedef enum {
+    DS4_DIST_TRANSPORT_TCP = 0,
+    DS4_DIST_TRANSPORT_RDMA,
+} ds4_dist_transport;
+
 typedef struct {
     ds4_distributed_role role;
     ds4_distributed_layers layers;
@@ -102,6 +109,16 @@ typedef struct {
     uint32_t activation_bits;
     bool replay_check;
     bool debug;
+    /* RDMA transport options. Defaults (0/NULL) select TCP and keep the
+     * existing behavior; these are only honored on Apple builds. */
+    ds4_dist_transport transport;
+    const char *rdma_adj_devices; /* local RDMA device per peer (--dist-rdma-adj-devices):
+                                   * a bare device name (routable fabric or a single
+                                   * link - dial each peer at its route address), or a
+                                   * "peerhost=device,..." map (Thunderbolt is
+                                   * point-to-point, so each neighbour is reached over
+                                   * a specific local cable). NULL = auto-select the
+                                   * first active device (safe only with one link). */
 } ds4_distributed_options;
 
 /* Tensor parallelism: two identical machines run the model in lockstep and
@@ -480,6 +497,12 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
+/* Whether a KV snapshot taken right now would be self-consistent. Always true
+ * for a local session; false on a distributed coordinator while a pipelined
+ * prefill has the workers lagging its own layer slice, where staging would do
+ * the expensive gather and then be rejected. Opportunistic snapshotters (the
+ * server's periodic KV cache store) should check this before staging. */
+int ds4_session_kv_snapshot_stable(const ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,

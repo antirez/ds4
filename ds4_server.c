@@ -9635,6 +9635,27 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!tokens) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
+    /* This runs from the prefill progress callback, so on a distributed
+     * coordinator it can land in the middle of a pipelined prefill - where the
+     * coordinator's layer slice is deliberately ahead of the workers and no
+     * consistent cross-node snapshot exists. Staging would gather the whole KV
+     * (a per-worker snapshot request plus hundreds of MiB) only to be rejected
+     * with a token-count mismatch, and it blocks the prefill driver thread while
+     * doing it, draining the very pipeline this checkpoint is riding on.
+     *
+     * There is no way to take this checkpoint later: a store requires the live
+     * timeline to equal the stored length exactly (no KV trimming), so once
+     * prefill moves past `target` that prefix is gone. Drop it and mark it done
+     * so it is not retried. The full prompt is still cached when the slot is
+     * evicted, and the post-prefill store sees a drained, consistent cluster. */
+    if (!ds4_session_kv_snapshot_stable(slot->session)) {
+        kv_cache_slot_note_store(slot, target);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache skipped tokens=%d reason=continued "
+                   "because a distributed prefill pipeline is in flight",
+                   target);
+        return;
+    }
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
         (void)kc;
         kv_cache_slot_note_store(slot, target);

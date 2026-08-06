@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
+#include "ds4_distributed_rdma.h"
 #include "ds4_help.h"
 #include "linenoise.h"
 

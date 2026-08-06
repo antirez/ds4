@@ -237,6 +237,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
     opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
+    opt(fp, c, "--dist-transport tcp|rdma", "Transport backend. Default: tcp. rdma = RDMA over Thunderbolt (Apple).");
+    opt(fp, c, "--dist-rdma-adj-devices SPEC", "Local RDMA device(s) per peer: a bare name (e.g. rdma_en6) used for every peer at its route address (routable fabric / single link), or a peerhost=device[,...] map pinning a cable per neighbour (Thunderbolt is point-to-point).");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
     fputc('\n', fp);
     title(fp, c, "Tensor Parallelism");

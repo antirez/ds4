@@ -28,13 +28,10 @@
 #include <unistd.h>
 
 #include "ds4_tp.h"
+#include "ds4_rdma_verbs.h"
 
-#if defined(__APPLE__) && defined(__has_include)
-#if __has_include(<infiniband/verbs.h>)
-#include <infiniband/verbs.h>
-#include <dlfcn.h>
+#ifdef DS4_RDMA_HAVE_VERBS
 #define DS4_TP_HAVE_VERBS 1
-#endif
 #endif
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
@@ -90,32 +87,12 @@ typedef struct {
 } ds4_tp_gate_header;
 
 #ifdef DS4_TP_HAVE_VERBS
-/* librdma is loaded at runtime so builds and machines without the RDMA
- * stack (or with it disabled) fall back to TCP with no link-time cost.
+/* librdma is loaded at runtime (ds4_rdma_verbs.h) so builds and machines
+ * without the RDMA stack fall back to TCP with no link-time cost.
  * ibv_post_send()/ibv_poll_cq() are header inlines over context->ops, so
- * only the setup entry points need dlsym. */
-typedef struct {
-    void *handle;
-    struct ibv_device **(*get_device_list)(int *);
-    void (*free_device_list)(struct ibv_device **);
-    const char *(*get_device_name)(struct ibv_device *);
-    struct ibv_context *(*open_device)(struct ibv_device *);
-    int (*close_device)(struct ibv_context *);
-    int (*query_device)(struct ibv_context *, struct ibv_device_attr *);
-    int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
-    int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
-    struct ibv_pd *(*alloc_pd)(struct ibv_context *);
-    int (*dealloc_pd)(struct ibv_pd *);
-    struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
-    int (*dereg_mr)(struct ibv_mr *);
-    struct ibv_cq *(*create_cq)(struct ibv_context *, int, void *, struct ibv_comp_channel *, int);
-    int (*destroy_cq)(struct ibv_cq *);
-    struct ibv_qp *(*create_qp)(struct ibv_pd *, struct ibv_qp_init_attr *);
-    int (*destroy_qp)(struct ibv_qp *);
-    int (*modify_qp)(struct ibv_qp *, struct ibv_qp_attr *, int);
-} ds4_tp_verbs_api;
-
-/* AppleThunderboltRDMA quirks (validated with scratchpad probes,
+ * only the setup entry points need dlsym.
+ *
+ * AppleThunderboltRDMA quirks (validated with scratchpad probes,
  * 2026-07-06): only UC queue pairs exist (RC/UD: ENOTSUP); RDMA WRITE work
  * requests are accepted but never execute, so the data plane is two-sided
  * SEND/RECV like Apple's own JACCL; messages above 16KB are not delivered;
@@ -131,7 +108,7 @@ typedef struct {
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
 
 typedef struct {
-    ds4_tp_verbs_api api;
+    ds4_rdma_verbs_api api;
     struct ibv_context *ctx;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
@@ -580,41 +557,9 @@ uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
 
 #ifdef DS4_TP_HAVE_VERBS
 
-static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
-    if (api->handle) return 1;
-    void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!h) return 0;
-#define TP_SYM(field, name) \
-    do { \
-        api->field = (__typeof__(api->field))dlsym(h, name); \
-        if (!api->field) { dlclose(h); return 0; } \
-    } while (0)
-    TP_SYM(get_device_list, "ibv_get_device_list");
-    TP_SYM(free_device_list, "ibv_free_device_list");
-    TP_SYM(get_device_name, "ibv_get_device_name");
-    TP_SYM(open_device, "ibv_open_device");
-    TP_SYM(close_device, "ibv_close_device");
-    TP_SYM(query_device, "ibv_query_device");
-    TP_SYM(query_port, "ibv_query_port");
-    TP_SYM(query_gid, "ibv_query_gid");
-    TP_SYM(alloc_pd, "ibv_alloc_pd");
-    TP_SYM(dealloc_pd, "ibv_dealloc_pd");
-    TP_SYM(reg_mr, "ibv_reg_mr");
-    TP_SYM(dereg_mr, "ibv_dereg_mr");
-    TP_SYM(create_cq, "ibv_create_cq");
-    TP_SYM(destroy_cq, "ibv_destroy_cq");
-    TP_SYM(create_qp, "ibv_create_qp");
-    TP_SYM(destroy_qp, "ibv_destroy_qp");
-    TP_SYM(modify_qp, "ibv_modify_qp");
-#undef TP_SYM
-    api->handle = h;
-    return 1;
-}
-
 /* Probe only: does this machine expose a verbs device right now? */
-static int tp_rdma_probe(ds4_tp_verbs_api *api) {
-    if (!tp_rdma_load_api(api)) return 0;
+static int tp_rdma_probe(ds4_rdma_verbs_api *api) {
+    if (!ds4_rdma_verbs_load(api)) return 0;
     int num = 0;
     struct ibv_device **devs = api->get_device_list(&num);
     if (!devs) return 0;
@@ -624,77 +569,18 @@ static int tp_rdma_probe(ds4_tp_verbs_api *api) {
 
 static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
-    int num = 0;
-    struct ibv_device **devs = r->api.get_device_list(&num);
-    if (!devs || num == 0) {
-        tp_set_err(err, errlen, "tp rdma: no verbs devices");
-        if (devs) r->api.free_device_list(devs);
+    /* Device (port 1, ACTIVE) + IPv4-mapped GID selection are the shared Apple
+     * recipe (ds4_rdma_verbs.c). A caller-set --rdma-gid-index overrides the
+     * auto scan. */
+    char resolved[32];
+    int want_gid = tp->opt.rdma_gid_index_set ? tp->opt.rdma_gid_index : -1;
+    if (ds4_rdma_open_ipv4_link(&r->api, tp->opt.rdma_device, want_gid,
+                                &r->ctx, &r->port, &r->gid, &r->gid_index,
+                                resolved, sizeof(resolved), err, errlen) != 0) {
         return 0;
     }
-    /* One verbs device per Thunderbolt port (rdma_enN); pick the active one
-     * unless the caller selected a device explicitly. */
-    const char *want_name = tp->opt.rdma_device;
-    char states[256] = "";
-    for (int i = 0; i < num && !r->ctx; i++) {
-        const char *name = r->api.get_device_name(devs[i]);
-        if (want_name && strcmp(want_name, name) != 0) continue;
-        struct ibv_context *ctx = r->api.open_device(devs[i]);
-        if (!ctx) continue;
-        struct ibv_port_attr pa;
-        if (r->api.query_port(ctx, 1, &pa) == 0 &&
-            (pa.state == IBV_PORT_ACTIVE || want_name)) {
-            r->ctx = ctx;
-            r->port = pa;
-            fprintf(stderr, "ds4-tp: rdma device %s (port state %d)\n", name, (int)pa.state);
-            break;
-        }
-        size_t off = strlen(states);
-        snprintf(states + off, sizeof(states) - off, "%s%s=%d",
-                 off ? ", " : "", name, (int)pa.state);
-        r->api.close_device(ctx);
-    }
-    r->api.free_device_list(devs);
-    if (!r->ctx) {
-        tp_set_err(err, errlen,
-                   "tp rdma: no device with an active port (%s); is the peer up "
-                   "and rdma_ctl enabled on both machines?", states);
-        return 0;
-    }
-    /* The driver only connects through the IPv4-mapped GID
-     * (::ffff:a.b.c.d), which exists only when the Thunderbolt member
-     * interface carries an IPv4 address (the bridge's address does not
-     * count). */
-    r->gid_index = -1;
-    if (tp->opt.rdma_gid_index_set) {
-        r->gid_index = tp->opt.rdma_gid_index;
-        if (r->api.query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
-            tp_set_err(err, errlen, "tp rdma: query_gid(%d): %s",
-                       r->gid_index, strerror(errno));
-            return 0;
-        }
-    } else {
-        for (int i = 0; i < r->port.gid_tbl_len; i++) {
-            union ibv_gid tmp;
-            if (r->api.query_gid(r->ctx, 1, i, &tmp) != 0) continue;
-            uint64_t hi;
-            uint16_t mid, v4tag;
-            memcpy(&hi, &tmp.raw[0], 8);
-            memcpy(&mid, &tmp.raw[8], 2);
-            memcpy(&v4tag, &tmp.raw[10], 2);
-            if (hi == 0 && mid == 0 && v4tag == 0xffff) {
-                r->gid = tmp;
-                r->gid_index = i;
-                break;
-            }
-        }
-        if (r->gid_index < 0) {
-            tp_set_err(err, errlen,
-                       "tp rdma: no IPv4-mapped GID on the active port; give the "
-                       "Thunderbolt interface its own IPv4 (e.g. sudo ifconfig en1 "
-                       "inet 10.99.0.2/30 alias) on both machines");
-            return 0;
-        }
-    }
+    fprintf(stderr, "ds4-tp: rdma device %s (port state %d)\n",
+            resolved, (int)r->port.state);
     r->pd = r->api.alloc_pd(r->ctx);
     if (!r->pd) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
@@ -758,41 +644,13 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
 
-    /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
-     * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
-    struct ibv_qp_attr a = {0};
-    a.qp_state = IBV_QPS_INIT;
-    a.pkey_index = 0;
-    a.port_num = 1;
-    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                        IBV_ACCESS_REMOTE_WRITE;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify INIT: %s", strerror(errno));
-        return 0;
-    }
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_RTR;
-    a.path_mtu = IBV_MTU_1024;
-    a.dest_qp_num = r->peer.qpn;
-    a.rq_psn = r->peer.psn;
-    a.ah_attr.dlid = (uint16_t)r->peer.lid;
-    a.ah_attr.port_num = 1;
-    a.ah_attr.is_global = 1;
-    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
-    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
-    a.ah_attr.grh.hop_limit = 1;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
-        return 0;
-    }
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_RTS;
-    a.sq_psn = mine.psn;
-    if (r->api.modify_qp(r->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
+    /* INIT -> RTR -> RTS with the shared Apple recipe (MTU 1024, GRH via the
+     * IPv4-mapped GID). The slab MR is already registered, so it is mapped on the
+     * RTR transition. */
+    if (ds4_rdma_qp_to_init(&r->api, r->qp, 1, err, errlen) != 0) return 0;
+    if (ds4_rdma_qp_to_rtr_rts(&r->api, r->qp, 1, r->gid_index, mine.psn,
+                               r->peer.gid, r->peer.qpn, r->peer.psn,
+                               (uint16_t)r->peer.lid, err, errlen) != 0) {
         return 0;
     }
     if (tp->vec_bytes > 2ull * DS4_TP_RDMA_MAX_MSG) {

@@ -100,6 +100,15 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* Whether a KV snapshot taken right now would be consistent across the cluster.
+ * Returns 0 while a pipelined prefill has the coordinator's layer slice running
+ * ahead of the workers: their timelines disagree, so a save would be rejected
+ * with a token-count mismatch after doing all the staging work. Callers that
+ * snapshot opportunistically (the server's periodic KV cache store) should check
+ * this first; save/load themselves are unaffected, since nothing calls them
+ * while a prefill is in flight. */
+int ds4_dist_session_kv_snapshot_stable(const ds4_dist_session *d);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

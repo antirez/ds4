@@ -51141,6 +51141,12 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 }
 #endif
 
+int ds4_session_kv_snapshot_stable(const ds4_session *s) {
+    if (!s) return 0;
+    if (s->distributed) return ds4_dist_session_kv_snapshot_stable(s->distributed);
+    return 1;
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
