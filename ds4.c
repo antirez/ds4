@@ -56437,7 +56437,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->ssd_streaming && e->multi_tier) {
         fprintf(stderr,
-                "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
+                "ds4: --ssd-streaming is not compatible with multi-tier placement "
+                "(e.g. CPU spill)\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
