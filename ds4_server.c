@@ -8400,6 +8400,12 @@ typedef struct {
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
+    /* Some Responses clients replay emitted final-answer reasoning summaries,
+     * while older clients omit them.  Both transcripts describe the same live
+     * KV frontier, so retain one optional alternate key instead of forcing one
+     * client shape to cold-prefill after a tool continuation. */
+    char *visible_text_alt;
+    size_t visible_alt_len;
     /* Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
@@ -8691,6 +8697,9 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    free(st->visible_text_alt);
+    st->visible_text_alt = NULL;
+    st->visible_alt_len = 0;
     st->valid = false;
     st->live_tokens = 0;
 }
@@ -8738,12 +8747,19 @@ static void thinking_live_remember(server *s, server_slot *slot,
 
 static void responses_live_remember(server *s, server_slot *slot,
                                     const char *visible_text,
+                                    const char *visible_text_alt,
                                     const tool_calls *calls) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->responses_live);
     slot->responses_live.visible_text = xstrdup(visible_text);
     slot->responses_live.visible_len = strlen(visible_text);
+    if (visible_text_alt && visible_text_alt[0] &&
+        strcmp(visible_text_alt, visible_text) != 0)
+    {
+        slot->responses_live.visible_text_alt = xstrdup(visible_text_alt);
+        slot->responses_live.visible_alt_len = strlen(visible_text_alt);
+    }
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
             id_list_push_unique(&slot->responses_live.call_ids, calls->v[i].id);
@@ -9734,6 +9750,36 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
     return live_tokens->len;
 }
 
+/* Return the visible replay key matched by this request.  The primary key is
+ * the exact Responses output shape emitted for the prior turn.  The alternate
+ * key preserves compatibility with clients that intentionally omit a final
+ * reasoning summary from their stateless replay. */
+static size_t responses_live_visible_prefix_len_locked(
+        const live_tool_state *state,
+        const char *prompt_text,
+        size_t prompt_len,
+        int live_pos)
+{
+    if (!state || !state->valid || state->live_tokens != live_pos ||
+        !prompt_text)
+    {
+        return 0;
+    }
+    if (state->visible_text && state->visible_len < prompt_len &&
+        byte_prefix_match(prompt_text, prompt_len,
+                          state->visible_text, state->visible_len))
+    {
+        return state->visible_len;
+    }
+    if (state->visible_text_alt && state->visible_alt_len < prompt_len &&
+        byte_prefix_match(prompt_text, prompt_len,
+                          state->visible_text_alt, state->visible_alt_len))
+    {
+        return state->visible_alt_len;
+    }
+    return 0;
+}
+
 /* Visible-replay Responses continuation.
  *
  * Other clients send the full visible transcript on every turn even though the
@@ -9757,16 +9803,10 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->responses_live.valid &&
-              slot->responses_live.live_tokens == live_pos &&
-              slot->responses_live.visible_text &&
-              slot->responses_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->responses_live.visible_text,
-                                slot->responses_live.visible_len);
-    if (ok) visible_len = slot->responses_live.visible_len;
+    visible_len = responses_live_visible_prefix_len_locked(
+        &slot->responses_live, req->prompt_text, prompt_len, live_pos);
     pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
+    if (visible_len == 0) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
@@ -10672,20 +10712,21 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
 static char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *content,
                                                       const char *reasoning,
-                                                      const tool_calls *calls) {
+                                                      const tool_calls *calls,
+                                                      bool include_final_reasoning) {
     const server_model_syntax syntax =
         r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
     buf suffix = {0};
     /* This suffix mirrors what a Responses client can replay, not necessarily
-     * every token in KV.  Hidden reasoning stays live in the session unless the
-     * next client replay is expected to include it.  In practice, pi replays
-     * reasoning summaries for tool-call turns, but not for final assistant
-     * answers; Codex currently requests no summaries at all.  So only include
-     * reasoning in the remembered visible prefix when this assistant turn ended
-     * in tool calls.  A client that does replay final-answer reasoning will not
-     * match this visible shortcut and can still use exact token-prefix replay. */
+     * every token in KV.  Reasoning summaries emitted on the wire are part of a
+     * faithful stateless replay and must be present in the primary visible key.
+     * Older clients may omit final-answer summaries, so callers can also build
+     * a summary-free alternate key for the same live frontier.  Tool-call
+     * summaries remain required because clients replay them before outputs. */
     if (r && ds4_think_mode_enabled(r->think_mode)) {
-        if (r->reasoning_summary_emit && calls && calls->len > 0) {
+        if (r->reasoning_summary_emit &&
+            ((calls && calls->len > 0) || include_final_reasoning))
+        {
             buf_puts(&suffix, reasoning ? reasoning : "");
         }
         buf_puts(&suffix, "</think>");
@@ -11995,14 +12036,35 @@ decode_again:
                 build_responses_visible_assistant_suffix(&j->req,
                     parsed_content ? parsed_content : "",
                     parsed_reasoning,
-                    &parsed_calls);
+                    &parsed_calls,
+                    true);
+            const bool remember_summary_free_alternate =
+                ds4_think_mode_enabled(j->req.think_mode) &&
+                j->req.reasoning_summary_emit &&
+                parsed_reasoning && parsed_reasoning[0] &&
+                parsed_calls.len == 0;
+            char *visible_suffix_alt = remember_summary_free_alternate ?
+                build_responses_visible_assistant_suffix(&j->req,
+                    parsed_content ? parsed_content : "",
+                    parsed_reasoning,
+                    &parsed_calls,
+                    false) : NULL;
             buf visible = {0};
             buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
+            buf visible_alt = {0};
+            if (visible_suffix_alt) {
+                buf_puts(&visible_alt,
+                         j->req.prompt_text ? j->req.prompt_text : "");
+                buf_puts(&visible_alt, visible_suffix_alt);
+            }
             responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
+                                    visible_alt.ptr ? visible_alt.ptr : NULL,
                                     parsed_calls.len ? &parsed_calls : NULL);
             buf_free(&visible);
+            buf_free(&visible_alt);
             free(visible_suffix);
+            free(visible_suffix_alt);
         } else {
             responses_live_clear(s, slot);
         }
@@ -16093,11 +16155,41 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     r.reasoning_summary_emit = true;
 
     char *suffix = build_responses_visible_assistant_suffix(&r, "5",
-                                                            "hidden summary",
-                                                            NULL);
-    TEST_ASSERT(strstr(suffix, "hidden summary") == NULL);
-    TEST_ASSERT(strstr(suffix, "</think>5") != NULL);
+                                                            "final summary",
+                                                            NULL, true);
+    TEST_ASSERT(strstr(suffix, "final summary</think>5") != NULL);
+
+    char *suffix_alt = build_responses_visible_assistant_suffix(&r, "5",
+                                                                "final summary",
+                                                                NULL, false);
+    TEST_ASSERT(strstr(suffix_alt, "final summary") == NULL);
+    TEST_ASSERT(strstr(suffix_alt, "</think>5") != NULL);
+
+    live_tool_state state = {0};
+    state.valid = true;
+    state.live_tokens = 321;
+    state.visible_text = xstrdup(suffix);
+    state.visible_len = strlen(suffix);
+    state.visible_text_alt = xstrdup(suffix_alt);
+    state.visible_alt_len = strlen(suffix_alt);
+
+    buf replay = {0};
+    buf_puts(&replay, suffix);
+    buf_puts(&replay, "<｜User｜>next");
+    TEST_ASSERT(responses_live_visible_prefix_len_locked(
+        &state, replay.ptr, replay.len, 321) == state.visible_len);
+    buf_free(&replay);
+
+    buf_puts(&replay, suffix_alt);
+    buf_puts(&replay, "<｜User｜>next");
+    TEST_ASSERT(responses_live_visible_prefix_len_locked(
+        &state, replay.ptr, replay.len, 321) == state.visible_alt_len);
+    TEST_ASSERT(responses_live_visible_prefix_len_locked(
+        &state, replay.ptr, replay.len, 320) == 0);
+    buf_free(&replay);
+    live_tool_state_free(&state);
     free(suffix);
+    free(suffix_alt);
 
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -16108,7 +16200,7 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
 
     suffix = build_responses_visible_assistant_suffix(&r, "",
                                                       "tool summary",
-                                                      &calls);
+                                                      &calls, false);
     TEST_ASSERT(strstr(suffix, "tool summary</think>") != NULL);
     TEST_ASSERT(strstr(suffix, "<｜DSML｜tool_calls>") != NULL);
     free(suffix);
