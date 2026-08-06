@@ -1093,6 +1093,33 @@ extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
     return 0;
 }
 
+/* Scratch for the GLM IQ2_XXS MoE path. GLM's dispatch is handed only `mid`
+ * and `out`, while the MMQ tier needs separate gate, up and down buffers, so
+ * carve them from one slab that grows to the largest batch seen. */
+static char    *g_glm_moe_scratch = NULL;
+static uint64_t g_glm_moe_scratch_bytes = 0;
+
+static char *glm_moe_scratch_ensure(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    if (g_glm_moe_scratch && g_glm_moe_scratch_bytes >= bytes) return g_glm_moe_scratch;
+    if (g_glm_moe_scratch) {
+        (void)cudaDeviceSynchronize();
+        (void)cudaFree(g_glm_moe_scratch);
+        g_glm_moe_scratch = NULL;
+        g_glm_moe_scratch_bytes = 0;
+    }
+    void *ptr = NULL;
+    if (cudaMalloc(&ptr, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: GLM MoE scratch alloc failed (%.2f MiB)\n",
+                (double)bytes / 1048576.0);
+        return NULL;
+    }
+    g_glm_moe_scratch = (char *)ptr;
+    g_glm_moe_scratch_bytes = bytes;
+    return g_glm_moe_scratch;
+}
+
 static int cuda_use_mmq(void) {
     static int init = 0;
     static int use = 0;
@@ -1267,7 +1294,29 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             int logical_tier,
                                             const char *label) {
     if (g_n_gpus <= 1) {
-        return cuda_model_range_ptr(model_map, offset, bytes, label);
+        const char *p = cuda_model_range_ptr(model_map, offset, bytes, label);
+        /* A weight that is not device memory was never populated: the kernel
+         * will read whatever happens to be mapped there. Report it rather than
+         * letting it surface as wrong output. */
+        if (p && getenv("DS4_CUDA_VERIFY_WEIGHT_PTR") != NULL) {
+            cudaPointerAttributes pa;
+            memset(&pa, 0, sizeof(pa));
+            const cudaError_t e = cudaPointerGetAttributes(&pa, p);
+            if (e != cudaSuccess || pa.type != cudaMemoryTypeDevice) {
+                static int shown = 0;
+                if (shown < 12) {
+                    shown++;
+                    fprintf(stderr,
+                            "ds4: WEIGHT NOT ON DEVICE label=%s bytes=%.2f MiB "
+                            "(type=%d)\n",
+                            label ? label : "?", (double)bytes / 1048576.0,
+                            e == cudaSuccess ? (int)pa.type : -1);
+                    fflush(stderr);
+                }
+            }
+            (void)cudaGetLastError();
+        }
+        return p;
     }
     if (g_support_host_base && model_map == g_support_host_base) {
         offset += g_support_offset_bias;
@@ -1852,7 +1901,13 @@ static void cuda_model_load_progress_reset(void) {
     g_model_load_progress_tty = 0;
 }
 
+/* Defined with the rest of the cache-budget logic, below. */
+static void cuda_model_cache_growth_warn(uint64_t cached_bytes);
+
 static void cuda_model_load_progress_note(uint64_t cached_bytes) {
+    /* Independent of the progress display, which is silenced by
+     * DS4_CUDA_WEIGHT_CACHE_VERBOSE and would hide the warning with it. */
+    cuda_model_cache_growth_warn(cached_bytes);
     if (!cuda_model_load_progress_enabled()) return;
 
     const double now = cuda_wall_sec();
@@ -2280,6 +2335,45 @@ static int cuda_model_copy_to_device_streamed(
     return 1;
 }
 
+/* Total memory of the current device.  On an integrated GPU this is the
+ * machine's RAM, because device allocations come out of the same pool the
+ * operating system is living in. */
+static uint64_t cuda_device_total_bytes(int *out_integrated) {
+    if (out_integrated) *out_integrated = 0;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    int integrated = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess &&
+        out_integrated) {
+        *out_integrated = integrated;
+    }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    return (uint64_t)total_b;
+}
+
+/* An unbounded weight cache is survivable on a discrete GPU: it stops when VRAM
+ * runs out and the allocation fails cleanly.  On an integrated GPU there is no
+ * such backstop -- the cache grows into system RAM until the OOM killer fires,
+ * and on a machine large enough to be interesting that means the host wedges
+ * hard enough to need a power cycle.  Say so, once, and name the way out. */
+static void cuda_model_cache_unbounded_notice(void) {
+    static int warned = 0;
+    if (warned) return;
+    warned = 1;
+    int integrated = 0;
+    const uint64_t total = cuda_device_total_bytes(&integrated);
+    if (!integrated) return;
+    fprintf(stderr,
+            "ds4: CUDA weight cache is unbounded (DS4_CUDA_WEIGHT_CACHE_LIMIT_GB is unset)\n"
+            "ds4:   this device shares memory with the host (%.1f GiB total), so the cache\n"
+            "ds4:   can consume system RAM until the OOM killer intervenes\n"
+            "ds4:   set DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=<N> to bound it; weights past the\n"
+            "ds4:   budget are read from the mapped model instead of being copied\n",
+            (double)total / 1073741824.0);
+    fflush(stderr);
+}
+
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
     const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
@@ -2288,8 +2382,30 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
     }
-    if (gb == 0) return UINT64_MAX;
+    if (gb == 0) {
+        cuda_model_cache_unbounded_notice();
+        return UINT64_MAX;
+    }
     return gb * 1073741824ull;
+}
+
+/* Second line of defence: an unbounded cache that is actually eating the
+ * machine says so while there is still time to react. */
+static void cuda_model_cache_growth_warn(uint64_t cached_bytes) {
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB") != NULL) return;
+    static uint64_t next_warn = 0;
+    int integrated = 0;
+    const uint64_t total = cuda_device_total_bytes(&integrated);
+    if (!integrated || total == 0) return;
+    if (next_warn == 0) next_warn = total / 4;
+    if (cached_bytes < next_warn) return;
+    fprintf(stderr,
+            "ds4: WARNING CUDA weight cache has reached %.2f GiB of %.1f GiB host memory "
+            "and is unbounded; set DS4_CUDA_WEIGHT_CACHE_LIMIT_GB to cap it\n",
+            (double)cached_bytes / 1073741824.0,
+            (double)total / 1073741824.0);
+    fflush(stderr);
+    next_warn = cached_bytes + total / 8;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -29021,6 +29137,12 @@ static int glm_routed_moe_finish_batch(
                    "glm routed moe local output copy");
 }
 
+/* Defined later in this file. */
+extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_selected);
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -29049,14 +29171,22 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride) {
-    (void)layer_index; (void)n_total_expert;
+    (void)layer_index;
     if (!out || !mid || !x || !selected || !weights || !model_map ||
         n_tokens == 0 || n_expert == 0 ||
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
     }
-    if (gate_type != 10u || up_type != 10u || down_type != 10u) {
-        fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",
+    /* 10 = Q2_K, 16 = IQ2_XXS. Gate and up share a kernel so they must match;
+     * down is dispatched separately, which is what a RoutedIQ2XXS_blk78Q2K
+     * style GGUF needs (IQ2_XXS gate/up with a Q2_K down). */
+    const bool gate_up_iq2 = (gate_type == 16u && up_type == 16u);
+    const bool gate_up_q2k = (gate_type == 10u && up_type == 10u);
+    if ((!gate_up_iq2 && !gate_up_q2k) ||
+        (down_type != 10u && down_type != 16u)) {
+        fprintf(stderr,
+                "ds4: glm routed moe: unsupported expert types gate/up/down=%u/%u/%u "
+                "(supported: 10=Q2_K, 16=IQ2_XXS; gate and up must match)\n",
                 gate_type, up_type, down_type);
         return 0;
     }
@@ -29067,16 +29197,216 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         return 0;
     }
     const int logical_tier = cuda_current_tier();
-    const char *gw = (const char *)cuda_resolve_weight_ptr(model_map,
-            gate_offset, (uint64_t)256 * gate_expert_bytes, logical_tier,
-            "glm_gate_exps");
-    const char *uw = (const char *)cuda_resolve_weight_ptr(model_map,
-            up_offset, (uint64_t)256 * up_expert_bytes, logical_tier,
-            "glm_up_exps");
-    const char *dw = (const char *)cuda_resolve_weight_ptr(model_map,
-            down_offset, (uint64_t)256 * down_expert_bytes, logical_tier,
-            "glm_down_exps");
+    /* Under SSD streaming the full n_total_expert span is never resident, and
+     * the single-GPU resolver answers a miss with a pointer to memory the model
+     * was never written into -- silently, so the model emits token soup. Use the
+     * same compaction DeepSeek uses: fetch only the experts this batch routes to
+     * into a contiguous buffer and remap the selected ids to index it. The
+     * kernels are unchanged; only their inputs are substituted. */
+    const ds4_gpu_tensor *sel = selected;
+    const char *gw = NULL, *uw = NULL, *dw = NULL;
+    if (g_ssd_streaming_mode) {
+        if (up_expert_bytes != gate_expert_bytes) {
+            fprintf(stderr,
+                    "ds4: GLM streaming needs equal gate/up expert strides "
+                    "(%llu vs %llu) at layer %u\n",
+                    (unsigned long long)gate_expert_bytes,
+                    (unsigned long long)up_expert_bytes, layer_index);
+            return 0;
+        }
+        ds4_gpu_stream_expert_table table;
+        memset(&table, 0, sizeof(table));
+        table.model_map = model_map;
+        table.model_size = model_size;
+        table.layer = layer_index;
+        table.n_total_expert = n_total_expert;
+        table.gate_offset = gate_offset;
+        table.up_offset = up_offset;
+        table.down_offset = down_offset;
+        table.gate_expert_bytes = gate_expert_bytes;
+        table.down_expert_bytes = down_expert_bytes;
+        if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                    &table, selected, n_tokens * n_expert) ||
+            !g_stream_selected_cache.valid ||
+            !g_stream_selected_cache.gate_ptr ||
+            !g_stream_selected_cache.up_ptr ||
+            !g_stream_selected_cache.down_ptr ||
+            !g_stream_selected_cache.slot_selected_tensor.ptr) {
+            fprintf(stderr,
+                    "ds4: GLM streaming expert compaction unavailable at layer %u; "
+                    "refusing to read unpopulated weights\n", layer_index);
+            return 0;
+        }
+        gw = g_stream_selected_cache.gate_ptr;
+        uw = g_stream_selected_cache.up_ptr;
+        dw = g_stream_selected_cache.down_ptr;
+        sel = &g_stream_selected_cache.slot_selected_tensor;
+        if (getenv("DS4_GLM_VERIFY_EXPERT_PTR") != NULL) {
+            static int said = 0;
+            if (!said) {
+                said = 1;
+                fprintf(stderr,
+                        "ds4: GLM batch MoE using compacted experts "
+                        "(layer=%u tokens=%u slots=%u compact=%u of %u)\n",
+                        layer_index, n_tokens, n_tokens * n_expert,
+                        g_stream_selected_cache.compact_count, n_total_expert);
+                fflush(stderr);
+            }
+        }
+    } else {
+        gw = (const char *)cuda_resolve_weight_ptr(model_map,
+                gate_offset, (uint64_t)n_total_expert * gate_expert_bytes,
+                logical_tier, "glm_gate_exps");
+        uw = (const char *)cuda_resolve_weight_ptr(model_map,
+                up_offset, (uint64_t)n_total_expert * up_expert_bytes,
+                logical_tier, "glm_up_exps");
+        dw = (const char *)cuda_resolve_weight_ptr(model_map,
+                down_offset, (uint64_t)n_total_expert * down_expert_bytes,
+                logical_tier, "glm_down_exps");
+    }
     if (!gw || !uw || !dw) return 0;
+
+    /* IQ2_XXS routed experts: GLM's own kernels are Q2_K-only, but the vendored
+     * MMQ tier already implements IQ2_XXS MoE and DeepSeek uses it on this same
+     * hardware. Its documented layout matches GLM exactly -- W is
+     * [n_experts, M, K] with experts stacked, ids is [n_tokens, n_expert_used]
+     * row-major, and out is column-major over (token, slot) -- which is the
+     * layout GLM already asserts via mid_token_stride. n_expert_used is 8 here,
+     * one of the specialised widths, so the paired entry applies. (The fused
+     * gate/up/mid entry is hardcoded to 6 and cannot be used.) */
+    if (gate_up_iq2) {
+        if (!cuda_use_mmq()) {
+            fprintf(stderr,
+                    "ds4: GLM IQ2_XXS routed experts need the MMQ tier (layer %u)\n",
+                    layer_index);
+            return 0;
+        }
+        /* With streaming compaction the ids were remapped into a dense range,
+         * so the expert count MMQ validates against is the compacted one. */
+        const uint32_t mmq_experts = (sel != selected)
+                ? g_stream_selected_cache.compact_count : n_total_expert;
+        const uint64_t slots      = (uint64_t)n_tokens * n_expert;
+        const uint64_t mid_floats = slots * expert_mid_dim;
+        const uint64_t out_floats = slots * out_dim;
+        const uint64_t gate_bytes = mid_floats * sizeof(float);
+        const uint64_t down_bytes = out_floats * sizeof(float);
+        char *scratch = glm_moe_scratch_ensure(2u * gate_bytes + down_bytes);
+        if (!scratch) return 0;
+        float *gate_buf = (float *)scratch;
+        float *up_buf   = (float *)(scratch + gate_bytes);
+        float *down_buf = (float *)(scratch + 2u * gate_bytes);
+
+        int rc = ds4_mmq_iq2_xxs_moe_pair(
+                gw, uw, (const float *)x->ptr, (const int32_t *)sel->ptr,
+                gate_buf, up_buf,
+                (int)expert_mid_dim, (int)expert_in_dim,
+                (int)n_tokens, (int)mmq_experts, (int)n_expert,
+                (cudaStream_t)0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: GLM IQ2_XXS gate/up failed rc=%d (layer %u)\n",
+                    rc, layer_index);
+            return 0;
+        }
+
+        /* SwiGLU and the router weighting, into mid. GLM applies no clamp. */
+        moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256>>>(
+                (float *)mid->ptr, gate_buf, up_buf, (const float *)weights->ptr,
+                expert_mid_dim, n_tokens, n_expert, 0.0f);
+        if (!cuda_ok(cudaGetLastError(), "glm iq2 moe swiglu launch")) return 0;
+
+        /* Down: each (token, slot) row is its own assignment, so n_expert_used=1. */
+        if (down_type == 16u) {
+            rc = ds4_mmq_iq2_xxs_moe(
+                    dw, (const float *)mid->ptr, (const int32_t *)sel->ptr,
+                    down_buf, (int)out_dim, (int)expert_mid_dim,
+                    (int)slots, (int)mmq_experts, 1, (cudaStream_t)0);
+        } else {
+            rc = ds4_mmq_q2_K_moe(
+                    dw, (const float *)mid->ptr, (const int32_t *)sel->ptr,
+                    down_buf, (int)out_dim, (int)expert_mid_dim,
+                    (int)slots, (int)mmq_experts, 1, (cudaStream_t)0);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "ds4: GLM IQ2_XXS down failed rc=%d (layer %u, down type %u)\n",
+                    rc, layer_index, down_type);
+            return 0;
+        }
+
+        const uint64_t out_n = (uint64_t)n_tokens * out_dim;
+        moe_mmq_sum_kernel<<<(uint32_t)((out_n + 255) / 256), 256>>>(
+                (float *)out->ptr, down_buf, NULL, out_dim, n_expert, n_tokens,
+                /*guard_nonfinite=*/1);
+        if (!cuda_ok(cudaGetLastError(), "glm iq2 moe sum launch")) return 0;
+        return 1;
+    }
+
+
+    /* Diagnostic: report what CUDA thinks these expert pointers are.  This path
+     * asks for all n_total_expert experts as one contiguous span, which SSD
+     * streaming can never satisfy, and the single-GPU resolver answers a miss
+     * with an unregistered host pointer rather than NULL.  A kernel dereferencing
+     * that reads memory the model was never written into. */
+    if (getenv("DS4_GLM_VERIFY_EXPERT_PTR") != NULL) {
+        /* Report the first layer, then only anomalies: a pointer that is not
+         * device memory means the kernel is about to read something that was
+         * never populated with weights. */
+        static int reported_first = 0;
+        int any_bad = 0;
+        {
+            const char *probe[3] = {gw, uw, dw};
+            for (int i = 0; i < 3; i++) {
+                cudaPointerAttributes pa;
+                memset(&pa, 0, sizeof(pa));
+                if (cudaPointerGetAttributes(&pa, probe[i]) != cudaSuccess ||
+                    pa.type != cudaMemoryTypeDevice) {
+                    any_bad = 1;
+                }
+            }
+            (void)cudaGetLastError();
+        }
+        if (!reported_first || any_bad) {
+            reported_first = 1;
+            const char *names[3] = {"gate", "up", "down"};
+            const char *ptrs[3] = {gw, uw, dw};
+            for (int i = 0; i < 3; i++) {
+                cudaPointerAttributes attr;
+                memset(&attr, 0, sizeof(attr));
+                const cudaError_t e = cudaPointerGetAttributes(&attr, ptrs[i]);
+                const char *kind = "?";
+                if (e != cudaSuccess) kind = "query-failed";
+                else if (attr.type == cudaMemoryTypeUnregistered) kind = "UNREGISTERED HOST";
+                else if (attr.type == cudaMemoryTypeHost) kind = "pinned host";
+                else if (attr.type == cudaMemoryTypeDevice) kind = "device";
+                else if (attr.type == cudaMemoryTypeManaged) kind = "managed";
+                /* Compare what the kernel will actually read against the
+                 * bytes in the mapped model. A device pointer proves memory
+                 * exists; it does not prove the streaming fetch put the right
+                 * weights there. */
+                char devbuf[256], refbuf[256];
+                const uint64_t off = (i == 0 ? gate_offset :
+                                      i == 1 ? up_offset : down_offset);
+                const char *ref = (const char *)model_map + off;
+                int cmp = -2;
+                if (cudaMemcpy(devbuf, ptrs[i], sizeof(devbuf),
+                               cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    memcpy(refbuf, ref, sizeof(refbuf));
+                    cmp = memcmp(devbuf, refbuf, sizeof(devbuf)) == 0 ? 1 : 0;
+                }
+                (void)cudaGetLastError();
+                fprintf(stderr,
+                        "ds4: GLM expert ptr %s layer=%u -> %s (span %.2f GiB) "
+                        "first256=%s\n",
+                        names[i], layer_index, kind,
+                        (double)((uint64_t)n_total_expert *
+                                 (i == 2 ? down_expert_bytes : gate_expert_bytes)) /
+                                1073741824.0,
+                        cmp == 1 ? "MATCHES-FILE" :
+                        cmp == 0 ? "*** DIFFERS FROM FILE ***" : "copy-failed");
+            }
+            (void)cudaGetLastError();
+            fflush(stderr);
+        }
+    }
 
     /* Stage 1: quantize x rows to q8_K (existing kernel). */
     const uint32_t xq_blocks = expert_in_dim / 256u;
@@ -29167,7 +29497,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
             int32_t *lists = (int32_t *)((char *)map_scratch[dev]->ptr + lists_off);
             cudaMemsetAsync(counts, 0, counts_bytes);
             glm_moe_expert_map_kernel<<<(n_pairs + 255u) / 256u, 256>>>(
-                    counts, lists, (const int32_t *)selected->ptr,
+                    counts, lists, (const int32_t *)sel->ptr,
                     n_pairs, 256u, cap, 0u);
             if (use_expert_tile8) {
                 uint32_t *tile_total = (uint32_t *)(
@@ -29228,7 +29558,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                                 glm_moe_expert_map_kernel<<<
                                         (chunk_pairs + 255u) / 256u, 256>>>(
                                         counts, lists,
-                                        (const int32_t *)selected->ptr,
+                                        (const int32_t *)sel->ptr,
                                         chunk_pairs, 256u, cap, pair_base);
                                 glm_moe_build_expert_tiles8_kernel<<<1, 1>>>(
                                         tile_total, tile_experts, tile_starts,
@@ -29252,7 +29582,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                                     gd2, 256>>>(
                                     out_work + (uint64_t)token0 * out_dim,
                                     (const float *)down_terms_scratch[dev]->ptr,
-                                    (const int32_t *)selected->ptr + pair_base,
+                                    (const int32_t *)sel->ptr + pair_base,
                                     (const float *)weights->ptr + pair_base,
                                     midq_blocks, out_dim, n_expert,
                                     chunk_tokens);
@@ -29271,7 +29601,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         ge2, warps * 32u, sh2>>>(
                         out_work, dw,
                         (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
-                        (const int32_t *)selected->ptr,
+                        (const int32_t *)sel->ptr,
                         (const float *)weights->ptr,
                         down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, n_tokens);
@@ -29316,7 +29646,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 g1, warps * 32u, sh1>>>(
                 mid_work, gw, uw,
                 (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)sel->ptr,
                 gate_expert_bytes, gate_row_bytes,
                 up_expert_bytes, up_row_bytes,
                 xq_blocks, expert_mid_dim, n_expert);
@@ -29325,7 +29655,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         glm_routed_moe_batch_q2K_gateup_kernel<<<g1, 128>>>(
                 mid_work, gw, uw,
                 (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)sel->ptr,
                 gate_expert_bytes, gate_row_bytes, up_expert_bytes, up_row_bytes,
                 xq_blocks, expert_mid_dim, n_expert, n_tokens, mid_token_stride);
     } else {
@@ -29335,7 +29665,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         glm_routed_moe_gateup_warp_kernel<<<g1, warps * 32u, sh1>>>(
                 mid_work, gw, uw,
                 (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)sel->ptr,
                 gate_expert_bytes, gate_row_bytes, up_expert_bytes, up_row_bytes,
                 xq_blocks, expert_mid_dim, n_expert, n_tokens);
     }
@@ -29352,7 +29682,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         glm_routed_moe_batch_q2K_down_kernel<<<g2, 128>>>(
                 out_work, dw,
                 (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)sel->ptr,
                 (const float *)weights->ptr,
                 down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                 n_expert, n_tokens);
@@ -29364,7 +29694,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         glm_routed_moe_down_warp_kernel<<<g2, warps * 32u, sh2>>>(
                 out_work, dw,
                 (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
-                (const int32_t *)selected->ptr,
+                (const int32_t *)sel->ptr,
                 (const float *)weights->ptr,
                 down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                 n_expert, n_tokens);

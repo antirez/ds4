@@ -35053,11 +35053,22 @@ static void glm_debug_dump_prefill_logits(const float *logits) {
 }
 
 static bool glm_graph_indexed_prefill_trace_enabled(void) {
-    return false;
+    /* Cached: this is consulted at every stage boundary of every layer. */
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_GLM_INDEXED_PREFILL_TRACE");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
 }
 
 static bool glm_graph_indexed_prefill_trace_all(void) {
-    return false;
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_GLM_INDEXED_PREFILL_TRACE_ALL");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
 }
 
 static uint32_t glm_graph_indexed_prefill_trace_slow_ms(void) {
@@ -37909,6 +37920,15 @@ static uint64_t glm_graph_host_memory_bytes(void) {
     size_t len = sizeof(mem);
     if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) != 0) return 0;
     return mem;
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    /* Without this the guard falls back to a GPU working-set estimate, which on
+     * an integrated GPU is not the constraint that actually matters: device
+     * allocations come out of host RAM, so a model that does not fit takes the
+     * whole machine down rather than failing. */
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    return (uint64_t)pages * (uint64_t)page_size;
 #else
     return 0;
 #endif
@@ -38149,6 +38169,21 @@ static bool glm_graph_memory_guard_for_compact_cap(
             ctx_size,
             mem.comp_cap,
             phase ? phase : "before Metal graph allocation");
+    fprintf(stderr,
+            "ds4:   need %.2f GiB but only %.2f GiB is available\n",
+            glm_graph_bytes_to_gib(required),
+            glm_graph_bytes_to_gib(budget));
+    if (!ssd_streaming) {
+        /* The remedy is not obvious from the numbers alone, and proceeding on an
+         * integrated GPU wedges the host rather than failing an allocation. */
+        fprintf(stderr,
+                "ds4:   this model does not fit in memory; retry with "
+                "--ssd-streaming (optionally --ssd-streaming-cache-experts NGB)\n");
+    } else {
+        fprintf(stderr,
+                "ds4:   already streaming; lower --ctx or "
+                "--ssd-streaming-cache-experts\n");
+    }
     if (ssd_streaming && model_bytes != model->size) {
         fprintf(stderr,
                 "ds4:   streamed active model map: %.2f GiB "
@@ -38578,11 +38613,19 @@ static bool glm_graph_dense_tensor_layout(
 
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
-    return l &&
-           l->ffn_gate_exps &&
-           l->ffn_up_exps &&
-           l->ffn_down_exps &&
-           l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS;
+    if (!l || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+        return false;
+    }
+    if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS) return false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* CUDA: the GLM dispatch handles IQ2_XXS itself via the MMQ tier, so it does
+     * not need the generic routed path -- whose batch_routed_* buffers are not
+     * wired up when a shared prefill workspace is in use, which made every
+     * IQ2_XXS layer fail. Metal and ROCm still rely on the generic path. */
+    return false;
+#else
+    return true;
+#endif
 }
 
 static bool glm_graph_stream_map_token(
@@ -40072,6 +40115,15 @@ static bool glm_graph_prefill_stage_boundary(
         uint32_t    pos0,
         uint32_t    n_tokens,
         double     *stage_t0) {
+    /* Stage boundaries are only reached while the ok-chain still holds, so the
+     * last line printed here is the stage after which a prefill failure
+     * occurred.  Without this a failure anywhere in the FFN surfaces only as
+     * "GLM prefill failed". */
+    if (glm_graph_indexed_prefill_trace_enabled()) {
+        fprintf(stderr, "ds4: GLM stage reached %s.%s layer=%u pos0=%u n_tokens=%u\n",
+                part ? part : "?", stage ? stage : "?", il, pos0, n_tokens);
+        fflush(stderr);
+    }
     if (stage_profile) {
         return glm_graph_profile_stage(true, part, stage, il, pos0, n_tokens, stage_t0);
     }
@@ -41772,17 +41824,24 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         bool                     stage_profile,
         bool                     stage_sync,
         double                  *stage_t0) {
-    if (!g || !model || !l || !after_attn || !next ||
-        !g->batch_ffn_norm ||
-        !g->batch_router_logits ||
-        !g->batch_router_probs ||
-        !g->batch_router_selected ||
-        !g->batch_router_weights ||
-        !g->batch_ffn_out ||
-        !g->batch_ffn_mid ||
-        n_tokens <= 1 ||
-        il < DS4_N_LEADING_DENSE ||
-        g->ffn_mid_elems > UINT32_MAX) {
+    /* As with the indexed-prefill guard, a bare false here reaches the user as
+     * "GLM prefill failed" with nothing to act on.  Name the missing piece. */
+    const char *moe_reject = NULL;
+    if (!g || !model || !l || !after_attn || !next) moe_reject = "null argument";
+    else if (!g->batch_ffn_norm) moe_reject = "batch_ffn_norm missing";
+    else if (!g->batch_router_logits) moe_reject = "batch_router_logits missing";
+    else if (!g->batch_router_probs) moe_reject = "batch_router_probs missing";
+    else if (!g->batch_router_selected) moe_reject = "batch_router_selected missing";
+    else if (!g->batch_router_weights) moe_reject = "batch_router_weights missing";
+    else if (!g->batch_ffn_out) moe_reject = "batch_ffn_out missing";
+    else if (!g->batch_ffn_mid) moe_reject = "batch_ffn_mid missing";
+    else if (n_tokens <= 1) moe_reject = "n_tokens<=1";
+    else if (il < DS4_N_LEADING_DENSE) moe_reject = "layer is leading-dense";
+    else if (g->ffn_mid_elems > UINT32_MAX) moe_reject = "ffn_mid_elems overflow";
+    if (moe_reject) {
+        fprintf(stderr,
+                "ds4: GLM routed MoE rejected (%s) layer=%u pos0=%u n_tokens=%u\n",
+                moe_reject, il, pos0, n_tokens);
         return false;
     }
 
@@ -42334,28 +42393,35 @@ static bool glm_graph_encode_ffn_batch(
                                       il,
                                       pos0);
     }
-    if (ok) ok = glm_graph_profile_router_selection_batch(g,
-                                                          l,
-                                                          il,
-                                                          pos0,
-                                                          n_tokens);
+    /* No stage boundary separates these four, so a failure in any of them was
+     * previously indistinguishable.  Report the first one that fails. */
+#define DS4_GLM_FFN_STEP(expr, name) do { \
+        if (ok) { \
+            ok = (expr); \
+            if (!ok && glm_graph_indexed_prefill_trace_enabled()) { \
+                fprintf(stderr, \
+                        "ds4: GLM routed-MoE step failed: %s layer=%u pos0=%u n_tokens=%u\n", \
+                        (name), il, pos0, n_tokens); \
+                fflush(stderr); \
+            } \
+        } \
+    } while (0)
+
+    DS4_GLM_FFN_STEP(glm_graph_profile_router_selection_batch(g, l, il, pos0, n_tokens),
+                     "profile_router_selection_batch");
     const bool tp_batch_split_ffn = g->tp_world == 2;
     if (ok && tp_batch_split_ffn) {
-        ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
+        DS4_GLM_FFN_STEP(glm_graph_tp_batch_bounce_ready(g, n_tokens),
+                         "tp_batch_bounce_ready");
     }
-    if (ok) ok = glm_graph_capture_prefill_seed_router_selected(g,
-                                                                il,
-                                                                n_tokens);
-    if (ok) ok = glm_graph_seed_streaming_expert_cache_from_full_layer(
-            g,
-            model,
-            weights,
-            l,
-            il,
-            n_tokens,
-            gate_out * gate_row_bytes,
-            down_out * down_row_bytes,
-            full_layer_prefill);
+    DS4_GLM_FFN_STEP(glm_graph_capture_prefill_seed_router_selected(g, il, n_tokens),
+                     "capture_prefill_seed_router_selected");
+    DS4_GLM_FFN_STEP(glm_graph_seed_streaming_expert_cache_from_full_layer(
+                             g, model, weights, l, il, n_tokens,
+                             gate_out * gate_row_bytes,
+                             down_out * down_row_bytes,
+                             full_layer_prefill),
+                     "seed_streaming_expert_cache_from_full_layer");
     bool shared_done = false;
 #define DS4_GLM_ENCODE_FFN_BATCH_SHARED() do { \
         if (ok) { \
@@ -42476,7 +42542,7 @@ static bool glm_graph_encode_ffn_batch(
     }
 #endif
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
-    if (ok) ok = glm_graph_routed_moe_batch_dispatch(
+    if (ok) { const bool ok_before_routed = ok; (void)ok_before_routed; ok = glm_graph_routed_moe_batch_dispatch(
             g,
             model,
             l,
@@ -42496,6 +42562,17 @@ static bool glm_graph_encode_ffn_batch(
             (uint32_t)g->ffn_mid_elems,
             full_layer_prefill,
             false) != 0;
+        if (!ok && glm_graph_indexed_prefill_trace_enabled()) {
+            fprintf(stderr,
+                    "ds4: GLM routed_moe_batch_dispatch failed layer=%u pos0=%u "
+                    "n_tokens=%u expert types gate/up/down=%u/%u/%u\n",
+                    il, pos0, n_tokens,
+                    l->ffn_gate_exps ? l->ffn_gate_exps->type : 0u,
+                    l->ffn_up_exps ? l->ffn_up_exps->type : 0u,
+                    l->ffn_down_exps ? l->ffn_down_exps->type : 0u);
+            fflush(stderr);
+        }
+    }
     if (ok && g->tp_world == 2) {
         ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
@@ -44194,24 +44271,41 @@ static bool glm_graph_forward_indexed_tokens(
         uint32_t           display_absolute_base,
         uint32_t           work_done_base,
         uint32_t           work_total) {
-    if (!g || !model || !weights || !tokens ||
-        g->compact_cache_cap == 0 ||
-        g->indexed_prefill_cap == 0 ||
-        g->indexed_prefill_score_cap == 0 ||
-        !g->batch_indexer_q ||
-        !g->batch_indexer_weights ||
-        !g->batch_indexer_scores ||
-        !g->batch_indexer_selected ||
-        !g->batch_qk_low ||
-        n_tokens == 0 ||
-        g->layer_count == 0 ||
-        n_tokens > g->indexed_prefill_cap ||
-        !glm_graph_span_fits_context(g, pos0, n_tokens)) {
+    /* Each of these rejections used to surface only as a bare false, which the
+     * caller turns into "GLM prefill failed" with no indication of which
+     * precondition was unmet.  Name the failing one. */
+    const char *reject = NULL;
+    if (!g || !model || !weights || !tokens) reject = "null argument";
+    else if (g->compact_cache_cap == 0) reject = "compact_cache_cap==0";
+    else if (g->indexed_prefill_cap == 0) reject = "indexed_prefill_cap==0";
+    else if (g->indexed_prefill_score_cap == 0) reject = "indexed_prefill_score_cap==0";
+    else if (!g->batch_indexer_q) reject = "batch_indexer_q missing";
+    else if (!g->batch_indexer_weights) reject = "batch_indexer_weights missing";
+    else if (!g->batch_indexer_scores) reject = "batch_indexer_scores missing";
+    else if (!g->batch_indexer_selected) reject = "batch_indexer_selected missing";
+    else if (!g->batch_qk_low) reject = "batch_qk_low missing";
+    else if (n_tokens == 0) reject = "n_tokens==0";
+    else if (g->layer_count == 0) reject = "layer_count==0";
+    else if (n_tokens > g->indexed_prefill_cap) reject = "n_tokens>indexed_prefill_cap";
+    else if (!glm_graph_span_fits_context(g, pos0, n_tokens)) reject = "span does not fit context";
+    if (reject) {
+        fprintf(stderr,
+                "ds4: GLM indexed prefill rejected (%s) pos0=%u n_tokens=%u "
+                "prefill_cap=%u score_cap=%u compact_cap=%u layers=%u\n",
+                reject, pos0, n_tokens,
+                g ? g->indexed_prefill_cap : 0,
+                g ? g->indexed_prefill_score_cap : 0,
+                g ? g->compact_cache_cap : 0,
+                g ? g->layer_count : 0);
         return false;
     }
     const uint32_t n_rows = pos0 + n_tokens;
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     if (pos0 < indexer_top_k && n_rows > indexer_top_k) {
+        fprintf(stderr,
+                "ds4: GLM indexed prefill rejected (chunk straddles indexer top_k) "
+                "pos0=%u n_tokens=%u n_rows=%u top_k=%u\n",
+                pos0, n_tokens, n_rows, indexer_top_k);
         return false;
     }
     const uint32_t indexed_selected_count =
