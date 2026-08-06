@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DwarfStar Chat</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <style>
   :root { --bg: #1a1a1a; --surface: #252525; --border: #333; --text: #e0e0e0; --text-muted: #888; --accent: #4a9eff; --accent-hover: #6ab0ff; --user-msg: #2d3748; --assistant-msg: #262626; --thinking: #2a2a30; --code-bg: #1e1e1e; --font: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -13,59 +14,115 @@
   #header .status { font-size: 12px; padding: 3px 8px; border-radius: 4px; background: #2d2d2d; }
   #header .status.ok { background: #1e3a1e; color: #7ccf7c; }
   #header .status.err { background: #3a1e1e; color: #cf7c7c; }
-  #header button { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  #header .spacer { margin-left: auto; }
+  #header label { font-size: 12px; color: var(--text-muted); }
+  #header select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 13px; font-family: var(--font); cursor: pointer; }
+  #header select:focus { outline: none; border-color: var(--accent); }
+  #header button { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
   #header button:hover { background: var(--surface); border-color: var(--accent); }
   #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-  .msg { display: flex; flex-direction: column; gap: 4px; max-width: 85%; padding: 10px 14px; border-radius: 10px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
-  .msg.user { background: var(--user-msg); align-self: flex-end; border-bottom-right-radius: 2px; }
+  .msg { display: flex; flex-direction: column; gap: 4px; max-width: 85%; padding: 10px 14px; border-radius: 10px; line-height: 1.5; font-size: 14px; word-wrap: break-word; overflow-wrap: anywhere; }
+  .msg.user { background: var(--user-msg); align-self: flex-end; border-bottom-right-radius: 2px; white-space: pre-wrap; }
   .msg.assistant { background: var(--assistant-msg); align-self: flex-start; border-bottom-left-radius: 2px; }
-  .msg .name { font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
+  .msg .head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .msg .name { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+  .copy-btn { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--text-muted); font-size: 11px; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-family: var(--font); line-height: 1.6; opacity: 0; transition: opacity .12s; }
+  .msg:hover .copy-btn, .copy-btn:focus { opacity: 1; }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+  .copy-btn.ok { color: #7ccf7c; border-color: #2f5c2f; opacity: 1; }
   .thinking-block { background: var(--thinking); border-left: 3px solid #7c7c3c; padding: 8px 12px; border-radius: 4px; font-size: 13px; color: #b0b070; margin: 4px 0; white-space: pre-wrap; }
-  .msg pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; overflow-x: auto; font-size: 13px; margin: 6px 0; }
-  .msg code { background: var(--code-bg); padding: 2px 5px; border-radius: 3px; font-size: 13px; }
-  .msg p { margin: 4px 0; }
-  .msg ul, .msg ol { margin: 4px 0; padding-left: 20px; }
+  .body > *:first-child { margin-top: 0; }
+  .body > *:last-child { margin-bottom: 0; }
+  .msg pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; overflow-x: auto; font-size: 13px; margin: 8px 0; }
+  .msg pre code { background: none; padding: 0; font-size: 13px; }
+  .msg code { background: var(--code-bg); padding: 2px 5px; border-radius: 3px; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .msg p { margin: 8px 0; }
+  .msg h1, .msg h2, .msg h3, .msg h4, .msg h5, .msg h6 { margin: 14px 0 6px; line-height: 1.3; }
+  .msg h1 { font-size: 20px; } .msg h2 { font-size: 18px; } .msg h3 { font-size: 16px; }
+  .msg h4, .msg h5, .msg h6 { font-size: 14px; }
+  .msg ul, .msg ol { margin: 8px 0; padding-left: 22px; }
+  .msg li { margin: 3px 0; }
+  .msg blockquote { border-left: 3px solid var(--border); padding-left: 12px; margin: 8px 0; color: var(--text-muted); }
+  .msg hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  .msg a { color: var(--accent); }
+  .msg table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; max-width: 100%; }
+  .msg th, .msg td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; font-size: 13px; }
+  .msg th { background: var(--surface); font-weight: 600; }
+  .math-display { display: block; overflow-x: auto; overflow-y: hidden; margin: 10px 0; text-align: center; }
+  .math-raw { color: #b0b070; }
+  .math-err { color: #cf7c7c; }
   #input-area { background: var(--surface); padding: 12px 20px; display: flex; gap: 10px; border-top: 1px solid var(--border); flex-shrink: 0; }
   #input-area textarea { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 14px; font-family: var(--font); resize: none; outline: none; max-height: 200px; }
   #input-area textarea:focus { border-color: var(--accent); }
   #input-area button { background: var(--accent); border: none; color: #fff; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
-  #input-area button:disabled { background: #444; cursor: default; }
+  #input-area button:disabled { background: #444; color: #888; cursor: default; }
   #input-area button:hover:not(:disabled) { background: var(--accent-hover); }
+  #stop-btn { background: #6b2d2d; }
+  #stop-btn:hover:not(:disabled) { background: #8a3a3a; }
   .typing { align-self: flex-start; color: var(--text-muted); font-size: 13px; padding: 6px 12px; }
   .error-msg { align-self: center; background: #3a1e1e; padding: 8px 16px; border-radius: 6px; color: #cf7c7c; font-size: 13px; }
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
-  @media (max-width: 600px) { .msg { max-width: 95%; } }
+  @media (max-width: 600px) { .msg { max-width: 95%; } #header label { display: none; } }
 </style>
 </head>
 <body>
 <div id="header">
   <h1>DwarfStar</h1>
   <span class="status" id="status-indicator">connecting...</span>
+  <span class="spacer"></span>
+  <label for="think-select">Thinking</label>
+  <select id="think-select">
+    <option value="none">off</option>
+    <option value="minimal">minimal</option>
+    <option value="low">low</option>
+    <option value="medium">medium</option>
+    <option value="high">high</option>
+  </select>
   <button id="new-chat-btn">New Chat</button>
 </div>
 <div id="chat"></div>
 <div id="input-area">
   <textarea id="input" rows="1" placeholder="Send a message..." autofocus></textarea>
   <button id="send-btn" disabled>Send</button>
+  <button id="stop-btn" disabled>Stop</button>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script>
 (function(){
   const BASE = 'http://127.0.0.1:8000';
+  const SENT = '';   // private-use sentinel, survives HTML escaping
 
   const chatEl = document.getElementById('chat');
   const inputEl = document.getElementById('input');
   const sendBtn = document.getElementById('send-btn');
   const statusEl = document.getElementById('status-indicator');
   const newChatBtn = document.getElementById('new-chat-btn');
+  const thinkEl = document.getElementById('think-select');
+  const stopBtn = document.getElementById('stop-btn');
 
   let messages = [];
   let modelId = '';
   let sending = false;
   let abortCtrl = null;
+  let streamingMsg = null;   // assistant message currently being filled
 
-  // Auto-resize textarea
+  function setBusy(busy){
+    sending = busy;
+    sendBtn.disabled = busy;
+    stopBtn.disabled = !busy;
+  }
+
+  // Thinking mode, persisted
+  try {
+    const saved = localStorage.getItem('ds4-think');
+    if (saved) thinkEl.value = saved;
+  } catch(_){}
+  thinkEl.addEventListener('change', function(){
+    try { localStorage.setItem('ds4-think', thinkEl.value); } catch(_){}
+  });
+
   inputEl.addEventListener('input', function(){
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
@@ -76,17 +133,12 @@
     statusEl.textContent = text;
   }
 
-  // Fetch available models
   async function init(){
     try {
       const res = await fetch(BASE + '/v1/models');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      if (data.data && data.data.length > 0) {
-        modelId = data.data[0].id || 'ds4flash.gguf';
-      } else {
-        modelId = 'ds4flash.gguf';
-      }
+      modelId = (data.data && data.data[0] && data.data[0].id) || 'ds4flash.gguf';
       setStatus(true, 'connected');
       sendBtn.disabled = false;
     } catch (e) {
@@ -97,18 +149,238 @@
   init();
 
   function escapeHtml(s){
-    const div = document.createElement('div');
-    div.appendChild(document.createTextNode(s));
-    return div.innerHTML;
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // ---- math -------------------------------------------------------------
+  function mathHtml(m){
+    if (window.katex) {
+      try {
+        return window.katex.renderToString(m.tex, {
+          displayMode: m.display, throwOnError: false, output: 'html'
+        });
+      } catch(e){
+        return '<code class="math-err">' + escapeHtml(m.tex) + '</code>';
+      }
+    }
+    // KaTeX unavailable (offline): show the source, don't lose it.
+    // Display wrapper is added by the caller, so only tag the style here.
+    return '<code class="math-raw">' + escapeHtml(m.tex) + '</code>';
+  }
+
+  function extractMath(s, store){
+    const push = (tex, display) => {
+      store.push({ tex: tex.trim(), display: display });
+      return SENT + 'M' + (store.length - 1) + SENT;
+    };
+    s = s.replace(/\$\$([\s\S]+?)\$\$/g, (m, t) => push(t, true));
+    s = s.replace(/\\\[([\s\S]+?)\\\]/g, (m, t) => push(t, true));
+    s = s.replace(/\\\(([\s\S]+?)\\\)/g, (m, t) => push(t, false));
+    // inline $...$ : no whitespace just inside either delimiter, no newlines.
+    // That rules out prose like "costs $5 and $7 total".
+    s = s.replace(/\$([^\s$](?:[^$\n]*[^\s$])?)\$/g, (m, t) => push(t, false));
+    return s;
+  }
+
+  // ---- markdown ---------------------------------------------------------
+  function inline(s){
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+      (m, txt, href) => '<a href="' + href + '" target="_blank" rel="noopener">' + txt + '</a>');
+    s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+    return s;
+  }
+
+  function isBlockStart(ln){
+    // NB: runs after escapeHtml, so '>' arrives as '&gt;'
+    return /^\s*$/.test(ln) || /^(#{1,6})\s+/.test(ln) || /^\s*&gt;/.test(ln) ||
+           /^\s*([-*+]|\d+[.)])\s+/.test(ln) ||
+           /^\s*([-*_])\s*(\1\s*){2,}$/.test(ln) ||
+           ln.indexOf(SENT + 'C') !== -1;
+  }
+
+  function listBlock(lines, i, out){
+    const first = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+/);
+    const baseIndent = first[1].length;
+    const ordered = /\d/.test(first[2]);
+    const items = [];
+    while (i < lines.length) {
+      const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+      if (!m || m[1].length < baseIndent) break;
+      if (m[1].length > baseIndent) {          // nested list
+        const sub = [];
+        while (i < lines.length) {
+          const n = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+/);
+          if (!n || n[1].length <= baseIndent) break;
+          sub.push(lines[i].slice(baseIndent + 2));
+          i++;
+        }
+        if (items.length) items[items.length - 1] += blocks(sub.join('\n'));
+        continue;
+      }
+      let text = m[3];
+      i++;
+      // lazy continuation lines
+      while (i < lines.length && !isBlockStart(lines[i]) && lines[i].trim() !== '') {
+        text += '\n' + lines[i].trim();
+        i++;
+      }
+      items.push(inline(text).replace(/\n/g, '<br>'));
+    }
+    const tag = ordered ? 'ol' : 'ul';
+    out.html += '<' + tag + '>' + items.map(t => '<li>' + t + '</li>').join('') + '</' + tag + '>';
+    return i;
+  }
+
+  function tableBlock(lines, i, out){
+    const split = ln => ln.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+    const head = split(lines[i]);
+    const rows = [];
+    i += 2;
+    while (i < lines.length && lines[i].indexOf('|') !== -1 && lines[i].trim() !== '') {
+      rows.push(split(lines[i]));
+      i++;
+    }
+    let h = '<table><thead><tr>' + head.map(c => '<th>' + inline(c) + '</th>').join('') + '</tr></thead>';
+    if (rows.length) {
+      h += '<tbody>' + rows.map(r => '<tr>' + r.map(c => '<td>' + inline(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+    }
+    out.html += h + '</table>';
+    return i;
+  }
+
+  function blocks(src){
+    const lines = src.split(/\r?\n/);
+    const out = { html: '' };
+    let i = 0;
+    while (i < lines.length) {
+      const ln = lines[i];
+      if (/^\s*$/.test(ln)) { i++; continue; }
+
+      let m = ln.match(/^(#{1,6})\s+(.*)$/);
+      if (m) { const l = m[1].length; out.html += '<h' + l + '>' + inline(m[2]) + '</h' + l + '>'; i++; continue; }
+
+      if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(ln)) { out.html += '<hr>'; i++; continue; }
+
+      if (/^\s*&gt;/.test(ln)) {
+        const buf = [];
+        while (i < lines.length && /^\s*&gt;/.test(lines[i])) { buf.push(lines[i].replace(/^\s*&gt;\s?/, '')); i++; }
+        out.html += '<blockquote>' + blocks(buf.join('\n')) + '</blockquote>';
+        continue;
+      }
+
+      if (ln.indexOf('|') !== -1 && i + 1 < lines.length &&
+          /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1]) && lines[i + 1].indexOf('|') !== -1) {
+        i = tableBlock(lines, i, out);
+        continue;
+      }
+
+      if (/^\s*([-*+]|\d+[.)])\s+/.test(ln)) { i = listBlock(lines, i, out); continue; }
+
+      // standalone code/math placeholder -> emit bare, no <p> wrapper
+      if (new RegExp('^' + SENT + '[CM]\\d+' + SENT + '$').test(ln.trim())) {
+        out.html += ln.trim(); i++; continue;
+      }
+
+      const buf = [];
+      while (i < lines.length && !isBlockStart(lines[i]) && lines[i].trim() !== '') { buf.push(lines[i]); i++; }
+      out.html += '<p>' + inline(buf.join('\n')).replace(/\n/g, '<br>') + '</p>';
+    }
+    return out.html;
+  }
+
+  function renderMarkdown(text){
+    const code = [], icode = [], math = [];
+    let s = String(text);
+
+    // 1. pull out fenced code (raw, untouched)
+    s = s.replace(/```([\w+-]*)\r?\n?([\s\S]*?)```/g, (m, lang, body) => {
+      code.push(body);
+      return '\n' + SENT + 'C' + (code.length - 1) + SENT + '\n';
+    });
+    // 2. pull out inline code, so `$x$` or `**x**` inside it stay literal
+    s = s.replace(/`([^`\n]+)`/g, (m, body) => {
+      icode.push(body);
+      return SENT + 'I' + (icode.length - 1) + SENT;
+    });
+    // 3. pull out math (raw LaTeX, must not be escaped or markdown-mangled)
+    s = extractMath(s, math);
+    // 4. escape everything that remains
+    s = escapeHtml(s);
+    // 5. block + inline markdown
+    let html = blocks(s);
+    // 6. put code and math back
+    html = html.replace(new RegExp(SENT + 'C(\\d+)' + SENT, 'g'),
+      (m, n) => '<pre><code>' + escapeHtml(code[+n]) + '</code></pre>');
+    html = html.replace(new RegExp(SENT + 'I(\\d+)' + SENT, 'g'),
+      (m, n) => '<code>' + escapeHtml(icode[+n]) + '</code>');
+    html = html.replace(new RegExp(SENT + 'M(\\d+)' + SENT, 'g'),
+      (m, n) => {
+        const item = math[+n];
+        const h = mathHtml(item);
+        return item.display ? '<span class="math-display">' + h + '</span>' : h;
+      });
+    return html;
+  }
+
+  // Re-render everything once KaTeX finishes loading
+  function rerenderAll(){
+    const items = chatEl.querySelectorAll('.msg');
+    for (let k = 0; k < items.length && k < messages.length; k++) {
+      const fresh = renderMessage(messages[k]);
+      items[k].replaceWith(fresh);
+    }
+  }
+  if (!window.katex) {
+    const s = document.querySelector('script[src*="katex"]');
+    if (s) s.addEventListener('load', rerenderAll);
+  }
+
+  function copyToClipboard(text, btn){
+    const restore = () => {
+      btn.textContent = 'Copied';
+      btn.classList.add('ok');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('ok'); }, 1200);
+    };
+    const legacy = () => {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); restore(); } catch(e){ btn.textContent = 'Failed'; }
+      ta.remove();
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(restore, legacy);
+    } else {
+      legacy();
+    }
   }
 
   function renderMessage(msg){
     const div = document.createElement('div');
     div.className = 'msg ' + msg.role;
+
+    const head = document.createElement('div');
+    head.className = 'head';
     const nameEl = document.createElement('div');
     nameEl.className = 'name';
     nameEl.textContent = msg.role === 'user' ? 'You' : 'DwarfStar';
-    div.appendChild(nameEl);
+    head.appendChild(nameEl);
+    if (msg.content) {
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'copy-btn';
+      copyBtn.type = 'button';
+      copyBtn.textContent = 'Copy';
+      copyBtn.title = 'Copy this message as Markdown';
+      copyBtn.onclick = () => copyToClipboard(msg.content, copyBtn);
+      head.appendChild(copyBtn);
+    }
+    div.appendChild(head);
 
     if (msg.reasoning) {
       const rb = document.createElement('div');
@@ -117,9 +389,11 @@
       div.appendChild(rb);
     }
     if (msg.content) {
-      const md = document.createElement('div');
-      md.innerHTML = renderMarkdown(msg.content);
-      div.appendChild(md);
+      const body = document.createElement('div');
+      body.className = 'body';
+      if (msg.role === 'user') body.textContent = msg.content;
+      else body.innerHTML = renderMarkdown(msg.content);
+      div.appendChild(body);
     }
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
@@ -132,58 +406,32 @@
     return div;
   }
 
-  function renderMarkdown(text){
-    let s = escapeHtml(text);
-    // code blocks ```...```
-    s = s.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code){
-      return '<pre><code>' + escapeHtml(code) + '</code></pre>';
-    });
-    // inline code
-    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-    // bold
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    // italic
-    s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    // newlines
-    s = s.replace(/\n/g, '<br>');
-    return s;
-  }
-
   function addMessage(msg, isDelta){
     if (isDelta && msg.content === null && msg.finish_reason === null) return;
     const last = messages[messages.length - 1];
     if (isDelta && last && last.role === msg.role && !last.finish_reason) {
-      // Append to existing message
       if (msg.content) last.content += msg.content;
       if (msg.finish_reason) last.finish_reason = msg.finish_reason;
-      // Update DOM
       const items = chatEl.querySelectorAll('.msg');
       if (items.length > 0) {
         const target = items[items.length - 1];
-        if (target.classList.contains(msg.role)) {
-          // Re-render the last message
-          const newEl = renderMessage(last);
-          target.replaceWith(newEl);
-        }
+        if (target.classList.contains(msg.role)) target.replaceWith(renderMessage(last));
       }
       scrollToBottom();
       return;
     }
     messages.push(msg);
-    const el = renderMessage(msg);
-    chatEl.appendChild(el);
+    chatEl.appendChild(renderMessage(msg));
     scrollToBottom();
   }
 
-  function scrollToBottom(){
-    chatEl.scrollTop = chatEl.scrollHeight;
-  }
+  function scrollToBottom(){ chatEl.scrollTop = chatEl.scrollHeight; }
 
   function addTyping(){
     const div = document.createElement('div');
     div.className = 'typing';
     div.id = 'typing-indicator';
-    div.textContent = 'DwarfStar is thinking...';
+    div.textContent = 'DwarfStar is working...';
     chatEl.appendChild(div);
     scrollToBottom();
   }
@@ -208,29 +456,20 @@
     if (!text) return;
     inputEl.value = '';
     inputEl.style.height = 'auto';
-    sending = true;
-    sendBtn.disabled = true;
+    setBusy(true);
 
-    // Add user message
-    const userMsg = { role: 'user', content: text };
-    addMessage(userMsg, false);
+    addMessage({ role: 'user', content: text }, false);
 
-    // Build request
     const msgs = messages.map(m => ({
       role: m.role === 'tool' ? 'function' : m.role,
       content: m.content || ''
     }));
-    // Remove last assistant msg from msgs array (it's being built incrementally)
-    if (msgs.length > 0 && msgs[msgs.length - 1].role === 'assistant') {
-      msgs.pop();
-    }
-    msgs.push({ role: 'user', content: text });
+    if (msgs.length > 0 && msgs[msgs.length - 1].role === 'assistant') msgs.pop();
 
     addTyping();
 
     const assistantMsg = { role: 'assistant', content: '', reasoning: '', finish_reason: null };
-    // Don't add to messages yet; will be added on first delta
-
+    streamingMsg = assistantMsg;
     abortCtrl = new AbortController();
     let firstDelta = true;
 
@@ -240,7 +479,8 @@
         messages: msgs,
         stream: true,
         temperature: 0.7,
-        max_tokens: 4096
+        max_tokens: 4096,
+        reasoning_effort: thinkEl.value
       });
 
       const res = await fetch(BASE + '/v1/chat/completions', {
@@ -252,13 +492,10 @@
 
       if (!res.ok) {
         let errText = 'HTTP ' + res.status;
-        try {
-          const e = await res.json();
-          errText = e.error?.message || errText;
-        } catch(_){}
+        try { const e = await res.json(); errText = (e.error && e.error.message) || errText; } catch(_){}
         showError('Server error: ' + errText);
-        sending = false;
-        sendBtn.disabled = false;
+        streamingMsg = null;
+        setBusy(false);
         return;
       }
 
@@ -270,7 +507,6 @@
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
-
         const lines = buf.split('\n');
         buf = lines.pop() || '';
 
@@ -278,66 +514,69 @@
           if (!line.startsWith('data: ')) continue;
           const payload = line.slice(6).trim();
           if (payload === '[DONE]') break;
-
           try {
             const parsed = JSON.parse(payload);
-            const delta = parsed.choices?.[0]?.delta || {};
-            const finish = parsed.choices?.[0]?.finish_reason || null;
+            const delta = (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) || {};
+            const finish = (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) || null;
 
-            if (firstDelta) {
-              removeTyping();
-              messages.push(assistantMsg);
-              firstDelta = false;
-            }
-
-            if (delta.content) {
-              assistantMsg.content += delta.content;
-            }
-            // Reasoning from provider-specific field (not in standard OpenAI)
+            if (firstDelta) { removeTyping(); messages.push(assistantMsg); firstDelta = false; }
+            if (delta.content) assistantMsg.content += delta.content;
+            if (delta.reasoning_content) assistantMsg.reasoning += delta.reasoning_content;
             assistantMsg.finish_reason = finish;
 
-            // Update UI
             const items = chatEl.querySelectorAll('.msg');
             const lastEl = items[items.length - 1];
-            if (lastEl && lastEl.classList.contains('assistant')) {
-              const newEl = renderMessage(assistantMsg);
-              lastEl.replaceWith(newEl);
-            } else {
-              const el = renderMessage(assistantMsg);
-              chatEl.appendChild(el);
-            }
+            if (lastEl && lastEl.classList.contains('assistant')) lastEl.replaceWith(renderMessage(assistantMsg));
+            else chatEl.appendChild(renderMessage(assistantMsg));
             scrollToBottom();
           } catch(e){ /* skip malformed */ }
         }
       }
 
       if (firstDelta) removeTyping();
-      // Ensure finish_reason is set
       if (!firstDelta && !assistantMsg.finish_reason) {
         assistantMsg.finish_reason = 'stop';
         const items = chatEl.querySelectorAll('.msg');
         const lastEl = items[items.length - 1];
-        if (lastEl && lastEl.classList.contains('assistant')) {
-          const newEl = renderMessage(assistantMsg);
-          lastEl.replaceWith(newEl);
-        }
+        if (lastEl && lastEl.classList.contains('assistant')) lastEl.replaceWith(renderMessage(assistantMsg));
       }
     } catch (e) {
       if (e.name === 'AbortError') {
+        // Keep whatever was generated so far; mark it finished so the next
+        // turn sends it as ordinary history.
         removeTyping();
+        if (assistantMsg.content && !assistantMsg.finish_reason) {
+          assistantMsg.finish_reason = 'stop';
+          const items = chatEl.querySelectorAll('.msg');
+          const lastEl = items[items.length - 1];
+          if (lastEl && lastEl.classList.contains('assistant')) lastEl.replaceWith(renderMessage(assistantMsg));
+        } else if (!assistantMsg.content) {
+          // stopped before any text arrived - drop the empty bubble entirely
+          const idx = messages.indexOf(assistantMsg);
+          if (idx !== -1) {
+            messages.splice(idx, 1);
+            const items = chatEl.querySelectorAll('.msg');
+            const lastEl = items[items.length - 1];
+            if (lastEl && lastEl.classList.contains('assistant')) lastEl.remove();
+          }
+        }
       } else {
         showError('Connection error: ' + e.message);
       }
     }
 
-    sending = false;
-    sendBtn.disabled = false;
+    streamingMsg = null;
+    setBusy(false);
+  }
+
+  function stopGeneration(){
+    if (sending && abortCtrl) abortCtrl.abort();
   }
 
   function newChat(){
     if (sending && abortCtrl) abortCtrl.abort();
-    sending = false;
-    sendBtn.disabled = false;
+    setBusy(false);
+    streamingMsg = null;
     messages = [];
     chatEl.innerHTML = '';
     inputEl.value = '';
@@ -346,13 +585,15 @@
   }
 
   sendBtn.addEventListener('click', sendMessage);
+  stopBtn.addEventListener('click', stopGeneration);
   inputEl.addEventListener('keydown', function(e){
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    if (e.key === 'Escape' && sending) { e.preventDefault(); stopGeneration(); }
   });
   newChatBtn.addEventListener('click', newChat);
+
+  // exposed for tests
+  window.__ds4 = { renderMarkdown: renderMarkdown };
 })();
 </script>
 </body>
