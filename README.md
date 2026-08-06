@@ -24,12 +24,12 @@ Model support is intentionally opportunistic. The project follows the best open
 weights for useful local machine sizes, especially 128 GB laptops and 512 GB
 workstations. A model may be removed when a better replacement arrives.
 
-# So, what can I do with this software?
+# So, what can I do with DwarfStar?
 
-* You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
-* Using the CUDA multi-GPU support and with ds4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggreated generation, 2000 t/s prefill.
+* You can run very capable models in consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you don't have enough RAM, with SSD streaming, you can run it at a decent speed.
+* Using the CUDA multi-GPU support and with ds4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggregated generation, 2000 t/s prefill.
 * Using two MacBook M5 Max / M3 Ultra RDMA, you can run 4 bit DeepSeek Flash or GLM 5.2 with tensor parallelism.
-* You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
+* You can also use pipeline parallelism to glue together multiple systems to sum their RAM and run larger models.
 
 ## Motivations
 
@@ -63,12 +63,12 @@ are definitely possible.
 
 # How to use this project?
 
-I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+I (Salvatore) believe that the way projects should be shipped and used has changed because of AI. The main differences today are:
 
-1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
-2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+1. With AI, users can modify software in significant ways with little effort and at low cost, even without deep domain knowledge of the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
+2. Similarly, because of the first point, software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
 
-So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
+So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to explore the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
 
 ## More Documentation
 
@@ -100,10 +100,10 @@ next sections.
 This implementation only works with the DeepSeek V4 and GLM 5.2 GGUFs listed
 below. It is not a general GGUF loader, and arbitrary GGUF files will not have
 the tensor layout, quantization mix, metadata, or optional MTP state expected by
-the engine. The 2 bit quantizations provided here are verified to be actually
+the engine. The 2-bit quantizations provided here are verified to be actually
 high quality: they behave well, work under coding agents, call tools in a reliable way.
 
-The 2 bit quants use a very asymmetrical quantization: only the routed MoE
+The 2-bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
