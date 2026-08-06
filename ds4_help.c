@@ -304,6 +304,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "--raw-prompt", "Non-interactive -p only: tokenize prompt without agent chat/tool text.");
+    opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
@@ -542,7 +543,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through Chrome-backed web tools.");
         para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM models use native <tool_call> syntax. Both are rendered live in the terminal.");
-        para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
+        para(fp, c, "Edit uses exact old/new replacement. --edit-upto enables anchored replacements between a unique head and tail.");
         fputc('\n', fp);
     } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
     else if (tool == DS4_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);

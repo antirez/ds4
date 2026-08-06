@@ -541,8 +541,10 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Queue messages while the model is busy.  Queued messages must not skip tool
   execution; after tool results, the queued user text must be provided.
 - Read/search/edit/write tools:
-  create a temp project, ask for edits, verify old/new and `[upto]` anchored
-  edits fail safely on ambiguous matches and do not require retyping whole files.
+  create a temp project and ask for edits. By default, verify that exact old/new
+  replacements work and the tool prompt does not advertise `[upto]`. In a
+  separate `--edit-upto` run, verify anchored edits fail safely on ambiguous
+  matches and do not require retyping whole files.
 - Real coding edit loop:
   delete `/tmp/mymandel`, ask ds4-agent to create a small C ASCII Mandelbrot
   program there, build and run it, then in a second user turn ask for a small
