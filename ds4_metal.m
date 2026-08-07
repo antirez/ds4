@@ -8436,6 +8436,16 @@ static NSUInteger g_tp_slab_buffer_off;
 static volatile uint32_t *g_tp_gpu_flags;   /* CPU view of the flag words */
 static uint64_t g_tp_gpu_flags_off;
 static uint64_t g_tp_seq;
+
+/* Fast release fence (DS4_METAL_FAST_SYNC=1, default off).  Resuming the
+ * command processor from g_tp_cpu_event costs ~186us of a 508us gate; spinning
+ * on a word this process writes instead removes most of it.  Row gates only;
+ * batch and big gates keep the shared event. */
+#define DS4_TP_FENCE_SLOTS 1024u            /* layer * 2 + gate, generously sized */
+static id<MTLBuffer> g_tp_release_buffer;
+static volatile uint32_t *g_tp_release_words;
+static bool g_tp_fast_sync;
+static uint32_t g_tp_fence_max_iters;
 static ds4_gpu_tp_exchange_fn g_tp_exchange_fn;
 static ds4_gpu_tp_batch_exchange_fn g_tp_batch_exchange_fn;
 static ds4_gpu_tp_big_exchange_fn g_tp_big_exchange_fn;
@@ -8605,9 +8615,19 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                         req.layer, req.gate, (unsigned long long)req.seq);
             g_tp_failed_flag = 1;
         }
-        /* Release the GPU even on failure so end_commands can drain. */
-        if (req.rows > 0) g_tp_batch_cpu_event.signaledValue = req.seq;
-        else g_tp_cpu_event.signaledValue = req.seq;
+        /* Release the GPU even on failure so end_commands can drain.  Must
+         * match what gate_encode chose; both key off the same init-fixed
+         * conditions. */
+        const uint32_t rel_slot = req.layer * 2u + req.gate;
+        if (req.rows > 0) {
+            g_tp_batch_cpu_event.signaledValue = req.seq;
+        } else if (g_tp_fast_sync && g_tp_release_words != NULL &&
+                   req.big_bytes == 0 && rel_slot < DS4_TP_FENCE_SLOTS) {
+            __atomic_store_n(&g_tp_release_words[rel_slot],
+                             (uint32_t)req.seq, __ATOMIC_RELEASE);
+        } else {
+            g_tp_cpu_event.signaledValue = req.seq;
+        }
         if (profile) {
             g_tp_stat_gpu_wait_ms += t1 - t0;
             g_tp_stat_exchange_ms += ds4_gpu_now_ms() - t1;
@@ -8640,6 +8660,29 @@ int ds4_gpu_tp_init(uint32_t rank,
      * (A/B 2026-07-06, byte-identical output).  DS4_TP_EVENT_GATES falls
      * back to the shared-event arrival path. */
     g_tp_flag_gates = g_tp_gpu_flags != NULL && getenv("DS4_TP_EVENT_GATES") == NULL;
+    /* Opt-in: relies on an undocumented Metal qualifier, so fall back to the
+     * shared event if anything is unavailable. */
+    g_tp_fast_sync = getenv("DS4_METAL_FAST_SYNC") != NULL;
+    if (g_tp_fast_sync) {
+        g_tp_fence_max_iters = (uint32_t)ds4_gpu_env_u64(
+                "DS4_TP_FENCE_MAX_ITERS", 200000000ull, 1000ull, 4000000000ull);
+        g_tp_release_buffer =
+            [g_device newBufferWithLength:DS4_TP_FENCE_SLOTS * sizeof(uint32_t)
+                                  options:MTLResourceStorageModeShared];
+        if (g_tp_release_buffer &&
+            ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_wait") != nil) {
+            g_tp_release_words = (volatile uint32_t *)g_tp_release_buffer.contents;
+            memset((void *)g_tp_release_words, 0,
+                   DS4_TP_FENCE_SLOTS * sizeof(uint32_t));
+            fprintf(stderr, "ds4: TP fast release fence enabled\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: TP fast release fence unavailable; using shared events\n");
+            g_tp_release_buffer = nil;
+            g_tp_release_words = NULL;
+            g_tp_fast_sync = false;
+        }
+    }
     g_tp_gpu_event = [g_device newSharedEvent];
     g_tp_cpu_event = [g_device newSharedEvent];
     g_tp_batch_gpu_event = [g_device newSharedEvent];
@@ -8703,6 +8746,9 @@ void ds4_gpu_tp_shutdown(void) {
     g_tp_split_rank = 0;
     g_tp_split_world = 1;
     g_tp_session_batch_mode = 0;
+    g_tp_release_buffer = nil;
+    g_tp_release_words = NULL;
+    g_tp_fast_sync = false;
 }
 
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
@@ -8721,17 +8767,25 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         return 0;
     }
     const uint64_t seq = ++g_tp_seq;
+    const uint32_t gate_slot = layer * 2u + gate;
+    const bool fast_release =
+        g_tp_fast_sync && g_tp_release_words != NULL &&
+        gate_slot < DS4_TP_FENCE_SLOTS;
     const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
     if (!event_arrival) {
         /* Publish arrival through the slab word; the buffer hazard against
          * the partial-output kernels orders the store after the payload. */
-        const uint32_t slot = layer * 2u + gate;
+        const uint32_t slot = gate_slot;
         const uint32_t value = (uint32_t)seq;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb || owned) return 0;
+        /* The relaxed store is only safe because the event block that follows
+         * flushes it; under the fence nothing does, so use the scoped variant. */
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_set");
+            ds4_gpu_get_pipeline(fast_release ?
+                                 "kernel_dsv4_tp_flag_set_coherent" :
+                                 "kernel_dsv4_tp_flag_set");
         if (!pipeline) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
@@ -8747,7 +8801,30 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         ds4_gpu_close_batch_encoder();
         [g_batch_cb encodeSignalEvent:g_tp_gpu_event value:seq];
     }
-    [g_batch_cb encodeWaitForEvent:g_tp_cpu_event value:seq];
+    if (fast_release) {
+        /* One threadgroup of one thread: two threadgroups cost 21% of a
+         * saturated GPU against 4% for one, so the shape is not tunable. */
+        const uint32_t want = (uint32_t)seq;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb || owned) return 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_wait");
+        if (!pipeline) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:g_tp_release_buffer
+                offset:(NSUInteger)gate_slot * sizeof(uint32_t)
+               atIndex:0];
+        [enc setBytes:&want length:sizeof(want) atIndex:1];
+        [enc setBytes:&g_tp_fence_max_iters length:sizeof(g_tp_fence_max_iters) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        ds4_gpu_close_batch_encoder();
+    } else {
+        [g_batch_cb encodeWaitForEvent:g_tp_cpu_event value:seq];
+    }
     pthread_mutex_lock(&g_tp_mutex);
     if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
         pthread_mutex_unlock(&g_tp_mutex);

@@ -6368,6 +6368,49 @@ kernel void kernel_dsv4_tp_flag_set(
     }
 }
 
+// Tensor-parallel gate release fence (CPU->GPU): the GPU spins on a word the
+// service thread writes instead of blocking the command processor on a shared
+// event, whose resume costs ~186us per gate here.  After MLX ml-explore/mlx#1773.
+// coherent(system) is required for correctness -- weaker qualifiers drop
+// wakeups -- and reaching it needs the internals pragma.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+// Bounded so a dead peer cannot wedge the command processor into a watchdog
+// kill; the service thread writes the release even on failure.
+kernel void kernel_dsv4_tp_fence_wait(
+        volatile coherent(system) device uint * release [[buffer(0)]],
+        constant uint & value [[buffer(1)]],
+        constant uint & max_iters [[buffer(2)]]) {
+    for (uint i = 0; i < max_iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+        if (release[0] >= value) {
+            return;
+        }
+    }
+}
+
+// Arrival publish for the fast-sync path.  kernel_dsv4_tp_flag_set relies on
+// the event block that follows it to flush the store; with no such stall the
+// write must carry system scope itself or the CPU spins on a stale word.
+kernel void kernel_dsv4_tp_flag_set_coherent(
+        volatile coherent(system) device uint * flag [[buffer(0)]],
+        constant uint & value [[buffer(1)]]) {
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+#pragma METAL internals : disable
+
 // Ratio-4 compressor pooling without materializing the [n_comp, 8, head_dim]
 // KV and score packs. The row mapping and both reduction loops deliberately
 // match kernel_dsv4_softmax_pool so the arithmetic order is unchanged.
