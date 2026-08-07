@@ -77,6 +77,14 @@ typedef struct {
     bool set;
 } ds4_distributed_layers;
 
+typedef enum {
+    /* Preserve the pre-v3 behavior unless transport selection is explicit. */
+    DS4_DIST_TRANSPORT_DEFAULT = 0,
+    DS4_DIST_TRANSPORT_AUTO,
+    DS4_DIST_TRANSPORT_TCP,
+    DS4_DIST_TRANSPORT_NHI,
+} ds4_distributed_transport;
+
 typedef struct {
     ds4_distributed_role role;
     ds4_distributed_layers layers;
@@ -87,6 +95,8 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
+    ds4_distributed_transport transport;
+    const char *nhi_device;
     bool replay_check;
     bool debug;
 } ds4_distributed_options;
@@ -425,6 +435,30 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
+typedef struct {
+    const void *input_hc_device;
+    uint64_t input_hc_bytes;
+    void *output_hc_device;
+    uint64_t output_hc_bytes;
+    void *logits_device;
+    uint64_t logits_bytes;
+    uint32_t flags;
+} ds4_layer_slice_device_io;
+
+enum {
+    DS4_LAYER_SLICE_DIRECT_INPUT_HC  = 1u << 0,
+    DS4_LAYER_SLICE_DIRECT_OUTPUT_HC = 1u << 1,
+    DS4_LAYER_SLICE_DIRECT_LOGITS    = 1u << 2,
+};
+
+enum {
+    /* Distributed callers may discard canonical graph copies only when the
+     * next operation is guaranteed to overwrite them before any read. The
+     * externally bound output remains valid and synchronized. */
+    DS4_LAYER_SLICE_DEVICE_IO_DISCARD_OUTPUT_HC_STATE = 1u << 0,
+    DS4_LAYER_SLICE_DEVICE_IO_DISCARD_LOGITS_STATE    = 1u << 1,
+};
+
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
@@ -438,12 +472,71 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen);
+/* ROCm single-device decode may bind externally owned mapped device spans to
+ * the first/last graph tensors. Each device span must alias the same backing
+ * bytes as its corresponding mandatory host pointer; input, output, and
+ * logits spans must not overlap one another. Host pointers are used as the
+ * byte-identical fallback whenever a requested span is ineligible.
+ * direct_used receives DS4_LAYER_SLICE_DIRECT_* bits only after successful
+ * synchronized evaluation. DISCARD_* flags leave the corresponding canonical
+ * graph tensor stale and are valid only when the caller proves it is dead
+ * until overwritten. */
+int ds4_session_eval_layer_slice_device_io(
+                                 ds4_session *s,
+                                 const int *tokens,
+                                 uint32_t n_tokens,
+                                 uint32_t pos0,
+                                 uint32_t layer_start,
+                                 uint32_t layer_end,
+                                 const float *input_hc,
+                                 float *output_hc,
+                                 bool output_logits,
+                                 float *logits,
+                                 const ds4_layer_slice_device_io *device_io,
+                                 uint32_t *direct_used,
+                                 char *err,
+                                 size_t errlen);
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
                                          uint32_t n_tokens,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
+/* Evaluate the locally loaded output head for every hidden-state row.  The
+ * caller provides n_tokens * n_vocab floats in row_logits.  selected_row is
+ * also installed as the session's current hidden state for subsequent MTP or
+ * decode work. */
+int ds4_session_eval_output_heads_from_hc(ds4_session *s,
+                                          const float *hidden_hc,
+                                          uint32_t n_tokens,
+                                          uint32_t selected_row,
+                                          float *row_logits,
+                                          char *err,
+                                          size_t errlen);
+/* Install one row from an inter-node hidden-state batch without recomputing
+ * the output head. */
+int ds4_session_select_hidden_state_from_hc(ds4_session *s,
+                                            const float *hidden_hc,
+                                            uint32_t n_tokens,
+                                            uint32_t selected_row,
+                                            char *err,
+                                            size_t errlen);
+
+/* Transactional frontier helpers for a tiny batched layer-slice verifier.
+ * begin snapshots the current slice and enables intermediate-prefix capture;
+ * commit keeps keep_n rows from the batch evaluated since begin (a full batch
+ * simply finalizes it), while rollback restores the original slice timeline. */
+int ds4_session_speculative_begin(ds4_session *s,
+                                  bool capture_prefixes,
+                                  char *err,
+                                  size_t errlen);
+int ds4_session_speculative_commit(ds4_session *s,
+                                   uint32_t keep_n,
+                                   char *err,
+                                   size_t errlen);
+int ds4_session_speculative_rollback(ds4_session *s,
+                                     char *err,
+                                     size_t errlen);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */

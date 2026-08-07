@@ -236,6 +236,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dist-prefill-chunk N", "Coordinator prefill pipeline chunk size. Default: session cap.");
     opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
     opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
+    opt(fp, c, "--dist-transport MODE", "Bulk transport: tcp, auto, or nhi. Default: tcp.");
+    opt(fp, c, "--dist-nhi-device PATH", "Local /dev/tbstream device used by auto/nhi mode.");
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
     fputc('\n', fp);

@@ -34,7 +34,7 @@ assert_not_grep() {
 BINS=(./ds4 ./ds4-server ./ds4-bench ./ds4-agent)
 NAMES=(ds4 ds4-server ds4-bench ds4-agent)
 
-# 1: each binary's --help mentions both flags.
+# 1: each binary advertises the options supported by its GPU backend.
 for i in "${!BINS[@]}"; do
     name=${NAMES[$i]}; bin=${BINS[$i]}
     if [ ! -x "$bin" ]; then
@@ -42,16 +42,52 @@ for i in "${!BINS[@]}"; do
         continue
     fi
     "$bin" --help > "$LOG" 2>&1 || true
-    assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
-    assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
-    assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    if grep -q -- "--rocm" "$LOG" 2>/dev/null; then
+        assert_grep "$name --help mentions --rocm" "--rocm" "$LOG"
+        assert_not_grep "$name --help omits CUDA tensor parallelism" \
+            "--cuda-tensor-parallel" "$LOG"
+    else
+        assert_grep "$name --help mentions --gpu-vram" "--gpu-vram" "$LOG"
+        assert_grep "$name --help mentions --gpu-devices" "--gpu-devices" "$LOG"
+        assert_grep "$name --help mentions --cuda-tensor-parallel" \
+            "--cuda-tensor-parallel" "$LOG"
+    fi
     if [ "$name" = "ds4" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
         assert_grep "$name --help distributed mentions --tensor-parallel-token-prefill" \
             "tensor-parallel-token-prefill" "$LOG"
+        assert_grep "$name --help distributed mentions --dist-transport" \
+            "--dist-transport" "$LOG"
+        assert_grep "$name --help distributed mentions --dist-nhi-device" \
+            "--dist-nhi-device" "$LOG"
         assert_not_grep "$name --help distributed omits old --tp spellings" "--tp-" "$LOG"
     fi
 done
+
+# ds4-bench owns legacy-MTP benchmark options in addition to the shared
+# runtime help/parser surface.
+if [ -x ./ds4-bench ]; then
+    ./ds4-bench --help > "$LOG" 2>&1 || true
+    assert_grep "ds4-bench --help mentions --mtp" "--mtp FILE" "$LOG"
+    assert_grep "ds4-bench --help mentions --mtp-draft" "--mtp-draft" "$LOG"
+    assert_grep "ds4-bench --help mentions --mtp-margin" "--mtp-margin" "$LOG"
+
+    for bad in \
+        "--mtp-draft 0" \
+        "--mtp-margin -1" \
+        "--mtp-margin 1001" \
+        "--mtp-margin nan"
+    do
+        # Word splitting is intentional: each item is one option/value pair.
+        ./ds4-bench $bad --prompt-file /dev/null -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -eq 2 ] && ! grep -q "unknown option" "$LOG"; then
+            ok "ds4-bench rejects $bad"
+        else
+            fail "ds4-bench did not reject $bad in its MTP parser"
+        fi
+    done
+fi
 
 # 2: parser error on syntactically invalid value. For ds4-bench, we
 # also pass --prompt-file /dev/null so it doesn't exit on the

@@ -28,8 +28,17 @@
 /tests/test_mxfp4_cuda
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
+/tests/test_mxfp4_rocm
 /tests/test_q4k_dot
+/tests/test_rocm_qkv_fusion
+/tests/test_rocm_timing_fake
+/tests/test_gpu_timing_stubs
 /tests/test_sampling
+/tests/test_transport
+/tests/test_dist_v3
+/tests/test_distributed_transport
+/tests/test_nhi_live
+/tests/test_nhi_live_rocm
 *.o
 *.dSYM/
 __pycache__/
@@ -37,3 +46,4 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/.idea/

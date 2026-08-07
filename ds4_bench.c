@@ -24,9 +24,11 @@
 #include <time.h>
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
+#define DS4_BENCH_SPEC_ACCEPT_CAP 17
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -41,6 +43,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int mtp_draft_tokens;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -49,6 +52,7 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
+    float mtp_margin;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
@@ -58,6 +62,7 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
     bool show_output;
+    bool mtp_options_set;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -91,6 +96,14 @@ static double bytes_to_gib(uint64_t bytes) {
 
 static void usage(FILE *fp, const char *topic) {
     ds4_help_print(fp, DS4_HELP_BENCH, topic);
+    if (!topic || !strcmp(topic, "all") || !strcmp(topic, "runtime") ||
+        !strcmp(topic, "benchmark")) {
+        fprintf(fp,
+                "MTP Decode\n"
+                "  --mtp FILE                 Optional MTP support GGUF used for speculative greedy decode.\n"
+                "  --mtp-draft N              Maximum autoregressive MTP draft tokens. Default: 1\n"
+                "  --mtp-margin F             Verifier confidence margin, 0..1000. Default: 3\n\n");
+    }
 }
 
 static int parse_int(const char *s, const char *opt) {
@@ -206,7 +219,9 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx_max = 32768,
         .step_incr = 2048,
         .gen_tokens = 128,
+        .mtp_draft_tokens = 1,
         .step_mul = 1.0,
+        .mtp_margin = 3.0f,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -236,6 +251,20 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+            c.mtp_options_set = true;
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.mtp_options_set = true;
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            const double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1000.0) {
+                fprintf(stderr, "ds4-bench: invalid value for %s: %.17g\n", arg, v);
+                exit(2);
+            }
+            c.mtp_margin = (float)v;
+            c.mtp_options_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -576,10 +605,13 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = cfg.mtp_margin,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
@@ -615,6 +647,27 @@ int main(int argc, char **argv) {
                 &engine, &opt, &gpu_cfg) != 0) return 1;
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
+    }
+    const int effective_mtp_draft = ds4_engine_mtp_draft_tokens(engine);
+    const bool mtp_disabled_by_env = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
+    const bool mtp_active = effective_mtp_draft > 1 && !mtp_disabled_by_env;
+    if (cfg.mtp_options_set) {
+        if (mtp_active) {
+            fprintf(stderr,
+                    "ds4-bench: MTP speculative greedy decode enabled "
+                    "(effective draft=%d, margin=%.3g)\n",
+                    effective_mtp_draft,
+                    (double)cfg.mtp_margin);
+        } else if (mtp_disabled_by_env && effective_mtp_draft > 1) {
+            fprintf(stderr,
+                    "ds4-bench: MTP support loaded but speculation is disabled by "
+                    "DS4_MTP_SPEC_DISABLE\n");
+        } else {
+            fprintf(stderr,
+                    "ds4-bench: MTP speculative decode is inactive "
+                    "(effective draft=%d; provide support with --mtp and set --mtp-draft above 1)\n",
+                    effective_mtp_draft);
+        }
     }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
@@ -668,7 +721,14 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes");
+    if (cfg.mtp_options_set) {
+        fprintf(out,
+                ",gen_cycles,gen_first_chunk_tokens,mtp_committed_tokens,"
+                "mtp_accepted_extras,mtp_max_committed_chunk,mtp_extra_slots,"
+                "mtp_slot_acceptance_pct,mtp_eos_recoveries");
+    }
+    fputc('\n', out);
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -729,15 +789,27 @@ int main(int argc, char **argv) {
             }
         }
 
-        const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
         int gen_done = 0;
-        int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
+        int gen_cycles = 0;
+        int gen_first_chunk_tokens = 0;
+        int mtp_accepted_extras = 0;
+        int mtp_max_committed_chunk = 0;
+        int mtp_extra_slots = 0;
+        int mtp_eos_recoveries = 0;
+        bool mtp_acceptance_defensible = true;
+        int *gen_token_buf = (cfg.show_output || mtp_active) && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
+        if ((cfg.show_output || mtp_active) && cfg.gen_tokens > 0 && !gen_token_buf) {
+            fprintf(stderr, "ds4-bench: out of memory recording generated tokens\n");
+            rc = 1;
+            break;
+        }
+        const double gen_t0 = bench_now_sec();
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -749,17 +821,130 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+
+            int committed[DS4_BENCH_SPEC_ACCEPT_CAP];
+            int committed_n = 1;
+            int accepted_extras_this_cycle = 0;
+            const int remaining = cfg.gen_tokens - gen_done;
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (mtp_active) {
+                int extra_slots = effective_mtp_draft;
+                if (extra_slots > remaining - 1) extra_slots = remaining - 1;
+                if (extra_slots > DS4_BENCH_SPEC_ACCEPT_CAP - 1) {
+                    extra_slots = DS4_BENCH_SPEC_ACCEPT_CAP - 1;
+                }
+                if (extra_slots > 0) mtp_extra_slots += extra_slots;
+
+                committed_n = ds4_session_eval_speculative_argmax(
+                        session,
+                        token,
+                        remaining,
+                        eos,
+                        committed,
+                        DS4_BENCH_SPEC_ACCEPT_CAP,
+                        err,
+                        sizeof(err));
+                if (committed_n <= 0 || committed_n > remaining ||
+                    committed_n > DS4_BENCH_SPEC_ACCEPT_CAP) {
+                    if (committed_n < 0) {
+                        fprintf(stderr,
+                                "ds4-bench: speculative decode at frontier %d failed: %s\n",
+                                frontier,
+                                err);
+                    } else {
+                        fprintf(stderr,
+                                "ds4-bench: speculative decode at frontier %d returned invalid token count %d\n",
+                                frontier,
+                                committed_n);
+                    }
+                    rc = 1;
+                    break;
+                }
+
+                int eos_index = -1;
+                for (int i = 0; i < committed_n; i++) {
+                    if (committed[i] == eos) {
+                        eos_index = i;
+                        break;
+                    }
+                }
+                if (eos_index >= 0) {
+                    /* The benchmark historically excludes EOS and always emits
+                     * exactly --gen-tokens tokens. Rebuild the state immediately
+                     * before the accepted EOS, then evaluate the non-EOS runner. */
+                    const int canonical_len = frontier + gen_token_count + eos_index;
+                    int *canonical_v = malloc((size_t)canonical_len * sizeof(canonical_v[0]));
+                    if (!canonical_v) {
+                        fprintf(stderr, "ds4-bench: out of memory recovering from speculative EOS\n");
+                        rc = 1;
+                        break;
+                    }
+                    memcpy(canonical_v,
+                           prefix.v,
+                           (size_t)frontier * sizeof(canonical_v[0]));
+                    memcpy(canonical_v + frontier,
+                           gen_token_buf,
+                           (size_t)gen_token_count * sizeof(canonical_v[0]));
+                    memcpy(canonical_v + frontier + gen_token_count,
+                           committed,
+                           (size_t)eos_index * sizeof(canonical_v[0]));
+                    ds4_tokens canonical = {
+                        .v = canonical_v,
+                        .len = canonical_len,
+                        .cap = canonical_len,
+                    };
+                    if (ds4_session_sync(session, &canonical, err, sizeof(err)) != 0) {
+                        fprintf(stderr,
+                                "ds4-bench: speculative EOS recovery at frontier %d failed: %s\n",
+                                frontier,
+                                err);
+                        free(canonical_v);
+                        rc = 1;
+                        break;
+                    }
+                    free(canonical_v);
+
+                    const int non_eos = ds4_session_argmax_excluding(session, eos);
+                    if (non_eos < 0 ||
+                        ds4_session_eval(session, non_eos, err, sizeof(err)) != 0) {
+                        fprintf(stderr,
+                                "ds4-bench: non-EOS decode recovery at frontier %d failed: %s\n",
+                                frontier,
+                                non_eos < 0 ? "no non-EOS token" : err);
+                        rc = 1;
+                        break;
+                    }
+                    committed[eos_index] = non_eos;
+                    committed_n = eos_index + 1;
+                    accepted_extras_this_cycle = eos_index > 1 ? eos_index - 1 : 0;
+                    mtp_eos_recoveries++;
+                    mtp_acceptance_defensible = false;
+                } else {
+                    accepted_extras_this_cycle = committed_n - 1;
+                }
+            } else {
+                committed[0] = token;
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
             }
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
+            if (gen_cycles == 0) {
+                gen_first_sec = token_t1 - token_t0;
+                gen_first_chunk_tokens = committed_n;
+            }
             else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            for (int i = 0; i < committed_n; i++) {
+                if (gen_token_buf) gen_token_buf[gen_token_count++] = committed[i];
+            }
+            gen_done += committed_n;
+            gen_cycles++;
+            mtp_accepted_extras += accepted_extras_this_cycle;
+            if (committed_n > mtp_max_committed_chunk) {
+                mtp_max_committed_chunk = committed_n;
+            }
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,9 +980,11 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens = gen_done > gen_first_chunk_tokens
+            ? gen_done - gen_first_chunk_tokens
+            : 0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -807,7 +994,45 @@ int main(int argc, char **argv) {
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
                 (unsigned long long)(have_snapshot ? snap.len : 0));
+        if (cfg.mtp_options_set) {
+            fprintf(out,
+                    ",%d,%d,%d,%d,%d,%d,",
+                    gen_cycles,
+                    gen_first_chunk_tokens,
+                    gen_done,
+                    mtp_accepted_extras,
+                    mtp_max_committed_chunk,
+                    mtp_extra_slots);
+            if (mtp_acceptance_defensible && mtp_extra_slots > 0) {
+                fprintf(out,
+                        "%.2f",
+                        100.0 * (double)mtp_accepted_extras / (double)mtp_extra_slots);
+            }
+            fprintf(out, ",%d", mtp_eos_recoveries);
+        }
+        fputc('\n', out);
         fflush(out);
+
+        if (cfg.mtp_options_set) {
+            fprintf(stderr,
+                    "ds4-bench: mtp[ctx=%d] active=%s cycles=%d committed=%d "
+                    "accepted-extras=%d max-chunk=%d slots=%d slot-acceptance=",
+                    frontier,
+                    mtp_active ? "yes" : "no",
+                    gen_cycles,
+                    gen_done,
+                    mtp_accepted_extras,
+                    mtp_max_committed_chunk,
+                    mtp_extra_slots);
+            if (mtp_acceptance_defensible && mtp_extra_slots > 0) {
+                fprintf(stderr,
+                        "%.2f%%",
+                        100.0 * (double)mtp_accepted_extras / (double)mtp_extra_slots);
+            } else {
+                fputs("n/a", stderr);
+            }
+            fprintf(stderr, " eos-recoveries=%d\n", mtp_eos_recoveries);
+        }
 
         previous = frontier;
         if (frontier >= cfg.ctx_max) break;

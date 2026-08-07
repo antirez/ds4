@@ -437,6 +437,7 @@ int ds4_tp_adopt_distributed_options(
         return 0;
     }
     if (dist->prefill_chunk || dist->prefill_window || dist->activation_bits ||
+        dist->transport != DS4_DIST_TRANSPORT_DEFAULT || dist->nhi_device ||
         dist->replay_check || dist->debug) {
         tp_set_err(err, errlen,
                    "--dist-* and distributed debug options cannot be used with --tensor-parallel");

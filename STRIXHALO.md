@@ -65,8 +65,12 @@ buffers.
 Use these kernel parameters:
 
 ```text
-amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856
+amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856
 ```
+
+Keep the IOMMU enabled. Disabling it is not required for the large GTT aperture
+and removes DMA isolation. The paired Strix Halo qualification hosts retain the
+expected ROCm-visible memory with translated/default IOMMU operation enabled.
 
 On Ubuntu with GRUB:
 
@@ -78,7 +82,7 @@ sudoedit /etc/default/grub
 Set:
 
 ```text
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856"
 ```
 
 Then:
@@ -92,9 +96,13 @@ After reboot, verify:
 
 ```sh
 cat /proc/cmdline
-sudo dmesg | grep -Ei 'GTT|gttsize|TTM|VRAM'
+sudo dmesg | grep -Ei 'IOMMU|AMD-Vi|GTT|gttsize|TTM|VRAM'
 rocminfo | grep -A80 'Name:                    gfx1151'
 ```
+
+Confirm that the command line does not contain `amd_iommu=off` and that the
+kernel reports the IOMMU enabled before granting a DMA-capable transport device
+to DS4.
 
 Expected signs:
 
@@ -134,3 +142,25 @@ Run it normally:
 ```
 
 The ROCm build uses the Strix Halo backend automatically.
+
+## 7. Run the batched server
+
+For resident-session serving, keep the canonical prefill graph quantum at its
+default unless a different numerical graph shape is being qualified:
+
+```sh
+DS4_SERVER_PREFILL_GRAPH_QUANTUM=128 \
+  ./ds4-server --batched-session 2 \
+  --kv-disk-dir /path/to/kv-canonical-128-v1 \
+  -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+```
+
+`DS4_SERVER_PREFILL_QUANTUM` and
+`DS4_SERVER_MIXED_PREFILL_QUANTUM` are only idle and generation-active burst
+budgets; they change scheduler yield frequency, not graph boundaries. Confirm
+the resolved graph quantum and both burst values in the startup log.
+
+On the first canonical-boundary deployment, stop the old server and use a new,
+empty, versioned KV directory. Repeat that rollover whenever the graph quantum
+or boundary policy changes; an older or off-grid checkpoint retains its prior
+numerical history and must not be reused for deterministic comparisons.

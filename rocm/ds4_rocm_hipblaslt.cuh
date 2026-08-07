@@ -35,6 +35,13 @@ static int hipblaslt_ok(hipblasStatus_t st, const char *what) {
     return 0;
 }
 
+static int hipblaslt_ensure_ready(void) {
+    if (g_hipblaslt_ready) return 1;
+    if (!hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) return 0;
+    g_hipblaslt_ready = 1;
+    return 1;
+}
+
 static cuda_hipblaslt_gemm_plan *hipblaslt_gemm_plan_get(
         uint32_t out_dim,
         uint32_t n_tok,
@@ -119,8 +126,9 @@ static int hipblaslt_gemm_tn_f16_out_f16(
         uint32_t n_tok,
         uint32_t in_dim,
         const char *label) {
-    if (!g_hipblaslt_ready || !out || !w_rowmajor_out_in || !x_rowmajor_tok_in ||
+    if (!out || !w_rowmajor_out_in || !x_rowmajor_tok_in ||
         out_dim == 0 || n_tok == 0 || in_dim == 0) return 0;
+    if (!hipblaslt_ensure_ready()) return 0;
     cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(out_dim, n_tok, in_dim, label);
     if (!p) return 0;
     const float alpha = 1.0f;

@@ -517,6 +517,30 @@ loading code changes.
 - Save and restore a distributed KV snapshot if that code changed.
 - If CUDA distributed is relevant, test across the CUDA hosts and record
   generation speed, not just "it works".
+- If the Linux NHI transport changed, first run `test-nhi-live` and
+  `test-nhi-live-rocm` on the directly connected pair. Require exit zero and a
+  PASS line from both roles; the CPU gate must report copy traffic in both
+  directions, and the ROCm gate must report both mapped traffic and wrap-copy
+  fallback. The ROCm Make target explicitly enables `DS4_DIST_NHI_MAPPED=1`;
+  leave mapped model I/O disabled outside that experiment. Retain the separate
+  full-pool GPU mapping test because the live harness deliberately verifies
+  leases through its host alias.
+- Also run `../strix-rdma/tools/ds4-shape/tbstream-ds4-gate` for at least 33
+  exchanges so the actual asymmetric request/response geometry crosses the
+  ring boundary. Repeat it from fresh opens and verify recovery after a forced
+  failure. Equal-size and fixed-size harnesses do not replace this gate. The
+  2026-08-05 post-fix stack completed 2,880 exact DS4-shaped exchanges across
+  27 sessions and repeated fresh opens; rerun this gate after every kernel or
+  transport change instead of relying on that historical qualification.
+- Before qualifying NHI for a release, compare model output against v3 TCP with
+  identical settings, then cover automatic/required fallback, process and
+  cable reconnect, IOMMU fault recovery, and the documented soak interval.
+- Verify production service manifests use `--dist-transport auto` without
+  `--dist-nhi-device`; that is descriptor-framed v3 TCP. Explicit
+  `--dist-transport tcp` is legacy v2. Any supplied NHI device, and required
+  `nhi` mode, must remain confined to an explicitly identified lab service until
+  the asymmetric gate, fresh-open recovery, full-model equivalence, and soak
+  all pass.
 
 ## 11. Disk KV Cache
 

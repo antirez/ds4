@@ -1,16 +1,20 @@
 CC ?= cc
+CXX ?= c++
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 SAMPLING_TEST :=
+METAL_SYNTH_TEST := tests/test_mxfp4_metal
 else
 NATIVE_CPU_FLAG ?= -march=native
 SAMPLING_TEST := tests/test_sampling
+METAL_SYNTH_TEST :=
 endif
 
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+CXXFLAGS ?= -O2 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c++11
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
@@ -24,8 +28,8 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
@@ -50,19 +54,20 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o $(MMQ_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
+ROCM_ROOT ?= $(abspath $(dir $(HIPCC))/..)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -Wl,-rpath,$(ROCM_ROOT)/lib
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-dist-v3 test-gpu-timing test-rocm-timing test-nhi-live test-nhi-live-rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -78,6 +83,7 @@ help:
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
+	@echo "  make test-rocm-timing  Run host-only ROCm timing backend and stub tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -156,8 +162,11 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make test-nhi-live       Run the opt-in two-host NHI CPU-copy gate"
+	@echo "  make test-nhi-live-rocm  Run the opt-in mapped-plus-copy ROCm NHI gate"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
+	@echo "  make test-rocm-timing    Run host-only ROCm timing backend and stub tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
@@ -178,8 +187,8 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
-		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
@@ -232,8 +241,20 @@ ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
+ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h ds4_transport.h ds4_dist_v3.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
+
+ds4_distributed_test.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h ds4_transport.h ds4_dist_v3.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -c -o $@ ds4_distributed.c
+
+ds4_dist_v3.o: ds4_dist_v3.c ds4_dist_v3.h ds4_transport.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_dist_v3.c
+
+ds4_transport.o: ds4_transport.c ds4_transport.h ds4_transport_internal.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_transport.c
+
+ds4_transport_nhi.o: ds4_transport_nhi.c ds4_transport.h ds4_transport_internal.h ds4_tbstream_uapi.h ds4_gpu.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_transport_nhi.c
 
 ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tp.c
@@ -346,6 +367,83 @@ tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_transport.o: tests/test_transport.c ds4_transport.h ds4_transport_internal.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_transport: tests/test_transport.o ds4_transport.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_rocm_timing_fake: tests/test_rocm_timing_fake.cc rocm/ds4_rocm_timing.cuh ds4_gpu.h
+	$(CXX) $(CXXFLAGS) -I. -o $@ $< -pthread
+
+tests/test_gpu_timing_stubs: tests/test_gpu_timing_stubs.c ds4_gpu.h
+	$(CC) $(CFLAGS) -UDS4_ROCM_BUILD -U__HIP_PLATFORM_AMD__ -I. -o $@ $< $(LDLIBS)
+
+test-gpu-timing: tests/test_rocm_timing_fake tests/test_gpu_timing_stubs
+	./tests/test_rocm_timing_fake
+	./tests/test_gpu_timing_stubs
+
+test-rocm-timing: test-gpu-timing
+
+# Opt-in two-host hardware test. Compile the backend with ROCm mapping disabled
+# so this target always exercises the model-independent CPU-copy NHI path.
+tests/test_nhi_live: tests/test_nhi_live.c ds4_transport.c ds4_transport_nhi.c ds4_transport.h ds4_transport_internal.h ds4_tbstream_uapi.h ds4_gpu.h
+	$(CC) $(CFLAGS) -UDS4_ROCM_BUILD -U__HIP_PLATFORM_AMD__ -I. -o $@ tests/test_nhi_live.c ds4_transport.c ds4_transport_nhi.c $(LDLIBS)
+
+test-nhi-live: tests/test_nhi_live
+	@if [ -z "$(NHI_LIVE_ARGS)" ]; then \
+		./tests/test_nhi_live --help; \
+		echo "Run on both hosts, e.g. make test-nhi-live NHI_LIVE_ARGS='--listen --device /dev/tbstream0'"; \
+		exit 2; \
+	fi
+	./tests/test_nhi_live --require-copy $(NHI_LIVE_ARGS)
+
+# Optional ROCm-linked variant: the same harness automatically uses mapped
+# leases for contiguous slots and reports copy fallbacks at ring boundaries.
+ifneq ($(UNAME_S),Darwin)
+tests/test_nhi_live_rocm.o: tests/test_nhi_live.c ds4_transport.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/ds4_transport_live_rocm.o: ds4_transport.c ds4_transport.h ds4_transport_internal.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/ds4_transport_nhi_live_rocm.o: ds4_transport_nhi.c ds4_transport.h ds4_transport_internal.h ds4_tbstream_uapi.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_nhi_live_rocm_alias.o: tests/test_nhi_live_rocm_alias.cu
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_nhi_live_rocm: tests/test_nhi_live_rocm.o tests/test_nhi_live_rocm_alias.o tests/ds4_transport_live_rocm.o tests/ds4_transport_nhi_live_rocm.o ds4_rocm.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-nhi-live-rocm: tests/test_nhi_live_rocm
+	@if [ -z "$(NHI_LIVE_ARGS)" ]; then \
+		./tests/test_nhi_live_rocm --help; \
+		echo "Run on both ROCm hosts, e.g. make test-nhi-live-rocm NHI_LIVE_ARGS='--listen --device /dev/tbstream0'"; \
+		exit 2; \
+	fi
+	DS4_DIST_NHI_MAPPED=1 ./tests/test_nhi_live_rocm --require-mapped --require-copy --require-gpu-alias $(NHI_LIVE_ARGS)
+else
+test-nhi-live-rocm:
+	@echo "test-nhi-live-rocm requires Linux and ROCm"
+	@exit 2
+endif
+
+tests/test_dist_v3.o: tests/test_dist_v3.c ds4_dist_v3.h ds4_transport.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dist_v3: tests/test_dist_v3.o ds4_dist_v3.o ds4_transport.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-dist-v3: tests/test_dist_v3
+	./tests/test_dist_v3
+
+tests/test_distributed_transport.o: tests/test_distributed_transport.c ds4_distributed.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_distributed_transport: tests/test_distributed_transport.o ds4_cpu_test_hooks.o ds4_distributed_test.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<
 
@@ -358,7 +456,7 @@ ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ifneq ($(UNAME_S),Darwin)
@@ -392,7 +490,7 @@ tests/test_engine_mgpu_refusal: tests/test_engine_mgpu_refusal.o ds4_gpu_args.o 
 tests/test_engine_mgpu_runtime.o: tests/test_engine_mgpu_runtime.c ds4.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+tests/test_engine_mgpu_runtime: tests/test_engine_mgpu_runtime.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_engine_correctness.o: tests/test_engine_correctness.c ds4.h ds4_gpu_mgpu.h
@@ -404,7 +502,7 @@ tests/test_engine_correctness: tests/test_engine_correctness.o ds4_gpu_args.o ds
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+tests/test_sampling: tests/test_sampling.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_cuda_session_batch.o: tests/test_cuda_session_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
@@ -419,7 +517,7 @@ test-cuda-session-batch: tests/test_cuda_session_batch
 tests/test_cuda_mixed_batch.o: tests/test_cuda_mixed_batch.c ds4.h ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+tests/test_cuda_mixed_batch: tests/test_cuda_mixed_batch.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-mixed-batch: tests/test_cuda_mixed_batch
@@ -441,18 +539,28 @@ else
 endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_layer_pack tests/test_transport tests/test_rocm_timing_fake tests/test_gpu_timing_stubs tests/test_dist_v3 tests/test_distributed_transport tests/test_engine_mgpu_placement tests/test_gpu_args \
+	$(SAMPLING_TEST) $(METAL_SYNTH_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test --server
 	./tests/test_layer_pack
+	./tests/test_transport
+	./tests/test_rocm_timing_fake
+	./tests/test_gpu_timing_stubs
+	./tests/test_dist_v3
+	./tests/test_distributed_transport
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
+ifeq ($(UNAME_S),Darwin)
+	./ds4_test --metal-kernels
+	./tests/test_mxfp4_metal
+endif
 ifneq ($(UNAME_S),Darwin)
 	./tests/test_sampling
 endif
+	./ds4_test
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
@@ -488,4 +596,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_mxfp4_rocm tests/test_mxfp4_rocm tests/test_rocm_qkv_fusion tests/test_transport tests/test_rocm_timing_fake tests/test_gpu_timing_stubs tests/test_nhi_live tests/test_nhi_live_rocm tests/test_dist_v3 tests/test_distributed_transport

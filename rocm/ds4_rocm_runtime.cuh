@@ -19,6 +19,7 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm_hipblaslt.cuh"
+#include "ds4_rocm_timing.cuh"
 #endif
 static int g_quality_mode;
 static int g_glm_model;
@@ -4851,7 +4852,8 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
 }
 
 static bool cuda_q8_prequant_decode_enabled(void) {
-    return !g_glm_model && cuda_runtime_config()->q8_prequant_decode;
+    const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    return !g_glm_model && !cfg->graph_dump && cfg->q8_prequant_decode;
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
@@ -5824,8 +5826,35 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+static pthread_once_t g_mapped_host_flags_once = PTHREAD_ONCE_INIT;
+
+static void cuda_mapped_host_enable_once(void) {
+    /* hipDeviceMapHost is currently always enabled/ignored by the AMD
+     * runtime.  Keep the explicit request for CUDA-compatibility semantics,
+     * but never make ordinary ROCm initialization depend on it: device
+     * discovery may already have activated the primary context. */
+    hipError_t err = hipSetDeviceFlags(hipDeviceMapHost);
+    if (err != hipSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "mapped-host device flag was not applied (continuing): %s\n",
+                hipGetErrorString(err));
+        (void)hipGetLastError();
+    }
+}
+
+static void cuda_mapped_host_enable_best_effort(void) {
+    (void)pthread_once(&g_mapped_host_flags_once,
+                       cuda_mapped_host_enable_once);
+}
+#endif
+
 
 extern "C" int ds4_gpu_init(void) {
+#ifdef __HIP_PLATFORM_AMD__
+    cuda_mapped_host_enable_best_effort();
+#endif
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
@@ -5839,18 +5868,14 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
-#ifdef __HIP_PLATFORM_AMD__
-    if (!g_hipblaslt_ready) {
-        if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
-            g_hipblaslt_ready = 1;
-        }
-    }
-#endif
     return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+#ifdef __HIP_PLATFORM_AMD__
+    ds4_rocm_timing_cleanup();
+#endif
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
@@ -5998,6 +6023,16 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_wrap_external(void *device_ptr, uint64_t bytes) {
+    if (!device_ptr || bytes == 0) return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->ptr = device_ptr;
+    t->bytes = bytes;
+    t->owner = 0;
+    return t;
+}
+
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
@@ -6013,6 +6048,72 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
 }
+
+#ifdef __HIP_PLATFORM_AMD__
+extern "C" int ds4_gpu_host_mapping_supported(void) {
+    int device = 0;
+    hipDeviceProp_t prop;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipGetDeviceProperties(&prop, device) != hipSuccess) {
+        (void)hipGetLastError();
+        return 0;
+    }
+    return prop.canMapHostMemory != 0;
+}
+
+extern "C" int ds4_gpu_host_register_mapped(void *host_ptr,
+                                              uint64_t bytes,
+                                              void **device_ptr) {
+    if (device_ptr) *device_ptr = NULL;
+    if (!host_ptr || !device_ptr || bytes == 0 ||
+        (uint64_t)(size_t)bytes != bytes) {
+        return 0;
+    }
+
+    cuda_mapped_host_enable_best_effort();
+    if (!ds4_gpu_host_mapping_supported()) return 0;
+
+    hipError_t err = hipHostRegister(host_ptr,
+                                     (size_t)bytes,
+                                     hipHostRegisterMapped);
+    if (err != hipSuccess) {
+        return cuda_ok(err, "mapped host registration");
+    }
+
+    void *mapped = NULL;
+    err = hipHostGetDevicePointer(&mapped, host_ptr, 0);
+    if (err != hipSuccess || !mapped) {
+        if (err != hipSuccess) {
+            (void)cuda_ok(err, "mapped host device-pointer lookup");
+        } else {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "mapped host device-pointer lookup returned NULL\n");
+        }
+        (void)hipHostUnregister(host_ptr);
+        return 0;
+    }
+
+    *device_ptr = mapped;
+    return 1;
+}
+
+extern "C" int ds4_gpu_host_mapped_synchronize(const char *label) {
+    return cuda_ok(hipDeviceSynchronize(),
+                   label && label[0]
+                       ? label
+                       : "mapped host ownership synchronization");
+}
+
+extern "C" int ds4_gpu_host_unregister_mapped(void *host_ptr) {
+    if (!host_ptr) return 0;
+    const int sync_ok = ds4_gpu_host_mapped_synchronize(
+        "mapped host unregister synchronization");
+    if (!sync_ok) return 0;
+    return cuda_ok(hipHostUnregister(host_ptr),
+                   "mapped host unregister");
+}
+#endif
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;

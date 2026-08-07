@@ -2,6 +2,7 @@
 #define DS4_GPU_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -47,6 +48,12 @@ void ds4_gpu_cleanup(void);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+#ifdef DS4_ROCM_BUILD
+/* Wrap an externally owned ROCm device address without taking ownership of
+ * the allocation.  The caller must keep the backing mapping alive until all
+ * GPU work using the returned tensor has completed and the wrapper is freed. */
+ds4_gpu_tensor *ds4_gpu_tensor_wrap_external(void *device_ptr, uint64_t bytes);
+#endif
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
@@ -109,6 +116,95 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+
+/* Low-overhead GPU timeline sampling.  begin records the first marker and
+ * mark appends another marker on the backend's primary (stream 0) timeline.
+ * collect returns the elapsed milliseconds between adjacent markers and
+ * consumes the sample, on success or failure.  At least one mark after begin
+ * is required.  The caller must collect only after an existing synchronization
+ * point has completed the sampled work; collection never adds a
+ * synchronization of its own.  discard is also nonblocking.
+ *
+ * The API is deliberately fail-open: zero means that profiling data is not
+ * available, and model execution must continue normally.  Profiling callers
+ * should invoke it only when an explicit diagnostic option is enabled.
+ */
+#define DS4_GPU_TIMING_MAX_MARKS 16u
+typedef struct ds4_gpu_timing_sample {
+    uint32_t slot;
+    uint32_t generation;
+    uint32_t mark_count;
+    uint32_t reserved;
+} ds4_gpu_timing_sample;
+
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+int ds4_gpu_timing_begin(ds4_gpu_timing_sample *sample);
+int ds4_gpu_timing_mark(ds4_gpu_timing_sample *sample);
+int ds4_gpu_timing_collect(ds4_gpu_timing_sample *sample,
+                           float *segment_ms,
+                           uint32_t segment_capacity,
+                           uint32_t *segment_count);
+void ds4_gpu_timing_discard(ds4_gpu_timing_sample *sample);
+#else
+static inline void ds4_gpu_timing_discard(ds4_gpu_timing_sample *sample) {
+    if (!sample) return;
+    sample->slot = 0;
+    sample->generation = 0;
+    sample->mark_count = 0;
+    sample->reserved = 0;
+}
+static inline int ds4_gpu_timing_begin(ds4_gpu_timing_sample *sample) {
+    ds4_gpu_timing_discard(sample);
+    return 0;
+}
+static inline int ds4_gpu_timing_mark(ds4_gpu_timing_sample *sample) {
+    (void)sample;
+    return 0;
+}
+static inline int ds4_gpu_timing_collect(ds4_gpu_timing_sample *sample,
+                                         float *segment_ms,
+                                         uint32_t segment_capacity,
+                                         uint32_t *segment_count) {
+    (void)segment_ms;
+    (void)segment_capacity;
+    if (segment_count) *segment_count = 0;
+    ds4_gpu_timing_discard(sample);
+    return 0;
+}
+#endif
+
+/* ROCm mapped-host handoff helpers for driver-owned mmap() regions.  A
+ * successful registration pins/maps the complete range and returns the GPU
+ * address corresponding to host_ptr.  Call synchronize before transferring
+ * ownership between the GPU and an external DMA device.  Non-ROCm builds
+ * expose the same source-level API and report it unsupported.
+ */
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+int ds4_gpu_host_mapping_supported(void);
+int ds4_gpu_host_register_mapped(void *host_ptr, uint64_t bytes,
+                                 void **device_ptr);
+int ds4_gpu_host_mapped_synchronize(const char *label);
+int ds4_gpu_host_unregister_mapped(void *host_ptr);
+#else
+static inline int ds4_gpu_host_mapping_supported(void) {
+    return 0;
+}
+static inline int ds4_gpu_host_register_mapped(void *host_ptr, uint64_t bytes,
+                                                void **device_ptr) {
+    (void)host_ptr;
+    (void)bytes;
+    if (device_ptr) *device_ptr = NULL;
+    return 0;
+}
+static inline int ds4_gpu_host_mapped_synchronize(const char *label) {
+    (void)label;
+    return 0;
+}
+static inline int ds4_gpu_host_unregister_mapped(void *host_ptr) {
+    (void)host_ptr;
+    return 0;
+}
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

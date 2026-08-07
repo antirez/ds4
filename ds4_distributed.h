@@ -13,7 +13,13 @@
  * ds4_dist_run() directly.
  */
 typedef ds4_distributed_options ds4_dist_options;
+typedef struct ds4_dist_coordinator ds4_dist_coordinator;
 typedef struct ds4_dist_session ds4_dist_session;
+
+/* Four captured intermediate frontiers support a five-row verifier: any
+ * partial result keeps at most four rows, while a five-row full accept needs
+ * no intermediate restore. */
+#define DS4_DIST_SPEC_MAX_DRAFT_TOKENS 5u
 
 /* Options used by standalone `./ds4 --role coordinator -p ...` generation.
  * Interactive tools and the server go through the normal ds4_session API.
@@ -67,6 +73,7 @@ int ds4_dist_prepare_engine_options(
  */
 int ds4_dist_session_create(
         ds4_dist_session **out,
+        ds4_dist_coordinator **shared,
         ds4_engine *engine,
         const ds4_dist_options *opt,
         ds4_session *owner,
@@ -74,6 +81,7 @@ int ds4_dist_session_create(
         char *err,
         size_t errlen);
 void ds4_dist_session_free(ds4_dist_session *d);
+void ds4_dist_coordinator_free(ds4_dist_coordinator *coordinator);
 
 /* Returns 1 when the coordinator has full layer coverage, 0 when workers are
  * still missing, and -1 for configuration or internal errors.
@@ -100,6 +108,19 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* Verify a coordinator-owned MTP draft block across all layer slices and
+ * atomically keep the greedy-accepted prefix. */
+int ds4_dist_session_verify_greedy(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const ds4_tokens *checkpoint,
+        const int *drafts,
+        uint32_t draft_n,
+        uint32_t *committed,
+        float *logits,
+        char *err,
+        size_t errlen);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */
@@ -121,5 +142,11 @@ int ds4_dist_session_load_payload(
  * mode uses it for `./ds4 --role coordinator -p ...`.
  */
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
+
+#ifdef DS4_TEST_HOOKS
+/* Deterministic socketpair coverage for persistent TCP WORK/RESULT bulk
+ * framing. Intended only for the test binary. */
+int ds4_dist_test_tcp_bulk_split(char *err, size_t errlen);
+#endif
 
 #endif

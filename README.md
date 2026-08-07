@@ -189,6 +189,11 @@ make strix-halo       # Linux ROCm, AMD Strix Halo
 make cpu              # CPU-only diagnostics build
 ```
 
+ROCm links record `$(ROCM_ROOT)/lib` as an ELF RUNPATH, derived from the
+selected `HIPCC`, so the applications do not depend on a service-specific
+`LD_LIBRARY_PATH`. Set both `HIPCC` and `ROCM_ROOT` when using a nonstandard
+toolchain layout.
+
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
@@ -565,6 +570,127 @@ many prefill chunks may be in flight end-to-end; the default is conservative
 and bounded. `--dist-prefill-chunk N` exists for experiments, but the default
 4096-token chunk is the canonical setting and should be used unless you are
 explicitly validating a different chunk size.
+
+On Linux, the production single-worker transport uses descriptor-framed
+protocol v3:
+
+```sh
+# Add these to both the coordinator and worker commands.
+--dist-transport auto
+```
+
+With no `--dist-nhi-device`, current peers negotiate descriptor-framed v3 TCP.
+Explicit `--dist-transport tcp` selects legacy protocol v2 and is retained for
+compatibility and A/B checks; it is not the v3 production spelling.
+
+The single-link NHI backend remains experimental. Supplying an NHI device to
+`auto`, or selecting `--dist-transport nhi`, enables the lab path. The earlier
+lost MSI-X notification and fresh-open RX ordering failures were repaired in
+the stream driver; the asymmetric raw gate, mapped GPU-alias gate, full-model
+output-equivalence checks, and repeated full-model cohorts now pass. NHI is not
+the default because the current serial layer split shows no tokens/second gain,
+not because a timed-out or replayed run is being counted as a benchmark.
+
+For lab qualification only, use the lifecycle-managed device on both peers:
+
+```sh
+--dist-transport auto --dist-nhi-device /run/ds4-tbstream/device
+# Or require the experiment to fail rather than select TCP:
+--dist-transport nhi --dist-nhi-device /run/ds4-tbstream/device
+```
+
+The current NHI implementation permits exactly one remote worker link. Its
+normal path stages tensors through mmap pools with CPU copies while bypassing
+the socket/network bulk path. Set `DS4_DIST_NHI_MAPPED=1` on both peers to
+enable mapped leases for contiguous 32-bit tensors. Reduced-width activations
+and ring-wrapping tensors always use CPU-copy NHI.
+
+Single-token ROCm decode can also alias graph I/O directly to a mapped lease.
+Set `DS4_DIST_NHI_DIRECT_SLOTS=rx`, `tx`, or `both` on both peers; the default is
+`off`. These are GPU mappings of driver-owned system/GTT pages, not peer VRAM or
+GPUDirect RDMA. `DS4_DIST_NHI_UNSAFE_FAST=1` is a benchmark-only companion that
+uses a caller-proven GPU-quiesced ownership handoff and skips copyback of
+terminal graph values that are dead before reuse. The conservative mapped
+lease synchronization remains the default. A matched 800-token A/B measured
+11.2557 tok/s on staged NHI and 11.2407 tok/s with direct TX plus the fast
+handoff, so the fast mode is not a throughput optimization on the current
+serial split.
+
+For qualification profiling, `DS4_DIST_DECODE_PROFILE=1` emits coordinator and
+worker synchronized evaluation spans, `DS4_DIST_NHI_TRACE=1` emits correlated NHI ownership and
+ioctl spans, and `DS4_DIST_NHI_DIRECT_TRACE=1` reports direct-slot masks. These
+logs are verbose and should be disabled for headline throughput measurements.
+
+For a low-overhead GPU-side breakdown on ROCm, set
+`DS4_ROCM_EVENT_PROFILE=1`. `DS4_ROCM_EVENT_PROFILE_INTERVAL=N` controls the
+number of samples in each report and defaults to `32`. It applies only to
+ordinary resident, non-streaming, non-speculative single-token layer-slice
+decode on one tier/device, without a placement plan or the older synchronized
+stage profiler. A rotating layer is sampled each token. Fourteen timing-enabled
+HIP events form 13 adjacent stream-0 segments covering input, work before and
+after the sampled layer, the sampled layer's QKV, compressor/indexer,
+attention, router/MoE and shared/post stages, the output head, and direct
+copyback. Each window also reports layer compression-ratio groups `0`, `4`,
+and `128`, compression emits, cache spans, direct-slot masks, and dropped
+samples. Events are collected after the existing `ds4_gpu_end_commands()`
+completion, so the profiler adds no synchronization point and disables itself
+without aborting inference if timing fails.
+
+Interpret `copyback` narrowly: it contains only queued direct/canonical D2D
+copies. An ordinary staged GPU-to-host read happens after event collection and
+is therefore included in `host_minus_stream0`, not `copyback`. In two balanced
+800-token profiler-on/off TCP arms, pooled request service time was `7.15150 s`
+on versus `7.14820 s` off: `+0.04617%` latency (`-0.04614%` throughput), with
+zero dropped samples or coverage differences. The profiler-on full-model
+means were `33.98704 ms` stream-0 and `34.09416 ms` host time on the coordinator
+(`0.10712 ms` residual), and `33.69936 ms` stream-0 and `33.82140 ms` host time
+on the worker (`0.12204 ms` residual). The worker output head cost
+`2.51466 ms` per token. Within the approximately extrapolated sampled-layer
+bodies, the largest buckets were routed MoE (`24.55%`), attention output
+(`24.24%`), and QKV (`20.71%`), followed by shared/post (`10.05%`),
+compressor/indexer (`9.80%`), FFN/router (`7.33%`), and attention core
+(`3.13%`). Treat those layer percentages as directional because event overhead
+is extrapolated from one rotating sampled layer.
+
+Resident single-token DeepSeek V4 decode on ROCm fuses Q/KV weighted RMS
+normalization and KV RoPE into one launch when the shape has at most 256 RoPE
+pairs. Larger synthetic shapes use the retained two-launch path. Set
+`DS4_ROCM_DISABLE_QKV_KV_ROPE_FUSION=1` before process startup for a diagnostic
+rollback. The strict reference comparison is model-independent:
+
+```sh
+make HIPCC=/opt/rocm-therock/bin/hipcc test-rocm-qkv-fusion
+```
+
+It covers dense and YaRN parameters, inverse and multi-row/head layouts,
+zero rotation, the 256-pair boundary, the 257-pair fallback, and rejected
+shapes, requiring bit-exact Q and KV output.
+
+The opt-in, model-independent two-host gate exercises the same descriptor and
+NHI backend without loading a GGUF. Run one role on each connected host after
+building the current tree and granting the account access to the stream device:
+
+```sh
+# CPU-copy backend; run the complementary --connect HOST role on the peer.
+make test-nhi-live \
+  NHI_LIVE_ARGS='--listen --device /run/ds4-tbstream/device --timeout 120'
+
+# Explicit ROCm registration plus mapped leases and ring-wrap copy fallback.
+# The Make target enables DS4_DIST_NHI_MAPPED=1 for this qualification gate.
+make test-nhi-live-rocm \
+  NHI_LIVE_ARGS='--listen --device /run/ds4-tbstream/device --timeout 120'
+```
+
+The runners require the expected paths in both directions and fail rather than
+reporting a mapped pass after silent CPU-copy fallback. They are intentionally
+excluded from `make test` because they require an exclusive physical endpoint.
+The mapped harness accesses the registered lease through its host alias; retain
+the separate full-pool GPU read/write gate when qualifying a deployment.
+These equal-size runners are component tests. NHI qualification must also pass
+`../strix-rdma/tools/ds4-shape/tbstream-ds4-gate` through ring wrap, prove
+reliable fresh-open recovery, and pass full-model output equivalence. The
+post-fix host pair passes those gates; deployment qualification still requires
+running them again after any kernel or transport change.
 
 By default DwarfStar sends hidden-state activations as 32-bit floats. To reduce
 traffic, pass `--dist-activation-bits 16` or `--dist-activation-bits 8` on the
