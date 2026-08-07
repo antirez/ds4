@@ -10282,6 +10282,28 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
     }
 }
 
+/* Budget for force-closing a thinking block that ran out of tokens.
+ *
+ * The ordinary grace (--thinking-grace-tokens) gives the model a chance to close
+ * the block itself; this is what is left when even that is spent.  Returns the
+ * extra tokens to grant -- the closing marker plus a small reserve so the answer
+ * has somewhere to go -- or 0 when there is nothing to do.  Granting less than the
+ * whole marker would be worse than granting nothing: the block would stay open and
+ * the last tokens would be spent anyway. */
+static int thinking_force_close_budget(bool inside, bool grace_pending,
+                                       int completion, int max_tokens,
+                                       int room, int close_tokens, int reserve) {
+    if (!inside || grace_pending) return 0;
+    if (completion < max_tokens) return 0;
+    if (close_tokens <= 0) return 0;
+
+    const int available = room - max_tokens;
+    if (available < close_tokens) return 0;
+
+    const int want = close_tokens + (reserve > 0 ? reserve : 0);
+    return want <= available ? want : available;
+}
+
 static thinking_state thinking_state_from_prompt(const request *r) {
     thinking_state st = {0};
     if (r && r->prompt_text) {
@@ -17250,6 +17272,35 @@ static void test_cancel_withdraws_only_pending_decode(void) {
     test_cancel_server_destroy(&s);
 }
 
+/* Forcing the close is a budget decision before it is an injection: it may fire
+ * only when the block is out of budget, the ordinary grace has nothing left to
+ * give, and the context still has room for the whole marker.  A truncated close
+ * marker would be worse than none -- it would not close the block and would still
+ * spend the last tokens. */
+static void test_thinking_force_close_budget_policy(void) {
+    const int close_tokens = 3;   /* "</think>\n\n" once tokenized */
+    const int reserve = 16;
+
+    /* Nothing open: nothing to close. */
+    TEST_ASSERT(thinking_force_close_budget(false, false, 48, 48, 4096,
+                                            close_tokens, reserve) == 0);
+    /* Still inside the ordinary budget: the model may close on its own. */
+    TEST_ASSERT(thinking_force_close_budget(true, false, 40, 48, 4096,
+                                            close_tokens, reserve) == 0);
+    /* The grace has not been spent yet: it fires first and may be enough. */
+    TEST_ASSERT(thinking_force_close_budget(true, true, 48, 48, 4096,
+                                            close_tokens, reserve) == 0);
+    /* Out of budget, grace spent, room to spare: marker plus visible reserve. */
+    TEST_ASSERT(thinking_force_close_budget(true, false, 96, 96, 4096,
+                                            close_tokens, reserve) == close_tokens + reserve);
+    /* Room for the marker but not the whole reserve: grant what fits. */
+    TEST_ASSERT(thinking_force_close_budget(true, false, 96, 96, 96 + close_tokens + 2,
+                                            close_tokens, reserve) == close_tokens + 2);
+    /* Not even room for the marker: leave the stream alone. */
+    TEST_ASSERT(thinking_force_close_budget(true, false, 96, 96, 96 + close_tokens - 1,
+                                            close_tokens, reserve) == 0);
+}
+
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -18470,6 +18521,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_detaches_assigned_job();
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
+    test_thinking_force_close_budget_policy();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
