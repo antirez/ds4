@@ -766,8 +766,28 @@ static int routed_moe_launch(
         /* Correctness rollback for the optimized resident IQ2 prefill path. */
         const uint32_t disable_resident_iq2_sorted =
             iq2_gate_path && getenv("DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED") != NULL;
+        /* MXFP4 small batches stay on the per-pair decode kernels through
+         * speculative-verify span sizes (2..8 rows): each token/expert pair
+         * computes independently with the single-token reduction order, so
+         * batched rows are bit-identical to sequential decode -- the
+         * invariant exact speculative verification depends on.  The tile
+         * path accumulates in a different order and starves the GPU at
+         * these sizes (the Q4_K small-batch finding, same effect).  The
+         * old threshold (4) was a prefill-era performance cutoff, not a
+         * correctness limit; DS4_ROCM_MXFP4_DIRECT_MAX restores it for
+         * comparison runs. */
+        static uint32_t mxfp4_direct_max_cached = 0;
+        if (mxfp4_direct_max_cached == 0u) {
+            uint32_t v = 8u;
+            const char *env = getenv("DS4_ROCM_MXFP4_DIRECT_MAX");
+            if (env && env[0]) {
+                const long parsed = strtol(env, NULL, 10);
+                if (parsed >= 1 && parsed <= 4096) v = (uint32_t)parsed;
+            }
+            mxfp4_direct_max_cached = v;
+        }
         const uint32_t use_mxfp4_tiny_batch =
-            mxfp4_path && n_tokens <= 4u;
+            mxfp4_path && n_tokens <= mxfp4_direct_max_cached;
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             !use_mxfp4_tiny_batch &&

@@ -66302,13 +66302,31 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+        static int batch_layer_timing = -1;
+        if (batch_layer_timing < 0)
+            batch_layer_timing = getenv("DS4_ROCM_BATCH_LAYER_TIMING") != NULL ? 1 : 0;
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            double lt0 = 0.0;
+            if (batch_layer_timing) {
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                if (ok) ok = ds4_gpu_synchronize() != 0;
+                lt0 = now_sec();
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+            }
             ok = metal_graph_encode_layer_batch(g,
                                                 &e->model,
                                                 &e->weights.layer[il],
                                                 il,
                                                 pos0,
                                                 n_tokens);
+            if (batch_layer_timing) {
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                if (ok) ok = ds4_gpu_synchronize() != 0;
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                fprintf(stderr,
+                        "ds4: batch layer timing pos=%u n=%u il=%u elapsed=%.1f ms\n",
+                        pos0, n_tokens, il, (now_sec() - lt0) * 1000.0);
+            }
         }
     }
     if (ok && output_logits) {
@@ -66333,7 +66351,19 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
     if (ok && output_hc) {
+        const bool time_readback = getenv("DS4_DIST_SYNC_TIMING") != NULL;
+        const double rb_t0 = time_readback ? now_sec() : 0.0;
         ok = ds4_gpu_tensor_read(metal_graph_batch_cur_hc(g), 0, output_hc, hc_bytes) != 0;
+        if (time_readback) {
+            fprintf(stderr,
+                    "ds4: dist sync timing hidden readback n=%u bytes=%llu elapsed=%.1f ms (%.1f MiB/s)\n",
+                    n_tokens,
+                    (unsigned long long)hc_bytes,
+                    (now_sec() - rb_t0) * 1000.0,
+                    (now_sec() - rb_t0) > 0.0
+                        ? (double)hc_bytes / (1024.0 * 1024.0) / (now_sec() - rb_t0)
+                        : 0.0);
+        }
     }
     if (ok && output_logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
