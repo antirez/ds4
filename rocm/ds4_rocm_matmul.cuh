@@ -392,10 +392,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1202__)
+            /* RDNA4 (gfx12xx): wide-K WMMA v2 fused double-K kernel
+             * — fuses two 16-K mma_sync per loop to saturate 128-bit
+             * memory bandwidth. */
             const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
-                            (uint32_t)((n_tok + 63u) / 64u),
+                            (uint32_t)((n_tok + 15u) / 16u),
                             1u);
-            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+            matmul_q8_0_f32_batch_wmma_v2_4w_kernel<<<grid, 128u>>>(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     (const float *)x->ptr,
@@ -403,7 +407,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     (uint32_t)in_dim,
                     (uint32_t)out_dim,
                     blocks * 34u);
-            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wide-K wmma v2 launch");
+#else
+            /* RDNA3/3.5 (gfx11xx): WMMA v1 __builtin_amdgcn_wmma_*_w32. */
+            if (g_wmma_v1) {
+                const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
+                                (uint32_t)((n_tok + 63u) / 64u),
+                                1u);
+                matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            }
+#endif
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
