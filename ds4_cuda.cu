@@ -99,6 +99,8 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+static uint64_t g_model_default_cache_limit;
+static int g_model_default_cache_limit_computed;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
@@ -703,13 +705,15 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
+    if (g_model_hmm_direct && !g_ssd_streaming_mode &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (direct_env && direct_env[0] && !g_ssd_streaming_mode) {
+        return cuda_model_ptr(model_map, offset);
+    }
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
@@ -733,6 +737,15 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
+    }
+
+    if (g_ssd_streaming_mode) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr,
+                    "ds4: CUDA SSD streaming has no bounded device range for %s\n",
+                    what ? what : "weights");
+        }
+        return NULL;
     }
 
     cudaError_t err = cudaSuccess;
@@ -1893,6 +1906,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || map_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
+    if (g_ssd_streaming_mode) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_PREFETCH") != NULL ||
         getenv("DS4_CUDA_COPY_MODEL") != NULL ||
         getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
@@ -2289,8 +2303,35 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+    if (gb > 0) return gb * 1073741824ull;
+
+    if (!g_model_default_cache_limit_computed) {
+        g_model_default_cache_limit_computed = 1;
+        const uint64_t free_now = ds4_gpu_tier_free_vram(0);
+        if (free_now > 0) {
+            const uint64_t ceiling = (free_now / 100ull) * 92ull;
+            const uint64_t guard_pct = (free_now / 100ull) * 8ull;
+            const uint64_t guard_min = 1536ull * 1024ull * 1024ull;
+            const uint64_t guard = guard_pct > guard_min ? guard_pct : guard_min;
+            g_model_default_cache_limit = ceiling > guard ? ceiling - guard : 0;
+            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                fprintf(stderr,
+                        "ds4: CUDA generic weight cache budget free=%.2f GiB "
+                        "ceiling=%.2f GiB guard=%.2f GiB limit=%.2f GiB\n",
+                        (double)free_now / 1073741824.0,
+                        (double)ceiling / 1073741824.0,
+                        (double)guard / 1073741824.0,
+                        (double)g_model_default_cache_limit / 1073741824.0);
+            }
+        }
+    }
+    return g_model_default_cache_limit > 0 ? g_model_default_cache_limit :
+        (g_ssd_streaming_mode ? 0 : UINT64_MAX);
+}
+
+static void cuda_model_cache_limit_reset(void) {
+    g_model_default_cache_limit = 0;
+    g_model_default_cache_limit_computed = 0;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -2367,12 +2408,28 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
+        if (g_ssd_streaming_mode) {
+            fprintf(stderr,
+                    "ds4: CUDA SSD streaming refused host fallback for %s; "
+                    "device weight cache budget is exhausted (%.2f GiB)\n",
+                    what ? what : "weights",
+                    (double)limit / 1073741824.0);
+            return NULL;
+        }
         return cuda_model_ptr(model_map, offset);
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL || g_ssd_streaming_mode) {
+            if (g_ssd_streaming_mode) {
+                fprintf(stderr,
+                        "ds4: CUDA SSD streaming refused host fallback for %s "
+                        "after device cache allocation failed\n",
+                        what ? what : "weights");
+            }
+            return NULL;
+        }
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
@@ -2450,6 +2507,7 @@ static const char *cuda_model_range_ptr_from_fd(
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
+    if (g_ssd_streaming_mode) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
         getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
         getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
@@ -2902,6 +2960,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    cuda_model_cache_limit_reset();
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -3718,12 +3777,13 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+    cuda_model_cache_limit_reset();
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
-    if (copy_env && copy_env[0]) {
+    if (copy_env && copy_env[0] && !g_ssd_streaming_mode) {
         void *dev = NULL;
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
         cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
@@ -3823,6 +3883,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+    cuda_model_cache_limit_reset();
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -30504,6 +30565,7 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
+    cuda_model_cache_limit_reset();
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
 }
