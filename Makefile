@@ -63,7 +63,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-float-compare test-metal-f32-inline-copy test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-float-compare test-first-divergence test-metal-f32-inline-copy test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -213,6 +213,18 @@ endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+first_divergence_capture.o: first_divergence_capture.c first_divergence_capture.h
+	$(CC) $(FLOAT_COMPARE_CFLAGS) -c -o $@ $<
+
+tests/test_first_divergence.o: tests/test_first_divergence.c first_divergence_capture.h
+	$(CC) $(FLOAT_COMPARE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_first_divergence: tests/test_first_divergence.o first_divergence_capture.o
+	$(CC) $(FLOAT_COMPARE_CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-first-divergence: tests/test_first_divergence
+	./tests/test_first_divergence
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
