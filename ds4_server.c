@@ -10291,6 +10291,10 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
  * whole marker would be worse than granting nothing: the block would stay open and
  * the last tokens would be spent anyway. */
 #define THINK_CLOSE_INJECT "</think>\n\n"
+/* Tokens kept aside for the visible answer after a forced close.  Small on
+ * purpose: the turn is already out of budget, this only avoids handing back a
+ * reply whose visible part is empty by construction. */
+#define THINK_CLOSE_VISIBLE_RESERVE 16
 
 /* Close an open thinking block in the emitted text and in the tracked state.
  * Both halves matter: the marker in `text` is what a client sees and what the
@@ -10303,10 +10307,15 @@ static void thinking_force_close_apply(buf *text, thinking_state *thinking) {
     thinking_state_feed(thinking, THINK_CLOSE_INJECT, strlen(THINK_CLOSE_INJECT));
 }
 
-static int thinking_force_close_budget(bool inside, bool grace_pending,
+static int thinking_force_close_budget(bool inside, int grace, bool grace_used,
                                        int completion, int max_tokens,
                                        int room, int close_tokens, int reserve) {
-    if (!inside || grace_pending) return 0;
+    if (!inside) return 0;
+    /* The forced close is the guarantee behind --thinking-grace-tokens, not a
+     * new default: without the option the turn is left exactly as before. */
+    if (grace <= 0) return 0;
+    /* The ordinary grace fires first and may be enough on its own. */
+    if (!grace_used) return 0;
     if (completion < max_tokens) return 0;
     if (close_tokens <= 0) return 0;
 
@@ -11662,6 +11671,7 @@ decode_again:
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const int thinking_grace = s->thinking_grace_tokens;
     bool thinking_grace_used = false;
+    bool thinking_force_closed = false;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -11779,6 +11789,57 @@ decode_again:
                                 "thinking grace granted: extra=%d max=%d",
                                 extra, max_tokens);
                 }
+            }
+            /* The grace is spent (or was never configured) and the budget
+             * is gone with the block still open: close it here.  Unlike the
+             * mid-stream close upstream removed in 51a1c14, this one is
+             * terminal -- nothing is expected of the model afterwards and the
+             * visible answer is already lost.  The point is only that the turn
+             * ends with a valid `thinking_live`, so the checkpoint is keyed on
+             * the visible text instead of raw token-text and is not born dead.
+             * The decision is taken once: at this point the loop is about to
+             * end either way. */
+            if (!thinking_force_closed && thinking.inside &&
+                completion >= max_tokens) {
+                thinking_force_closed = true;
+                ds4_tokens close_toks = {0};
+                ds4_tokenize_rendered_chat(s->engine, THINK_CLOSE_INJECT,
+                                           &close_toks);
+                const int extra = thinking_force_close_budget(
+                    thinking.inside, thinking_grace, thinking_grace_used,
+                    completion, max_tokens, room,
+                    close_toks.len, THINK_CLOSE_VISIBLE_RESERVE);
+                if (extra > 0) {
+                    int fed = 0;
+                    while (fed < close_toks.len &&
+                           server_eval_token(s, slot, close_toks.v[fed],
+                                             err, sizeof(err)) == 0) {
+                        fed++;
+                    }
+                    /* Whatever was fed is in the KV: account for it even when
+                     * the feed broke, or the budget stops matching the state. */
+                    completion += fed;
+                    if (fed == close_toks.len) {
+                        max_tokens += extra;
+                        thinking_force_close_apply(&text, &thinking);
+                        server_log(DS4_LOG_GENERATION,
+                                   "ds4-server: thinking block force-closed "
+                                   "extra=%d max_tokens=%d completion=%d",
+                                   extra, max_tokens, completion);
+                        trace_event(s, trace_id,
+                                    "thinking block force-closed: extra=%d max=%d",
+                                    extra, max_tokens);
+                    } else {
+                        /* Could not close cleanly: leave the stream as
+                         * generated.  The end-of-generation warning still
+                         * reports the open block. */
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: forced close of the thinking "
+                                   "block failed after %d/%d tokens: %s",
+                                   fed, close_toks.len, err);
+                    }
+                }
+                ds4_tokens_free(&close_toks);
             }
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
@@ -17317,24 +17378,31 @@ static void test_thinking_force_close_apply_closes_the_block(void) {
 static void test_thinking_force_close_budget_policy(void) {
     const int close_tokens = 3;   /* "</think>\n\n" once tokenized */
     const int reserve = 16;
+    const int grace = 2000;
 
     /* Nothing open: nothing to close. */
-    TEST_ASSERT(thinking_force_close_budget(false, false, 48, 48, 4096,
+    TEST_ASSERT(thinking_force_close_budget(false, grace, true, 48, 48, 4096,
+                                            close_tokens, reserve) == 0);
+    /* Grace not configured: default behaviour must not change.  The forced
+     * close is the guarantee behind --thinking-grace-tokens, not a new default. */
+    TEST_ASSERT(thinking_force_close_budget(true, 0, true, 48, 48, 4096,
                                             close_tokens, reserve) == 0);
     /* Still inside the ordinary budget: the model may close on its own. */
-    TEST_ASSERT(thinking_force_close_budget(true, false, 40, 48, 4096,
+    TEST_ASSERT(thinking_force_close_budget(true, grace, true, 40, 48, 4096,
                                             close_tokens, reserve) == 0);
     /* The grace has not been spent yet: it fires first and may be enough. */
-    TEST_ASSERT(thinking_force_close_budget(true, true, 48, 48, 4096,
+    TEST_ASSERT(thinking_force_close_budget(true, grace, false, 48, 48, 4096,
                                             close_tokens, reserve) == 0);
     /* Out of budget, grace spent, room to spare: marker plus visible reserve. */
-    TEST_ASSERT(thinking_force_close_budget(true, false, 96, 96, 4096,
+    TEST_ASSERT(thinking_force_close_budget(true, grace, true, 96, 96, 4096,
                                             close_tokens, reserve) == close_tokens + reserve);
     /* Room for the marker but not the whole reserve: grant what fits. */
-    TEST_ASSERT(thinking_force_close_budget(true, false, 96, 96, 96 + close_tokens + 2,
+    TEST_ASSERT(thinking_force_close_budget(true, grace, true, 96, 96,
+                                            96 + close_tokens + 2,
                                             close_tokens, reserve) == close_tokens + 2);
     /* Not even room for the marker: leave the stream alone. */
-    TEST_ASSERT(thinking_force_close_budget(true, false, 96, 96, 96 + close_tokens - 1,
+    TEST_ASSERT(thinking_force_close_budget(true, grace, true, 96, 96,
+                                            96 + close_tokens - 1,
                                             close_tokens, reserve) == 0);
 }
 
