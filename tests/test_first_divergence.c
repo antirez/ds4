@@ -64,6 +64,7 @@ static bool run_pass_b_token(void *context,
     }
     fixture->pass_b_calls++;
     value = (float)(forced_token + (int)row);
+    if (row == 1) value += 0.25f;
     return ds4_first_divergence_capture_f32(
         capture, row, 0, DS4_FIRST_DIVERGENCE_CP1, "attn_norm", &value, 1);
 }
@@ -72,6 +73,7 @@ int main(void) {
     ds4_first_divergence_capture capture;
     ds4_first_divergence_capture pass_a;
     ds4_first_divergence_capture pass_b;
+    ds4_first_divergence_report report;
     const float cp1[] = {1.0f, -0.0f, 3.5f};
     const uint32_t n_comp = 17;
     const int forced_tokens[] = {101, 202, 303};
@@ -115,6 +117,14 @@ int main(void) {
     REQUIRE(pass_b.count == fixture.token_count);
     REQUIRE(memcmp(forced_tokens, fixture.expected_tokens,
                    sizeof(forced_tokens)) == 0);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &pass_a, &pass_b, stdout, &report));
+    REQUIRE(!report.bit_exact);
+    REQUIRE(report.first_divergence_found);
+    REQUIRE(report.row == 1);
+    REQUIRE(report.layer == 0);
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP1);
+    REQUIRE(strcmp(report.subobject, "attn_norm") == 0);
     ds4_first_divergence_capture_free(&pass_a);
     ds4_first_divergence_capture_free(&pass_b);
 

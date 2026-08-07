@@ -214,13 +214,13 @@ endif
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
-first_divergence_capture.o: first_divergence_capture.c first_divergence_capture.h
+first_divergence_capture.o: first_divergence_capture.c first_divergence_capture.h ds4_float_compare.h
 	$(CC) $(FLOAT_COMPARE_CFLAGS) -c -o $@ $<
 
 tests/test_first_divergence.o: tests/test_first_divergence.c first_divergence_capture.h
 	$(CC) $(FLOAT_COMPARE_CFLAGS) -I. -c -o $@ $<
 
-tests/test_first_divergence: tests/test_first_divergence.o first_divergence_capture.o
+tests/test_first_divergence: tests/test_first_divergence.o first_divergence_capture.o ds4_float_compare.o
 	$(CC) $(FLOAT_COMPARE_CFLAGS) -o $@ $^ $(LDLIBS)
 
 test-first-divergence: tests/test_first_divergence
@@ -441,8 +441,9 @@ else
 endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+	tests/test_first_divergence tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	./tests/test_first_divergence
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -504,4 +505,4 @@ test-float-compare: tests/test_float_compare
 	./tests/test_float_compare
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_float_compare tests/test_metal_f32_inline_copy tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_float_compare tests/test_first_divergence tests/test_metal_f32_inline_copy tests/test_mxfp4_metal tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

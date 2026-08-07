@@ -1,4 +1,5 @@
 #include "first_divergence_capture.h"
+#include "ds4_float_compare.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -201,4 +202,252 @@ bool ds4_first_divergence_run_forced_pair(
     }
     free(immutable_tokens);
     return true;
+}
+
+static int cp3_subobject_rank(const char *name) {
+    static const char *const ordered[] = {
+        "attn_state_kv",
+        "attn_state_score",
+        "layer_n_comp",
+        "attn_cache",
+        "index_state_kv",
+        "index_state_score",
+        "layer_n_index_comp",
+        "index_cache"
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(ordered) / sizeof(ordered[0]); ++i) {
+        if (strcmp(name, ordered[i]) == 0) return (int)i;
+    }
+    return (int)(sizeof(ordered) / sizeof(ordered[0]));
+}
+
+static int snapshot_order(const ds4_first_divergence_snapshot *a,
+                          const ds4_first_divergence_snapshot *b) {
+    int a_rank;
+    int b_rank;
+
+    if (a->row != b->row) return a->row < b->row ? -1 : 1;
+    if (a->layer != b->layer) return a->layer < b->layer ? -1 : 1;
+    if (a->checkpoint != b->checkpoint) {
+        return a->checkpoint < b->checkpoint ? -1 : 1;
+    }
+    if (a->checkpoint == DS4_FIRST_DIVERGENCE_CP3_F) {
+        a_rank = cp3_subobject_rank(a->subobject);
+        b_rank = cp3_subobject_rank(b->subobject);
+        if (a_rank != b_rank) return a_rank < b_rank ? -1 : 1;
+    }
+    return strcmp(a->subobject, b->subobject);
+}
+
+static int snapshot_pointer_order(const void *lhs, const void *rhs) {
+    const ds4_first_divergence_snapshot *const *a = lhs;
+    const ds4_first_divergence_snapshot *const *b = rhs;
+    return snapshot_order(*a, *b);
+}
+
+static const ds4_first_divergence_snapshot *find_snapshot(
+        const ds4_first_divergence_capture *capture,
+        const ds4_first_divergence_snapshot *key) {
+    size_t i;
+
+    for (i = 0; i < capture->count; ++i) {
+        if (snapshot_order(&capture->snapshots[i], key) == 0) {
+            return &capture->snapshots[i];
+        }
+    }
+    return NULL;
+}
+
+static bool same_layout(const ds4_first_divergence_snapshot *a,
+                        const ds4_first_divergence_snapshot *b) {
+    return a->kind == b->kind &&
+           a->element_count == b->element_count &&
+           a->element_size == b->element_size;
+}
+
+static void compare_raw_elements(const ds4_first_divergence_snapshot *a,
+                                 const ds4_first_divergence_snapshot *b,
+                                 size_t *mismatch_count,
+                                 size_t *first_mismatch) {
+    size_t i;
+
+    *mismatch_count = 0;
+    *first_mismatch = SIZE_MAX;
+    for (i = 0; i < a->element_count; ++i) {
+        const size_t offset = i * a->element_size;
+        if (memcmp(a->data + offset, b->data + offset,
+                   a->element_size) != 0) {
+            if (*first_mismatch == SIZE_MAX) *first_mismatch = i;
+            (*mismatch_count)++;
+        }
+    }
+}
+
+static void print_raw(FILE *stream, const unsigned char *data, size_t bytes) {
+    size_t i;
+
+    fputs("0x", stream);
+    for (i = bytes; i > 0; --i) {
+        fprintf(stream, "%02x", data[i - 1]);
+    }
+}
+
+static void remember_first(ds4_first_divergence_report *report,
+                           const ds4_first_divergence_snapshot *key) {
+    if (report->first_divergence_found) return;
+    report->first_divergence_found = true;
+    report->row = key->row;
+    report->layer = key->layer;
+    report->checkpoint = key->checkpoint;
+    (void)copy_text(report->subobject, sizeof(report->subobject),
+                    key->subobject);
+}
+
+static void print_object_prefix(FILE *stream,
+                                const ds4_first_divergence_snapshot *key) {
+    fprintf(stream,
+            "FIRST_DIVERGENCE_OBJECT row=%u layer=%u checkpoint=%s subobject=%s",
+            key->row,
+            key->layer,
+            ds4_first_divergence_checkpoint_name(key->checkpoint),
+            key->subobject[0] ? key->subobject : "-");
+}
+
+bool ds4_first_divergence_emit_report(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream,
+        ds4_first_divergence_report *report) {
+    const ds4_first_divergence_snapshot **ordered;
+    size_t ordered_count;
+    size_t i;
+
+    if (!pass_a || !pass_b || !stream || !report ||
+        pass_a->count > SIZE_MAX - pass_b->count) {
+        return false;
+    }
+    memset(report, 0, sizeof(*report));
+    report->bit_exact = true;
+    ordered_count = pass_a->count + pass_b->count;
+    if (ordered_count == 0) {
+        fputs("FIRST_DIVERGENCE NONE compared_objects=0\n", stream);
+        return ferror(stream) == 0;
+    }
+    if (ordered_count > SIZE_MAX / sizeof(*ordered)) return false;
+    ordered = malloc(ordered_count * sizeof(*ordered));
+    if (!ordered) return false;
+    for (i = 0; i < pass_a->count; ++i) ordered[i] = &pass_a->snapshots[i];
+    for (i = 0; i < pass_b->count; ++i) {
+        ordered[pass_a->count + i] = &pass_b->snapshots[i];
+    }
+    qsort(ordered, ordered_count, sizeof(*ordered), snapshot_pointer_order);
+
+    for (i = 0; i < ordered_count; ++i) {
+        const ds4_first_divergence_snapshot *key = ordered[i];
+        const ds4_first_divergence_snapshot *a;
+        const ds4_first_divergence_snapshot *b;
+
+        if (i != 0 && snapshot_order(ordered[i - 1], key) == 0) continue;
+        a = find_snapshot(pass_a, key);
+        b = find_snapshot(pass_b, key);
+        report->compared_objects++;
+        print_object_prefix(stream, key);
+
+        if (!a || !b) {
+            report->bit_exact = false;
+            remember_first(report, key);
+            fprintf(stream, " result=MISMATCH reason=missing_%s\n",
+                    a ? "PASS_B" : "PASS_A");
+            continue;
+        }
+        if (!same_layout(a, b)) {
+            report->bit_exact = false;
+            remember_first(report, key);
+            fprintf(stream,
+                    " result=MISMATCH reason=layout pass_a_kind=%u pass_b_kind=%u pass_a_elements=%zu pass_b_elements=%zu pass_a_element_size=%zu pass_b_element_size=%zu\n",
+                    (unsigned)a->kind, (unsigned)b->kind,
+                    a->element_count, b->element_count,
+                    a->element_size, b->element_size);
+            continue;
+        }
+
+        if (a->kind == DS4_FIRST_DIVERGENCE_PAYLOAD_F32) {
+            ds4_float_compare_result comparison;
+
+            if (!ds4_float_compare_exact((const float *)a->data,
+                                         (const float *)b->data,
+                                         a->element_count, &comparison)) {
+                free(ordered);
+                return false;
+            }
+            if (comparison.bit_exact) {
+                fprintf(stream, " result=EXACT elements=%zu\n",
+                        a->element_count);
+                continue;
+            }
+            report->bit_exact = false;
+            remember_first(report, key);
+            fprintf(stream,
+                    " result=MISMATCH elements=%zu mismatch_count=%zu first_index=%zu actual_bits=0x%08x expected_bits=0x%08x",
+                    comparison.length, comparison.mismatch_count,
+                    comparison.first_mismatch_index,
+                    comparison.first_actual_bits,
+                    comparison.first_expected_bits);
+            if (comparison.max_abs_diff_defined) {
+                fprintf(stream, " max_abs=%.17g", comparison.max_abs_diff);
+            } else {
+                fputs(" max_abs=undefined", stream);
+            }
+            if (comparison.max_rel_diff_defined) {
+                fprintf(stream, " max_rel=%.17g", comparison.max_rel_diff);
+            } else {
+                fputs(" max_rel=undefined", stream);
+            }
+            if (comparison.max_ulp_distance_defined) {
+                fprintf(stream, " max_ulp=%u", comparison.max_ulp_distance);
+            } else {
+                fputs(" max_ulp=undefined", stream);
+            }
+            fputc('\n', stream);
+        } else {
+            size_t mismatch_count;
+            size_t first_mismatch;
+
+            compare_raw_elements(a, b, &mismatch_count, &first_mismatch);
+            if (mismatch_count == 0) {
+                fprintf(stream, " result=EXACT elements=%zu\n",
+                        a->element_count);
+                continue;
+            }
+            report->bit_exact = false;
+            remember_first(report, key);
+            fprintf(stream,
+                    " result=MISMATCH elements=%zu mismatch_count=%zu first_index=%zu actual_raw=",
+                    a->element_count, mismatch_count, first_mismatch);
+            print_raw(stream, a->data + first_mismatch * a->element_size,
+                      a->element_size);
+            fputs(" expected_raw=", stream);
+            print_raw(stream, b->data + first_mismatch * b->element_size,
+                      b->element_size);
+            fputs(" max_abs=undefined max_rel=undefined max_ulp=undefined\n",
+                  stream);
+        }
+    }
+    free(ordered);
+
+    if (report->first_divergence_found) {
+        fprintf(stream,
+                "FIRST_DIVERGENCE row=%u layer=%u checkpoint=%s subobject=%s compared_objects=%zu\n",
+                report->row,
+                report->layer,
+                ds4_first_divergence_checkpoint_name(report->checkpoint),
+                report->subobject[0] ? report->subobject : "-",
+                report->compared_objects);
+    } else {
+        fprintf(stream, "FIRST_DIVERGENCE NONE compared_objects=%zu\n",
+                report->compared_objects);
+    }
+    return ferror(stream) == 0;
 }

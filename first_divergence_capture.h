@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define DS4_FIRST_DIVERGENCE_LABEL_MAX 16
 #define DS4_FIRST_DIVERGENCE_SUBOBJECT_MAX 48
@@ -65,6 +66,16 @@ typedef struct {
     ds4_first_divergence_pass_b_token_fn run_pass_b_token;
 } ds4_first_divergence_pair_ops;
 
+typedef struct {
+    bool bit_exact;
+    size_t compared_objects;
+    bool first_divergence_found;
+    uint32_t row;
+    uint32_t layer;
+    ds4_first_divergence_checkpoint checkpoint;
+    char subobject[DS4_FIRST_DIVERGENCE_SUBOBJECT_MAX];
+} ds4_first_divergence_report;
+
 bool ds4_first_divergence_capture_init(ds4_first_divergence_capture *capture,
                                        const char *label);
 void ds4_first_divergence_capture_free(ds4_first_divergence_capture *capture);
@@ -106,5 +117,11 @@ bool ds4_first_divergence_run_forced_pair(
         const ds4_first_divergence_pair_ops *ops,
         ds4_first_divergence_capture *pass_a,
         ds4_first_divergence_capture *pass_b);
+
+bool ds4_first_divergence_emit_report(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream,
+        ds4_first_divergence_report *report);
 
 #endif
