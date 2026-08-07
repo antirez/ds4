@@ -710,6 +710,17 @@ static size_t checked_size_product(size_t a, size_t b, const char *what) {
     return a * b;
 }
 
+static void validate_finite_f32(const char *name, const float *values, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        if (isfinite(values[i])) continue;
+        fprintf(stderr,
+                "error: non-finite value in source tensor %s at element %" PRId64 "\n",
+                name,
+                i);
+        exit(1);
+    }
+}
+
 static float *tensor_to_f32(const st_value *t, int64_t *n_out) {
     const int64_t n = value_nelements(t);
     float *out = xmalloc((size_t)n * sizeof(float));
@@ -1367,6 +1378,7 @@ static byte_buf generate_regular_hf(st_db *db, const char *gguf_name, const char
         f32 = tensor_to_f32(&w, &n);
         st_value_free(&w);
     }
+    validate_finite_f32(hf_name, f32, n);
     const float *imat = NULL;
     if (target_uses_imatrix(target)) {
         const char *names[2] = { gguf_name, hf_name };
@@ -1440,6 +1452,7 @@ static void generate_one_expert(expert_job *j, int xid) {
         if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] != j->ncols) die("expert shape mismatch");
         f32 = tensor_to_f32(&w, &n);
     }
+    validate_finite_f32(weight_name, f32, n);
     const float *imat = NULL;
     if (target_uses_imatrix(j->target)) {
         const char *names[2] = { j->gguf_name, weight_name };
