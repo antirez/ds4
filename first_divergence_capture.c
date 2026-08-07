@@ -162,3 +162,43 @@ const char *ds4_first_divergence_checkpoint_name(
     }
     return names[checkpoint];
 }
+
+bool ds4_first_divergence_run_forced_pair(
+        const int *forced_tokens,
+        size_t token_count,
+        const ds4_first_divergence_pair_ops *ops,
+        ds4_first_divergence_capture *pass_a,
+        ds4_first_divergence_capture *pass_b) {
+    int *immutable_tokens;
+    bool pass_a_ok;
+    bool restore_ok;
+    size_t i;
+
+    if (!ops || !ops->run_pass_a || !ops->restore_s0 ||
+        !ops->run_pass_b_token || !pass_a || !pass_b ||
+        token_count == 0 || !forced_tokens ||
+        token_count > SIZE_MAX / sizeof(*immutable_tokens)) {
+        return false;
+    }
+    immutable_tokens = malloc(token_count * sizeof(*immutable_tokens));
+    if (!immutable_tokens) return false;
+    memcpy(immutable_tokens, forced_tokens,
+           token_count * sizeof(*immutable_tokens));
+
+    pass_a_ok = ops->run_pass_a(ops->context, immutable_tokens,
+                                token_count, pass_a);
+    restore_ok = ops->restore_s0(ops->context);
+    if (!pass_a_ok || !restore_ok) {
+        free(immutable_tokens);
+        return false;
+    }
+    for (i = 0; i < token_count; ++i) {
+        if (!ops->run_pass_b_token(ops->context, immutable_tokens[i],
+                                   (uint32_t)i, pass_b)) {
+            free(immutable_tokens);
+            return false;
+        }
+    }
+    free(immutable_tokens);
+    return true;
+}

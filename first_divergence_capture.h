@@ -44,6 +44,27 @@ typedef struct {
     size_t capacity;
 } ds4_first_divergence_capture;
 
+typedef bool (*ds4_first_divergence_pass_a_fn)(
+        void *context,
+        const int *forced_tokens,
+        size_t token_count,
+        ds4_first_divergence_capture *capture);
+
+typedef bool (*ds4_first_divergence_restore_fn)(void *context);
+
+typedef bool (*ds4_first_divergence_pass_b_token_fn)(
+        void *context,
+        int forced_token,
+        uint32_t row,
+        ds4_first_divergence_capture *capture);
+
+typedef struct {
+    void *context;
+    ds4_first_divergence_pass_a_fn run_pass_a;
+    ds4_first_divergence_restore_fn restore_s0;
+    ds4_first_divergence_pass_b_token_fn run_pass_b_token;
+} ds4_first_divergence_pair_ops;
+
 bool ds4_first_divergence_capture_init(ds4_first_divergence_capture *capture,
                                        const char *label);
 void ds4_first_divergence_capture_free(ds4_first_divergence_capture *capture);
@@ -78,5 +99,12 @@ bool ds4_first_divergence_capture_bytes(
 
 const char *ds4_first_divergence_checkpoint_name(
         ds4_first_divergence_checkpoint checkpoint);
+
+bool ds4_first_divergence_run_forced_pair(
+        const int *forced_tokens,
+        size_t token_count,
+        const ds4_first_divergence_pair_ops *ops,
+        ds4_first_divergence_capture *pass_a,
+        ds4_first_divergence_capture *pass_b);
 
 #endif
