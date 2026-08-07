@@ -10290,6 +10290,19 @@ static void thinking_state_feed(thinking_state *st, const char *p, size_t len) {
  * has somewhere to go -- or 0 when there is nothing to do.  Granting less than the
  * whole marker would be worse than granting nothing: the block would stay open and
  * the last tokens would be spent anyway. */
+#define THINK_CLOSE_INJECT "</think>\n\n"
+
+/* Close an open thinking block in the emitted text and in the tracked state.
+ * Both halves matter: the marker in `text` is what a client sees and what the
+ * checkpoint is canonicalized from, and feeding it back to `thinking` is what
+ * makes `thinking_live` valid instead of leaving the turn keyed on raw
+ * token-text.  The caller is responsible for the KV side (see the injection at
+ * the decode site) and for having secured the budget first. */
+static void thinking_force_close_apply(buf *text, thinking_state *thinking) {
+    buf_puts(text, THINK_CLOSE_INJECT);
+    thinking_state_feed(thinking, THINK_CLOSE_INJECT, strlen(THINK_CLOSE_INJECT));
+}
+
 static int thinking_force_close_budget(bool inside, bool grace_pending,
                                        int completion, int max_tokens,
                                        int room, int close_tokens, int reserve) {
@@ -17277,6 +17290,30 @@ static void test_cancel_withdraws_only_pending_decode(void) {
  * give, and the context still has room for the whole marker.  A truncated close
  * marker would be worse than none -- it would not close the block and would still
  * spend the last tokens. */
+/* What the forced close has to achieve, stated as the property that matters: the
+ * block ends closed and the marker is in the emitted text.  That is exactly what
+ * makes `thinking_live` valid, and therefore what keeps the session checkpoint
+ * from being keyed on raw token-text. */
+static void test_thinking_force_close_apply_closes_the_block(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup("<｜Assistant｜><think>");
+    thinking_state st = thinking_state_from_prompt(&r);
+    TEST_ASSERT(st.inside == true);
+
+    buf text = {0};
+    buf_puts(&text, "half a thought");
+    thinking_force_close_apply(&text, &st);
+
+    TEST_ASSERT(st.inside == false);
+    TEST_ASSERT(text.len == strlen("half a thought") + strlen(THINK_CLOSE_INJECT));
+    TEST_ASSERT(strstr(text.ptr, THINK_CLOSE_INJECT) != NULL);
+
+    buf_free(&text);
+    request_free(&r);
+}
+
 static void test_thinking_force_close_budget_policy(void) {
     const int close_tokens = 3;   /* "</think>\n\n" once tokenized */
     const int reserve = 16;
@@ -18521,6 +18558,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_detaches_assigned_job();
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
+    test_thinking_force_close_apply_closes_the_block();
     test_thinking_force_close_budget_policy();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
