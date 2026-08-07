@@ -233,6 +233,7 @@ static int compare_repeated(const char *name,
                             uint32_t n_tokens,
                             uint32_t token_elems,
                             const reference_pattern patterns[N_PATTERN],
+                            uint32_t pattern_offset,
                             float abs_tolerance,
                             float rel_tolerance) {
     float max_abs = 0.0f;
@@ -243,7 +244,8 @@ static int compare_repeated(const char *name,
     const uint64_t count = (uint64_t)n_tokens * token_elems;
 
     for (uint32_t token = 0; token < n_tokens; token++) {
-        const float *expected = patterns[token % N_PATTERN].mid;
+        const float *expected =
+            patterns[(token + pattern_offset) % N_PATTERN].mid;
         for (uint32_t i = 0; i < token_elems; i++) {
             const uint64_t index = (uint64_t)token * token_elems + i;
             const float got = actual[index];
@@ -291,6 +293,7 @@ static int check_out_from_gpu_mid(const float *out_actual,
                                   const float *mid_actual,
                                   uint32_t n_tokens,
                                   const reference_pattern patterns[N_PATTERN],
+                                  uint32_t pattern_offset,
                                   const block_mxfp4 *down_matrix,
                                   float abs_tolerance,
                                   float rel_tolerance) {
@@ -305,7 +308,7 @@ static int check_out_from_gpu_mid(const float *out_actual,
     const uint64_t count = (uint64_t)n_tokens * MODEL_DIM;
 
     for (uint32_t token = 0; token < n_tokens; token++) {
-        const uint32_t p = token % N_PATTERN;
+        const uint32_t p = (token + pattern_offset) % N_PATTERN;
         const reference_pattern *pattern = &patterns[p];
         const float *mid = mid_actual + (uint64_t)token * N_EXPERT * FFN_DIM;
         const uint64_t mid_bytes = (uint64_t)N_EXPERT * FFN_DIM * sizeof(float);
@@ -373,6 +376,7 @@ static int run_case(uint32_t n_tokens,
                     uint64_t down_expert_bytes,
                     uint64_t down_row_bytes,
                     const reference_pattern patterns[N_PATTERN],
+                    uint32_t pattern_offset,
                     float *snapshot_out,
                     const float *expect_out) {
     const uint64_t token_x_count = (uint64_t)n_tokens * MODEL_DIM;
@@ -396,7 +400,8 @@ static int run_case(uint32_t n_tokens,
     int ok = x && selected && weights && mid_actual && out_actual;
 
     for (uint32_t token = 0; ok && token < n_tokens; token++) {
-        const reference_pattern *pattern = &patterns[token % N_PATTERN];
+        const reference_pattern *pattern =
+            &patterns[(token + pattern_offset) % N_PATTERN];
         memcpy(x + (uint64_t)token * MODEL_DIM,
                pattern->x, sizeof(pattern->x));
         memcpy(selected + (uint64_t)token * N_EXPERT,
@@ -463,9 +468,9 @@ static int run_case(uint32_t n_tokens,
          * mid is the public, stable result of that fused stage. */
         const int mid_ok = compare_repeated(
             "mid", mid_actual, n_tokens, N_EXPERT * FFN_DIM, patterns,
-            1.0e-4f, 1.0e-4f);
+            pattern_offset, 1.0e-4f, 1.0e-4f);
         const int out_ok = check_out_from_gpu_mid(
-            out_actual, mid_actual, n_tokens, patterns,
+            out_actual, mid_actual, n_tokens, patterns, pattern_offset,
             (const block_mxfp4 *)((const char *)model + down_offset),
             2.0e-4f, 1.0e-4f);
         ok = mid_ok && out_ok;
@@ -498,10 +503,11 @@ static int run_case(uint32_t n_tokens,
 }
 
 int main(void) {
-    /* Two through four tokens exercise the direct tiny-batch path; five
-     * tokens returns to expert-sorted tiles. Larger cases cover prefill. */
+    /* One through eight tokens stay on the direct per-pair kernels (the
+     * speculative-verify span sizes); larger cases cover the tile prefill
+     * path. */
     static const uint32_t token_cases[] = {
-        1u, 2u, 3u, 4u, 5u, 32u, 128u, 512u,
+        1u, 2u, 3u, 4u, 5u, 8u, 32u, 128u, 512u,
     };
     const uint64_t gate_row_bytes =
         (MODEL_DIM / QK_MXFP4) * sizeof(block_mxfp4);
@@ -602,10 +608,51 @@ int main(void) {
         if (!run_case(token_cases[i], model, model_size,
                       gate_offset, up_offset, down_offset,
                       gate_expert_bytes, gate_row_bytes,
-                      down_expert_bytes, down_row_bytes, patterns,
+                      down_expert_bytes, down_row_bytes, patterns, 0u,
                       snap, NULL)) {
             ok = 0;
         }
+    }
+    /* Speculative-verify exactness: every row of a batched evaluation at
+     * span sizes (2..8 tokens) must be bit-identical to the single-token
+     * evaluation of the same inputs.  Distributed span verification
+     * depends on this invariant; anchor all four activation patterns with
+     * single-token runs, then compare each batched row against its
+     * pattern's single-token output byte for byte. */
+    if (ok) {
+        static float singles[N_PATTERN][MODEL_DIM];
+        int span_ok = 1;
+        for (uint32_t p = 0; span_ok && p < N_PATTERN; p++) {
+            span_ok = run_case(1u, model, model_size,
+                               gate_offset, up_offset, down_offset,
+                               gate_expert_bytes, gate_row_bytes,
+                               down_expert_bytes, down_row_bytes, patterns,
+                               p, singles[p], NULL);
+        }
+        for (uint32_t k = 2u; span_ok && k <= 8u; k++) {
+            float *batch = (float *)malloc((size_t)k * MODEL_DIM * sizeof(float));
+            span_ok = batch != NULL &&
+                      run_case(k, model, model_size,
+                               gate_offset, up_offset, down_offset,
+                               gate_expert_bytes, gate_row_bytes,
+                               down_expert_bytes, down_row_bytes, patterns,
+                               0u, batch, NULL);
+            for (uint32_t t = 0; span_ok && t < k; t++) {
+                if (memcmp(batch + (uint64_t)t * MODEL_DIM,
+                           singles[t % N_PATTERN],
+                           MODEL_DIM * sizeof(float)) != 0) {
+                    fprintf(stderr,
+                            "MXFP4 ROCm span exactness: batch=%u row=%u "
+                            "differs from its single-token evaluation\n",
+                            k, t);
+                    span_ok = 0;
+                }
+            }
+            free(batch);
+        }
+        fprintf(stderr, "MXFP4 ROCm span exactness (2..8 rows vs single-token): %s\n",
+                span_ok ? "bitwise OK" : "MISMATCH");
+        if (!span_ok) ok = 0;
     }
     /* Occupancy/path variants must reproduce the default tile path bit
      * for bit: same accumulation order by construction, so the out
@@ -625,12 +672,12 @@ int main(void) {
                 run_case(128u, model, model_size,
                          gate_offset, up_offset, down_offset,
                          gate_expert_bytes, gate_row_bytes,
-                         down_expert_bytes, down_row_bytes, patterns,
+                         down_expert_bytes, down_row_bytes, patterns, 0u,
                          NULL, snap128) &&
                 run_case(512u, model, model_size,
                          gate_offset, up_offset, down_offset,
                          gate_expert_bytes, gate_row_bytes,
-                         down_expert_bytes, down_row_bytes, patterns,
+                         down_expert_bytes, down_row_bytes, patterns, 0u,
                          NULL, snap512);
             unsetenv(variant_envs[v].name);
             fprintf(stderr, "MXFP4 ROCm variant %s=%s: %s\n",

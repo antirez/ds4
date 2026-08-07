@@ -80,6 +80,110 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     }
 }
 
+__device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
+
+/* Keep the weighted RMS output in kv_out exactly as the two-launch path does,
+ * then rotate the normalized KV tail after a block-wide barrier.  This removes
+ * one launch per layer without changing the float value that RoPE consumes. */
+__global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
+        float *q_out,
+        const float *q,
+        const float *q_w,
+        uint32_t q_n,
+        float *kv_out,
+        const float *kv,
+        const float *kv_w,
+        uint32_t kv_n,
+        uint32_t rows,
+        uint32_t kv_n_head,
+        uint32_t kv_head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t which = blockIdx.y;
+    if (row >= rows || which > 1u) return;
+    const uint32_t n = which == 0u ? q_n : kv_n;
+    const float *xr = (which == 0u ? q : kv) + (uint64_t)row * n;
+    float *orow = (which == 0u ? q_out : kv_out) + (uint64_t)row * n;
+    const float *w = which == 0u ? q_w : kv_w;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * scale * w[i];
+    }
+    if (which == 0u) return;
+    __syncthreads();
+    if (n_rot == 0u) return;
+
+    const uint32_t n_nope = kv_head_dim - n_rot;
+    const uint32_t pairs_per_head = n_rot / 2u;
+    const uint32_t total_pairs = kv_n_head * pairs_per_head;
+    if (threadIdx.x >= total_pairs) return;
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot *
+            logf((float)n_ctx_orig /
+                 (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot *
+            logf((float)n_ctx_orig /
+                 (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1u), corr1);
+    }
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const uint32_t p = threadIdx.x;
+    const uint32_t h = p / pairs_per_head;
+    const uint32_t pair = p - h * pairs_per_head;
+    const uint32_t i = pair * 2u;
+    const uint32_t i0 = h * kv_head_dim + n_nope + i;
+    const float theta_extrap =
+        (float)(pos0 + row) * powf(theta_scale, (float)pair);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        const float ramp = rope_yarn_ramp_dev(corr0, corr1, (int)i);
+        /* Keep the retained rope_tail kernel's operation order.  A loop here
+         * lets fast-math hoist a reciprocal for the YaRN ramp and changes
+         * output bits.  The launcher sends shapes over one block to the
+         * reference two-kernel path. */
+        const float theta_delta = theta_extrap - theta_interp;
+        const float scaled_delta = theta_delta * ext_factor;
+        theta = scaled_delta * ramp + theta_interp;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+    const float x0 = orow[i0];
+    const float x1 = orow[i0 + 1u];
+    orow[i0] = x0 * c - x1 * s;
+    orow[i0 + 1u] = x0 * s + x1 * c;
+}
+
 __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
@@ -99,8 +203,6 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
     float scale = rsqrtf(partial[0] / (float)head_dim + eps);
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) xr[i] *= scale;
 }
-
-__device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
 
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
@@ -512,6 +614,121 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
             eps);
     return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
 }
+
+extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+        ds4_gpu_tensor       *q_out,
+        const ds4_gpu_tensor *q,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint32_t              q_n,
+        ds4_gpu_tensor       *kv_out,
+        const ds4_gpu_tensor *kv,
+        uint64_t              kv_weight_offset,
+        uint32_t              kv_n,
+        uint32_t              rows,
+        uint32_t              kv_n_head,
+        uint32_t              kv_head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        bool                  inverse,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps) {
+    uint64_t q_weight_bytes = 0, kv_weight_bytes = 0, kv_shape = 0;
+    if (!q_out || !q || !kv_out || !kv || !model_map ||
+        q_n == 0u || kv_n == 0u || kv_n_head == 0u ||
+        kv_head_dim == 0u || n_rot > kv_head_dim || (n_rot & 1u) ||
+        !cuda_u64_mul_checked(kv_n_head, kv_head_dim, &kv_shape) ||
+        kv_shape != kv_n ||
+        !cuda_u64_mul_checked(q_n, sizeof(float), &q_weight_bytes) ||
+        !cuda_u64_mul_checked(kv_n, sizeof(float), &kv_weight_bytes) ||
+        !cuda_model_range_fits(model_size,
+                               q_weight_offset,
+                               q_weight_bytes) ||
+        !cuda_model_range_fits(model_size,
+                               kv_weight_offset,
+                               kv_weight_bytes) ||
+        !cuda_tensor_has_elems2(q_out, q_n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(q, q_n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(kv_out, kv_n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(kv, kv_n, rows, sizeof(float))) {
+        return 0;
+    }
+    if (rows == 0u) return 1;
+    const uint64_t rope_pairs =
+        (uint64_t)kv_n_head * (uint64_t)(n_rot / 2u);
+    if (cuda_runtime_config()->disable_qkv_kv_rope_fusion ||
+        rope_pairs > 256u) {
+        if (!ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+                q_out,
+                q,
+                model_map,
+                model_size,
+                q_weight_offset,
+                q_n,
+                kv_out,
+                kv,
+                kv_weight_offset,
+                kv_n,
+                rows,
+                eps)) {
+            return 0;
+        }
+        return n_rot == 0u ||
+               ds4_gpu_rope_tail_tensor(
+                   kv_out,
+                   rows,
+                   kv_n_head,
+                   kv_head_dim,
+                   n_rot,
+                   pos0,
+                   n_ctx_orig,
+                   inverse,
+                   freq_base,
+                   freq_scale,
+                   ext_factor,
+                   attn_factor,
+                   beta_fast,
+                   beta_slow);
+    }
+    const float *q_w = (const float *)cuda_model_range_ptr(
+        model_map, q_weight_offset, q_weight_bytes, "q_rms_weight");
+    const float *kv_w = (const float *)cuda_model_range_ptr(
+        model_map, kv_weight_offset, kv_weight_bytes, "kv_rms_weight");
+    if (!q_w || !kv_w) return 0;
+    const dim3 grid(rows, 2u, 1u);
+    dsv4_qkv_rms_norm_rows_kv_rope_kernel<<<grid, 256>>>(
+        (float *)q_out->ptr,
+        (const float *)q->ptr,
+        q_w,
+        q_n,
+        (float *)kv_out->ptr,
+        (const float *)kv->ptr,
+        kv_w,
+        kv_n,
+        rows,
+        kv_n_head,
+        kv_head_dim,
+        n_rot,
+        pos0,
+        n_ctx_orig,
+        inverse ? 1 : 0,
+        freq_base,
+        freq_scale,
+        ext_factor,
+        attn_factor,
+        beta_fast,
+        beta_slow,
+        eps);
+    return cuda_ok(cudaGetLastError(),
+                   "dsv4 qkv rms norm kv rope launch");
+}
 extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     uint64_t rows64 = 0;
     if (!cuda_u64_mul_checked(n_tok, n_head, &rows64) || rows64 > UINT32_MAX ||
@@ -601,9 +818,19 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 }
 
 static int cuda_rope_tail_stride_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t pos_stride, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
-    if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, pos_stride, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    uint64_t row_count = 0, elem_count = 0, bytes = 0, pairs64 = 0;
+    if (!x || n_rot > head_dim || (n_rot & 1) ||
+        !cuda_u64_mul_checked(n_tok, n_head, &row_count) ||
+        !cuda_u64_mul_checked(row_count, head_dim, &elem_count) ||
+        !cuda_u64_mul_checked(elem_count, sizeof(float), &bytes) ||
+        !cuda_u64_mul_checked(row_count, n_rot / 2u, &pairs64) ||
+        pairs64 > UINT32_MAX || x->bytes < bytes) {
+        return 0;
+    }
+    if (pairs64 == 0u) return 1;
+    const uint32_t pairs = (uint32_t)pairs64;
+    const uint32_t blocks = ((pairs - 1u) / 256u) + 1u;
+    rope_tail_kernel<<<blocks, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, pos_stride, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 
