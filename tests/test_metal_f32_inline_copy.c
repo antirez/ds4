@@ -1,12 +1,18 @@
 #include "ds4_float_compare.h"
 #include "ds4_gpu.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+bool ds4_log_is_tty(FILE *fp) {
+    (void)fp;
+    return false;
+}
 
 typedef struct {
     const char *name;
