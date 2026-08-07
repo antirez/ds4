@@ -5026,6 +5026,19 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
+/* Some consumers of the shared Q8_0 dispatch run a kernel whose row count is a
+ * compile-time constant -- kernel_mul_mv_q8_0_f32_pair and the fused HC-expand
+ * variants all bind NR0 = N_R0_Q8_0 and ignore args.nr0 -- yet still size their
+ * threadgroup grid as out_dim / nr0.  Letting DS4_METAL_Q8_MV_ROWS widen nr0
+ * there halves the grid without widening the kernel, so the upper half of every
+ * output is never written.  Pin those paths back to the 2-row shape. */
+static void ds4_gpu_mv_dispatch_pin_nr2(ds4_gpu_mv_dispatch *d) {
+    if (!d || d->nr0 == 2) return;
+    d->function_name = "kernel_mul_mv_q8_0_f32";
+    d->nr0 = 2;
+    d->smem = 32u * 2u * sizeof(float);
+}
+
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
         uint64_t in_dim,
         int      f32_weights) {
@@ -18997,6 +19010,8 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
 
         ds4_gpu_mv_dispatch dispatch0 = ds4_gpu_make_q8_0_mv_dispatch();
         ds4_gpu_mv_dispatch dispatch1 = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch_pin_nr2(&dispatch0);
+        ds4_gpu_mv_dispatch_pin_nr2(&dispatch1);
         if (out0_dim > 65536u) dispatch0.nsg = 8;
         if (out1_dim > 65536u) dispatch1.nsg = 8;
         /* A common threadgroup shape is required to retain each standalone
@@ -43271,6 +43286,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch_pin_nr2(&mv_dispatch);
         mv_args.nr0 = mv_dispatch.nr0;
 
         ds4_gpu_hc_expand_args hc_args = {
@@ -43387,6 +43403,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch_pin_nr2(&mv_dispatch);
         mv_args.nr0 = mv_dispatch.nr0;
 
         ds4_gpu_hc_expand_args hc_args = {
