@@ -29,6 +29,7 @@
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
+/tests/test_rocm_qkv_fusion
 /tests/test_sampling
 *.o
 *.dSYM/

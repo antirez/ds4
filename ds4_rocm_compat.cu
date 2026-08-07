@@ -240,25 +240,6 @@ extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
                                      4096u, 256u, x, n_rows);
 }
 
-extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
-        ds4_gpu_tensor *q_out, const ds4_gpu_tensor *q,
-        const void *model_map, uint64_t model_size,
-        uint64_t q_weight_offset, uint32_t q_n,
-        ds4_gpu_tensor *kv_out, const ds4_gpu_tensor *kv,
-        uint64_t kv_weight_offset, uint32_t kv_n, uint32_t rows,
-        uint32_t kv_n_head, uint32_t kv_head_dim, uint32_t n_rot,
-        uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
-        float freq_base, float freq_scale, float ext_factor,
-        float attn_factor, float beta_fast, float beta_slow, float eps) {
-    return ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
-                   q_out, q, model_map, model_size, q_weight_offset, q_n,
-                   kv_out, kv, kv_weight_offset, kv_n, rows, eps) != 0 &&
-           ds4_gpu_rope_tail_tensor(
-                   kv_out, rows, kv_n_head, kv_head_dim, n_rot, pos0,
-                   n_ctx_orig, inverse, freq_base, freq_scale, ext_factor,
-                   attn_factor, beta_fast, beta_slow) != 0;
-}
-
 extern "C" int ds4_gpu_embed_token_quant_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t weight_type, uint32_t n_vocab,

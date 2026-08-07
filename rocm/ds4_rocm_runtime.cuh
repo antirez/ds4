@@ -4757,6 +4757,7 @@ struct ds4_rocm_runtime_config {
     int glm_grouped_value_project;
     int glm_grouped_qk_low;
     int q8_decode_sharedx_64k;
+    int disable_qkv_kv_rope_fusion;
     int graph_dump;
     uint32_t q8_decode_rpb;
     uint32_t q8_hc_decode_rpb;
@@ -4811,6 +4812,9 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.q8_decode_sharedx_64k =
             q8_decode_sharedx_64k_env == NULL ||
             cuda_env_present(q8_decode_sharedx_64k_env);
+        g_rocm_cfg.disable_qkv_kv_rope_fusion =
+            cuda_env_present(
+                getenv("DS4_ROCM_DISABLE_QKV_KV_ROPE_FUSION"));
         const int graph_dump_requested =
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_PREFIX")) ||
             cuda_env_present(getenv("DS4_METAL_GRAPH_DUMP_PREFIX"));
