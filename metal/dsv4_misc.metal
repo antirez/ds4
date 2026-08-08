@@ -417,8 +417,8 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         return;
     }
 
-    threadgroup float *ktg = shared;        // [128]
-    threadgroup float *psum = ktg + 128u;   // [4]
+    threadgroup float *ktg = shared;          // [128]
+    threadgroup float *dotbuf = ktg + 128u;   // [64], one slot per head
 
     if (tid < 128u) {
         device const float *krow = (device const float *)(index_comp +
@@ -426,9 +426,13 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         ktg[tid] = krow[tid];
     }
 
-    float acc = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* One slot per head instead of a four-entry scratch that every iteration
+     * reused: the writes never collide, so the two barriers that guarded that
+     * reuse disappear and a row costs 2 threadgroup barriers instead of 33.
+     * The final accumulation still walks heads in ascending order with the
+     * same max(s,0)*(w*scale) grouping, so scores stay bit-identical. */
     for (uint head0 = 0; head0 < 64u; head0 += 4u) {
         const uint head = head0 + (uint)sg;
         device const float4 *q4 = (device const float4 *)(q +
@@ -439,19 +443,16 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         s = simd_sum(s);
         if (lane == 0) {
             device const float *w = (device const float *)weights;
-            psum[sg] = max(s, 0.0f) * (w[head] * args.scale);
+            dotbuf[head] = max(s, 0.0f) * (w[head] * args.scale);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            acc += psum[0];
-            acc += psum[1];
-            acc += psum[2];
-            acc += psum[3];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0) {
+        float acc = 0.0f;
+        for (uint head = 0; head < 64u; head++) {
+            acc += dotbuf[head];
+        }
         device float *dst = (device float *)scores;
         dst[row] = acc;
     }

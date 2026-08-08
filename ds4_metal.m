@@ -17576,7 +17576,7 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:(128u + 64u) * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
