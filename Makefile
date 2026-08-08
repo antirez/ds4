@@ -135,7 +135,7 @@ help:
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
-	@echo "  make rocm                Auto-detect ROCm GPU (RDNA3/4) and build"
+	@echo "  make rocm                Auto-detect ROCm GPU (RDNA3/4) via rocminfo and build"
 	@echo "  make rx9070              Build ROCm for RX 9070 / gfx1201 (RDNA4)"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
