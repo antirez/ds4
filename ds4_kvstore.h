@@ -16,6 +16,8 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/* Exact checkpoint keyed by a server-local /v1/responses response id. */
+#define DS4_KVSTORE_EXT_RESPONSES_ID      (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -137,6 +139,12 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 int user_token_id,
                                 int assistant_token_id);
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens);
+/* Return the latest continued-cache boundary crossed by live_tokens after
+ * last_store_tokens, or zero when no new boundary is due. This lets callers
+ * that need an exact post-boundary snapshot share the normal cache cadence. */
+int ds4_kvstore_continued_store_crossed_target(const ds4_kvstore *kc,
+                                               int last_store_tokens,
+                                               int live_tokens);
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens);
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens);
 void ds4_kvstore_restore_suppressed_continued(ds4_kvstore *kc,
@@ -164,6 +172,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_session *session,
                                         const ds4_tokens *tokens,
                                         int store_len,
+                                        /* Bypass only the minimum-prefix policy; disk budget still applies. */
+                                        bool force_store,
                                         const char *reason,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
@@ -186,6 +196,8 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        const ds4_kvstore_trailer_hooks *hooks,
                                        char *err,
                                        size_t err_len);
+/* required_ext_flags rejects a text-key match before it can replace the live
+ * session with a checkpoint from a different protocol namespace. */
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
@@ -193,7 +205,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol);
+                              bool responses_protocol,
+                              uint8_t required_ext_flags);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

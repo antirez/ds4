@@ -383,6 +383,11 @@ void ds4_test_engine_free_byte_tokenizer(ds4_engine *e);
 /* A checkpoint-only session for server integration tests. Its sync path keeps
  * the exact token prefix but intentionally performs no model evaluation. */
 ds4_session *ds4_test_session_create_token_only(ds4_engine *e, int ctx_size);
+/* Pad this test-only session's restartable checkpoint to exercise disk-copy
+ * paths without model weights. The exact token prefix remains authoritative. */
+bool ds4_test_session_set_payload_bytes(ds4_session *s, uint64_t bytes);
+/* Number of attempts to serialize this fixture's checkpoint payload. */
+uint64_t ds4_test_session_payload_save_count(const ds4_session *s);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

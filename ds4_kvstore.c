@@ -183,6 +183,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_ID) return "responses-id";
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
@@ -738,13 +739,21 @@ static int kv_cache_continued_step(const ds4_kvstore *kc) {
     return step;
 }
 
-int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
+int ds4_kvstore_continued_store_crossed_target(const ds4_kvstore *kc,
+                                               int last_store_tokens,
+                                               int live_tokens) {
+    if (!kc) return 0;
     const int step = kv_cache_continued_step(kc);
-    if (step <= 0) return 0;
-    if (live_tokens < kc->opt.min_tokens) return 0;
-    if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
-    return live_tokens;
+    if (step <= 0 || live_tokens < kc->opt.min_tokens) return 0;
+    const int boundary = live_tokens - live_tokens % step;
+    if (boundary < kc->opt.min_tokens || boundary <= last_store_tokens) return 0;
+    return boundary;
+}
+
+int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
+    const int boundary = ds4_kvstore_continued_store_crossed_target(
+        kc, kc ? kc->continued_last_store_tokens : 0, live_tokens);
+    return boundary == live_tokens ? boundary : 0;
 }
 
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
@@ -925,6 +934,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_session *session,
                                         const ds4_tokens *tokens,
                                         int store_len,
+                                        bool force_store,
                                         const char *reason,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
@@ -933,7 +943,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         char *err,
                                         size_t err_len) {
     if (!kc->enabled) return false;
-    if (!tokens || store_len < kc->opt.min_tokens) return false;
+    if (!tokens || (!force_store && store_len < kc->opt.min_tokens)) return false;
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
@@ -1164,7 +1174,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    char *err,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
-                                              store_len, reason, NULL, 0, NULL,
+                                              store_len, false, reason, NULL, 0, NULL,
                                               hooks, err, err_len);
 }
 
@@ -1219,7 +1229,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+                              bool responses_protocol,
+                              uint8_t required_ext_flags) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
@@ -1248,6 +1259,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
+        } else if (required_ext_flags &&
+                   (hdr.ext_flags & required_ext_flags) != required_ext_flags) {
+            header_ok = false;
+            fail_reason = "cached checkpoint has incompatible extension flags";
         } else if ((uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";

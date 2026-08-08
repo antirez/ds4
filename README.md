@@ -1058,6 +1058,23 @@ and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
 Responses continuations bound to live state when possible, and can fall back to
 the same DSML rendering and KV prefix reuse used by chat completions.
 
+Each completed Responses turn has an opaque `resp_` id. To continue that exact
+turn, send it as `previous_response_id` and put only the new user or tool-output
+items in `input`. DS4 resolves the id to its saved model/KV frontier, validates
+prompt-affecting settings and tool call IDs, and renders/tokenizes only the new
+tail. The in-memory index is FIFO-bounded (4096 ids by default; tune it with
+`--response-state-max-ids`). With disk KV caching enabled, DS4 writes an exact
+post-response frontier under its opaque id only when that frontier crosses the
+normal continued-cache cadence. This avoids a synchronous full KV copy after
+every short turn; ids between retained boundaries are live-process-only and
+cannot survive a restart or session displacement. The checkpoint persists
+configuration and tool-call bindings, so a retained compatible id can be
+rebuilt after a server restart or session displacement. Disk budget eviction,
+an oversized checkpoint,
+an incompatible model/context, changed instructions/tools/reasoning/model, or
+an edited branch still requires full input replay. `conversation` objects are
+not implemented.
+
 `/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
@@ -1343,7 +1360,10 @@ Tool calls also keep a bounded exact-DSML replay map keyed by unguessable tool
 IDs, so client JSON history can be rendered back to the exact sampled text. The
 RAM map keeps up to 100000 IDs by default; tune it with `--tool-memory-max-ids`.
 Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
-canonical JSON-to-DSML rendering.
+canonical JSON-to-DSML rendering. Responses response-id checkpoints use an
+opaque id as their disk key rather than a visible prompt copy. Their trailer
+persists the bounded continuation metadata needed to validate and resume that
+checkpoint after restart.
 
 On disk, a cache file is:
 
@@ -1352,7 +1372,7 @@ KVC fixed header, 48 bytes
 u32 rendered_text_bytes
 rendered_text_bytes of UTF-8-ish token text
 DS4 session payload, payload_bytes from the KVC header
-optional tool-id map section
+optional response-id continuation section followed by an optional tool-id map
 ```
 
 The fixed header is little-endian:
@@ -1362,7 +1382,9 @@ The fixed header is little-endian:
 3   u8     version = 1
 4   u8     routed expert quant bits, currently 2 or 4
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8     extension flags, bit 0 = appended tool-id map
+6   u8     extension flags: bit 0 = appended tool-id map; bit 1 = Responses-visible key;
+              bit 2 = thinking-visible key; bit 3 = session-title metadata;
+              bit 4 = opaque response-id key
 7   u8     reserved
 8   u32    cached token count
 12  u32    hit count
@@ -1373,12 +1395,15 @@ The fixed header is little-endian:
 40  u64    DS4 session payload byte count
 ```
 
-The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is both the human-inspectable prefix and the lookup identity: its SHA1 is
-the filename, and a file is reusable only when those bytes are a prefix of the
-incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
-payload remain authoritative, and only the incoming text suffix after the cached
-bytes is tokenized.
+For ordinary entries, the rendered text is the tokenizer-decoded text for the
+cached token prefix. It is both the human-inspectable prefix and the lookup
+identity: its SHA1 is the filename, and a file is reusable only when those bytes
+are a prefix of the incoming rendered prompt. Response-id entries instead store
+their opaque server-local key as the lookup text and carry their continuation
+configuration and tool-call bindings in the trailer. They are accepted only by
+the response-state continuation path. After load, the exact checkpoint tokens from
+the DS4 payload remain authoritative, and only the incoming text suffix after
+the cached bytes is tokenized.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields
@@ -1482,6 +1507,7 @@ tokens.
 - `--kv-cache-boundary-trim-tokens`
 - `--kv-cache-boundary-align-tokens`
 - `--tool-memory-max-ids`
+- `--response-state-max-ids`
 - `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
@@ -1489,8 +1515,9 @@ variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
 when you want strict same-quant reuse only.
 
 The cache directory is disposable. If behavior looks suspicious, stop the
-server and remove it. You can investigate what is cached with hexdump as
-the kv cache files include the verbatim prompt cached.
+server and remove it. You can investigate what is cached with hexdump: ordinary
+entries include their rendered prompt, while response-id entries use an opaque
+server-local checkpoint key.
 
 ## Backends
 
