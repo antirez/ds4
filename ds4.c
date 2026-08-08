@@ -15309,6 +15309,7 @@ static ds4_c2b_capture *g_ds4_c45_capture;
  * generic A0/A1/A2 with selected row-wise canonical arithmetic. */
 enum {
     DS4_FIRST_DIVERGENCE_CANON_QA = 1u << 0,
+    DS4_FIRST_DIVERGENCE_CANON_KV = 1u << 1,
 };
 static uint32_t g_ds4_first_divergence_canonical_mask;
 
@@ -25494,6 +25495,27 @@ static bool metal_graph_matmul_canonical_rows(
     return ok;
 }
 
+static bool metal_graph_matmul_named_or_canonical_rows(
+        uint32_t                canonical_bit,
+        const char             *name,
+        uint32_t                il,
+        uint32_t                pos0,
+        ds4_gpu_tensor       *out,
+        const ds4_model        *model,
+        const ds4_tensor       *weight,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *input,
+        uint32_t                rows) {
+    if (ds4_first_divergence_canonical_enabled(canonical_bit)) {
+        return metal_graph_matmul_canonical_rows(
+            out, model, weight, in_dim, out_dim, input, rows);
+    }
+    return metal_graph_matmul_q8_0_named_tensor(
+        name, il, pos0, out, model, weight,
+        in_dim, out_dim, input, rows);
+}
+
 static bool metal_graph_encode_output_head_mtp(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,
@@ -27444,33 +27466,22 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok && ds4_first_divergence_canonical_enabled(
-                      DS4_FIRST_DIVERGENCE_CANON_QA)) {
-        ok = metal_graph_matmul_canonical_rows(
-            metal_graph_batch_qr(g), model, layer->attn_q_a,
-            DS4_N_EMBD, q_rank, metal_graph_batch_attn_norm(g), n_tokens);
-    } else if (ok) {
-        ok = metal_graph_matmul_q8_0_named_tensor(
-            "attn_q_a", il, pos0, metal_graph_batch_qr(g),
-            model, layer->attn_q_a, DS4_N_EMBD, q_rank,
-            metal_graph_batch_attn_norm(g), n_tokens);
-    }
+    if (ok) ok = metal_graph_matmul_named_or_canonical_rows(
+        DS4_FIRST_DIVERGENCE_CANON_QA,
+        "attn_q_a", il, pos0, metal_graph_batch_qr(g),
+        model, layer->attn_q_a, DS4_N_EMBD, q_rank,
+        metal_graph_batch_attn_norm(g), n_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_batch_qr(g),
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
-                                                          il,
-                                                          pos0,
-                                                          metal_graph_batch_kv_raw(g),
-                                                          model,
-                                                          layer->attn_kv,
-                                                          DS4_N_EMBD,
-                                                          DS4_N_HEAD_DIM,
-                                                          metal_graph_batch_attn_norm(g),
-                                                          n_tokens);
+        if (ok) ok = metal_graph_matmul_named_or_canonical_rows(
+            DS4_FIRST_DIVERGENCE_CANON_KV,
+            "attn_kv", il, pos0, metal_graph_batch_kv_raw(g),
+            model, layer->attn_kv, DS4_N_EMBD, DS4_N_HEAD_DIM,
+            metal_graph_batch_attn_norm(g), n_tokens);
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_batch_kv_raw(g),
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -27637,16 +27648,11 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
-        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
-                                                          il,
-                                                          pos0,
-                                                          metal_graph_batch_kv_raw(g),
-                                                          model,
-                                                          layer->attn_kv,
-                                                          DS4_N_EMBD,
-                                                          DS4_N_HEAD_DIM,
-                                                          metal_graph_batch_attn_norm(g),
-                                                          n_tokens);
+        if (ok) ok = metal_graph_matmul_named_or_canonical_rows(
+            DS4_FIRST_DIVERGENCE_CANON_KV,
+            "attn_kv", il, pos0, metal_graph_batch_kv_raw(g),
+            model, layer->attn_kv, DS4_N_EMBD, DS4_N_HEAD_DIM,
+            metal_graph_batch_attn_norm(g), n_tokens);
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_batch_kv_raw(g),
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -51181,10 +51187,12 @@ typedef struct {
     bool weights_same;
     bool numerical_non_equivalence;
     ds4_float_compare_result output_comparison;
+    ds4_first_divergence_float_signature output_signature;
 } ds4_qa_primitive_ab_result;
 
-static void ds4_qa_primitive_ab_print_metrics(
-        const ds4_float_compare_result *comparison) {
+static void ds4_projection_primitive_ab_print_metrics(
+        const ds4_float_compare_result *comparison,
+        const ds4_first_divergence_float_signature *signature) {
     fprintf(stderr,
             " mismatch_count=%zu first_index=%zu generic_bits=0x%08" PRIx32
             " sequential_bits=0x%08" PRIx32,
@@ -51208,6 +51216,36 @@ static void ds4_qa_primitive_ab_print_metrics(
     } else {
         fputs(" max_ulp=undefined", stderr);
     }
+    fprintf(stderr,
+            " mismatch_fraction=%.17g",
+            signature->mismatch_fraction);
+    if (signature->finite_metrics_defined) {
+        fprintf(stderr,
+                " mean_abs=%.17g rms_abs=%.17g p50_abs=%.17g p95_abs=%.17g p99_abs=%.17g",
+                signature->mean_abs,
+                signature->rms_abs,
+                signature->p50_abs,
+                signature->p95_abs,
+                signature->p99_abs);
+    } else {
+        fputs(" mean_abs=undefined rms_abs=undefined p50_abs=undefined"
+              " p95_abs=undefined p99_abs=undefined", stderr);
+    }
+    if (signature->relative_l2_defined) {
+        fprintf(stderr, " relative_l2=%.17g", signature->relative_l2);
+    } else {
+        fputs(" relative_l2=undefined", stderr);
+    }
+    if (signature->cosine_similarity_defined) {
+        fprintf(stderr, " cosine_similarity=%.17g",
+                signature->cosine_similarity);
+    } else {
+        fputs(" cosine_similarity=undefined", stderr);
+    }
+    fprintf(stderr,
+            " positive_delta_count=%zu negative_delta_count=%zu",
+            signature->positive_delta_count,
+            signature->negative_delta_count);
 }
 
 /* Re-run only layer-0 Q-A on the real Pass-A CP1 bits.  The generic call
@@ -51305,7 +51343,10 @@ static bool ds4_qa_primitive_ab_run(
         !ds4_float_compare_exact(generic_output_cpu,
                                  sequential_output_cpu,
                                  (size_t)out_dim,
-                                 &result->output_comparison)) {
+                                 &result->output_comparison) ||
+        !ds4_first_divergence_float_signature_compute(
+            generic_output_cpu, sequential_output_cpu,
+            (size_t)out_dim, &result->output_signature)) {
         ok = false;
         goto done;
     }
@@ -51329,7 +51370,8 @@ done:
                   "sequential_bits=none max_abs=0 max_rel=0 max_ulp=0",
                   stderr);
         } else {
-            ds4_qa_primitive_ab_print_metrics(&result->output_comparison);
+            ds4_projection_primitive_ab_print_metrics(
+                &result->output_comparison, &result->output_signature);
         }
     }
     fputc('\n', stderr);
@@ -51340,6 +51382,154 @@ done:
         ok = true;
     } else {
         fputs("QA_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
+        ok = false;
+    }
+
+    free(sequential_output_cpu);
+    free(generic_output_cpu);
+    free(sequential_input_cpu);
+    free(generic_input_cpu);
+    ds4_gpu_tensor_free(sequential_out);
+    ds4_gpu_tensor_free(generic_out);
+    ds4_gpu_tensor_free(sequential_input);
+    return ok;
+}
+
+typedef ds4_qa_primitive_ab_result ds4_kv_primitive_ab_result;
+
+/* Re-run only layer-0 pre-store KV projection on the same real Pass-A CP1
+ * allocation. The generic invocation retains the verifier row count; the
+ * sequential invocation receives row 0 and the identical attn_kv Q8_0
+ * tensor, metadata, mapping, and byte offset. */
+static bool ds4_kv_primitive_ab_run(
+        ds4_session *s,
+        const ds4_c2b_capture *capture,
+        uint32_t start,
+        ds4_kv_primitive_ab_result *result) {
+    ds4_gpu_tensor *generic_out = NULL;
+    ds4_gpu_tensor *sequential_out = NULL;
+    ds4_gpu_tensor *sequential_input = NULL;
+    float *generic_input_cpu = NULL;
+    float *sequential_input_cpu = NULL;
+    float *generic_output_cpu = NULL;
+    float *sequential_output_cpu = NULL;
+    ds4_float_compare_result input_comparison;
+    bool ok = false;
+
+    if (!result) return false;
+    memset(result, 0, sizeof(*result));
+    if (!s || !capture || capture->graph != &s->graph ||
+        capture->n_tokens < 2u || !capture->cp1[0]) {
+        fputs("KV_PRIMITIVE_AB input_bits_equal=FAIL weights_same=FAIL "
+              "elements=0 result=ERROR reason=invalid_real_shape_fixture\n",
+              stderr);
+        fputs("KV_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
+        return false;
+    }
+
+    const ds4_layer_weights *layer = &s->engine->weights.layer[0];
+    const ds4_tensor *weight = layer->attn_kv;
+    const uint64_t in_dim = DS4_N_EMBD;
+    const uint64_t out_dim = DS4_N_HEAD_DIM;
+    const uint64_t input_bytes = in_dim * sizeof(float);
+    const uint64_t output_bytes = out_dim * sizeof(float);
+    const uint64_t generic_output_bytes =
+        (uint64_t)capture->n_tokens * output_bytes;
+    result->weights_same = weight && weight->type == DS4_TENSOR_Q8_0 &&
+        weight->dim[0] == in_dim && weight->dim[1] == out_dim;
+    if (!result->weights_same ||
+        ds4_gpu_tensor_bytes(capture->cp1[0]) <
+            (uint64_t)capture->n_tokens * input_bytes) {
+        fprintf(stderr,
+                "KV_PRIMITIVE_AB input_bits_equal=FAIL weights_same=%s "
+                "elements=%llu result=ERROR reason=invalid_weight_or_input_layout\n",
+                result->weights_same ? "PASS" : "FAIL",
+                (unsigned long long)out_dim);
+        fputs("KV_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
+        return false;
+    }
+
+    sequential_input = ds4_gpu_tensor_view(capture->cp1[0], 0, input_bytes);
+    generic_out = ds4_gpu_tensor_alloc(generic_output_bytes);
+    sequential_out = ds4_gpu_tensor_alloc(output_bytes);
+    if (!sequential_input || !generic_out || !sequential_out) goto done;
+
+    generic_input_cpu = xmalloc((size_t)input_bytes);
+    sequential_input_cpu = xmalloc((size_t)input_bytes);
+    generic_output_cpu = xmalloc((size_t)output_bytes);
+    sequential_output_cpu = xmalloc((size_t)output_bytes);
+    if (!ds4_gpu_tensor_read(capture->cp1[0], 0,
+                             generic_input_cpu, input_bytes) ||
+        !ds4_gpu_tensor_read(sequential_input, 0,
+                             sequential_input_cpu, input_bytes) ||
+        !ds4_float_compare_exact(generic_input_cpu, sequential_input_cpu,
+                                 (size_t)in_dim, &input_comparison)) {
+        goto done;
+    }
+    result->input_bits_equal = input_comparison.bit_exact;
+    if (!result->input_bits_equal) goto done;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = metal_graph_matmul_q8_0_named_tensor(
+            "attn_kv", 0, start, generic_out,
+            &s->engine->model, weight, in_dim, out_dim,
+            capture->cp1[0], capture->n_tokens);
+    }
+    if (ok) {
+        ok = metal_graph_matmul_dense_quant_tensor(
+            sequential_out, &s->engine->model, weight,
+            in_dim, out_dim, sequential_input, 1);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok ||
+        !ds4_gpu_tensor_read(generic_out, 0,
+                             generic_output_cpu, output_bytes) ||
+        !ds4_gpu_tensor_read(sequential_out, 0,
+                             sequential_output_cpu, output_bytes) ||
+        !ds4_float_compare_exact(generic_output_cpu,
+                                 sequential_output_cpu,
+                                 (size_t)out_dim,
+                                 &result->output_comparison) ||
+        !ds4_first_divergence_float_signature_compute(
+            generic_output_cpu, sequential_output_cpu,
+            (size_t)out_dim, &result->output_signature)) {
+        ok = false;
+        goto done;
+    }
+    result->executed = true;
+    result->numerical_non_equivalence =
+        !result->output_comparison.bit_exact;
+
+done:
+    fprintf(stderr,
+            "KV_PRIMITIVE_AB input_bits_equal=%s weights_same=%s "
+            "elements=%llu result=%s",
+            result->input_bits_equal ? "PASS" : "FAIL",
+            result->weights_same ? "PASS" : "FAIL",
+            (unsigned long long)out_dim,
+            result->executed
+                ? (result->output_comparison.bit_exact ? "EXACT" : "MISMATCH")
+                : "ERROR");
+    if (result->executed) {
+        if (result->output_comparison.bit_exact) {
+            fputs(" mismatch_count=0 first_index=none generic_bits=none "
+                  "sequential_bits=none max_abs=0 max_rel=0 max_ulp=0",
+                  stderr);
+        } else {
+            ds4_projection_primitive_ab_print_metrics(
+                &result->output_comparison, &result->output_signature);
+        }
+    }
+    fputc('\n', stderr);
+    if (result->executed && result->input_bits_equal &&
+        result->weights_same && result->numerical_non_equivalence) {
+        fputs("KV_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST\n",
+              stderr);
+        ok = true;
+    } else {
+        fputs("KV_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
         ok = false;
     }
 
@@ -51456,12 +51646,99 @@ static bool ds4_first_divergence_parse_canonical_mask(
         }
         if (strcasecmp(token, "QA") == 0) {
             *mask |= DS4_FIRST_DIVERGENCE_CANON_QA;
+        } else if (strcasecmp(token, "KV") == 0) {
+            *mask |= DS4_FIRST_DIVERGENCE_CANON_KV;
         } else {
             return false;
         }
         token = strtok_r(NULL, ",", &save);
     }
     return *mask != 0;
+}
+
+static bool ds4_first_divergence_report_is(
+        const ds4_first_divergence_report *report,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject) {
+    return report && report->first_divergence_found &&
+        report->row == 0 && report->layer == 0 &&
+        report->checkpoint == checkpoint &&
+        strcmp(report->subobject, subobject) == 0;
+}
+
+static void ds4_first_divergence_print_report_location(
+        const ds4_first_divergence_report *report) {
+    if (!report || !report->first_divergence_found) {
+        fputs("NONE", stderr);
+        return;
+    }
+    fprintf(stderr, "row=%u,layer=%u,checkpoint=%s,subobject=%s",
+            report->row, report->layer,
+            ds4_first_divergence_checkpoint_name(report->checkpoint),
+            report->subobject[0] ? report->subobject : "-");
+}
+
+static void ds4_projection_drift_source_print(
+        const char *site,
+        const char *semantic,
+        const char *generic,
+        const char *sequential,
+        const ds4_qa_primitive_ab_result *result,
+        bool canonicalization_removes_site) {
+    if (!result || !result->executed ||
+        !result->numerical_non_equivalence) {
+        return;
+    }
+    fprintf(stderr,
+            "DRIFT_SOURCE site=%s semantic=%s generic=%s sequential=%s "
+            "generic_primitive=kernel_mul_mv_ext_q8_0_f32_r1 "
+            "sequential_primitive=kernel_mul_mv_q8_0_f32 "
+            "weight_quant=Q8_0 batch_vs_single=YES "
+            "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+            "elements=%zu mismatch_count=%zu mismatch_fraction=%.17g",
+            site, semantic, generic, sequential,
+            result->output_comparison.length,
+            result->output_comparison.mismatch_count,
+            result->output_signature.mismatch_fraction);
+    if (result->output_comparison.max_abs_diff_defined) {
+        fprintf(stderr, " max_abs=%.17g",
+                result->output_comparison.max_abs_diff);
+    } else {
+        fputs(" max_abs=undefined", stderr);
+    }
+    if (result->output_signature.finite_metrics_defined) {
+        fprintf(stderr,
+                " mean_abs=%.17g rms_abs=%.17g p50_abs=%.17g p95_abs=%.17g p99_abs=%.17g",
+                result->output_signature.mean_abs,
+                result->output_signature.rms_abs,
+                result->output_signature.p50_abs,
+                result->output_signature.p95_abs,
+                result->output_signature.p99_abs);
+    } else {
+        fputs(" mean_abs=undefined rms_abs=undefined p50_abs=undefined"
+              " p95_abs=undefined p99_abs=undefined", stderr);
+    }
+    if (result->output_signature.relative_l2_defined) {
+        fprintf(stderr, " relative_l2=%.17g",
+                result->output_signature.relative_l2);
+    } else {
+        fputs(" relative_l2=undefined", stderr);
+    }
+    if (result->output_comparison.max_rel_diff_defined) {
+        fprintf(stderr, " max_rel=%.17g",
+                result->output_comparison.max_rel_diff);
+    } else {
+        fputs(" max_rel=undefined", stderr);
+    }
+    if (result->output_comparison.max_ulp_distance_defined) {
+        fprintf(stderr, " max_ulp=%" PRIu32,
+                result->output_comparison.max_ulp_distance);
+    } else {
+        fputs(" max_ulp=undefined", stderr);
+    }
+    fprintf(stderr,
+            " canonicalization_removes_site=%s evidence=PROVEN_BY_SOURCE_AND_TEST\n",
+            canonicalization_removes_site ? "YES" : "NO");
 }
 
 static int ds4_first_divergence_run(ds4_session *s,
@@ -51477,6 +51754,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_first_divergence_capture pass_b = {0};
     ds4_first_divergence_report report = {0};
     ds4_qa_primitive_ab_result qa_ab = {0};
+    ds4_kv_primitive_ab_result kv_ab = {0};
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
@@ -51491,6 +51769,9 @@ static int ds4_first_divergence_run(ds4_session *s,
         strcmp(legacy_canonical_qa_env, "0") != 0) {
         canonical_mask |= DS4_FIRST_DIVERGENCE_CANON_QA;
     }
+    canonical_config_ok = canonical_config_ok &&
+        ((canonical_mask & DS4_FIRST_DIVERGENCE_CANON_KV) == 0 ||
+         (canonical_mask & DS4_FIRST_DIVERGENCE_CANON_QA) != 0);
     const bool canonical_requested = canonical_mask != 0;
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
@@ -51539,9 +51820,14 @@ static int ds4_first_divergence_run(ds4_session *s,
     const bool qa_ab_proven = !qa_ab_requested ||
         (a2_ok && ds4_qa_primitive_ab_run(
             s, &capture_a, start, &qa_ab));
+    const bool kv_ab_requested =
+        (canonical_mask & DS4_FIRST_DIVERGENCE_CANON_KV) != 0;
+    const bool kv_ab_proven = !kv_ab_requested ||
+        (qa_ab_proven && a2_ok && ds4_kv_primitive_ab_run(
+            s, &capture_a, start, &kv_ab));
 
     bool canonical_rerun_ok = !canonical_requested;
-    if (canonical_requested && qa_ab_proven) {
+    if (canonical_requested && qa_ab_proven && kv_ab_proven) {
         ds4_c2b_observable_free(&a0);
         ds4_c2b_observable_free(&a1);
         ds4_c2b_observable_free(&a2);
@@ -51612,7 +51898,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool pass_b_run_ok = false;
     bool pass_b_materialize_ok = false;
     bool report_ok = false;
-    if (control && probe && qa_ab_proven) {
+    if (control && probe && qa_ab_proven && kv_ab_proven) {
         pass_b_init_ok = ds4_first_divergence_capture_init(&pass_b, "PASS_B");
         pass_b_run_ok = pass_b_init_ok && ds4_c45_run_pass_b(
             s, forced_tokens, n_tokens, start, &capture_b);
@@ -51627,13 +51913,63 @@ static int ds4_first_divergence_run(ds4_session *s,
             report_ok = ds4_first_divergence_emit_q_trace(
                 &pass_a, &pass_b, stderr, &q_projection_exact) &&
                 q_projection_exact;
+            if (report_ok && canonical_mask ==
+                                 DS4_FIRST_DIVERGENCE_CANON_QA) {
+                const bool baseline_reproduced =
+                    ds4_first_divergence_report_is(
+                        &report, DS4_FIRST_DIVERGENCE_CP2_KV_P, "kv_raw");
+                fprintf(stderr,
+                        "CANONICALIZATION_SWEEP_BASELINE canonical_set=QA result=%s expected_first_divergence=CP2-KV-P/kv_raw\n",
+                        baseline_reproduced ? "PASS" : "FAIL");
+                report_ok = baseline_reproduced;
+            }
             if (report_ok) {
                 report_ok = ds4_first_divergence_emit_qa_canonical_summary(
                     &report, stderr);
             }
+            if (report_ok) {
+                fputs("CANONICALIZATION_SWEEP_BEGIN baseline_set=QA "
+                      "baseline_first_divergence=CP2-KV-P/kv_raw\n",
+                      stderr);
+            }
+            if (report_ok && (canonical_mask &
+                              DS4_FIRST_DIVERGENCE_CANON_KV) != 0) {
+                bool kv_projection_exact = false;
+                report_ok = ds4_first_divergence_emit_kv_trace(
+                    &pass_a, &pass_b, stderr, &kv_projection_exact) &&
+                    kv_projection_exact;
+                if (report_ok) {
+                    fputs("DRIFT_SOURCE_TABLE\n", stderr);
+                    ds4_projection_drift_source_print(
+                        "CP2-Q", "q_a_projection_output",
+                        "metal_graph_matmul_q8_0_named_tensor_attn_q_a",
+                        "metal_graph_matmul_dense_quant_tensor_attn_q_a",
+                        &qa_ab, true);
+                    ds4_projection_drift_source_print(
+                        "CP2-KV-P", "kv_projection_output_before_persistent_store",
+                        "metal_graph_matmul_q8_0_named_tensor_attn_kv",
+                        "metal_graph_matmul_dense_quant_tensor_attn_kv",
+                        &kv_ab, true);
+                    fputs("SWEEP_STEP index=1 added=KV "
+                          "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
+                          "primitive_non_equivalence=PROVEN_BY_TEST "
+                          "previous_stage_after_patch=EXACT "
+                          "new_first_divergence=",
+                          stderr);
+                    ds4_first_divergence_print_report_location(&report);
+                    fputc('\n', stderr);
+                    fputs("CANONICALIZATION_SWEEP_RESULT "
+                          "canonical_set=QA,KV sources_exposed=2 "
+                          "arithmetic_families=1 family_concentration=HIGH "
+                          "first_divergence=",
+                          stderr);
+                    ds4_first_divergence_print_report_location(&report);
+                    fputc('\n', stderr);
+                }
+            }
         }
     }
-    if (control && probe && qa_ab_proven && !report_ok) {
+    if (control && probe && qa_ab_proven && kv_ab_proven && !report_ok) {
         fprintf(stderr,
                 "C45_ERROR pass_b_init=%d pass_b_run=%d "
                 "materialize_b=%d report=%d\n",
@@ -51653,7 +51989,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_c2b_capture_free(&capture_b);
     ds4_c2b_raw_s0_free(&raw);
     spec_frontier_free(&frontier);
-    return control && probe && qa_ab_proven &&
+    return control && probe && qa_ab_proven && kv_ab_proven &&
         canonical_rerun_ok && report_ok ? 0 : 1;
 }
 

@@ -76,6 +76,23 @@ typedef struct {
     char subobject[DS4_FIRST_DIVERGENCE_SUBOBJECT_MAX];
 } ds4_first_divergence_report;
 
+typedef struct {
+    size_t mismatch_count;
+    double mismatch_fraction;
+    bool finite_metrics_defined;
+    double mean_abs;
+    double rms_abs;
+    double p50_abs;
+    double p95_abs;
+    double p99_abs;
+    bool relative_l2_defined;
+    double relative_l2;
+    bool cosine_similarity_defined;
+    double cosine_similarity;
+    size_t positive_delta_count;
+    size_t negative_delta_count;
+} ds4_first_divergence_float_signature;
+
 bool ds4_first_divergence_capture_init(ds4_first_divergence_capture *capture,
                                        const char *label);
 void ds4_first_divergence_capture_free(ds4_first_divergence_capture *capture);
@@ -130,8 +147,20 @@ bool ds4_first_divergence_emit_q_trace(
         FILE *stream,
         bool *q_projection_exact);
 
+bool ds4_first_divergence_emit_kv_trace(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream,
+        bool *kv_projection_exact);
+
 bool ds4_first_divergence_emit_qa_canonical_summary(
         const ds4_first_divergence_report *report,
         FILE *stream);
+
+bool ds4_first_divergence_float_signature_compute(
+        const float *actual,
+        const float *expected,
+        size_t length,
+        ds4_first_divergence_float_signature *signature);
 
 #endif

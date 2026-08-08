@@ -180,8 +180,8 @@ causal summary.  If another mismatch exists it also emits exactly one
 `NEXT_INDEPENDENT_DRIFT_SOURCE` line.  No later operator is modified.
 
 Evidence label for the implementation and its narrow scope: **PROVEN BY
-SOURCE**.  Evidence that canonicalized CP2-Q becomes exact, and the resulting
-next divergence: **UNKNOWN pending M4 runtime**.
+SOURCE**.  The M4 run proved canonicalized CP2-Q exact and moved the first
+divergence to `CP2-KV-P/kv_raw`: **PROVEN BY TEST**.
 
 Old first divergence:
 
@@ -189,8 +189,13 @@ Old first divergence:
 row=0 layer=0 checkpoint=CP2-Q subobject=qr
 ```
 
-New first divergence: **UNKNOWN pending M4 Phase B run**.
+New first divergence:
 
-Until that run removes CP2-Q divergence, the careful interpretation remains:
-the QA primitives are proven numerically non-equivalent, while QA's status as
-the earliest observed causal drift source is still **UNKNOWN**.
+```text
+row=0 layer=0 checkpoint=CP2-KV-P subobject=kv_raw
+```
+
+The QA primitive numerical non-equivalence is therefore proven to be the
+earliest observed causal drift source, while QA-only sufficiency is disproven.
+The composable KV and later-source investigation is maintained in
+`skill/CODEX-CANONICALIZATION-SWEEP.md`.

@@ -2,6 +2,7 @@
 #include "ds4_float_compare.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -358,6 +359,133 @@ static void print_float_metrics(FILE *stream,
     }
 }
 
+static int compare_double_ascending(const void *lhs, const void *rhs) {
+    const double a = *(const double *)lhs;
+    const double b = *(const double *)rhs;
+    return (a > b) - (a < b);
+}
+
+static double nearest_rank_percentile(const double *sorted,
+                                      size_t length,
+                                      size_t numerator,
+                                      size_t denominator) {
+    size_t rank = (length * numerator + denominator - 1u) / denominator;
+    if (rank == 0) rank = 1;
+    if (rank > length) rank = length;
+    return sorted[rank - 1u];
+}
+
+bool ds4_first_divergence_float_signature_compute(
+        const float *actual,
+        const float *expected,
+        size_t length,
+        ds4_first_divergence_float_signature *signature) {
+    double *absolute_deltas;
+    long double sum_abs = 0.0L;
+    long double sum_delta_sq = 0.0L;
+    long double sum_actual_sq = 0.0L;
+    long double sum_expected_sq = 0.0L;
+    long double dot = 0.0L;
+
+    if (!actual || !expected || !signature || length == 0 ||
+        length > SIZE_MAX / sizeof(*absolute_deltas)) {
+        return false;
+    }
+    memset(signature, 0, sizeof(*signature));
+    signature->finite_metrics_defined = true;
+    absolute_deltas = malloc(length * sizeof(*absolute_deltas));
+    if (!absolute_deltas) return false;
+
+    for (size_t i = 0; i < length; i++) {
+        uint32_t actual_bits;
+        uint32_t expected_bits;
+        const double a = actual[i];
+        const double e = expected[i];
+        const double delta = a - e;
+        memcpy(&actual_bits, actual + i, sizeof(actual_bits));
+        memcpy(&expected_bits, expected + i, sizeof(expected_bits));
+        if (actual_bits != expected_bits) signature->mismatch_count++;
+        if (!isfinite(a) || !isfinite(e) || !isfinite(delta)) {
+            signature->finite_metrics_defined = false;
+            absolute_deltas[i] = 0.0;
+            continue;
+        }
+        if (delta > 0.0) signature->positive_delta_count++;
+        if (delta < 0.0) signature->negative_delta_count++;
+        absolute_deltas[i] = fabs(delta);
+        sum_abs += absolute_deltas[i];
+        sum_delta_sq += (long double)delta * delta;
+        sum_actual_sq += (long double)a * a;
+        sum_expected_sq += (long double)e * e;
+        dot += (long double)a * e;
+    }
+    signature->mismatch_fraction =
+        (double)signature->mismatch_count / (double)length;
+    if (signature->finite_metrics_defined) {
+        qsort(absolute_deltas, length, sizeof(*absolute_deltas),
+              compare_double_ascending);
+        signature->mean_abs = (double)(sum_abs / (long double)length);
+        signature->rms_abs =
+            (double)sqrtl(sum_delta_sq / (long double)length);
+        signature->p50_abs = nearest_rank_percentile(
+            absolute_deltas, length, 50u, 100u);
+        signature->p95_abs = nearest_rank_percentile(
+            absolute_deltas, length, 95u, 100u);
+        signature->p99_abs = nearest_rank_percentile(
+            absolute_deltas, length, 99u, 100u);
+        if (sum_expected_sq > 0.0L) {
+            signature->relative_l2_defined = true;
+            signature->relative_l2 =
+                (double)sqrtl(sum_delta_sq / sum_expected_sq);
+        }
+        if (sum_actual_sq > 0.0L && sum_expected_sq > 0.0L) {
+            signature->cosine_similarity_defined = true;
+            signature->cosine_similarity =
+                (double)(dot / sqrtl(sum_actual_sq * sum_expected_sq));
+        }
+    }
+    free(absolute_deltas);
+    return true;
+}
+
+static bool print_float_signature(
+        FILE *stream,
+        const float *actual,
+        const float *expected,
+        size_t length) {
+    ds4_first_divergence_float_signature signature;
+    if (!ds4_first_divergence_float_signature_compute(
+            actual, expected, length, &signature)) {
+        return false;
+    }
+    fprintf(stream, " mismatch_fraction=%.17g",
+            signature.mismatch_fraction);
+    if (signature.finite_metrics_defined) {
+        fprintf(stream,
+                " mean_abs=%.17g rms_abs=%.17g p50_abs=%.17g p95_abs=%.17g p99_abs=%.17g",
+                signature.mean_abs, signature.rms_abs,
+                signature.p50_abs, signature.p95_abs, signature.p99_abs);
+    } else {
+        fputs(" mean_abs=undefined rms_abs=undefined p50_abs=undefined"
+              " p95_abs=undefined p99_abs=undefined", stream);
+    }
+    if (signature.relative_l2_defined) {
+        fprintf(stream, " relative_l2=%.17g", signature.relative_l2);
+    } else {
+        fputs(" relative_l2=undefined", stream);
+    }
+    if (signature.cosine_similarity_defined) {
+        fprintf(stream, " cosine_similarity=%.17g",
+                signature.cosine_similarity);
+    } else {
+        fputs(" cosine_similarity=undefined", stream);
+    }
+    fprintf(stream, " positive_delta_count=%zu negative_delta_count=%zu",
+            signature.positive_delta_count,
+            signature.negative_delta_count);
+    return ferror(stream) == 0;
+}
+
 bool ds4_first_divergence_emit_q_trace(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,
@@ -423,12 +551,77 @@ bool ds4_first_divergence_emit_q_trace(
     }
     fputs("MISMATCH", stream);
     print_float_metrics(stream, &qr_comparison);
+    if (!print_float_signature(stream,
+                               (const float *)qr_a->data,
+                               (const float *)qr_b->data,
+                               qr_a->element_count)) {
+        return false;
+    }
     fputc('\n', stream);
     fputs("Q_FIRST_DIVERGENCE stage=q_a_projection_output producer_generic=metal_graph_matmul_q8_0_named_tensor_attn_q_a producer_sequential=metal_graph_matmul_dense_quant_tensor_attn_q_a subobject=qr",
           stream);
     print_float_metrics(stream, &qr_comparison);
     fputc('\n', stream);
     fputs("Q_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_Q_PATH\n",
+          stream);
+    return ferror(stream) == 0;
+}
+
+bool ds4_first_divergence_emit_kv_trace(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream,
+        bool *kv_projection_exact) {
+    const ds4_first_divergence_snapshot *kv_a;
+    const ds4_first_divergence_snapshot *kv_b;
+    ds4_float_compare_result comparison;
+
+    if (kv_projection_exact) *kv_projection_exact = false;
+    if (!pass_a || !pass_b || !stream) return false;
+    kv_a = find_snapshot_fields(pass_a, 0, 0,
+                                DS4_FIRST_DIVERGENCE_CP2_KV_P,
+                                "kv_raw");
+    kv_b = find_snapshot_fields(pass_b, 0, 0,
+                                DS4_FIRST_DIVERGENCE_CP2_KV_P,
+                                "kv_raw");
+    fputs("KV_DIVERGENCE_TRACE row=0 layer=0\n", stream);
+    if (!kv_a || !kv_b) {
+        fputs("KV_DIVERGENCE_SANITY FAIL reason=missing_required_snapshot\n",
+              stream);
+        return false;
+    }
+    if (!same_layout(kv_a, kv_b) ||
+        kv_a->kind != DS4_FIRST_DIVERGENCE_PAYLOAD_F32) {
+        fputs("KV_DIVERGENCE_SANITY FAIL reason=non_comparable_layout\n",
+              stream);
+        return false;
+    }
+    if (!ds4_float_compare_exact((const float *)kv_a->data,
+                                 (const float *)kv_b->data,
+                                 kv_a->element_count, &comparison)) {
+        fputs("KV_DIVERGENCE_SANITY FAIL reason=compare_error\n", stream);
+        return false;
+    }
+    fputs("KV_DIVERGENCE_STAGE stage=CP2-KV-P semantic=kv_projection_output_before_persistent_store subobject=kv_raw result=",
+          stream);
+    if (comparison.bit_exact) {
+        fprintf(stream, "EXACT elements=%zu\n", comparison.length);
+        fputs("KV_LOCALIZATION_RESULT KV_PROJECTION_EXACT\n", stream);
+        if (kv_projection_exact) *kv_projection_exact = true;
+        return ferror(stream) == 0;
+    }
+    fputs("MISMATCH", stream);
+    print_float_metrics(stream, &comparison);
+    if (!print_float_signature(stream,
+                               (const float *)kv_a->data,
+                               (const float *)kv_b->data,
+                               kv_a->element_count)) {
+        return false;
+    }
+    fputc('\n', stream);
+    fputs("KV_FIRST_DIVERGENCE stage=kv_projection_output_before_persistent_store producer_generic=metal_graph_matmul_q8_0_named_tensor_attn_kv producer_sequential=metal_graph_matmul_dense_quant_tensor_attn_kv subobject=kv_raw\n",
+          stream);
+    fputs("KV_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_KV_PATH\n",
           stream);
     return ferror(stream) == 0;
 }
@@ -554,6 +747,13 @@ bool ds4_first_divergence_emit_report(
                 fprintf(stream, " max_ulp=%u", comparison.max_ulp_distance);
             } else {
                 fputs(" max_ulp=undefined", stream);
+            }
+            if (!print_float_signature(stream,
+                                       (const float *)a->data,
+                                       (const float *)b->data,
+                                       a->element_count)) {
+                free(ordered);
+                return false;
             }
             fputc('\n', stream);
         } else {

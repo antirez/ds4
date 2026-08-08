@@ -1,5 +1,6 @@
 #include "first_divergence_capture.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -78,11 +79,16 @@ int main(void) {
     ds4_first_divergence_capture q_pass_b;
     FILE *q_log;
     bool q_projection_exact;
+    bool kv_projection_exact;
+    ds4_first_divergence_float_signature signature;
     char q_log_text[4096];
     size_t q_log_bytes;
     const float cp1[] = {1.0f, -0.0f, 3.5f};
     const float qr_a[] = {0.125f, -0.5f, 1.0f, 2.0f};
     const float qr_b[] = {0.12500001f, -0.5f, 1.0000001f, 2.0f};
+    const float kv_raw[] = {0.25f, -1.5f, 4.0f};
+    const float signature_actual[] = {1.0f, 3.0f, 5.0f, 7.0f};
+    const float signature_expected[] = {1.0f, 2.0f, 4.0f, 8.0f};
     const uint32_t n_comp = 17;
     const int forced_tokens[] = {101, 202, 303};
     pair_fixture fixture = {
@@ -112,6 +118,21 @@ int main(void) {
     REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
                        DS4_FIRST_DIVERGENCE_CP2_KV_R),
                    "CP2-KV-R") == 0);
+    REQUIRE(ds4_first_divergence_float_signature_compute(
+        signature_actual, signature_expected, 4, &signature));
+    REQUIRE(signature.mismatch_count == 3);
+    REQUIRE(signature.mismatch_fraction == 0.75);
+    REQUIRE(signature.finite_metrics_defined);
+    REQUIRE(signature.mean_abs == 0.75);
+    REQUIRE(fabs(signature.rms_abs - sqrt(0.75)) < 1e-15);
+    REQUIRE(signature.p50_abs == 1.0);
+    REQUIRE(signature.p95_abs == 1.0);
+    REQUIRE(signature.p99_abs == 1.0);
+    REQUIRE(signature.relative_l2_defined);
+    REQUIRE(fabs(signature.relative_l2 - sqrt(3.0 / 85.0)) < 1e-15);
+    REQUIRE(signature.cosine_similarity_defined);
+    REQUIRE(signature.positive_delta_count == 2);
+    REQUIRE(signature.negative_delta_count == 1);
     ds4_first_divergence_capture_free(&capture);
     REQUIRE(capture.count == 0);
 
@@ -150,6 +171,12 @@ int main(void) {
     REQUIRE(ds4_first_divergence_capture_f32(
         &q_pass_b, 0, 0, DS4_FIRST_DIVERGENCE_CP2_Q, "qr",
         qr_b, sizeof(qr_b) / sizeof(qr_b[0])));
+    REQUIRE(ds4_first_divergence_capture_f32(
+        &q_pass_a, 0, 0, DS4_FIRST_DIVERGENCE_CP2_KV_P, "kv_raw",
+        kv_raw, sizeof(kv_raw) / sizeof(kv_raw[0])));
+    REQUIRE(ds4_first_divergence_capture_f32(
+        &q_pass_b, 0, 0, DS4_FIRST_DIVERGENCE_CP2_KV_P, "kv_raw",
+        kv_raw, sizeof(kv_raw) / sizeof(kv_raw[0])));
     q_log = tmpfile();
     REQUIRE(q_log != NULL);
     REQUIRE(ds4_first_divergence_emit_report(
@@ -184,6 +211,9 @@ int main(void) {
     REQUIRE(ds4_first_divergence_emit_q_trace(
         &q_pass_a, &q_pass_b, q_log, &q_projection_exact));
     REQUIRE(q_projection_exact);
+    REQUIRE(ds4_first_divergence_emit_kv_trace(
+        &q_pass_a, &q_pass_b, q_log, &kv_projection_exact));
+    REQUIRE(kv_projection_exact);
     REQUIRE(ds4_first_divergence_emit_qa_canonical_summary(
         &report, q_log));
     report.first_divergence_found = true;
@@ -202,6 +232,10 @@ int main(void) {
                    "stage=CP2-Q semantic=q_a_projection_output subobject=qr result=EXACT") != NULL);
     REQUIRE(strstr(q_log_text,
                    "Q_LOCALIZATION_RESULT QA_PROJECTION_EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "stage=CP2-KV-P semantic=kv_projection_output_before_persistent_store subobject=kv_raw result=EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "KV_LOCALIZATION_RESULT KV_PROJECTION_EXACT") != NULL);
     REQUIRE(strstr(q_log_text,
                    "QA_CANONICALIZATION_RESULT baseline_first_divergence=row=0,layer=0,checkpoint=CP2-Q,q_a_projection_output qa_after_patch=EXACT new_first_divergence=NONE") != NULL);
     REQUIRE(strstr(q_log_text,
