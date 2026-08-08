@@ -213,12 +213,12 @@ Q-A normalization and Q-B/Q-RoPE; persistent KV store and compressor frontier
 precede the attention-head result; the HC post expansion ends at CP4.
 
 The output-projection temporary is deliberately not made a frozen comparison
-object.  On the tested single-device Metal configuration, generic execution
-can fuse both Q8_0 output projections to F16 before HC expansion, while the
-canonical sequential tail uses its existing low-rank/output/HC fusion.  A
-standalone common F32 `attn_out` would therefore require changing or
-recomputing a canonical path.  `CP4-HEADS` and CP4 bracket that asymmetric
-fused tail without disabling fusion.
+object.  On the tested single-device Metal configuration, the F16 output/HC
+fast-path entry points are unavailable stubs. Generic execution therefore
+uses the F32 batched output projection and separate HC expansion, while the
+canonical sequential tail uses its existing low-rank/output/HC fusion. A
+standalone common F32 `attn_out` still does not exist on both paths.
+`CP4-HEADS` and CP4 bracket that asymmetric tail without disabling fusion.
 
 All new snapshots are preallocated and copied by
 `ds4_gpu_tensor_copy_f32_inline()` from the existing end-of-layer capture
@@ -441,13 +441,14 @@ weights, and Q8_0 output-B weights:
 | generic | `metal_graph_attention_output_dense_quant_batch` then `ds4_gpu_hc_expand_split_tensor` |
 | sequential | per-row `ds4_gpu_attention_output_low_q8_tensor` then `ds4_gpu_matmul_q8_0_hc_expand_tensor` |
 
-On Metal, the batch-F16 output and half-HC helpers are unavailable stubs.  The
-ordinary generic verifier therefore uses this F32 fallback.  The isolated test
-must use the same fallback instead of treating the unavailable fast-path probe
-as a hard failure.  The test covers output-A, output-B, HC expansion, and
-residual addition. Because the sequential path fuses output-B with HC expansion,
-attribution to one component inside the compound tail remains `UNKNOWN`. Only
-the final F32 `after_attn_hc` is compared bitwise.
+The generic F16 fast-path entry points are explicit Metal stubs returning zero;
+the production call site falls through to the F32 path above. The isolated
+fixture skips only those side-effect-free unavailable probes.
+
+This covers output-A, output-B, HC expansion, and residual addition. Because
+neither path naturally materializes the same
+post-output-B object, attribution to one component inside the compound tail
+remains `UNKNOWN`. Only the final F32 `after_attn_hc` is compared bitwise.
 
 Run the isolated A/B without tail substitution:
 

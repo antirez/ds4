@@ -51975,9 +51975,8 @@ typedef struct {
 /* Isolate the complete asymmetric CP4 tail without introducing an online
  * checkpoint.  Both calls consume clones of the exact same captured F32
  * heads, residual HC and HC split state.  The generic side invokes the real
- * Metal F32 batch output projection fallback plus F32 HC expand; the sequential
- * side invokes the real F32 low projection plus fused Q8 output-B/HC epilogue
- * row by row. */
+ * batch F32 output projection plus HC split expand; the sequential side invokes
+ * the real F32 low projection plus fused Q8 output-B/HC epilogue row by row. */
 static bool ds4_cp4_tail_primitive_ab_run(
         ds4_session *s,
         const ds4_c2b_capture *capture,
@@ -51996,13 +51995,14 @@ static bool ds4_cp4_tail_primitive_ab_run(
     float *generic_output_cpu = NULL;
     float *sequential_output_cpu = NULL;
     ds4_float_compare_result input_comparison;
+    const char *failure_stage = "preconditions";
     bool ok = false;
-    const char *error_stage = "allocation";
 
     fputs("CP4_TAIL_SOURCE_AUDIT "
           "generic_path=metal_graph_attention_output_dense_quant_batch+ds4_gpu_hc_expand_split_tensor "
           "sequential_path=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
-          "generic_primitives=Q8_output_A_batch+Q8_output_B_batch+HC_split_F32_expand_residual_add "
+          "unavailable_fastpath=ds4_gpu_attention_output_q8_batch_f16_tensor+ds4_gpu_hc_expand_split_half_tensor "
+          "generic_primitives=Q8_output_A_batch+Q8_output_B_batch+F32_HC_split_expand_residual_add "
           "sequential_primitives=Q8_output_A_single_F32+Q8_output_B_single+fused_HC_expand_residual_add "
           "candidate_family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
           "component_attribution=UNKNOWN evidence=PROVEN_BY_SOURCE\n",
@@ -52074,6 +52074,7 @@ static bool ds4_cp4_tail_primitive_ab_run(
         return false;
     }
 
+    failure_stage = "allocation";
     seq_heads = ds4_gpu_tensor_alloc(heads_bytes);
     seq_cur_hc = ds4_gpu_tensor_alloc(hc_bytes);
     seq_hc_split = ds4_gpu_tensor_alloc(split_bytes);
@@ -52087,9 +52088,10 @@ static bool ds4_cp4_tail_primitive_ab_run(
         !generic_attn_out || !generic_after || !sequential_low ||
         !sequential_attn_out || !sequential_after) goto done;
 
-    error_stage = "input_clone";
+    failure_stage = "input_clone_begin";
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
+        failure_stage = "input_clone_copy";
         ok = ds4_c2b_inline_copy(seq_heads, 0,
                                   capture->cp4_heads[0], 0,
                                   heads_bytes) &&
@@ -52100,7 +52102,10 @@ static bool ds4_cp4_tail_primitive_ab_run(
                                   capture->cp4_tail_hc_split[0], 0,
                                   split_bytes);
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) {
+        failure_stage = "input_clone_end";
+        ok = ds4_gpu_end_commands() != 0;
+    }
     else (void)ds4_gpu_synchronize();
     if (!ok) goto done;
 
@@ -52110,6 +52115,7 @@ static bool ds4_cp4_tail_primitive_ab_run(
     sequential_output_cpu = xmalloc(output_values * sizeof(float));
     const size_t heads_values = (size_t)(heads_bytes / sizeof(float));
     const size_t hc_values = (size_t)(hc_bytes / sizeof(float));
+    failure_stage = "input_read_compare";
     if (!ds4_gpu_tensor_read(capture->cp4_heads[0], 0,
                              generic_input_cpu, heads_bytes) ||
         !ds4_gpu_tensor_read(capture->cp4_tail_cur_hc[0], 0,
@@ -52131,9 +52137,10 @@ static bool ds4_cp4_tail_primitive_ab_run(
     result->input_bits_equal = input_comparison.bit_exact;
     if (!result->input_bits_equal) goto done;
 
-    error_stage = "generic_output_projection";
+    failure_stage = "tail_begin";
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
+        failure_stage = "generic_output_projection";
         ok = metal_graph_attention_output_dense_quant_batch(
                 generic_attn_out, generic_low, &s->graph,
                 &s->engine->model,
@@ -52142,7 +52149,7 @@ static bool ds4_cp4_tail_primitive_ab_run(
                 capture->cp4_heads[0], rows);
     }
     if (ok) {
-        error_stage = "generic_hc_expand";
+        failure_stage = "generic_hc_expand";
         ok = ds4_gpu_hc_expand_split_tensor(
                 generic_after, generic_attn_out,
                 capture->cp4_tail_cur_hc[0],
@@ -52150,38 +52157,35 @@ static bool ds4_cp4_tail_primitive_ab_run(
                 DS4_N_EMBD, DS4_N_HC) != 0;
     }
     if (ok) {
-        error_stage = "sequential_tail";
+        failure_stage = "sequential_tail";
         ok = metal_graph_attention_output_hc_canonical_rows(
                 sequential_after, sequential_low, sequential_attn_out,
                 &s->engine->model, layer,
                 seq_heads, seq_cur_hc, seq_hc_split, rows);
     }
     if (ok) {
-        error_stage = "command_completion";
+        failure_stage = "tail_end";
         ok = ds4_gpu_end_commands() != 0;
-    } else {
-        (void)ds4_gpu_synchronize();
     }
-    if (ok) error_stage = "output_read_compare";
-    if (!ok ||
-        !ds4_gpu_tensor_read(generic_after, 0,
+    else (void)ds4_gpu_synchronize();
+    if (!ok) goto done;
+    failure_stage = "output_read";
+    if (!ds4_gpu_tensor_read(generic_after, 0,
                              generic_output_cpu, hc_bytes) ||
         !ds4_gpu_tensor_read(sequential_after, 0,
-                             sequential_output_cpu, hc_bytes) ||
-        !ds4_float_compare_exact(generic_output_cpu,
+                             sequential_output_cpu, hc_bytes)) goto done;
+    failure_stage = "output_compare";
+    if (!ds4_float_compare_exact(generic_output_cpu,
                                  sequential_output_cpu,
                                  output_values,
-                                 &result->output_comparison) ||
-        !ds4_first_divergence_float_signature_compute(
+                                 &result->output_comparison)) goto done;
+    failure_stage = "output_signature";
+    if (!ds4_first_divergence_float_signature_compute(
             generic_output_cpu, sequential_output_cpu,
-            output_values, &result->output_signature)) {
-        ok = false;
-        goto done;
-    }
+            output_values, &result->output_signature)) goto done;
     result->executed = true;
     result->numerical_non_equivalence =
         !result->output_comparison.bit_exact;
-    error_stage = "none";
 
 done:
     fprintf(stderr,
@@ -52194,6 +52198,9 @@ done:
             result->executed
                 ? (result->output_comparison.bit_exact ? "EXACT" : "MISMATCH")
                 : "ERROR");
+    if (!result->executed) {
+        fprintf(stderr, " failed_stage=%s", failure_stage);
+    }
     if (result->executed) {
         if (result->output_comparison.bit_exact) {
             fputs(" mismatch_count=0 first_index=none generic_bits=none "
@@ -52203,8 +52210,6 @@ done:
             ds4_projection_primitive_ab_print_metrics(
                 &result->output_comparison, &result->output_signature);
         }
-    } else {
-        fprintf(stderr, " reason=%s", error_stage);
     }
     fprintf(stderr, " evidence=%s\n",
             result->executed ? "PROVEN_BY_TEST" : "UNKNOWN");
