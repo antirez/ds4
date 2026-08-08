@@ -51131,6 +51131,184 @@ static bool ds4_c2b_compare_observables(const char *comparison,
     return exact;
 }
 
+typedef struct {
+    bool executed;
+    bool input_bits_equal;
+    bool weights_same;
+    bool numerical_non_equivalence;
+    ds4_float_compare_result output_comparison;
+} ds4_qa_primitive_ab_result;
+
+static void ds4_qa_primitive_ab_print_metrics(
+        const ds4_float_compare_result *comparison) {
+    fprintf(stderr,
+            " mismatch_count=%zu first_index=%zu generic_bits=0x%08" PRIx32
+            " sequential_bits=0x%08" PRIx32,
+            comparison->mismatch_count,
+            comparison->first_mismatch_index,
+            comparison->first_actual_bits,
+            comparison->first_expected_bits);
+    if (comparison->max_abs_diff_defined) {
+        fprintf(stderr, " max_abs=%.17g", comparison->max_abs_diff);
+    } else {
+        fputs(" max_abs=undefined", stderr);
+    }
+    if (comparison->max_rel_diff_defined) {
+        fprintf(stderr, " max_rel=%.17g", comparison->max_rel_diff);
+    } else {
+        fputs(" max_rel=undefined", stderr);
+    }
+    if (comparison->max_ulp_distance_defined) {
+        fprintf(stderr, " max_ulp=%" PRIu32,
+                comparison->max_ulp_distance);
+    } else {
+        fputs(" max_ulp=undefined", stderr);
+    }
+}
+
+/* Re-run only layer-0 Q-A on the real Pass-A CP1 bits.  The generic call
+ * receives the original verifier row count, while the sequential call sees
+ * row 0 through a view of the exact same GPU allocation.  Both calls use the
+ * same model map, tensor metadata, weight offset and Q8_0 bytes. */
+static bool ds4_qa_primitive_ab_run(
+        ds4_session *s,
+        const ds4_c2b_capture *capture,
+        uint32_t start,
+        ds4_qa_primitive_ab_result *result) {
+    ds4_gpu_tensor *generic_out = NULL;
+    ds4_gpu_tensor *sequential_out = NULL;
+    ds4_gpu_tensor *sequential_input = NULL;
+    float *generic_input_cpu = NULL;
+    float *sequential_input_cpu = NULL;
+    float *generic_output_cpu = NULL;
+    float *sequential_output_cpu = NULL;
+    ds4_float_compare_result input_comparison;
+    bool ok = false;
+
+    if (!result) return false;
+    memset(result, 0, sizeof(*result));
+    if (!s || !capture || capture->graph != &s->graph ||
+        capture->n_tokens < 2u || !capture->cp1[0]) {
+        fputs("QA_PRIMITIVE_AB input_bits_equal=FAIL weights_same=FAIL "
+              "elements=0 result=ERROR reason=invalid_real_shape_fixture\n",
+              stderr);
+        fputs("QA_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
+        return false;
+    }
+
+    const ds4_layer_weights *layer = &s->engine->weights.layer[0];
+    const ds4_tensor *weight = layer->attn_q_a;
+    const uint64_t in_dim = DS4_N_EMBD;
+    const uint64_t out_dim = weight ? weight->dim[1] : 0;
+    const uint64_t input_bytes = in_dim * sizeof(float);
+    const uint64_t output_bytes = out_dim * sizeof(float);
+    const uint64_t generic_output_bytes =
+        (uint64_t)capture->n_tokens * output_bytes;
+    result->weights_same = weight && weight->type == DS4_TENSOR_Q8_0 &&
+        weight->dim[0] == in_dim && out_dim != 0 &&
+        capture->q_values[0] == out_dim;
+    if (!result->weights_same ||
+        ds4_gpu_tensor_bytes(capture->cp1[0]) <
+            (uint64_t)capture->n_tokens * input_bytes) {
+        fprintf(stderr,
+                "QA_PRIMITIVE_AB input_bits_equal=FAIL weights_same=%s "
+                "elements=%llu result=ERROR reason=invalid_weight_or_input_layout\n",
+                result->weights_same ? "PASS" : "FAIL",
+                (unsigned long long)out_dim);
+        fputs("QA_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
+        return false;
+    }
+
+    sequential_input = ds4_gpu_tensor_view(capture->cp1[0], 0, input_bytes);
+    generic_out = ds4_gpu_tensor_alloc(generic_output_bytes);
+    sequential_out = ds4_gpu_tensor_alloc(output_bytes);
+    if (!sequential_input || !generic_out || !sequential_out) goto done;
+
+    generic_input_cpu = xmalloc((size_t)input_bytes);
+    sequential_input_cpu = xmalloc((size_t)input_bytes);
+    generic_output_cpu = xmalloc((size_t)output_bytes);
+    sequential_output_cpu = xmalloc((size_t)output_bytes);
+    if (!ds4_gpu_tensor_read(capture->cp1[0], 0,
+                             generic_input_cpu, input_bytes) ||
+        !ds4_gpu_tensor_read(sequential_input, 0,
+                             sequential_input_cpu, input_bytes) ||
+        !ds4_float_compare_exact(generic_input_cpu, sequential_input_cpu,
+                                 (size_t)in_dim, &input_comparison)) {
+        goto done;
+    }
+    result->input_bits_equal = input_comparison.bit_exact;
+    if (!result->input_bits_equal) goto done;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = metal_graph_matmul_q8_0_named_tensor(
+            "attn_q_a", 0, start, generic_out,
+            &s->engine->model, weight, in_dim, out_dim,
+            capture->cp1[0], capture->n_tokens);
+    }
+    if (ok) {
+        ok = metal_graph_matmul_dense_quant_tensor(
+            sequential_out, &s->engine->model, weight,
+            in_dim, out_dim, sequential_input, 1);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok ||
+        !ds4_gpu_tensor_read(generic_out, 0,
+                             generic_output_cpu, output_bytes) ||
+        !ds4_gpu_tensor_read(sequential_out, 0,
+                             sequential_output_cpu, output_bytes) ||
+        !ds4_float_compare_exact(generic_output_cpu,
+                                 sequential_output_cpu,
+                                 (size_t)out_dim,
+                                 &result->output_comparison)) {
+        ok = false;
+        goto done;
+    }
+    result->executed = true;
+    result->numerical_non_equivalence =
+        !result->output_comparison.bit_exact;
+
+done:
+    fprintf(stderr,
+            "QA_PRIMITIVE_AB input_bits_equal=%s weights_same=%s "
+            "elements=%llu result=%s",
+            result->input_bits_equal ? "PASS" : "FAIL",
+            result->weights_same ? "PASS" : "FAIL",
+            (unsigned long long)out_dim,
+            result->executed
+                ? (result->output_comparison.bit_exact ? "EXACT" : "MISMATCH")
+                : "ERROR");
+    if (result->executed) {
+        if (result->output_comparison.bit_exact) {
+            fputs(" mismatch_count=0 first_index=none generic_bits=none "
+                  "sequential_bits=none max_abs=0 max_rel=0 max_ulp=0",
+                  stderr);
+        } else {
+            ds4_qa_primitive_ab_print_metrics(&result->output_comparison);
+        }
+    }
+    fputc('\n', stderr);
+    if (result->executed && result->input_bits_equal &&
+        result->weights_same && result->numerical_non_equivalence) {
+        fputs("QA_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST\n",
+              stderr);
+        ok = true;
+    } else {
+        fputs("QA_PRIMITIVE_ISOLATION_INCONCLUSIVE\n", stderr);
+        ok = false;
+    }
+
+    free(sequential_output_cpu);
+    free(generic_output_cpu);
+    free(sequential_input_cpu);
+    free(generic_input_cpu);
+    ds4_gpu_tensor_free(sequential_out);
+    ds4_gpu_tensor_free(generic_out);
+    ds4_gpu_tensor_free(sequential_input);
+    return ok;
+}
+
 static bool ds4_c2b_restore_s0(ds4_session *s,
                                ds4_spec_frontier *frontier,
                                const ds4_c2b_raw_s0 *raw,
@@ -51225,6 +51403,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_first_divergence_capture pass_a = {0};
     ds4_first_divergence_capture pass_b = {0};
     ds4_first_divergence_report report = {0};
+    ds4_qa_primitive_ab_result qa_ab = {0};
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
@@ -51267,6 +51446,12 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool a2_ok = restore2_ok &&
         ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, &capture_a,
                           &a2, n_comp_before, n_index_before);
+    const char *qa_ab_env = getenv("DS4_QA_PRIMITIVE_AB");
+    const bool qa_ab_requested =
+        qa_ab_env && qa_ab_env[0] && strcmp(qa_ab_env, "0") != 0;
+    const bool qa_ab_proven = !qa_ab_requested ||
+        (a2_ok && ds4_qa_primitive_ab_run(
+            s, &capture_a, start, &qa_ab));
     const bool pass_a_init_ok = a2_ok &&
         ds4_first_divergence_capture_init(&pass_a, "PASS_A");
     const bool pass_a_materialize_ok = pass_a_init_ok &&
@@ -51312,7 +51497,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     bool pass_b_run_ok = false;
     bool pass_b_materialize_ok = false;
     bool report_ok = false;
-    if (control && probe) {
+    if (control && probe && qa_ab_proven) {
         pass_b_init_ok = ds4_first_divergence_capture_init(&pass_b, "PASS_B");
         pass_b_run_ok = pass_b_init_ok && ds4_c45_run_pass_b(
             s, forced_tokens, n_tokens, start, &capture_b);
@@ -51322,7 +51507,7 @@ static int ds4_first_divergence_run(ds4_session *s,
             ds4_first_divergence_emit_report(
                 &pass_a, &pass_b, stderr, &report);
     }
-    if (control && probe && !report_ok) {
+    if (control && probe && qa_ab_proven && !report_ok) {
         fprintf(stderr,
                 "C45_ERROR pass_b_init=%d pass_b_run=%d "
                 "materialize_b=%d report=%d\n",
@@ -51341,7 +51526,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_c2b_capture_free(&capture_b);
     ds4_c2b_raw_s0_free(&raw);
     spec_frontier_free(&frontier);
-    return control && probe && report_ok ? 0 : 1;
+    return control && probe && qa_ab_proven && report_ok ? 0 : 1;
 }
 
 /* Commit an intermediate state captured by a tiny speculative verifier.
