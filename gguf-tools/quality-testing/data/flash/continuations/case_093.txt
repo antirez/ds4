@@ -1,3 +1,1 @@
-Here’s a clear explanation of why a page cache makes a second file read faster.
-
-### The Core Reason: Avoiding
+To understand why a second file read is faster, you have to look at the difference between **where the data lives**

@@ -184,7 +184,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
-            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: 0.9");
+            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: 0.7");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
@@ -304,6 +304,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "--raw-prompt", "Non-interactive -p only: tokenize prompt without agent chat/tool text.");
+    opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
@@ -332,6 +333,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+    opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
@@ -541,7 +543,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through Chrome-backed web tools.");
         para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM models use native <tool_call> syntax. Both are rendered live in the terminal.");
-        para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
+        para(fp, c, "Edit uses exact old/new replacement. --edit-upto enables anchored replacements between a unique head and tail.");
         fputc('\n', fp);
     } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
     else if (tool == DS4_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);

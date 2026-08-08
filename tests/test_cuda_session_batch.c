@@ -11,6 +11,8 @@
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-session-batch
+ * Set DS4_TEST_SERVER_PREFILL=1 to exercise the progress-split prefill path
+ * used by ds4-server.
  */
 
 #include "ds4.h"
@@ -56,6 +58,14 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
+static void display_progress_noop(void *ud, const char *event,
+                                  int current, int total) {
+    (void)ud;
+    (void)event;
+    (void)current;
+    (void)total;
+}
+
 static void fail(const char *what, int session, int step) {
     fprintf(stderr, "FAIL: %s session=%d step=%d\n", what, session, step);
     exit(1);
@@ -97,6 +107,7 @@ int main(void) {
         fprintf(stderr, "FAIL: DS4_TEST_MODEL is not set\n");
         return 1;
     }
+    const bool server_prefill = getenv("DS4_TEST_SERVER_PREFILL") != NULL;
 
     int session_count = DEFAULT_SESSION_COUNT;
     const char *session_count_env = getenv("DS4_TEST_SESSION_COUNT");
@@ -186,6 +197,10 @@ int main(void) {
         }
         if (ds4_session_create(&batched[i], engine, (uint32_t)test_ctx) != 0) {
             fail("session create", i, -1);
+        }
+        if (server_prefill) {
+            ds4_session_set_display_progress(
+                    batched[i], display_progress_noop, NULL);
         }
         if (ds4_session_sync(batched[i], &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: prefill session=%d: %s\n", i, err);
@@ -299,8 +314,15 @@ int main(void) {
     int nonexact = 0;
     for (int i = 0; i < session_count; i++) {
         ds4_session *control = NULL;
-        if (ds4_session_create(&control, engine, (uint32_t)test_ctx) != 0 ||
-            ds4_session_sync(control, &prompt[i], err, sizeof(err)) != 0) {
+        if (ds4_session_create(&control, engine, (uint32_t)test_ctx) != 0) {
+            fprintf(stderr, "FAIL: control session create=%d\n", i);
+            return 1;
+        }
+        if (server_prefill) {
+            ds4_session_set_display_progress(
+                    control, display_progress_noop, NULL);
+        }
+        if (ds4_session_sync(control, &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: control prefill session=%d: %s\n", i, err);
             return 1;
         }

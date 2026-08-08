@@ -1,1 +1,1 @@
-La cache KV (Key-Value) su disco è particolarmente utile nelle **sessioni agentiche** (d
+La cache KV (Key-Value) su disco è una tecnica fondamentale per le sessioni agentiche, ovvero

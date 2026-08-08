@@ -61,6 +61,15 @@ The software is currently very fast changing. Consider it beta quality.
 Before each release, a big QA run is executed, however instabilities
 are definitely possible.
 
+# How to use this project?
+
+I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+
+1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
+2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+
+So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
+
 ## More Documentation
 
 If you are looking for very specific things, we have other
@@ -102,11 +111,17 @@ projections, routing) are left untouched to guarantee quality.
 Download one main model. **Prefer the imatrix versions.**
 
 ```sh
-./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
-./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
-./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
+./download_model.sh ds4f-q2      # 96/128 GB RAM machines
+./download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
+./download_model.sh ds4f-q4      # >= 256 GB RAM machines
+./download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
+
+The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
+than requantizing them. It runs on Metal and CUDA; Blackwell CUDA devices use
+native FP4 matrix instructions and FP4 activations for batched expert work.
+Decode and other CUDA devices use Q8 activations.
 
 For the full PRO Q4 distributed run, download one half on each machine:
 
@@ -129,12 +144,6 @@ model-building work and can take a long time on the full DeepSeek V4 Flash
 weights. Flash GGUF generation is supported by the local tools. PRO GGUF
 production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
-
-`./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
-but must be enabled explicitly with `--mtp`. The current MTP/speculative
-decoding path is still experimental: it is correctness-gated and currently
-provides at most a slight speedup, not a meaningful generation-speed win.
 
 GLM 5.2 support is limited to the GGUF files tested by this branch:
 
@@ -199,16 +208,17 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
-The released DSpark checkpoint is packaged here as a separate support GGUF of
-about 5.6 GiB. It is not a standalone model. Download it once:
+The DSpark checkpoint for Flash 0731 is packaged here as a separate support
+GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 
 ```sh
-./download_model.sh dspark-support
+./download_model.sh ds4f-dspark
 ```
 
-The same support file can be used with the Flash `q2-imatrix`,
-`q2-q4-imatrix`, and `q4-imatrix` models listed above. For now **DeepSeek
-V4 PRO** is not supported. On Metal, the main model may be resident or use
+The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
+`ds4f-q4` models listed above. It is checkpoint-specific
+and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
+is not supported. On Metal, the main model may be resident or use
 `--ssd-streaming`; the support model still adds its own weights and runtime
 state to the memory requirement. DSpark replaces the legacy one-stage MTP
 support model for that run rather than stacking with it.
@@ -217,12 +227,12 @@ Run it with greedy decoding:
 
 ```sh
 ./ds4 -m ds4flash.gguf \
-  --mtp gguf/DeepSeek-V4-Flash-DSpark-support.gguf \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
   --dspark --temp 0
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-The default confidence threshold is `0.9`; it prunes suffixes that are unlikely
+The default confidence threshold is `0.7`; it prunes suffixes that are unlikely
 to repay their verification cost. `--dspark-confidence 0` forces fixed
 five-token blocks and is intended for diagnostics. Sampled decoding does not
 use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
@@ -230,31 +240,38 @@ decoding, which is useful for comparisons and correctness checks.
 
 ## Speed
 
-*Warning: some of those numbers may no longer be updated, because of the optimization
-efforts that improved the runtime speed without updating the benchmark
-results.*
+The current q2 results use `ds4-bench` with the standard *Promessi sposi*
+input, 2048-token context steps, and 128 greedy generation tokens at every
+frontier. Each prefill number is for the next 2048-token chunk. The complete
+sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
+[gb10.csv](speed-bench/gb10.csv).
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+| Machine | Backend | Context | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| MacBook Pro M5 Max, 128 GB | Metal | 2048 | 790.18 t/s | 39.35 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 16384 | 572.53 t/s | 36.14 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 32768 | 557.04 t/s | 34.36 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 65536 | 398.50 t/s | 27.64 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 2048 | 825.76 t/s | 18.05 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 16384 | 872.44 t/s | 15.10 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 32768 | 855.94 t/s | 14.43 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 65536 | 822.98 t/s | 13.84 t/s |
+
+Older measurements for machines and model variants not rerun in this pass are
+kept for reference. They used the earlier CLI prompt procedure and are not
+directly comparable with the table above.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
 | MacBook Pro M3 Max, 128 GB | q2 | short | 58.52 t/s | 26.68 t/s |
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
-| MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
-| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-![M3 Max t/s](speed-bench/m3_max_ts.svg)
+![M5 Max t/s](speed-bench/m5_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
 
 ## Running models larger than RAM
@@ -305,7 +322,7 @@ the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
 
 ```sh
-./download_model.sh q2-imatrix
+./download_model.sh ds4f-q2
 
 ./ds4 \
   -m ./ds4flash.gguf \
@@ -702,14 +719,14 @@ unsupported grouped routed shapes use the exact fallback and have lower
 aggregate serving throughput. Download and build the L40S target with:
 
 ```sh
-./download_model.sh q4-imatrix
+./download_model.sh ds4f-q4
 make cuda CUDA_ARCH=sm_89
 ```
 
 This is the interactive-agent setup used on the eight-L40S server:
 
 ```sh
-MODEL=gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf
+MODEL=gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
 
 ./ds4-agent --cuda --cuda-tensor-parallel \
   --gpu-vram auto \
@@ -733,10 +750,11 @@ across requests. The tested host is configured for up to 16 resident sessions:
 
 The equivalent local launchers are `./run-nvidia-tp-agent.sh` and
 `./run-nvidia-tp-server.sh`. The server launcher also enables the on-disk KV
-cache. Reduce the session count or context size if the requested resident KV
-caches do not fit after model loading. CUDA TP, half-resident expert ownership,
-output sharding, pipelined prefill, and compatible grouped decode are selected
-by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
+cache and defaults to the native 0731 MXFP4 GGUF. Set `DS4_MODEL` to use the Q4
+file above instead. Reduce the session count or context size if the requested
+resident KV caches do not fit after model loading. CUDA TP, half-resident expert
+ownership, output sharding, pipelined prefill, and compatible grouped decode are
+selected by `--cuda-tensor-parallel`; no `DS4_CUDA_*` environment tuning is required.
 Without an explicit `--prefill-chunk`, this mode uses 2048-token chunks so the
 tested 16-session, 100k-context layout retains enough VRAM for resident KV
 caches. An explicit `--prefill-chunk` remains an override for other topologies.
@@ -984,9 +1002,13 @@ request is never evicted. Choose `N` and `--ctx` so all resident KV allocations
 fit in GPU memory. Without this option, inference retains the original
 single-session behavior.
 
-Batching is exact: when a native batched kernel is unavailable, DwarfStar runs
-the affected rows in a fixed order and returns the same full logits as separate
-session evaluations. The current backend behavior is:
+While generation is active, prefill yields every 128 tokens by default.
+`--mixed-prefill-quantum N` changes that interval for testing; larger values
+reduce scheduling handoffs but can make active decoders wait longer.
+
+Decode batching is exact: when a native batched kernel is unavailable,
+DwarfStar runs the affected rows in a fixed order and returns the same full
+logits as separate session evaluations. The current backend behavior is:
 
 | Backend and model | Session execution |
 | --- | --- |

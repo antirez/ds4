@@ -441,6 +441,7 @@ static int routed_moe_q2_float_down_launch(
 typedef struct {
     int q4k_path;
     int iq2_path;
+    int iq2_iq2_path;
     int q2k_path;
     uint64_t gate_bytes;
     uint64_t down_bytes;
@@ -490,8 +491,10 @@ static int routed_moe_build_plan(
     }
     plan->q4k_path = (gate_type == 12u && down_type == 12u);
     plan->iq2_path = (gate_type == 16u && down_type == 10u);
+    plan->iq2_iq2_path = (gate_type == 16u && down_type == 16u);
     plan->q2k_path = (gate_type == 10u && down_type == 10u);
-    if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path) return 0;
+    if (!plan->q4k_path && !plan->iq2_path &&
+        !plan->iq2_iq2_path && !plan->q2k_path) return 0;
     if (!cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &plan->gate_bytes) ||
         !cuda_u64_mul_checked(n_total_expert, down_expert_bytes, &plan->down_bytes) ||
         !cuda_model_range_fits(model_size, gate_offset, plan->gate_bytes) ||
@@ -553,6 +556,8 @@ static int routed_moe_launch(
     }
     const int q4k_path = plan.q4k_path;
     const int iq2_path = plan.iq2_path;
+    const int iq2_iq2_path = plan.iq2_iq2_path;
+    const int iq2_gate_path = iq2_path || iq2_iq2_path;
     const int q2k_path = plan.q2k_path;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
@@ -604,7 +609,7 @@ static int routed_moe_launch(
         !stream_full_layer &&
         !full_table_cached &&
         n_tokens > 1u &&
-        (iq2_path || q2k_path) &&
+        (iq2_gate_path || q2k_path) &&
         n_expert <= DS4_ROCM_N_EXPERT_USED &&
         cuda_stream_batch_selected_apply_split(model_map,
                                                layer_index,
@@ -631,7 +636,7 @@ static int routed_moe_launch(
         !full_table_cached &&
         !batch_stream_split_selected &&
         n_tokens > 1u &&
-        (iq2_path || q2k_path) &&
+        (iq2_gate_path || q2k_path) &&
         n_expert <= DS4_ROCM_N_EXPERT_USED &&
         cuda_stream_batch_selected_prepare(model_map,
                                            model_size,
@@ -737,8 +742,13 @@ static int routed_moe_launch(
     if (!q2k_path && down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t use_sorted_pairs = n_tokens > 1u &&
-            (!q4k_path || n_tokens >= 32u);
+        /* Correctness rollback for the optimized resident IQ2 prefill path. */
+        const uint32_t disable_resident_iq2_sorted =
+            iq2_gate_path && getenv("DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED") != NULL;
+        const uint32_t use_sorted_pairs =
+            n_tokens > 1u &&
+            (!q4k_path || n_tokens >= 32u) &&
+            !disable_resident_iq2_sorted;
         const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = 8u;
         const uint32_t write_gate_up = 0u;
@@ -848,17 +858,33 @@ static int routed_moe_launch(
             }
             if (ok) {
                 dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
-                moe_down_sum6_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
-                        (float *)out->ptr,
-                        down_slot_ptrs,
-                        midq,
-                        (const int32_t *)selected_exec->ptr,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert,
-                        n_tokens);
-                ok = cuda_ok(cudaGetLastError(), "routed_moe streaming batch down launch");
+                if (iq2_iq2_path) {
+                    moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_slot_ptrs,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert,
+                            n_tokens);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch iq2 down launch");
+                } else {
+                    moe_down_sum6_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
+                            (float *)out->ptr,
+                            down_slot_ptrs,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert,
+                            n_tokens);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe streaming batch down launch");
+                }
             }
             if (ok) ok = cuda_stream_batch_selected_mark_inflight();
             return ok;
@@ -958,7 +984,7 @@ static int routed_moe_launch(
         const uint32_t iq2_down_hot_threshold = 8u;
         uint32_t h_iq2_gate_hot[DS4_ROCM_MAX_N_EXPERT] = {0};
         const uint32_t use_iq2_gate_wmma =
-            ok && iq2_path && n_tokens > 1u && n_expert == 6u && !write_gate_up &&
+            ok && iq2_gate_path && n_tokens > 1u && n_expert == 6u && !write_gate_up &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts && iq2_gate_hot_dev && use_expert_tiles &&
             (expert_in_dim % 16u) == 0u && (expert_mid_dim % 16u) == 0u &&
             !g_quality_mode;
@@ -999,7 +1025,7 @@ static int routed_moe_launch(
         int split_gateup_done = 0;
         if (ok && split_selected) {
             const int split_supported =
-                iq2_path &&
+                iq2_gate_path &&
                 n_tokens == 1u &&
                 n_expert <= DS4_ROCM_N_EXPERT_USED &&
                 !q4k_path &&
@@ -1348,8 +1374,38 @@ static int routed_moe_launch(
             q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, pair_count);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
+        int direct_iq2_down_done = 0;
+        if (ok && iq2_iq2_path) {
+            dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
+            if (split_gateup_done) {
+                moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_slot_ptrs,
+                        midq,
+                        (const int32_t *)selected_exec->ptr,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert,
+                        n_tokens);
+            } else {
+                moe_down_iq2_sum_qwarp32_batch_kernel<<<dgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected_exec->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert,
+                        n_tokens);
+            }
+            ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 down launch");
+            direct_iq2_down_done = ok;
+        }
         int split_ptr_down_done = 0;
-        if (ok && split_gateup_done) {
+        if (ok && !direct_iq2_down_done && split_gateup_done) {
             moe_down_sum6_qwarp32_ptrs_kernel<<<(out_dim + 31u) / 32u, 256>>>(
                     (float *)out->ptr,
                     down_slot_ptrs,
@@ -1362,7 +1418,9 @@ static int routed_moe_launch(
             split_ptr_down_done = ok;
         }
         if (ok) {
-            if (split_ptr_down_done) {
+            if (direct_iq2_down_done) {
+                /* The IQ2 direct-sum kernel writes final token rows. */
+            } else if (split_ptr_down_done) {
                 /* The split pointer-table path writes the final token row. */
             } else if (use_iq2_q2_float_down) {
                 ok = routed_moe_q2_float_down_launch(
@@ -1544,7 +1602,8 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
             }
         }
-        if (ok && !use_atomic_down && !use_direct_down_sum6 && !use_iq2_q2_float_down) {
+        if (ok && !direct_iq2_down_done && !use_atomic_down &&
+            !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");

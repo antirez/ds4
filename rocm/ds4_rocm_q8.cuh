@@ -1568,6 +1568,91 @@ __global__ static void grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel(
     }
 }
 
+/*
+ * Variant of the grouped shared-X kernel for inputs whose logical groups are
+ * slices of a wider physical row.  GLM QK-low projects only qk_nope values
+ * from each q head, while consecutive heads remain qk_dim values apart.
+ */
+template <uint32_t TOK_TILE, uint32_t BLOCKS_TILE>
+__global__ static void grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel(
+        float *low,
+        const unsigned char *w,
+        const float *heads,
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t n_blocks,
+        uint32_t rank,
+        uint32_t x_token_stride,
+        uint32_t x_group_stride,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row_blocks = (rank + rows_per_block - 1u) / rows_per_block;
+    const uint32_t g = blockIdx.x / row_blocks;
+    const uint32_t row0 = (blockIdx.x - g * row_blocks) * rows_per_block + wave;
+    const uint32_t t0 = blockIdx.y * TOK_TILE;
+    if (g >= n_groups || t0 >= n_tokens) return;
+    const bool row_valid = row0 < rank;
+    const unsigned char *wr =
+        w + ((uint64_t)g * rank + (row_valid ? row0 : 0u)) * row_bytes;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = 0.0f;
+
+    for (uint32_t b0 = 0; b0 < n_blocks; b0 += BLOCKS_TILE) {
+        const uint32_t b_count =
+            ((b0 + BLOCKS_TILE) <= n_blocks) ? BLOCKS_TILE : (n_blocks - b0);
+        for (uint32_t j = tid;
+             j < TOK_TILE * BLOCKS_TILE * 32u;
+             j += blockDim.x) {
+            const uint32_t u = j / (BLOCKS_TILE * 32u);
+            const uint32_t r = j - u * (BLOCKS_TILE * 32u);
+            const uint32_t bb = r >> 5u;
+            const uint32_t k = r & 31u;
+            const uint32_t t = t0 + u;
+            const uint64_t xoff =
+                (uint64_t)t * x_token_stride +
+                (uint64_t)g * x_group_stride +
+                ((uint64_t)(b0 + bb) << 5u) + k;
+            shx[j] =
+                (t < n_tokens && bb < b_count) ? heads[xoff] : 0.0f;
+        }
+        __syncthreads();
+        if (row_valid) {
+            for (uint32_t bb = 0; bb < b_count; bb++) {
+                const unsigned char *blk =
+                    wr + (uint64_t)(b0 + bb) * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+                const float wv = d * (float)q;
+#pragma unroll
+                for (uint32_t u = 0; u < TOK_TILE; u++) {
+                    acc[u] +=
+                        wv * shx[(u * BLOCKS_TILE + bb) * 32u + lane];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) {
+        acc[u] = warp_sum_f32(acc[u]);
+    }
+    if (lane == 0u && row_valid) {
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; u++) {
+            const uint32_t t = t0 + u;
+            if (t < n_tokens) {
+                low[((uint64_t)t * n_groups + g) * rank + row0] = acc[u];
+            }
+        }
+    }
+}
+
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
 __global__ static void grouped_q8_0_a_f32_batch_wmma_onthefly_kernel(

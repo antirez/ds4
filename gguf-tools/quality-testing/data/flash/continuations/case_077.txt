@@ -1,1 +1,1 @@
-Questa è un'ottima domanda che tocca un aspetto fondamentale della gestione della memoria nei sistemi oper
+La differenza tra la **dimensione virtuale** e la **residenza** (o *resident set

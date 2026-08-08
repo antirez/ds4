@@ -1,1 +1,1 @@
-Ecco una spiegazione dettagliata del funzionamento dell'inserimento in un **B-tree**, con
+Perfetto, ti spiego in dettaglio come funziona l'inserimento in un **B-tree

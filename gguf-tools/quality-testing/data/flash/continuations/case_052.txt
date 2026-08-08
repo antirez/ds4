@@ -1,1 +1,3 @@
-Certamente! Spiegherò la **softmax** nel contesto del meccanismo di **attenzione**
+Ti spiego il **softmax nell'attenzione** con un esempio molto semplice, passo per passo.
+
+Immag

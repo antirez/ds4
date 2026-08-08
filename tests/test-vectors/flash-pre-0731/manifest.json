@@ -2,6 +2,7 @@
   "schema": "ds4-test-vector-manifest-v1",
   "source": "deepseek-official-api",
   "model": "deepseek-v4-flash",
+  "checkpoint": "pre-0731",
   "endpoint": "https://api.deepseek.com/chat/completions",
   "top_logprobs": 20,
   "max_tokens": 4,

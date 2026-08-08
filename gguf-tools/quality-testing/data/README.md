@@ -5,8 +5,8 @@ safe to commit and use in release QA.
 
 - `glm52-openrouter-100`: 100 GLM 5.2 OpenRouter continuations with API
   top-logprob slices.
-- `flash`: 100 DeepSeek V4 Flash official continuations with API top-logprob
-  slices.
+- `flash`: 100 DeepSeek V4 Flash 0731 continuations from the official DeepSeek
+  API, with API top-logprob slices.
 - `pro`: 100 DeepSeek V4 PRO official continuations with API top-logprob
   slices.
 

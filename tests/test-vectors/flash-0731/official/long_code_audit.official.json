@@ -1,0 +1,1328 @@
+{
+  "schema": "ds4-official-logprobs-v1",
+  "source": "deepseek-official-api",
+  "model": "deepseek-v4-flash",
+  "checkpoint": "0731",
+  "endpoint": "https://api.deepseek.com/chat/completions",
+  "created_at": "2026-08-03T17:14:22Z",
+  "id": "long_code_audit",
+  "kind": "long",
+  "prompt": "Review this generated C-code audit log. After the log, complete the sentence with the most likely next words.\n\nFunction f_0 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 0: reject negative sizes before casting.\nFunction f_1 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 1: reject negative sizes before casting.\nFunction f_2 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 2: reject negative sizes before casting.\nFunction f_3 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 3: reject negative sizes before casting.\nFunction f_4 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 4: reject negative sizes before casting.\nFunction f_5 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 5: reject negative sizes before casting.\nFunction f_6 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 6: reject negative sizes before casting.\nFunction f_7 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 7: reject negative sizes before casting.\nFunction f_8 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 8: reject negative sizes before casting.\nFunction f_9 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 9: reject negative sizes before casting.\nFunction f_10 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 10: reject negative sizes before casting.\nFunction f_11 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 11: reject negative sizes before casting.\nFunction f_12 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 12: reject negative sizes before casting.\nFunction f_13 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 13: reject negative sizes before casting.\nFunction f_14 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 14: reject negative sizes before casting.\nFunction f_15 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 15: reject negative sizes before casting.\nFunction f_16 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 16: reject negative sizes before casting.\nFunction f_17 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 17: reject negative sizes before casting.\nFunction f_18 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 18: reject negative sizes before casting.\nFunction f_19 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 19: reject negative sizes before casting.\nFunction f_20 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 20: reject negative sizes before casting.\nFunction f_21 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 21: reject negative sizes before casting.\nFunction f_22 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 22: reject negative sizes before casting.\nFunction f_23 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 23: reject negative sizes before casting.\nFunction f_24 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 24: reject negative sizes before casting.\nFunction f_25 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 25: reject negative sizes before casting.\nFunction f_26 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 26: reject negative sizes before casting.\nFunction f_27 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 27: reject negative sizes before casting.\nFunction f_28 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 28: reject negative sizes before casting.\nFunction f_29 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 29: reject negative sizes before casting.\nFunction f_30 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 30: reject negative sizes before casting.\nFunction f_31 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 31: reject negative sizes before casting.\nFunction f_32 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 32: reject negative sizes before casting.\nFunction f_33 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 33: reject negative sizes before casting.\nFunction f_34 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 34: reject negative sizes before casting.\nFunction f_35 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 35: reject negative sizes before casting.\nFunction f_36 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 36: reject negative sizes before casting.\nFunction f_37 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 37: reject negative sizes before casting.\nFunction f_38 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 38: reject negative sizes before casting.\nFunction f_39 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 39: reject negative sizes before casting.\nFunction f_40 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 40: reject negative sizes before casting.\nFunction f_41 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 41: reject negative sizes before casting.\nFunction f_42 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 42: reject negative sizes before casting.\nFunction f_43 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 43: reject negative sizes before casting.\nFunction f_44 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 44: reject negative sizes before casting.\nFunction f_45 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 45: reject negative sizes before casting.\nFunction f_46 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 46: reject negative sizes before casting.\nFunction f_47 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 47: reject negative sizes before casting.\nFunction f_48 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 48: reject negative sizes before casting.\nFunction f_49 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 49: reject negative sizes before casting.\nFunction f_50 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 50: reject negative sizes before casting.\nFunction f_51 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 51: reject negative sizes before casting.\nFunction f_52 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 52: reject negative sizes before casting.\nFunction f_53 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 53: reject negative sizes before casting.\nFunction f_54 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 54: reject negative sizes before casting.\nFunction f_55 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 55: reject negative sizes before casting.\nFunction f_56 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 56: reject negative sizes before casting.\nFunction f_57 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 57: reject negative sizes before casting.\nFunction f_58 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 58: reject negative sizes before casting.\nFunction f_59 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 59: reject negative sizes before casting.\nFunction f_60 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 60: reject negative sizes before casting.\nFunction f_61 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 61: reject negative sizes before casting.\nFunction f_62 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 62: reject negative sizes before casting.\nFunction f_63 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 63: reject negative sizes before casting.\nFunction f_64 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 64: reject negative sizes before casting.\nFunction f_65 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 65: reject negative sizes before casting.\nFunction f_66 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 66: reject negative sizes before casting.\nFunction f_67 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 67: reject negative sizes before casting.\n\nCompletion target: The most important code quality issue is",
+  "request": {
+    "model": "deepseek-v4-flash",
+    "temperature": 0,
+    "max_tokens": 4,
+    "logprobs": true,
+    "top_logprobs": 20,
+    "thinking": {
+      "type": "disabled"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Review this generated C-code audit log. After the log, complete the sentence with the most likely next words.\n\nFunction f_0 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 0: reject negative sizes before casting.\nFunction f_1 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 1: reject negative sizes before casting.\nFunction f_2 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 2: reject negative sizes before casting.\nFunction f_3 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 3: reject negative sizes before casting.\nFunction f_4 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 4: reject negative sizes before casting.\nFunction f_5 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 5: reject negative sizes before casting.\nFunction f_6 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 6: reject negative sizes before casting.\nFunction f_7 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 7: reject negative sizes before casting.\nFunction f_8 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 8: reject negative sizes before casting.\nFunction f_9 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 9: reject negative sizes before casting.\nFunction f_10 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 10: reject negative sizes before casting.\nFunction f_11 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 11: reject negative sizes before casting.\nFunction f_12 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 12: reject negative sizes before casting.\nFunction f_13 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 13: reject negative sizes before casting.\nFunction f_14 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 14: reject negative sizes before casting.\nFunction f_15 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 15: reject negative sizes before casting.\nFunction f_16 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 16: reject negative sizes before casting.\nFunction f_17 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 17: reject negative sizes before casting.\nFunction f_18 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 18: reject negative sizes before casting.\nFunction f_19 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 19: reject negative sizes before casting.\nFunction f_20 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 20: reject negative sizes before casting.\nFunction f_21 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 21: reject negative sizes before casting.\nFunction f_22 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 22: reject negative sizes before casting.\nFunction f_23 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 23: reject negative sizes before casting.\nFunction f_24 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 24: reject negative sizes before casting.\nFunction f_25 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 25: reject negative sizes before casting.\nFunction f_26 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 26: reject negative sizes before casting.\nFunction f_27 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 27: reject negative sizes before casting.\nFunction f_28 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 28: reject negative sizes before casting.\nFunction f_29 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 29: reject negative sizes before casting.\nFunction f_30 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 30: reject negative sizes before casting.\nFunction f_31 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 31: reject negative sizes before casting.\nFunction f_32 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 32: reject negative sizes before casting.\nFunction f_33 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 33: reject negative sizes before casting.\nFunction f_34 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 34: reject negative sizes before casting.\nFunction f_35 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 35: reject negative sizes before casting.\nFunction f_36 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 36: reject negative sizes before casting.\nFunction f_37 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 37: reject negative sizes before casting.\nFunction f_38 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 38: reject negative sizes before casting.\nFunction f_39 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 39: reject negative sizes before casting.\nFunction f_40 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 40: reject negative sizes before casting.\nFunction f_41 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 41: reject negative sizes before casting.\nFunction f_42 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 42: reject negative sizes before casting.\nFunction f_43 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 43: reject negative sizes before casting.\nFunction f_44 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 44: reject negative sizes before casting.\nFunction f_45 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 45: reject negative sizes before casting.\nFunction f_46 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 46: reject negative sizes before casting.\nFunction f_47 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 47: reject negative sizes before casting.\nFunction f_48 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 48: reject negative sizes before casting.\nFunction f_49 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 49: reject negative sizes before casting.\nFunction f_50 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 50: reject negative sizes before casting.\nFunction f_51 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 51: reject negative sizes before casting.\nFunction f_52 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 52: reject negative sizes before casting.\nFunction f_53 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 53: reject negative sizes before casting.\nFunction f_54 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 54: reject negative sizes before casting.\nFunction f_55 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 55: reject negative sizes before casting.\nFunction f_56 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 56: reject negative sizes before casting.\nFunction f_57 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 57: reject negative sizes before casting.\nFunction f_58 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 58: reject negative sizes before casting.\nFunction f_59 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 59: reject negative sizes before casting.\nFunction f_60 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 60: reject negative sizes before casting.\nFunction f_61 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 61: reject negative sizes before casting.\nFunction f_62 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 62: reject negative sizes before casting.\nFunction f_63 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 63: reject negative sizes before casting.\nFunction f_64 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 64: reject negative sizes before casting.\nFunction f_65 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 65: reject negative sizes before casting.\nFunction f_66 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 66: reject negative sizes before casting.\nFunction f_67 validates a queue entry, calls normalize_path(), then appends a compact audit line. The invariant is that strlen() must not be recomputed when a trusted length returned by snprintf() is already available. Security note 67: reject negative sizes before casting.\n\nCompletion target: The most important code quality issue is"
+      }
+    ]
+  },
+  "usage": {
+    "prompt_tokens": 3844,
+    "completion_tokens": 4,
+    "total_tokens": 3848,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 3844
+  },
+  "finish_reason": "length",
+  "message": {
+    "role": "assistant",
+    "content": "The most important code"
+  },
+  "logits_available": false,
+  "steps": [
+    {
+      "step": 0,
+      "token": {
+        "text": "The",
+        "bytes": [
+          84,
+          104,
+          101
+        ]
+      },
+      "logprob": 0.0,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": "The",
+            "bytes": [
+              84,
+              104,
+              101
+            ]
+          },
+          "logprob": 0.0
+        },
+        {
+          "token": {
+            "text": "the",
+            "bytes": [
+              116,
+              104,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "that",
+            "bytes": [
+              116,
+              104,
+              97,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " The",
+            "bytes": [
+              32,
+              84,
+              104,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "...",
+            "bytes": [
+              46,
+              46,
+              46
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "That",
+            "bytes": [
+              84,
+              104,
+              97,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "re",
+            "bytes": [
+              114,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "most",
+            "bytes": [
+              109,
+              111,
+              115,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "Based",
+            "bytes": [
+              66,
+              97,
+              115,
+              101,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "This",
+            "bytes": [
+              84,
+              104,
+              105,
+              115
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "**",
+            "bytes": [
+              42,
+              42
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "…",
+            "bytes": [
+              226,
+              128,
+              166
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "##",
+            "bytes": [
+              35,
+              35
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "this",
+            "bytes": [
+              116,
+              104,
+              105,
+              115
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "There",
+            "bytes": [
+              84,
+              104,
+              101,
+              114,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "un",
+            "bytes": [
+              117,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "[",
+            "bytes": [
+              91
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "Given",
+            "bytes": [
+              71,
+              105,
+              118,
+              101,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "du",
+            "bytes": [
+              100,
+              117
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "In",
+            "bytes": [
+              73,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        }
+      ]
+    },
+    {
+      "step": 1,
+      "token": {
+        "text": " most",
+        "bytes": [
+          32,
+          109,
+          111,
+          115,
+          116
+        ]
+      },
+      "logprob": 0.0,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " most",
+            "bytes": [
+              32,
+              109,
+              111,
+              115,
+              116
+            ]
+          },
+          "logprob": 0.0
+        },
+        {
+          "token": {
+            "text": " repetition",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              116,
+              105,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " generated",
+            "bytes": [
+              32,
+              103,
+              101,
+              110,
+              101,
+              114,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " code",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " audit",
+            "bytes": [
+              32,
+              97,
+              117,
+              100,
+              105,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " repeated",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " log",
+            "bytes": [
+              32,
+              108,
+              111,
+              103
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " repetitive",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              116,
+              105,
+              116,
+              105,
+              118,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " complete",
+            "bytes": [
+              32,
+              99,
+              111,
+              109,
+              112,
+              108,
+              101,
+              116,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " pattern",
+            "bytes": [
+              32,
+              112,
+              97,
+              116,
+              116,
+              101,
+              114,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " presence",
+            "bytes": [
+              32,
+              112,
+              114,
+              101,
+              115,
+              101,
+              110,
+              99,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " recurrence",
+            "bytes": [
+              32,
+              114,
+              101,
+              99,
+              117,
+              114,
+              114,
+              101,
+              110,
+              99,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " completion",
+            "bytes": [
+              32,
+              99,
+              111,
+              109,
+              112,
+              108,
+              101,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " duplication",
+            "bytes": [
+              32,
+              100,
+              117,
+              112,
+              108,
+              105,
+              99,
+              97,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " review",
+            "bytes": [
+              32,
+              114,
+              101,
+              118,
+              105,
+              101,
+              119
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " proliferation",
+            "bytes": [
+              32,
+              112,
+              114,
+              111,
+              108,
+              105,
+              102,
+              101,
+              114,
+              97,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " functions",
+            "bytes": [
+              32,
+              102,
+              117,
+              110,
+              99,
+              116,
+              105,
+              111,
+              110,
+              115
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " function",
+            "bytes": [
+              32,
+              102,
+              117,
+              110,
+              99,
+              116,
+              105,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " provided",
+            "bytes": [
+              32,
+              112,
+              114,
+              111,
+              118,
+              105,
+              100,
+              101,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " use",
+            "bytes": [
+              32,
+              117,
+              115,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "token": {
+        "text": " important",
+        "bytes": [
+          32,
+          105,
+          109,
+          112,
+          111,
+          114,
+          116,
+          97,
+          110,
+          116
+        ]
+      },
+      "logprob": 0.0,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " important",
+            "bytes": [
+              32,
+              105,
+              109,
+              112,
+              111,
+              114,
+              116,
+              97,
+              110,
+              116
+            ]
+          },
+          "logprob": 0.0
+        },
+        {
+          "token": {
+            "text": " likely",
+            "bytes": [
+              32,
+              108,
+              105,
+              107,
+              101,
+              108,
+              121
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " import",
+            "bytes": [
+              32,
+              105,
+              109,
+              112,
+              111,
+              114,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " importante",
+            "bytes": [
+              32,
+              105,
+              109,
+              112,
+              111,
+              114,
+              116,
+              97,
+              110,
+              116,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "important",
+            "bytes": [
+              105,
+              109,
+              112,
+              111,
+              114,
+              116,
+              97,
+              110,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "重要",
+            "bytes": [
+              233,
+              135,
+              141,
+              232,
+              166,
+              129
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " critical",
+            "bytes": [
+              32,
+              99,
+              114,
+              105,
+              116,
+              105,
+              99,
+              97,
+              108
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " common",
+            "bytes": [
+              32,
+              99,
+              111,
+              109,
+              109,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "重要的",
+            "bytes": [
+              233,
+              135,
+              141,
+              232,
+              166,
+              129,
+              231,
+              154,
+              132
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " imp",
+            "bytes": [
+              32,
+              105,
+              109,
+              112
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "<｜｜end▁of▁sentence｜｜>",
+            "bytes": [
+              60,
+              239,
+              189,
+              156,
+              239,
+              189,
+              156,
+              101,
+              110,
+              100,
+              226,
+              150,
+              129,
+              111,
+              102,
+              226,
+              150,
+              129,
+              115,
+              101,
+              110,
+              116,
+              101,
+              110,
+              99,
+              101,
+              239,
+              189,
+              156,
+              239,
+              189,
+              156,
+              62
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " obvious",
+            "bytes": [
+              32,
+              111,
+              98,
+              118,
+              105,
+              111,
+              117,
+              115
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " repeated",
+            "bytes": [
+              32,
+              114,
+              101,
+              112,
+              101,
+              97,
+              116,
+              101,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " Important",
+            "bytes": [
+              32,
+              73,
+              109,
+              112,
+              111,
+              114,
+              116,
+              97,
+              110,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " notable",
+            "bytes": [
+              32,
+              110,
+              111,
+              116,
+              97,
+              98,
+              108,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " важ",
+            "bytes": [
+              32,
+              208,
+              178,
+              208,
+              176,
+              208,
+              182
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " wichtig",
+            "bytes": [
+              32,
+              119,
+              105,
+              99,
+              104,
+              116,
+              105,
+              103
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " importantly",
+            "bytes": [
+              32,
+              105,
+              109,
+              112,
+              111,
+              114,
+              116,
+              97,
+              110,
+              116,
+              108,
+              121
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " prominent",
+            "bytes": [
+              32,
+              112,
+              114,
+              111,
+              109,
+              105,
+              110,
+              101,
+              110,
+              116
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " importantes",
+            "bytes": [
+              32,
+              105,
+              109,
+              112,
+              111,
+              114,
+              116,
+              97,
+              110,
+              116,
+              101,
+              115
+            ]
+          },
+          "logprob": -9999.0
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "token": {
+        "text": " code",
+        "bytes": [
+          32,
+          99,
+          111,
+          100,
+          101
+        ]
+      },
+      "logprob": 0.0,
+      "top_logprobs": [
+        {
+          "token": {
+            "text": " code",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": 0.0
+        },
+        {
+          "token": {
+            "text": " issue",
+            "bytes": [
+              32,
+              105,
+              115,
+              115,
+              117,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "代码",
+            "bytes": [
+              228,
+              187,
+              163,
+              231,
+              160,
+              129
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "<｜｜end▁of▁sentence｜｜>",
+            "bytes": [
+              60,
+              239,
+              189,
+              156,
+              239,
+              189,
+              156,
+              101,
+              110,
+              100,
+              226,
+              150,
+              129,
+              111,
+              102,
+              226,
+              150,
+              129,
+              115,
+              101,
+              110,
+              116,
+              101,
+              110,
+              99,
+              101,
+              239,
+              189,
+              156,
+              239,
+              189,
+              156,
+              62
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " quality",
+            "bytes": [
+              32,
+              113,
+              117,
+              97,
+              108,
+              105,
+              116,
+              121
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " coding",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " 코드",
+            "bytes": [
+              32,
+              236,
+              189,
+              148,
+              235,
+              147,
+              156
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " Code",
+            "bytes": [
+              32,
+              67,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " ",
+            "bytes": [
+              32
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " thing",
+            "bytes": [
+              32,
+              116,
+              104,
+              105,
+              110,
+              103
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " sentence",
+            "bytes": [
+              32,
+              115,
+              101,
+              110,
+              116,
+              101,
+              110,
+              99,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " common",
+            "bytes": [
+              32,
+              99,
+              111,
+              109,
+              109,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": "code",
+            "bytes": [
+              99,
+              111,
+              100,
+              101
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " código",
+            "bytes": [
+              32,
+              99,
+              195,
+              179,
+              100,
+              105,
+              103,
+              111
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " and",
+            "bytes": [
+              32,
+              97,
+              110,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " codes",
+            "bytes": [
+              32,
+              99,
+              111,
+              100,
+              101,
+              115
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " data",
+            "bytes": [
+              32,
+              100,
+              97,
+              116,
+              97
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " cod",
+            "bytes": [
+              32,
+              99,
+              111,
+              100
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " key",
+            "bytes": [
+              32,
+              107,
+              101,
+              121
+            ]
+          },
+          "logprob": -9999.0
+        },
+        {
+          "token": {
+            "text": " reason",
+            "bytes": [
+              32,
+              114,
+              101,
+              97,
+              115,
+              111,
+              110
+            ]
+          },
+          "logprob": -9999.0
+        }
+      ]
+    }
+  ]
+}

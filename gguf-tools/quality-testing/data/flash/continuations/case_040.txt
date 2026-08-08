@@ -1,3 +1,1 @@
-Here are the first five measurements to take when diagnosing generation slowdowns at long context:
-
-1.  **Time-to-F
+Here are the first five measurements to take when diagnosing slow generation at long context, ordered by speed of insight and likelihood of

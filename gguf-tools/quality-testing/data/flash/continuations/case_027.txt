@@ -1,1 +1,1 @@
-This is an excellent question that gets to the heart of why modern low-bit quantization (like 4-bit and 3
+In the context of low-bit quantization (e.g., 4-bit, 2-bit, or even 1-bit

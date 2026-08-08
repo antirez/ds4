@@ -1,1 +1,1 @@
-Checksums catch accidental corruption because they rely on a mathematical algorithm that computes a fixed-size, unique summary (the checks
+Checksums catch accidental corruption because they exploit the mathematical principle that any change to a data block—even a single flipped
