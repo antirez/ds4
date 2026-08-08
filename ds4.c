@@ -52087,15 +52087,21 @@ static bool ds4_cp4_tail_primitive_ab_run(
         !generic_half || !generic_after || !sequential_low ||
         !sequential_attn_out || !sequential_after) goto done;
 
-    if (!ds4_c2b_inline_copy(seq_heads, 0, capture->cp4_heads[0], 0,
-                             heads_bytes) ||
-        !ds4_c2b_inline_copy(seq_cur_hc, 0,
-                             capture->cp4_tail_cur_hc[0], 0, hc_bytes) ||
-        !ds4_c2b_inline_copy(seq_hc_split, 0,
-                             capture->cp4_tail_hc_split[0], 0,
-                             split_bytes)) {
-        goto done;
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = ds4_c2b_inline_copy(seq_heads, 0,
+                                  capture->cp4_heads[0], 0,
+                                  heads_bytes) &&
+             ds4_c2b_inline_copy(seq_cur_hc, 0,
+                                  capture->cp4_tail_cur_hc[0], 0,
+                                  hc_bytes) &&
+             ds4_c2b_inline_copy(seq_hc_split, 0,
+                                  capture->cp4_tail_hc_split[0], 0,
+                                  split_bytes);
     }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) goto done;
 
     generic_input_cpu = xmalloc(input_values * sizeof(float));
     sequential_input_cpu = xmalloc(input_values * sizeof(float));
