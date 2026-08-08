@@ -6,9 +6,13 @@
 - KV producer localization: **PROVEN BY SOURCE**.
 - KV isolated primitive A/B and `{QA,KV}` causal substitution:
   **PROVEN BY TEST** on M4 Max.
-- Current `{QA,KV}` first divergence: `CP4/after_attn_hc` at row 0,
+- Previous coarse `{QA,KV}` first divergence: `CP4/after_attn_hc` at row 0,
   layer 0: **PROVEN BY TEST** on M4 Max.
 - Natural semantic subdivision of the interval leading to CP4:
+  **PROVEN BY TEST** on M4 Max.
+- Current first divergence: `CP2-Q-CUR/q_cur` at row 0, layer 0;
+  `CP2-Q-NORM/qr_norm` is exact: **PROVEN BY TEST** on M4 Max.
+- Q-B isolated A/B and `{QA,KV,QB}` causal substitution:
   **IMPLEMENTED; M4 RUNTIME REQUIRED**.
 - Default production behavior remains unchanged when
   `DS4_FIRST_DIVERGENCE_CANONICAL` is unset.
@@ -43,10 +47,11 @@ The composable diagnostic interface is:
 ```sh
 DS4_FIRST_DIVERGENCE_CANONICAL=QA
 DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB
 ```
 
-`KV` without `QA` is rejected because this forward sweep starts from the
-already-adjudicated QA correction.  The legacy
+`KV` without `QA`, or `QB` without both earlier sites, is rejected because
+this forward sweep preserves the proven causal prefix.  The legacy
 `DS4_FIRST_DIVERGENCE_CANONICAL_QA=1` gate remains accepted.  The mask is set
 only while encoding generic diagnostic A0/A1/A2 and is cleared before
 canonical sequential Pass B.
@@ -239,7 +244,81 @@ C2B_RESULT  PASS
 ```
 
 Only the first mismatching stage in `ATTENTION_INTERVAL_TRACE` becomes the
-next localization target.  No new canonicalization mask bit has been added.
+next localization target.  That result gates creation of the `QB` mask bit
+described below.
+
+The real M4 result was:
+
+```text
+FIRST_DIVERGENCE row=0 layer=0 checkpoint=CP2-Q-CUR subobject=q_cur
+ATTENTION_INTERVAL_STAGE stage=CP2-Q-NORM semantic=normalized_q_a_projection_output subobject=qr_norm result=EXACT elements=1024
+ATTENTION_INTERVAL_STAGE stage=CP2-Q-CUR semantic=q_after_q_b_head_norm_and_rope subobject=q_cur result=MISMATCH elements=32768 mismatch_count=26485 mismatch_fraction=0.808258056640625 max_abs=1.9073486328125e-06 mean_abs=1.0823077339905396e-07 rms_abs=1.5083385413086959e-07 p50_abs=8.9406967163085938e-08 p95_abs=2.9802322387695312e-07 p99_abs=4.76837158203125e-07 relative_l2=1.5091385773441392e-07 max_rel=0.0027780565314971164 max_ulp=30674 cosine_similarity=0.99999999999997191 positive_delta_count=13379 negative_delta_count=13106
+ATTENTION_INTERVAL_RESULT FIRST_RUNTIME_DIVERGENCE stage=CP2-Q-CUR semantic=q_after_q_b_head_norm_and_rope subobject=q_cur
+```
+
+## CP2-Q-CUR producer localization
+
+On Apple Metal, `ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor()` is an
+explicit unavailable stub that returns zero.  The actual runtime producer is
+therefore the existing fallback:
+
+| Stage | Generic verifier | Canonical sequential decode |
+| --- | --- | --- |
+| Q-B projection | `metal_graph_matmul_q8_0_named_tensor("attn_q_b", ..., n_tokens)` | `metal_graph_matmul_dense_quant_abs(..., n=1)` |
+| Weight | same `layer->attn_q_b`, Q8_0 bytes and metadata | same |
+| Input | F32 `qr_norm`, `[n_tokens, 1024]` | F32 row, `[1, 1024]` |
+| Projection output | F32 Qraw, `[n_tokens, 32768]` | F32 row, `[1, 32768]` |
+| Post-projection | `ds4_gpu_head_rms_norm_rope_tail_tensor(..., n_tokens)` | the same helper with `n_tok=1` |
+
+The post-projection kernel dispatches one independent threadgroup per
+token/head and uses the same reduction and RoPE implementation.  The Q-B
+projection itself selects the same Q8_0 batch-ext versus single-MV primitive
+pair already proven at QA and KV.  Source evidence therefore places Q-B in
+`FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV`; causal removal remains pending runtime.
+
+When `QB` is selected, the diagnostic:
+
+1. runs a same-input isolated Q-B projection A/B on the captured real
+   `cp2_q_norm` allocation, stopping before RMS normalization and RoPE;
+2. requires input bits and the Q8_0 weight object to match;
+3. runs generic Q-B once per verifier batch and sequential Q-B on row 0;
+4. canonicalizes Q-B for every verifier row/layer through the existing N=1
+   row helper;
+5. leaves the shared head RMS/RoPE kernel, attention, compressor, output
+   projection, HC expansion, and sequential path unchanged.
+
+Run:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-qa-kv-qb.log 2>&1
+```
+
+Inspect:
+
+```sh
+grep -E '^QA_PRIMITIVE_|^KV_PRIMITIVE_|^QB_|^C2B_|^FIRST_DIVERGENCE |^ATTENTION_INTERVAL_|^CANONICALIZATION_SWEEP_|^SWEEP_STEP |^DRIFT_SOURCE' \
+  canonical-sweep-qa-kv-qb.log
+```
+
+Required gates:
+
+```text
+QB_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS ... result=MISMATCH ...
+QB_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+C2B_CONTROL A0_vs_A1 PASS
+C2B_PROBE   A0_vs_A2 PASS
+C2B_RESULT  PASS
+ATTENTION_INTERVAL_STAGE stage=CP2-Q-CUR ... result=EXACT
+SWEEP_STEP index=2 added=QB ... previous_stage_after_patch=EXACT ...
+```
 
 ## Divergent operator families
 
@@ -247,6 +326,7 @@ next localization target.  No new canonicalization mask bit has been added.
 | --- | --- | --- | --- | --- | --- | --- |
 | CP2-Q | Q-A projection output | named Q8_0 batch projection | dense-quant N=1 projection | `FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV` | source + isolated A/B + causal substitution | YES |
 | CP2-KV-P | pre-store raw KV projection output | named Q8_0 batch projection | dense-quant N=1 projection | `FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV` | source + isolated A/B + causal substitution | YES |
+| CP2-Q-CUR | Q-B projection before shared head RMS/RoPE | named Q8_0 batch projection | dense-quant-abs N=1 projection | `FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV` | source; isolated A/B and causal substitution pending | UNKNOWN |
 
 QA and KV satisfy the family-identity rule through the same underlying Metal
 kernel pair, Q8_0 dequantization paths, batch-versus-single distinction, and
@@ -268,9 +348,9 @@ SUFFICIENT_CANONICALIZATION_SET UNKNOWN
 MINIMAL_CANONICAL_REPAIR_SET NOT_EVALUATED
 ```
 
-The next coarse location after `{QA,KV}` is **PROVEN BY TEST** as
-`CP4/after_attn_hc`.  The exact producer inside that interval remains
-**UNKNOWN pending M4 runtime** with the new subdivisions.  No attention,
-normalization, output projection, HC expansion, FFN, MoE, store, or later
-checkpoint is canonicalized before the earliest natural semantic object is
-identified.
+The next source after `{QA,KV}` is **PROVEN BY TEST** at
+`CP2-Q-CUR/q_cur`.  Source localization identifies the Q-B projection as the
+first testable member of the compound producer; its isolated A/B and causal
+removal are **UNKNOWN pending M4 runtime**.  No attention, output projection,
+HC expansion, FFN, MoE, store, or later checkpoint is canonicalized before
+Q-B is adjudicated.
