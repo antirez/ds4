@@ -54583,28 +54583,6 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                     "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
             return false;
         }
-
-        /*
-         * Enforce a floor: the cache must hold at least one full prefill's
-         * routed working set (n_layers * DS4_N_EXPERT_USED experts). Below
-         * that the cache is smaller than a single token's routed set and
-         * every slot evicts what it is about to reuse, so prefill always
-         * fails with "cannot reserve a slot".
-         */
-        const uint32_t min_prefill_experts =
-            DS4_N_LAYER * DS4_N_EXPERT_USED;
-        if (budget < min_prefill_experts) {
-            fprintf(stderr,
-                    "ds4: SSD streaming expert cache budget (%u) below "
-                    "one-prefill minimum (%u layers x %d experts = %u); "
-                    "raising to %u\n",
-                    budget,
-                    DS4_N_LAYER,
-                    DS4_N_EXPERT_USED,
-                    min_prefill_experts,
-                    min_prefill_experts);
-            budget = min_prefill_experts;
-        }
         e->ssd_streaming_cache_experts = budget;
         e->ssd_streaming_cache_bytes =
             (uint64_t)budget * budget_expert_bytes;
