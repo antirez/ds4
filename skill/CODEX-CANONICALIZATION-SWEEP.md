@@ -438,13 +438,16 @@ weights, and Q8_0 output-B weights:
 
 | Path | Exact primitives |
 | --- | --- |
-| generic | `ds4_gpu_attention_output_q8_batch_f16_tensor` then `ds4_gpu_hc_expand_split_half_tensor` |
+| generic | `metal_graph_attention_output_dense_quant_batch` then `ds4_gpu_hc_expand_split_tensor` |
 | sequential | per-row `ds4_gpu_attention_output_low_q8_tensor` then `ds4_gpu_matmul_q8_0_hc_expand_tensor` |
 
-This covers output-A, output-B, the generic F32-to-F16 boundary, HC expansion,
-and residual addition. Because neither path naturally materializes the same
-post-output-B object, attribution to one component inside the compound tail
-remains `UNKNOWN`. Only the final F32 `after_attn_hc` is compared bitwise.
+On Metal, the batch-F16 output and half-HC helpers are unavailable stubs.  The
+ordinary generic verifier therefore uses this F32 fallback.  The isolated test
+must use the same fallback instead of treating the unavailable fast-path probe
+as a hard failure.  The test covers output-A, output-B, HC expansion, and
+residual addition. Because the sequential path fuses output-B with HC expansion,
+attribution to one component inside the compound tail remains `UNKNOWN`. Only
+the final F32 `after_attn_hc` is compared bitwise.
 
 Run the isolated A/B without tail substitution:
 

@@ -51975,8 +51975,9 @@ typedef struct {
 /* Isolate the complete asymmetric CP4 tail without introducing an online
  * checkpoint.  Both calls consume clones of the exact same captured F32
  * heads, residual HC and HC split state.  The generic side invokes the real
- * batch-F16 output projection plus half HC expand; the sequential side invokes
- * the real F32 low projection plus fused Q8 output-B/HC epilogue row by row. */
+ * Metal F32 batch output projection fallback plus F32 HC expand; the sequential
+ * side invokes the real F32 low projection plus fused Q8 output-B/HC epilogue
+ * row by row. */
 static bool ds4_cp4_tail_primitive_ab_run(
         ds4_session *s,
         const ds4_c2b_capture *capture,
@@ -51985,7 +51986,7 @@ static bool ds4_cp4_tail_primitive_ab_run(
     ds4_gpu_tensor *seq_cur_hc = NULL;
     ds4_gpu_tensor *seq_hc_split = NULL;
     ds4_gpu_tensor *generic_low = NULL;
-    ds4_gpu_tensor *generic_half = NULL;
+    ds4_gpu_tensor *generic_attn_out = NULL;
     ds4_gpu_tensor *generic_after = NULL;
     ds4_gpu_tensor *sequential_low = NULL;
     ds4_gpu_tensor *sequential_attn_out = NULL;
@@ -51996,13 +51997,14 @@ static bool ds4_cp4_tail_primitive_ab_run(
     float *sequential_output_cpu = NULL;
     ds4_float_compare_result input_comparison;
     bool ok = false;
+    const char *error_stage = "allocation";
 
     fputs("CP4_TAIL_SOURCE_AUDIT "
-          "generic_path=ds4_gpu_attention_output_q8_batch_f16_tensor+ds4_gpu_hc_expand_split_half_tensor "
+          "generic_path=metal_graph_attention_output_dense_quant_batch+ds4_gpu_hc_expand_split_tensor "
           "sequential_path=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
-          "generic_primitives=Q8_output_A_batch+Q8_output_B_batch+F32_to_F16_output+HC_split_half_expand_residual_add "
+          "generic_primitives=Q8_output_A_batch+Q8_output_B_batch+HC_split_F32_expand_residual_add "
           "sequential_primitives=Q8_output_A_single_F32+Q8_output_B_single+fused_HC_expand_residual_add "
-          "candidate_family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+          "candidate_family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
           "component_attribution=UNKNOWN evidence=PROVEN_BY_SOURCE\n",
           stderr);
 
@@ -52041,8 +52043,6 @@ static bool ds4_cp4_tail_primitive_ab_run(
         (uint64_t)rows * low_values_per_row * sizeof(float);
     const uint64_t attn_out_bytes =
         (uint64_t)rows * DS4_N_EMBD * sizeof(float);
-    const uint64_t half_bytes =
-        (uint64_t)rows * DS4_N_EMBD * sizeof(uint16_t);
     const size_t input_values = (size_t)(
         (uint64_t)rows * (heads_values_per_row + hc_values_per_row +
                           split_values_per_row));
@@ -52078,15 +52078,16 @@ static bool ds4_cp4_tail_primitive_ab_run(
     seq_cur_hc = ds4_gpu_tensor_alloc(hc_bytes);
     seq_hc_split = ds4_gpu_tensor_alloc(split_bytes);
     generic_low = ds4_gpu_tensor_alloc(low_bytes);
-    generic_half = ds4_gpu_tensor_alloc(half_bytes);
+    generic_attn_out = ds4_gpu_tensor_alloc(attn_out_bytes);
     generic_after = ds4_gpu_tensor_alloc(hc_bytes);
     sequential_low = ds4_gpu_tensor_alloc(low_bytes);
     sequential_attn_out = ds4_gpu_tensor_alloc(attn_out_bytes);
     sequential_after = ds4_gpu_tensor_alloc(hc_bytes);
     if (!seq_heads || !seq_cur_hc || !seq_hc_split || !generic_low ||
-        !generic_half || !generic_after || !sequential_low ||
+        !generic_attn_out || !generic_after || !sequential_low ||
         !sequential_attn_out || !sequential_after) goto done;
 
+    error_stage = "input_clone";
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_c2b_inline_copy(seq_heads, 0,
@@ -52130,31 +52131,38 @@ static bool ds4_cp4_tail_primitive_ab_run(
     result->input_bits_equal = input_comparison.bit_exact;
     if (!result->input_bits_equal) goto done;
 
+    error_stage = "generic_output_projection";
     ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
-        ok = ds4_gpu_attention_output_q8_batch_f16_tensor(
-                generic_half, generic_low,
-                s->engine->model.map, s->engine->model.size,
-                layer->attn_output_a->abs_offset,
-                layer->attn_output_b->abs_offset,
+        ok = metal_graph_attention_output_dense_quant_batch(
+                generic_attn_out, generic_low, &s->graph,
+                &s->engine->model,
+                layer->attn_output_a, layer->attn_output_b,
                 group_dim, rank, (uint32_t)n_groups, DS4_N_EMBD,
-                capture->cp4_heads[0], rows) != 0;
+                capture->cp4_heads[0], rows);
     }
     if (ok) {
-        ok = ds4_gpu_hc_expand_split_half_tensor(
-                generic_after, generic_half,
+        error_stage = "generic_hc_expand";
+        ok = ds4_gpu_hc_expand_split_tensor(
+                generic_after, generic_attn_out,
                 capture->cp4_tail_cur_hc[0],
                 capture->cp4_tail_hc_split[0],
                 DS4_N_EMBD, DS4_N_HC) != 0;
     }
     if (ok) {
+        error_stage = "sequential_tail";
         ok = metal_graph_attention_output_hc_canonical_rows(
                 sequential_after, sequential_low, sequential_attn_out,
                 &s->engine->model, layer,
                 seq_heads, seq_cur_hc, seq_hc_split, rows);
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    if (ok) {
+        error_stage = "command_completion";
+        ok = ds4_gpu_end_commands() != 0;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+    if (ok) error_stage = "output_read_compare";
     if (!ok ||
         !ds4_gpu_tensor_read(generic_after, 0,
                              generic_output_cpu, hc_bytes) ||
@@ -52173,6 +52181,7 @@ static bool ds4_cp4_tail_primitive_ab_run(
     result->executed = true;
     result->numerical_non_equivalence =
         !result->output_comparison.bit_exact;
+    error_stage = "none";
 
 done:
     fprintf(stderr,
@@ -52194,6 +52203,8 @@ done:
             ds4_projection_primitive_ab_print_metrics(
                 &result->output_comparison, &result->output_signature);
         }
+    } else {
+        fprintf(stderr, " reason=%s", error_stage);
     }
     fprintf(stderr, " evidence=%s\n",
             result->executed ? "PROVEN_BY_TEST" : "UNKNOWN");
@@ -52201,14 +52212,14 @@ done:
         result->weights_same && result->semantics_preserved &&
         result->numerical_non_equivalence) {
         fputs("DRIFT_SOURCE site=CP4 "
-              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
-              "generic=ds4_gpu_attention_output_q8_batch_f16_tensor+ds4_gpu_hc_expand_split_half_tensor "
+              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+              "generic=metal_graph_attention_output_dense_quant_batch+ds4_gpu_hc_expand_split_tensor "
               "sequential=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
               "component_attribution=UNKNOWN evidence=PROVEN_BY_TEST\n",
               stderr);
     } else if (result->executed) {
         fputs("CP4_TAIL_CANDIDATE "
-              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
               "result=REJECTED evidence=PROVEN_BY_TEST\n",
               stderr);
     }
@@ -52223,7 +52234,7 @@ done:
     ds4_gpu_tensor_free(sequential_attn_out);
     ds4_gpu_tensor_free(sequential_low);
     ds4_gpu_tensor_free(generic_after);
-    ds4_gpu_tensor_free(generic_half);
+    ds4_gpu_tensor_free(generic_attn_out);
     ds4_gpu_tensor_free(generic_low);
     ds4_gpu_tensor_free(seq_hc_split);
     ds4_gpu_tensor_free(seq_cur_hc);
@@ -52811,7 +52822,7 @@ static int ds4_first_divergence_run(ds4_session *s,
                             if (cp4_tail_selected) {
                                 fprintf(stderr,
                                         "SWEEP_STEP index=4 added=CP4-TAIL "
-                                        "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+                                        "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F32_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
                                         "primitive_non_equivalence=%s "
                                         "previous_stage_after_patch=%s "
                                         "new_first_divergence=",
