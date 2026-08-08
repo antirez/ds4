@@ -15305,9 +15305,16 @@ static ds4_c2b_capture *g_ds4_c2b_capture;
 /* Canonical sequential Pass-B capture.  Like the Pass-A hook, NULL is the
  * entire production fast path. */
 static ds4_c2b_capture *g_ds4_c45_capture;
-/* Default false.  Set only while the full first-divergence diagnostic encodes
- * generic A0/A1/A2 with row-wise canonical Q-A arithmetic. */
-static bool g_ds4_first_divergence_canonical_qa;
+/* Default zero. Set only while the full first-divergence diagnostic encodes
+ * generic A0/A1/A2 with selected row-wise canonical arithmetic. */
+enum {
+    DS4_FIRST_DIVERGENCE_CANON_QA = 1u << 0,
+};
+static uint32_t g_ds4_first_divergence_canonical_mask;
+
+static bool ds4_first_divergence_canonical_enabled(uint32_t bit) {
+    return (g_ds4_first_divergence_canonical_mask & bit) != 0;
+}
 static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
                                    uint32_t il,
                                    uint32_t pos);
@@ -25454,7 +25461,7 @@ static bool metal_graph_matmul_q8_0_named_tensor(
                                                 n_tok);
 }
 
-static bool metal_graph_matmul_qa_canonical_rows(
+static bool metal_graph_matmul_canonical_rows(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
         const ds4_tensor       *weight,
@@ -27437,8 +27444,9 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok && g_ds4_first_divergence_canonical_qa) {
-        ok = metal_graph_matmul_qa_canonical_rows(
+    if (ok && ds4_first_divergence_canonical_enabled(
+                      DS4_FIRST_DIVERGENCE_CANON_QA)) {
+        ok = metal_graph_matmul_canonical_rows(
             metal_graph_batch_qr(g), model, layer->attn_q_a,
             DS4_N_EMBD, q_rank, metal_graph_batch_attn_norm(g), n_tokens);
     } else if (ok) {
@@ -51427,6 +51435,35 @@ static bool ds4_c45_run_pass_b(ds4_session *s,
            s->checkpoint.len == (int)(start + n_tokens);
 }
 
+static bool ds4_first_divergence_parse_canonical_mask(
+        const char *value,
+        uint32_t *mask) {
+    char copy[64];
+    char *save = NULL;
+    char *token;
+
+    if (!mask) return false;
+    *mask = 0;
+    if (!value || !value[0]) return true;
+    if (strlen(value) >= sizeof(copy)) return false;
+    memcpy(copy, value, strlen(value) + 1u);
+    token = strtok_r(copy, ",", &save);
+    while (token) {
+        while (*token == ' ' || *token == '\t') token++;
+        char *end = token + strlen(token);
+        while (end > token && (end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+        if (strcasecmp(token, "QA") == 0) {
+            *mask |= DS4_FIRST_DIVERGENCE_CANON_QA;
+        } else {
+            return false;
+        }
+        token = strtok_r(NULL, ",", &save);
+    }
+    return *mask != 0;
+}
+
 static int ds4_first_divergence_run(ds4_session *s,
                                     const int *drafts,
                                     uint32_t n_tokens,
@@ -51443,11 +51480,24 @@ static int ds4_first_divergence_run(ds4_session *s,
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
+    uint32_t canonical_mask = 0;
+    const char *canonical_env =
+        getenv("DS4_FIRST_DIVERGENCE_CANONICAL");
+    const char *legacy_canonical_qa_env =
+        getenv("DS4_FIRST_DIVERGENCE_CANONICAL_QA");
+    bool canonical_config_ok = ds4_first_divergence_parse_canonical_mask(
+        canonical_env, &canonical_mask);
+    if (legacy_canonical_qa_env && legacy_canonical_qa_env[0] &&
+        strcmp(legacy_canonical_qa_env, "0") != 0) {
+        canonical_mask |= DS4_FIRST_DIVERGENCE_CANON_QA;
+    }
+    const bool canonical_requested = canonical_mask != 0;
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
     ds4_gpu_tensor *batch_next = g->batch_next_hc_by_tier[0];
     const bool config_ok =
-        s && drafts && s->engine->backend == DS4_BACKEND_METAL &&
+        canonical_config_ok && s && drafts &&
+        s->engine->backend == DS4_BACKEND_METAL &&
         !g->placement && !g->ssd_streaming &&
         g->tp_world <= 1u && n_tokens != 0 && n_tokens <= g->raw_cap &&
         n_tokens <= DS4_SPEC_PREFIX_SLOTS + 1u;
@@ -51483,26 +51533,22 @@ static int ds4_first_divergence_run(ds4_session *s,
         ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, &capture_a,
                           &a2, n_comp_before, n_index_before);
     const char *qa_ab_env = getenv("DS4_QA_PRIMITIVE_AB");
-    const char *canonical_qa_env =
-        getenv("DS4_FIRST_DIVERGENCE_CANONICAL_QA");
-    const bool canonical_qa_requested =
-        canonical_qa_env && canonical_qa_env[0] &&
-        strcmp(canonical_qa_env, "0") != 0;
     const bool qa_ab_requested =
-        canonical_qa_requested ||
+        (canonical_mask & DS4_FIRST_DIVERGENCE_CANON_QA) != 0 ||
         (qa_ab_env && qa_ab_env[0] && strcmp(qa_ab_env, "0") != 0);
     const bool qa_ab_proven = !qa_ab_requested ||
         (a2_ok && ds4_qa_primitive_ab_run(
             s, &capture_a, start, &qa_ab));
 
-    bool canonical_qa_rerun_ok = !canonical_qa_requested;
-    if (canonical_qa_requested && qa_ab_proven) {
+    bool canonical_rerun_ok = !canonical_requested;
+    if (canonical_requested && qa_ab_proven) {
         ds4_c2b_observable_free(&a0);
         ds4_c2b_observable_free(&a1);
         ds4_c2b_observable_free(&a2);
         const bool restore_canonical_ok = ds4_c2b_restore_s0(
             s, &frontier, &raw, start, batch_cur, batch_next);
-        g_ds4_first_divergence_canonical_qa = restore_canonical_ok;
+        g_ds4_first_divergence_canonical_mask = restore_canonical_ok
+            ? canonical_mask : 0;
         a0_ok = restore_canonical_ok &&
             ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
                               &a0, n_comp_before, n_index_before);
@@ -51516,8 +51562,8 @@ static int ds4_first_divergence_run(ds4_session *s,
         a2_ok = restore2_ok &&
             ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, &capture_a,
                               &a2, n_comp_before, n_index_before);
-        g_ds4_first_divergence_canonical_qa = false;
-        canonical_qa_rerun_ok = restore_canonical_ok && a0_ok &&
+        g_ds4_first_divergence_canonical_mask = 0;
+        canonical_rerun_ok = restore_canonical_ok && a0_ok &&
             restore1_ok && a1_ok && restore2_ok && a2_ok;
     }
     const bool pass_a_init_ok = a2_ok &&
@@ -51539,14 +51585,14 @@ static int ds4_first_divergence_run(ds4_session *s,
             "A0_vs_A2", &a2, &a0, start, n_tokens, g->raw_cap);
     }
     if (!config_ok || !alloc_a_ok || !alloc_b_ok || !raw_ok ||
-        !frontier_ok || !a0_ok || !canonical_qa_rerun_ok ||
+        !frontier_ok || !a0_ok || !canonical_rerun_ok ||
         !restore1_ok || !a1_ok || !restore2_ok || !a2_ok ||
         !pass_a_init_ok || !pass_a_materialize_ok || !pass_b_restore_ok) {
         fprintf(stderr,
                 "C2B_ERROR config=%d alloc_a=%d alloc_b=%d "
                 "raw_snapshot=%d frontier=%d "
                 "A0=%d restore1=%d A1=%d restore2=%d A2=%d "
-                "materialize_a=%d pass_b_restore=%d canonical_qa_rerun=%d\n",
+                "materialize_a=%d pass_b_restore=%d canonical_rerun=%d\n",
                 config_ok ? 1 : 0, alloc_a_ok ? 1 : 0,
                 alloc_b_ok ? 1 : 0,
                 raw_ok ? 1 : 0, frontier_ok ? 1 : 0, a0_ok ? 1 : 0,
@@ -51554,7 +51600,7 @@ static int ds4_first_divergence_run(ds4_session *s,
                 restore2_ok ? 1 : 0, a2_ok ? 1 : 0,
                 pass_a_materialize_ok ? 1 : 0,
                 pass_b_restore_ok ? 1 : 0,
-                canonical_qa_rerun_ok ? 1 : 0);
+                canonical_rerun_ok ? 1 : 0);
         control = false;
         probe = false;
     }
@@ -51575,7 +51621,8 @@ static int ds4_first_divergence_run(ds4_session *s,
         report_ok = pass_b_materialize_ok &&
             ds4_first_divergence_emit_report(
                 &pass_a, &pass_b, stderr, &report);
-        if (report_ok && canonical_qa_requested) {
+        if (report_ok && (canonical_mask &
+                          DS4_FIRST_DIVERGENCE_CANON_QA) != 0) {
             bool q_projection_exact = false;
             report_ok = ds4_first_divergence_emit_q_trace(
                 &pass_a, &pass_b, stderr, &q_projection_exact) &&
@@ -51596,7 +51643,7 @@ static int ds4_first_divergence_run(ds4_session *s,
 
     g_ds4_c2b_capture = NULL;
     g_ds4_c45_capture = NULL;
-    g_ds4_first_divergence_canonical_qa = false;
+    g_ds4_first_divergence_canonical_mask = 0;
     ds4_c2b_observable_free(&a0);
     ds4_c2b_observable_free(&a1);
     ds4_c2b_observable_free(&a2);
@@ -51607,7 +51654,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_c2b_raw_s0_free(&raw);
     spec_frontier_free(&frontier);
     return control && probe && qa_ab_proven &&
-        canonical_qa_rerun_ok && report_ok ? 0 : 1;
+        canonical_rerun_ok && report_ok ? 0 : 1;
 }
 
 /* Commit an intermediate state captured by a tiny speculative verifier.
