@@ -8096,6 +8096,41 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+int ds4_gpu_tensor_copy_f32_inline(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t bytes) {
+    if (!dst || !src || bytes == 0) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ((bytes | dst_offset | src_offset) & (sizeof(float) - 1u)) return 0;
+    if (!g_batch_cb || !g_cpy_f32_f32_pipeline ||
+        bytes / sizeof(float) > UINT32_MAX) {
+        return 0;
+    }
+
+    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+    if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
+    if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
+
+    id<MTLComputeCommandEncoder> encoder_before = g_batch_enc;
+    if (!ds4_gpu_encode_cpy_f32_f32_1d(
+            g_batch_cb,
+            s.buffer,
+            (NSUInteger)(s.offset + src_offset),
+            d.buffer,
+            (NSUInteger)(d.offset + dst_offset),
+            (uint32_t)(bytes / sizeof(float)))) {
+        return 0;
+    }
+
+    /* Make same-encoder transport part of the success contract. The first
+     * call may create the cached encoder; subsequent calls must retain it. */
+    if (!g_batch_enc || (encoder_before && g_batch_enc != encoder_before)) {
+        return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {

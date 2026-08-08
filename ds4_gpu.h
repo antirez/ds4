@@ -56,6 +56,14 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Strict F32 checkpoint transport. On Metal, success means a nonempty copy
+ * kernel was encoded in the active batch's cached compute encoder and that
+ * encoder remained open; this function never falls back to a blit copy.
+ * Offsets and byte count must be multiples of sizeof(float). Other backends
+ * provide linkage-compatible ordinary-copy semantics only. */
+int ds4_gpu_tensor_copy_f32_inline(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);

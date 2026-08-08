@@ -6047,6 +6047,16 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy enqueue");
 }
 
+/* Linkage compatibility only: ROCm has no Metal compute-encoder semantics. */
+extern "C" int ds4_gpu_tensor_copy_f32_inline(ds4_gpu_tensor *dst,
+                                                uint64_t dst_offset,
+                                                const ds4_gpu_tensor *src,
+                                                uint64_t src_offset,
+                                                uint64_t bytes) {
+    if (bytes == 0 || ((bytes | dst_offset | src_offset) & 3u)) return 0;
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
