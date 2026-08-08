@@ -156,7 +156,8 @@ const char *ds4_first_divergence_checkpoint_name(
         ds4_first_divergence_checkpoint checkpoint) {
     static const char *const names[] = {
         "CP1", "CP2-Q", "CP2-KV-P", "CP2-Q-NORM", "CP2-Q-CUR",
-        "CP2-KV-R", "CP3-P", "CP3-F", "CP4-HEADS", "CP4", "CP5"
+        "CP2-KV-R", "CP3-P", "CP3-F", "CP4-HEADS-RAW",
+        "CP4-HEADS", "CP4", "CP5"
     };
 
     if (checkpoint >= DS4_FIRST_DIVERGENCE_CHECKPOINT_COUNT) {
@@ -641,6 +642,8 @@ bool ds4_first_divergence_emit_attention_interval_trace(
          "normalized_q_a_projection_output"},
         {DS4_FIRST_DIVERGENCE_CP2_Q_CUR, "q_cur",
          "q_after_q_b_head_norm_and_rope"},
+        {DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW, "attn_heads_raw",
+         "attention_heads_before_inverse_rope"},
         {DS4_FIRST_DIVERGENCE_CP4_HEADS, "attn_heads",
          "attention_heads_after_inverse_rope"},
         {DS4_FIRST_DIVERGENCE_CP4, "after_attn_hc",

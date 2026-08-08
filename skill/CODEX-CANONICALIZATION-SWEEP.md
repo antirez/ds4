@@ -10,9 +10,13 @@
   layer 0: **PROVEN BY TEST** on M4 Max.
 - Natural semantic subdivision of the interval leading to CP4:
   **PROVEN BY TEST** on M4 Max.
-- Current first divergence: `CP2-Q-CUR/q_cur` at row 0, layer 0;
-  `CP2-Q-NORM/qr_norm` is exact: **PROVEN BY TEST** on M4 Max.
+- Previous first divergence: `CP2-Q-CUR/q_cur` at row 0, layer 0;
+  `CP2-Q-NORM/qr_norm` exact: **PROVEN BY TEST** on M4 Max.
 - Q-B isolated A/B and `{QA,KV,QB}` causal substitution:
+  **PROVEN BY TEST** on M4 Max.
+- Current first divergence: `CP4-HEADS/attn_heads` at row 0, layer 0;
+  `CP2-Q-CUR/q_cur` exact: **PROVEN BY TEST** on M4 Max.
+- Pre-inverse-RoPE heads subdivision and raw-attention canonicalization:
   **IMPLEMENTED; M4 RUNTIME REQUIRED**.
 - Default production behavior remains unchanged when
   `DS4_FIRST_DIVERGENCE_CANONICAL` is unset.
@@ -48,10 +52,12 @@ The composable diagnostic interface is:
 DS4_FIRST_DIVERGENCE_CANONICAL=QA
 DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV
 DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW
 ```
 
-`KV` without `QA`, or `QB` without both earlier sites, is rejected because
-this forward sweep preserves the proven causal prefix.  The legacy
+`KV` without `QA`, `QB` without both earlier sites, or `ATTN-RAW` without
+`QA,KV,QB` is rejected because this forward sweep preserves the proven causal
+prefix. The legacy
 `DS4_FIRST_DIVERGENCE_CANONICAL_QA=1` gate remains accepted.  The mask is set
 only while encoding generic diagnostic A0/A1/A2 and is cleared before
 canonical sequential Pass B.
@@ -354,3 +360,63 @@ first testable member of the compound producer; its isolated A/B and causal
 removal are **UNKNOWN pending M4 runtime**.  No attention, output projection,
 HC expansion, FFN, MoE, store, or later checkpoint is canonicalized before
 Q-B is adjudicated.
+
+## CP4-HEADS subdivision and raw-attention family
+
+The `{QA,KV,QB}` M4 run established:
+
+```text
+ATTENTION_INTERVAL_STAGE stage=CP2-Q-CUR ... result=EXACT
+FIRST_DIVERGENCE row=0 layer=0 checkpoint=CP4-HEADS subobject=attn_heads
+```
+
+Both paths already materialize the same F32 attention-head object before
+inverse RoPE mutates it in place. The diagnostic now snapshots that object as
+`CP4-HEADS-RAW/attn_heads_raw`. It does not expose or recompute logits,
+softmax probabilities, or `P·V`; the batch and single-row FlashAttention
+kernels do not materialize a common intermediate for those stages.
+
+At row 0, layer 0 of the fixed Flash model, the producer pair is:
+
+| Path | Producer | Metal arithmetic |
+| --- | --- | --- |
+| generic | `ds4_gpu_attention_decode_raw_batch_heads_tensor` | direct `kernel_flash_attn_ext_f16_dk512_dv512` batch output |
+| sequential | `ds4_gpu_attention_decode_heads_tensor` | `kernel_flash_attn_ext_vec_f16_dk512_dv512` plus `kernel_flash_attn_reduce` |
+
+If `CP4-HEADS-RAW` is the first mismatch, classify it as
+`FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE`. This is a new
+arithmetic family, independent of the proven Q8_0 projection family.
+
+First run the new checkpoint without attention canonicalization:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-attn-raw-baseline.log 2>&1
+```
+
+If `CP4-HEADS-RAW` mismatches, run the narrow diagnostic substitution:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-attn-raw-canonical.log 2>&1
+```
+
+`ATTN-RAW` only disables the raw-only batched attention call and reuses the
+existing per-row `ds4_gpu_attention_decode_heads_tensor` fallback. Compressed
+attention, inverse RoPE, output projection/fusion, replay, and production
+behavior remain unchanged. Stop if the next mismatch is CP4: the output tail
+has asymmetric fusion and no common standalone F32 `attn_out` boundary.

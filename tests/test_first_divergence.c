@@ -126,6 +126,9 @@ int main(void) {
                        DS4_FIRST_DIVERGENCE_CP2_Q_NORM),
                    "CP2-Q-NORM") == 0);
     REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
+                       DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW),
+                   "CP4-HEADS-RAW") == 0);
+    REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
                        DS4_FIRST_DIVERGENCE_CP4_HEADS),
                    "CP4-HEADS") == 0);
     REQUIRE(ds4_first_divergence_float_signature_compute(
@@ -270,6 +273,8 @@ int main(void) {
                           "after_attn_hc", interval_exact, interval_exact);
     CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP4_HEADS,
                           "attn_heads", interval_exact, interval_exact);
+    CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW,
+                          "attn_heads_raw", interval_exact, interval_exact);
     CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP2_Q_CUR,
                           "q_cur", interval_exact, interval_mismatch);
     CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP2_Q_NORM,
@@ -295,7 +300,36 @@ int main(void) {
     REQUIRE(strstr(q_log_text,
                    "stage=CP2-Q-CUR semantic=q_after_q_b_head_norm_and_rope subobject=q_cur result=MISMATCH") != NULL);
     REQUIRE(strstr(q_log_text,
+                   "stage=CP4-HEADS-RAW semantic=attention_heads_before_inverse_rope subobject=attn_heads_raw result=EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
                    "ATTENTION_INTERVAL_RESULT FIRST_RUNTIME_DIVERGENCE stage=CP2-Q-CUR") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    for (size_t i = 0; i < interval_pass_b.count; i++) {
+        ds4_first_divergence_snapshot *b = &interval_pass_b.snapshots[i];
+        if (b->checkpoint == DS4_FIRST_DIVERGENCE_CP2_Q_CUR) {
+            memcpy(b->data, interval_exact, sizeof(interval_exact));
+        } else if (b->checkpoint == DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW) {
+            memcpy(b->data, interval_mismatch, sizeof(interval_mismatch));
+        }
+    }
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &interval_pass_a, &interval_pass_b, q_log, &report));
+    REQUIRE(report.first_divergence_found);
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW);
+    REQUIRE(strcmp(report.subobject, "attn_heads_raw") == 0);
+    REQUIRE(ds4_first_divergence_emit_attention_interval_trace(
+        &interval_pass_a, &interval_pass_b, q_log));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "FIRST_DIVERGENCE row=0 layer=0 checkpoint=CP4-HEADS-RAW subobject=attn_heads_raw") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "ATTENTION_INTERVAL_RESULT FIRST_RUNTIME_DIVERGENCE stage=CP4-HEADS-RAW") != NULL);
     REQUIRE(fclose(q_log) == 0);
     ds4_first_divergence_capture_free(&interval_pass_a);
     ds4_first_divergence_capture_free(&interval_pass_b);

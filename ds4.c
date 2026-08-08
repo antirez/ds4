@@ -15293,6 +15293,7 @@ typedef struct {
     ds4_gpu_tensor *cp3_index_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp4_heads_raw[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_heads[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp5[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
@@ -15315,6 +15316,7 @@ enum {
     DS4_FIRST_DIVERGENCE_CANON_QA = 1u << 0,
     DS4_FIRST_DIVERGENCE_CANON_KV = 1u << 1,
     DS4_FIRST_DIVERGENCE_CANON_QB = 1u << 2,
+    DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW = 1u << 3,
 };
 static uint32_t g_ds4_first_divergence_canonical_mask;
 
@@ -15324,6 +15326,13 @@ static bool ds4_first_divergence_canonical_enabled(uint32_t bit) {
 static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
                                    uint32_t il,
                                    uint32_t pos);
+static bool ds4_c2b_capture_attention_heads_raw(ds4_gpu_graph *g,
+                                                 uint32_t il,
+                                                 uint32_t pos0,
+                                                 uint32_t n_tokens);
+static bool ds4_c45_capture_attention_heads_raw(ds4_gpu_graph *g,
+                                                 uint32_t il,
+                                                 uint32_t pos);
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
  * decode. The batched server serializes every operation that uses them, so one
@@ -22858,6 +22867,9 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     }
     if (ok && !cuda_tp_attn_heads_active && !attn_inv_rope_done) {
+        ok = ds4_c45_capture_attention_heads_raw(g, il, pos);
+    }
+    if (ok && !cuda_tp_attn_heads_active && !attn_inv_rope_done) {
         ok = ds4_gpu_rope_tail_tensor(metal_graph_heads(g),
                                       1, tp_heads, DS4_N_HEAD_DIM,
                                       DS4_N_ROT, pos,
@@ -27719,7 +27731,11 @@ static bool metal_graph_encode_layer_attention_batch(
     if (!ok) {
         fprintf(stderr, "ds4: gpu layer %u raw KV batch store failed\n", il);
     }
-    const bool raw_batch_attention = zero_prefix && ratio == 0;
+    const bool canonical_raw_attention =
+        ratio == 0 && ds4_first_divergence_canonical_enabled(
+            DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW);
+    const bool raw_batch_attention =
+        zero_prefix && ratio == 0 && !canonical_raw_attention;
     bool batch_attention_done = false;
 
     if (ok && raw_batch_attention) {
@@ -27749,7 +27765,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                               DS4_N_HEAD_DIM) != 0;
         }
         if (ok) batch_attention_done = true;
-    } else if (ok && !zero_prefix && ratio == 0 && n_tokens <= g->raw_cap) {
+    } else if (ok && !zero_prefix && ratio == 0 &&
+               n_tokens <= g->raw_cap && !canonical_raw_attention) {
         /*
          * The ubatch path stores the whole batch in the SWA cache, then runs
          * one batched attention kernel with an absolute-position causal/window
@@ -28853,6 +28870,9 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
+    if (ok) {
+        ok = ds4_c2b_capture_attention_heads_raw(g, il, pos0, n_tokens);
+    }
     if (ok) ok = ds4_gpu_rope_tail_tensor(tp_heads ? tp_heads : metal_graph_batch_heads(g),
                                             tp_rows,
                                             DS4_N_HEAD,
@@ -29698,6 +29718,41 @@ static bool ds4_c2b_inline_copy(ds4_gpu_tensor *dst,
     return dst && src && bytes != 0 &&
            ds4_gpu_tensor_copy_f32_inline(dst, dst_offset,
                                           src, src_offset, bytes) != 0;
+}
+
+/* Both paths materialize F32 attention heads before inverse RoPE mutates the
+ * tensor in place. No score/probability tensor is exposed by both
+ * FlashAttention implementations. */
+static bool ds4_c2b_capture_attention_heads_raw(ds4_gpu_graph *g,
+                                                 uint32_t il,
+                                                 uint32_t pos0,
+                                                 uint32_t n_tokens) {
+    ds4_c2b_capture *c = g_ds4_c2b_capture;
+    if (!c) return true;
+    if (c->graph != g || c->start != pos0 || c->n_tokens != n_tokens ||
+        il >= DS4_N_LAYER || n_tokens == 0) {
+        return false;
+    }
+    const uint64_t bytes =
+        (uint64_t)n_tokens * c->q_out_values[il] * sizeof(float);
+    return ds4_c2b_inline_copy(c->cp4_heads_raw[il], 0,
+                               metal_graph_batch_heads(g), 0, bytes);
+}
+
+static bool ds4_c45_capture_attention_heads_raw(ds4_gpu_graph *g,
+                                                 uint32_t il,
+                                                 uint32_t pos) {
+    ds4_c2b_capture *c = g_ds4_c45_capture;
+    if (!c) return true;
+    if (c->graph != g || il >= DS4_N_LAYER || pos < c->start ||
+        pos - c->start >= c->n_tokens) {
+        return false;
+    }
+    const uint32_t row = pos - c->start;
+    const uint64_t row_bytes = c->q_out_values[il] * sizeof(float);
+    return ds4_c2b_inline_copy(c->cp4_heads_raw[il],
+                               (uint64_t)row * row_bytes,
+                               metal_graph_heads(g), 0, row_bytes);
 }
 
 static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
@@ -50464,6 +50519,7 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp3_index_state_score);
         DS4_C2B_FREE(cp3_index_cache);
         DS4_C2B_FREE(cp4);
+        DS4_C2B_FREE(cp4_heads_raw);
         DS4_C2B_FREE(cp4_heads);
         DS4_C2B_FREE(cp5);
 #undef DS4_C2B_FREE
@@ -50550,11 +50606,13 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         c->cp2_q_cur[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp2_kv_r[il] = ds4_gpu_tensor_alloc(kv_bytes);
         c->cp4[il] = ds4_gpu_tensor_alloc(hc_bytes);
+        c->cp4_heads_raw[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp4_heads[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp5[il] = ds4_gpu_tensor_alloc(hc_bytes);
         if (!c->cp1[il] || !c->cp2_q[il] || !c->cp2_kv_p[il] ||
             !c->cp2_q_norm[il] || !c->cp2_q_cur[il] ||
-            !c->cp2_kv_r[il] || !c->cp4_heads[il] ||
+            !c->cp2_kv_r[il] || !c->cp4_heads_raw[il] ||
+            !c->cp4_heads[il] ||
             !c->cp4[il] || !c->cp5[il]) {
             ds4_c2b_capture_free(c);
             return false;
@@ -50781,6 +50839,10 @@ static bool ds4_c2b_materialize_capture(
              ds4_c2b_materialize_f32_rows(
                  out, capture->cp2_kv_r[il], rows, DS4_N_HEAD_DIM, il,
                  DS4_FIRST_DIVERGENCE_CP2_KV_R, "raw_cache") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->cp4_heads_raw[il], rows,
+                 (size_t)capture->q_out_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW, "attn_heads_raw") &&
              ds4_c2b_materialize_f32_rows(
                  out, capture->cp4_heads[il], rows,
                  (size_t)capture->q_out_values[il], il,
@@ -51867,6 +51929,9 @@ static bool ds4_first_divergence_parse_canonical_mask(
             *mask |= DS4_FIRST_DIVERGENCE_CANON_KV;
         } else if (strcasecmp(token, "QB") == 0) {
             *mask |= DS4_FIRST_DIVERGENCE_CANON_QB;
+        } else if (strcasecmp(token, "ATTN") == 0 ||
+                   strcasecmp(token, "ATTN-RAW") == 0) {
+            *mask |= DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW;
         } else {
             return false;
         }
@@ -51969,6 +52034,22 @@ static void ds4_projection_drift_source_print(
             canonicalization_removes_site ? "YES" : "NO");
 }
 
+static void ds4_raw_attention_drift_source_print(
+        bool canonicalization_removes_site) {
+    fprintf(stderr,
+            "DRIFT_SOURCE site=CP4-HEADS-RAW "
+            "semantic=attention_heads_before_inverse_rope "
+            "generic=ds4_gpu_attention_decode_raw_batch_heads_tensor "
+            "sequential=ds4_gpu_attention_decode_heads_tensor "
+            "generic_primitive=kernel_flash_attn_ext_f16_dk512_dv512 "
+            "sequential_primitive=kernel_flash_attn_ext_vec_f16_dk512_dv512+kernel_flash_attn_reduce "
+            "batch_vs_single=YES "
+            "family=FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE "
+            "canonicalization_removes_site=%s "
+            "evidence=PROVEN_BY_SOURCE_AND_TEST\n",
+            canonicalization_removes_site ? "YES" : "NO");
+}
+
 static int ds4_first_divergence_run(ds4_session *s,
                                     const int *drafts,
                                     uint32_t n_tokens,
@@ -52004,8 +52085,15 @@ static int ds4_first_divergence_run(ds4_session *s,
         ((canonical_mask & DS4_FIRST_DIVERGENCE_CANON_QB) == 0 ||
          (canonical_mask & (DS4_FIRST_DIVERGENCE_CANON_QA |
                             DS4_FIRST_DIVERGENCE_CANON_KV)) ==
+              (DS4_FIRST_DIVERGENCE_CANON_QA |
+               DS4_FIRST_DIVERGENCE_CANON_KV)) &&
+        ((canonical_mask & DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) == 0 ||
+         (canonical_mask & (DS4_FIRST_DIVERGENCE_CANON_QA |
+                            DS4_FIRST_DIVERGENCE_CANON_KV |
+                            DS4_FIRST_DIVERGENCE_CANON_QB)) ==
              (DS4_FIRST_DIVERGENCE_CANON_QA |
-              DS4_FIRST_DIVERGENCE_CANON_KV));
+              DS4_FIRST_DIVERGENCE_CANON_KV |
+              DS4_FIRST_DIVERGENCE_CANON_QB));
     const bool canonical_requested = canonical_mask != 0;
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
@@ -52197,6 +52285,19 @@ static int ds4_first_divergence_run(ds4_session *s,
                         (canonical_mask & DS4_FIRST_DIVERGENCE_CANON_QB) != 0 &&
                         ds4_first_divergence_report_after_layer0_checkpoint(
                             &report, DS4_FIRST_DIVERGENCE_CP2_Q_CUR);
+                    const bool attn_raw_selected =
+                        (canonical_mask &
+                         DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0;
+                    const bool attn_raw_is_first =
+                        ds4_first_divergence_report_is(
+                            &report,
+                            DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW,
+                            "attn_heads_raw");
+                    const bool attn_raw_site_removed =
+                        attn_raw_selected &&
+                        ds4_first_divergence_report_after_layer0_checkpoint(
+                            &report,
+                            DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW);
                     if ((canonical_mask &
                          DS4_FIRST_DIVERGENCE_CANON_QB) != 0) {
                         ds4_projection_drift_source_print(
@@ -52204,6 +52305,10 @@ static int ds4_first_divergence_run(ds4_session *s,
                             "metal_graph_matmul_q8_0_named_tensor_attn_q_b",
                             "metal_graph_matmul_dense_quant_abs",
                             &qb_ab, qb_site_removed);
+                    }
+                    if (attn_raw_is_first || attn_raw_selected) {
+                        ds4_raw_attention_drift_source_print(
+                            attn_raw_site_removed);
                     }
                     fputs("SWEEP_STEP index=1 added=KV "
                           "family=FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV "
@@ -52221,16 +52326,41 @@ static int ds4_first_divergence_run(ds4_session *s,
                                 "previous_stage_after_patch=%s "
                                 "new_first_divergence=",
                                 qb_site_removed ? "EXACT" : "MISMATCH");
-                        ds4_first_divergence_print_report_location(&report);
+                        if (attn_raw_selected) {
+                            fputs("row=0,layer=0,checkpoint=CP4-HEADS-RAW,subobject=attn_heads_raw",
+                                  stderr);
+                        } else {
+                            ds4_first_divergence_print_report_location(&report);
+                        }
                         fputc('\n', stderr);
-                        fputs("CANONICALIZATION_SWEEP_RESULT "
-                              "canonical_set=QA,KV,QB sources_exposed=3 "
-                              "arithmetic_families=1 family_concentration=HIGH "
-                              "first_divergence=",
-                              stderr);
-                        ds4_first_divergence_print_report_location(&report);
-                        fputc('\n', stderr);
-                        report_ok = qb_site_removed;
+                        if (attn_raw_selected) {
+                            fprintf(stderr,
+                                    "SWEEP_STEP index=3 added=ATTN-RAW "
+                                    "family=FAMILY_FLASH_ATTN_BATCH_DIRECT_VS_SINGLE_VEC_REDUCE "
+                                    "previous_stage_after_patch=%s "
+                                    "new_first_divergence=",
+                                    attn_raw_site_removed ? "EXACT" : "MISMATCH");
+                            ds4_first_divergence_print_report_location(&report);
+                            fputc('\n', stderr);
+                            fputs("CANONICALIZATION_SWEEP_RESULT "
+                                  "canonical_set=QA,KV,QB,ATTN-RAW "
+                                  "sources_exposed=4 arithmetic_families=2 "
+                                  "family_concentration=MIXED first_divergence=",
+                                  stderr);
+                            ds4_first_divergence_print_report_location(&report);
+                            fputc('\n', stderr);
+                            report_ok = qb_site_removed &&
+                                        attn_raw_site_removed;
+                        } else {
+                            fputs("CANONICALIZATION_SWEEP_RESULT "
+                                  "canonical_set=QA,KV,QB sources_exposed=4 "
+                                  "arithmetic_families=2 family_concentration=MIXED "
+                                  "first_divergence=",
+                                  stderr);
+                            ds4_first_divergence_print_report_location(&report);
+                            fputc('\n', stderr);
+                            report_ok = qb_site_removed;
+                        }
                     } else {
                         fputs("CANONICALIZATION_SWEEP_RESULT "
                               "canonical_set=QA,KV sources_exposed=2 "
