@@ -13,9 +13,12 @@ typedef enum {
     DS4_FIRST_DIVERGENCE_CP1 = 0,
     DS4_FIRST_DIVERGENCE_CP2_Q,
     DS4_FIRST_DIVERGENCE_CP2_KV_P,
+    DS4_FIRST_DIVERGENCE_CP2_Q_NORM,
+    DS4_FIRST_DIVERGENCE_CP2_Q_CUR,
     DS4_FIRST_DIVERGENCE_CP2_KV_R,
     DS4_FIRST_DIVERGENCE_CP3_P,
     DS4_FIRST_DIVERGENCE_CP3_F,
+    DS4_FIRST_DIVERGENCE_CP4_HEADS,
     DS4_FIRST_DIVERGENCE_CP4,
     DS4_FIRST_DIVERGENCE_CP5,
     DS4_FIRST_DIVERGENCE_CHECKPOINT_COUNT
@@ -152,6 +155,11 @@ bool ds4_first_divergence_emit_kv_trace(
         const ds4_first_divergence_capture *pass_b,
         FILE *stream,
         bool *kv_projection_exact);
+
+bool ds4_first_divergence_emit_attention_interval_trace(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream);
 
 bool ds4_first_divergence_emit_qa_canonical_summary(
         const ds4_first_divergence_report *report,

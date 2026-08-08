@@ -155,8 +155,8 @@ bool ds4_first_divergence_capture_bytes(
 const char *ds4_first_divergence_checkpoint_name(
         ds4_first_divergence_checkpoint checkpoint) {
     static const char *const names[] = {
-        "CP1", "CP2-Q", "CP2-KV-P", "CP2-KV-R",
-        "CP3-P", "CP3-F", "CP4", "CP5"
+        "CP1", "CP2-Q", "CP2-KV-P", "CP2-Q-NORM", "CP2-Q-CUR",
+        "CP2-KV-R", "CP3-P", "CP3-F", "CP4-HEADS", "CP4", "CP5"
     };
 
     if (checkpoint >= DS4_FIRST_DIVERGENCE_CHECKPOINT_COUNT) {
@@ -623,6 +623,86 @@ bool ds4_first_divergence_emit_kv_trace(
           stream);
     fputs("KV_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_KV_PATH\n",
           stream);
+    return ferror(stream) == 0;
+}
+
+typedef struct {
+    ds4_first_divergence_checkpoint checkpoint;
+    const char *subobject;
+    const char *semantic;
+} ds4_attention_interval_stage;
+
+bool ds4_first_divergence_emit_attention_interval_trace(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream) {
+    static const ds4_attention_interval_stage stages[] = {
+        {DS4_FIRST_DIVERGENCE_CP2_Q_NORM, "qr_norm",
+         "normalized_q_a_projection_output"},
+        {DS4_FIRST_DIVERGENCE_CP2_Q_CUR, "q_cur",
+         "q_after_q_b_head_norm_and_rope"},
+        {DS4_FIRST_DIVERGENCE_CP4_HEADS, "attn_heads",
+         "attention_heads_after_inverse_rope"},
+        {DS4_FIRST_DIVERGENCE_CP4, "after_attn_hc",
+         "post_attention_hidden_state"},
+    };
+    const ds4_attention_interval_stage *first_mismatch = NULL;
+
+    if (!pass_a || !pass_b || !stream) return false;
+    fputs("ATTENTION_INTERVAL_TRACE row=0 layer=0\n", stream);
+    for (size_t i = 0; i < sizeof(stages) / sizeof(stages[0]); i++) {
+        const ds4_attention_interval_stage *stage = &stages[i];
+        const ds4_first_divergence_snapshot *a = find_snapshot_fields(
+            pass_a, 0, 0, stage->checkpoint, stage->subobject);
+        const ds4_first_divergence_snapshot *b = find_snapshot_fields(
+            pass_b, 0, 0, stage->checkpoint, stage->subobject);
+        ds4_float_compare_result comparison;
+
+        if (!a || !b) {
+            fputs("ATTENTION_INTERVAL_SANITY FAIL reason=missing_required_snapshot\n",
+                  stream);
+            return false;
+        }
+        if (!same_layout(a, b) ||
+            a->kind != DS4_FIRST_DIVERGENCE_PAYLOAD_F32) {
+            fputs("ATTENTION_INTERVAL_SANITY FAIL reason=non_comparable_layout\n",
+                  stream);
+            return false;
+        }
+        if (!ds4_float_compare_exact((const float *)a->data,
+                                     (const float *)b->data,
+                                     a->element_count, &comparison)) {
+            fputs("ATTENTION_INTERVAL_SANITY FAIL reason=compare_error\n",
+                  stream);
+            return false;
+        }
+        fprintf(stream,
+                "ATTENTION_INTERVAL_STAGE stage=%s semantic=%s subobject=%s result=",
+                ds4_first_divergence_checkpoint_name(stage->checkpoint),
+                stage->semantic, stage->subobject);
+        if (comparison.bit_exact) {
+            fprintf(stream, "EXACT elements=%zu\n", comparison.length);
+            continue;
+        }
+        if (!first_mismatch) first_mismatch = stage;
+        fputs("MISMATCH", stream);
+        print_float_metrics(stream, &comparison);
+        if (!print_float_signature(stream,
+                                   (const float *)a->data,
+                                   (const float *)b->data,
+                                   a->element_count)) {
+            return false;
+        }
+        fputc('\n', stream);
+    }
+    if (first_mismatch) {
+        fprintf(stream,
+                "ATTENTION_INTERVAL_RESULT FIRST_RUNTIME_DIVERGENCE stage=%s semantic=%s subobject=%s\n",
+                ds4_first_divergence_checkpoint_name(first_mismatch->checkpoint),
+                first_mismatch->semantic, first_mismatch->subobject);
+    } else {
+        fputs("ATTENTION_INTERVAL_RESULT EXACT_THROUGH_CP4\n", stream);
+    }
     return ferror(stream) == 0;
 }
 

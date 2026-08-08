@@ -77,6 +77,8 @@ int main(void) {
     ds4_first_divergence_report report;
     ds4_first_divergence_capture q_pass_a;
     ds4_first_divergence_capture q_pass_b;
+    ds4_first_divergence_capture interval_pass_a;
+    ds4_first_divergence_capture interval_pass_b;
     FILE *q_log;
     bool q_projection_exact;
     bool kv_projection_exact;
@@ -87,6 +89,8 @@ int main(void) {
     const float qr_a[] = {0.125f, -0.5f, 1.0f, 2.0f};
     const float qr_b[] = {0.12500001f, -0.5f, 1.0000001f, 2.0f};
     const float kv_raw[] = {0.25f, -1.5f, 4.0f};
+    const float interval_exact[] = {0.25f, -0.75f};
+    const float interval_mismatch[] = {0.25f, -0.5f};
     const float signature_actual[] = {1.0f, 3.0f, 5.0f, 7.0f};
     const float signature_expected[] = {1.0f, 2.0f, 4.0f, 8.0f};
     const uint32_t n_comp = 17;
@@ -118,6 +122,12 @@ int main(void) {
     REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
                        DS4_FIRST_DIVERGENCE_CP2_KV_R),
                    "CP2-KV-R") == 0);
+    REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
+                       DS4_FIRST_DIVERGENCE_CP2_Q_NORM),
+                   "CP2-Q-NORM") == 0);
+    REQUIRE(strcmp(ds4_first_divergence_checkpoint_name(
+                       DS4_FIRST_DIVERGENCE_CP4_HEADS),
+                   "CP4-HEADS") == 0);
     REQUIRE(ds4_first_divergence_float_signature_compute(
         signature_actual, signature_expected, 4, &signature));
     REQUIRE(signature.mismatch_count == 3);
@@ -243,6 +253,52 @@ int main(void) {
     REQUIRE(fclose(q_log) == 0);
     ds4_first_divergence_capture_free(&q_pass_a);
     ds4_first_divergence_capture_free(&q_pass_b);
+
+    REQUIRE(ds4_first_divergence_capture_init(&interval_pass_a, "PASS_A"));
+    REQUIRE(ds4_first_divergence_capture_init(&interval_pass_b, "PASS_B"));
+#define CAPTURE_INTERVAL_PAIR(checkpoint_, subobject_, a_, b_) do { \
+        REQUIRE(ds4_first_divergence_capture_f32( \
+            &interval_pass_a, 0, 0, (checkpoint_), (subobject_), \
+            (a_), 2)); \
+        REQUIRE(ds4_first_divergence_capture_f32( \
+            &interval_pass_b, 0, 0, (checkpoint_), (subobject_), \
+            (b_), 2)); \
+    } while (0)
+    /* Capture deliberately out of order; reporting must follow the causal
+     * checkpoint enum, not insertion order or subobject spelling. */
+    CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP4,
+                          "after_attn_hc", interval_exact, interval_exact);
+    CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP4_HEADS,
+                          "attn_heads", interval_exact, interval_exact);
+    CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP2_Q_CUR,
+                          "q_cur", interval_exact, interval_mismatch);
+    CAPTURE_INTERVAL_PAIR(DS4_FIRST_DIVERGENCE_CP2_Q_NORM,
+                          "qr_norm", interval_exact, interval_exact);
+#undef CAPTURE_INTERVAL_PAIR
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &interval_pass_a, &interval_pass_b, q_log, &report));
+    REQUIRE(report.first_divergence_found);
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP2_Q_CUR);
+    REQUIRE(strcmp(report.subobject, "q_cur") == 0);
+    REQUIRE(ds4_first_divergence_emit_attention_interval_trace(
+        &interval_pass_a, &interval_pass_b, q_log));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "FIRST_DIVERGENCE row=0 layer=0 checkpoint=CP2-Q-CUR subobject=q_cur") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "stage=CP2-Q-NORM semantic=normalized_q_a_projection_output subobject=qr_norm result=EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "stage=CP2-Q-CUR semantic=q_after_q_b_head_norm_and_rope subobject=q_cur result=MISMATCH") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "ATTENTION_INTERVAL_RESULT FIRST_RUNTIME_DIVERGENCE stage=CP2-Q-CUR") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+    ds4_first_divergence_capture_free(&interval_pass_a);
+    ds4_first_divergence_capture_free(&interval_pass_b);
 
     puts("first-divergence forced pair: OK");
     return 0;

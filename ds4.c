@@ -15277,11 +15277,14 @@ typedef struct {
     uint32_t start;
     uint32_t n_tokens;
     uint64_t q_values[DS4_MAX_LAYER];
+    uint64_t q_out_values[DS4_MAX_LAYER];
     uint32_t n_comp_before[DS4_MAX_LAYER];
     uint32_t n_index_before[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp1[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp2_q[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp2_kv_p[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp2_q_norm[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp2_q_cur[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp2_kv_r[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_attn_state_score[DS4_MAX_LAYER];
@@ -15290,6 +15293,7 @@ typedef struct {
     ds4_gpu_tensor *cp3_index_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp3_index_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp4_heads[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp5[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t cp3_n_index[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
@@ -29712,6 +29716,8 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
         (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
     const uint64_t q_bytes =
         (uint64_t)n_tokens * c->q_values[il] * sizeof(float);
+    const uint64_t q_out_bytes =
+        (uint64_t)n_tokens * c->q_out_values[il] * sizeof(float);
     const uint64_t kv_bytes =
         (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t hc_bytes =
@@ -29723,6 +29729,12 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
                             metal_graph_batch_qr(g), 0, q_bytes) &&
         ds4_c2b_inline_copy(c->cp2_kv_p[il], 0,
                             metal_graph_batch_kv_raw(g), 0, kv_bytes) &&
+        ds4_c2b_inline_copy(c->cp2_q_norm[il], 0,
+                            metal_graph_batch_qr_norm(g), 0, q_bytes) &&
+        ds4_c2b_inline_copy(c->cp2_q_cur[il], 0,
+                            metal_graph_batch_q(g), 0, q_out_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_heads[il], 0,
+                            metal_graph_batch_heads(g), 0, q_out_bytes) &&
         ds4_c2b_inline_copy(c->cp4[il], 0,
                             metal_graph_batch_after_attn_hc(g), 0, hc_bytes);
 
@@ -29851,6 +29863,7 @@ static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
     const uint64_t cp1_row_bytes =
         (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t q_row_bytes = c->q_values[il] * sizeof(float);
+    const uint64_t q_out_row_bytes = c->q_out_values[il] * sizeof(float);
     const uint64_t kv_row_bytes =
         (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t hc_row_bytes =
@@ -29862,12 +29875,21 @@ static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
                             metal_graph_qr(g), 0, q_row_bytes) &&
         ds4_c2b_inline_copy(c->cp2_kv_p[il], (uint64_t)row * kv_row_bytes,
                             metal_graph_kv_raw(g), 0, kv_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp2_q_norm[il],
+                            (uint64_t)row * q_row_bytes,
+                            metal_graph_qr_norm(g), 0, q_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp2_q_cur[il],
+                            (uint64_t)row * q_out_row_bytes,
+                            metal_graph_q(g), 0, q_out_row_bytes) &&
         ds4_c2b_inline_copy(
             c->cp2_kv_r[il], (uint64_t)row * kv_row_bytes,
             g->layer_raw_cache[il],
             (uint64_t)(pos % g->raw_cap) * kv_row_bytes, kv_row_bytes) &&
         ds4_c2b_inline_copy(c->cp4[il], (uint64_t)row * hc_row_bytes,
                             metal_graph_after_attn_hc(g), 0, hc_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_heads[il],
+                            (uint64_t)row * q_out_row_bytes,
+                            metal_graph_heads(g), 0, q_out_row_bytes) &&
         ds4_c2b_inline_copy(c->cp5[il], (uint64_t)row * hc_row_bytes,
                             metal_graph_after_ffn_hc(g), 0, hc_row_bytes);
 
@@ -50431,6 +50453,8 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp1);
         DS4_C2B_FREE(cp2_q);
         DS4_C2B_FREE(cp2_kv_p);
+        DS4_C2B_FREE(cp2_q_norm);
+        DS4_C2B_FREE(cp2_q_cur);
         DS4_C2B_FREE(cp2_kv_r);
         DS4_C2B_FREE(cp3_attn_state_kv);
         DS4_C2B_FREE(cp3_attn_state_score);
@@ -50439,6 +50463,7 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp3_index_state_score);
         DS4_C2B_FREE(cp3_index_cache);
         DS4_C2B_FREE(cp4);
+        DS4_C2B_FREE(cp4_heads);
         DS4_C2B_FREE(cp5);
 #undef DS4_C2B_FREE
     }
@@ -50472,28 +50497,43 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         const ds4_layer_weights *layer = &weights->layer[il];
         if (!g->layer_raw_cache[il] || !layer->attn_q_a ||
             !metal_graph_batch_attn_norm(g) || !metal_graph_batch_qr(g) ||
-            !metal_graph_batch_kv_raw(g) ||
+            !metal_graph_batch_kv_raw(g) || !metal_graph_batch_qr_norm(g) ||
+            !metal_graph_batch_q(g) || !metal_graph_batch_heads(g) ||
             !metal_graph_batch_after_attn_hc(g) ||
             !metal_graph_batch_next_hc(g) || !metal_graph_attn_norm(g) ||
             !metal_graph_qr(g) || !metal_graph_kv_raw(g) ||
+            !metal_graph_qr_norm(g) || !metal_graph_q(g) ||
+            !metal_graph_heads(g) ||
             !metal_graph_after_attn_hc(g) ||
             !metal_graph_after_ffn_hc(g)) {
             ds4_c2b_capture_free(c);
             return false;
         }
         c->q_values[il] = layer->attn_q_a->dim[1];
+        c->q_out_values[il] = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
         const uint64_t q_bytes =
             (uint64_t)n_tokens * c->q_values[il] * sizeof(float);
+        const uint64_t q_out_bytes =
+            (uint64_t)n_tokens * c->q_out_values[il] * sizeof(float);
         if (c->q_values[il] == 0 ||
             ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)) < cp1_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_qr(g)) < q_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_kv_raw(g)) < kv_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_qr_norm(g)) < q_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_q(g)) < q_out_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_heads(g)) < q_out_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_attn_norm(g)) <
                 (uint64_t)DS4_N_EMBD * sizeof(float) ||
             ds4_gpu_tensor_bytes(metal_graph_qr(g)) <
                 c->q_values[il] * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_qr_norm(g)) <
+                c->q_values[il] * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_q(g)) <
+                c->q_out_values[il] * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_heads(g)) <
+                c->q_out_values[il] * sizeof(float) ||
             ds4_gpu_tensor_bytes(metal_graph_kv_raw(g)) < kv_bytes / n_tokens ||
             ds4_gpu_tensor_bytes(metal_graph_after_attn_hc(g)) <
                 (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float) ||
@@ -50505,11 +50545,16 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         c->cp1[il] = ds4_gpu_tensor_alloc(cp1_bytes);
         c->cp2_q[il] = ds4_gpu_tensor_alloc(q_bytes);
         c->cp2_kv_p[il] = ds4_gpu_tensor_alloc(kv_bytes);
+        c->cp2_q_norm[il] = ds4_gpu_tensor_alloc(q_bytes);
+        c->cp2_q_cur[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp2_kv_r[il] = ds4_gpu_tensor_alloc(kv_bytes);
         c->cp4[il] = ds4_gpu_tensor_alloc(hc_bytes);
+        c->cp4_heads[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp5[il] = ds4_gpu_tensor_alloc(hc_bytes);
         if (!c->cp1[il] || !c->cp2_q[il] || !c->cp2_kv_p[il] ||
-            !c->cp2_kv_r[il] || !c->cp4[il] || !c->cp5[il]) {
+            !c->cp2_q_norm[il] || !c->cp2_q_cur[il] ||
+            !c->cp2_kv_r[il] || !c->cp4_heads[il] ||
+            !c->cp4[il] || !c->cp5[il]) {
             ds4_c2b_capture_free(c);
             return false;
         }
@@ -50725,8 +50770,20 @@ static bool ds4_c2b_materialize_capture(
                  out, capture->cp2_kv_p[il], rows, DS4_N_HEAD_DIM, il,
                  DS4_FIRST_DIVERGENCE_CP2_KV_P, "kv_raw") &&
              ds4_c2b_materialize_f32_rows(
+                 out, capture->cp2_q_norm[il], rows,
+                 (size_t)capture->q_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP2_Q_NORM, "qr_norm") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->cp2_q_cur[il], rows,
+                 (size_t)capture->q_out_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP2_Q_CUR, "q_cur") &&
+             ds4_c2b_materialize_f32_rows(
                  out, capture->cp2_kv_r[il], rows, DS4_N_HEAD_DIM, il,
                  DS4_FIRST_DIVERGENCE_CP2_KV_R, "raw_cache") &&
+             ds4_c2b_materialize_f32_rows(
+                 out, capture->cp4_heads[il], rows,
+                 (size_t)capture->q_out_values[il], il,
+                 DS4_FIRST_DIVERGENCE_CP4_HEADS, "attn_heads") &&
              ds4_c2b_materialize_f32_rows(
                  out, capture->cp4[il], rows, hc_values, il,
                  DS4_FIRST_DIVERGENCE_CP4, "after_attn_hc") &&
@@ -51938,6 +51995,10 @@ static int ds4_first_divergence_run(ds4_session *s,
                 report_ok = ds4_first_divergence_emit_kv_trace(
                     &pass_a, &pass_b, stderr, &kv_projection_exact) &&
                     kv_projection_exact;
+                if (report_ok) {
+                    report_ok = ds4_first_divergence_emit_attention_interval_trace(
+                        &pass_a, &pass_b, stderr);
+                }
                 if (report_ok) {
                     fputs("DRIFT_SOURCE_TABLE\n", stderr);
                     ds4_projection_drift_source_print(

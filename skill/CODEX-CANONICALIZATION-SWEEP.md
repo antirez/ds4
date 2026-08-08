@@ -5,6 +5,10 @@
 - Starting `{QA}` baseline: **PROVEN BY TEST** on M4 Max.
 - KV producer localization: **PROVEN BY SOURCE**.
 - KV isolated primitive A/B and `{QA,KV}` causal substitution:
+  **PROVEN BY TEST** on M4 Max.
+- Current `{QA,KV}` first divergence: `CP4/after_attn_hc` at row 0,
+  layer 0: **PROVEN BY TEST** on M4 Max.
+- Natural semantic subdivision of the interval leading to CP4:
   **IMPLEMENTED; M4 RUNTIME REQUIRED**.
 - Default production behavior remains unchanged when
   `DS4_FIRST_DIVERGENCE_CANONICAL` is unset.
@@ -112,7 +116,14 @@ KV_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS ... result=MISMATCH ...
 KV_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
 ```
 
-Current evidence label: **UNKNOWN pending M4 runtime**.
+The real M4 run produced:
+
+```text
+KV_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS elements=512 result=MISMATCH mismatch_count=431 mismatch_fraction=0.841796875 max_abs=4.4703483581542969e-08 mean_abs=9.7720658231992275e-09 rms_abs=1.2926741589862414e-08 p50_abs=7.4505805969238281e-09 p95_abs=2.9802322387695312e-08 p99_abs=3.3527612686157227e-08 relative_l2=1.5454367931804077e-07 max_rel=0.00066137566137566134 max_ulp=8192 cosine_similarity=0.99999999999998945 positive_delta_count=220 negative_delta_count=211
+KV_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+```
+
+Current evidence label: **PROVEN BY TEST**.
 
 ## Sweep execution
 
@@ -164,16 +175,82 @@ The `{QA,KV}` run must show CP1, CP2-Q, and CP2-KV-P exact before its new
 first-divergence location is interpreted.  It then prints one `SWEEP_STEP`, a
 grep-friendly `DRIFT_SOURCE_TABLE`, and `CANONICALIZATION_SWEEP_RESULT`.
 
+The completed M4 step showed `CP2-KV-P` exact and moved the first divergence
+to `CP4/after_attn_hc`.  It did not expose a new operator by itself because
+CP4 spans several arithmetic stages.
+
+## CP4 interval subdivision
+
+The diagnostic now captures three additional existing F32 semantic objects.
+No intermediate is recomputed, and the canonical sequential execution is not
+changed.
+
+| Ordered checkpoint | Semantic object | Generic tensor | Sequential tensor |
+| --- | --- | --- | --- |
+| `CP2-Q-NORM` | normalized Q-A projection output | `metal_graph_batch_qr_norm(g)` | `metal_graph_qr_norm(g)` |
+| `CP2-Q-CUR` | Q after Q-B, per-head RMS norm, and RoPE | `metal_graph_batch_q(g)` | `metal_graph_q(g)` |
+| `CP4-HEADS` | attention heads after inverse RoPE | `metal_graph_batch_heads(g)` | `metal_graph_heads(g)` |
+| `CP4` | post-attention hidden state | `metal_graph_batch_after_attn_hc(g)` | `metal_graph_after_attn_hc(g)` |
+
+The ordering follows producer causality: Q-A and KV raw projections precede
+Q-A normalization and Q-B/Q-RoPE; persistent KV store and compressor frontier
+precede the attention-head result; the HC post expansion ends at CP4.
+
+The output-projection temporary is deliberately not made a frozen comparison
+object.  On the tested single-device Metal configuration, generic execution
+can fuse both Q8_0 output projections to F16 before HC expansion, while the
+canonical sequential tail uses its existing low-rank/output/HC fusion.  A
+standalone common F32 `attn_out` would therefore require changing or
+recomputing a canonical path.  `CP4-HEADS` and CP4 bracket that asymmetric
+fused tail without disabling fusion.
+
+All new snapshots are preallocated and copied by
+`ds4_gpu_tensor_copy_f32_inline()` from the existing end-of-layer capture
+hook.  CPU comparison remains `ds4_float_compare_exact()`.  Because checkpoint
+coverage changed, the M4 run must re-establish the C2b A0/A1 and A0/A2 gates.
+
+Run the updated `{QA,KV}` diagnostic:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >cp4-interval-localization.log 2>&1
+```
+
+Inspect it with:
+
+```sh
+grep -E '^QA_PRIMITIVE_|^KV_PRIMITIVE_|^C2B_|^FIRST_DIVERGENCE |^ATTENTION_INTERVAL_|^CANONICALIZATION_SWEEP_|^SWEEP_STEP |^DRIFT_SOURCE' \
+  cp4-interval-localization.log
+```
+
+The hard gate remains:
+
+```text
+C2B_CONTROL A0_vs_A1 PASS
+C2B_PROBE   A0_vs_A2 PASS
+C2B_RESULT  PASS
+```
+
+Only the first mismatching stage in `ATTENTION_INTERVAL_TRACE` becomes the
+next localization target.  No new canonicalization mask bit has been added.
+
 ## Divergent operator families
 
 | Site | Semantic | Generic producer | Sequential producer | Family | Evidence | Canonicalization removes site? |
 | --- | --- | --- | --- | --- | --- | --- |
 | CP2-Q | Q-A projection output | named Q8_0 batch projection | dense-quant N=1 projection | `FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV` | source + isolated A/B + causal substitution | YES |
-| CP2-KV-P | pre-store raw KV projection output | named Q8_0 batch projection | dense-quant N=1 projection | `FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV` | runtime location + source; isolated/canonical pending | UNKNOWN |
+| CP2-KV-P | pre-store raw KV projection output | named Q8_0 batch projection | dense-quant N=1 projection | `FAMILY_Q8_0_BATCH_EXT_VS_SINGLE_MV` | source + isolated A/B + causal substitution | YES |
 
 QA and KV satisfy the family-identity rule through the same underlying Metal
 kernel pair, Q8_0 dequantization paths, batch-versus-single distinction, and
-reduction mechanisms.  If the M4 `{QA,KV}` run makes CP2-KV-P exact, the first
+reduction mechanisms.  The M4 `{QA,KV}` run made CP2-KV-P exact, so the first
 two independent sites are concentrated in one arithmetic family and the
 intermediate classification is:
 
@@ -191,6 +268,9 @@ SUFFICIENT_CANONICALIZATION_SET UNKNOWN
 MINIMAL_CANONICAL_REPAIR_SET NOT_EVALUATED
 ```
 
-The next source after `{QA,KV}` is **UNKNOWN pending M4 runtime**.  No
-compressor, attention, normalization, FFN, MoE, store, or later checkpoint is
-canonicalized before that result becomes the proven earliest divergence.
+The next coarse location after `{QA,KV}` is **PROVEN BY TEST** as
+`CP4/after_attn_hc`.  The exact producer inside that interval remains
+**UNKNOWN pending M4 runtime** with the new subdivisions.  No attention,
+normalization, output projection, HC expansion, FFN, MoE, store, or later
+checkpoint is canonicalized before the earliest natural semantic object is
+identified.
