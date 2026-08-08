@@ -361,7 +361,8 @@ static void print_float_metrics(FILE *stream,
 bool ds4_first_divergence_emit_q_trace(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,
-        FILE *stream) {
+        FILE *stream,
+        bool *q_projection_exact) {
     const ds4_first_divergence_snapshot *cp1_a;
     const ds4_first_divergence_snapshot *cp1_b;
     const ds4_first_divergence_snapshot *qr_a;
@@ -369,6 +370,7 @@ bool ds4_first_divergence_emit_q_trace(
     ds4_float_compare_result cp1_comparison;
     ds4_float_compare_result qr_comparison;
 
+    if (q_projection_exact) *q_projection_exact = false;
     if (!pass_a || !pass_b || !stream) return false;
     cp1_a = find_snapshot_fields(pass_a, 0, 0, DS4_FIRST_DIVERGENCE_CP1,
                                  "attn_norm");
@@ -415,8 +417,9 @@ bool ds4_first_divergence_emit_q_trace(
           stream);
     if (qr_comparison.bit_exact) {
         fprintf(stream, "EXACT elements=%zu\n", qr_comparison.length);
-        fputs("Q_DIVERGENCE_SANITY FAIL reason=q_a_projection_exact\n", stream);
-        return false;
+        fputs("Q_LOCALIZATION_RESULT QA_PROJECTION_EXACT\n", stream);
+        if (q_projection_exact) *q_projection_exact = true;
+        return ferror(stream) == 0;
     }
     fputs("MISMATCH", stream);
     print_float_metrics(stream, &qr_comparison);
@@ -427,6 +430,33 @@ bool ds4_first_divergence_emit_q_trace(
     fputc('\n', stream);
     fputs("Q_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_Q_PATH\n",
           stream);
+    return ferror(stream) == 0;
+}
+
+bool ds4_first_divergence_emit_qa_canonical_summary(
+        const ds4_first_divergence_report *report,
+        FILE *stream) {
+    if (!report || !stream) return false;
+    fputs("QA_CANONICALIZATION_RESULT "
+          "baseline_first_divergence=row=0,layer=0,checkpoint=CP2-Q,q_a_projection_output "
+          "qa_after_patch=EXACT new_first_divergence=",
+          stream);
+    if (!report->first_divergence_found) {
+        fputs("NONE\n", stream);
+        return ferror(stream) == 0;
+    }
+    fprintf(stream,
+            "row=%u,layer=%u,checkpoint=%s,subobject=%s\n",
+            report->row,
+            report->layer,
+            ds4_first_divergence_checkpoint_name(report->checkpoint),
+            report->subobject[0] ? report->subobject : "-");
+    fprintf(stream,
+            "NEXT_INDEPENDENT_DRIFT_SOURCE row=%u layer=%u checkpoint=%s subobject=%s\n",
+            report->row,
+            report->layer,
+            ds4_first_divergence_checkpoint_name(report->checkpoint),
+            report->subobject[0] ? report->subobject : "-");
     return ferror(stream) == 0;
 }
 
@@ -568,7 +598,8 @@ bool ds4_first_divergence_emit_report(
         report->row == 0 && report->layer == 0 &&
         report->checkpoint == DS4_FIRST_DIVERGENCE_CP2_Q &&
         strcmp(report->subobject, "qr") == 0 &&
-        !ds4_first_divergence_emit_q_trace(pass_a, pass_b, stream)) {
+        !ds4_first_divergence_emit_q_trace(
+            pass_a, pass_b, stream, NULL)) {
         return false;
     }
     return ferror(stream) == 0;

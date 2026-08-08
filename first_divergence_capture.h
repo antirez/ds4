@@ -127,6 +127,11 @@ bool ds4_first_divergence_emit_report(
 bool ds4_first_divergence_emit_q_trace(
         const ds4_first_divergence_capture *pass_a,
         const ds4_first_divergence_capture *pass_b,
+        FILE *stream,
+        bool *q_projection_exact);
+
+bool ds4_first_divergence_emit_qa_canonical_summary(
+        const ds4_first_divergence_report *report,
         FILE *stream);
 
 #endif

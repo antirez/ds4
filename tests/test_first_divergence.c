@@ -77,6 +77,7 @@ int main(void) {
     ds4_first_divergence_capture q_pass_a;
     ds4_first_divergence_capture q_pass_b;
     FILE *q_log;
+    bool q_projection_exact;
     char q_log_text[4096];
     size_t q_log_bytes;
     const float cp1[] = {1.0f, -0.0f, 3.5f};
@@ -171,6 +172,40 @@ int main(void) {
                    "Q_FIRST_DIVERGENCE stage=q_a_projection_output") != NULL);
     REQUIRE(strstr(q_log_text,
                    "Q_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_Q_PATH") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+
+    memcpy(q_pass_b.snapshots[1].data, qr_a, sizeof(qr_a));
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &q_pass_a, &q_pass_b, q_log, &report));
+    REQUIRE(report.bit_exact);
+    REQUIRE(!report.first_divergence_found);
+    REQUIRE(ds4_first_divergence_emit_q_trace(
+        &q_pass_a, &q_pass_b, q_log, &q_projection_exact));
+    REQUIRE(q_projection_exact);
+    REQUIRE(ds4_first_divergence_emit_qa_canonical_summary(
+        &report, q_log));
+    report.first_divergence_found = true;
+    report.row = 0;
+    report.layer = 0;
+    report.checkpoint = DS4_FIRST_DIVERGENCE_CP2_KV_P;
+    REQUIRE(snprintf(report.subobject, sizeof(report.subobject), "%s",
+                     "kv_raw") > 0);
+    REQUIRE(ds4_first_divergence_emit_qa_canonical_summary(
+        &report, q_log));
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text,
+                   "stage=CP2-Q semantic=q_a_projection_output subobject=qr result=EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "Q_LOCALIZATION_RESULT QA_PROJECTION_EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "QA_CANONICALIZATION_RESULT baseline_first_divergence=row=0,layer=0,checkpoint=CP2-Q,q_a_projection_output qa_after_patch=EXACT new_first_divergence=NONE") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "NEXT_INDEPENDENT_DRIFT_SOURCE row=0 layer=0 checkpoint=CP2-KV-P subobject=kv_raw") != NULL);
     REQUIRE(fclose(q_log) == 0);
     ds4_first_divergence_capture_free(&q_pass_a);
     ds4_first_divergence_capture_free(&q_pass_b);

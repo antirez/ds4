@@ -2,10 +2,9 @@
 
 ## Status
 
-- Phase A isolated primitive A/B: **IMPLEMENTED; M4 RUNTIME REQUIRED**.
-- Phase B QA-only canonicalization: **BLOCKED** until Phase A prints
-  `QA_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST` on the M4 run.
-- Production behavior is unchanged when `DS4_QA_PRIMITIVE_AB` is unset.
+- Phase A isolated primitive A/B: **PROVEN BY TEST** on M4 Max.
+- Phase B QA-only canonicalization: **IMPLEMENTED; M4 RUNTIME REQUIRED**.
+- Production behavior is unchanged when both diagnostic gates are unset.
 
 ## Proven runtime facts
 
@@ -111,18 +110,78 @@ bytes producing a non-bit-identical 1024-element output.
 
 ## Phase A result
 
-Current status: **M4 RUNTIME PENDING**.
+The M4 Max run produced:
 
-The implementation host cannot run the Apple Metal model.  No isolated A/B
-result is claimed by this commit.
+```text
+QA_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS elements=1024 result=MISMATCH mismatch_count=823 first_index=0 generic_bits=0x3b21c760 sequential_bits=0x3b21c7a0 max_abs=5.2154064178466797e-08 max_rel=0.0013335873499714232 max_ulp=14336
+QA_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+```
 
-## Phase B gate
+Evidence label: **PROVEN BY TEST**.  The isolated real-shape comparison
+reproduced the whole-model first element bits as well as the mismatch count
+and aggregate metrics.  This proves numerical non-equivalence of the two QA
+primitives for this input; it does not yet prove that QA is the only
+future-visible drift source.
 
-QA-only canonicalization remains unimplemented until the M4 log proves Phase
-A.  After that proof, a second focused commit may add a default-off
-`DS4_FIRST_DIVERGENCE_CANONICAL_QA=1` mode which runs only generic Q-A once per
-proposal row through the canonical N=1 primitive and leaves the rest of the
-generic verifier batched and unchanged.
+## Phase B QA-only canonicalization
+
+`DS4_FIRST_DIVERGENCE_CANONICAL_QA=1` is a default-off diagnostic gate.  It
+first runs the unmodified isolated primitive A/B and proceeds only when that
+test prints `QA_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST`.
+
+After the gate passes, each generic verifier row's `attn_q_a` projection is
+encoded through the same N=1 `metal_graph_matmul_dense_quant_tensor()` path as
+canonical sequential decode.  The output is written into the corresponding
+row of `metal_graph_batch_qr(g)`.  The generic verifier otherwise remains
+batched and layer-major: Q-B, KV projection, attention, compressor, FFN/MoE,
+proposal rows, state handling, and scheduling are unchanged.  Pass B still
+calls the existing `metal_graph_eval_token_raw_swa()` path and is not affected
+by the gate.
+
+The canonicalized experiment reruns A0/A1/A2 independently from restored S0.
+It refuses to interpret the full map unless C2b is exact, CP1 is exact, and
+CP2-Q is exact.
+
+Run on M4 Max with the same model files and prompt as Phase A:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL_QA=1 \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >qa-canonicalization.log 2>&1
+```
+
+Inspect:
+
+```sh
+grep -E '^QA_PRIMITIVE_|^C2B_|^FIRST_DIVERGENCE |^Q_|^QA_CANONICALIZATION_RESULT|^NEXT_INDEPENDENT_DRIFT_SOURCE' \
+  qa-canonicalization.log
+```
+
+Required gates before interpreting the new location:
+
+```text
+QA_PRIMITIVE_NUMERICAL_NON_EQUIVALENCE PROVEN_BY_TEST
+C2B_CONTROL A0_vs_A1 PASS
+C2B_PROBE   A0_vs_A2 PASS
+C2B_RESULT  PASS
+Q_DIVERGENCE_STAGE stage=CP1 ... result=EXACT ...
+Q_DIVERGENCE_STAGE stage=CP2-Q semantic=q_a_projection_output ... result=EXACT ...
+Q_LOCALIZATION_RESULT QA_PROJECTION_EXACT
+```
+
+The run then emits the complete existing checkpoint map and one concise
+causal summary.  If another mismatch exists it also emits exactly one
+`NEXT_INDEPENDENT_DRIFT_SOURCE` line.  No later operator is modified.
+
+Evidence label for the implementation and its narrow scope: **PROVEN BY
+SOURCE**.  Evidence that canonicalized CP2-Q becomes exact, and the resulting
+next divergence: **UNKNOWN pending M4 runtime**.
 
 Old first divergence:
 
@@ -130,4 +189,8 @@ Old first divergence:
 row=0 layer=0 checkpoint=CP2-Q subobject=qr
 ```
 
-New first divergence: **UNKNOWN pending Phase B**.
+New first divergence: **UNKNOWN pending M4 Phase B run**.
+
+Until that run removes CP2-Q divergence, the careful interpretation remains:
+the QA primitives are proven numerically non-equivalent, while QA's status as
+the earliest observed causal drift source is still **UNKNOWN**.
