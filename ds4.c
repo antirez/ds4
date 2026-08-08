@@ -15295,6 +15295,10 @@ typedef struct {
     ds4_gpu_tensor *cp4[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_heads_raw[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp4_heads[DS4_MAX_LAYER];
+    /* Inputs for the isolated CP4 tail A/B.  These are copied alongside the
+     * existing CP4 capture and are not registered as online checkpoints. */
+    ds4_gpu_tensor *cp4_tail_cur_hc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *cp4_tail_hc_split[DS4_MAX_LAYER];
     ds4_gpu_tensor *cp5[DS4_MAX_LAYER];
     uint32_t cp3_n_comp[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t cp3_n_index[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
@@ -15317,6 +15321,7 @@ enum {
     DS4_FIRST_DIVERGENCE_CANON_KV = 1u << 1,
     DS4_FIRST_DIVERGENCE_CANON_QB = 1u << 2,
     DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW = 1u << 3,
+    DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL = 1u << 4,
 };
 static uint32_t g_ds4_first_divergence_canonical_mask;
 
@@ -25512,6 +25517,101 @@ static bool metal_graph_matmul_canonical_rows(
     return ok;
 }
 
+/* Diagnostic-only canonical CP4 tail.  Each row invokes the exact two
+ * primitives used by ordinary sequential decode: the F32 Q8 output-A
+ * projection followed by the fused output-B/HC expand epilogue.  It creates
+ * no intermediate checkpoint and is unreachable while the canonical mask is
+ * zero. */
+static bool metal_graph_attention_output_hc_canonical_rows(
+        ds4_gpu_tensor       *after_attn_hc,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *attn_out,
+        const ds4_model      *model,
+        const ds4_layer_weights *layer,
+        const ds4_gpu_tensor *heads,
+        const ds4_gpu_tensor *cur_hc,
+        const ds4_gpu_tensor *hc_split,
+        uint32_t              rows) {
+    const uint64_t n_groups = DS4_N_OUT_GROUP;
+    const uint64_t rank = DS4_N_LORA_O;
+    const uint64_t group_dim =
+        (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t heads_values = n_groups * group_dim;
+    const uint64_t low_values = n_groups * rank;
+    const uint64_t hc_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t split_values =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    if (!after_attn_hc || !low || !attn_out || !model || !layer ||
+        !layer->attn_output_a || !layer->attn_output_b || !heads ||
+        !cur_hc || !hc_split || rows == 0 ||
+        layer->attn_output_a->type != DS4_TENSOR_Q8_0 ||
+        layer->attn_output_b->type != DS4_TENSOR_Q8_0 ||
+        layer->attn_output_a->dim[0] != group_dim ||
+        layer->attn_output_a->dim[1] != low_values ||
+        layer->attn_output_b->dim[0] != low_values ||
+        layer->attn_output_b->dim[1] != DS4_N_EMBD ||
+        ds4_gpu_tensor_bytes(heads) <
+            (uint64_t)rows * heads_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(low) <
+            (uint64_t)rows * low_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(attn_out) <
+            (uint64_t)rows * DS4_N_EMBD * sizeof(float) ||
+        ds4_gpu_tensor_bytes(cur_hc) <
+            (uint64_t)rows * hc_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(hc_split) <
+            (uint64_t)rows * split_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(after_attn_hc) <
+            (uint64_t)rows * hc_values * sizeof(float)) {
+        return false;
+    }
+
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < rows; row++) {
+        ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view(
+            heads, (uint64_t)row * heads_values * sizeof(float),
+            heads_values * sizeof(float));
+        ds4_gpu_tensor *low_row = ds4_gpu_tensor_view(
+            low, (uint64_t)row * low_values * sizeof(float),
+            low_values * sizeof(float));
+        ds4_gpu_tensor *attn_out_row = ds4_gpu_tensor_view(
+            attn_out, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *cur_hc_row = ds4_gpu_tensor_view(
+            cur_hc, (uint64_t)row * hc_values * sizeof(float),
+            hc_values * sizeof(float));
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
+            hc_split, (uint64_t)row * split_values * sizeof(float),
+            split_values * sizeof(float));
+        ds4_gpu_tensor *after_row = ds4_gpu_tensor_view(
+            after_attn_hc, (uint64_t)row * hc_values * sizeof(float),
+            hc_values * sizeof(float));
+        ok = heads_row && low_row && attn_out_row && cur_hc_row &&
+             split_row && after_row;
+        if (ok) {
+            ok = ds4_gpu_attention_output_low_q8_tensor(
+                    low_row, model->map, model->size,
+                    layer->attn_output_a->abs_offset,
+                    group_dim, rank, (uint32_t)n_groups, heads_row) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_matmul_q8_0_hc_expand_tensor(
+                    after_row, attn_out_row,
+                    model->map, model->size,
+                    layer->attn_output_b->abs_offset,
+                    low_values, DS4_N_EMBD, low_row,
+                    cur_hc_row, split_row,
+                    DS4_N_EMBD, DS4_N_HC) != 0;
+        }
+        ds4_gpu_tensor_free(after_row);
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(cur_hc_row);
+        ds4_gpu_tensor_free(attn_out_row);
+        ds4_gpu_tensor_free(low_row);
+        ds4_gpu_tensor_free(heads_row);
+    }
+    return ok;
+}
+
 static bool metal_graph_matmul_named_or_canonical_rows(
         uint32_t                canonical_bit,
         const char             *name,
@@ -28895,8 +28995,28 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool attn_out_debug =
         metal_graph_debug_wants("attn_low", il, pos0) ||
         metal_graph_debug_wants("attn_out", il, pos0);
+    const bool canonical_cp4_tail =
+        ds4_first_divergence_canonical_enabled(
+            DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL);
+    bool cp4_tail_done = false;
+    if (ok && canonical_cp4_tail && !attn_out_debug &&
+        !tp_row_split_attn &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        !metal_graph_directional_steering_attn_enabled(g)) {
+        cp4_tail_done = metal_graph_attention_output_hc_canonical_rows(
+            after_attn_hc_view,
+            metal_graph_batch_attn_low(g),
+            metal_graph_batch_attn_out(g),
+            model, layer,
+            metal_graph_batch_heads(g),
+            metal_graph_batch_cur_hc(g),
+            hc_split_view,
+            n_tokens);
+        ok = cp4_tail_done;
+    }
     bool attn_out_f16 = false;
-    if (ok &&
+    if (ok && !cp4_tail_done &&
         !attn_out_debug &&
         !tp_row_split_attn &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
@@ -28929,7 +29049,7 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool tp_attn_pipeline =
         tp_row_split_attn && (n_tokens % 256u) == 0u &&
         metal_graph_tp_subgate_pipeline();
-    if (!attn_out_f16) {
+    if (!cp4_tail_done && !attn_out_f16) {
         if (ok && tp_attn_pipeline) {
             /* Sub-chunk pipelined swap: the output projection runs in two
              * sub-halves of this rank's rows and each sub-half's row swap
@@ -29010,7 +29130,7 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
-    if (ok && tp_row_split_attn) {
+    if (ok && !cp4_tail_done && tp_row_split_attn) {
         /* Release point for the pipelined row swaps of batch_attn_out: both
          * ranks reach the HC post expand with identical full tensors. */
         if (tp_attn_pipeline) {
@@ -29034,17 +29154,18 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (!ok) fprintf(stderr, "ds4: TP prefill attention row gate failed (layer %u)\n", il);
     }
-    if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
+    if (ok && !cp4_tail_done && !attn_out_f16 &&
+        metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, metal_graph_batch_attn_out(g), il, n_tokens);
     }
-    if (ok && attn_out_f16) {
+    if (ok && !cp4_tail_done && attn_out_f16) {
         ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
                                                  g->batch_q_half,
                                                  metal_graph_batch_cur_hc(g),
                                                  hc_split_view,
                                                  DS4_N_EMBD,
                                                  DS4_N_HC) != 0;
-    } else if (ok) {
+    } else if (ok && !cp4_tail_done) {
         ok = ds4_gpu_hc_expand_split_tensor(after_attn_hc_view,
                                             metal_graph_batch_attn_out(g),
                                             metal_graph_batch_cur_hc(g),
@@ -29778,6 +29899,10 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
         (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t hc_bytes =
         (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t split_bytes =
+        (uint64_t)n_tokens *
+        (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) *
+        sizeof(float);
     bool ok =
         ds4_c2b_inline_copy(c->cp1[il], 0,
                             metal_graph_batch_attn_norm(g), 0, cp1_bytes) &&
@@ -29791,6 +29916,10 @@ static bool ds4_c2b_capture_attention(ds4_gpu_graph *g,
                             metal_graph_batch_q(g), 0, q_out_bytes) &&
         ds4_c2b_inline_copy(c->cp4_heads[il], 0,
                             metal_graph_batch_heads(g), 0, q_out_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_tail_cur_hc[il], 0,
+                            metal_graph_batch_cur_hc(g), 0, hc_bytes) &&
+        ds4_c2b_inline_copy(c->cp4_tail_hc_split[il], 0,
+                            metal_graph_batch_hc_split(g), 0, split_bytes) &&
         ds4_c2b_inline_copy(c->cp4[il], 0,
                             metal_graph_batch_after_attn_hc(g), 0, hc_bytes);
 
@@ -50521,6 +50650,8 @@ static void ds4_c2b_capture_free(ds4_c2b_capture *c) {
         DS4_C2B_FREE(cp4);
         DS4_C2B_FREE(cp4_heads_raw);
         DS4_C2B_FREE(cp4_heads);
+        DS4_C2B_FREE(cp4_tail_cur_hc);
+        DS4_C2B_FREE(cp4_tail_hc_split);
         DS4_C2B_FREE(cp5);
 #undef DS4_C2B_FREE
     }
@@ -50572,6 +50703,10 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             (uint64_t)n_tokens * c->q_values[il] * sizeof(float);
         const uint64_t q_out_bytes =
             (uint64_t)n_tokens * c->q_out_values[il] * sizeof(float);
+        const uint64_t split_bytes =
+            (uint64_t)n_tokens *
+            (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) *
+            sizeof(float);
         if (c->q_values[il] == 0 ||
             ds4_gpu_tensor_bytes(metal_graph_batch_attn_norm(g)) < cp1_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_qr(g)) < q_bytes ||
@@ -50579,6 +50714,8 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_bytes(metal_graph_batch_qr_norm(g)) < q_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_q(g)) < q_out_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_heads(g)) < q_out_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_cur_hc(g)) < hc_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_batch_hc_split(g)) < split_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_attn_norm(g)) <
@@ -50608,11 +50745,14 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
         c->cp4[il] = ds4_gpu_tensor_alloc(hc_bytes);
         c->cp4_heads_raw[il] = ds4_gpu_tensor_alloc(q_out_bytes);
         c->cp4_heads[il] = ds4_gpu_tensor_alloc(q_out_bytes);
+        c->cp4_tail_cur_hc[il] = ds4_gpu_tensor_alloc(hc_bytes);
+        c->cp4_tail_hc_split[il] = ds4_gpu_tensor_alloc(split_bytes);
         c->cp5[il] = ds4_gpu_tensor_alloc(hc_bytes);
         if (!c->cp1[il] || !c->cp2_q[il] || !c->cp2_kv_p[il] ||
             !c->cp2_q_norm[il] || !c->cp2_q_cur[il] ||
             !c->cp2_kv_r[il] || !c->cp4_heads_raw[il] ||
-            !c->cp4_heads[il] ||
+            !c->cp4_heads[il] || !c->cp4_tail_cur_hc[il] ||
+            !c->cp4_tail_hc_split[il] ||
             !c->cp4[il] || !c->cp5[il]) {
             ds4_c2b_capture_free(c);
             return false;
@@ -51822,6 +51962,269 @@ done:
     return ok;
 }
 
+typedef struct {
+    bool executed;
+    bool input_bits_equal;
+    bool weights_same;
+    bool semantics_preserved;
+    bool numerical_non_equivalence;
+    ds4_float_compare_result output_comparison;
+    ds4_first_divergence_float_signature output_signature;
+} ds4_cp4_tail_primitive_ab_result;
+
+/* Isolate the complete asymmetric CP4 tail without introducing an online
+ * checkpoint.  Both calls consume clones of the exact same captured F32
+ * heads, residual HC and HC split state.  The generic side invokes the real
+ * batch-F16 output projection plus half HC expand; the sequential side invokes
+ * the real F32 low projection plus fused Q8 output-B/HC epilogue row by row. */
+static bool ds4_cp4_tail_primitive_ab_run(
+        ds4_session *s,
+        const ds4_c2b_capture *capture,
+        ds4_cp4_tail_primitive_ab_result *result) {
+    ds4_gpu_tensor *seq_heads = NULL;
+    ds4_gpu_tensor *seq_cur_hc = NULL;
+    ds4_gpu_tensor *seq_hc_split = NULL;
+    ds4_gpu_tensor *generic_low = NULL;
+    ds4_gpu_tensor *generic_half = NULL;
+    ds4_gpu_tensor *generic_after = NULL;
+    ds4_gpu_tensor *sequential_low = NULL;
+    ds4_gpu_tensor *sequential_attn_out = NULL;
+    ds4_gpu_tensor *sequential_after = NULL;
+    float *generic_input_cpu = NULL;
+    float *sequential_input_cpu = NULL;
+    float *generic_output_cpu = NULL;
+    float *sequential_output_cpu = NULL;
+    ds4_float_compare_result input_comparison;
+    bool ok = false;
+
+    fputs("CP4_TAIL_SOURCE_AUDIT "
+          "generic_path=ds4_gpu_attention_output_q8_batch_f16_tensor+ds4_gpu_hc_expand_split_half_tensor "
+          "sequential_path=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
+          "generic_primitives=Q8_output_A_batch+Q8_output_B_batch+F32_to_F16_output+HC_split_half_expand_residual_add "
+          "sequential_primitives=Q8_output_A_single_F32+Q8_output_B_single+fused_HC_expand_residual_add "
+          "candidate_family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+          "component_attribution=UNKNOWN evidence=PROVEN_BY_SOURCE\n",
+          stderr);
+
+    if (!result) return false;
+    memset(result, 0, sizeof(*result));
+    if (!s || !capture || capture->graph != &s->graph ||
+        capture->n_tokens < 2u || !capture->cp4_heads[0] ||
+        !capture->cp4_tail_cur_hc[0] ||
+        !capture->cp4_tail_hc_split[0]) {
+        fputs("CP4_TAIL_PRIMITIVE_AB input_bits_equal=FAIL weights_same=FAIL "
+              "semantics_preserved=FAIL elements=0 result=ERROR "
+              "reason=invalid_real_shape_fixture evidence=UNKNOWN\n",
+              stderr);
+        return false;
+    }
+
+    const ds4_layer_weights *layer = &s->engine->weights.layer[0];
+    const uint32_t rows = capture->n_tokens;
+    const uint64_t n_groups = DS4_N_OUT_GROUP;
+    const uint64_t rank = DS4_N_LORA_O;
+    const uint64_t group_dim =
+        (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t heads_values_per_row = n_groups * group_dim;
+    const uint64_t low_values_per_row = n_groups * rank;
+    const uint64_t hc_values_per_row =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t split_values_per_row =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t heads_bytes =
+        (uint64_t)rows * heads_values_per_row * sizeof(float);
+    const uint64_t hc_bytes =
+        (uint64_t)rows * hc_values_per_row * sizeof(float);
+    const uint64_t split_bytes =
+        (uint64_t)rows * split_values_per_row * sizeof(float);
+    const uint64_t low_bytes =
+        (uint64_t)rows * low_values_per_row * sizeof(float);
+    const uint64_t attn_out_bytes =
+        (uint64_t)rows * DS4_N_EMBD * sizeof(float);
+    const uint64_t half_bytes =
+        (uint64_t)rows * DS4_N_EMBD * sizeof(uint16_t);
+    const size_t input_values = (size_t)(
+        (uint64_t)rows * (heads_values_per_row + hc_values_per_row +
+                          split_values_per_row));
+    const size_t output_values =
+        (size_t)((uint64_t)rows * hc_values_per_row);
+
+    result->weights_same =
+        layer->attn_output_a && layer->attn_output_b &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_a->dim[0] == group_dim &&
+        layer->attn_output_a->dim[1] == low_values_per_row &&
+        layer->attn_output_b->dim[0] == low_values_per_row &&
+        layer->attn_output_b->dim[1] == DS4_N_EMBD;
+    result->semantics_preserved = result->weights_same &&
+        s->graph.tp_world <= 1u && !s->graph.placement &&
+        !metal_graph_directional_steering_attn_enabled(&s->graph) &&
+        !metal_graph_debug_wants("attn_low", 0, capture->start) &&
+        !metal_graph_debug_wants("attn_out", 0, capture->start) &&
+        ds4_gpu_tensor_bytes(capture->cp4_heads[0]) >= heads_bytes &&
+        ds4_gpu_tensor_bytes(capture->cp4_tail_cur_hc[0]) >= hc_bytes &&
+        ds4_gpu_tensor_bytes(capture->cp4_tail_hc_split[0]) >= split_bytes;
+    if (!result->semantics_preserved) {
+        fprintf(stderr,
+                "CP4_TAIL_PRIMITIVE_AB input_bits_equal=FAIL weights_same=%s "
+                "semantics_preserved=FAIL elements=%zu result=ERROR "
+                "reason=real_tail_preconditions_not_met evidence=UNKNOWN\n",
+                result->weights_same ? "PASS" : "FAIL", output_values);
+        return false;
+    }
+
+    seq_heads = ds4_gpu_tensor_alloc(heads_bytes);
+    seq_cur_hc = ds4_gpu_tensor_alloc(hc_bytes);
+    seq_hc_split = ds4_gpu_tensor_alloc(split_bytes);
+    generic_low = ds4_gpu_tensor_alloc(low_bytes);
+    generic_half = ds4_gpu_tensor_alloc(half_bytes);
+    generic_after = ds4_gpu_tensor_alloc(hc_bytes);
+    sequential_low = ds4_gpu_tensor_alloc(low_bytes);
+    sequential_attn_out = ds4_gpu_tensor_alloc(attn_out_bytes);
+    sequential_after = ds4_gpu_tensor_alloc(hc_bytes);
+    if (!seq_heads || !seq_cur_hc || !seq_hc_split || !generic_low ||
+        !generic_half || !generic_after || !sequential_low ||
+        !sequential_attn_out || !sequential_after) goto done;
+
+    if (!ds4_c2b_inline_copy(seq_heads, 0, capture->cp4_heads[0], 0,
+                             heads_bytes) ||
+        !ds4_c2b_inline_copy(seq_cur_hc, 0,
+                             capture->cp4_tail_cur_hc[0], 0, hc_bytes) ||
+        !ds4_c2b_inline_copy(seq_hc_split, 0,
+                             capture->cp4_tail_hc_split[0], 0,
+                             split_bytes)) {
+        goto done;
+    }
+
+    generic_input_cpu = xmalloc(input_values * sizeof(float));
+    sequential_input_cpu = xmalloc(input_values * sizeof(float));
+    generic_output_cpu = xmalloc(output_values * sizeof(float));
+    sequential_output_cpu = xmalloc(output_values * sizeof(float));
+    const size_t heads_values = (size_t)(heads_bytes / sizeof(float));
+    const size_t hc_values = (size_t)(hc_bytes / sizeof(float));
+    if (!ds4_gpu_tensor_read(capture->cp4_heads[0], 0,
+                             generic_input_cpu, heads_bytes) ||
+        !ds4_gpu_tensor_read(capture->cp4_tail_cur_hc[0], 0,
+                             generic_input_cpu + heads_values, hc_bytes) ||
+        !ds4_gpu_tensor_read(capture->cp4_tail_hc_split[0], 0,
+                             generic_input_cpu + heads_values + hc_values,
+                             split_bytes) ||
+        !ds4_gpu_tensor_read(seq_heads, 0,
+                             sequential_input_cpu, heads_bytes) ||
+        !ds4_gpu_tensor_read(seq_cur_hc, 0,
+                             sequential_input_cpu + heads_values, hc_bytes) ||
+        !ds4_gpu_tensor_read(seq_hc_split, 0,
+                             sequential_input_cpu + heads_values + hc_values,
+                             split_bytes) ||
+        !ds4_float_compare_exact(generic_input_cpu, sequential_input_cpu,
+                                 input_values, &input_comparison)) {
+        goto done;
+    }
+    result->input_bits_equal = input_comparison.bit_exact;
+    if (!result->input_bits_equal) goto done;
+
+    ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = ds4_gpu_attention_output_q8_batch_f16_tensor(
+                generic_half, generic_low,
+                s->engine->model.map, s->engine->model.size,
+                layer->attn_output_a->abs_offset,
+                layer->attn_output_b->abs_offset,
+                group_dim, rank, (uint32_t)n_groups, DS4_N_EMBD,
+                capture->cp4_heads[0], rows) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_hc_expand_split_half_tensor(
+                generic_after, generic_half,
+                capture->cp4_tail_cur_hc[0],
+                capture->cp4_tail_hc_split[0],
+                DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_attention_output_hc_canonical_rows(
+                sequential_after, sequential_low, sequential_attn_out,
+                &s->engine->model, layer,
+                seq_heads, seq_cur_hc, seq_hc_split, rows);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok ||
+        !ds4_gpu_tensor_read(generic_after, 0,
+                             generic_output_cpu, hc_bytes) ||
+        !ds4_gpu_tensor_read(sequential_after, 0,
+                             sequential_output_cpu, hc_bytes) ||
+        !ds4_float_compare_exact(generic_output_cpu,
+                                 sequential_output_cpu,
+                                 output_values,
+                                 &result->output_comparison) ||
+        !ds4_first_divergence_float_signature_compute(
+            generic_output_cpu, sequential_output_cpu,
+            output_values, &result->output_signature)) {
+        ok = false;
+        goto done;
+    }
+    result->executed = true;
+    result->numerical_non_equivalence =
+        !result->output_comparison.bit_exact;
+
+done:
+    fprintf(stderr,
+            "CP4_TAIL_PRIMITIVE_AB input_bits_equal=%s weights_same=%s "
+            "semantics_preserved=%s elements=%zu result=%s",
+            result->input_bits_equal ? "PASS" : "FAIL",
+            result->weights_same ? "PASS" : "FAIL",
+            result->semantics_preserved ? "PASS" : "FAIL",
+            output_values,
+            result->executed
+                ? (result->output_comparison.bit_exact ? "EXACT" : "MISMATCH")
+                : "ERROR");
+    if (result->executed) {
+        if (result->output_comparison.bit_exact) {
+            fputs(" mismatch_count=0 first_index=none generic_bits=none "
+                  "sequential_bits=none max_abs=0 max_rel=0 max_ulp=0",
+                  stderr);
+        } else {
+            ds4_projection_primitive_ab_print_metrics(
+                &result->output_comparison, &result->output_signature);
+        }
+    }
+    fprintf(stderr, " evidence=%s\n",
+            result->executed ? "PROVEN_BY_TEST" : "UNKNOWN");
+    if (result->executed && result->input_bits_equal &&
+        result->weights_same && result->semantics_preserved &&
+        result->numerical_non_equivalence) {
+        fputs("DRIFT_SOURCE site=CP4 "
+              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+              "generic=ds4_gpu_attention_output_q8_batch_f16_tensor+ds4_gpu_hc_expand_split_half_tensor "
+              "sequential=ds4_gpu_attention_output_low_q8_tensor+ds4_gpu_matmul_q8_0_hc_expand_tensor "
+              "component_attribution=UNKNOWN evidence=PROVEN_BY_TEST\n",
+              stderr);
+    } else if (result->executed) {
+        fputs("CP4_TAIL_CANDIDATE "
+              "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+              "result=REJECTED evidence=PROVEN_BY_TEST\n",
+              stderr);
+    }
+    ok = result->executed && result->input_bits_equal &&
+         result->weights_same && result->semantics_preserved;
+
+    free(sequential_output_cpu);
+    free(generic_output_cpu);
+    free(sequential_input_cpu);
+    free(generic_input_cpu);
+    ds4_gpu_tensor_free(sequential_after);
+    ds4_gpu_tensor_free(sequential_attn_out);
+    ds4_gpu_tensor_free(sequential_low);
+    ds4_gpu_tensor_free(generic_after);
+    ds4_gpu_tensor_free(generic_half);
+    ds4_gpu_tensor_free(generic_low);
+    ds4_gpu_tensor_free(seq_hc_split);
+    ds4_gpu_tensor_free(seq_cur_hc);
+    ds4_gpu_tensor_free(seq_heads);
+    return ok;
+}
+
 static bool ds4_c2b_restore_s0(ds4_session *s,
                                ds4_spec_frontier *frontier,
                                const ds4_c2b_raw_s0 *raw,
@@ -51932,6 +52335,8 @@ static bool ds4_first_divergence_parse_canonical_mask(
         } else if (strcasecmp(token, "ATTN") == 0 ||
                    strcasecmp(token, "ATTN-RAW") == 0) {
             *mask |= DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW;
+        } else if (strcasecmp(token, "CP4-TAIL") == 0) {
+            *mask |= DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL;
         } else {
             return false;
         }
@@ -52065,6 +52470,7 @@ static int ds4_first_divergence_run(ds4_session *s,
     ds4_qa_primitive_ab_result qa_ab = {0};
     ds4_kv_primitive_ab_result kv_ab = {0};
     ds4_qb_primitive_ab_result qb_ab = {0};
+    ds4_cp4_tail_primitive_ab_result cp4_tail_ab = {0};
     int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
@@ -52093,8 +52499,21 @@ static int ds4_first_divergence_run(ds4_session *s,
                             DS4_FIRST_DIVERGENCE_CANON_QB)) ==
              (DS4_FIRST_DIVERGENCE_CANON_QA |
               DS4_FIRST_DIVERGENCE_CANON_KV |
-              DS4_FIRST_DIVERGENCE_CANON_QB));
+              DS4_FIRST_DIVERGENCE_CANON_QB)) &&
+        ((canonical_mask & DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL) == 0 ||
+         (canonical_mask & (DS4_FIRST_DIVERGENCE_CANON_QA |
+                            DS4_FIRST_DIVERGENCE_CANON_KV |
+                            DS4_FIRST_DIVERGENCE_CANON_QB |
+                            DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW)) ==
+             (DS4_FIRST_DIVERGENCE_CANON_QA |
+              DS4_FIRST_DIVERGENCE_CANON_KV |
+              DS4_FIRST_DIVERGENCE_CANON_QB |
+              DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW));
     const bool canonical_requested = canonical_mask != 0;
+    const bool cp4_tail_selected =
+        (canonical_mask & DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL) != 0;
+    const uint32_t pre_tail_canonical_mask =
+        canonical_mask & ~DS4_FIRST_DIVERGENCE_CANON_CP4_TAIL;
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
     ds4_gpu_tensor *batch_next = g->batch_next_hc_by_tier[0];
@@ -52161,7 +52580,7 @@ static int ds4_first_divergence_run(ds4_session *s,
         const bool restore_canonical_ok = ds4_c2b_restore_s0(
             s, &frontier, &raw, start, batch_cur, batch_next);
         g_ds4_first_divergence_canonical_mask = restore_canonical_ok
-            ? canonical_mask : 0;
+            ? pre_tail_canonical_mask : 0;
         a0_ok = restore_canonical_ok &&
             ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
                               &a0, n_comp_before, n_index_before);
@@ -52179,6 +52598,41 @@ static int ds4_first_divergence_run(ds4_session *s,
         canonical_rerun_ok = restore_canonical_ok && a0_ok &&
             restore1_ok && a1_ok && restore2_ok && a2_ok;
     }
+    const bool cp4_tail_ab_requested =
+        (pre_tail_canonical_mask &
+         DS4_FIRST_DIVERGENCE_CANON_ATTN_RAW) != 0;
+    const bool cp4_tail_ab_ok = !cp4_tail_ab_requested ||
+        (canonical_rerun_ok && a2_ok &&
+         ds4_cp4_tail_primitive_ab_run(s, &capture_a, &cp4_tail_ab));
+    bool cp4_tail_substitution_ok = !cp4_tail_selected;
+    if (cp4_tail_selected && cp4_tail_ab_ok &&
+        cp4_tail_ab.numerical_non_equivalence) {
+        ds4_c2b_observable_free(&a0);
+        ds4_c2b_observable_free(&a1);
+        ds4_c2b_observable_free(&a2);
+        const bool restore_tail_ok = ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        g_ds4_first_divergence_canonical_mask = restore_tail_ok
+            ? canonical_mask : 0;
+        a0_ok = restore_tail_ok &&
+            ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
+                              &a0, n_comp_before, n_index_before);
+        restore1_ok = a0_ok && ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        a1_ok = restore1_ok &&
+            ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
+                              &a1, n_comp_before, n_index_before);
+        restore2_ok = a1_ok && ds4_c2b_restore_s0(
+            s, &frontier, &raw, start, batch_cur, batch_next);
+        a2_ok = restore2_ok &&
+            ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, &capture_a,
+                              &a2, n_comp_before, n_index_before);
+        g_ds4_first_divergence_canonical_mask = 0;
+        cp4_tail_substitution_ok = restore_tail_ok && a0_ok &&
+            restore1_ok && a1_ok && restore2_ok && a2_ok;
+    }
+    canonical_rerun_ok = canonical_rerun_ok && cp4_tail_ab_ok &&
+        cp4_tail_substitution_ok;
     const bool pass_a_init_ok = a2_ok &&
         ds4_first_divergence_capture_init(&pass_a, "PASS_A");
     const bool pass_a_materialize_ok = pass_a_init_ok &&
@@ -52298,6 +52752,12 @@ static int ds4_first_divergence_run(ds4_session *s,
                         ds4_first_divergence_report_after_layer0_checkpoint(
                             &report,
                             DS4_FIRST_DIVERGENCE_CP4_HEADS_RAW);
+                    const bool cp4_tail_site_removed =
+                        cp4_tail_selected &&
+                        cp4_tail_ab.executed &&
+                        cp4_tail_ab.numerical_non_equivalence &&
+                        ds4_first_divergence_report_after_layer0_checkpoint(
+                            &report, DS4_FIRST_DIVERGENCE_CP4);
                     if ((canonical_mask &
                          DS4_FIRST_DIVERGENCE_CANON_QB) != 0) {
                         ds4_projection_drift_source_print(
@@ -52342,15 +52802,43 @@ static int ds4_first_divergence_run(ds4_session *s,
                                     attn_raw_site_removed ? "EXACT" : "MISMATCH");
                             ds4_first_divergence_print_report_location(&report);
                             fputc('\n', stderr);
-                            fputs("CANONICALIZATION_SWEEP_RESULT "
-                                  "canonical_set=QA,KV,QB,ATTN-RAW "
-                                  "sources_exposed=4 arithmetic_families=2 "
-                                  "family_concentration=MIXED first_divergence=",
-                                  stderr);
-                            ds4_first_divergence_print_report_location(&report);
-                            fputc('\n', stderr);
-                            report_ok = qb_site_removed &&
-                                        attn_raw_site_removed;
+                            if (cp4_tail_selected) {
+                                fprintf(stderr,
+                                        "SWEEP_STEP index=4 added=CP4-TAIL "
+                                        "family=FAMILY_Q8_ATTN_OUTPUT_BATCH_F16_HC_SPLIT_VS_SINGLE_F32_FUSED_HC "
+                                        "primitive_non_equivalence=%s "
+                                        "previous_stage_after_patch=%s "
+                                        "new_first_divergence=",
+                                        cp4_tail_ab.numerical_non_equivalence
+                                            ? "PROVEN_BY_TEST" : "UNKNOWN",
+                                        cp4_tail_site_removed
+                                            ? "EXACT" : "MISMATCH");
+                                ds4_first_divergence_print_report_location(
+                                    &report);
+                                fputc('\n', stderr);
+                                fputs("CANONICALIZATION_SWEEP_RESULT "
+                                      "canonical_set=QA,KV,QB,ATTN-RAW,CP4-TAIL "
+                                      "sources_exposed=5 arithmetic_families=3 "
+                                      "family_concentration=MIXED first_divergence=",
+                                      stderr);
+                                ds4_first_divergence_print_report_location(
+                                    &report);
+                                fputc('\n', stderr);
+                                report_ok = qb_site_removed &&
+                                            attn_raw_site_removed &&
+                                            cp4_tail_site_removed;
+                            } else {
+                                fputs("CANONICALIZATION_SWEEP_RESULT "
+                                      "canonical_set=QA,KV,QB,ATTN-RAW "
+                                      "sources_exposed=4 arithmetic_families=2 "
+                                      "family_concentration=MIXED first_divergence=",
+                                      stderr);
+                                ds4_first_divergence_print_report_location(
+                                    &report);
+                                fputc('\n', stderr);
+                                report_ok = qb_site_removed &&
+                                            attn_raw_site_removed;
+                            }
                         } else {
                             fputs("CANONICALIZATION_SWEEP_RESULT "
                                   "canonical_set=QA,KV,QB sources_exposed=4 "

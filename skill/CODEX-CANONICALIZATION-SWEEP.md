@@ -17,7 +17,11 @@
 - Current first divergence: `CP4-HEADS/attn_heads` at row 0, layer 0;
   `CP2-Q-CUR/q_cur` exact: **PROVEN BY TEST** on M4 Max.
 - Pre-inverse-RoPE heads subdivision and raw-attention canonicalization:
-  **IMPLEMENTED; M4 RUNTIME REQUIRED**.
+  **PROVEN BY TEST** on M4 Max.
+- Current first divergence after `{QA,KV,QB,ATTN-RAW}`:
+  `CP4/after_attn_hc` at row 0, layer 0: **PROVEN BY TEST** on M4 Max.
+- Isolated same-input CP4 tail A/B and conditional `CP4-TAIL`
+  causal substitution: **IMPLEMENTED; M4 RUNTIME REQUIRED**.
 - Default production behavior remains unchanged when
   `DS4_FIRST_DIVERGENCE_CANONICAL` is unset.
 
@@ -53,11 +57,12 @@ DS4_FIRST_DIVERGENCE_CANONICAL=QA
 DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV
 DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB
 DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW,CP4-TAIL
 ```
 
-`KV` without `QA`, `QB` without both earlier sites, or `ATTN-RAW` without
-`QA,KV,QB` is rejected because this forward sweep preserves the proven causal
-prefix. The legacy
+`KV` without `QA`, `QB` without both earlier sites, `ATTN-RAW` without
+`QA,KV,QB`, or `CP4-TAIL` without the complete earlier set is rejected because
+this forward sweep preserves the proven causal prefix. The legacy
 `DS4_FIRST_DIVERGENCE_CANONICAL_QA=1` gate remains accepted.  The mask is set
 only while encoding generic diagnostic A0/A1/A2 and is cleared before
 canonical sequential Pass B.
@@ -418,5 +423,66 @@ DS4_DSPARK_SCHEDULER=0 \
 `ATTN-RAW` only disables the raw-only batched attention call and reuses the
 existing per-row `ds4_gpu_attention_decode_heads_tensor` fallback. Compressed
 attention, inverse RoPE, output projection/fusion, replay, and production
-behavior remain unchanged. Stop if the next mismatch is CP4: the output tail
-has asymmetric fusion and no common standalone F32 `attn_out` boundary.
+behavior remain unchanged.
+
+## Isolated CP4 tail A/B
+
+No additional first-divergence checkpoint is introduced between `CP4-HEADS`
+and CP4. The existing generic CP4 capture also snapshots the tail's F32
+`cur_hc` and `hc_split` inputs into diagnostic-owned tensors. These snapshots
+are A/B fixtures, not ordered comparison objects.
+
+The isolated layer-0 test clones the exact same `CP4-HEADS`, `cur_hc`, and
+`hc_split` bits for both calls and uses the same model mapping, Q8_0 output-A
+weights, and Q8_0 output-B weights:
+
+| Path | Exact primitives |
+| --- | --- |
+| generic | `ds4_gpu_attention_output_q8_batch_f16_tensor` then `ds4_gpu_hc_expand_split_half_tensor` |
+| sequential | per-row `ds4_gpu_attention_output_low_q8_tensor` then `ds4_gpu_matmul_q8_0_hc_expand_tensor` |
+
+This covers output-A, output-B, the generic F32-to-F16 boundary, HC expansion,
+and residual addition. Because neither path naturally materializes the same
+post-output-B object, attribution to one component inside the compound tail
+remains `UNKNOWN`. Only the final F32 `after_attn_hc` is compared bitwise.
+
+Run the isolated A/B without tail substitution:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-cp4-tail-ab.log 2>&1
+```
+
+Required semantic gate:
+
+```text
+CP4_TAIL_PRIMITIVE_AB input_bits_equal=PASS weights_same=PASS semantics_preserved=PASS ... result=MISMATCH|EXACT ... evidence=PROVEN_BY_TEST
+```
+
+If it is `MISMATCH`, the compound candidate family is proven by the isolated
+test. `CP4-TAIL` first repeats the run with the earlier four canonicalizations,
+runs the isolated A/B, and enables row-wise sequential tail substitution only
+after the A/B proves numerical non-equivalence in that same invocation:
+
+```sh
+DS4_FIRST_DIVERGENCE=1 \
+DS4_FIRST_DIVERGENCE_CANONICAL=QA,KV,QB,ATTN-RAW,CP4-TAIL \
+DS4_DSPARK_SCHEDULER=0 \
+./ds4 --dspark --dspark-confidence 0 \
+  -m ./ds4flash.gguf \
+  --mtp ./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --tokens 16 --temp 0 --nothink \
+  -p 'Explain Redis in one sentence.' \
+  >canonical-sweep-cp4-tail-canonical.log 2>&1
+```
+
+The substitution is diagnostic-only. It creates no new online checkpoint,
+does not alter sequential Pass B, and leaves production execution and replay
+unchanged when the mask is unset.
