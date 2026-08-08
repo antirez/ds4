@@ -48380,6 +48380,25 @@ static bool ds4_dspark_scheduler_timing_enabled(void) {
            ds4_dspark_scheduler_max_extra_saved_ratio_milli() != 0;
 }
 
+/* On a full accept, the batched verify pass has already produced correct raw
+ * KV / compressor / indexer state for every drafted position -- the same
+ * batched attention path a plain (non-speculative) prefill chunk uses. MTP's
+ * default Metal path already trusts that state directly on a full accept
+ * instead of paying for a rollback and a sequential exact-kernel replay of
+ * every drafted token (see the DS4_ROCM_BUILD / prefer_decode2_exact split
+ * a few hundred lines into the MTP speculative-argmax path). This applies
+ * the same trade-off to DSpark, which currently never does.
+ *
+ * The trade-off is real, not just a performance knob: the batched kernel can
+ * differ from the exact single-token decode kernel by enough to flip a
+ * near-tied greedy token (documented on metal_graph_verify_decode2_exact),
+ * and unlike MTP this is not yet the shipped default here. Opt-in until
+ * there's more mileage on it than one contributor's benchmark. */
+static bool ds4_dspark_full_accept_fast_commit_enabled(void) {
+    const char *env = getenv("DS4_DSPARK_FULL_ACCEPT_FAST_COMMIT");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 static void ds4_session_dspark_scheduler_reset(ds4_session *s) {
     if (!s) return;
     s->dspark_sched_cycles = 0;
@@ -61706,6 +61725,55 @@ static int ds4_session_eval_dspark_speculative_argmax(
             if (row_tops[i - 1] != drafts[i]) break;
             commit_drafts++;
         }
+    }
+
+    /* Full accept, non-TP, opt-in: skip the rollback and the sequential
+     * exact-kernel replay below entirely and commit straight from the
+     * batched verify pass's own output, mirroring MTP's default Metal
+     * behavior on a full accept. See
+     * ds4_dspark_full_accept_fast_commit_enabled() for why this is opt-in
+     * rather than the default. TP is intentionally excluded: the worker-side
+     * commit protocol for this path has not been written or tested. */
+    if (ok && commit_drafts == draft_n && !tp_verify_sent &&
+        ds4_dspark_full_accept_fast_commit_enabled()) {
+        int full_accept_n = draft_n;
+        for (int i = 0; i < draft_n; i++) {
+            if (drafts[i] == eos_token) { full_accept_n = i + 1; break; }
+        }
+        if (metal_graph_read_spec_logits_row(&s->graph,
+                                             (uint32_t)(full_accept_n - 1),
+                                             row_logits)) {
+            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+            for (int i = 0; i < full_accept_n && n_accept < accepted_cap; i++) {
+                accepted[n_accept++] = drafts[i];
+            }
+            s->checkpoint_valid = true;
+            ds4_session_dspark_capture_note_checkpoint(s);
+            if (stats_enabled) {
+                s->dspark_stats.full_accepts++;
+                s->dspark_stats.accepted_draft_tokens += (uint64_t)full_accept_n;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                          (uint32_t)full_accept_n);
+            }
+            ds4_session_dspark_scheduler_note(
+                    s,
+                    (uint32_t)full_accept_n,
+                    false,
+                    DS4_DSPARK_SCHED_EXTRA_MS());
+            if (spec_log) {
+                fprintf(stderr,
+                        "ds4: DSpark spec full accept (fast commit, no replay) "
+                        "drafted=%d verified=%d accepted=%d\n",
+                        draft_n,
+                        commit_drafts,
+                        n_accept);
+            }
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STATS_FINISH();
+            return n_accept;
+        }
+        /* Row read failed (should not happen after a successful verify): fall
+         * through to the normal rollback+replay path below. */
     }
 
     /* Batch verification and ordinary decode update compressor state with
