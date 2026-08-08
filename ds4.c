@@ -37911,6 +37911,60 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
+#ifdef DS4_TEST_HOOKS
+/* Build only the tokenizer state needed by server/parser tests.  Each raw byte
+ * maps to its GPT-2 byte-encoding token, while synthetic special-token IDs make
+ * rendered chat delimiters take the same fast path as a loaded model tokenizer. */
+ds4_engine *ds4_test_engine_create_byte_tokenizer(void) {
+    enum { TEST_BYTE_TOKENS = 256, TEST_SPECIAL_FIRST = 256 };
+    ds4_engine *e = xcalloc(1, sizeof(*e));
+    e->backend = DS4_BACKEND_CPU;
+    ds4_vocab *vocab = &e->vocab;
+    vocab->n_vocab = TEST_SPECIAL_FIRST + 20;
+    vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    table_init(&vocab->token_to_id, TEST_BYTE_TOKENS);
+    table_init(&vocab->merge_rank, 0);
+    for (int i = 0; i < TEST_BYTE_TOKENS; i++) {
+        char encoded[5];
+        char *end = encoded;
+        utf8_put(&end, gpt2_byte_to_codepoint((uint8_t)i));
+        size_t len = (size_t)(end - encoded);
+        char *owned = xmalloc(len + 1);
+        memcpy(owned, encoded, len);
+        owned[len] = '\0';
+        vocab->token[i] = (ds4_str){.ptr = owned, .len = len};
+        table_put(&vocab->token_to_id, vocab->token[i], i);
+    }
+    int special = TEST_SPECIAL_FIRST;
+    vocab->bos_id = special++;
+    vocab->eos_id = special++;
+    vocab->system_id = special++;
+    vocab->user_id = special++;
+    vocab->assistant_id = special++;
+    vocab->observation_id = special++;
+    vocab->sop_id = special++;
+    vocab->think_start_id = special++;
+    vocab->think_end_id = special++;
+    vocab->tool_call_start_id = special++;
+    vocab->tool_call_end_id = special++;
+    vocab->tool_response_start_id = special++;
+    vocab->tool_response_end_id = special++;
+    vocab->arg_key_start_id = special++;
+    vocab->arg_key_end_id = special++;
+    vocab->arg_value_start_id = special++;
+    vocab->arg_value_end_id = special++;
+    vocab->dsml_id = special++;
+    return e;
+}
+
+void ds4_test_engine_free_byte_tokenizer(ds4_engine *e) {
+    if (!e) return;
+    for (int i = 0; i < 256; i++) free((void *)e->vocab.token[i].ptr);
+    vocab_free(&e->vocab);
+    free(e);
+}
+#endif
+
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     chat_push_bos_sequence(&e->vocab, tokens);
 }
@@ -49336,7 +49390,22 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+#ifdef DS4_TEST_HOOKS
+    bool test_token_only;
+#endif
 };
+
+#ifdef DS4_TEST_HOOKS
+ds4_session *ds4_test_session_create_token_only(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 1) return NULL;
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->ctx_size = ctx_size;
+    s->prefill_cap = (uint32_t)ctx_size;
+    s->test_token_only = true;
+    return s;
+}
+#endif
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -59836,6 +59905,22 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only) {
+        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+            }
+        } else {
+            ds4_tokens_copy(&s->checkpoint, prompt);
+        }
+        s->checkpoint_valid = true;
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
+        return 0;
+    }
+#endif
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
@@ -60743,6 +60828,9 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifdef DS4_TEST_HOOKS
+    if (s && s->test_token_only) return 'A';
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -61462,6 +61550,18 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only) {
+        if (s->checkpoint.len >= s->ctx_size - 1) {
+            if (errlen) snprintf(err, errlen, "test session context reached");
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");

@@ -376,6 +376,13 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+/* A tokenizer-only engine with a synthetic byte vocabulary. It exercises the
+ * production rendered-chat tokenizer without loading model weights. */
+ds4_engine *ds4_test_engine_create_byte_tokenizer(void);
+void ds4_test_engine_free_byte_tokenizer(ds4_engine *e);
+/* A checkpoint-only session for server integration tests. Its sync path keeps
+ * the exact token prefix but intentionally performs no model evaluation. */
+ds4_session *ds4_test_session_create_token_only(ds4_engine *e, int ctx_size);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
