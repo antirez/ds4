@@ -260,6 +260,24 @@ static const ds4_first_divergence_snapshot *find_snapshot(
     return NULL;
 }
 
+static const ds4_first_divergence_snapshot *find_snapshot_fields(
+        const ds4_first_divergence_capture *capture,
+        uint32_t row,
+        uint32_t layer,
+        ds4_first_divergence_checkpoint checkpoint,
+        const char *subobject) {
+    size_t i;
+
+    if (!capture) return NULL;
+    for (i = 0; i < capture->count; ++i) {
+        if (same_key(&capture->snapshots[i], row, layer, checkpoint,
+                     subobject)) {
+            return &capture->snapshots[i];
+        }
+    }
+    return NULL;
+}
+
 static bool same_layout(const ds4_first_divergence_snapshot *a,
                         const ds4_first_divergence_snapshot *b) {
     return a->kind == b->kind &&
@@ -313,6 +331,103 @@ static void print_object_prefix(FILE *stream,
             key->layer,
             ds4_first_divergence_checkpoint_name(key->checkpoint),
             key->subobject[0] ? key->subobject : "-");
+}
+
+static void print_float_metrics(FILE *stream,
+                                const ds4_float_compare_result *comparison) {
+    fprintf(stream,
+            " elements=%zu mismatch_count=%zu first_index=%zu actual_bits=0x%08x expected_bits=0x%08x",
+            comparison->length, comparison->mismatch_count,
+            comparison->first_mismatch_index,
+            comparison->first_actual_bits,
+            comparison->first_expected_bits);
+    if (comparison->max_abs_diff_defined) {
+        fprintf(stream, " max_abs=%.17g", comparison->max_abs_diff);
+    } else {
+        fputs(" max_abs=undefined", stream);
+    }
+    if (comparison->max_rel_diff_defined) {
+        fprintf(stream, " max_rel=%.17g", comparison->max_rel_diff);
+    } else {
+        fputs(" max_rel=undefined", stream);
+    }
+    if (comparison->max_ulp_distance_defined) {
+        fprintf(stream, " max_ulp=%u", comparison->max_ulp_distance);
+    } else {
+        fputs(" max_ulp=undefined", stream);
+    }
+}
+
+bool ds4_first_divergence_emit_q_trace(
+        const ds4_first_divergence_capture *pass_a,
+        const ds4_first_divergence_capture *pass_b,
+        FILE *stream) {
+    const ds4_first_divergence_snapshot *cp1_a;
+    const ds4_first_divergence_snapshot *cp1_b;
+    const ds4_first_divergence_snapshot *qr_a;
+    const ds4_first_divergence_snapshot *qr_b;
+    ds4_float_compare_result cp1_comparison;
+    ds4_float_compare_result qr_comparison;
+
+    if (!pass_a || !pass_b || !stream) return false;
+    cp1_a = find_snapshot_fields(pass_a, 0, 0, DS4_FIRST_DIVERGENCE_CP1,
+                                 "attn_norm");
+    cp1_b = find_snapshot_fields(pass_b, 0, 0, DS4_FIRST_DIVERGENCE_CP1,
+                                 "attn_norm");
+    qr_a = find_snapshot_fields(pass_a, 0, 0, DS4_FIRST_DIVERGENCE_CP2_Q,
+                                "qr");
+    qr_b = find_snapshot_fields(pass_b, 0, 0, DS4_FIRST_DIVERGENCE_CP2_Q,
+                                "qr");
+
+    fputs("Q_DIVERGENCE_TRACE row=0 layer=0\n", stream);
+    if (!cp1_a || !cp1_b || !qr_a || !qr_b) {
+        fputs("Q_DIVERGENCE_SANITY FAIL reason=missing_required_snapshot\n",
+              stream);
+        return false;
+    }
+    if (!same_layout(cp1_a, cp1_b) ||
+        cp1_a->kind != DS4_FIRST_DIVERGENCE_PAYLOAD_F32 ||
+        !same_layout(qr_a, qr_b) ||
+        qr_a->kind != DS4_FIRST_DIVERGENCE_PAYLOAD_F32) {
+        fputs("Q_DIVERGENCE_SANITY FAIL reason=non_comparable_layout\n",
+              stream);
+        return false;
+    }
+    if (!ds4_float_compare_exact((const float *)cp1_a->data,
+                                 (const float *)cp1_b->data,
+                                 cp1_a->element_count, &cp1_comparison) ||
+        !ds4_float_compare_exact((const float *)qr_a->data,
+                                 (const float *)qr_b->data,
+                                 qr_a->element_count, &qr_comparison)) {
+        fputs("Q_DIVERGENCE_SANITY FAIL reason=compare_error\n", stream);
+        return false;
+    }
+
+    fprintf(stream,
+            "Q_DIVERGENCE_STAGE stage=CP1 semantic=normalized_attention_input subobject=attn_norm result=%s elements=%zu\n",
+            cp1_comparison.bit_exact ? "EXACT" : "MISMATCH",
+            cp1_comparison.length);
+    if (!cp1_comparison.bit_exact) {
+        fputs("Q_DIVERGENCE_SANITY FAIL reason=cp1_not_exact\n", stream);
+        return false;
+    }
+    fputs("Q_DIVERGENCE_STAGE stage=CP2-Q semantic=q_a_projection_output subobject=qr result=",
+          stream);
+    if (qr_comparison.bit_exact) {
+        fprintf(stream, "EXACT elements=%zu\n", qr_comparison.length);
+        fputs("Q_DIVERGENCE_SANITY FAIL reason=q_a_projection_exact\n", stream);
+        return false;
+    }
+    fputs("MISMATCH", stream);
+    print_float_metrics(stream, &qr_comparison);
+    fputc('\n', stream);
+    fputs("Q_FIRST_DIVERGENCE stage=q_a_projection_output producer_generic=metal_graph_matmul_q8_0_named_tensor_attn_q_a producer_sequential=metal_graph_matmul_dense_quant_tensor_attn_q_a subobject=qr",
+          stream);
+    print_float_metrics(stream, &qr_comparison);
+    fputc('\n', stream);
+    fputs("Q_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_Q_PATH\n",
+          stream);
+    return ferror(stream) == 0;
 }
 
 bool ds4_first_divergence_emit_report(
@@ -448,6 +563,13 @@ bool ds4_first_divergence_emit_report(
     } else {
         fprintf(stream, "FIRST_DIVERGENCE NONE compared_objects=%zu\n",
                 report->compared_objects);
+    }
+    if (report->first_divergence_found &&
+        report->row == 0 && report->layer == 0 &&
+        report->checkpoint == DS4_FIRST_DIVERGENCE_CP2_Q &&
+        strcmp(report->subobject, "qr") == 0 &&
+        !ds4_first_divergence_emit_q_trace(pass_a, pass_b, stream)) {
+        return false;
     }
     return ferror(stream) == 0;
 }

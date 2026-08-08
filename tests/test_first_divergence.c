@@ -74,7 +74,14 @@ int main(void) {
     ds4_first_divergence_capture pass_a;
     ds4_first_divergence_capture pass_b;
     ds4_first_divergence_report report;
+    ds4_first_divergence_capture q_pass_a;
+    ds4_first_divergence_capture q_pass_b;
+    FILE *q_log;
+    char q_log_text[4096];
+    size_t q_log_bytes;
     const float cp1[] = {1.0f, -0.0f, 3.5f};
+    const float qr_a[] = {0.125f, -0.5f, 1.0f, 2.0f};
+    const float qr_b[] = {0.12500001f, -0.5f, 1.0000001f, 2.0f};
     const uint32_t n_comp = 17;
     const int forced_tokens[] = {101, 202, 303};
     pair_fixture fixture = {
@@ -127,6 +134,46 @@ int main(void) {
     REQUIRE(strcmp(report.subobject, "attn_norm") == 0);
     ds4_first_divergence_capture_free(&pass_a);
     ds4_first_divergence_capture_free(&pass_b);
+
+    REQUIRE(ds4_first_divergence_capture_init(&q_pass_a, "PASS_A"));
+    REQUIRE(ds4_first_divergence_capture_init(&q_pass_b, "PASS_B"));
+    REQUIRE(ds4_first_divergence_capture_f32(
+        &q_pass_a, 0, 0, DS4_FIRST_DIVERGENCE_CP1, "attn_norm",
+        cp1, sizeof(cp1) / sizeof(cp1[0])));
+    REQUIRE(ds4_first_divergence_capture_f32(
+        &q_pass_b, 0, 0, DS4_FIRST_DIVERGENCE_CP1, "attn_norm",
+        cp1, sizeof(cp1) / sizeof(cp1[0])));
+    REQUIRE(ds4_first_divergence_capture_f32(
+        &q_pass_a, 0, 0, DS4_FIRST_DIVERGENCE_CP2_Q, "qr",
+        qr_a, sizeof(qr_a) / sizeof(qr_a[0])));
+    REQUIRE(ds4_first_divergence_capture_f32(
+        &q_pass_b, 0, 0, DS4_FIRST_DIVERGENCE_CP2_Q, "qr",
+        qr_b, sizeof(qr_b) / sizeof(qr_b[0])));
+    q_log = tmpfile();
+    REQUIRE(q_log != NULL);
+    REQUIRE(ds4_first_divergence_emit_report(
+        &q_pass_a, &q_pass_b, q_log, &report));
+    REQUIRE(report.first_divergence_found);
+    REQUIRE(report.row == 0);
+    REQUIRE(report.layer == 0);
+    REQUIRE(report.checkpoint == DS4_FIRST_DIVERGENCE_CP2_Q);
+    REQUIRE(strcmp(report.subobject, "qr") == 0);
+    REQUIRE(fflush(q_log) == 0);
+    REQUIRE(fseek(q_log, 0, SEEK_SET) == 0);
+    q_log_bytes = fread(q_log_text, 1, sizeof(q_log_text) - 1, q_log);
+    q_log_text[q_log_bytes] = '\0';
+    REQUIRE(strstr(q_log_text, "Q_DIVERGENCE_TRACE row=0 layer=0") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "stage=CP1 semantic=normalized_attention_input subobject=attn_norm result=EXACT") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "stage=CP2-Q semantic=q_a_projection_output subobject=qr result=MISMATCH") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "Q_FIRST_DIVERGENCE stage=q_a_projection_output") != NULL);
+    REQUIRE(strstr(q_log_text,
+                   "Q_LOCALIZATION_RESULT FIRST_RUNTIME_DIVERGENCE_WITHIN_Q_PATH") != NULL);
+    REQUIRE(fclose(q_log) == 0);
+    ds4_first_divergence_capture_free(&q_pass_a);
+    ds4_first_divergence_capture_free(&q_pass_b);
 
     puts("first-divergence forced pair: OK");
     return 0;
