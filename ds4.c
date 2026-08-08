@@ -15295,11 +15295,19 @@ typedef struct {
     uint32_t cp3_n_index[DS4_MAX_LAYER][DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t attention_hooks;
     uint32_t ffn_hooks;
+    uint32_t expected_hooks;
 } ds4_c2b_capture;
 
 /* The diagnostic command is single-session and single-device by contract.
  * NULL is the entire production fast path. */
 static ds4_c2b_capture *g_ds4_c2b_capture;
+
+/* Canonical sequential Pass-B capture.  Like the Pass-A hook, NULL is the
+ * entire production fast path. */
+static ds4_c2b_capture *g_ds4_c45_capture;
+static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
+                                   uint32_t il,
+                                   uint32_t pos);
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
  * decode. The batched server serializes every operation that uses them, so one
@@ -26667,6 +26675,9 @@ static bool metal_graph_encode_token_raw_swa(
                                              raw_row,
                                              n_raw,
                                              token);
+        if (ok && g_ds4_c45_capture) {
+            ok = ds4_c45_capture_layer(g, il, pos);
+        }
         ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
@@ -29773,6 +29784,113 @@ static bool ds4_c2b_capture_ffn(ds4_gpu_graph *g,
         (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
     return ds4_c2b_inline_copy(c->cp5[il], 0,
                                metal_graph_batch_next_hc(g), 0, bytes);
+}
+
+/* Snapshot one canonical ordinary-decode layer after its complete producer
+ * tape has been encoded and before the caller swaps the HC pointers. */
+static bool ds4_c45_capture_layer(ds4_gpu_graph *g,
+                                  uint32_t il,
+                                  uint32_t pos) {
+    ds4_c2b_capture *c = g_ds4_c45_capture;
+    if (!c) return true;
+    if (c->graph != g || il >= DS4_N_LAYER || pos < c->start ||
+        pos - c->start >= c->n_tokens) {
+        return false;
+    }
+    const uint32_t row = pos - c->start;
+    const uint64_t cp1_row_bytes =
+        (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t q_row_bytes = c->q_values[il] * sizeof(float);
+    const uint64_t kv_row_bytes =
+        (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t hc_row_bytes =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    bool ok =
+        ds4_c2b_inline_copy(c->cp1[il], (uint64_t)row * cp1_row_bytes,
+                            metal_graph_attn_norm(g), 0, cp1_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp2_q[il], (uint64_t)row * q_row_bytes,
+                            metal_graph_qr(g), 0, q_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp2_kv_p[il], (uint64_t)row * kv_row_bytes,
+                            metal_graph_kv_raw(g), 0, kv_row_bytes) &&
+        ds4_c2b_inline_copy(
+            c->cp2_kv_r[il], (uint64_t)row * kv_row_bytes,
+            g->layer_raw_cache[il],
+            (uint64_t)(pos % g->raw_cap) * kv_row_bytes, kv_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp4[il], (uint64_t)row * hc_row_bytes,
+                            metal_graph_after_attn_hc(g), 0, hc_row_bytes) &&
+        ds4_c2b_inline_copy(c->cp5[il], (uint64_t)row * hc_row_bytes,
+                            metal_graph_after_ffn_hc(g), 0, hc_row_bytes);
+
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ok && ratio != 0) {
+        const uint64_t attn_state_bytes =
+            ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint32_t previous = row == 0
+            ? c->n_comp_before[il]
+            : c->cp3_n_comp[il][row - 1u];
+        const uint32_t current = g->layer_n_comp[il];
+        c->cp3_n_comp[il][row] = current;
+        ok = current >= previous && current >= c->n_comp_before[il] &&
+             current - c->n_comp_before[il] <= c->n_tokens &&
+             ds4_c2b_inline_copy(
+                 c->cp3_attn_state_kv[il],
+                 (uint64_t)row * attn_state_bytes,
+                 g->layer_attn_state_kv[il], 0, attn_state_bytes) &&
+             ds4_c2b_inline_copy(
+                 c->cp3_attn_state_score[il],
+                 (uint64_t)row * attn_state_bytes,
+                 g->layer_attn_state_score[il], 0, attn_state_bytes);
+#if !DS4_GPU_ATTN_COMP_CACHE_F16
+        const uint32_t emitted = current - previous;
+        if (ok && emitted != 0) {
+            const uint64_t cache_row_bytes =
+                (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            ok = ds4_c2b_inline_copy(
+                c->cp3_attn_cache[il],
+                (uint64_t)(previous - c->n_comp_before[il]) *
+                    cache_row_bytes,
+                g->layer_attn_comp_cache[il],
+                (uint64_t)previous * cache_row_bytes,
+                (uint64_t)emitted * cache_row_bytes);
+        }
+#endif
+
+        if (ok && ratio == 4) {
+            const uint64_t index_state_bytes =
+                ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            const uint32_t index_previous = row == 0
+                ? c->n_index_before[il]
+                : c->cp3_n_index[il][row - 1u];
+            const uint32_t index_current = g->layer_n_index_comp[il];
+            c->cp3_n_index[il][row] = index_current;
+            ok = index_current >= index_previous &&
+                 index_current >= c->n_index_before[il] &&
+                 index_current - c->n_index_before[il] <= c->n_tokens &&
+                 ds4_c2b_inline_copy(
+                     c->cp3_index_state_kv[il],
+                     (uint64_t)row * index_state_bytes,
+                     g->layer_index_state_kv[il], 0, index_state_bytes) &&
+                 ds4_c2b_inline_copy(
+                     c->cp3_index_state_score[il],
+                     (uint64_t)row * index_state_bytes,
+                     g->layer_index_state_score[il], 0, index_state_bytes);
+            const uint32_t index_emitted = index_current - index_previous;
+            if (ok && index_emitted != 0) {
+                const uint64_t index_row_bytes =
+                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                ok = ds4_c2b_inline_copy(
+                    c->cp3_index_cache[il],
+                    (uint64_t)(index_previous - c->n_index_before[il]) *
+                        index_row_bytes,
+                    g->layer_index_comp_cache[il],
+                    (uint64_t)index_previous * index_row_bytes,
+                    (uint64_t)index_emitted * index_row_bytes);
+            }
+        }
+    }
+    c->attention_hooks++;
+    c->ffn_hooks++;
+    return ok;
 }
 
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
@@ -50292,6 +50410,7 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
     c->graph = g;
     c->start = start;
     c->n_tokens = n_tokens;
+    c->expected_hooks = DS4_N_LAYER;
 
     const uint64_t cp1_bytes =
         (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
@@ -50305,7 +50424,10 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             !metal_graph_batch_attn_norm(g) || !metal_graph_batch_qr(g) ||
             !metal_graph_batch_kv_raw(g) ||
             !metal_graph_batch_after_attn_hc(g) ||
-            !metal_graph_batch_next_hc(g)) {
+            !metal_graph_batch_next_hc(g) || !metal_graph_attn_norm(g) ||
+            !metal_graph_qr(g) || !metal_graph_kv_raw(g) ||
+            !metal_graph_after_attn_hc(g) ||
+            !metal_graph_after_ffn_hc(g)) {
             ds4_c2b_capture_free(c);
             return false;
         }
@@ -50317,7 +50439,16 @@ static bool ds4_c2b_capture_alloc(ds4_c2b_capture *c,
             ds4_gpu_tensor_bytes(metal_graph_batch_qr(g)) < q_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_kv_raw(g)) < kv_bytes ||
             ds4_gpu_tensor_bytes(metal_graph_batch_after_attn_hc(g)) < hc_bytes ||
-            ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes) {
+            ds4_gpu_tensor_bytes(metal_graph_batch_next_hc(g)) < hc_bytes ||
+            ds4_gpu_tensor_bytes(metal_graph_attn_norm(g)) <
+                (uint64_t)DS4_N_EMBD * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_qr(g)) <
+                c->q_values[il] * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_kv_raw(g)) < kv_bytes / n_tokens ||
+            ds4_gpu_tensor_bytes(metal_graph_after_attn_hc(g)) <
+                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float) ||
+            ds4_gpu_tensor_bytes(metal_graph_after_ffn_hc(g)) <
+                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) {
             ds4_c2b_capture_free(c);
             return false;
         }
@@ -50524,8 +50655,9 @@ static bool ds4_c2b_materialize_capture(
         const ds4_c2b_capture *capture,
         ds4_first_divergence_capture *out) {
     if (!capture || !out || !capture->graph || capture->n_tokens == 0 ||
-        capture->attention_hooks != DS4_N_LAYER ||
-        capture->ffn_hooks != DS4_N_LAYER) {
+        capture->expected_hooks == 0 ||
+        capture->attention_hooks != capture->expected_hooks ||
+        capture->ffn_hooks != capture->expected_hooks) {
         return false;
     }
     const uint32_t rows = capture->n_tokens;
@@ -51049,55 +51181,99 @@ static bool ds4_c2b_run_pass(ds4_session *s,
     return ok;
 }
 
-static int ds4_c2b_run(ds4_session *s,
-                       const int *drafts,
-                       uint32_t n_tokens,
-                       uint32_t start) {
+static bool ds4_c45_run_pass_b(ds4_session *s,
+                               const int *forced_tokens,
+                               uint32_t n_tokens,
+                               uint32_t start,
+                               ds4_c2b_capture *capture) {
+    if (!s || !forced_tokens || !capture || !s->spec_row_logits ||
+        n_tokens == 0 || n_tokens > DS4_DSPARK_MAX_BLOCK_SIZE ||
+        s->checkpoint.len != (int)start ||
+        n_tokens > UINT32_MAX / DS4_N_LAYER) {
+        return false;
+    }
+    capture->attention_hooks = 0;
+    capture->ffn_hooks = 0;
+    capture->expected_hooks = n_tokens * DS4_N_LAYER;
+    g_ds4_c45_capture = capture;
+    bool ok = true;
+    for (uint32_t row = 0; ok && row < n_tokens; row++) {
+        if (s->checkpoint.len != (int)(start + row)) {
+            ok = false;
+            break;
+        }
+        ok = metal_graph_eval_token_raw_swa(
+            &s->graph, &s->engine->model, &s->engine->weights,
+            forced_tokens[row], start + row, s->spec_row_logits);
+        if (ok) token_vec_push(&s->checkpoint, forced_tokens[row]);
+    }
+    g_ds4_c45_capture = NULL;
+    return ok && capture->attention_hooks == capture->expected_hooks &&
+           capture->ffn_hooks == capture->expected_hooks &&
+           s->checkpoint.len == (int)(start + n_tokens);
+}
+
+static int ds4_first_divergence_run(ds4_session *s,
+                                    const int *drafts,
+                                    uint32_t n_tokens,
+                                    uint32_t start) {
     ds4_spec_frontier frontier = {0};
     ds4_c2b_raw_s0 raw = {0};
-    ds4_c2b_capture capture = {0};
+    ds4_c2b_capture capture_a = {0};
+    ds4_c2b_capture capture_b = {0};
     ds4_c2b_observable a0 = {0}, a1 = {0}, a2 = {0};
     ds4_first_divergence_capture pass_a = {0};
+    ds4_first_divergence_capture pass_b = {0};
+    ds4_first_divergence_report report = {0};
+    int forced_tokens[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
     uint32_t n_comp_before[DS4_MAX_LAYER] = {0};
     uint32_t n_index_before[DS4_MAX_LAYER] = {0};
     ds4_gpu_graph *g = &s->graph;
     ds4_gpu_tensor *batch_cur = g->batch_cur_hc_by_tier[0];
     ds4_gpu_tensor *batch_next = g->batch_next_hc_by_tier[0];
     const bool config_ok =
-        s->engine->backend == DS4_BACKEND_METAL && !g->placement &&
+        s && drafts && s->engine->backend == DS4_BACKEND_METAL &&
+        !g->placement && !g->ssd_streaming &&
         g->tp_world <= 1u && n_tokens != 0 && n_tokens <= g->raw_cap &&
         n_tokens <= DS4_SPEC_PREFIX_SLOTS + 1u;
+    if (config_ok) {
+        memcpy(forced_tokens, drafts,
+               (size_t)n_tokens * sizeof(forced_tokens[0]));
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         n_comp_before[il] = g->layer_n_comp[il];
         n_index_before[il] = g->layer_n_index_comp[il];
     }
-    const bool alloc_ok = config_ok &&
-        ds4_c2b_capture_alloc(&capture, g, &s->engine->weights,
+    const bool alloc_a_ok = config_ok &&
+        ds4_c2b_capture_alloc(&capture_a, g, &s->engine->weights,
                               start, n_tokens);
-    const bool raw_ok = alloc_ok &&
+    const bool alloc_b_ok = alloc_a_ok &&
+        ds4_c2b_capture_alloc(&capture_b, g, &s->engine->weights,
+                              start, n_tokens);
+    const bool raw_ok = alloc_b_ok &&
         ds4_c2b_raw_s0_snapshot(&raw, g, start, n_tokens);
     const bool frontier_ok = raw_ok && spec_frontier_snapshot(&frontier, s);
 
     bool a0_ok = frontier_ok &&
-        ds4_c2b_run_pass(s, drafts, n_tokens, start, NULL,
+        ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
                           &a0, n_comp_before, n_index_before);
     bool restore1_ok = frontier_ok &&
         ds4_c2b_restore_s0(s, &frontier, &raw, start, batch_cur, batch_next);
     bool a1_ok = restore1_ok &&
-        ds4_c2b_run_pass(s, drafts, n_tokens, start, NULL,
+        ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, NULL,
                           &a1, n_comp_before, n_index_before);
     bool restore2_ok = a1_ok &&
         ds4_c2b_restore_s0(s, &frontier, &raw, start, batch_cur, batch_next);
     bool a2_ok = restore2_ok &&
-        ds4_c2b_run_pass(s, drafts, n_tokens, start, &capture,
+        ds4_c2b_run_pass(s, forced_tokens, n_tokens, start, &capture_a,
                           &a2, n_comp_before, n_index_before);
-    const bool capture_init_ok = a2_ok &&
+    const bool pass_a_init_ok = a2_ok &&
         ds4_first_divergence_capture_init(&pass_a, "PASS_A");
-    const bool materialize_ok = capture_init_ok &&
-        ds4_c2b_materialize_capture(&capture, &pass_a);
-    bool final_restore_ok = frontier_ok &&
+    const bool pass_a_materialize_ok = pass_a_init_ok &&
+        ds4_c2b_materialize_capture(&capture_a, &pass_a);
+    bool pass_b_restore_ok = frontier_ok &&
         ds4_c2b_restore_s0(s, &frontier, &raw, start, batch_cur, batch_next);
-    if (final_restore_ok) final_restore_ok = ds4_gpu_synchronize() != 0;
+    if (pass_b_restore_ok) pass_b_restore_ok = ds4_gpu_synchronize() != 0;
 
     bool control = false;
     bool probe = false;
@@ -51109,19 +51285,22 @@ static int ds4_c2b_run(ds4_session *s,
         probe = ds4_c2b_compare_observables(
             "A0_vs_A2", &a2, &a0, start, n_tokens, g->raw_cap);
     }
-    if (!config_ok || !alloc_ok || !raw_ok || !frontier_ok || !a0_ok ||
+    if (!config_ok || !alloc_a_ok || !alloc_b_ok || !raw_ok ||
+        !frontier_ok || !a0_ok ||
         !restore1_ok || !a1_ok || !restore2_ok || !a2_ok ||
-        !capture_init_ok || !materialize_ok || !final_restore_ok) {
+        !pass_a_init_ok || !pass_a_materialize_ok || !pass_b_restore_ok) {
         fprintf(stderr,
-                "C2B_ERROR config=%d alloc=%d raw_snapshot=%d frontier=%d "
+                "C2B_ERROR config=%d alloc_a=%d alloc_b=%d "
+                "raw_snapshot=%d frontier=%d "
                 "A0=%d restore1=%d A1=%d restore2=%d A2=%d "
-                "materialize=%d final_restore=%d\n",
-                config_ok ? 1 : 0, alloc_ok ? 1 : 0,
+                "materialize_a=%d pass_b_restore=%d\n",
+                config_ok ? 1 : 0, alloc_a_ok ? 1 : 0,
+                alloc_b_ok ? 1 : 0,
                 raw_ok ? 1 : 0, frontier_ok ? 1 : 0, a0_ok ? 1 : 0,
                 restore1_ok ? 1 : 0, a1_ok ? 1 : 0,
                 restore2_ok ? 1 : 0, a2_ok ? 1 : 0,
-                materialize_ok ? 1 : 0,
-                final_restore_ok ? 1 : 0);
+                pass_a_materialize_ok ? 1 : 0,
+                pass_b_restore_ok ? 1 : 0);
         control = false;
         probe = false;
     }
@@ -51129,15 +51308,40 @@ static int ds4_c2b_run(ds4_session *s,
     fprintf(stderr, "C2B_PROBE   A0_vs_A2 %s\n", probe ? "PASS" : "FAIL");
     fprintf(stderr, "C2B_RESULT  %s\n", control && probe ? "PASS" : "FAIL");
 
+    bool pass_b_init_ok = false;
+    bool pass_b_run_ok = false;
+    bool pass_b_materialize_ok = false;
+    bool report_ok = false;
+    if (control && probe) {
+        pass_b_init_ok = ds4_first_divergence_capture_init(&pass_b, "PASS_B");
+        pass_b_run_ok = pass_b_init_ok && ds4_c45_run_pass_b(
+            s, forced_tokens, n_tokens, start, &capture_b);
+        pass_b_materialize_ok = pass_b_run_ok &&
+            ds4_c2b_materialize_capture(&capture_b, &pass_b);
+        report_ok = pass_b_materialize_ok &&
+            ds4_first_divergence_emit_report(
+                &pass_a, &pass_b, stderr, &report);
+    }
+    if (control && probe && !report_ok) {
+        fprintf(stderr,
+                "C45_ERROR pass_b_init=%d pass_b_run=%d "
+                "materialize_b=%d report=%d\n",
+                pass_b_init_ok ? 1 : 0, pass_b_run_ok ? 1 : 0,
+                pass_b_materialize_ok ? 1 : 0, report_ok ? 1 : 0);
+    }
+
     g_ds4_c2b_capture = NULL;
+    g_ds4_c45_capture = NULL;
     ds4_c2b_observable_free(&a0);
     ds4_c2b_observable_free(&a1);
     ds4_c2b_observable_free(&a2);
     ds4_first_divergence_capture_free(&pass_a);
-    ds4_c2b_capture_free(&capture);
+    ds4_first_divergence_capture_free(&pass_b);
+    ds4_c2b_capture_free(&capture_a);
+    ds4_c2b_capture_free(&capture_b);
     ds4_c2b_raw_s0_free(&raw);
     spec_frontier_free(&frontier);
-    return control && probe ? 0 : 1;
+    return control && probe && report_ok ? 0 : 1;
 }
 
 /* Commit an intermediate state captured by a tiny speculative verifier.
@@ -62732,11 +62936,12 @@ static int ds4_session_eval_dspark_speculative_argmax(
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
 
-    const char *c2b_env = getenv("DS4_FIRST_DIVERGENCE");
-    const bool c2b_enabled =
-        c2b_env && c2b_env[0] && strcmp(c2b_env, "0") != 0;
+    const char *first_divergence_env = getenv("DS4_FIRST_DIVERGENCE");
+    const bool first_divergence_enabled =
+        first_divergence_env && first_divergence_env[0] &&
+        strcmp(first_divergence_env, "0") != 0;
     const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
-    if (target_top != drafts[0] && !c2b_enabled) {
+    if (target_top != drafts[0] && !first_divergence_enabled) {
         if (stats_enabled) {
             s->dspark_stats.first_misses++;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
@@ -62752,19 +62957,19 @@ static int ds4_session_eval_dspark_speculative_argmax(
         DS4_DSPARK_STATS_FINISH();
         return n_accept;
     }
-    if (drafts[0] == eos_token && !c2b_enabled) draft_n = 1;
+    if (drafts[0] == eos_token && !first_divergence_enabled) draft_n = 1;
 
     ds4_engine *e = s->engine;
     int row_tops_buf[DS4_DSPARK_MAX_BLOCK_SIZE];
     int *row_tops = draft_n > 1 ? row_tops_buf : NULL;
     float *row_logits = s->spec_row_logits;
     const int start = s->checkpoint.len;
-    if (c2b_enabled) {
-        const int c2b_rc = ds4_c2b_run(
+    if (first_divergence_enabled) {
+        const int diagnostic_rc = ds4_first_divergence_run(
             s, drafts, (uint32_t)draft_n, (uint32_t)start);
         fflush(stdout);
         fflush(stderr);
-        exit(c2b_rc);
+        exit(diagnostic_rc);
     }
 
     ds4_spec_frontier frontier;
