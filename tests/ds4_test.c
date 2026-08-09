@@ -6649,7 +6649,7 @@ static void test_tool_call_quality_one(bool quality) {
 
     /* Use the real response-side id assignment and exact sampled-DSML memory.
      * The same id is serialized on both the assistant call and tool result. */
-    assign_tool_call_ids(&s, &first.calls, API_OPENAI);
+    assign_tool_call_ids(&s, NULL, &first.calls, API_OPENAI);
     TEST_ASSERT(first.calls.v[0].id && first.calls.v[0].id[0]);
     if (!first.calls.v[0].id || !first.calls.v[0].id[0]) goto done;
     tool_memory_remember(&s, &first.calls);
