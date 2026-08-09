@@ -173,7 +173,20 @@ int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void);
 /* Strict test oracle for the generated resident-prefill MXFP4 half LUT. */
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits);
+enum {
+    DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL = 1u << 0,
+    DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE = 1u << 1,
+    DS4_GPU_TEST_MXFP4_MAP_SCATTER = 1u << 2,
+    DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL = 1u << 3,
+    DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
+    DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
+    DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+};
+void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
+#else
+static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
+static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
@@ -2595,18 +2608,6 @@ int ds4_gpu_hc_weighted_sum_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_embd,
         uint32_t                n_hc);
-
-int ds4_gpu_hc_weighted_sum_norm_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *norm_out,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *weights,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                norm_weight_offset,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        float                   norm_eps);
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
         ds4_gpu_tensor       *out,

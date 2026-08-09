@@ -17,17 +17,6 @@
 #define DIM 256u
 #define BATCH_TOKENS 48u
 
-#define MXFP4_PAIR_TAIL_CULL_ENV \
-    "DS4_METAL_ENABLE_MXFP4_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL"
-#define MXFP4_PAIR_COMPACT_TILE_ENV \
-    "DS4_METAL_ENABLE_MXFP4_MOE_MM_ID_PAIR_SWIGLU_COMPACT_TILE"
-#define MXFP4_MAP_SCATTER_ENV \
-    "DS4_METAL_ENABLE_MXFP4_MOE_MM_ID_MAP_SCATTER"
-#define MXFP4_DOWN_TAIL_CULL_ENV \
-    "DS4_METAL_ENABLE_MXFP4_MOE_MM_ID_DOWN_TAIL_SIMDGROUP_CULL"
-#define MXFP4_DOWN_HALF_LUT_ENV \
-    "DS4_METAL_ENABLE_MXFP4_MOE_MM_ID_DOWN_HALF_LUT"
-
 typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2u];
@@ -452,11 +441,7 @@ int main(void) {
      * a 16-row tail tile. Run the established, pair-culling, and down-culling
      * pipelines in the same process and require exact FP16 intermediates and
      * F32 outputs. */
-    unsetenv(MXFP4_PAIR_TAIL_CULL_ENV);
-    unsetenv(MXFP4_PAIR_COMPACT_TILE_ENV);
-    unsetenv(MXFP4_MAP_SCATTER_ENV);
-    unsetenv(MXFP4_DOWN_HALF_LUT_ENV);
-    ok = ok && setenv(MXFP4_DOWN_TAIL_CULL_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL);
     ok = ok && ds4_gpu_tensor_write(
         mid_batch_tensor, 0, batch_poison,
         batch_pairs * sizeof(_Float16));
@@ -491,7 +476,9 @@ int main(void) {
      * and run twice in this process; the FP16 mid, expert-major F32 down
      * scratch, and summed F32 output must all match the established kernel
      * byte-for-byte on each repetition. */
-    ok = ok && setenv(MXFP4_DOWN_HALF_LUT_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(
+        DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL |
+        DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT);
     for (uint32_t run = 0; run < 2u && ok; run++) {
         mid_is_f16 = false;
         ok = ok && ds4_gpu_tensor_write(
@@ -539,11 +526,10 @@ int main(void) {
                     run + 1u);
         }
     }
-    unsetenv(MXFP4_DOWN_HALF_LUT_ENV);
-    unsetenv(MXFP4_DOWN_TAIL_CULL_ENV);
+    ds4_gpu_test_set_flags(0);
 
     mid_is_f16 = false;
-    ok = ok && setenv(MXFP4_PAIR_TAIL_CULL_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL);
     ok = ok && ds4_gpu_tensor_write(
         mid_batch_tensor, 0, batch_poison,
         batch_pairs * sizeof(_Float16));
@@ -569,7 +555,7 @@ int main(void) {
     ok = ok && ds4_gpu_tensor_read(
         out_batch_tensor, 0, out_batch_actual,
         batch_out_count * sizeof(float));
-    unsetenv(MXFP4_PAIR_TAIL_CULL_ENV);
+    ds4_gpu_test_set_flags(0);
     if (ok && (memcmp(mid_batch_storage, mid_batch_baseline,
                       batch_pairs * sizeof(_Float16)) != 0 ||
                memcmp(out_batch_actual, out_batch_baseline,
@@ -588,7 +574,7 @@ int main(void) {
      * intermediate and final F32 output to match the established 64x32 path
      * byte-for-byte. */
     mid_is_f16 = false;
-    ok = ok && setenv(MXFP4_PAIR_COMPACT_TILE_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE);
     ok = ok && ds4_gpu_tensor_write(
         mid_batch_tensor, 0, batch_poison,
         batch_pairs * sizeof(_Float16));
@@ -614,7 +600,7 @@ int main(void) {
     ok = ok && ds4_gpu_tensor_read(
         out_batch_tensor, 0, out_batch_actual,
         batch_out_count * sizeof(float));
-    unsetenv(MXFP4_PAIR_COMPACT_TILE_ENV);
+    ds4_gpu_test_set_flags(0);
     if (ok && (memcmp(mid_batch_storage, mid_batch_baseline,
                       batch_pairs * sizeof(_Float16)) != 0 ||
                memcmp(out_batch_actual, out_batch_baseline,
@@ -628,7 +614,7 @@ int main(void) {
     }
 
     mid_is_f16 = false;
-    ok = ok && setenv(MXFP4_DOWN_TAIL_CULL_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL);
     ok = ok && ds4_gpu_tensor_write(
         mid_batch_tensor, 0, batch_poison,
         batch_pairs * sizeof(_Float16));
@@ -654,7 +640,7 @@ int main(void) {
     ok = ok && ds4_gpu_tensor_read(
         out_batch_tensor, 0, out_batch_actual,
         batch_out_count * sizeof(float));
-    unsetenv(MXFP4_DOWN_TAIL_CULL_ENV);
+    ds4_gpu_test_set_flags(0);
     if (ok && (memcmp(mid_batch_storage, mid_batch_baseline,
                       batch_pairs * sizeof(_Float16)) != 0 ||
                memcmp(out_batch_actual, out_batch_baseline,
@@ -693,8 +679,7 @@ int main(void) {
     ok = ok && ds4_gpu_tensor_write(
         selected_batch_tensor, 0, selected_batch,
         BATCH_TOKENS * sizeof(selected));
-    unsetenv(MXFP4_MAP_SCATTER_ENV);
-    ok = ok && setenv(MXFP4_PAIR_COMPACT_TILE_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE);
     mid_is_f16 = false;
     ok = ok && ds4_gpu_routed_moe_batch_tensor(
         out_batch_tensor, gate_batch_tensor, up_batch_tensor,
@@ -713,7 +698,9 @@ int main(void) {
         out_batch_tensor, 0, out_batch_baseline,
         batch_out_count * sizeof(float));
 
-    ok = ok && setenv(MXFP4_MAP_SCATTER_ENV, "1", 1) == 0;
+    ds4_gpu_test_set_flags(
+        DS4_GPU_TEST_MXFP4_PAIR_COMPACT_TILE |
+        DS4_GPU_TEST_MXFP4_MAP_SCATTER);
     for (uint32_t run = 0; run < 2u && ok; run++) {
         mid_is_f16 = false;
         ok = ok && ds4_gpu_tensor_write(
@@ -755,8 +742,7 @@ int main(void) {
                     run + 1u);
         }
     }
-    unsetenv(MXFP4_MAP_SCATTER_ENV);
-    unsetenv(MXFP4_PAIR_COMPACT_TILE_ENV);
+    ds4_gpu_test_set_flags(0);
 
     ds4_gpu_tensor_free(out_batch_tensor);
     ds4_gpu_tensor_free(experts_batch_tensor);

@@ -24,6 +24,125 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
+extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t              n_tokens,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_head,
+        uint32_t              head_dim) {
+    if (!heads || !q || !raw_kv || !model_map ||
+        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map,
+            sinks_offset,
+            (uint64_t)n_head * sizeof(float),
+            "dspark_attn_sinks");
+    if (!sinks) return 0;
+
+    const size_t shmem = (size_t)n_raw * sizeof(float);
+    if (shmem > 32768u) return 0;
+    dim3 grid(n_tokens, n_head, 1);
+    attention_noncausal_raw_batch_heads_kernel<<<grid, 256, shmem>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_tokens,
+            n_raw,
+            raw_cap,
+            raw_start,
+            n_head,
+            head_dim);
+    if (!cuda_ok(cudaGetLastError(),
+                 "DSpark noncausal raw batch attention launch")) {
+        return 0;
+    }
+
+    static int verify_left = -1;
+    if (verify_left < 0) {
+        verify_left = getenv("DS4_DSPARK_VERIFY_NONCAUSAL") != NULL ? 3 : 0;
+    }
+    if (verify_left > 0) {
+        verify_left--;
+        (void)cudaDeviceSynchronize();
+        const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+        const uint64_t kn = (uint64_t)raw_cap * head_dim;
+        std::vector<float> hq(qn), hkv(kn), hout(qn), hsink(n_head);
+        (void)cudaMemcpy(hq.data(), q->ptr, qn * sizeof(float),
+                         cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hkv.data(), raw_kv->ptr, kn * sizeof(float),
+                         cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hout.data(), heads->ptr, qn * sizeof(float),
+                         cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hsink.data(), sinks, (uint64_t)n_head * sizeof(float),
+                         cudaMemcpyDeviceToHost);
+        double max_abs = 0.0;
+        double max_rel = 0.0;
+        const double scale = 1.0 / sqrt((double)head_dim);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t h = 0; h < n_head; h++) {
+                std::vector<double> scores(n_raw);
+                double max_score = (double)hsink[h];
+                for (uint32_t r = 0; r < n_raw; r++) {
+                    const uint32_t row = (raw_start + r) % raw_cap;
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        dot += (double)hq[((uint64_t)t * n_head + h) *
+                                            head_dim + d] *
+                               (double)hkv[(uint64_t)row * head_dim + d];
+                    }
+                    scores[r] = dot * scale;
+                    if (scores[r] > max_score) max_score = scores[r];
+                }
+                double den = exp((double)hsink[h] - max_score);
+                for (uint32_t r = 0; r < n_raw; r++) {
+                    den += exp(scores[r] - max_score);
+                }
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    double acc = 0.0;
+                    for (uint32_t r = 0; r < n_raw; r++) {
+                        const uint32_t row = (raw_start + r) % raw_cap;
+                        acc += exp(scores[r] - max_score) *
+                               (double)hkv[(uint64_t)row * head_dim + d];
+                    }
+                    const double ref = acc / den;
+                    const double got =
+                        (double)hout[((uint64_t)t * n_head + h) * head_dim + d];
+                    const double abs_diff = fabs(ref - got);
+                    if (abs_diff > max_abs) max_abs = abs_diff;
+                    if (fabs(ref) > 1e-3 && abs_diff / fabs(ref) > max_rel) {
+                        max_rel = abs_diff / fabs(ref);
+                    }
+                }
+            }
+        }
+        fprintf(stderr,
+                "ds4: DSpark noncausal verify n_tok=%u n_raw=%u start=%u "
+                "cap=%u max_abs=%.3e max_rel=%.3e\n",
+                n_tokens,
+                n_raw,
+                raw_start,
+                raw_cap,
+                max_abs,
+                max_rel);
+    }
+    return 1;
+}
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

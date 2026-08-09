@@ -309,6 +309,77 @@ __device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, 
     return av > bv || (av == bv && ai < bi);
 }
 
+/* DSpark Markov correction: select argmax(logits + W2 * W1[prev]) without
+ * moving the vocabulary row back to the host. W1 and W2 are Q8_0. */
+__global__ static void dspark_markov_argmax_kernel(
+        unsigned long long *out_key,
+        const float *logits,
+        const unsigned char *w1_row,
+        const unsigned char *w2,
+        uint32_t vocab,
+        uint32_t rank_blocks) {
+    __shared__ float state[256];
+    const uint32_t tid = threadIdx.x;
+    if (tid < rank_blocks * 32u) {
+        const uint32_t block = tid >> 5u;
+        const uint32_t lane = tid & 31u;
+        const unsigned char *qblock = w1_row + (uint64_t)block * 34u;
+        const float scale = __half2float(*(const __half *)qblock);
+        state[tid] =
+            scale * (float)((const int8_t *)(qblock + 2u))[lane];
+    }
+    __syncthreads();
+
+    float best_value = -INFINITY;
+    uint32_t best_index = 0;
+    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < vocab;
+         i += gridDim.x * blockDim.x) {
+        const unsigned char *row =
+            w2 + (uint64_t)i * rank_blocks * 34u;
+        float acc = 0.0f;
+        for (uint32_t block = 0; block < rank_blocks; block++) {
+            const unsigned char *qblock = row + (uint64_t)block * 34u;
+            const float scale = __half2float(*(const __half *)qblock);
+            const int8_t *quants = (const int8_t *)(qblock + 2u);
+            float sum = 0.0f;
+#pragma unroll
+            for (uint32_t lane = 0; lane < 32u; lane++) {
+                sum += (float)quants[lane] * state[block * 32u + lane];
+            }
+            acc += scale * sum;
+        }
+        const float value = logits[i] + acc;
+        if (topk_score_better(value, i, best_value, best_index)) {
+            best_value = value;
+            best_index = i;
+        }
+    }
+
+    __shared__ float values[256];
+    __shared__ uint32_t indices[256];
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride &&
+            topk_score_better(values[tid + stride], indices[tid + stride],
+                              values[tid], indices[tid])) {
+            values[tid] = values[tid + stride];
+            indices[tid] = indices[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        const unsigned int bits = __float_as_uint(values[0]);
+        const unsigned int value_key =
+            (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        const unsigned long long key =
+            ((unsigned long long)value_key << 32) |
+            (unsigned int)(~indices[0]);
+        atomicMax(out_key, key);
+    }
+}
+
 __device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
     const uint32_t u = __float_as_uint(v);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -1100,6 +1171,62 @@ extern "C" int ds4_gpu_argmax_tensor(
                                (const float *)logits->ptr,
                                n_vocab);
     return cuda_ok(cudaGetLastError(), "argmax launch");
+}
+
+extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits_row,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w1_offset,
+        uint64_t              w2_offset,
+        uint32_t              prev_token,
+        uint32_t              vocab,
+        uint32_t              rank) {
+    if (!out_idx || !logits_row || !model_map || vocab == 0 ||
+        rank == 0 || (rank & 31u) != 0u || rank > 256u ||
+        out_idx->bytes < sizeof(unsigned long long) ||
+        logits_row->bytes < (uint64_t)vocab * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t rank_blocks = rank / 32u;
+    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
+    if (prev_token > UINT64_MAX / row_bytes ||
+        vocab > UINT64_MAX / row_bytes) {
+        return 0;
+    }
+    const uint64_t w1_row_offset = (uint64_t)prev_token * row_bytes;
+    const uint64_t w2_bytes = (uint64_t)vocab * row_bytes;
+    if (w1_offset > model_size ||
+        w1_row_offset > model_size - w1_offset ||
+        row_bytes > model_size - w1_offset - w1_row_offset ||
+        w2_offset > model_size || w2_bytes > model_size - w2_offset) {
+        return 0;
+    }
+    const unsigned char *w1_row =
+        (const unsigned char *)cuda_model_range_ptr(
+            model_map,
+            w1_offset + w1_row_offset,
+            row_bytes,
+            "markov_w1_row");
+    const unsigned char *w2 =
+        (const unsigned char *)cuda_model_range_ptr(
+            model_map, w2_offset, w2_bytes, "markov_w2");
+    if (!w1_row || !w2) return 0;
+
+    if (!cuda_ok(cudaMemsetAsync(out_idx->ptr, 0,
+                                 sizeof(unsigned long long)),
+                 "DSpark markov argmax clear")) {
+        return 0;
+    }
+    dspark_markov_argmax_kernel<<<128, 256>>>(
+            (unsigned long long *)out_idx->ptr,
+            (const float *)logits_row->ptr,
+            w1_row,
+            w2,
+            vocab,
+            rank_blocks);
+    return cuda_ok(cudaGetLastError(), "DSpark markov argmax launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(

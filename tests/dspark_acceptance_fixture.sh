@@ -6,10 +6,14 @@ MODEL=${DS4_DSPARK_MODEL:-${DS4_TEST_MODEL:-./ds4flash.gguf}}
 SUPPORT=${DS4_DSPARK_SUPPORT:-gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
 TOKENS=${DS4_DSPARK_FIXTURE_TOKENS:-32}
 REQUIRE_PARTIAL=${DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL:-0}
+REQUIRE_DIRECT=${DS4_DSPARK_FIXTURE_REQUIRE_DIRECT_COMMIT:-1}
+REQUIRE_IDENTICAL=${DS4_DSPARK_FIXTURE_REQUIRE_IDENTICAL:-0}
 PROPOSAL_QUALITY_GUARD=${DS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY:-auto}
 C_ADD_MIN_ACCEPTED=${DS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED:-8}
 CONFIDENCE=${DS4_DSPARK_FIXTURE_CONFIDENCE:-}
 partial_cases=0
+direct_partial_cases=0
+direct_commits=0
 
 proposal_quality_guard_enabled() {
     case "$PROPOSAL_QUALITY_GUARD" in
@@ -89,11 +93,12 @@ print_metadata() {
     printf '# model=%s model_bytes=%s support=%s support_bytes=%s\n' \
         "$MODEL" "$(file_bytes "$MODEL")" \
         "$SUPPORT" "$(file_bytes "$SUPPORT")"
-    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s\n' \
+    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
         "$TOKENS" "$confidence" "$scheduler" "$no_draft_skip" \
         "$short_accept_skip" "$cold_low_conf_skip" "$cold_low_conf_milli" \
         "$tail_min_tokens" "$PROPOSAL_QUALITY_GUARD" \
-        "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED"
+        "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED" \
+        "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
     printf '# baseline_command=%s -m %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
         "$DS4_BIN" "$MODEL" "$TOKENS"
     printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
@@ -142,13 +147,17 @@ run_case() {
             >"$dspark_out" 2>"$dspark_err"
     fi
 
+    output_match=1
     if ! cmp -s "$base_out" "$dspark_out"; then
-        echo "dspark-fixture: output mismatch for $id" >&2
-        echo "baseline:" >&2
-        sed 's/^/  /' "$base_out" >&2
-        echo "dspark:" >&2
-        sed 's/^/  /' "$dspark_out" >&2
-        return 1
+        output_match=0
+        if [ "$REQUIRE_IDENTICAL" != 0 ]; then
+            echo "dspark-fixture: output mismatch for $id" >&2
+            echo "baseline:" >&2
+            sed 's/^/  /' "$base_out" >&2
+            echo "dspark:" >&2
+            sed 's/^/  /' "$dspark_out" >&2
+            return 1
+        fi
     fi
 
     base_tps=$(sed -n 's/.*generation: \([0-9.][0-9.]*\) t\/s.*/\1/p' "$base_err" | tail -n 1)
@@ -159,12 +168,16 @@ run_case() {
         return 1
     fi
 
-    partial=$(printf '%s\n' "$stats" | sed -n 's/.*partial=\([0-9][0-9]*\).*/\1/p')
+    partial=$(printf '%s\n' "$stats" | sed -n 's/.* partial=\([0-9][0-9]*\).*/\1/p')
     errors=$(printf '%s\n' "$stats" | sed -n 's/.*errors=\([0-9][0-9]*\).*/\1/p')
     accepted_draft=$(printf '%s\n' "$stats" | sed -n 's/.*accepted_draft=\([0-9][0-9]*\).*/\1/p')
+    direct_full=$(printf '%s\n' "$stats" | sed -n 's/.*direct_full=\([0-9][0-9]*\).*/\1/p')
+    direct_partial=$(printf '%s\n' "$stats" | sed -n 's/.*direct_partial=\([0-9][0-9]*\).*/\1/p')
     partial=${partial:-0}
     errors=${errors:-0}
     accepted_draft=${accepted_draft:-0}
+    direct_full=${direct_full:-0}
+    direct_partial=${direct_partial:-0}
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
         return 1
@@ -177,13 +190,17 @@ run_case() {
     if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$partial" -gt 0 ]; then
         partial_cases=$((partial_cases + 1))
     fi
+    if [ "$direct_partial" -gt 0 ]; then
+        direct_partial_cases=$((direct_partial_cases + 1))
+    fi
+    direct_commits=$((direct_commits + direct_full + direct_partial))
 
-    printf '%s\tbaseline_tps=%s\tdspark_tps=%s\t%s\n' \
-        "$id" "${base_tps:-n/a}" "${dspark_tps:-n/a}" "$stats"
+    printf '%s\toutput_match=%s\tbaseline_tps=%s\tdspark_tps=%s\t%s\n' \
+        "$id" "$output_match" "${base_tps:-n/a}" "${dspark_tps:-n/a}" "$stats"
 }
 
 print_metadata
-echo "id	baseline_tps	dspark_tps	dspark_stats"
+echo "id	output_match	baseline_tps	dspark_tps	dspark_stats"
 run_case hello 'Hello'
 run_case redis 'Explain Redis in one sentence.'
 run_case math 'What is 17 times 23?'
@@ -192,5 +209,13 @@ run_case c_add 'Complete this C function: int add(int a, int b) {'
 
 if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$partial_cases" -eq 0 ]; then
     echo "dspark-fixture: expected at least one partial accept case" >&2
+    exit 1
+fi
+if [ "$REQUIRE_PARTIAL" != 0 ] && [ "$direct_partial_cases" -eq 0 ]; then
+    echo "dspark-fixture: expected at least one direct partial commit" >&2
+    exit 1
+fi
+if [ "$REQUIRE_DIRECT" != 0 ] && [ "$direct_commits" -eq 0 ]; then
+    echo "dspark-fixture: expected at least one direct verifier-state commit" >&2
     exit 1
 fi
