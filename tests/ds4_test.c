@@ -4018,6 +4018,237 @@ static void test_metal_hc_rms_scale_project_f16_exact(void) {
     test_restore_env(disable_env, saved_disable);
 }
 
+static void test_metal_topk_fused512_exact(void) {
+    static const uint32_t widths[] = {1537u, 2048u};
+    const uint32_t max_n_comp = 2048u;
+    const uint32_t n_tokens = 33u;
+    const uint32_t top_k = 512u;
+    const uint32_t repeats = 4u;
+    const uint64_t selected_count = (uint64_t)top_k * n_tokens;
+    const uint64_t max_score_bytes =
+        (uint64_t)max_n_comp * n_tokens * sizeof(float);
+    const uint64_t selected_bytes = selected_count * sizeof(uint32_t);
+    const char *enable_env = "DS4_METAL_ENABLE_TOPK_FUSED512";
+    const char *disable_env = "DS4_METAL_DISABLE_TOPK_FUSED512";
+
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(max_score_bytes);
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(selected_bytes);
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(selected_bytes);
+    float *scores_host = malloc((size_t)max_score_bytes);
+    uint32_t *reference_host = malloc((size_t)selected_bytes);
+    uint32_t *candidate_host = malloc((size_t)selected_bytes);
+    TEST_ASSERT(scores != NULL);
+    TEST_ASSERT(reference != NULL);
+    TEST_ASSERT(candidate != NULL);
+    TEST_ASSERT(scores_host != NULL);
+    TEST_ASSERT(reference_host != NULL);
+    TEST_ASSERT(candidate_host != NULL);
+
+    char *saved_enable = test_save_env(enable_env);
+    char *saved_disable = test_save_env(disable_env);
+    size_t total_mismatches = 0;
+    uint64_t total_compared = 0u;
+    const bool allocated = scores && reference && candidate && scores_host &&
+        reference_host && candidate_host;
+    if (allocated) {
+        TEST_ASSERT(setenv(enable_env, "1", 1) == 0);
+        for (size_t width_i = 0u;
+             width_i < sizeof(widths) / sizeof(widths[0]);
+             width_i++) {
+            const uint32_t n_comp = widths[width_i];
+            const uint64_t score_bytes =
+                (uint64_t)n_comp * n_tokens * sizeof(float);
+            // Cover both a unique permutation and heavy ties: the latter
+            // guards canonical bitonic/merge order, not just set membership.
+            for (uint32_t pattern = 0u; pattern < 2u; pattern++) {
+                for (uint32_t token = 0u; token < n_tokens; token++) {
+                    for (uint32_t col = 0u; col < n_comp; col++) {
+                        uint32_t rank =
+                            (col * 2053u + token * 977u) % n_comp;
+                        if (pattern != 0u) rank %= 31u;
+                        scores_host[(uint64_t)token * n_comp + col] =
+                            (float)((int32_t)rank -
+                                    (int32_t)(pattern ? 15u : n_comp / 2u));
+                    }
+                }
+                TEST_ASSERT(ds4_gpu_tensor_write(
+                                scores, 0, scores_host, score_bytes) != 0);
+
+                TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+                TEST_ASSERT(ds4_gpu_indexer_topk_tensor(
+                                reference, scores, n_comp,
+                                n_tokens, top_k) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(
+                                reference, 0,
+                                reference_host, selected_bytes) != 0);
+
+                TEST_ASSERT(unsetenv(disable_env) == 0);
+                for (uint32_t repeat = 0u; repeat < repeats; repeat++) {
+                    TEST_ASSERT(ds4_gpu_indexer_topk_tensor(
+                                    candidate, scores, n_comp,
+                                    n_tokens, top_k) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_read(
+                                    candidate, 0,
+                                    candidate_host, selected_bytes) != 0);
+                    for (uint64_t i = 0u; i < selected_count; i++) {
+                        const bool mismatch =
+                            candidate_host[i] != reference_host[i];
+                        total_mismatches += mismatch;
+                    }
+                    total_compared += selected_count;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "ds4-test: fused top-512 exact "
+            "rows=%u widths=%zu max_width=%u repeats=%u "
+            "mismatches=%zu/%llu\n",
+            n_tokens, sizeof(widths) / sizeof(widths[0]), max_n_comp,
+            repeats, total_mismatches,
+            (unsigned long long)total_compared);
+    TEST_ASSERT(total_mismatches == 0);
+
+    test_restore_env(enable_env, saved_enable);
+    test_restore_env(disable_env, saved_disable);
+    free(candidate_host);
+    free(reference_host);
+    free(scores_host);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(scores);
+}
+
+static void test_metal_indexed_attention_dual_rb16_exact(void) {
+    const uint32_t n_tokens = 33u;
+    const uint32_t n_head = 64u;
+    const uint32_t head_dim = 512u;
+    const uint32_t n_raw = 128u;
+    const uint32_t raw_cap = 128u;
+    const uint32_t n_comp = 1024u;
+    const uint32_t top_k = 512u;
+    const uint32_t pos0 = n_comp * 4u;
+    const uint32_t repeats = 2u;
+    const uint64_t q_count = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    const uint64_t topk_count = (uint64_t)n_tokens * top_k;
+    const uint64_t q_bytes = q_count * sizeof(float);
+    const uint64_t raw_bytes = raw_count * sizeof(float);
+    const uint64_t comp_bytes = comp_count * sizeof(uint16_t);
+    const uint64_t topk_bytes = topk_count * sizeof(int32_t);
+    const uint64_t page = (uint64_t)getpagesize();
+    const char *enable_env = "DS4_METAL_ENABLE_INDEXED_ATTN_DUAL_RB16";
+    const char *disable_env = "DS4_METAL_DISABLE_INDEXED_ATTN_DUAL_RB16";
+
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(topk_bytes);
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(q_bytes);
+    float *q_host = malloc((size_t)q_bytes);
+    float *raw_host = malloc((size_t)raw_bytes);
+    uint16_t *comp_host = malloc((size_t)comp_bytes);
+    int32_t *topk_host = malloc((size_t)topk_bytes);
+    float *reference_host = malloc((size_t)q_bytes);
+    float *candidate_host = malloc((size_t)q_bytes);
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    TEST_ASSERT(q && raw && comp && topk && reference && candidate);
+    TEST_ASSERT(q_host && raw_host && comp_host && topk_host &&
+                reference_host && candidate_host && model_raw);
+
+    char *saved_enable = test_save_env(enable_env);
+    char *saved_disable = test_save_env(disable_env);
+    size_t total_mismatches = 0u;
+    uint64_t total_compared = 0u;
+    const bool allocated = q && raw && comp && topk && reference && candidate &&
+        q_host && raw_host && comp_host && topk_host && reference_host &&
+        candidate_host && model_raw;
+    if (allocated) {
+        memset(model_raw, 0, (size_t)page);
+        for (uint32_t h = 0u; h < n_head; h++) {
+            ((float *)model_raw)[h] = -0.25f + (float)(h % 7u) * 0.03125f;
+        }
+        for (uint64_t i = 0u; i < q_count; i++) {
+            const int32_t v = (int32_t)((i * 17u + i / 97u) % 19u) - 9;
+            q_host[i] = (float)v * 0.015625f;
+        }
+        for (uint64_t i = 0u; i < raw_count; i++) {
+            const int32_t v = (int32_t)((i * 29u + i / 53u) % 23u) - 11;
+            raw_host[i] = (float)v * 0.015625f;
+        }
+        for (uint64_t i = 0u; i < comp_count; i++) {
+            const int32_t v = (int32_t)((i * 13u + i / 43u) % 29u) - 14;
+            comp_host[i] = test_float_to_f16((float)v * 0.015625f);
+        }
+        for (uint32_t token = 0u; token < n_tokens; token++) {
+            for (uint32_t s = 0u; s < top_k; s++) {
+                topk_host[(uint64_t)token * top_k + s] =
+                    (int32_t)((s * 197u + token * 17u) % n_comp);
+            }
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, raw_host, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(comp, 0, comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(topk, 0, topk_host, topk_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
+        ds4_gpu_set_quality(false);
+
+        TEST_ASSERT(setenv(enable_env, "1", 1) == 0);
+        TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                        reference, model_raw, page, 0u,
+                        q, raw, comp, 1u, topk,
+                        n_tokens, pos0, n_raw, raw_cap, 0u,
+                        n_comp, top_k, 128u, 4u, n_head, head_dim) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        reference, 0, reference_host, q_bytes) != 0);
+
+        TEST_ASSERT(unsetenv(disable_env) == 0);
+        for (uint32_t repeat = 0u; repeat < repeats; repeat++) {
+            TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                            candidate, model_raw, page, 0u,
+                            q, raw, comp, 1u, topk,
+                            n_tokens, pos0, n_raw, raw_cap, 0u,
+                            n_comp, top_k, 128u, 4u, n_head, head_dim) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            candidate, 0, candidate_host, q_bytes) != 0);
+            for (uint64_t i = 0u; i < q_count; i++) {
+                total_mismatches +=
+                    memcmp(&candidate_host[i], &reference_host[i],
+                           sizeof(float)) != 0;
+            }
+            total_compared += q_count;
+        }
+    }
+
+    fprintf(stderr,
+            "ds4-test: indexed attention dual rb16 exact "
+            "tokens=%u selected=%u repeats=%u mismatches=%zu/%llu\n",
+            n_tokens, top_k, repeats, total_mismatches,
+            (unsigned long long)total_compared);
+    TEST_ASSERT(total_mismatches == 0u);
+
+    test_restore_env(enable_env, saved_enable);
+    test_restore_env(disable_env, saved_disable);
+    free(model_raw);
+    free(candidate_host);
+    free(reference_host);
+    free(topk_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+}
+
 static void test_metal_router_simd_finalize_exact(void) {
     typedef struct {
         const char *name;
@@ -4565,6 +4796,8 @@ static void test_metal_kernel_group(void) {
     test_metal_hc_split_weighted_sum_norm_batch_exact();
     test_metal_output_hc_weights4_exact();
     test_metal_hc_rms_scale_project_f16_exact();
+    test_metal_topk_fused512_exact();
+    test_metal_indexed_attention_dual_rb16_exact();
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
 #endif
