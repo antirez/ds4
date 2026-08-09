@@ -3,7 +3,7 @@
 // Included from ds4_cuda.cu in the same translation unit so kernel helpers stay
 // private/static while we gradually split the custom ROCm backend into modules.
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1202__)
 #include <rocwmma/rocwmma.hpp>
 #endif
 
@@ -751,6 +751,9 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
             const _Float16 *xb = lds_x + nt * K_TILE;
             const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
             const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
+            /* gfx12xx (RDNA4) uses WMMA v2; the dispatch skips this kernel
+             * via g_wmma_v1, but the device code must compile on all arches. */
+#if !defined(__gfx1200__) && !defined(__gfx1201__)
             if (ntile == 0u) {
                 acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
                 acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc0);
@@ -764,6 +767,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
                 acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc3);
                 acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
             }
+#endif
         }
         __syncthreads();
     }
@@ -851,6 +855,139 @@ __global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(
         const uint32_t t = t0 + m;
         const uint32_t row = row0 + tn * BN + nn;
         if (t < n_tokens && row < out_dim) out[(uint64_t)t * out_dim + row] = shC[j];
+    }
+}
+#endif
+
+/* Wide-K WMMA v2 kernel for RDNA 4 (gfx12xx).
+ *
+ * RDNA 4 exposes 128-bit shared memory loads, but rocWMMA v2 fragments
+ * still operate on BK=16 tiles.  To saturate the wider memory bus we
+ * fuse two consecutive 16-K WMMA mma_sync calls into one loop iteration
+ * so that each thread fetches 32 K-elements per K-block.
+ *
+ * Numerical correctness is guaranteed by associativity:
+ *   D = A[0:32]*B[0:32] + A[32:64]*B[32:64]
+ * is identical to two separate WMMA accumulates because the FMA order
+ * within each 16-K half is unchanged.
+ *
+ * This kernel is the gfx12 counterpart to matmul_q8_0_f32_batch_wmma_4w
+ * (which uses v1 builtins).
+ */
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1202__)
+__launch_bounds__(128, 2)
+__global__ static void matmul_q8_0_f32_batch_wmma_v2_4w_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_tokens,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    constexpr uint32_t M_TILE    = 64u;
+    constexpr uint32_t N_TILE    = 64u;
+    constexpr uint32_t BM        = 16u;
+    constexpr uint32_t BN        = 16u;
+    constexpr uint32_t BK        = 16u;
+    constexpr uint32_t K_FUSED   = 2u * BK;   /* 32 K per loop iteration */
+    constexpr uint32_t WARPS     = 4u;
+    constexpr uint32_t M_PER_W   = M_TILE / WARPS;   /* 16 */
+    constexpr uint32_t N_PER_W   = N_TILE / WARPS;   /* 16 tokens per warp */
+
+    const uint32_t block_m   = (uint32_t)blockIdx.x * M_TILE;
+    const uint32_t block_n   = (uint32_t)blockIdx.y * N_PER_W;
+    if (block_m >= out_dim || block_n >= n_tokens) return;
+
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp_id = tid >> 5u;
+    const uint32_t warp_m  = block_m + warp_id * M_PER_W;
+
+    /* rocWMMA v2 fragment types. */
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::col_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+
+    /* One accumulator per warp: 16 rows × 16 tokens, accumulated over all
+     * K-blocks.  mma_sync does D = A*B + D so we only need one fragment. */
+    frag_c acc;
+    rocwmma::fill_fragment(acc, 0.0f);
+
+    /* Shared memory: 16 rows × 32 K (weights) + 16 tokens × 32 K (activations).
+     * 2 × 16 × 32 × 2 B = 2048 B — fits easily in LDS. */
+    __shared__ half lds_w[M_PER_W * K_FUSED];
+    __shared__ half lds_x[N_PER_W * K_FUSED];
+
+    const uint32_t n_fused_blocks = in_dim / K_FUSED;
+
+    for (uint32_t fb = 0; fb < n_fused_blocks; fb++) {
+        /* ---- Load activations: N_PER_W tokens × K_FUSED K-elements ---- */
+        for (uint32_t j = tid; j < N_PER_W * K_FUSED; j += blockDim.x) {
+            const uint32_t tok  = j / K_FUSED;
+            const uint32_t kk   = j % K_FUSED;
+            const uint32_t gtok = block_n + tok;
+            float xv = 0.0f;
+            if (gtok < n_tokens) {
+                xv = x[(uint64_t)gtok * in_dim + fb * K_FUSED + kk];
+            }
+            lds_x[j] = __float2half(xv);
+        }
+
+        /* ---- Load weights: M_PER_W rows × K_FUSED K-elements,
+         *      scale × int8 → f16 on the fly. ---- */
+        for (uint32_t j = tid; j < M_PER_W * K_FUSED; j += blockDim.x) {
+            const uint32_t row_i = j / K_FUSED;
+            const uint32_t kk    = j % K_FUSED;
+            const uint32_t grow  = warp_m + row_i;
+            if (grow < out_dim) {
+                const uint32_t gk   = fb * K_FUSED + kk;
+                const uint32_t blk  = gk / 32u;
+                const uint32_t elem = gk % 32u;
+                const unsigned char *bp =
+                    w + (uint64_t)grow * row_bytes + blk * 34u;
+                const float d   = q8_0_scale_scalar(bp);
+                const int8_t  *qs = (const int8_t *)(bp + 2u);
+                lds_w[j] = __float2half(d * (float)qs[elem]);
+            }
+        }
+
+        __syncthreads();
+
+        /* ---- Half 0: K[0:16] ---- */
+        {
+            frag_a a0, b0;
+            /* A: row-major M_PER_W × BK loaded from lds_w + 0, stride K_FUSED */
+            rocwmma::load_matrix_sync(a0, lds_w, K_FUSED);
+            /* B: col-major BK × N_PER_W loaded from lds_x + 0, stride K_FUSED */
+            rocwmma::load_matrix_sync(b0, lds_x, K_FUSED);
+            rocwmma::mma_sync(acc, a0, b0, acc);
+        }
+
+        /* ---- Half 1: K[16:32] ---- */
+        {
+            frag_a a1, b1;
+            /* A: skip first BK elements → lds_w + BK, same stride */
+            rocwmma::load_matrix_sync(a1, lds_w + BK, K_FUSED);
+            /* B: skip first BK elements → lds_x + BK */
+            rocwmma::load_matrix_sync(b1, lds_x + BK, K_FUSED);
+            rocwmma::mma_sync(acc, a1, b1, acc);
+        }
+
+        __syncthreads();
+    }
+
+    /* ---- Store: copy acc (16×16 fragment) to shared, then to global ---- */
+    __shared__ float sh_out[BM * BN];   /* 256 floats */
+    rocwmma::store_matrix_sync(sh_out, acc, BN, rocwmma::mem_row_major);
+    __syncthreads();
+
+    for (uint32_t j = tid; j < BM * BN; j += blockDim.x) {
+        const uint32_t r = j / BN;
+        const uint32_t c = j % BN;
+        const uint32_t gr = warp_m + r;
+        const uint32_t gc = block_n + c;
+        if (gr < out_dim && gc < n_tokens) {
+            out[(uint64_t)gc * out_dim + gr] = sh_out[j];
+        }
     }
 }
 #endif

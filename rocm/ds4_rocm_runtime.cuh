@@ -21,6 +21,11 @@ static int g_cublas_ready;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
+/* 1 if device supports RDNA3 WMMA v1 (__builtin_amdgcn_wmma_*_w32).
+ * 0 for RDNA4 (gfx12xx) which uses WMMA v2 rocWMMA — use wide-K kernel. */
+static int g_wmma_v1;
+/* True on RDNA4 (gfx12xx): use wide-K WMMA v2 fused double-K kernel. */
+static int g_is_gfx12;
 static int g_glm_model;
 
 enum {
@@ -5832,6 +5837,20 @@ extern "C" int ds4_gpu_init(void) {
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
+#ifdef __HIP_PLATFORM_AMD__
+        /* RDNA4 (gfx12xx): WMMA v2 via rocWMMA — uses fused double-K
+         * (wide-K) kernel for bandwidth saturation.  RDNA3/3.5 (gfx11xx)
+         * uses v1 __builtin_amdgcn_wmma_* builtins. */
+        g_wmma_v1   = (strstr(prop.gcnArchName, "gfx12") == NULL);
+        g_is_gfx12  = (strstr(prop.gcnArchName, "gfx12") != NULL);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "WMMA v1: %s  gfx12: %s (arch: %s)\n",
+                g_wmma_v1   ? "yes" : "no (gfx12 RDNA4, uses wide-K WMMA v2)",
+                g_is_gfx12  ? "yes" : "no",
+                prop.gcnArchName);
+#else
+        g_wmma_v1   = 1;
+        g_is_gfx12  = 0;
+#endif
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
