@@ -573,6 +573,21 @@ int ds4_mmq_q8_0_aligned_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Row-range form of the aligned Q8_0 decode kernel.  W_aligned describes the
+// complete M_total-row artifact, while only [row0, row0 + M) is evaluated and
+// written densely to out_f32.  This lets network TP gather disjoint complete
+// rows without changing the single-rank dot-product arithmetic.
+int ds4_mmq_q8_0_aligned_dense_vec_rows(
+    const void  * W_aligned,
+    const float * X_f32,
+    float       * out_f32,
+    int           M_total,
+    int           row0,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_iq2_xxs_aligned_moe_vec(
     const void    * W_aligned,
     const float   * X_f32,

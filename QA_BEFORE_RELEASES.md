@@ -178,6 +178,15 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   about `0.800` unless the quantization changed deliberately.
 - Run the 100-case DeepSeek V4 PRO fixture for every released PRO GGUF:
   `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro.gguf gguf-tools/quality-testing/data/pro/manifest.tsv /tmp/pro.tsv 4096`.
+- After network EP/TP graph, collective, ownership, or numerical-path changes,
+  run the matching 100-case fixture through `score_official` with
+  `--role coordinator`, the selected `--expert-parallel` or
+  `--tensor-parallel` mode, and the real rank count. Score the exact/default
+  path and every proposed faster path into separate TSVs, then compare them
+  with `compare_scores.py`. A clear NLL regression, first-token-match drop, or
+  material API top-1/pair-order drop blocks making the faster path the default.
+  Set path-selecting environment variables identically on every rank and keep
+  both raw summaries in the QA record.
 - For SSD streaming, run the same official-continuation scorer once with full
   residency and once with `--ssd-streaming` for the release model.  The summary
   and API agreement should stay in the same quality band.
@@ -452,6 +461,54 @@ release-ready without this pass.
   code changed, test the specific GGUF and split mode that uses that path.
 - Verify that any CUDA-only warning fixes are also clean on macOS and do not
   change Metal behavior.
+
+### CUDA network EP/TP
+
+Run these gates when NCCL bootstrap, ownership mapping, collective MoE,
+DeepSeek/GLM TP, or the shared frontend TP options change:
+
+- Build the same warning-free commit on every rank and verify the complete GGUF
+  has the same size and checksum on every host. Start at `--ctx 512`; DGX Spark
+  uses one unified CPU/GPU memory pool, and an overcommitted two-rank experiment
+  can make a machine require a manual reboot.
+- Run `tests/test_tp_protocol` locally, then complete short two- and four-rank
+  `--expert-parallel` and `--tensor-parallel` prompts where the guarded model
+  plan fits. For an oversized two-rank GLM plan, verify preflight rejection
+  instead of disabling the memory guard. Every worker must report the intended
+  rank/world and exit after the coordinator instead of reconnecting
+  indefinitely.
+- For DeepSeek Flash Q2, compare a greedy single-rank raw-expert trace with
+  four-rank EP and TP over a prompt long enough to exercise batch prefill plus
+  at least 32 decode tokens. Set `DS4_CUDA_MOE_NO_IQ2_ALIGNED=1` and
+  `DS4_CUDA_MOE_NO_Q2K_ALIGNED=1` on the single-rank reference. EP and TP model
+  output must be byte-identical to that reference without
+  `DS4_TP_ORDERED_REDUCE`; a matching first token alone is insufficient.
+- When shard-local DeepSeek artifacts or aligned dense row slicing changes,
+  run `make test-q8-aligned-rows CUDA_ARCH=sm_121` on a Spark. Confirm every
+  rank reports the same owned expert count, `expert raw residency replaced`,
+  and the replicated aligned-dense bytes in its guarded memory plan. Repeat
+  the parity trace once with `--expert-parallel` and once with
+  `--tensor-parallel`; do not use the replication diagnostic environment
+  variables to make the default TP gate pass.
+- If `DS4_CUDA_TP_FAST_ALIGNED_EXPERTS=1` changes, set it on every rank and
+  repeat matching EP/TP speed sweeps plus the four-case, 4,096-token DeepSeek
+  evaluation. This opt-in path may drift from the raw-reference token stream,
+  but EP and TP must agree with each other, keep finite output, and stay in the
+  default path's quality band. It does not replace the byte-identical default
+  parity gate above.
+- For GLM 5.2, compare four-rank EP and TP greedy traces over a prompt long
+  enough to exercise batch prefill plus at least 32 decode tokens. The complete
+  `--dump-logprobs` JSON, including selected tokens and top-logprob entries,
+  must be byte-identical. GLM TP must not require ordered reduction to pass.
+- Run matching single-rank (where it fits), four-rank EP, and four-rank TP
+  `ds4-bench` sweeps and preserve the CSVs. Record prefill and generation
+  separately: both supported model paths intentionally replicate dense prefill
+  kernels for numerical parity, while model-specific decode work is
+  partitioned.
+- Exercise one real request through `ds4-server`, one non-interactive
+  `ds4-agent` prompt, and one `ds4-eval` case with network workers. Confirm all
+  mirrored sessions are destroyed and no rank remains running after rank 0
+  exits.
 
 ## 9. ROCm / Strix Halo
 

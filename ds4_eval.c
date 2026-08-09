@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1218,6 +1219,7 @@ typedef struct {
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1550,6 +1552,18 @@ static eval_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &c.tp,
+                                 tp_parse_err, sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr, "ds4-eval: %s\n",
+                    tp_parse_err[0] ? tp_parse_err :
+                                      "invalid network parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -1665,6 +1679,17 @@ static eval_config parse_options(int argc, char **argv) {
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
 
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&c.tp, &c.dist,
+                                           tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n", tp_err);
+        exit(2);
+    }
+    if (ds4_tp_enabled(&c.tp) && c.ctx_size <= 0) {
+        fprintf(stderr,
+                "ds4-eval: network parallelism requires an explicit --ctx so every rank advertises the same capacity\n");
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
@@ -4157,6 +4182,7 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
+        .placement_ctx_hint = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
@@ -4172,10 +4198,19 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 2;
+    }
+    char tp_err[256] = {0};
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n",
+                tp_err[0] ? tp_err : "invalid network parallel options");
         if (trace) fclose(trace);
         free(case_sequence);
         return 2;
@@ -4186,6 +4221,30 @@ int main(int argc, char **argv) {
         if (trace) fclose(trace);
         free(case_sequence);
         return 1;
+    }
+
+    if (cfg.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.tp,
+                                   (uint32_t)cfg.ctx_size);
+        ds4_engine_close(engine);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return rc;
+    }
+
+    ds4_tp *tp_leader = NULL;
+    if (cfg.tp.role == DS4_TP_LEADER) {
+        if (!ds4_tp_leader_bind(engine, &cfg.tp,
+                                (uint32_t)cfg.ctx_size,
+                                &tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-eval: %s\n",
+                    tp_err[0] ? tp_err :
+                                "network parallel initialization failed");
+            ds4_engine_close(engine);
+            if (trace) fclose(trace);
+            free(case_sequence);
+            return 1;
+        }
     }
 
     int max_prompt_tokens = 0;
@@ -4219,6 +4278,7 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
         if (trace) fclose(trace);
+        ds4_tp_leader_shutdown(engine, &tp_leader);
         ds4_engine_close(engine);
         free(case_sequence);
         return 1;
@@ -4228,6 +4288,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         if (trace) fclose(trace);
+        ds4_tp_leader_shutdown(engine, &tp_leader);
         ds4_engine_close(engine);
         free(case_sequence);
         return 1;
@@ -4305,6 +4366,7 @@ int main(int argc, char **argv) {
 
     tui_free(&ui);
     ds4_session_free(session);
+    ds4_tp_leader_shutdown(engine, &tp_leader);
     ds4_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);

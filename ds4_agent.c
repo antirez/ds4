@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
 
@@ -605,6 +606,18 @@ static agent_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &c.engine.tp,
+                                 tp_parse_err, sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr, "ds4-agent: %s\n",
+                    tp_parse_err[0] ? tp_parse_err :
+                                      "invalid network parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
@@ -746,12 +759,23 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                           &c.engine.distributed,
+                                           tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-agent: %s\n", dist_err);
+        exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", tp_err);
         exit(2);
     }
     if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -4265,7 +4289,10 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     char load_err[160] = {0};
-    if (ok && hdr.payload_bytes == 0) {
+    if (ok && (hdr.payload_bytes == 0 ||
+               ds4_engine_network_parallel(w->engine))) {
+        /* Network ranks cannot restore a leader-local KV payload. Rebuild the
+         * exact rendered transcript through mirrored session sync instead. */
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
@@ -11288,6 +11315,27 @@ int main(int argc, char **argv) {
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp,
+                                   (uint32_t)cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        return rc;
+    }
+
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = {0};
+        if (!ds4_tp_leader_bind(engine, &cfg.engine.tp,
+                                (uint32_t)cfg.gen.ctx_size,
+                                &tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-agent: %s\n",
+                    tp_err[0] ? tp_err :
+                                "network parallel initialization failed");
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
     struct sigaction old_int;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -11301,6 +11349,7 @@ int main(int argc, char **argv) {
         run_agent(engine, &cfg);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
+    ds4_tp_leader_shutdown(engine, &tp_leader);
     ds4_engine_close(engine);
     return rc;
 }

@@ -125,6 +125,40 @@ Use `data/flash/manifest.tsv` for Flash GGUFs,
 which model produced the manifest; the manifest path selects the continuation
 set.
 
+The DS4 scorer also accepts the normal distributed and network-parallel
+options. Start the worker ranks with `./ds4` using the same model, context,
+mode, world size, transport, and relevant environment variables, then run the
+scorer as rank 0. For example, after starting ranks 1 through 3 as described in
+the main README:
+
+```sh
+gguf-tools/quality-testing/score_official \
+  /path/to/deepseek-v4-flash-0731.gguf \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  /tmp/flash-ep4.tsv \
+  4096 \
+  --role coordinator --expert-parallel \
+  --tensor-parallel-world 4 --listen 10.100.184.4 9911 \
+  --transport nccl
+```
+
+Use `--tensor-parallel` in place of `--expert-parallel` to score network TP.
+The scorer waits for the complete rank set before creating its session and
+stops the workers after closing the scored session. Set experimental-path
+environment variables identically on every rank. `--cuda-tensor-parallel` is
+the separate, single-host multi-GPU mode and should not be substituted for
+network `--tensor-parallel`.
+
+For DeepSeek V4 Pro 0813 EP8, start explicit worker ranks 1 through 7, select
+`data/pro/manifest.tsv`, and pass `--expert-parallel
+--tensor-parallel-world 8` to the scorer on rank 0. Verify the documented Pro
+0813 SHA-256 on every host before scoring. Full TP at world size eight is not
+supported.
+
+Pipeline-distributed scoring is also available on rank 0 through
+`--role coordinator --layers A:B --listen HOST PORT`; start its layer workers
+with `./ds4` in the usual way.
+
 Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
 and the token-identical DS4 prompt renderer:

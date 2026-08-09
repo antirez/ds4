@@ -161,9 +161,12 @@ Q8/F32 paths and supports routed expert gate/up tensors in `Q2_K`, `Q4_K`, or
 are added deliberately and scored against the official 100-case fixture.
 
 These formats do not all support the same execution modes. The Q4 files work
-for normal Metal and CUDA inference. Two-Mac tensor parallelism currently
-requires an ownership-aware IQ2_XXS or Q2_K routed layout; a routed Q4 GLM
-must be rejected before evaluation.
+for normal Metal and CUDA inference. Two-Mac tensor parallelism accepts the
+ownership-aware IQ2_XXS and Q2_K routed layouts. CUDA network expert/tensor
+parallelism currently requires IQ2_XXS gate/up experts in executable layers
+(IQ2_XXS and Q2_K down projections are supported); a fully routed-Q2_K or routed-Q4
+CUDA network model is rejected before evaluation. CUDA tensor parallelism also
+requires sliceable Q8_0 dense and attention projections.
 
 GLM's MTP block is part of the main GGUF; it does not use the separate Flash
 MTP file. Ordinary decode remains the default. `--glm-mtp` enables experimental
@@ -614,6 +617,408 @@ encryption or authentication, and is not release-stable yet; coordinator and
 workers should be built from the same commit and used on trusted machines and
 trusted networks.
 
+## Network expert and tensor parallelism on DGX Spark
+
+CUDA network parallelism runs one GLM 5.2 or supported DeepSeek V4 graph in
+lockstep across two, four, or eight machines using NCCL collectives. World size
+eight is DeepSeek Pro expert-parallel only; full tensor parallelism remains
+limited to worlds two and four. This is different from the layer pipeline
+above: every rank evaluates the same tokens at the same time and keeps a full
+KV cache, while routed weights and selected per-layer work are partitioned
+inside the graph.
+
+There are two modes:
+
+- `--expert-parallel` partitions the routed MoE experts. Attention, leading
+  dense FFNs, shared experts, embeddings, routers, and the output head remain
+  replicated.
+- `--tensor-parallel` includes that same expert partition and additionally
+  partitions model-specific decode work. GLM partitions complete attention
+  heads and leading dense-FFN lanes, then partitions their projections by
+  complete output rows. DeepSeek partitions decode attention heads/output
+  groups, shared-expert lanes and complete output rows, and output vocabulary
+  rows. Both paths keep dense prefill attention and dense/shared FFNs replicated
+  to preserve the CUDA batch kernels' numerical path; routed experts remain
+  partitioned during both prefill and decode.
+
+Tensor parallelism here is not token, sequence, or context parallelism. Every
+rank sees the same token rows. Decode remains autoregressive, so the ranks work
+simultaneously on one token but the next token cannot start early.
+
+The GLM CUDA path supports DSA GGUFs whose executable routed layers use
+ownership-aware `IQ2_XXS` gate/up experts and supported `IQ2_XXS` or `Q2_K`
+down projections. A fully routed-`Q2_K` layer is not shard-safe yet. Full GLM
+tensor parallelism also requires the checkpoint's dense and attention
+projections to be `Q8_0`.
+
+GLM TP does not all-reduce partial dot products. During decode, disjoint
+complete heads or FFN lanes are gathered first, and each following projection
+is divided into complete output rows. This preserves the EP arithmetic within
+each output row. Dense prefill stays replicated for the same numerical-parity
+reason; `DS4_GLM_TP_SPLIT_PREFILL=1` restores the old split-prefill path for
+diagnosis only and is not a supported production setting.
+
+The supported DeepSeek Q2 layouts include the tested 0731 Flash tensor mix
+downloaded by `./download_model.sh ds4f-q2` and the Pro 0813 profile described
+below: routed gate/up tensors must be `IQ2_XXS`, routed down tensors must be
+`Q2_K`, and attention output, shared-expert, and output-head projections must
+be `Q8_0`. The mixed `ds4f-q2-q4` file is not ownership-shard compatible yet.
+Unsupported layouts and dimensions are rejected before the expert shard is
+made resident. CUDA uses NCCL only; `--transport auto` selects it, and
+`--transport nccl` makes the requirement explicit. External MTP/DSpark
+drafting, GLM MTP, directional steering, and SSD streaming are not enabled in
+CUDA network mode. Native mixed prefill-plus-decode batches are supported by
+`ds4-server` and mirrored to every rank.
+
+### Build and NCCL setup
+
+NCCL is optional for ordinary CUDA builds and is loaded at runtime. The build
+needs `nccl.h` to enable network collectives. A system install is detected in
+`/usr/include` or `/usr/local/include`; an unprivileged install can be selected
+explicitly:
+
+```sh
+NCCL_INCLUDE_DIR=/path/to/nccl/include make cuda-spark
+```
+
+If `libnccl.so.2` is not in the dynamic loader's normal search path, point ds4
+at it on every rank:
+
+```sh
+export DS4_NCCL_LIBRARY=/path/to/libnccl.so.2
+```
+
+NCCL should use the high-speed cluster interface rather than Wi-Fi or the
+RJ45 management network. Interface and HCA names are machine-specific. The
+tested four-Spark cluster uses `192.168.2.40` through `.43` only for SSH and
+API access, with two switched 200 Gb/s RoCE rails:
+
+| Rank | Node | Management | Fabric A | Fabric B |
+| ---: | --- | --- | --- | --- |
+| 0 | Spark 1 | `192.168.2.40` | `10.100.184.4` | `10.100.185.4` |
+| 1 | Spark 2 | `192.168.2.41` | `10.100.184.3` | `10.100.185.3` |
+| 2 | Spark 3 | `192.168.2.42` | `10.100.184.1` | `10.100.185.1` |
+| 3 | Spark 4 | `192.168.2.43` | `10.100.184.2` | `10.100.185.2` |
+
+Torch rendezvous and ds4 rank control use Fabric A. NCCL may use both HCAs;
+the RoCE settings are:
+
+```sh
+export NCCL_SOCKET_IFNAME=enp1s0f0np0
+export NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0
+```
+
+Use `NCCL_DEBUG=INFO` while diagnosing interface selection and return it to
+`WARN` for measurements. All ranks must use the same world size, mode, model
+contents, and build. Each worker's `--ctx` must be at least as large as the
+coordinator session or benchmark allocation. Rank 0 is always the coordinator;
+workers have unique ranks 1 through `world-1`. Do not pass `--layers`: network
+expert/tensor parallelism owns model placement.
+
+### Four-Spark GLM 5.2 example
+
+Put the full GGUF on local storage on every Spark. Each rank opens the complete
+file but makes only its owned routed-expert range plus replicated tensors
+resident on the CUDA device.
+The tested 196.6 GiB IQ2_XXS GGUF maps about 63.84 GiB of model tensors per rank
+with a four-way expert split.
+
+Start the three workers first:
+
+```sh
+# Spark 2 (management 192.168.2.41, fabric 10.100.184.3), rank 1
+./ds4 --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --role worker --tensor-parallel \
+  --tensor-parallel-world 4 --tensor-parallel-rank 1 \
+  --coordinator 10.100.184.4 9911 --transport nccl
+
+# Spark 3 (management 192.168.2.42, fabric 10.100.184.1), rank 2
+./ds4 --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --role worker --tensor-parallel \
+  --tensor-parallel-world 4 --tensor-parallel-rank 2 \
+  --coordinator 10.100.184.4 9911 --transport nccl
+
+# Spark 4 (management 192.168.2.43, fabric 10.100.184.2), rank 3
+./ds4 --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --role worker --tensor-parallel \
+  --tensor-parallel-world 4 --tensor-parallel-rank 3 \
+  --coordinator 10.100.184.4 9911 --transport nccl
+```
+
+Then start rank 0:
+
+```sh
+# Spark 1 (management 192.168.2.40, fabric 10.100.184.4), rank 0
+./ds4 --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --role coordinator --tensor-parallel \
+  --tensor-parallel-world 4 --listen 10.100.184.4 9911 \
+  --transport nccl --temp 0 \
+  -p "Explain why the sky is blue."
+```
+
+Replace `--tensor-parallel` with `--expert-parallel` on every rank to partition
+only the routed experts. Workers retry until the coordinator is listening, so
+connection-refused messages during startup are expected.
+
+The full GGUF is still required on disk on every host; only resident model
+memory is sharded. Startup prints both the mapped shard and the complete planned
+memory. The GLM memory guard keeps 32 GiB of system/GPU headroom by default on
+128 GiB unified-memory systems. Do not disable that guard on DGX Spark: pushing
+the shared CPU/GPU memory pool to exhaustion can make the machine unresponsive.
+Start with a conservative context and increase it only after checking the
+reported plan on every rank.
+
+This particular 196.6 GiB GLM file does not fit safely across only two 128 GiB
+Sparks. Its two-way model shard plus graph state exceeds the guarded budget and
+must be refused. Use all four Sparks for this model.
+
+### DeepSeek V4 Flash example
+
+The tested 80.76 GiB 0731 Q2 Flash file maps about 26.34 GiB of model tensors
+per rank with four ranks. Every host still needs the complete GGUF on local
+storage. On ranks 1 through 3, change both `--tensor-parallel-rank` and the
+worker host as appropriate:
+
+```sh
+MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+
+# Spark 2, rank 1. Repeat on Sparks 3/rank 2 and 4/rank 3.
+./ds4 --cuda -m "$MODEL" --ctx 4096 \
+  --role worker --tensor-parallel \
+  --tensor-parallel-world 4 --tensor-parallel-rank 1 \
+  --coordinator 10.100.184.4 9911 --transport nccl
+
+# Spark 1, rank 0, after all workers are loading.
+./ds4 --cuda -m "$MODEL" --ctx 4096 \
+  --role coordinator --tensor-parallel --tensor-parallel-world 4 \
+  --listen 10.100.184.4 9911 --transport nccl --temp 0 \
+  -p "Explain why the sky is blue."
+```
+
+Use `--expert-parallel` on every rank for expert-only execution. DeepSeek TP
+uses disjoint expert slots and complete dense output rows during decode, rather
+than summing partial dot products. The supported path is therefore designed to
+preserve the single-rank arithmetic order and does not require
+`DS4_TP_ORDERED_REDUCE`. Prefill attention and the shared expert remain
+replicated because their optimized CUDA batch kernels are shape-sensitive.
+Decode keeps the row split: sliced dense Q8 projections resolve the complete
+aligned artifact and evaluate only the rank's row interval, so their per-row
+arithmetic stays identical to a complete single-rank launch.
+
+On DeepSeek Q2, each network rank builds aligned IQ2_XXS/Q2_K artifacts only
+for its owned expert interval and replaces that interval's raw CUDA residency.
+Decode consumes the shard-local artifacts directly. Batch prefill reconstructs
+only the current layer into reusable device scratch before running the exact
+raw-layout arithmetic; it does not restore or pin the complete expert shard.
+Dense Q8 aligned artifacts stay replicated because dense/shared weights are
+replicated. Startup reports their additive memory separately, for example
+`aligned dense artifacts 6.15 GiB` for the tested 0731 file.
+
+`DS4_CUDA_TP_FAST_ALIGNED_EXPERTS=1` is an opt-in throughput mode for this
+DeepSeek layout. Set it identically on every rank. It runs prefill and decode
+directly through the shard-local aligned MMQ representation instead of using
+the raw-arithmetic parity twins. This changes floating-point rounding and is
+therefore not the byte-identical release-parity path. On the four-Spark 0731
+Q2 test at a 4,096-token frontier it measured 535.74/14.92 prefill/generation
+t/s in EP and 511.36/19.43 t/s in TP; both modes passed the same four-case,
+4,096-token evaluation and produced identical extracted answers. Treat those
+numbers as one-cluster measurements, not a general performance guarantee.
+GLM currently keeps its existing routed-expert representation; enabling this
+environment variable does not change the GLM graph.
+
+For a strict greedy parity reference, disable only the single-rank routed
+expert artifacts. Dense Q8 artifacts remain enabled on both the reference and
+the network ranks:
+
+```sh
+DS4_CUDA_MOE_NO_IQ2_ALIGNED=1 \
+DS4_CUDA_MOE_NO_Q2K_ALIGNED=1 \
+./ds4 --cuda -m "$MODEL" --ctx 512 --temp 0 --tokens 32 -p "Hello"
+```
+
+`DS4_CUDA_TP_NO_ALIGNED_EXPERTS=1` is a diagnostic rollback for a network
+rank. It disables the shard-local artifact build, including the replicated Q8
+artifacts, and restores the older raw-resident path; set it identically on all
+ranks. It is not the parity reference above and uses substantially more model
+residency.
+
+### Eight-Spark DeepSeek V4 Pro 0813 EP example
+
+The Pro 0813 IQ2/Q2 GGUF is supported at world size eight only with
+`--expert-parallel`. Its 384 routed experts divide into 48 contiguous experts
+per rank. `--tensor-parallel --tensor-parallel-world 8` is intentionally
+rejected; use EP8 so dense attention, the shared expert, output head, and KV
+state remain replicated.
+
+Every Spark must be able to open the complete file. This may be a local copy on
+each host or one complete file at a shared path such as BeeGFS. Hash every
+independent copy before starting; for one shared file, hash it once and verify
+that all eight mounts report the same size and file identity. The protocol's
+layout fingerprint detects structural incompatibility but is not a content
+checksum:
+
+```sh
+MODEL=gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf
+EXPECTED=c4d997ab9894b6c78b759f7869fe1726b6314b6515f6ff82607df3797c5eb193
+printf '%s  %s\n' "$EXPECTED" "$MODEL" | sha256sum -c -
+```
+
+Start ranks 1 through 7 first, assigning a unique explicit rank on each worker:
+
+```sh
+# Set RANK to 1..7 on the corresponding worker and use rank 0's fabric address.
+RANK=1
+LEADER_FABRIC_IP=REPLACE_WITH_RANK0_FABRIC_IP
+./ds4 --cuda -m "$MODEL" --ctx 4096 \
+  --role worker --expert-parallel \
+  --tensor-parallel-world 8 --tensor-parallel-rank "$RANK" \
+  --coordinator "$LEADER_FABRIC_IP" 9911 --transport nccl
+```
+
+After all workers are loading, start rank 0:
+
+```sh
+LEADER_FABRIC_IP=REPLACE_WITH_RANK0_FABRIC_IP
+./ds4 --cuda -m "$MODEL" --ctx 4096 \
+  --role coordinator --expert-parallel --tensor-parallel-world 8 \
+  --listen "$LEADER_FABRIC_IP" 9911 --transport nccl --temp 0 \
+  -p "Explain why the sky is blue."
+```
+
+Startup identifies the exact Pro IQ2/Q2 tensor profile, exchanges a protocol-v11
+layout fingerprint, and prints the rank's expert interval and complete memory
+plan before building CUDA artifacts. The admission plan reserves 32 GiB by
+default and includes the sharded GGUF spans, aligned artifacts, shared
+workspace, ordered-reduction scratch when enabled, and per-session KV/private
+buffers. Dense Q8 aligned artifacts are an additive exact-mode optimization;
+when that term alone would cross the guarded budget, network startup reports
+the decision and uses the canonical raw-Q8 kernels instead. Reduce
+`--batched-session` or `--ctx` when the resulting plan is still refused.
+`DS4_CUDA_EP_MEMORY_RESERVE_GB` changes the reserve and should be overridden
+only deliberately and identically on all ranks.
+
+`DS4_CUDA_TP_FAST_ALIGNED_EXPERTS=1` remains an opt-in, non-byte-identical
+throughput mode. Set it identically on all eight ranks; a requested fast mode
+that cannot build its shard-local artifacts fails startup instead of silently
+falling back.
+
+### Two ranks
+
+The DeepSeek Q2 file maps about 44.48 GiB of model tensors per rank with a
+two-way split. Rank 1 may omit its explicit rank in a two-rank world, but
+spelling it out makes launch scripts clearer:
+
+```sh
+MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+
+# Worker, rank 1.
+./ds4 --cuda -m "$MODEL" --ctx 4096 \
+  --role worker --tensor-parallel \
+  --tensor-parallel-world 2 --tensor-parallel-rank 1 \
+  --coordinator 10.100.184.4 9911 --transport nccl
+
+# Coordinator, rank 0.
+./ds4 --cuda -m "$MODEL" --ctx 4096 \
+  --role coordinator --tensor-parallel \
+  --tensor-parallel-world 2 --listen 10.100.184.4 9911 \
+  --transport nccl --temp 0 -p "Hello"
+```
+
+The same two-way protocol works for a smaller supported GLM model whose
+per-rank plan fits with headroom; the 196.6 GiB GLM example above does not.
+Two- and four-rank collective setup use the same code path. Before model tests,
+`nccl-tests` is useful for confirming that the selected interfaces complete an
+in-place all-reduce without errors.
+
+### Benchmarking
+
+Start workers with `./ds4` exactly as above, giving them enough `--ctx` for the
+benchmark allocation. Run `ds4-bench` as rank 0. This short command is a smoke
+benchmark rather than a quality evaluation:
+
+```sh
+./ds4-bench --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 16 --ctx-max 16 --ctx-alloc 128 \
+  --step-incr 16 --gen-tokens 64 \
+  --role coordinator --tensor-parallel \
+  --tensor-parallel-world 4 --listen 10.100.184.4 9911 \
+  --transport nccl --csv /tmp/glm52-tp4.csv
+```
+
+Supported GLM TP should match its EP reference exactly, and supported DeepSeek
+TP should match its raw-expert single-rank/EP reference. Compare a multi-token
+`--dump-logprobs` trace, not only the first selected token: selected token bytes
+and stored top-logprob entries must be byte-identical. Treat a greedy mismatch
+as a correctness failure. All ranks must also remain bit-identical to each other
+after every collective.
+
+### Server, agent, and evaluation frontends
+
+Network expert/tensor parallelism is wired into `ds4`, `ds4-bench`,
+`ds4-server`, `ds4-agent`, `ds4-eval`, and the official-continuation
+`score_official` tool. Rank 0 runs the selected frontend; ordinary frontend
+workers may run either that same executable or plain `ds4` with the matching
+model, mode, world, rank, and context options. Use plain `ds4` workers for the
+scorer. Frontend-only flags are ignored after a worker enters its
+mirrored-session loop. The scorer's exact commands and comparison workflow are
+documented in
+`gguf-tools/quality-testing/README.md`.
+
+For example, after starting the three `ds4` workers from the four-Spark example
+above, rank 0 can serve the model over HTTP:
+
+```sh
+./ds4-server --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --role coordinator --tensor-parallel \
+  --tensor-parallel-world 4 --listen 10.100.184.4 9911 \
+  --transport nccl --host 127.0.0.1 --port 8000
+```
+
+`--listen` is the rank-control address; `--host` and `--port` remain the HTTP
+address. Graceful server shutdown destroys every mirrored session before it
+stops the workers. Native `--batched-session N` is supported, but every
+resident session has its own KV/cache allocation, so begin with one session
+and increase it only when the printed guarded memory plan leaves ample room.
+`DS4_SERVER_DECODE_COALESCE_US` controls how long the decode coordinator waits
+for staggered resident sessions (2,000 microseconds by default; accepted range
+0 through 60,000,000). Large values are intended for batch acceptance and
+diagnostics because an incomplete batch waits for the deadline and adds that
+delay to every decode step.
+
+The agent and evaluation harness use the same coordinator options:
+
+```sh
+./ds4-agent --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --non-interactive --nothink --tokens 64 \
+  -p "Explain why the sky is blue." \
+  --role coordinator --tensor-parallel --tensor-parallel-world 4 \
+  --listen 10.100.184.4 9911 --transport nccl
+
+./ds4-eval --cuda \
+  -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  --ctx 4096 --questions 1 --tokens 64 --nothink --plain \
+  --role coordinator --tensor-parallel --tensor-parallel-world 4 \
+  --listen 10.100.184.4 9911 --transport nccl
+```
+
+`ds4-eval` requires an explicit `--ctx` in network mode; automatic context
+sizing cannot establish a safe common capacity before workers connect. Each
+frontend sends the same session create/sync/eval/rewind/destroy protocol, and
+rank 0 sends a final stop only after its live sessions have been released.
+Server and agent KV files may still be written, but direct payload restore is
+disabled in network mode because it would update rank 0 alone. A cache hit
+therefore falls back to replaying the requested or stored prompt tokens through
+every rank in lockstep; this is slower than a local KV restore but preserves
+collective and cache alignment.
+
 ## Tensor Parallelism over RDMA
 
 Tensor parallelism runs a single decode across two Macs connected with a
@@ -678,8 +1083,9 @@ MODEL=gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
 The active verbs device and IPv4-mapped GID are selected automatically. If that
 is ambiguous, add `--rdma-device rdma_en6 --rdma-gid-index 1` on the worker and
 the matching `rdma_en1` flags on the coordinator. Use `--transport tcp` on both
-sides to force TCP. Tensor parallel roles are currently exposed by the `ds4`
-CLI, not by `ds4-server` or `ds4-agent`.
+sides to force TCP. Network tensor-parallel roles are exposed by `ds4`,
+`ds4-bench`, `ds4-server`, `ds4-agent`, and `ds4-eval`; workers may use any of
+those frontends with matching model, mode, rank, and context options.
 
 Startup takes about 9 seconds per machine: each rank pre-faults its
 ~100 GiB shard from SSD and pins it through a Metal residency set.

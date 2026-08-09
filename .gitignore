@@ -10,6 +10,7 @@
 /ds4flash.gguf
 /TODO.md
 /gguf/
+/.deps/
 /core
 /core.*
 /tests/test_engine_mgpu_placement
@@ -29,7 +30,9 @@
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
+/cuda/mmq/test/test_q8_aligned_rows
 /tests/test_sampling
+/tests/test_tp_protocol
 *.o
 *.dSYM/
 __pycache__/
