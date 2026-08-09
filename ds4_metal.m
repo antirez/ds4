@@ -2206,11 +2206,62 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
     return pipeline;
 }
 
+/* Hot dispatch sites look this up by name on every call. Formatting an
+ * NSString to probe an NSMutableDictionary measured ~0.5 ms/token in a
+ * symbolicated profile (__CFStringAppendFormatCore plus objc retain/release
+ * traffic), all to recover a pointer that never changes. Probe a
+ * content-hashed C-string table first. The dictionary still owns the
+ * reference, so entries here are unretained and never need invalidating, and
+ * the strcmp means a recycled name pointer cannot alias another kernel. */
+enum { DS4_PIPELINE_FAST_SLOTS = 512u, DS4_PIPELINE_FAST_PROBES = 8u };
+
+typedef struct {
+    const char *name;
+    __unsafe_unretained id<MTLComputePipelineState> pipeline;
+} ds4_gpu_pipeline_fast_entry;
+
+static ds4_gpu_pipeline_fast_entry g_pipeline_fast[DS4_PIPELINE_FAST_SLOTS];
+
+static uint32_t ds4_gpu_pipeline_slot(const char *name) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h & (DS4_PIPELINE_FAST_SLOTS - 1u);
+}
+
+static void ds4_gpu_pipeline_fast_insert(
+        const char *name,
+        __unsafe_unretained id<MTLComputePipelineState> pipeline,
+        uint32_t slot) {
+    for (uint32_t probe = 0; probe < DS4_PIPELINE_FAST_PROBES; probe++) {
+        ds4_gpu_pipeline_fast_entry *e =
+            &g_pipeline_fast[(slot + probe) & (DS4_PIPELINE_FAST_SLOTS - 1u)];
+        if (e->name && strcmp(e->name, name) != 0) continue;
+        e->name = name;
+        e->pipeline = pipeline;
+        return;
+    }
+    /* Bucket full: the dictionary path still answers correctly. */
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
         const char *function_name) {
+    const uint32_t slot = ds4_gpu_pipeline_slot(function_name);
+    for (uint32_t probe = 0; probe < DS4_PIPELINE_FAST_PROBES; probe++) {
+        ds4_gpu_pipeline_fast_entry *e =
+            &g_pipeline_fast[(slot + probe) & (DS4_PIPELINE_FAST_SLOTS - 1u)];
+        if (!e->name) break;
+        if (strcmp(e->name, function_name) == 0) return e->pipeline;
+    }
+
     NSString *key = [NSString stringWithFormat:@"%s", function_name];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
-    if (cached) return cached;
+    if (cached) {
+        ds4_gpu_pipeline_fast_insert(function_name, cached, slot);
+        return cached;
+    }
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -2228,6 +2279,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
+    ds4_gpu_pipeline_fast_insert(function_name, pipeline, slot);
     return pipeline;
 }
 
@@ -11570,8 +11622,13 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         return nil;
     }
 
+    /* Consecutive lookups almost always land in the same view, and a large
+     * model has many of them, so start from the last hit instead of rescanning
+     * from zero. Purely an ordering hint: the range check below still decides. */
+    static uint32_t hint;
     const uint64_t end = offset + len;
-    for (uint32_t i = 0; i < g_model_view_count; i++) {
+    for (uint32_t n = 0; n < g_model_view_count; n++) {
+        const uint32_t i = (hint + n) % g_model_view_count;
         if (g_model_views[i].model_map != model_map ||
             g_model_views[i].model_size != model_size) {
             continue;
@@ -11580,6 +11637,7 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const uint64_t view_end = view_start + g_model_views[i].bytes;
         if (offset >= view_start && end <= view_end) {
             *inner_offset = offset - view_start;
+            hint = i;
             return g_model_views[i].buffer;
         }
     }

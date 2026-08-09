@@ -428,13 +428,31 @@ static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) 
     return false;
 }
 
+/* getenv() is a locked linear scan of the environment. This is called from the
+ * per-layer graph path, so it showed up as 0.15 ms/token in __findenv_locked in
+ * a symbolicated profile. The environment does not change under us, so memoize
+ * on the name pointer - callers pass literals. */
 static bool glm_graph_env_present(const char *rocm_name, const char *metal_name) {
+    enum { GLM_ENV_MEMO = 64 };
+    static struct { const char *r, *m; bool present; } memo[GLM_ENV_MEMO];
+    static uint32_t memo_len;
+    for (uint32_t i = 0; i < memo_len; i++) {
+        if (memo[i].r == rocm_name && memo[i].m == metal_name) return memo[i].present;
+    }
+    bool present = false;
 #ifdef DS4_ROCM_BUILD
-    if (rocm_name && getenv(rocm_name) != NULL) return true;
+    if (rocm_name && getenv(rocm_name) != NULL) present = true;
 #else
     (void)rocm_name;
 #endif
-    return metal_name && getenv(metal_name) != NULL;
+    if (!present) present = metal_name && getenv(metal_name) != NULL;
+    if (memo_len < GLM_ENV_MEMO) {
+        memo[memo_len].r = rocm_name;
+        memo[memo_len].m = metal_name;
+        memo[memo_len].present = present;
+        memo_len++;
+    }
+    return present;
 }
 
 static const char *glm_graph_env_value(const char *rocm_name,
