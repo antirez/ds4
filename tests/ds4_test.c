@@ -88,7 +88,9 @@ static void test_restore_canonical_streaming_prefill(
                      saved.batch_selected_addr);
 }
 
-static ds4_backend test_backend(void) {
+static ds4_backend test_model_backend(void) {
+    const char *backend = getenv("DS4_TEST_BACKEND");
+    if (backend && !strcmp(backend, "cpu")) return DS4_BACKEND_CPU;
 #ifdef __APPLE__
     return DS4_BACKEND_METAL;
 #else
@@ -108,11 +110,7 @@ static ds4_engine *test_open_engine(bool quality) {
     const bool use_mtp = mtp && mtp[0] && !quality;
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
+        .backend = test_model_backend(),
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
@@ -945,12 +943,16 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
         uint32_t ratio,
         uint32_t pos,
         uint32_t ape_type,
-        uint32_t seed) {
+        uint32_t seed,
+        bool test_decode_pack) {
     const uint32_t in_dim = 4096u;
     const uint32_t coff = ratio == 4u ? 2u : 1u;
     const uint32_t head_dim = width / coff;
     const uint32_t state_rows = coff * ratio;
     const bool emit = ((pos + 1u) % ratio) == 0u;
+    TEST_ASSERT(!test_decode_pack ||
+                (ratio == 4u && emit &&
+                 (head_dim == 128u || head_dim == 512u)));
     const uint64_t page = (uint64_t)getpagesize();
     const uint64_t weight_bytes =
         (uint64_t)width * in_dim * sizeof(uint16_t);
@@ -1036,10 +1038,28 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
         "DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ";
     const char *store_disable_env =
         "DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE";
+    const char *decode_pack_env =
+        "DS4_METAL_ENABLE_COMPRESSOR_RATIO4_DECODE_PACK_FUSION";
+    const char *decode_pack_disable_env =
+        "DS4_METAL_DISABLE_M3_COMPRESSOR_RATIO4_DECODE_PACK_FUSION";
+    const char *exact_reduction_env =
+        "DS4_METAL_ENABLE_COMPRESSOR_EXACT_REDUCTION_FUSION";
+    const char *exact_reduction_disable_env =
+        "DS4_METAL_DISABLE_M3_COMPRESSOR_EXACT_REDUCTION_FUSION";
+    const char *exact_reduction_poison_env =
+        "DS4_METAL_TEST_POISON_COMPRESSOR_EXACT_REDUCTION_SCRATCH";
     char *saved_force = test_save_env(force_env);
     char *saved_disable = test_save_env(disable_env);
     char *saved_pair_disable = test_save_env(pair_disable_env);
     char *saved_store_disable = test_save_env(store_disable_env);
+    char *saved_decode_pack = test_save_env(decode_pack_env);
+    char *saved_decode_pack_disable =
+        test_save_env(decode_pack_disable_env);
+    char *saved_exact_reduction = test_save_env(exact_reduction_env);
+    char *saved_exact_reduction_disable =
+        test_save_env(exact_reduction_disable_env);
+    char *saved_exact_reduction_poison =
+        test_save_env(exact_reduction_poison_env);
 
     test_float_compare_stats kv_stats = {0};
     test_float_compare_stats score_stats = {0};
@@ -1115,6 +1135,32 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
             ref_state_score_host[i] = (float)score_value / 72.0f;
             fused_state_score_host[i] = ref_state_score_host[i];
         }
+        if (test_decode_pack) {
+            static const uint32_t edge_bits[8] = {
+                0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+                0x3f800000u, 0xbf800000u, 0x42a00000u, 0xc2a00000u,
+            };
+            for (uint32_t col = 0; col < 4u; col++) {
+                for (uint32_t row = 0; row < 8u; row++) {
+                    const uint64_t state_col =
+                        (row >= 4u ? head_dim : 0u) + col;
+                    const uint64_t state_index =
+                        (uint64_t)row * width + state_col;
+                    const uint32_t score_bits =
+                        edge_bits[(row + col) & 7u];
+                    const uint32_t kv_bits =
+                        edge_bits[(7u - row + col) & 7u];
+                    memcpy(ref_state_score_host + state_index,
+                           &score_bits, sizeof(score_bits));
+                    memcpy(fused_state_score_host + state_index,
+                           &score_bits, sizeof(score_bits));
+                    memcpy(ref_state_kv_host + state_index,
+                           &kv_bits, sizeof(kv_bits));
+                    memcpy(fused_state_kv_host + state_index,
+                           &kv_bits, sizeof(kv_bits));
+                }
+            }
+        }
         for (uint32_t i = 0; i < head_dim; i++) {
             const uint32_t poison = 0x7fc01001u + (i & 0x3ffu);
             memcpy(ref_comp_host + i, &poison, sizeof(poison));
@@ -1152,6 +1198,13 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
         TEST_ASSERT(unsetenv(disable_env) == 0);
         TEST_ASSERT(unsetenv(pair_disable_env) == 0);
         TEST_ASSERT(unsetenv(store_disable_env) == 0);
+        TEST_ASSERT(unsetenv(decode_pack_env) == 0);
+        TEST_ASSERT(unsetenv(exact_reduction_env) == 0);
+        TEST_ASSERT(setenv(exact_reduction_disable_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(exact_reduction_poison_env) == 0);
+        if (test_decode_pack) {
+            TEST_ASSERT(setenv(decode_pack_disable_env, "1", 1) == 0);
+        }
 
         TEST_ASSERT(ds4_gpu_matmul_f16_pair_tensor(
                         ref_kv, ref_score, model_raw, model_bytes,
@@ -1161,7 +1214,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         ref_comp, model_raw, model_bytes, ape_offset, ape_type,
                         norm_offset, 0, head_dim, ratio, pos, 0, 0, 0,
                         10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
-                        1.0e-6f, false) != 0);
+                        1.0e-6f, false, test_decode_pack, false) != 0);
 
         TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                         fused_kv, fused_score,
@@ -1169,6 +1222,13 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         model_raw, model_bytes, 0, score_weight_offset,
                         ape_offset, ape_type, in_dim, width, x,
                         ratio, pos) == 1);
+        if (test_decode_pack) {
+            TEST_ASSERT(setenv(decode_pack_env, "1", 1) == 0);
+            TEST_ASSERT(unsetenv(decode_pack_disable_env) == 0);
+            TEST_ASSERT(setenv(exact_reduction_env, "1", 1) == 0);
+            TEST_ASSERT(unsetenv(exact_reduction_disable_env) == 0);
+            TEST_ASSERT(setenv(exact_reduction_poison_env, "1", 1) == 0);
+        }
         TEST_ASSERT(ds4_gpu_compressor_update_tensor(
                         fused_kv, fused_score,
                         fused_state_kv, fused_state_score,
@@ -1176,7 +1236,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         ape_offset, ape_type, norm_offset, 0,
                         head_dim, ratio, pos, 0, 0, 0,
                         10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
-                        1.0e-6f, true) != 0);
+                        1.0e-6f, true, test_decode_pack, false) != 0);
 
         TEST_ASSERT(ds4_gpu_tensor_read(
                         ref_kv, 0, ref_kv_host, out_bytes) != 0);
@@ -1219,13 +1279,23 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
     test_restore_env(disable_env, saved_disable);
     test_restore_env(pair_disable_env, saved_pair_disable);
     test_restore_env(store_disable_env, saved_store_disable);
+    test_restore_env(decode_pack_env, saved_decode_pack);
+    test_restore_env(decode_pack_disable_env, saved_decode_pack_disable);
+    test_restore_env(exact_reduction_env, saved_exact_reduction);
+    test_restore_env(exact_reduction_disable_env,
+                     saved_exact_reduction_disable);
+    test_restore_env(
+        exact_reduction_poison_env, saved_exact_reduction_poison);
 
     fprintf(stderr,
             "ds4-test: compressor pair state-store exact width=%u ratio=%u "
-            "pos=%u emit=%u ape=%s proj=%zu/%zu state=%zu/%zu "
+            "pos=%u emit=%u ape=%s decode_pack=%u exact_reduce=%u "
+            "proj=%zu/%zu state=%zu/%zu "
             "comp=%zu max_ulp=%u/%u/%u/%u/%u\n",
             width, ratio, pos, emit ? 1u : 0u,
             ape_type == 1u ? "f16" : "f32",
+            test_decode_pack ? 1u : 0u,
+            test_decode_pack ? 1u : 0u,
             kv_stats.mismatch_count, score_stats.mismatch_count,
             state_kv_stats.mismatch_count,
             state_score_stats.mismatch_count,
@@ -1266,11 +1336,13 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
 
 static void test_metal_f16_compressor_pair_state_store_exact(void) {
     test_metal_f16_compressor_pair_state_store_exact_case(
-        256, 4, 8, 0, 17);
+        256, 4, 8, 0, 17, false);
     test_metal_f16_compressor_pair_state_store_exact_case(
-        1024, 4, 11, 1, 29);
+        256, 4, 11, 1, 23, true);
     test_metal_f16_compressor_pair_state_store_exact_case(
-        512, 128, 255, 1, 43);
+        1024, 4, 11, 1, 29, true);
+    test_metal_f16_compressor_pair_state_store_exact_case(
+        512, 128, 255, 1, 43, false);
 }
 
 static void test_metal_compressor_ape_add_exact_case(
@@ -4383,7 +4455,7 @@ static void test_metal_router_simd_finalize_exact(void) {
     };
     const uint32_t n_expert = 256;
     const uint32_t n_used = 6;
-    const uint32_t repeats = 2;
+    const uint32_t modes = 4;
     const uint64_t probs_bytes = (uint64_t)n_expert * sizeof(float);
     const uint64_t selected_bytes = (uint64_t)n_used * sizeof(int32_t);
     const uint64_t weights_bytes = (uint64_t)n_used * sizeof(float);
@@ -4395,6 +4467,10 @@ static void test_metal_router_simd_finalize_exact(void) {
         "DS4_METAL_ENABLE_ROUTER_SIMD_WEIGHTS_FUSION";
     const char *weights_disable_env =
         "DS4_METAL_DISABLE_M3_ROUTER_SIMD_WEIGHTS_FUSION";
+    const char *transform_finalize_env =
+        "DS4_METAL_ENABLE_ROUTER_TRANSFORM_FINALIZE_FUSION";
+    const char *transform_finalize_disable_env =
+        "DS4_METAL_DISABLE_M3_ROUTER_TRANSFORM_FINALIZE_FUSION";
     const char *select_disable_env =
         "DS4_METAL_DISABLE_ROUTER_SELECT_FUSION";
 
@@ -4431,6 +4507,9 @@ static void test_metal_router_simd_finalize_exact(void) {
     char *saved_disable = test_save_env(disable_env);
     char *saved_weights_force = test_save_env(weights_force_env);
     char *saved_weights_disable = test_save_env(weights_disable_env);
+    char *saved_transform_finalize = test_save_env(transform_finalize_env);
+    char *saved_transform_finalize_disable =
+        test_save_env(transform_finalize_disable_env);
     char *saved_select_disable = test_save_env(select_disable_env);
     size_t total_selected_mismatch = 0;
     size_t total_weights_mismatch = 0;
@@ -4448,6 +4527,8 @@ static void test_metal_router_simd_finalize_exact(void) {
         ds4_gpu_set_quality(false);
         TEST_ASSERT(setenv(force_env, "1", 1) == 0);
         TEST_ASSERT(setenv(weights_force_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(transform_finalize_env) == 0);
+        TEST_ASSERT(setenv(transform_finalize_disable_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(select_disable_env) == 0);
 
         for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
@@ -4501,6 +4582,7 @@ static void test_metal_router_simd_finalize_exact(void) {
             TEST_ASSERT(ds4_gpu_tensor_write(
                 logits, 0, logits_host, probs_bytes) != 0);
 
+            TEST_ASSERT(unsetenv(transform_finalize_env) == 0);
             TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
             TEST_ASSERT(ds4_gpu_router_select_tensor(
                 ref_selected, ref_weights, ref_probs,
@@ -4525,13 +4607,30 @@ static void test_metal_router_simd_finalize_exact(void) {
             }
 
             TEST_ASSERT(unsetenv(disable_env) == 0);
-            for (uint32_t rep = 0; rep <= repeats; rep++) {
-                const bool fused_weights = rep != 0;
+            for (uint32_t mode = 0; mode < modes; mode++) {
+                const bool fused_weights = mode != 0;
+                const bool fused_transform = mode >= 2;
                 if (fused_weights) {
                     TEST_ASSERT(unsetenv(weights_disable_env) == 0);
                 } else {
                     TEST_ASSERT(setenv(weights_disable_env, "1", 1) == 0);
                 }
+                if (fused_transform) {
+                    TEST_ASSERT(setenv(transform_finalize_env, "1", 1) == 0);
+                    TEST_ASSERT(unsetenv(transform_finalize_disable_env) == 0);
+                } else {
+                    TEST_ASSERT(unsetenv(transform_finalize_env) == 0);
+                    TEST_ASSERT(setenv(
+                        transform_finalize_disable_env, "1", 1) == 0);
+                }
+                for (uint32_t i = 0; i < n_expert; i++) {
+                    const uint32_t poison_bits = 0x7fc00001u + i;
+                    memcpy(&simd_probs_host[i],
+                           &poison_bits,
+                           sizeof(poison_bits));
+                }
+                TEST_ASSERT(ds4_gpu_tensor_write(
+                    simd_probs, 0, simd_probs_host, probs_bytes) != 0);
                 TEST_ASSERT(ds4_gpu_router_select_tensor(
                     simd_selected, simd_weights, simd_probs,
                     model_raw, page, 0, 0, 1, 0,
@@ -4563,8 +4662,9 @@ static void test_metal_router_simd_finalize_exact(void) {
                         "case=%s mode=%s rep=%u selected=%zu/%u weights=%zu/%u "
                         "probs=%zu/%u max_weight_ulp=%u max_prob_ulp=%u\n",
                         c->name,
+                        fused_transform ? "fused-transform" :
                         fused_weights ? "fused-weights" : "split-weights",
-                        fused_weights ? rep - 1u : 0u,
+                        fused_transform ? mode - 2u : 0u,
                         selected_mismatch,
                         n_used,
                         weights_stats.mismatch_count,
@@ -4587,16 +4687,19 @@ static void test_metal_router_simd_finalize_exact(void) {
     test_restore_env(disable_env, saved_disable);
     test_restore_env(weights_force_env, saved_weights_force);
     test_restore_env(weights_disable_env, saved_weights_disable);
+    test_restore_env(transform_finalize_env, saved_transform_finalize);
+    test_restore_env(transform_finalize_disable_env,
+                     saved_transform_finalize_disable);
     test_restore_env(select_disable_env, saved_select_disable);
     fprintf(stderr,
             "ds4-test: router SIMD finalize total selected=%zu/%zu "
             "weights=%zu/%zu probs=%zu/%zu\n",
             total_selected_mismatch,
-            (sizeof(cases) / sizeof(cases[0])) * (repeats + 1u) * (size_t)n_used,
+            (sizeof(cases) / sizeof(cases[0])) * modes * (size_t)n_used,
             total_weights_mismatch,
-            (sizeof(cases) / sizeof(cases[0])) * (repeats + 1u) * (size_t)n_used,
+            (sizeof(cases) / sizeof(cases[0])) * modes * (size_t)n_used,
             total_probs_mismatch,
-            (sizeof(cases) / sizeof(cases[0])) * (repeats + 1u) * (size_t)n_expert);
+            (sizeof(cases) / sizeof(cases[0])) * modes * (size_t)n_expert);
     TEST_ASSERT(total_selected_mismatch == 0);
     TEST_ASSERT(total_weights_mismatch == 0);
     TEST_ASSERT(total_probs_mismatch == 0);
@@ -6214,24 +6317,97 @@ static void test_streaming_decode_prefill_correctness(void) {
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
 
+#define TEST_LIST_FILES_USER_PROMPT \
+    "Use the list_files tool to list the current directory exactly once, " \
+    "then report the listed files and stop."
+
+#define TEST_LIST_FILES_TOOL_JSON \
+    "{\"type\":\"function\",\"function\":{" \
+        "\"name\":\"list_files\"," \
+        "\"description\":\"List files in a directory.\"," \
+        "\"parameters\":{\"type\":\"object\",\"properties\":{" \
+            "\"path\":{\"type\":\"string\",\"description\":\"Directory path to list.\"}" \
+        "},\"required\":[\"path\"]}" \
+    "}}"
+
+#define TEST_LIST_FILES_RESULT "[\"README.md\",\"Makefile\",\"ds4.c\",\"metal\"]"
+
 static const char *test_tool_call_request_json(void) {
     return
         "{"
         "\"model\":\"deepseek-v4-flash\","
-        "\"messages\":[{\"role\":\"user\",\"content\":\"List the files in the current directory. Use the provided tool; do not answer in prose.\"}],"
-        "\"tools\":[{\"type\":\"function\",\"function\":{"
-            "\"name\":\"list_files\","
-            "\"description\":\"List files in a directory.\","
-            "\"parameters\":{\"type\":\"object\",\"properties\":{"
-                "\"path\":{\"type\":\"string\",\"description\":\"Directory path to list.\"}"
-            "},\"required\":[\"path\"]}"
-        "}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\""
+            TEST_LIST_FILES_USER_PROMPT
+        "\"}],"
+        "\"tools\":[" TEST_LIST_FILES_TOOL_JSON "],"
         "\"tool_choice\":\"auto\","
         "\"think\":false,"
         "\"temperature\":0,"
         "\"max_tokens\":256,"
         "\"stream\":false"
         "}";
+}
+
+static char *test_tool_result_request_json(const char *assistant_content,
+                                           const tool_call *call) {
+    if (!call || !call->id || !call->id[0]) return NULL;
+
+    buf b = {0};
+    buf_puts(&b,
+        "{\"model\":\"deepseek-v4-flash\",\"messages\":["
+        "{\"role\":\"user\",\"content\":");
+    json_escape(&b, TEST_LIST_FILES_USER_PROMPT);
+    buf_puts(&b, "},{\"role\":\"assistant\",\"content\":");
+    json_escape(&b, assistant_content ? assistant_content : "");
+    buf_puts(&b, ",\"tool_calls\":[{\"id\":");
+    json_escape(&b, call->id);
+    buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
+    json_escape(&b, call->name ? call->name : "");
+    buf_puts(&b, ",\"arguments\":");
+    json_escape(&b, call->arguments ? call->arguments : "{}");
+    buf_puts(&b, "}}]},{\"role\":\"tool\",\"tool_call_id\":");
+    json_escape(&b, call->id);
+    buf_puts(&b, ",\"content\":");
+    json_escape(&b, TEST_LIST_FILES_RESULT);
+    buf_puts(&b,
+        "}],\"tools\":[" TEST_LIST_FILES_TOOL_JSON "],"
+        "\"tool_choice\":\"auto\",\"think\":false,"
+        "\"temperature\":0,\"max_tokens\":256,\"stream\":false}");
+    return buf_take(&b);
+}
+
+static char *test_openai_reasoning_stream_wire(const char *raw,
+                                                  openai_stream_mode *mode_out) {
+    int fd[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    if (fd[0] < 0 || fd[1] < 0) return NULL;
+
+    request r = {0};
+    r.model = xstrdup("deepseek-v4-flash");
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_HIGH;
+    openai_stream stream = {0};
+    openai_stream_start(&r, &stream);
+    server s = {0};
+    bool ok = openai_sse_stream_update(fd[0], &s, &r, "test-stream",
+                                       &stream, raw, strlen(raw), true);
+    TEST_ASSERT(ok);
+    if (mode_out) *mode_out = stream.mode;
+    shutdown(fd[0], SHUT_WR);
+
+    buf wire = {0};
+    char chunk[4096];
+    ssize_t n;
+    while ((n = recv(fd[1], chunk, sizeof(chunk), 0)) > 0) {
+        buf_append(&wire, chunk, (size_t)n);
+    }
+    TEST_ASSERT(n == 0);
+
+    close(fd[0]);
+    close(fd[1]);
+    openai_stream_free(&stream);
+    free(r.model);
+    return buf_take(&wire);
 }
 
 /* A complete tool call inside unclosed reasoning is recovered directly. The
@@ -6248,14 +6424,15 @@ static void test_think_tool_recovery(void) {
 
     buf text = {0};
     size_t scan_from = 0;
-    bool complete = false;
+    think_tool_status status = THINK_TOOL_NONE;
     for (size_t i = 0; generated[i]; i++) {
         buf_append(&text, generated + i, 1);
-        complete = complete_tool_call_inside_thinking(text.ptr, text.len,
-                                                      &scan_from);
-        TEST_ASSERT(complete == (generated[i + 1] == '\0'));
+        status = tool_call_status_inside_thinking(text.ptr, text.len,
+                                                  &scan_from);
+        TEST_ASSERT((status == THINK_TOOL_COMPLETE) ==
+                    (generated[i + 1] == '\0'));
     }
-    TEST_ASSERT(complete);
+    TEST_ASSERT(status == THINK_TOOL_COMPLETE);
 
     char *content = NULL;
     char *reasoning = NULL;
@@ -6270,67 +6447,252 @@ static void test_think_tool_recovery(void) {
 
     fprintf(stderr,
             "ds4-test: think-tool-recovery complete=%d calls=%d name=%s\n",
-            complete ? 1 : 0, calls.len, calls.len ? calls.v[0].name : "-");
+            status == THINK_TOOL_COMPLETE ? 1 : 0,
+            calls.len, calls.len ? calls.v[0].name : "-");
 
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
     buf_free(&text);
+
+    const char *truncated =
+        "The user wants a directory listing.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"list_files\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">." DS4_PARAM_END "\n"
+        DS4_INVOKE_END;
+    scan_from = 0;
+    status = tool_call_status_inside_thinking(truncated, strlen(truncated),
+                                              &scan_from);
+    TEST_ASSERT(status == THINK_TOOL_STARTED);
+
+    buf repaired = {0};
+    TEST_ASSERT(try_repair_dsml(truncated, strlen(truncated), &repaired));
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    parsed = parse_generated_message_ex(repaired.ptr, true,
+                                        &content, &reasoning, &calls);
+    TEST_ASSERT(parsed);
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "list_files"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning &&
+                !strcmp(reasoning, "The user wants a directory listing."));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    buf_free(&repaired);
+
+    openai_stream_mode stream_mode = OPENAI_STREAM_THINKING;
+    char *wire = test_openai_reasoning_stream_wire(truncated, &stream_mode);
+    TEST_ASSERT(wire != NULL);
+    TEST_ASSERT(stream_mode == OPENAI_STREAM_SUPPRESS);
+    TEST_ASSERT(wire && strstr(wire, "reasoning_content"));
+    TEST_ASSERT(wire && strstr(wire, "list_files"));
+    free(wire);
+
+    const char *closed_in_reasoning =
+        "plan\n\n" DS4_TOOL_CALLS_START "\nnot a call</think>VISIBLE";
+    wire = test_openai_reasoning_stream_wire(closed_in_reasoning, &stream_mode);
+    TEST_ASSERT(wire != NULL);
+    TEST_ASSERT(stream_mode == OPENAI_STREAM_SUPPRESS);
+    TEST_ASSERT(wire && strstr(wire, "reasoning_content"));
+    TEST_ASSERT(wire && strstr(wire, "tool_calls"));
+    TEST_ASSERT(wire && strstr(wire, "VISIBLE"));
+    free(wire);
+
+    wire = test_openai_reasoning_stream_wire(generated, &stream_mode);
+    TEST_ASSERT(wire != NULL);
+    TEST_ASSERT(stream_mode == OPENAI_STREAM_SUPPRESS);
+    TEST_ASSERT(wire && strstr(wire, "reasoning_content"));
+    TEST_ASSERT(!wire || !strstr(wire, "list_files"));
+    free(wire);
+}
+
+typedef struct {
+    char *raw;
+    char *content;
+    char *reasoning;
+    tool_calls calls;
+    const char *finish;
+} test_chat_turn;
+
+static void test_chat_turn_free(test_chat_turn *turn) {
+    if (!turn) return;
+    free(turn->raw);
+    free(turn->content);
+    free(turn->reasoning);
+    tool_calls_free(&turn->calls);
+    memset(turn, 0, sizeof(*turn));
+}
+
+/* Run the same greedy stop/tool-marker/response parse path needed by the server,
+ * while keeping one session alive so the next request genuinely continues from
+ * this sampled turn. */
+static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
+                                    const request *r, test_chat_turn *turn) {
+    memset(turn, 0, sizeof(*turn));
+    char err[160] = {0};
+    if (ds4_session_sync(session, &r->prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-test: tool-call sync failed: %s\n", err);
+        turn->finish = "error";
+        return false;
+    }
+
+    buf text = {0};
+    uint64_t rng = 123;
+    const char *finish = "length";
+    bool saw_tool_start = false;
+    bool saw_tool_end = false;
+    bool decode_ok = true;
+
+    for (int i = 0; i < r->max_tokens; i++) {
+        int token = ds4_session_sample(session, r->temperature, r->top_k,
+                                       r->top_p, r->min_p, &rng);
+        if (ds4_token_is_stop_for_think_mode(engine, token, r->think_mode)) {
+            finish = "stop";
+            break;
+        }
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            finish = "error";
+            decode_ok = false;
+            break;
+        }
+
+        size_t piece_len = 0;
+        char *piece = ds4_token_text(engine, token, &piece_len);
+        buf_append(&text, piece, piece_len);
+        free(piece);
+        if (r->has_tools) {
+            observe_tool_markers(text.ptr ? text.ptr : "",
+                                 &saw_tool_start, &saw_tool_end, NULL);
+            if (saw_tool_end) {
+                finish = "tool_calls";
+                break;
+            }
+        }
+    }
+
+    turn->raw = buf_take(&text);
+    turn->finish = finish;
+    if (!decode_ok) {
+        fprintf(stderr, "ds4-test: tool-call decode failed: %s\n", err);
+        return false;
+    }
+
+    bool recovered = false;
+    bool parsed = parse_generated_message_for_response_for_syntax(
+        r->model_syntax,
+        turn->raw ? turn->raw : "",
+        r->has_tools,
+        saw_tool_start,
+        ds4_think_mode_enabled(r->think_mode),
+        &turn->finish,
+        err,
+        sizeof(err),
+        &turn->content,
+        &turn->reasoning,
+        &turn->calls,
+        &recovered);
+    if (turn->calls.len > 0) turn->finish = "tool_calls";
+    if (!parsed) {
+        fprintf(stderr,
+                "ds4-test: generated message parse failed: %s recovered=%d raw=%s\n",
+                err, recovered ? 1 : 0, turn->raw ? turn->raw : "");
+    }
+    return parsed;
 }
 
 static void test_tool_call_quality_one(bool quality) {
     ds4_engine *engine = test_get_engine(quality);
     if (!engine) return;
 
-    request r;
-    char err[160];
-    TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
-                                   512, 32768, &r, err, sizeof(err)));
+    server s = {0};
+    s.engine = engine;
+    pthread_mutex_init(&s.tool_mu, NULL);
 
+    request first_request = {0};
+    request second_request = {0};
     ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
-    if (!session) {
-        request_free(&r);
-        return;
+    test_chat_turn first = {0};
+    test_chat_turn second = {0};
+    char *second_body = NULL;
+    char err[160] = {0};
+
+    bool request_ok = parse_chat_request(engine, &s,
+                                         test_tool_call_request_json(),
+                                         512, 32768, &first_request,
+                                         err, sizeof(err));
+    TEST_ASSERT(request_ok);
+    if (!request_ok) goto done;
+
+    bool session_ok = ds4_session_create(&session, engine, 32768) == 0;
+    TEST_ASSERT(session_ok);
+    if (!session_ok) goto done;
+
+    bool first_ok = test_generate_chat_turn(engine, session,
+                                            &first_request, &first);
+    TEST_ASSERT(first_ok);
+    TEST_ASSERT(first.finish && !strcmp(first.finish, "tool_calls"));
+    TEST_ASSERT(first.calls.len == 1);
+    TEST_ASSERT(first.calls.len == 1 && first.calls.v[0].name &&
+                !strcmp(first.calls.v[0].name, "list_files"));
+    TEST_ASSERT(first.calls.raw_tool_text && first.calls.raw_tool_text[0]);
+    if (!first_ok || first.calls.len != 1 ||
+        !first.calls.v[0].name ||
+        strcmp(first.calls.v[0].name, "list_files") ||
+        !first.calls.raw_tool_text || !first.calls.raw_tool_text[0]) {
+        goto done;
     }
-    TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
-    buf text = {0};
-    uint64_t rng = 123;
-    bool decode_ok = true;
-    bool saw_tool_start = false;
-    bool saw_tool_end = false;
-    for (int i = 0; i < r.max_tokens; i++) {
-        int token = ds4_session_sample(session, r.temperature, r.top_k,
-                                       r.top_p, r.min_p, &rng);
-        size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, token, &piece_len);
-        buf_append(&text, piece, piece_len);
-        free(piece);
-        observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
-        if (saw_tool_end) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-            decode_ok = false;
-            break;
-        }
-    }
+    /* Use the real response-side id assignment and exact sampled-DSML memory.
+     * The same id is serialized on both the assistant call and tool result. */
+    assign_tool_call_ids(&s, &first.calls, API_OPENAI);
+    TEST_ASSERT(first.calls.v[0].id && first.calls.v[0].id[0]);
+    if (!first.calls.v[0].id || !first.calls.v[0].id[0]) goto done;
+    tool_memory_remember(&s, &first.calls);
 
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    bool parsed = parse_generated_message_ex(text.ptr ? text.ptr : "",
-                                             false, &content, &reasoning, &calls);
-    TEST_ASSERT(decode_ok);
-    TEST_ASSERT(parsed);
-    TEST_ASSERT(calls.len > 0);
-    TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
+    second_body = test_tool_result_request_json(first.content,
+                                                &first.calls.v[0]);
+    TEST_ASSERT(second_body != NULL);
+    if (!second_body) goto done;
 
-    free(content);
-    free(reasoning);
-    tool_calls_free(&calls);
-    buf_free(&text);
+    err[0] = '\0';
+    request_ok = parse_chat_request(engine, &s, second_body,
+                                    512, 32768, &second_request,
+                                    err, sizeof(err));
+    TEST_ASSERT(request_ok);
+    if (!request_ok) goto done;
+    TEST_ASSERT(second_request.tool_replay.mem == 1);
+    TEST_ASSERT(second_request.tool_replay.disk == 0);
+    TEST_ASSERT(second_request.tool_replay.canonical == 0);
+    TEST_ASSERT(second_request.tool_replay.missing_ids == 0);
+
+    bool second_ok = test_generate_chat_turn(engine, session,
+                                             &second_request, &second);
+    TEST_ASSERT(second_ok);
+    TEST_ASSERT(second.finish && !strcmp(second.finish, "stop"));
+    TEST_ASSERT(second.calls.len == 0);
+    TEST_ASSERT(second.content && second.content[0]);
+
+    fprintf(stderr,
+            "ds4-test: post-tool-result turn1 finish_reason=%s tool_calls=%d "
+            "turn2 finish_reason=%s tool_calls=%d replay_mem=%d\n",
+            first.finish ? first.finish : "-", first.calls.len,
+            second.finish ? second.finish : "-", second.calls.len,
+            second_request.tool_replay.mem);
+
+done:
+    free(second_body);
+    test_chat_turn_free(&second);
+    test_chat_turn_free(&first);
     ds4_session_free(session);
-    request_free(&r);
+    request_free(&second_request);
+    request_free(&first_request);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_tool_call_quality(void) {
@@ -6599,7 +6961,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
-    {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
+    {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
@@ -6634,6 +6996,7 @@ static void test_print_help(const char *prog) {
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  DS4_TEST_BACKEND=cpu       Run model tests on CPU instead of Metal/CUDA.");
     puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through Metal SSD streaming.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");

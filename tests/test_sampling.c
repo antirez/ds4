@@ -227,6 +227,49 @@ static void compare_case(const float *logits, float *scratch, uint32_t n,
     }
 }
 
+static void check_greedy_argmax_case(const float *logits, uint32_t n,
+                                     int expected, const char *label) {
+    uint64_t unrolled_rng = 0x1234u;
+    uint64_t scalar_rng = unrolled_rng;
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s select unrolled argmax", label);
+    const int unrolled = ds4_test_sample_logits(
+            logits, n, 0.0f, 0, 1.0f, 0.0f, &unrolled_rng, NULL);
+    CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
+          "%s select scalar argmax", label);
+    const int scalar = ds4_test_sample_logits(
+            logits, n, 0.0f, 0, 1.0f, 0.0f, &scalar_rng, NULL);
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s restore unrolled argmax", label);
+    CHECK(unrolled == scalar,
+          "%s unrolled=%d scalar=%d", label, unrolled, scalar);
+    CHECK(unrolled == expected,
+          "%s token=%d expected=%d", label, unrolled, expected);
+    CHECK(unrolled_rng == 0x1234u && scalar_rng == 0x1234u,
+          "%s greedy argmax changed RNG state", label);
+}
+
+static void check_excluding_argmax_case(const float *logits, uint32_t n,
+                                        int excluded_id, int expected,
+                                        const char *label) {
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s select unrolled excluding argmax", label);
+    const int unrolled = ds4_test_argmax_excluding_logits(
+            logits, n, excluded_id);
+    CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
+          "%s select scalar excluding argmax", label);
+    const int scalar = ds4_test_argmax_excluding_logits(
+            logits, n, excluded_id);
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "%s restore unrolled excluding argmax", label);
+    CHECK(unrolled == scalar,
+          "%s excluded=%d unrolled=%d scalar=%d",
+          label, excluded_id, unrolled, scalar);
+    CHECK(unrolled == expected,
+          "%s excluded=%d token=%d expected=%d",
+          label, excluded_id, unrolled, expected);
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -251,8 +294,75 @@ int main(void) {
                  "top-p");
     compare_case(logits, scratch, semantic_n, 0.8f, 64, 0.9f, 0.05f,
                  "top-k");
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "select unrolled argmax default");
     compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f,
                  "greedy");
+    CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
+          "set scalar argmax control");
+    compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f,
+                 "greedy-scalar-control");
+    CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
+          "restore unrolled argmax default");
+
+    const float cross_lane_tie[] = {
+        -4.0f, 9.0f, -2.0f, 3.0f, 1.0f, 5.0f, 0.0f, 7.0f,
+         9.0f, 4.0f,  6.0f, 2.0f, 8.0f, 1.0f, 3.0f, 0.0f,
+         9.0f,
+    };
+    check_greedy_argmax_case(
+            cross_lane_tie,
+            (uint32_t)(sizeof(cross_lane_tie) / sizeof(cross_lane_tie[0])),
+            1, "greedy-cross-lane-tie");
+
+    const float tail_tie[] = {
+        -3.0f, 0.0f, 8.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,
+         6.0f, 7.0f, 8.0f,
+    };
+    check_greedy_argmax_case(
+            tail_tie,
+            (uint32_t)(sizeof(tail_tie) / sizeof(tail_tie[0])),
+            2, "greedy-tail-tie");
+
+    const float nonfinite_greedy[] = {
+        NAN, -INFINITY, -2.0e30f, INFINITY, INFINITY, 1.0f, NAN, 0.0f, 2.0f,
+    };
+    check_greedy_argmax_case(
+            nonfinite_greedy,
+            (uint32_t)(sizeof(nonfinite_greedy) /
+                       sizeof(nonfinite_greedy[0])),
+            3, "greedy-nonfinite");
+
+    const float below_sentinel[] = {
+        -2.0e30f, -1.5e30f, -INFINITY, NAN, -3.0e30f,
+    };
+    check_greedy_argmax_case(
+            below_sentinel,
+            (uint32_t)(sizeof(below_sentinel) / sizeof(below_sentinel[0])),
+            0, "greedy-below-sentinel");
+
+    const uint32_t excluding_n =
+        (uint32_t)(sizeof(cross_lane_tie) / sizeof(cross_lane_tie[0]));
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, -1, 1, "excluding-none");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, 1, 8, "excluding-best");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, 8, 1, "excluding-later-tie");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, 16, 1, "excluding-tail-tie");
+    check_excluding_argmax_case(
+            cross_lane_tie, excluding_n, (int)excluding_n, 1,
+            "excluding-out-of-range");
+    check_excluding_argmax_case(
+            nonfinite_greedy,
+            (uint32_t)(sizeof(nonfinite_greedy) /
+                       sizeof(nonfinite_greedy[0])),
+            -1, 0, "excluding-leading-nan");
+    check_excluding_argmax_case(
+            below_sentinel,
+            (uint32_t)(sizeof(below_sentinel) / sizeof(below_sentinel[0])),
+            0, 1, "excluding-first-anchor");
 
     /* Exercise min-p values immediately around expf's cutoff. */
     const float cutoff = logf(0.05f);

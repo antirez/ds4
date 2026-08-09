@@ -497,6 +497,189 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
+// Decode-only fusion of the router logits matvec (F16, embd -> n_expert)
+// with the shared-expert gate/up SwiGLU (Q8_0, embd -> shared).  Both read
+// the same normalized FFN input back to back; one dispatch removes one
+// launch per decode layer.  Router threadgroups replicate
+// kernel_mul_mv_f16_f32_4 (nsg=8, nr0=2); shared threadgroups host two
+// virtual 4-simdgroup cohorts replicating
+// kernel_dsv4_shared_gate_up_swiglu_q8_0 (nsg=4, nr0=2), including its
+// per-row simd/shmem reduction trees.  Bit-exact by construction.
+kernel void kernel_dsv4_router_shared_gate_up_q8_0(
+        constant ds4_metal_args_mul_mv & args,
+        constant ds4_metal_args_mul_mv & sargs,
+        device const char * src0_router,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_router,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NW = N_SIMDWIDTH;
+    const uint router_tgs = ((uint)args.ne01 + 1u) / 2u;
+
+    if (tgpig.x < router_tgs) {
+        // Exact replica of kernel_mul_mv_f16_f32_4 with NSG=8, NR0=2.
+        constexpr short NSG = 8;
+        constexpr short NR0 = 2;
+        constexpr short NB  = 32;
+        constexpr short NF  = 16;
+        constexpr short NF4 = NF/4;
+
+        const int nb = args.ne00/NB;
+        const int r0 = tgpig.x*NR0;
+
+        device const float4 * y4 = (device const float4 *) src1;
+
+        device const half4 * ax4[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            ax4[row] = (device const half4 *)
+                (src0_router + (uint64_t)(r0 + row)*args.nb01);
+        }
+
+        float sumf[NR0] = { 0.f };
+
+        const short ix = tiisg/(NW/NF);
+        const short il = tiisg%(NW/NF);
+        const int ib0 = sgitg*NF + ix;
+
+        device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+        for (int ib = ib0; ib < nb; ib += NSG*NF) {
+            float4 yl4[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[i];
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                device const half4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xb4[i]), yl4[i]);
+                }
+
+                sumf[row] += sumq;
+            }
+
+            yb4 += NSG*NF*NW/4;
+        }
+
+        device float * dst_f32 = (device float *) dst_router;
+        helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01,
+                                        tiisg, sgitg, shmem);
+        return;
+    }
+
+    // Shared-expert part: two virtual nsg=4 cohorts per threadgroup, each an
+    // exact replica of kernel_dsv4_shared_gate_up_swiglu_q8_0 (NR0=2).
+    constexpr short NSG = 4;
+    constexpr short NR0 = 2;
+    constexpr short NQ  = 8;
+
+    const uint   cohort = sgitg >> 2;
+    const ushort vsg    = sgitg & 3u;
+    const uint   vt     = (tgpig.x - router_tgs) * 2u + cohort;
+
+    const int nb = sargs.ne00 / QK8_0;
+    const int r0 = vt * NR0;
+
+    device const float *y = (device const float *) src1;
+
+    device const block_q8_0 *ag[NR0];
+    device const block_q8_0 *au[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row) * sargs.nb01;
+        ag[row] = (device const block_q8_0 *)(src0_gate + offset0);
+        au[row] = (device const block_q8_0 *)(src0_up   + offset0);
+    }
+
+    float sumg[NR0] = { 0.f };
+    float sumu[NR0] = { 0.f };
+
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = vsg * NQ + ix;
+    float yl[NQ];
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t *qg = ag[row][ib].qs + il * NQ;
+            device const int8_t *qu = au[row][ib].qs + il * NQ;
+
+            float sg = 0.f;
+            float su = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sg += qg[i] * yl[i];
+                su += qu[i] * yl[i];
+            }
+
+            sumg[row] += sg * ag[row][ib].d;
+            sumu[row] += su * au[row][ib].d;
+        }
+
+        yb += NSG * NQ * QK8_0;
+    }
+
+    threadgroup float *shmem_f32 = (threadgroup float *)shmem + cohort * (2*NR0*NW);
+    threadgroup float *sh_gate[NR0];
+    threadgroup float *sh_up[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        sh_gate[row] = shmem_f32 + NW * row;
+        sh_up[row]   = shmem_f32 + NW * (NR0 + row);
+        if (vsg == 0) {
+            sh_gate[row][tiisg] = 0.0f;
+            sh_up[row][tiisg] = 0.0f;
+        }
+        sumg[row] = simd_sum(sumg[row]);
+        sumu[row] = simd_sum(sumu[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            sh_gate[row][vsg] = sumg[row];
+            sh_up[row][vsg] = sumu[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *gate_f32 = (device float *)dst_gate;
+    device float *up_f32   = (device float *)dst_up;
+    device float *mid_f32  = (device float *)dst_mid;
+
+    FOR_UNROLL (short row = 0; row < NR0 && r0 + row < sargs.ne01; ++row) {
+        const float gate = simd_sum(sh_gate[row][tiisg]);
+        const float up = simd_sum(sh_up[row][tiisg]);
+        if (tiisg == 0 && vsg == 0) {
+            const uint out_row = r0 + row;
+            gate_f32[out_row] = gate;
+            up_f32[out_row] = up;
+            float g = gate;
+            float u = up;
+            if (clamp_value > 1.0e-6f) {
+                g = min(g, clamp_value);
+                u = clamp(u, -clamp_value, clamp_value);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u;
+        }
+    }
+}
+
 [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_r4")]]
 kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0_r4(
         constant ds4_metal_args_mul_mv & args,
@@ -963,6 +1146,311 @@ kernel void kernel_mul_mv_f16_f32_pair_compressor_store_4(
             (device volatile const float *)dst_a;
     device volatile const float * projected_score =
             (device volatile const float *)dst_b;
+    float ape_v;
+    if (store.ape_type == 1u) {
+        ape_v = (float)(((device const half *)ape)[ape_i]);
+    } else {
+        ape_v = ((device const float *)ape)[ape_i];
+    }
+
+    state_kv[dst] = projected_kv[col];
+    state_score[dst] = projected_score[col] + ape_v;
+}
+
+// Decode compressor + indexer-compressor projection in one dispatch.  Both
+// pairs read the same normalized activation with the same F16 matvec shape,
+// so one launch covers all four matrices: threadgroups below the first
+// range boundary run the exact paired matvec + state store of
+// kernel_mul_mv_f16_f32_pair_compressor_store_4 for the attention
+// compressor, the rest for the indexer compressor.  Per-row reduction trees
+// and the per-threadgroup state stores are unchanged, keeping the fused
+// result bit-identical to the two separate dispatches while removing one
+// dispatch per decode layer.
+kernel void kernel_mul_mv_f16_f32_quad_compressor_store_4(
+        constant ds4_metal_args_mul_mv & args,
+        constant ds4_metal_args_compressor_pair_store & store0,
+        constant ds4_metal_args_compressor_pair_store & store1,
+        device const char * src0_a0,
+        device const char * src0_b0,
+        device const char * src0_a1,
+        device const char * src0_b1,
+        device const char * src1,
+        device       char * dst_a0,
+        device       char * dst_b0,
+        device       char * dst_a1,
+        device       char * dst_b1,
+        device const char * ape0,
+        device const char * ape1,
+        device       float * state0_kv,
+        device       float * state0_score,
+        device       float * state1_kv,
+        device       float * state1_score,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        ushort tiitg  [[thread_index_in_threadgroup]],
+        ushort tiisg  [[thread_index_in_simdgroup]],
+        ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    const uint tgs0 = ((uint)store0.width + NR0 - 1u) / NR0;
+    const bool second = tgpig.x >= tgs0;
+
+    uint3 local_tgpig = tgpig;
+    if (second) local_tgpig.x = tgpig.x - tgs0;
+
+    ds4_metal_args_mul_mv largs = args;
+    largs.nr0 = NR0;
+    largs.ne01 = second ? (int32_t)store1.width : (int32_t)store0.width;
+
+    if (!second) {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, src0_a0, src0_b0, src1, dst_a0, dst_b0,
+                shmem, local_tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, src0_a1, src0_b1, src1, dst_a1, dst_b1,
+                shmem, local_tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // State append: identical to the paired store kernel, scoped to the
+    // range this threadgroup just projected (its own outputs only).
+    constant ds4_metal_args_compressor_pair_store & store = second ? store1 : store0;
+    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
+        return;
+    }
+    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
+    if (col >= store.width) return;
+
+    const uint pos_mod = store.pos % store.ratio;
+    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
+    const uint dst = dst_row * store.width + col;
+    const uint ape_i = pos_mod * store.width + col;
+
+    device volatile const float * projected_kv = second
+        ? (device volatile const float *)dst_a1
+        : (device volatile const float *)dst_a0;
+    device volatile const float * projected_score = second
+        ? (device volatile const float *)dst_b1
+        : (device volatile const float *)dst_b0;
+    device const char * ape = second ? ape1 : ape0;
+    device float * state_kv = second ? state1_kv : state0_kv;
+    device float * state_score = second ? state1_score : state0_score;
+
+    float ape_v;
+    if (store.ape_type == 1u) {
+        ape_v = (float)(((device const half *)ape)[ape_i]);
+    } else {
+        ape_v = ((device const float *)ape)[ape_i];
+    }
+
+    state_kv[dst] = projected_kv[col];
+    state_score[dst] = projected_score[col] + ape_v;
+}
+
+/* Decode-only fusion: one dispatch covers the q_a/kv Q8 pair projection and
+ * the four F16 compressor projections (attention + indexer) with their
+ * state-store epilogue.  Both stages read the same normalized attention
+ * input and write disjoint outputs.  The q_a/kv range hosts two virtual
+ * NSG=4 cohorts per threadgroup, each an exact replica of
+ * kernel_mul_mv_q8_0_f32_pair (same per-lane K walk and reduction tree, cf.
+ * kernel_dsv4_router_shared_gate_up_q8_0); the compressor ranges run
+ * kernel_mul_mv_f16_f32_pair_4_impl<2> and the paired store epilogue
+ * verbatim, so every output bit matches the two separate dispatches. */
+kernel void kernel_dsv4_qkv_pair_quad_compressor_store_q8_0(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        constant ds4_metal_args_mul_mv & cargs,
+        constant ds4_metal_args_compressor_pair_store & store0,
+        constant ds4_metal_args_compressor_pair_store & store1,
+        constant uint & pair_vtgs,
+        device const char * qw0,
+        device const char * qw1,
+        device const char * cw0a,
+        device const char * cw0b,
+        device const char * cw1a,
+        device const char * cw1b,
+        device const char * src1,
+        device       char * dst0,
+        device       char * dst1,
+        device       char * cdst_a0,
+        device       char * cdst_b0,
+        device       char * cdst_a1,
+        device       char * cdst_b1,
+        device const char * ape0,
+        device const char * ape1,
+        device       float * state0_kv,
+        device       float * state0_score,
+        device       float * state1_kv,
+        device       float * state1_score,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        ushort tiitg  [[thread_index_in_threadgroup]],
+        ushort tiisg  [[thread_index_in_simdgroup]],
+        ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NW = N_SIMDWIDTH;
+    const uint pair_ctgs = (pair_vtgs + 1u) / 2u;
+
+    if (tgpig.x < pair_ctgs) {
+        /* Q8 pair range: cohort c of threadgroup t runs virtual pair
+         * threadgroup 2t+c with the original NSG=4 mapping. */
+        constexpr short NSG = 4;
+        constexpr short NQ  = 8;
+        constexpr short NR0 = 2;
+        const uint   cohort = sgitg >> 2;
+        const ushort vsg    = sgitg & 3u;
+        const uint   vt     = tgpig.x * 2u + cohort;
+        const bool   valid  = vt < pair_vtgs;
+
+        const int r0 = vt * NR0;
+        const bool active_a = valid && r0 < args0.ne01;
+        const bool active_b = valid && r0 < args1.ne01;
+        const int nb = args0.ne00 / QK8_0;
+
+        device const float *y = (device const float *)src1;
+        device const block_q8_0 *ax_a[NR0];
+        device const block_q8_0 *ax_b[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const int out_row = r0 + row;
+            ax_a[row] = active_a && out_row < args0.ne01
+                ? (device const block_q8_0 *)(qw0 + (uint64_t)out_row * args0.nb01)
+                : (device const block_q8_0 *)qw0;
+            ax_b[row] = active_b && out_row < args1.ne01
+                ? (device const block_q8_0 *)(qw1 + (uint64_t)out_row * args1.nb01)
+                : (device const block_q8_0 *)qw1;
+        }
+
+        float suma[NR0] = { 0.f };
+        float sumb[NR0] = { 0.f };
+        const short ix = tiisg / (NW / NQ);
+        const short il = tiisg % (NW / NQ);
+        const int ib0 = vsg * NQ + ix;
+        float yl[NQ];
+        device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+        if (valid) {
+            for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    yl[i] = yb[i];
+                }
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    const int out_row = r0 + row;
+                    if (active_a && out_row < args0.ne01) {
+                        device const int8_t *qs = ax_a[row][ib].qs + il * NQ;
+                        float sumq = 0.f;
+                        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                            sumq += qs[i] * yl[i];
+                        }
+                        suma[row] += sumq * ax_a[row][ib].d;
+                    }
+                    if (active_b && out_row < args1.ne01) {
+                        device const int8_t *qs = ax_b[row][ib].qs + il * NQ;
+                        float sumq = 0.f;
+                        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                            sumq += qs[i] * yl[i];
+                        }
+                        sumb[row] += sumq * ax_b[row][ib].d;
+                    }
+                }
+                yb += NSG * NQ * QK8_0;
+            }
+        }
+
+        threadgroup float *shared =
+            (threadgroup float *)shmem + cohort * (2 * NR0 * NW);
+        threadgroup float *sha[NR0];
+        threadgroup float *shb[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sha[row] = shared + NW * row;
+            shb[row] = shared + NW * (NR0 + row);
+            if (vsg == 0) {
+                sha[row][tiisg] = 0.0f;
+                if (active_b) shb[row][tiisg] = 0.0f;
+            }
+            suma[row] = simd_sum(suma[row]);
+            if (active_b) sumb[row] = simd_sum(sumb[row]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) {
+                sha[row][vsg] = suma[row];
+                if (active_b) shb[row][vsg] = sumb[row];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device float *out_a = (device float *)dst0;
+        device float *out_b = (device float *)dst1;
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const float total_a = simd_sum(sha[row][tiisg]);
+            if (tiisg == 0 && vsg == 0) {
+                const int out_row = r0 + row;
+                if (active_a && out_row < args0.ne01) out_a[out_row] = total_a;
+            }
+            if (active_b) {
+                const float total_b = simd_sum(shb[row][tiisg]);
+                if (tiisg == 0 && vsg == 0) {
+                    const int out_row = r0 + row;
+                    if (out_row < args1.ne01) out_b[out_row] = total_b;
+                }
+            }
+        }
+        return;
+    }
+
+    /* Compressor quad range: verbatim body of
+     * kernel_mul_mv_f16_f32_quad_compressor_store_4 on the shifted grid. */
+    constexpr short NR0 = 2;
+    const uint lx = tgpig.x - pair_ctgs;
+    const uint tgs0 = ((uint)store0.width + NR0 - 1u) / NR0;
+    const bool second = lx >= tgs0;
+
+    uint3 local_tgpig = tgpig;
+    local_tgpig.x = second ? lx - tgs0 : lx;
+
+    ds4_metal_args_mul_mv largs = cargs;
+    largs.nr0 = NR0;
+    largs.ne01 = second ? (int32_t)store1.width : (int32_t)store0.width;
+
+    if (!second) {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, cw0a, cw0b, src1, cdst_a0, cdst_b0,
+                shmem, local_tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+                largs, cw1a, cw1b, src1, cdst_a1, cdst_b1,
+                shmem, local_tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // State append: identical to the paired store kernel, scoped to the
+    // range this threadgroup just projected (its own outputs only).
+    constant ds4_metal_args_compressor_pair_store & store = second ? store1 : store0;
+    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
+        return;
+    }
+    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
+    if (col >= store.width) return;
+
+    const uint pos_mod = store.pos % store.ratio;
+    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
+    const uint dst = dst_row * store.width + col;
+    const uint ape_i = pos_mod * store.width + col;
+
+    device volatile const float * projected_kv = second
+        ? (device volatile const float *)cdst_a1
+        : (device volatile const float *)cdst_a0;
+    device volatile const float * projected_score = second
+        ? (device volatile const float *)cdst_b1
+        : (device volatile const float *)cdst_b0;
+    device const char * ape = second ? ape1 : ape0;
+    device float * state_kv = second ? state1_kv : state0_kv;
+    device float * state_score = second ? state1_score : state0_score;
+
     float ape_v;
     if (store.ape_type == 1u) {
         ape_v = (float)(((device const half *)ape)[ape_i]);

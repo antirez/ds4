@@ -4915,6 +4915,270 @@ kernel void kernel_dsv4_router_finalize_weights_one_simd(
     }
 }
 
+// M3 decode specialization that materializes the probability
+// transform in device memory before running the exact SIMD selection and
+// weight normalization above. The volatile reload after the device barrier
+// pins the same float store/load boundary as the standalone transform dispatch.
+kernel void kernel_dsv4_router_transform_finalize_weights_one_simd(
+        constant ds4_metal_args_dsv4_router_select_one & args,
+        device const float *logits,
+        device float *probs,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= 256 || args.hash_mode) return;
+
+    if (tid < 64) {
+        device const float4 *s = (device const float4 *)logits;
+        device float4 *d = (device float4 *)probs;
+        const float4 x = s[tid];
+        const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+        d[tid] = sqrt(sp);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    device volatile const float *reloaded_probs =
+        (device volatile const float *)probs;
+
+    (void)hash;
+    (void)tokens;
+    threadgroup float *score0_tg = scratch;
+    threadgroup int32_t *idx0_tg =
+        (threadgroup int32_t *)(scratch + 256);
+    threadgroup float *score1_tg = scratch + 512;
+    threadgroup int32_t *idx1_tg =
+        (threadgroup int32_t *)(scratch + 768);
+    const float p = reloaded_probs[tid];
+    float score = args.has_bias ? p + bias[tid] : p;
+    int32_t idx = (int32_t)tid;
+    uint cross_stage = 0;
+
+    for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            float peer_score;
+            int32_t peer_idx;
+            bool take_peer;
+            const bool lower = (tid & j) == 0;
+            const bool descending = (tid & k) == 0;
+
+            if (j < 32) {
+                peer_score = simd_shuffle_xor(score, (ushort)j);
+                peer_idx = simd_shuffle_xor(idx, (ushort)j);
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+            } else {
+                threadgroup float *score_tg =
+                    (cross_stage & 1u) != 0u ? score1_tg : score0_tg;
+                threadgroup int32_t *idx_tg =
+                    (cross_stage & 1u) != 0u ? idx1_tg : idx0_tg;
+                score_tg[tid] = score;
+                idx_tg[tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint other = tid ^ j;
+                peer_score = score_tg[other];
+                peer_idx = idx_tg[other];
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+                cross_stage++;
+            }
+        }
+    }
+
+    if (tid < 6) {
+        selected[tid] = idx;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    threadgroup volatile float *norm_scratch =
+        (threadgroup volatile float *)scratch;
+    if (tid == 0) {
+        device const int32_t *s = selected;
+        norm_scratch[0] = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            norm_scratch[0] =
+                norm_scratch[0] + reloaded_probs[s[i]];
+        }
+        norm_scratch[0] = max(norm_scratch[0], 6.103515625e-5f);
+        norm_scratch[1] = 1.5f / norm_scratch[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 6) {
+        device const int32_t *s = selected;
+        weights[tid] = reloaded_probs[s[tid]] * norm_scratch[1];
+    }
+}
+
+kernel void kernel_dsv4_router_project_select_fused(
+        constant ds4_metal_args_mul_mv & args,
+        constant ds4_metal_args_dsv4_router_select_one & select_args,
+        device const char * src0_router,
+        device const char * src1,
+        device float * logits,
+        device float * probs,
+        device const float * bias,
+        device int32_t * selected,
+        device float * weights,
+        device atomic_uint * completion,
+        threadgroup char * shmem_raw [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 8;
+    constexpr short NR0 = 2;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+    constexpr short NW  = N_SIMDWIDTH;
+    const uint tid = tpitg.x;
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+    device const float4 *y4 = (device const float4 *)src1;
+    device const half4 *ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax4[row] = (device const half4 *)
+            (src0_router + (uint64_t)(r0 + row)*args.nb01);
+    }
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+    device const float4 *yb4 = y4 + (ib0*NB + il*NF)/4;
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        float4 yl4[NF4];
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const half4 *xb4 = ax4[row] + (ib*NB + il*NF)/4;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), yl4[i]);
+            }
+            sumf[row] += sumq;
+        }
+        yb4 += NSG*NF*NW/4;
+    }
+    helper_mv_reduce_and_write<NR0>(logits, sumf, r0, args.ne01,
+                                    tiisg, sgitg, shmem_raw);
+
+    threadgroup float *scratch = (threadgroup float *)shmem_raw;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    atomic_thread_fence(mem_flags::mem_device,
+                        memory_order_seq_cst,
+                        thread_scope_device);
+    if (tid == 0) {
+        const uint old = atomic_fetch_add_explicit(
+            completion, 1u, memory_order_relaxed);
+        scratch[0] = old == 127u ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (scratch[0] == 0.0f) return;
+    atomic_thread_fence(mem_flags::mem_device,
+                        memory_order_seq_cst,
+                        thread_scope_device);
+
+    if (tid < 64) {
+        device volatile const float4 *s =
+            (device volatile const float4 *)logits;
+        device float4 *d = (device float4 *)probs;
+        const float4 xv = s[tid];
+        const float4 sp = select(log(1.0f + exp(xv)), xv, xv > 20.0f);
+        d[tid] = sqrt(sp);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    device volatile const float *reloaded_probs =
+        (device volatile const float *)probs;
+
+    threadgroup float *score0_tg = scratch;
+    threadgroup int32_t *idx0_tg =
+        (threadgroup int32_t *)(scratch + 256);
+    threadgroup float *score1_tg = scratch + 512;
+    threadgroup int32_t *idx1_tg =
+        (threadgroup int32_t *)(scratch + 768);
+    const float p = reloaded_probs[tid];
+    float score = select_args.has_bias ? p + bias[tid] : p;
+    int32_t idx = (int32_t)tid;
+    uint cross_stage = 0;
+    for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            float peer_score;
+            int32_t peer_idx;
+            bool take_peer;
+            const bool lower = (tid & j) == 0;
+            const bool descending = (tid & k) == 0;
+            if (j < 32) {
+                peer_score = simd_shuffle_xor(score, (ushort)j);
+                peer_idx = simd_shuffle_xor(idx, (ushort)j);
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+            } else {
+                threadgroup float *score_tg =
+                    (cross_stage & 1u) != 0u ? score1_tg : score0_tg;
+                threadgroup int32_t *idx_tg =
+                    (cross_stage & 1u) != 0u ? idx1_tg : idx0_tg;
+                score_tg[tid] = score;
+                idx_tg[tid] = idx;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const uint other = tid ^ j;
+                peer_score = score_tg[other];
+                peer_idx = idx_tg[other];
+                take_peer = descending
+                    ? (lower ? score < peer_score : score > peer_score)
+                    : (lower ? score > peer_score : score < peer_score);
+                if (take_peer) {
+                    score = peer_score;
+                    idx = peer_idx;
+                }
+                cross_stage++;
+            }
+        }
+    }
+    if (tid < 6) selected[tid] = idx;
+    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup volatile float *norm_scratch =
+        (threadgroup volatile float *)scratch;
+    if (tid == 0) {
+        norm_scratch[0] = 0.0f;
+        for (uint i = 0; i < 6; ++i) {
+            norm_scratch[0] = norm_scratch[0] + reloaded_probs[selected[i]];
+        }
+        norm_scratch[0] = max(norm_scratch[0], 6.103515625e-5f);
+        norm_scratch[1] = 1.5f / norm_scratch[0];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 6) {
+        weights[tid] = reloaded_probs[selected[tid]] * norm_scratch[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    atomic_thread_fence(mem_flags::mem_device,
+                        memory_order_seq_cst,
+                        thread_scope_device);
+    if (tid == 0) {
+        atomic_store_explicit(completion, 0u, memory_order_relaxed);
+    }
+}
+
+
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows
 // are enabled by kernel_dsv4_topk_mask_scatter in a second ordered dispatch.
 kernel void kernel_dsv4_topk_mask(

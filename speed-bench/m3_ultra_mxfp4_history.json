@@ -1,0 +1,818 @@
+{
+ "schema_version": 1,
+ "campaign_id": "m3_ultra_mxfp4_exact_20260801",
+ "recorded_on": "2026-08-03",
+ "purpose": "Chart-ready record of accepted MXFP4 speedups, raw replicates, controlled attribution, rejected attempts, and exactness evidence.",
+ "files": {
+  "accepted_history": "m3_ultra_mxfp4_history.csv",
+  "raw_runs": "m3_ultra_mxfp4_runs.csv",
+  "controlled_attribution": "m3_ultra_mxfp4_controlled.csv",
+  "rejected_and_diagnostic_attempts": "m3_ultra_mxfp4_attempts.csv"
+ },
+ "environment": {
+  "hardware": "Apple M3 Ultra",
+  "ram_gib": 512,
+  "backend": "Metal",
+  "model": "ds4flash.gguf",
+  "quantization": "MXFP4",
+  "residency": "resident",
+  "tensor_parallel_world": 1,
+  "prompt_file": "speed-bench/promessi_sposi.txt"
+ },
+ "default_platform_scope": {
+  "automatic_target": "shared pre-M5 Apple Silicon path",
+  "apple_soc_families": [
+   "M1",
+   "M2",
+   "M3",
+   "M4"
+  ],
+  "performance_measurement_hardware": "Apple M3 Ultra only",
+  "performance_not_measured_on": [
+   "Apple M1",
+   "Apple M2",
+   "Apple M4"
+  ],
+  "m5_path": "separate and outside these defaults",
+  "rollback_environment_naming": {
+   "canonical_new_prefix": "DS4_METAL_DISABLE_PRE_M5_",
+   "historical_prefix": "DS4_METAL_DISABLE_M3_",
+   "historical_prefix_status": "preserved as compatibility aliases and as provenance for the earlier recorded rounds"
+  }
+ },
+ "benchmark_contract": {
+  "ctx_start": 2048,
+  "ctx_max": 2048,
+  "ctx_alloc": 2081,
+  "step_incr": 2048,
+  "gen_tokens": 32,
+  "prefill_chunk": 4096,
+  "power_percent": 100,
+  "warm_weights": true,
+  "command": "./ds4-bench -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt --ctx-start 2048 --ctx-max 2048 --ctx-alloc 2081 --step-incr 2048 --gen-tokens 32 --prefill-chunk 4096 --power 100 --warm-weights"
+ },
+ "baseline": {
+  "checkpoint": "original",
+  "source_revision": "4893e0c40fba03dbc85555faeb035799aa04e0b6",
+  "selection_rule": "The first baseline run is the immutable denominator; the second run is variance evidence only.",
+  "prefill_tps": 580.08,
+  "gen_tps": 35.27,
+  "gen_first_ms": 31.801,
+  "gen_steady_tps": 36.13,
+  "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+  "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+ },
+ "git_history": [
+  {
+   "revision": "4893e0c40fba03dbc85555faeb035799aa04e0b6",
+   "role": "original_baseline",
+   "committed_at": "2026-08-01T09:50:30+02:00"
+  },
+  {
+   "revision": "4135fa2bb059e5d0fb60a889e1246fcd7602c369",
+   "role": "initial_exact_speedups",
+   "committed_at": "2026-08-01T23:41:26+02:00"
+  },
+  {
+   "revision": "c683fb971fb71e7c329bccc266e2005fd3d4bcc7",
+   "role": "rounds_1_to_3_consolidated",
+   "committed_at": "2026-08-02T01:42:26+02:00"
+  },
+  {
+   "revision": "3658bd648425340c6b3325c8108fdc32c77fc747",
+   "role": "round_4_adaptive_pre_m5_decode_split",
+   "committed_at": "2026-08-02T12:00:14+02:00"
+  },
+  {
+   "revision": "ee5c0f9f8ed0f747f86436acc59495f2edd01c5b",
+   "role": "round_5_mxfp4_down_half_lut",
+   "committed_at": "2026-08-02T13:02:49+02:00"
+  },
+  {
+   "revision": "c0431e3ab9eab6f9fed74cc621f7dfb2da3ff8e0",
+   "role": "round_6_decode_pipeline_fast_lookup",
+   "committed_at": "2026-08-02T13:33:52+02:00"
+  },
+  {
+   "revision": "6b01de156d87965dff8711c463df1085ca8adcdc",
+   "role": "round_7_decode_pipeline_fast_lookup_mul_mv_ext",
+   "committed_at": "2026-08-02T17:23:59+02:00"
+  },
+  {
+   "revision": "2424d2920c9079c2c48e4e85bfd9b2853171c65f",
+   "role": "round_8_flash_attn_pad_blk_memo",
+   "committed_at": "2026-08-02T17:36:30+02:00"
+  },
+  {
+   "revision": "b0d2f020dd45e89c4bbb70329f40cd1f56075f94",
+   "role": "round_9_flash_attn_batched_memo",
+   "committed_at": "2026-08-02T17:49:47+02:00"
+  },
+  {
+   "revision": "3fb202a6fdc307e6161936cfe47a719a8fa878b3",
+   "role": "round_10_decode_second_split16",
+   "committed_at": "2026-08-02T21:18:23+02:00"
+  },
+  {
+   "revision": "c21ec43eeac16f66005fc7a68e31c1f1460fb094",
+   "role": "round_11_mxfp4_moe_decode_nsg1",
+   "committed_at": "2026-08-02T22:02:52+02:00"
+  },
+  {
+   "revision": "6711f7652be20057074f3308555807636396a6b0",
+   "role": "round_12_decode_second_split16_wide3328",
+   "committed_at": "2026-08-02T22:27:17+02:00"
+  },
+  {
+   "revision": "0efef8deee05dce15acf625e7a83493bd187345b",
+   "role": "round_13_mxfp4_moe_decode_tg_multiple",
+   "committed_at": "2026-08-03T01:41:05+02:00"
+  },
+  {
+   "revision": "5c4f816ff3790838a6d32c879da6fddb3fd8c764",
+   "role": "round_14_mxfp4_moe_decode_fixed_route_pair",
+   "committed_at": "2026-08-03T02:18:24+02:00"
+  },
+  {
+   "revision": "f3574462990af2be1dc30e7e517a435be3c423b2",
+   "role": "round_15_mxfp4_moe_decode_fixed_route_sum6",
+   "committed_at": "2026-08-03T02:38:27+02:00"
+  }
+ ],
+ "round_variants": {
+  "round_1": {
+   "accepted_change": "compact-pair-32x32",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_M3_MXFP4_MOE_MM_ID_MAP_SCATTER=1",
+    "DS4_METAL_DISABLE_M3_ROUTER_TRANSFORM_FINALIZE_FUSION=1",
+    "DS4_METAL_DISABLE_M3_COMPRESSOR_EXACT_REDUCTION_FUSION=1"
+   ]
+  },
+  "round_2": {
+   "accepted_change": "router-transform-finalize",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_M3_MXFP4_MOE_MM_ID_MAP_SCATTER=1",
+    "DS4_METAL_DISABLE_M3_COMPRESSOR_EXACT_REDUCTION_FUSION=1"
+   ]
+  },
+  "round_3": {
+   "accepted_change": "token-scatter-map+compressor-softmax-product",
+   "rollback_environment": []
+  },
+  "round_4": {
+   "source_revision": "3658bd648425340c6b3325c8108fdc32c77fc747",
+   "accepted_change": "adaptive-early-decode-split5",
+   "description": "Use a five-layer first command-buffer split for eligible resident MXFP4 decode positions 2048 through 2815, then return to the established four-layer split.",
+   "force_environment": "DS4_METAL_ENABLE_DECODE_EARLY_SPLIT5=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SPLIT5=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 622.45,
+    "prefill_tps_min": 621.81,
+    "prefill_tps_max": 623.86,
+    "gen_tps": 36.9,
+    "gen_tps_min": 36.58,
+    "gen_tps_max": 37.0,
+    "gen_first_ms": 30.629,
+    "gen_first_ms_min": 30.49,
+    "gen_first_ms_max": 30.939,
+    "gen_steady_tps": 37.12,
+    "gen_steady_tps_min": 36.78,
+    "gen_steady_tps_max": 37.21,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_modes": [
+     "forward_enable",
+     "inverse_disable"
+    ],
+    "forward_process_count": 2,
+    "inverse_process_count": 2,
+    "measured_decode_steps_per_process": 1024,
+    "forward_delta_pct": [
+     0.421281,
+     0.304669
+    ],
+    "inverse_rollback_delta_pct": [
+     -0.362437,
+     -0.370372
+    ],
+    "forward_gate_at_measurement": "DS4_METAL_ENABLE_M3_DECODE_EARLY_SPLIT5=1 (provisional gate; later renamed and production-guarded, with identical behavior under the measured resident-MXFP4 M3 contract)",
+    "forward_log_sha256": [
+     "56357ba10200b3dd7c328f09f62a65c6851b051d5c04279a292536f245f8e38e",
+     "147304fd84d51d857f0ce0480c751303e023de853230d54e1333ed2a15f51f35"
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040
+   }
+  },
+  "round_5": {
+   "source_revision": "ee5c0f9f8ed0f747f86436acc59495f2edd01c5b",
+   "accepted_change": "exact-mxfp4-down-half-result-lut",
+   "description": "Use an exact 256x16 raw-binary16 lookup table for finite E8M0 times E2M1 dequantization in the resident MXFP4 prefill down projection.",
+   "force_environment": "DS4_METAL_ENABLE_MXFP4_MOE_MM_ID_DOWN_HALF_LUT=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_HALF_LUT=1"
+   ],
+   "generated_table_sha256": "4345e991f2ff74c3ac43cac4f31660c537a23ca92aa12367487e489cf6a91090",
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 639.8,
+    "prefill_tps_min": 639.13,
+    "prefill_tps_max": 640.28,
+    "gen_tps": 38.41,
+    "gen_tps_min": 38.39,
+    "gen_tps_max": 38.52,
+    "gen_first_ms": 29.704,
+    "gen_first_ms_min": 29.562,
+    "gen_first_ms_max": 29.787,
+    "gen_steady_tps": 38.63,
+    "gen_steady_tps_min": 38.6,
+    "gen_steady_tps_max": 38.73,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "forward_block_count": 4,
+    "inverse_block_count": 2,
+    "prefix_tokens": [
+     2048,
+     8192
+    ],
+    "exact_comparisons_per_block": 16,
+    "exact_floats_per_block": 2068480,
+    "inverse_rollback_delta_pct": {
+     "2048": -0.5554,
+     "8192": -0.4889
+    }
+   }
+  },
+  "round_6": {
+   "source_revision": "c0431e3ab9eab6f9fed74cc621f7dfb2da3ff8e0",
+   "accepted_change": "decode-pipeline-fast-lookup",
+   "description": "Use a 64-slot C mirror for specialized mul_mv Metal pipeline lookups during eligible resident MXFP4 decode.",
+   "force_environment": "DS4_METAL_ENABLE_DECODE_PIPELINE_FAST_LOOKUP=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_DECODE_PIPELINE_FAST_LOOKUP=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 640.39,
+    "prefill_tps_min": 639.97,
+    "prefill_tps_max": 640.86,
+    "gen_tps": 38.53,
+    "gen_tps_min": 38.52,
+    "gen_tps_max": 38.53,
+    "gen_first_ms": 30.349,
+    "gen_first_ms_min": 29.574,
+    "gen_first_ms_max": 30.592,
+    "gen_steady_tps": 38.77,
+    "gen_steady_tps_min": 38.74,
+    "gen_steady_tps_max": 38.79,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "forward_enable_and_inverse_disable",
+    "retained_forward_process_count": 3,
+    "inverse_process_count": 2,
+    "inverse_rollback_delta_pct": [
+     -0.116377,
+     -0.12208
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040
+   }
+  },
+  "round_7": {
+   "source_revision": "6b01de156d87965dff8711c463df1085ca8adcdc",
+   "accepted_change": "decode-pipeline-fast-lookup-mul-mv-ext",
+   "description": "Extend the 64-slot decode pipeline fast lookup to the mul_mv_ext (nsg+nxpsg) family used by resident dense matmul decode layers.",
+   "force_environment": "DS4_METAL_ENABLE_DECODE_PIPELINE_FAST_LOOKUP=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_DECODE_PIPELINE_FAST_LOOKUP=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 642.84,
+    "prefill_tps_min": 642.35,
+    "prefill_tps_max": 643.46,
+    "gen_tps": 38.29,
+    "gen_tps_min": 38.19,
+    "gen_tps_max": 38.35,
+    "gen_first_ms": 29.41,
+    "gen_first_ms_min": 28.736,
+    "gen_first_ms_max": 29.806,
+    "gen_steady_tps": 38.45,
+    "gen_steady_tps_min": 38.4,
+    "gen_steady_tps_max": 38.55,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "forward_enable_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "inverse_rollback_delta_pct": [
+     -0.1355,
+     -0.1337
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "drift_note": "Decode step vs R6 is cross-run machine drift; same-session disabled control confirmed decode +0.078% and prefill +0.43%."
+   }
+  },
+  "round_8": {
+   "source_revision": "2424d2920c9079c2c48e4e85bfd9b2853171c65f",
+   "accepted_change": "flash-attn-pad-blk-memo",
+   "description": "Add single-slot memoization to the flash attention pad and blk decode pipeline lookups, mirroring the proven vec/reduce memo pattern.",
+   "force_environment": null,
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 643.11,
+    "prefill_tps_min": 642.81,
+    "prefill_tps_max": 644.29,
+    "gen_tps": 38.61,
+    "gen_tps_min": 38.19,
+    "gen_tps_max": 38.62,
+    "gen_first_ms": 29.632,
+    "gen_first_ms_min": 29.47,
+    "gen_first_ms_max": 29.698,
+    "gen_steady_tps": 38.83,
+    "gen_steady_tps_min": 38.4,
+    "gen_steady_tps_max": 38.84,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "inverse_disable",
+    "retained_forward_process_count": 0,
+    "inverse_process_count": 2,
+    "inverse_rollback_delta_pct": [
+     -0.0282,
+     -0.0311
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040
+   }
+  },
+  "round_9": {
+   "source_revision": "b0d2f020dd45e89c4bbb70329f40cd1f56075f94",
+   "accepted_change": "flash-attn-batched-memo",
+   "description": "Add single-slot memoization to the batched (non-vec) flash attention pipeline lookup used during prefill and batched-decode, completing the flash attention memo family.",
+   "force_environment": null,
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 644.4,
+    "prefill_tps_min": 644.21,
+    "prefill_tps_max": 644.65,
+    "gen_tps": 38.18,
+    "gen_tps_min": 38.1,
+    "gen_tps_max": 38.21,
+    "gen_first_ms": 30.577,
+    "gen_first_ms_min": 29.503,
+    "gen_first_ms_max": 31.053,
+    "gen_steady_tps": 38.41,
+    "gen_steady_tps_min": 38.37,
+    "gen_steady_tps_max": 38.43,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "prefill_inverse_disable",
+    "retained_forward_process_count": 0,
+    "inverse_process_count": 1,
+    "inverse_rollback_delta_pct_2k": -0.0043,
+    "inverse_rollback_delta_pct_8k": -0.0257,
+    "exact_rows_per_process": 1,
+    "exact_floats_per_process": 2068480,
+    "exact_selected_ids_per_process": 0,
+    "decode_neutrality_check_delta_pct": 0.0311,
+    "drift_note": "Decode step vs R8 is cross-run drift; batched getter is decode-neutral by construction (does not fire during single-token decode). Prefill (target) improved +0.20% vs R8."
+   }
+  },
+  "round_10": {
+   "source_revision": "3fb202a6fdc307e6161936cfe47a719a8fa878b3",
+   "accepted_change": "decode-second-split16",
+   "description": "Flush a second decode command buffer after layer 16 in the eligible resident MXFP4 pre-M5 window (pos 2048-2815), closing the GPU idle bubble between the first split buffer and the single tail buffer. Command-buffer boundaries only; bit-exact.",
+   "force_environment": null,
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_DECODE_SECOND_SPLIT16=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 641.79,
+    "prefill_tps_min": 640.58,
+    "prefill_tps_max": 642.11,
+    "gen_tps": 38.36,
+    "gen_tps_min": 38.35,
+    "gen_tps_max": 38.41,
+    "gen_first_ms": 29.662,
+    "gen_first_ms_min": 28.781,
+    "gen_first_ms_max": 29.76,
+    "gen_steady_tps": 38.58,
+    "gen_steady_tps_min": 38.56,
+    "gen_steady_tps_max": 38.58,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "decode_forward_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "forward_delta_pct": [
+     3.154,
+     2.969
+    ],
+    "inverse_rollback_delta_pct": [
+     -1.958,
+     -0.909
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "prefill_neutrality_check_delta_pct": 0.0297,
+    "drift_note": "Prefill median step (-0.405%) is cross-run drift; prefill A/B flat (+0.0297%) and the change is decode-only."
+   }
+  },
+  "round_11": {
+   "source_revision": "c21ec43eeac16f66005fc7a68e31c1f1460fb094",
+   "accepted_change": "mxfp4-moe-decode-nsg1",
+   "description": "Dispatch the MXFP4 routed pair_swiglu and sum6 decode kernels with one simdgroup per threadgroup (nsg=1) for single-token decode on pre-M5 Apple Silicon. Bit-exact row-to-simdgroup remap; per-row per-lane arithmetic unchanged.",
+   "force_environment": null,
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 642.15,
+    "prefill_tps_min": 641.76,
+    "prefill_tps_max": 642.37,
+    "gen_tps": 38.37,
+    "gen_tps_min": 38.27,
+    "gen_tps_max": 38.45,
+    "gen_first_ms": 30.34,
+    "gen_first_ms_min": 30.103,
+    "gen_first_ms_max": 31.838,
+    "gen_steady_tps": 38.68,
+    "gen_steady_tps_min": 38.53,
+    "gen_steady_tps_max": 38.68,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "decode_forward_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "forward_delta_pct": [
+     0.437,
+     0.402
+    ],
+    "inverse_rollback_delta_pct": [
+     -0.496,
+     -0.343
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "drift_note": "Official decode median flat (+0.026%) with unanimous controlled evidence (+0.4% forwards, -0.3/-0.5% inverses); steady +0.259%, prefill +0.056% no regression."
+   }
+  },
+  "round_12": {
+   "source_revision": "6711f7652be20057074f3308555807636396a6b0",
+   "accepted_change": "decode-second-split16-wide3328",
+   "description": "Widen the adaptive second-split decode window from pos 2048-2815 to pos 2048-3327; the encode/GPU overlap bubble persists past 2815 (raw SWA saturates at 128 rows, compressed KV grows slowly). Command-buffer boundaries only; bit-exact.",
+   "force_environment": null,
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_DECODE_SECOND_SPLIT16=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 624.97,
+    "prefill_tps_min": 623.8,
+    "prefill_tps_max": 626.72,
+    "gen_tps": 37.87,
+    "gen_tps_min": 37.25,
+    "gen_tps_max": 37.94,
+    "gen_first_ms": 31.582,
+    "gen_first_ms_min": 30.89,
+    "gen_first_ms_max": 31.853,
+    "gen_steady_tps": 38.14,
+    "gen_steady_tps_min": 37.56,
+    "gen_steady_tps_max": 38.18,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "decode_forward_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "forward_delta_pct": [
+     0.243,
+     1.006
+    ],
+    "inverse_rollback_delta_pct": [
+     -0.663,
+     -3.115
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "drift_note": "Official medians below R11 are cross-run machine drift: schedule byte-identical to R11 below pos 2816 (inert in the official window); prefill (untouched) drifted down in the same session; drift-check replica reproduced the 37.87-37.94 decode band."
+   }
+  },
+  "round_13": {
+   "source_revision": "0efef8deee05dce15acf625e7a83493bd187345b",
+   "source_tree": "5a4cd03a6ef0de6fd1e3f696afaf73eeb0bf0f97",
+   "accepted_change": "mxfp4-moe-decode-tg-multiple",
+   "description": "Build separate nsg=1 pair-SwiGLU and sum6 decode PSOs whose descriptors truthfully declare that every threadgroup size is a multiple of the Metal thread execution width. Shader source and arithmetic are unchanged.",
+   "force_environment": "DS4_METAL_ENABLE_MXFP4_MOE_DECODE_TG_MULTIPLE=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_TG_MULTIPLE=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 643.47,
+    "prefill_tps_min": 642.77,
+    "prefill_tps_max": 644.69,
+    "gen_tps": 38.02,
+    "gen_tps_min": 37.96,
+    "gen_tps_max": 38.35,
+    "gen_first_ms": 30.1,
+    "gen_first_ms_min": 30.02,
+    "gen_first_ms_max": 31.202,
+    "gen_steady_tps": 38.24,
+    "gen_steady_tps_min": 38.22,
+    "gen_steady_tps_max": 38.58,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "decode_forward_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "forward_delta_pct": [
+     0.173358,
+     0.208556
+    ],
+    "inverse_rollback_delta_pct": [
+     -0.125547,
+     -0.192905
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "prefill_note": "The pipeline is selected only for n_tokens == 1, so prefill cannot take the changed path; official prefill is retained as a non-regression check."
+   }
+  },
+  "round_14": {
+   "source_revision": "5c4f816ff3790838a6d32c879da6fddb3fd8c764",
+   "source_tree": "bc7f18bb650cf8b2e388ad23d5401b0ae1a71efa",
+   "accepted_change": "mxfp4-moe-decode-fixed-route-pair",
+   "description": "Dispatch a sibling pair-SwiGLU kernel for the exact resident Flash one-token, six-route, world-1 shape. It fixes token and route indexing while preserving the generic accumulation helper, arithmetic order, reduction, and writes.",
+   "force_environment": "DS4_METAL_ENABLE_MXFP4_MOE_DECODE_FIXED_ROUTE_PAIR=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_FIXED_ROUTE_PAIR=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 642.91,
+    "prefill_tps_min": 642.82,
+    "prefill_tps_max": 643.48,
+    "gen_tps": 38.46,
+    "gen_tps_min": 38.22,
+    "gen_tps_max": 38.54,
+    "gen_first_ms": 30.562,
+    "gen_first_ms_min": 30.529,
+    "gen_first_ms_max": 30.961,
+    "gen_steady_tps": 38.74,
+    "gen_steady_tps_min": 38.46,
+    "gen_steady_tps_max": 38.8,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "decode_forward_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "forward_delta_pct": [
+     0.5345,
+     0.7667
+    ],
+    "inverse_rollback_delta_pct": [
+     -0.5865,
+     -0.6292
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "prefill_note": "The sibling kernel is selected only for n_tokens == 1, so prefill cannot take the changed path."
+   }
+  },
+  "round_15": {
+   "source_revision": "f3574462990af2be1dc30e7e517a435be3c423b2",
+   "source_tree": "6fb11b01fef12908ba87a5374902edb10e9a2a21",
+   "accepted_change": "mxfp4-moe-decode-fixed-route-sum6",
+   "description": "Dispatch a sibling sum6 kernel for the exact resident Flash one-token, six-route, world-1 output shape. It fixes token and expert-base indexing while preserving LUT staging, slot order, the generic accumulation helper, arithmetic order, reduction, row guard, and output expression.",
+   "force_environment": "DS4_METAL_ENABLE_MXFP4_MOE_DECODE_FIXED_ROUTE_SUM6=1",
+   "rollback_environment": [
+    "DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_FIXED_ROUTE_SUM6=1"
+   ],
+   "official_end_to_end": {
+    "run_count": 3,
+    "aggregation": "median",
+    "prefill_tps": 643.16,
+    "prefill_tps_min": 642.85,
+    "prefill_tps_max": 644.06,
+    "gen_tps": 38.62,
+    "gen_tps_min": 38.59,
+    "gen_tps_max": 38.8,
+    "gen_first_ms": 30.758,
+    "gen_first_ms_min": 29.762,
+    "gen_first_ms_max": 31.353,
+    "gen_steady_tps": 38.93,
+    "gen_steady_tps_min": 38.87,
+    "gen_steady_tps_max": 39.05,
+    "frontier_artifacts_matching_reference": 3,
+    "logits_payload_artifacts_matching_reference": 3,
+    "frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+    "logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a"
+   },
+   "controlled_attribution": {
+    "comparison_mode": "decode_forward_and_inverse_disable",
+    "retained_forward_process_count": 2,
+    "inverse_process_count": 2,
+    "forward_delta_pct": [
+     0.2636,
+     0.2182
+    ],
+    "inverse_rollback_delta_pct": [
+     -0.2537,
+     -0.2507
+    ],
+    "exact_rows_per_process": 1041,
+    "exact_floats_per_process": 134580480,
+    "exact_selected_ids_per_process": 1040,
+    "prefill_note": "The sibling kernel is selected only for n_tokens == 1, so prefill cannot take the changed path."
+   }
+  }
+ },
+ "chart_contract": {
+  "x_axis": "sequence",
+  "checkpoint_label": "label",
+  "absolute_series": [
+   "prefill_tps",
+   "gen_tps",
+   "gen_first_ms",
+   "gen_steady_tps"
+  ],
+  "normalized_improvement_series": [
+   "prefill_gain_pct",
+   "gen_gain_pct",
+   "gen_first_reduction_pct",
+   "gen_steady_gain_pct"
+  ],
+  "increment_series": [
+   "prefill_step_gain_pct",
+   "gen_step_gain_pct",
+   "gen_first_step_reduction_pct",
+   "gen_steady_step_gain_pct"
+  ],
+  "error_bar_columns": {
+   "prefill_tps": [
+    "prefill_tps_min",
+    "prefill_tps_max"
+   ],
+   "gen_tps": [
+    "gen_tps_min",
+    "gen_tps_max"
+   ],
+   "gen_first_ms": [
+    "gen_first_ms_min",
+    "gen_first_ms_max"
+   ],
+   "gen_steady_tps": [
+    "gen_steady_tps_min",
+    "gen_steady_tps_max"
+   ]
+  },
+  "notes": "Use accepted_history for the promoted line. Use controlled_attribution for contribution annotations. Exclude attempts rows unless explicitly showing rejected experiments."
+ },
+ "validation": {
+  "accepted_frontier_artifacts_matching_reference": 48,
+  "round_frontier_artifacts_matching_reference": 45,
+  "rounds_4_to_6_frontier_artifacts_matching_reference": 9,
+  "rounds_4_to_6_logits_payload_artifacts_matching_reference": 9,
+  "canonical_frontier_sha256": "6f7edd6d7319d48270e3a5d34eb31f9f8f957ad7f54f4067afa9157c47708179",
+  "canonical_logits_payload_sha256": "676ebe416af66e53596f818b4d1b3a36503ddb9f53e9e48d0334c878aee4794a",
+  "decode_ab_exact_rows_per_trial": 1041,
+  "decode_ab_exact_floats_per_trial": 134580480,
+  "decode_ab_exact_selected_ids_per_trial": 1040,
+  "streaming_pair_sha256": "47ba9aa739f95f987e9af39ec1c969dc70f7cd6283a0e2a65e7be5da56e6aea3",
+  "focused_tests": [
+   "./tests/test_mxfp4_metal",
+   "./ds4_test --metal-kernels",
+   "DS4_TEST_SSD_STREAMING=1 DS4_TEST_SSD_STREAMING_COLD=1 DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=1 ./ds4_test --streaming-decode-prefill-correctness"
+  ],
+  "repository_wide_test": {
+   "command": "make test",
+   "exit_code": 2,
+   "failed_assertions": 17,
+   "failed_test_groups": [
+    "think-tool-recovery",
+    "logprob-vectors",
+    "metal-ssd-streaming-cache-pressure",
+    "local-golden-vectors"
+   ],
+   "metal_kernels": "passed",
+   "metal_tensor_equivalence": "passed bit-exact",
+   "log_sha256": "de5830ee7e308fa4134420ac153d6e5c863e6350d9716f97fe78890509b34197",
+   "rounds_4_to_6_defaults_disabled_reproduction": {
+    "exit_code": 1,
+    "failed_assertions": 17,
+    "same_failed_test_groups": true,
+    "log_sha256": "8840ee5ecbbe77330162fa820e8dac7b4a29a60670449f1c6b7c42475f240414"
+   },
+   "rounds_10_to_12_tip_reproduction": {
+    "exit_code": 1,
+    "failed_assertions": 17,
+    "same_failed_assertion_sites": true,
+    "log_sha256": "793d64260802542176c740c755957ae8fdac3ddf2c47656dc4920d184179a82a"
+   },
+   "rounds_13_to_15_tip_reproduction": {
+    "exit_code": 2,
+    "failed_assertions": 17,
+    "same_normalized_assertion_fingerprint": true,
+    "normalized_fingerprint_sha256": "0d96c14c8ea079281c095dbb5609202ccf88ba56118596487de6fdb0c5728261",
+    "log_sha256": "de5830ee7e308fa4134420ac153d6e5c863e6350d9716f97fe78890509b34197"
+   }
+  },
+  "rounds_7_to_9_frontier_artifacts_matching_reference": 9,
+  "rounds_7_to_9_logits_payload_artifacts_matching_reference": 9,
+  "rounds_10_to_12_frontier_artifacts_matching_reference": 9,
+  "rounds_10_to_12_logits_payload_artifacts_matching_reference": 9,
+  "rounds_13_to_15_frontier_artifacts_matching_reference": 9,
+  "rounds_13_to_15_logits_payload_artifacts_matching_reference": 9
+ },
+ "provenance_limits": [
+  "Rounds 1 and 2 were measured as intermediate working-tree states and were later consolidated with Round 3 into c683fb9; they do not have standalone commits.",
+  "Rounds 4, 5, and 6 have standalone commits: 3658bd648425340c6b3325c8108fdc32c77fc747, ee5c0f9f8ed0f747f86436acc59495f2edd01c5b, and c0431e3ab9eab6f9fed74cc621f7dfb2da3ff8e0.",
+  "The promoted defaults target the shared Apple M1-M4 pre-M5 path, but campaign performance was measured only on Apple M3 Ultra; no throughput claim is made for M1, M2, or M4, and M5 remains on its separate path.",
+  "Historical DS4_METAL_DISABLE_M3_* strings are retained as compatibility aliases and provenance. New rollback switches introduced in Rounds 4-6 use DS4_METAL_DISABLE_PRE_M5_* names.",
+  "Through Round 3, controlled-harness output files were not retained; those figures are copied from the recorded session. Round 4-6 controlled logs were retained under the campaign evidence directory, and cumulative CSV plus frontier artifacts remain independently hash-verifiable.",
+  "The initial controlled attribution of +4.9% prefill and +2.43% decode is approximate because the raw control/candidate rates were not retained.",
+  "Round 3 cumulative decode is below Round 2 because of cross-run drift; interleaved compressor A/B still measures a repeatable positive gain.",
+  "Round 4 official cumulative rates ran below the session anchor despite strictly positive interleaved attribution; the cross-process drift is not treated as causal evidence.",
+  "The final repository-wide make test retained 17 golden/model-behavior assertion failures; disabling all three new Round 4-6 defaults reproduced the same 17 failures, while Metal kernels and tensor equivalence passed exactly.",
+  "Stage probes and eight-token SSD runs are diagnostic correctness evidence, not comparable milestone performance.",
+  "Rounds 10, 11, and 12 have standalone commits: 3fb202a6fdc307e6161936cfe47a719a8fa878b3, c21ec43eeac16f66005fc7a68e31c1f1460fb094, and 6711f7652be20057074f3308555807636396a6b0. Round 12's official medians are drift-documented (inert below pos 2816 with unanimous controlled evidence).",
+  "Rounds 13, 14, and 15 have standalone commits: 0efef8deee05dce15acf625e7a83493bd187345b, 5c4f816ff3790838a6d32c879da6fddb3fd8c764, and f3574462990af2be1dc30e7e517a435be3c423b2. All twelve required controlled blocks were exact and directionally unanimous.",
+  "Rounds 14 and 15 official replicas were run before final Git staging, contrary to the requested evidence ordering. Retained pre-official source patches and hashes match the subsequently staged and committed diffs byte-for-byte; this is an ordering provenance caveat, not a source-identity or correctness gap."
+ ]
+}

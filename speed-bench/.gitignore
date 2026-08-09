@@ -1,3 +1,3 @@
-__pycache__
-.DS_Store
 local-runs/
+metal_decode_schedule_bench
+metal_prefill_variant_bench

@@ -261,7 +261,11 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        bool                    state_already_stored) {
+        bool                    state_already_stored,
+        bool                    decode_one_token,
+        bool                    defer_finalize) {
+    (void)decode_one_token;
+    (void)defer_finalize;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || !cuda_compressor_shape_supported(head_dim, ratio) ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||

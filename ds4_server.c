@@ -231,7 +231,7 @@ static bool json_u16(const char **p, uint32_t *out) {
     return true;
 }
 
-static bool json_string(const char **p, char **out) {
+static bool json_string_n(const char **p, char **out, size_t *out_len) {
     /* Always define *out. Every failure path below returns false without
      * producing a string, and several callers reparse in place with
      * `free(x); json_string(&p, &x)` (e.g. duplicate JSON keys, the "model"
@@ -239,6 +239,7 @@ static bool json_string(const char **p, char **out) {
      * holding the just-freed pointer, which a later cleanup frees again --
      * a double-free. Nulling on entry closes that whole class at the root. */
     *out = NULL;
+    if (out_len) *out_len = 0;
     json_ws(p);
     if (**p != '"') return false;
     (*p)++;
@@ -281,11 +282,16 @@ static bool json_string(const char **p, char **out) {
     }
     if (**p != '"') goto fail;
     (*p)++;
+    if (out_len) *out_len = b.len;
     *out = buf_take(&b);
     return true;
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool json_string(const char **p, char **out) {
+    return json_string_n(p, out, NULL);
 }
 
 static bool json_number(const char **p, double *out) {
@@ -1328,6 +1334,151 @@ static void append_raw_json_line(buf *b, const char *json) {
 
 static void json_escape(buf *b, const char *s);
 
+/* Length-aware Python-style string spelling for canonicalized tool schemas.
+ * Decoded JSON strings may contain an embedded U+0000, so the ordinary
+ * NUL-terminated json_escape() helper is not safe here. */
+static void json_prompt_escape_n(buf *b, const char *s, size_t n) {
+    buf_putc(b, '"');
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            buf_putc(b, '\\');
+            buf_putc(b, (char)c);
+        } else if (c == '\b') {
+            buf_puts(b, "\\b");
+        } else if (c == '\f') {
+            buf_puts(b, "\\f");
+        } else if (c == '\n') {
+            buf_puts(b, "\\n");
+        } else if (c == '\r') {
+            buf_puts(b, "\\r");
+        } else if (c == '\t') {
+            buf_puts(b, "\\t");
+        } else if (c < 0x20) {
+            buf_printf(b, "\\u%04x", (unsigned)c);
+        } else {
+            buf_putc(b, (char)c);
+        }
+    }
+    buf_putc(b, '"');
+}
+
+/* Render a parsed JSON value in the lexical form used by the official DS4
+ * tokenizer: preserve object insertion order, emit the default Python
+ * separators (", " and ": "), and keep decoded UTF-8 instead of client-specific
+ * \u escapes.  Tool schemas are part of the model prompt, so forwarding their
+ * HTTP spelling verbatim makes semantically identical requests tokenize
+ * differently depending on the caller's JSON serializer. */
+static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+
+    if (**p == '"') {
+        char *s = NULL;
+        size_t n = 0;
+        if (!json_string_n(p, &s, &n)) return false;
+        json_prompt_escape_n(out, s, n);
+        free(s);
+        return true;
+    }
+
+    if (**p == '{') {
+        (*p)++;
+        buf_putc(out, '{');
+        json_ws(p);
+        if (**p == '}') {
+            (*p)++;
+            buf_putc(out, '}');
+            return true;
+        }
+        bool first = true;
+        for (;;) {
+            char *key = NULL;
+            size_t key_len = 0;
+            if (!json_string_n(p, &key, &key_len)) return false;
+            if (!first) buf_puts(out, ", ");
+            first = false;
+            json_prompt_escape_n(out, key, key_len);
+            free(key);
+            json_ws(p);
+            if (**p != ':') return false;
+            (*p)++;
+            buf_puts(out, ": ");
+            if (!json_prompt_value_depth(p, out, depth + 1)) return false;
+            json_ws(p);
+            if (**p == '}') {
+                (*p)++;
+                buf_putc(out, '}');
+                return true;
+            }
+            if (**p != ',') return false;
+            (*p)++;
+        }
+    }
+
+    if (**p == '[') {
+        (*p)++;
+        buf_putc(out, '[');
+        json_ws(p);
+        if (**p == ']') {
+            (*p)++;
+            buf_putc(out, ']');
+            return true;
+        }
+        bool first = true;
+        for (;;) {
+            if (!first) buf_puts(out, ", ");
+            first = false;
+            if (!json_prompt_value_depth(p, out, depth + 1)) return false;
+            json_ws(p);
+            if (**p == ']') {
+                (*p)++;
+                buf_putc(out, ']');
+                return true;
+            }
+            if (**p != ',') return false;
+            (*p)++;
+        }
+    }
+
+    if (json_lit(p, "true")) {
+        buf_puts(out, "true");
+        return true;
+    }
+    if (json_lit(p, "false")) {
+        buf_puts(out, "false");
+        return true;
+    }
+    if (json_lit(p, "null")) {
+        buf_puts(out, "null");
+        return true;
+    }
+
+    /* JSON serializers already agree on ordinary schema numbers.  Preserve
+     * their exact finite lexeme here rather than introducing libc-dependent
+     * binary-float formatting. */
+    const char *start = *p;
+    double value = 0.0;
+    if (!json_number(p, &value) || !isfinite(value)) return false;
+    for (const char *s = start; s < *p; s++) buf_putc(out, *s);
+    return true;
+}
+
+static char *json_prompt_value(const char *json) {
+    const char *p = json;
+    buf out = {0};
+    if (!json_prompt_value_depth(&p, &out, 0)) {
+        buf_free(&out);
+        return NULL;
+    }
+    json_ws(&p);
+    if (*p != '\0') {
+        buf_free(&out);
+        return NULL;
+    }
+    return buf_take(&out);
+}
+
 static char *openai_function_schema_from_tool(const char *raw) {
     const char *p = raw;
     json_ws(&p);
@@ -1347,7 +1498,10 @@ static char *openai_function_schema_from_tool(const char *raw) {
         if (!strcmp(key, "function")) {
             free(key);
             if (!json_raw_value(&p, &value)) return NULL;
-            return value;
+            char *prompt_value = json_prompt_value(value);
+            if (!prompt_value) return value;
+            free(value);
+            return prompt_value;
         }
         free(key);
         if (!json_skip_value(&p)) return NULL;
@@ -6640,16 +6794,23 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         const char *tool = r->has_tools ?
             find_any_tool_start(raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
+        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_end && (!close || tool_end < close);
         size_t limit;
-        if (tool_before_close) {
+        if (complete_tool) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
                                            (size_t)(tool - raw));
         } else if (close) {
+            /* An incomplete marker that remains inside a closed think block is
+             * reasoning text, not an executable call. */
             limit = (size_t)(close - raw);
         } else if (final) {
+            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
             limit = raw_len;
+        } else if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
@@ -6664,11 +6825,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->emit_pos = limit;
         }
 
-        if (tool_before_close) {
-            if (complete_tool) {
-                st->emit_pos = (size_t)(tool - raw);
-                st->mode = OPENAI_STREAM_SUPPRESS;
-            }
+        if (complete_tool) {
+            st->emit_pos = (size_t)(tool - raw);
+            st->mode = OPENAI_STREAM_SUPPRESS;
             return true;
         }
 
@@ -7373,16 +7532,20 @@ static bool responses_sse_stream_update(int fd, const request *r,
         const char *tool = r->has_tools ?
             find_any_tool_start(raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
+        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_end && (!close || tool_end < close);
         size_t limit;
-        if (tool_before_close) {
+        if (complete_tool) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
                                            (size_t)(tool - raw));
         } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
+        } else if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
@@ -7409,11 +7572,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
             st->emit_pos = limit;
         }
 
-        if (tool_before_close) {
-            if (complete_tool) {
-                st->emit_pos = (size_t)(tool - raw);
-                st->mode = RESP_STREAM_SUPPRESS;
-            }
+        if (complete_tool) {
+            st->emit_pos = (size_t)(tool - raw);
+            st->mode = RESP_STREAM_SUPPRESS;
             return true;
         }
 
@@ -8269,16 +8430,20 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         const char *tool = r->has_tools ?
             find_any_tool_start(raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
+        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_end && (!close || tool_end < close);
         size_t limit;
-        if (tool_before_close) {
+        if (complete_tool) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
                                            (size_t)(tool - raw));
         } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
+        } else if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
@@ -8294,12 +8459,10 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             st->emit_pos = limit;
         }
 
-        if (tool_before_close) {
-            if (complete_tool) {
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                st->emit_pos = (size_t)(tool - raw);
-                st->mode = ANTH_STREAM_SUPPRESS;
-            }
+        if (complete_tool) {
+            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+            st->emit_pos = (size_t)(tool - raw);
+            st->mode = ANTH_STREAM_SUPPRESS;
             return true;
         }
 
@@ -10707,21 +10870,29 @@ static void server_apply_decode_directional_steering(server *s,
                       s->steering_policy == DS4_STEERING_POLICY_DECODING));
 }
 
+typedef enum {
+    THINK_TOOL_NONE = 0,
+    THINK_TOOL_STARTED,
+    THINK_TOOL_COMPLETE,
+} think_tool_status;
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
- * short overlap until the opening appears, then wait for its matching end. */
-static bool complete_tool_call_inside_thinking(const char *text, size_t len,
-                                               size_t *scan_from) {
-    if (!text || !scan_from) return false;
+ * short overlap until the opening appears, then remember a partial block so
+ * end-of-decode repair does not silently discard it. */
+static think_tool_status tool_call_status_inside_thinking(const char *text,
+                                                          size_t len,
+                                                          size_t *scan_from) {
+    if (!text || !scan_from) return THINK_TOOL_NONE;
     if (*scan_from > len) *scan_from = len;
     const char *start = find_any_tool_start(text + *scan_from);
     if (!start) {
         const size_t hold = 80;
         *scan_from = len > hold ? len - hold : 0;
-        return false;
+        return THINK_TOOL_NONE;
     }
     *scan_from = (size_t)(start - text);
-    return find_any_tool_end(start) != NULL;
+    return find_any_tool_end(start) ? THINK_TOOL_COMPLETE : THINK_TOOL_STARTED;
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
@@ -12080,6 +12251,7 @@ decode_again:
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
+    bool partial_tool_inside_thinking = false;
     size_t think_recovery_scan_from = 0;
     if (ds4_think_mode_enabled(j->req.think_mode) &&
         (j->req.temperature != DS4_DEFAULT_TEMPERATURE ||
@@ -12346,10 +12518,13 @@ decode_again:
                 if (thinking_gates_tool_markers && thinking.inside) {
                     /* Do not act on an opening marker alone: it can be quoted
                      * protocol text. A complete block is unambiguous enough to
-                     * recover without asking the model to restart it after an
-                     * injected close marker. */
-                    if (complete_tool_call_inside_thinking(
-                            text.ptr, text.len, &think_recovery_scan_from)) {
+                     * recover immediately; remember a partial block only while
+                     * reasoning stays open so EOF can use ordinary DSML repair. */
+                    const think_tool_status status =
+                        tool_call_status_inside_thinking(
+                            text.ptr, text.len, &think_recovery_scan_from);
+                    partial_tool_inside_thinking = status == THINK_TOOL_STARTED;
+                    if (status == THINK_TOOL_COMPLETE) {
                         saw_tool_start = true;
                         saw_tool_end = true;
                         finish = "tool_calls";
@@ -12373,6 +12548,7 @@ decode_again:
                         tool_scan_from = think_end ? (size_t)((think_end + 8) - text.ptr) : text.len;
                         if (tool_scan_from > text.len) tool_scan_from = text.len;
                         tool_scan_waiting_for_think_close = false;
+                        partial_tool_inside_thinking = false;
                     }
                     if (tool_scan_from > text.len) tool_scan_from = text.len;
                     const char *tool_scan = text.ptr ? text.ptr + tool_scan_from : "";
@@ -12448,6 +12624,14 @@ decode_again:
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
+    }
+
+    if (thinking_gates_tool_markers && thinking.inside &&
+        partial_tool_inside_thinking) {
+        saw_tool_start = true;
+        trace_event(s, trace_id,
+                    "found unterminated tool call inside unclosed reasoning after %d generated tokens",
+                    completion);
     }
 
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
@@ -14368,7 +14552,7 @@ static void test_tool_schema_order_from_openai_tools(void) {
     char *schemas = NULL;
     tool_schema_orders orders = {0};
     TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
-    TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"edit\""));
+    TEST_ASSERT(schemas && strstr(schemas, "\"name\": \"edit\""));
     const tool_schema_order *order = tool_schema_orders_find(&orders, "edit");
     TEST_ASSERT(order != NULL);
     TEST_ASSERT(order && order->len == 3);
@@ -14377,6 +14561,121 @@ static void test_tool_schema_order_from_openai_tools(void) {
     TEST_ASSERT(order && !strcmp(order->prop[2], "newString"));
     free(schemas);
     tool_schema_orders_free(&orders);
+}
+
+static void test_openai_tool_schema_json_spelling_is_canonical(void) {
+    const char *compact =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"bash\","
+        "\"description\":\"Run — now\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{\"type\":\"string\","
+        "\"description\":\"line\\nrocket 🚀\"}},"
+        "\"required\":[\"command\"],\"additionalProperties\":false}}}]";
+    const char *spaced =
+        "[ { \"type\" : \"function\", \"function\" : { \"name\" : \"bash\", "
+        "\"description\" : \"Run — now\", \"parameters\" : { \"type\" : \"object\", "
+        "\"properties\" : { \"command\" : { \"type\" : \"string\", "
+        "\"description\" : \"line\\nrocket 🚀\" } }, \"required\" : [ \"command\" ], "
+        "\"additionalProperties\" : false } } } ]";
+    const char *pretty_escaped =
+        "[\n  {\n    \"type\": \"function\",\n    \"function\": {\n"
+        "      \"name\": \"bash\",\n      \"description\": \"Run \\u2014 now\",\n"
+        "      \"parameters\": {\n        \"type\": \"object\",\n"
+        "        \"properties\": {\n          \"command\": {\n"
+        "            \"type\": \"string\",\n"
+        "            \"description\": \"line\\nrocket \\ud83d\\ude80\"\n"
+        "          }\n        },\n        \"required\": [\"command\"],\n"
+        "        \"additionalProperties\": false\n      }\n    }\n  }\n]";
+    const char *expected =
+        "{\"name\": \"bash\", \"description\": \"Run — now\", "
+        "\"parameters\": {\"type\": \"object\", \"properties\": {\"command\": "
+        "{\"type\": \"string\", \"description\": \"line\\nrocket 🚀\"}}, "
+        "\"required\": [\"command\"], \"additionalProperties\": false}}";
+
+    const char *p_compact = compact;
+    const char *p_spaced = spaced;
+    const char *p_pretty = pretty_escaped;
+    char *schema_compact = NULL;
+    char *schema_spaced = NULL;
+    char *schema_pretty = NULL;
+    tool_schema_orders compact_orders = {0};
+    tool_schema_orders spaced_orders = {0};
+    tool_schema_orders pretty_orders = {0};
+    TEST_ASSERT(parse_tools_value(&p_compact, &schema_compact, &compact_orders));
+    TEST_ASSERT(parse_tools_value(&p_spaced, &schema_spaced, &spaced_orders));
+    TEST_ASSERT(parse_tools_value(&p_pretty, &schema_pretty, &pretty_orders));
+    json_ws(&p_compact);
+    json_ws(&p_spaced);
+    json_ws(&p_pretty);
+    TEST_ASSERT(*p_compact == '\0' && *p_spaced == '\0' && *p_pretty == '\0');
+    TEST_ASSERT(schema_compact && schema_spaced && schema_pretty);
+    TEST_ASSERT(schema_compact && !strcmp(schema_compact, expected));
+    TEST_ASSERT(schema_compact && schema_spaced &&
+                !strcmp(schema_compact, schema_spaced));
+    TEST_ASSERT(schema_compact && schema_pretty &&
+                !strcmp(schema_compact, schema_pretty));
+
+    /* Canonicalization must not truncate decoded embedded NULs. Match
+     * Python's short spellings for backspace/form-feed at the same time. */
+    const char *controls_compact =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"controls\","
+        "\"description\":\"a\\u0000b\\b\\f\"}}]";
+    const char *controls_spaced =
+        "[ { \"type\" : \"function\", \"function\" : { "
+        "\"name\" : \"controls\", \"description\" : "
+        "\"a\\u0000b\\b\\f\" } } ]";
+    const char *controls_expected =
+        "{\"name\": \"controls\", \"description\": "
+        "\"a\\u0000b\\b\\f\"}";
+    const char *p_controls_compact = controls_compact;
+    const char *p_controls_spaced = controls_spaced;
+    char *schema_controls_compact = NULL;
+    char *schema_controls_spaced = NULL;
+    tool_schema_orders controls_compact_orders = {0};
+    tool_schema_orders controls_spaced_orders = {0};
+    TEST_ASSERT(parse_tools_value(&p_controls_compact,
+                                  &schema_controls_compact,
+                                  &controls_compact_orders));
+    TEST_ASSERT(parse_tools_value(&p_controls_spaced,
+                                  &schema_controls_spaced,
+                                  &controls_spaced_orders));
+    TEST_ASSERT(schema_controls_compact && schema_controls_spaced);
+    TEST_ASSERT(schema_controls_compact &&
+                !strcmp(schema_controls_compact, controls_expected));
+    TEST_ASSERT(schema_controls_compact && schema_controls_spaced &&
+                !strcmp(schema_controls_compact, schema_controls_spaced));
+    free(schema_controls_compact);
+    free(schema_controls_spaced);
+    tool_schema_orders_free(&controls_compact_orders);
+    tool_schema_orders_free(&controls_spaced_orders);
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+    char *prompt_compact = render_chat_prompt_text(
+        &msgs, schema_compact, NULL, DS4_THINK_HIGH);
+    char *prompt_spaced = render_chat_prompt_text(
+        &msgs, schema_spaced, NULL, DS4_THINK_HIGH);
+    char *prompt_pretty = render_chat_prompt_text(
+        &msgs, schema_pretty, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt_compact && prompt_spaced && prompt_pretty);
+    TEST_ASSERT(prompt_compact && prompt_spaced &&
+                !strcmp(prompt_compact, prompt_spaced));
+    TEST_ASSERT(prompt_compact && prompt_pretty &&
+                !strcmp(prompt_compact, prompt_pretty));
+    TEST_ASSERT(prompt_compact && strstr(prompt_compact, expected));
+
+    free(prompt_compact);
+    free(prompt_spaced);
+    free(prompt_pretty);
+    chat_msgs_free(&msgs);
+    free(schema_compact);
+    free(schema_spaced);
+    free(schema_pretty);
+    tool_schema_orders_free(&compact_orders);
+    tool_schema_orders_free(&spaced_orders);
+    tool_schema_orders_free(&pretty_orders);
 }
 
 static void test_tool_schema_order_from_responses_tool_search(void) {
@@ -17907,7 +18206,7 @@ static void test_json_parser_handles_tool_heavy_requests(void) {
         TEST_ASSERT(parse_tools_value(&tp, &schemas, &orders));
         json_ws(&tp);
         TEST_ASSERT(*tp == '\0');
-        TEST_ASSERT(schemas && strstr(schemas, "\"name\":\"opencode_tool_00\""));
+        TEST_ASSERT(schemas && strstr(schemas, "\"name\": \"opencode_tool_00\""));
         TEST_ASSERT(tool_schema_orders_find(&orders, "opencode_tool_00") != NULL);
         free(schemas);
         tool_schema_orders_free(&orders);
@@ -19223,6 +19522,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_openai_tool_schema_json_spelling_is_canonical();
     test_tool_schema_order_from_responses_tool_search();
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
