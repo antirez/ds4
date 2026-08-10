@@ -979,8 +979,23 @@ ds4>
 The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
-`/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
-and returns to `ds4>`.
+`/ctx N`, `/markdown MODE`, `/read FILE`, and `/quit`. Ctrl+C interrupts the
+current generation and returns to `ds4>`.
+
+Replies are rendered as markdown when stdout is a terminal. Bold, italic, and
+inline code become terminal attributes, fenced code blocks are syntax
+highlighted, headings, lists, quotes, and rules are styled, and pipe tables are
+drawn as aligned boxes using character widths that count CJK text correctly.
+Thinking runs through the same renderer in a muted grey palette, so reasoning
+keeps its structure without competing with the answer. `--markdown MODE` selects
+how much of this runs: `full` is the default and does everything, `basic` keeps
+the inline and block styling but streams table rows as ordinary text instead of
+buffering a table until it ends, and `off` prints the raw model text. `--plain`
+is an alias for `--markdown off`, and `--think-plain` keeps thinking flat grey
+while the answer still renders. In the interactive prompt, `/markdown
+[off|basic|full]` switches the mode for the following turns and prints the
+current mode when called without an argument. Redirected or piped output is
+always raw, whatever the mode.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative

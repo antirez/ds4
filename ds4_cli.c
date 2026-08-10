@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_render.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -89,12 +90,30 @@ typedef struct {
     bool metal_graph_prompt_test;
 } cli_generation_options;
 
+/* How much of the markdown pipeline runs on a terminal.  BASIC leaves table
+ * rows as ordinary text so nothing is ever buffered while streaming. */
+typedef enum {
+    CLI_MARKDOWN_OFF = 0,
+    CLI_MARKDOWN_BASIC,
+    CLI_MARKDOWN_FULL,
+} cli_markdown_mode;
+
+static const char *cli_markdown_mode_name(cli_markdown_mode mode) {
+    switch (mode) {
+    case CLI_MARKDOWN_OFF: return "off";
+    case CLI_MARKDOWN_BASIC: return "basic";
+    default: return "full";
+    }
+}
+
 typedef struct {
     ds4_engine_options engine;
     ds4_dist_options *dist;
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    cli_markdown_mode markdown;
+    bool think_plain;       /* --think-plain: reasoning stays flat grey */
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -212,6 +231,15 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
         exit(2);
     }
     return v;
+}
+
+static cli_markdown_mode parse_markdown_mode(const char *s) {
+    if (!strcmp(s, "off")) return CLI_MARKDOWN_OFF;
+    if (!strcmp(s, "basic")) return CLI_MARKDOWN_BASIC;
+    if (!strcmp(s, "full")) return CLI_MARKDOWN_FULL;
+    fprintf(stderr, "ds4: invalid value for --markdown: %s\n", s);
+    fprintf(stderr, "ds4: valid markdown modes are: off, basic, full\n");
+    exit(2);
 }
 
 static ds4_backend parse_backend(const char *s) {
@@ -373,119 +401,51 @@ static bool is_rendered_chat_prompt(const char *prompt) {
     return false;
 }
 
+/* Chat output funnels through one renderer.  Markdown formatting only happens
+ * on a terminal and when --plain was not given; redirected output stays a byte
+ * for byte copy of the model text minus the <think> markers. */
 typedef struct {
     ds4_engine *engine;
     FILE *fp;
-    bool format_thinking;
-    bool in_think;
-    bool color_open;
-    bool use_color;
-    bool last_output_newline;
-    char pending[16];
-    size_t pending_len;
+    ds4r render;
 } token_printer;
 
-static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n >= plen && memcmp(p, prefix, plen) == 0;
+static void token_printer_init(token_printer  *p,
+                               ds4_engine      *engine,
+                               FILE            *fp,
+                               bool             format_thinking,
+                               const cli_config *cfg) {
+    memset(p, 0, sizeof(*p));
+    p->engine = engine;
+    p->fp = fp;
+    ds4r_init(&p->render, fp, isatty(fileno(fp)) != 0, format_thinking);
+    if (cfg->markdown == CLI_MARKDOWN_OFF)
+        ds4r_set_markdown(&p->render, false);
+    if (cfg->markdown != CLI_MARKDOWN_FULL)
+        ds4r_set_tables(&p->render, false);
+    if (cfg->think_plain) ds4r_set_think_markdown(&p->render, false);
+    /* Thinking models start their reply inside the reasoning block, without
+     * emitting the opening tag. */
+    if (format_thinking) ds4r_set_in_think(&p->render, true);
 }
 
-static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n < plen && memcmp(prefix, p, n) == 0;
-}
-
-static void token_printer_set_grey(token_printer *p) {
-    if (p->use_color && !p->color_open) {
-        fputs("\x1b[90m", p->fp);
-        p->color_open = true;
-    }
-}
-
-static void token_printer_reset_color(token_printer *p) {
-    if (p->use_color && p->color_open) {
-        fputs("\x1b[0m", p->fp);
-        p->color_open = false;
-    }
-}
-
-static void token_printer_write_char(token_printer *p, char c) {
-    if (p->in_think) token_printer_set_grey(p);
-    fputc((unsigned char)c, p->fp);
-    p->last_output_newline = c == '\n';
-}
-
-static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = p->pending_len + len;
-    char *buf = malloc(total ? total : 1);
-    if (!buf) return;
-    if (p->pending_len) memcpy(buf, p->pending, p->pending_len);
-    if (len) memcpy(buf + p->pending_len, text, len);
-    p->pending_len = 0;
-
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = buf + i;
-        const size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
-            p->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, think_close)) {
-            p->in_think = false;
-            token_printer_reset_color(p);
-            if (!p->last_output_newline) {
-                fputc('\n', p->fp);
-                p->last_output_newline = true;
-            }
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(p->pending)) {
-                memcpy(p->pending, cur, rem);
-                p->pending_len = rem;
-            }
-            break;
-        }
-        token_printer_write_char(p, cur[0]);
-        i++;
-    }
-
-    free(buf);
+static void token_printer_release(token_printer *p) {
+    ds4r_free(&p->render);
 }
 
 static void token_printer_finish(token_printer *p) {
-    if (p->format_thinking) {
-        token_printer_process(p, NULL, 0, true);
-        token_printer_reset_color(p);
-    }
-    fflush(p->fp);
+    ds4r_finish(&p->render);
 }
 
 static void generation_done(void *ud) {
     token_printer *p = ud;
     token_printer_finish(p);
-    if (!p->last_output_newline) {
-        fputc('\n', p->fp);
-        p->last_output_newline = true;
-    }
+    if (!ds4r_at_line_start(&p->render)) ds4r_newline(&p->render);
     fflush(p->fp);
 }
 
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
-    if (p->format_thinking) {
-        token_printer_process(p, text, len, false);
-    } else if (len) {
-        fwrite(text, 1, len, p->fp);
-        p->last_output_newline = text[len - 1] == '\n';
-    }
+    ds4r_write(&p->render, text, len);
 }
 
 static void print_generated_token(void *ud, int token) {
@@ -534,14 +494,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
-    token_printer printer = {
-        .engine = engine,
-        .fp = stdout,
-        .format_thinking = ds4_think_mode_enabled(think_mode),
-        .in_think = ds4_think_mode_enabled(think_mode),
-        .use_color = isatty(fileno(stdout)) != 0,
-        .last_output_newline = true,
-    };
+    token_printer printer;
+    token_printer_init(&printer, engine, stdout,
+                       ds4_think_mode_enabled(think_mode), cfg);
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
@@ -560,6 +515,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         ds4_session_set_progress(session, NULL, NULL);
         ds4_session_set_display_progress(session, NULL, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+        token_printer_release(&printer);
         ds4_session_free(session);
         return 1;
     }
@@ -611,6 +567,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                token_printer_release(&printer);
                 ds4_session_free(session);
                 return 1;
             }
@@ -630,6 +587,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                token_printer_release(&printer);
                 ds4_session_free(session);
                 return 1;
             }
@@ -654,6 +612,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     }
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
+    token_printer_release(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -1232,14 +1191,10 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
              * compares like with like. */
             rc = run_sampled_generation(engine, cfg, &prompt);
         } else {
-            token_printer printer = {
-                .engine = engine,
-                .fp = stdout,
-                .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-                .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-                .use_color = isatty(fileno(stdout)) != 0,
-                .last_output_newline = true,
-            };
+            token_printer printer;
+            token_printer_init(&printer, engine, stdout,
+                               ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+                               cfg);
             cli_prefill_progress progress = {
                 .base_tokens = 0,
                 .input_tokens = prompt.len,
@@ -1252,6 +1207,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                                             &printer,
                                             cli_prefill_progress_cb,
                                             &progress);
+            token_printer_release(&printer);
         }
     }
 
@@ -1274,6 +1230,7 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
+    puts("  /markdown MODE Set output rendering: off, basic, or full.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
@@ -1462,14 +1419,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
-    token_printer printer = {
-        .engine = engine,
-        .fp = stdout,
-        .format_thinking = ds4_think_mode_enabled(think_mode),
-        .in_think = ds4_think_mode_enabled(think_mode),
-        .use_color = isatty(fileno(stdout)) != 0,
-        .last_output_newline = true,
-    };
+    token_printer printer;
+    token_printer_init(&printer, engine, stdout,
+                       ds4_think_mode_enabled(think_mode), cfg);
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
@@ -1519,6 +1471,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                token_printer_release(&printer);
                 return 1;
             }
         } else {
@@ -1535,6 +1488,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
+                token_printer_release(&printer);
                 ds4_session_invalidate(chat->session);
                 return 1;
             }
@@ -1561,6 +1515,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     }
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
+    token_printer_release(&printer);
 
     const bool interrupted = cli_interrupt_requested();
     if (interrupted && generated == 0) {
@@ -1637,6 +1592,23 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE);
             puts("Thinking mode: none.");
+        } else if (!strncmp(cmd, "/markdown", 9) &&
+                   (cmd[9] == '\0' || isspace((unsigned char)cmd[9]))) {
+            char *arg = trim_inplace(cmd + 9);
+            if (!arg[0]) {
+                printf("Markdown: %s.\n", cli_markdown_mode_name(cfg->markdown));
+            } else if (!strcmp(arg, "off")) {
+                cfg->markdown = CLI_MARKDOWN_OFF;
+                puts("Markdown: off.");
+            } else if (!strcmp(arg, "basic")) {
+                cfg->markdown = CLI_MARKDOWN_BASIC;
+                puts("Markdown: basic.");
+            } else if (!strcmp(arg, "full")) {
+                cfg->markdown = CLI_MARKDOWN_FULL;
+                puts("Markdown: full.");
+            } else {
+                fprintf(stderr, "ds4: /markdown takes off, basic, or full\n");
+            }
         } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
@@ -1762,6 +1734,7 @@ static cli_config parse_options(int argc, char **argv) {
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
+        .markdown = CLI_MARKDOWN_FULL,
         .gen = {
             .prompt = NULL,
             .system = "You are a helpful assistant",
@@ -1835,6 +1808,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
+        } else if (!strcmp(arg, "--markdown")) {
+            c.markdown = parse_markdown_mode(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--plain")) {
+            c.markdown = CLI_MARKDOWN_OFF;
+        } else if (!strcmp(arg, "--think-plain")) {
+            c.think_plain = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
