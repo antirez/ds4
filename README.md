@@ -254,7 +254,9 @@ The current q2 results use `ds4-bench` with the standard *Promessi sposi*
 input, 2048-token context steps, and 128 greedy generation tokens at every
 frontier. Each prefill number is for the next 2048-token chunk. The complete
 sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
-[gb10.csv](speed-bench/gb10.csv).
+[gb10.csv](speed-bench/gb10.csv). The GB10 optimization methodology and
+validation are documented in
+[ds4_gb10_q2_cuda_port_results.md](speed-bench/ds4_gb10_q2_cuda_port_results.md).
 
 | Machine | Backend | Context | Prefill | Generation |
 | --- | --- | ---: | ---: | ---: |
@@ -262,10 +264,10 @@ sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
 | MacBook Pro M5 Max, 128 GB | Metal | 16384 | 572.53 t/s | 36.14 t/s |
 | MacBook Pro M5 Max, 128 GB | Metal | 32768 | 557.04 t/s | 34.36 t/s |
 | MacBook Pro M5 Max, 128 GB | Metal | 65536 | 398.50 t/s | 27.64 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 2048 | 825.76 t/s | 18.05 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 16384 | 872.44 t/s | 15.10 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 32768 | 855.94 t/s | 14.43 t/s |
-| DGX Spark GB10, 128 GB | CUDA | 65536 | 822.98 t/s | 13.84 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 2048 | 832.86 t/s | 20.58 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 16384 | 883.81 t/s | 16.80 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 32768 | 865.40 t/s | 15.99 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 65536 | 833.44 t/s | 15.27 t/s |
 
 Older measurements for machines and model variants not rerun in this pass are
 kept for reference. They used the earlier CLI prompt procedure and are not
