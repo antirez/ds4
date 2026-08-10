@@ -80,6 +80,10 @@ struct linenoiseState {
     int fold_count;    /* Number of folded ranges. */
     size_t fold_start[LINENOISE_MAX_FOLDS]; /* Folded range start offsets. */
     size_t fold_end[LINENOISE_MAX_FOLDS];   /* Folded range end offsets. */
+    int fold_id[LINENOISE_MAX_FOLDS];  /* Placeholder number of each fold, or 0
+                                        * for folds not pasted on this line. */
+    int fold_next_id;   /* Last placeholder number given out on this line. */
+    int fold_hint_id;   /* Fold showing the "paste again" hint, or 0. */
     char *status;       /* Optional status/footer rendered below the prompt. */
     char *status_start; /* Optional escape sequence emitted before status. */
     char *status_end;   /* Optional escape sequence emitted after status. */

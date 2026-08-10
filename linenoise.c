@@ -121,12 +121,19 @@
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE (1024*1024)      // That will get dynamically allocated
 #define LINENOISE_INITIAL_BUFLEN 4096
-#define PASTE_FOLD_THRESHOLD 200            // Min bytes to fold a single-line paste.
-#define PASTE_FOLD_CONTEXT 8                // Context chars kept around generic folds.
+#define PASTE_FOLD_THRESHOLD 200            // Min bytes to fold a paste.
+#define PASTE_FOLD_LINES 5                  // Max lines shown inline unfolded.
 #define HISTORY_FOLD_THRESHOLD 4096         // Min bytes to fold single-line history.
 #define HISTORY_FOLD_MULTILINE_LINES 16     // Min lines to fold shorter history.
 #define HISTORY_FOLD_CONTEXT 96             // Context chars kept around history folds.
 #define PASTE_MAX_BYTES LINENOISE_MAX_LINE
+/* U+21B5 stands in for hard newlines: the editor treats the buffer as one
+ * logical line, so a literal newline would desync the refresh cursor math.
+ * The glyph is East Asian Neutral, exactly one column on every terminal, and
+ * carries no escape sequence, so refreshSingleLine() can still slice the
+ * rendered text by characters when scrolling horizontally. */
+#define LINENOISE_NEWLINE_MARKER "\xe2\x86\xb5"
+#define LINENOISE_NEWLINE_MARKER_LEN 3
 static char *unsupported_term[] = {"dumb","cons25","emacs",NULL};
 static linenoiseCompletionCallback *completionCallback = NULL;
 static linenoiseHintsCallback *hintsCallback = NULL;
@@ -714,6 +721,21 @@ failed:
     return 80;
 }
 
+/* Try to get the number of rows in the current terminal, or assume 24 if it
+ * fails. Unlike getColumns() there is no escape sequence fallback: the only
+ * user is the guard refusing to expand a paste that would not fit, and a
+ * conservative guess there simply keeps the placeholder folded. */
+static int getRows(void) {
+    struct winsize ws;
+
+    /* Test mode: use LINENOISE_ROWS env var for fixed height. */
+    char *rows_env = getenv("LINENOISE_ROWS");
+    if (rows_env) return atoi(rows_env);
+
+    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_row == 0) return 24;
+    return ws.ws_row;
+}
+
 /* Clear the screen. Used to handle ctrl+l */
 void linenoiseClearScreen(void) {
     if (write(STDOUT_FILENO,"\x1b[H\x1b[2J",7) <= 0) {
@@ -986,6 +1008,8 @@ static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
 struct linenoiseFold {
     size_t start;
     size_t end;
+    int id;             /* Placeholder number, or 0 for unnumbered folds. */
+    int hinted;         /* Show the "paste again to expand" suffix. */
     char display[64];
     size_t displaylen;
 };
@@ -1004,10 +1028,13 @@ static size_t foldCountLines(const char *buf, size_t len) {
     return lines;
 }
 
-/* Return true if the text should be folded: if it contains newlines or is at
- * least PASTE_FOLD_THRESHOLD bytes long. */
+/* Return true if the text should be folded, that is if showing it inline
+ * would take over the prompt: long text, or more than PASTE_FOLD_LINES lines.
+ * A short snippet is easier to review as itself than as a placeholder, and
+ * its newlines are rendered as markers on the single prompt line. */
 static int shouldFoldText(const char *buf, size_t len) {
-    return memchr(buf, '\n', len) != NULL || len >= PASTE_FOLD_THRESHOLD;
+    return len >= PASTE_FOLD_THRESHOLD ||
+           foldCountLines(buf,len) > PASTE_FOLD_LINES;
 }
 
 /* History recall should not aggressively hide normal prompts.  A single-line
@@ -1020,17 +1047,37 @@ static int shouldFoldHistoryText(const char *buf, size_t len) {
            lines >= HISTORY_FOLD_MULTILINE_LINES;
 }
 
-/* Fill f->display with the text shown instead of the folded range. */
+/* Fill f->display with the text shown instead of the folded range. Folds
+ * created by a paste on the current line carry a number the user can refer
+ * to; folds reconstructed from history have no number, since they were never
+ * pasted here. */
 static void foldSetRenderedText(struct linenoiseFold *f, const char *buf) {
     size_t hidden = f->end - f->start;
     size_t lines = foldCountLines(buf + f->start, hidden);
+    const char *hint = f->hinted ? " (paste again to expand)" : "";
     int n;
 
-    if (lines > 1)
-        n = snprintf(f->display,sizeof(f->display),"[... %zu pasted lines ...]",lines);
-    else
-        n = snprintf(f->display,sizeof(f->display),"[... %zu pasted chars ...]",hidden);
+    /* Text ending with a newline still has that many lines: the final
+     * newline closes the last line instead of opening an empty one. */
+    if (lines > 1 && buf[f->end-1] == '\n') lines--;
+
+    if (f->id > 0) {
+        if (lines > 1)
+            n = snprintf(f->display,sizeof(f->display),
+                         "[Pasted text #%d +%zu lines]%s",f->id,lines,hint);
+        else
+            n = snprintf(f->display,sizeof(f->display),
+                         "[Pasted text #%d +%zu chars]%s",f->id,hidden,hint);
+    } else {
+        if (lines > 1)
+            n = snprintf(f->display,sizeof(f->display),"[... %zu lines ...]",lines);
+        else
+            n = snprintf(f->display,sizeof(f->display),"[... %zu chars ...]",hidden);
+    }
+    /* snprintf() reports the untruncated length: never trust it past the
+     * buffer, or the render would read out of bounds. */
     if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(f->display)) n = (int)sizeof(f->display)-1;
     f->displaylen = (size_t)n;
 }
 
@@ -1040,6 +1087,7 @@ static void foldSetRenderedText(struct linenoiseFold *f, const char *buf) {
  * contains newlines. */
 static int linenoiseBuildHistoryFold(struct linenoiseState *l, struct linenoiseFold *f) {
     f->start = f->end = f->displaylen = 0;
+    f->id = f->hinted = 0;
     if (l->len == 0 || maskmode) return 0;
     if (!shouldFoldHistoryText(l->buf,l->len)) return 0;
 
@@ -1099,44 +1147,75 @@ static int linenoiseGetRenderFolds(struct linenoiseState *l, struct linenoiseFol
         f = fs->fold + fs->count++;
         f->start = start;
         f->end = end;
+        f->id = l->fold_id[j];
+        f->hinted = f->id > 0 && f->id == l->fold_hint_id;
         foldSetRenderedText(f,l->buf);
     }
     return fs->count != 0;
 }
 
+/* Rendered byte length of the buffer range [start,end). With 'markers' every
+ * hard newline expands to the newline marker, which is what the renderers
+ * confined to a single row need; byte offsets are then not preserved, so
+ * translating an edit position into a render position requires scanning
+ * instead of subtracting. Without it the bytes are kept verbatim and
+ * refreshMultiLine() turns each newline into a real terminal row. */
+static size_t renderPlainLen(const char *buf, size_t start, size_t end, int markers) {
+    size_t len = 0, j;
+
+    if (!markers) return end-start;
+    for (j = start; j < end; j++)
+        len += buf[j] == '\n' ? LINENOISE_NEWLINE_MARKER_LEN : 1;
+    return len;
+}
+
+/* Copy [start,end) into out with the same substitution, returning the number
+ * of bytes written, that is renderPlainLen() of the same range. */
+static size_t renderPlainCopy(const char *buf, size_t start, size_t end, char *out, int markers) {
+    size_t n = 0, j;
+
+    if (!markers) {
+        memcpy(out,buf+start,end-start);
+        return end-start;
+    }
+    for (j = start; j < end; j++) {
+        if (buf[j] == '\n') {
+            memcpy(out+n,LINENOISE_NEWLINE_MARKER,LINENOISE_NEWLINE_MARKER_LEN);
+            n += LINENOISE_NEWLINE_MARKER_LEN;
+        } else {
+            out[n++] = buf[j];
+        }
+    }
+    return n;
+}
+
 /* Return the freshly allocated string content that is actually displayed in
  * the user prompt. It can be the actual edited line, or a special version
  * where pasted or multiline history ranges are replaced by their folded
- * "[...]" style versions. outpos is l->pos translated into this rendered
- * buffer. */
-static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *outlen, size_t *outpos) {
+ * "[...]" style versions. Newlines outside the folds are kept verbatim, or
+ * replaced by markers when the caller can only paint one row.
+ * outpos is l->pos translated into this rendered buffer. */
+static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *outlen, size_t *outpos, int markers) {
     struct linenoiseFolds fs;
     size_t len, pos, src, dst;
     char *r;
     int j, pos_set = 0;
 
-    if (!linenoiseGetRenderFolds(l,&fs)) {
-        /* Keep the refresh code simple: it always owns a temporary render
-         * buffer, even when the render is identical to the real edit buffer. */
-        r = malloc(l->len+1);
-        if (r == NULL) return -1;
-        memcpy(r,l->buf,l->len);
-        r[l->len] = '\0';
-        *out = r;
-        *outlen = l->len;
-        *outpos = l->pos;
-        return 0;
-    }
+    /* An empty fold set is not a special case: the loops below then just
+     * render the whole buffer as one gap. */
+    linenoiseGetRenderFolds(l,&fs);
 
-    /* Gaps are copied as-is, folded ranges are replaced by their markers.
-     * The bytes inside each [start,end) range stay in l->buf but are not
-     * emitted to the terminal. */
-    len = l->len;
+    /* Gaps are copied with their newlines substituted, folded ranges are
+     * replaced by their placeholder. The bytes inside each [start,end) range
+     * stay in l->buf but are not emitted to the terminal. */
+    len = 0;
+    src = 0;
     for (j = 0; j < fs.count; j++) {
         struct linenoiseFold *f = fs.fold+j;
-        len -= f->end - f->start;
-        len += f->displaylen;
+        len += renderPlainLen(l->buf,src,f->start,markers) + f->displaylen;
+        src = f->end;
     }
+    len += renderPlainLen(l->buf,src,l->len,markers);
     r = malloc(len+1);
     if (r == NULL) return -1;
 
@@ -1144,14 +1223,12 @@ static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *o
     pos = 0;
     for (j = 0; j < fs.count; j++) {
         struct linenoiseFold *f = fs.fold+j;
-        size_t gap = f->start - src;
 
         if (!pos_set && l->pos <= f->start) {
-            pos = dst + (l->pos - src);
+            pos = dst + renderPlainLen(l->buf,src,l->pos,markers);
             pos_set = 1;
         }
-        memcpy(r+dst,l->buf+src,gap);
-        dst += gap;
+        dst += renderPlainCopy(l->buf,src,f->start,r+dst,markers);
 
         if (!pos_set && l->pos < f->end) {
             pos = dst + f->displaylen;
@@ -1165,14 +1242,62 @@ static int linenoiseRenderBuffer(struct linenoiseState *l, char **out, size_t *o
         }
         src = f->end;
     }
-    if (!pos_set) pos = dst + (l->pos - src);
-    memcpy(r+dst,l->buf+src,l->len-src);
+    if (!pos_set) pos = dst + renderPlainLen(l->buf,src,l->pos,markers);
+    renderPlainCopy(l->buf,src,l->len,r+dst,markers);
     r[len] = '\0';
 
     *out = r;
     *outlen = len;
     *outpos = pos;
     return 0;
+}
+
+/* Where the terminal cursor ends up after printing the prompt followed by the
+ * first 'stop' bytes of a rendered buffer. The stream wraps at the right
+ * margin and every hard newline starts a fresh row, so once newlines are in
+ * play the position can only be known by walking the text.
+ *
+ * Rows are 1 based and counted from the prompt row; *col is the 0 based
+ * column. *pending reports the deferred wrap terminals implement: text that
+ * ends exactly on the right margin leaves the cursor logically at column 0 of
+ * the row below, but the terminal only moves there when the next glyph, CR or
+ * LF arrives. That distinction matters twice: a newline right after such text
+ * must not skip a row, and a buffer ending there needs an explicit CR LF so
+ * the row the cursor claims really exists.
+ *
+ * Segment widths come from utf8StrWidth(), so a double width character that
+ * does not fit in the last column is accounted where it was written rather
+ * than where the terminal wraps it. This approximation predates newline
+ * support and only shows up with CJK text straddling the margin. */
+static void linenoiseGeometry(const char *render, size_t stop, size_t pwidth,
+                              size_t cols, int *row, int *col, int *pending)
+{
+    size_t used = pwidth;   /* Columns used so far on the current row. */
+    size_t i = 0, seg = 0;
+    int r = 1, p = 0;
+
+    if (cols == 0) cols = 80;
+    while (1) {
+        int newline = i < stop && render[i] == '\n';
+
+        if (i == stop || newline) {
+            used += utf8StrWidth(render+seg,i-seg);
+            r += (int)(used/cols);
+            p = used > 0 && used%cols == 0;
+            used %= cols;
+            if (i == stop) break;
+            /* A newline resolves a deferred wrap instead of adding to it: the
+             * terminal already moved to the row below when it wrapped. */
+            if (!p) r++;
+            p = 0;
+            used = 0;
+            seg = i+1;
+        }
+        i++;
+    }
+    *row = r;
+    *col = (int)used;
+    *pending = p;
 }
 
 /* Return the number of bytes to move right from pos. If pos is at the start of
@@ -1205,25 +1330,45 @@ static size_t linenoiseEditPrevLen(struct linenoiseState *l, size_t pos) {
     return utf8PrevCharLen(l->buf,pos);
 }
 
-/* Add a fold range, keeping the array sorted by start offset. */
-static void linenoiseFoldAdd(struct linenoiseState *l, size_t start, size_t end) {
+/* Add a fold range with an explicit number, keeping the array sorted by start
+ * offset. Return 1 if the fold was stored. The number is kept beside the range
+ * because the array order follows the offsets, not the creation order. */
+static int linenoiseFoldInsert(struct linenoiseState *l, size_t start, size_t end, int id) {
     int j;
 
-    if (start >= end || l->fold_count == LINENOISE_MAX_FOLDS) return;
+    if (start >= end || l->fold_count == LINENOISE_MAX_FOLDS) return 0;
     j = l->fold_count;
     while (j > 0 && start < l->fold_start[j-1]) {
         l->fold_start[j] = l->fold_start[j-1];
         l->fold_end[j] = l->fold_end[j-1];
+        l->fold_id[j] = l->fold_id[j-1];
         j--;
     }
     l->fold_start[j] = start;
     l->fold_end[j] = end;
+    l->fold_id[j] = id;
     l->fold_count++;
+    return 1;
 }
 
-/* Clear all remembered fold ranges. */
+/* Add a fold for text just pasted on this line, giving it the next
+ * placeholder number. Return the assigned number, or 0 if there was no free
+ * fold slot. Numbers are never reused or reassigned, so expanding "#1" leaves
+ * the next paste as "#2" instead of renumbering what is on screen. */
+static int linenoiseFoldAdd(struct linenoiseState *l, size_t start, size_t end) {
+    int id = l->fold_next_id+1;
+
+    if (!linenoiseFoldInsert(l,start,end,id)) return 0;
+    l->fold_next_id = id;
+    return id;
+}
+
+/* Clear all remembered fold ranges. Numbering restarts from #1 with the next
+ * edited line, like a fresh prompt. */
 static void linenoiseFoldClear(struct linenoiseState *l) {
     l->fold_count = 0;
+    l->fold_next_id = 0;
+    l->fold_hint_id = 0;
 }
 
 /* Remove one remembered fold range. */
@@ -1232,6 +1377,8 @@ static void linenoiseFoldRemove(struct linenoiseState *l, int j) {
             sizeof(size_t)*(l->fold_count-j-1));
     memmove(l->fold_end+j,l->fold_end+j+1,
             sizeof(size_t)*(l->fold_count-j-1));
+    memmove(l->fold_id+j,l->fold_id+j+1,
+            sizeof(int)*(l->fold_count-j-1));
     l->fold_count--;
 }
 
@@ -1248,10 +1395,16 @@ static int linenoiseRangeOverlapsFold(struct linenoiseState *l, size_t pos, size
 }
 
 /* Adjust fold ranges after an insertion. If insertion somehow lands inside a
- * fold, remove that fold because it no longer maps to an unchanged range. */
+ * fold, remove that fold because it no longer maps to an unchanged range.
+ *
+ * This is also where the inline "paste again" hint dies: it is an aid shown
+ * right after a paste, and every path that changes the buffer content passes
+ * through here, through linenoiseAdjustFoldsAfterDelete() or through
+ * linenoiseFoldClear(). Moving the cursor around leaves it alone. */
 static void linenoiseAdjustFoldsAfterInsert(struct linenoiseState *l, size_t pos, size_t len) {
     int j = 0;
 
+    l->fold_hint_id = 0;
     while (j < l->fold_count) {
         if (pos <= l->fold_start[j]) {
             l->fold_start[j] += len;
@@ -1271,6 +1424,7 @@ static void linenoiseAdjustFoldsAfterDelete(struct linenoiseState *l, size_t pos
     size_t end = pos + len;
     int j = 0;
 
+    l->fold_hint_id = 0;
     while (j < l->fold_count) {
         if (end <= l->fold_start[j]) {
             l->fold_start[j] -= len;
@@ -1284,20 +1438,74 @@ static void linenoiseAdjustFoldsAfterDelete(struct linenoiseState *l, size_t pos
     }
 }
 
+/* Number of terminal rows the prompt currently needs, with the same geometry
+ * refreshMultiLine() uses, plus the status footer. Text ending on the right
+ * margin counts the row the cursor would claim, which is what the multi row
+ * refresh reserves when the cursor sits there. Return -1 if the buffer can't
+ * be rendered. */
+static int linenoiseRenderRows(struct linenoiseState *l) {
+    char *render = NULL;
+    size_t render_len, render_pos;
+    int row, col, pending;
+
+    if (linenoiseRenderBuffer(l,&render,&render_len,&render_pos,0) == -1) return -1;
+    linenoiseGeometry(render,render_len,utf8StrWidth(l->prompt,l->plen),
+                      l->cols,&row,&col,&pending);
+    free(render);
+    return row + linenoiseStatusRows(l);
+}
+
+/* Return the index of the fold hiding exactly the given text, or -1. A fold is
+ * never partially edited: the cursor jumps over it and any overlapping edit
+ * drops the whole entry, so an exact byte compare is enough. When more than
+ * one fold matches, the most recently created one wins. */
+static int linenoiseFoldMatch(struct linenoiseState *l, const char *buf, size_t len) {
+    int j, best = -1;
+
+    for (j = 0; j < l->fold_count; j++) {
+        if (l->fold_end[j]-l->fold_start[j] != len) continue;
+        if (memcmp(l->buf+l->fold_start[j],buf,len) != 0) continue;
+        if (best == -1 || l->fold_id[j] > l->fold_id[best]) best = j;
+    }
+    return best;
+}
+
+/* Reveal the text hidden by fold j. The expanded text is shown as one long
+ * logical line, so refuse when it would not fit on screen: a file pasted twice
+ * by mistake must not blow the prompt past the terminal. Two rows are kept
+ * free so the prompt still has room to grow. Return 1 on success, or 0 with
+ * the fold left untouched. */
+static int linenoiseFoldExpand(struct linenoiseState *l, int j) {
+    size_t start = l->fold_start[j], end = l->fold_end[j];
+    int id = l->fold_id[j];
+    int rows;
+
+    linenoiseFoldRemove(l,j);
+    rows = linenoiseRenderRows(l);
+    if (rows < 0 || rows > getRows()-2) {
+        linenoiseFoldInsert(l,start,end,id);
+        return 0;
+    }
+    if (l->fold_hint_id == id) l->fold_hint_id = 0;
+    return 1;
+}
+
 /* Helper of refreshSingleLine() and refreshMultiLine() to show hints
- * to the right of the prompt. Now uses display widths for proper UTF-8. */
-void refreshShowHints(struct abuf *ab, struct linenoiseState *l, int pwidth, size_t bufwidth) {
+ * to the right of the prompt. Now uses display widths for proper UTF-8.
+ * 'col' is the column the hint would start at, that is where the text just
+ * written left the cursor: with multiple rows only the last one is left. */
+void refreshShowHints(struct abuf *ab, struct linenoiseState *l, size_t col) {
     if (hintsCallback) {
         char seq[64];
         int color = -1, bold = 0;
         char *hint;
 
-        if (pwidth + bufwidth >= l->cols) return;
+        if (col >= l->cols) return;
         hint = hintsCallback(l->buf,&color,&bold);
         if (hint) {
             size_t hintlen = strlen(hint);
             size_t hintwidth = utf8StrWidth(hint, hintlen);
-            size_t hintmaxwidth = l->cols - (pwidth + bufwidth);
+            size_t hintmaxwidth = l->cols - col;
             /* Truncate hint to fit, respecting UTF-8 boundaries. */
             if (hintwidth > hintmaxwidth) {
                 size_t i = 0, w = 0;
@@ -1348,7 +1556,8 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
     size_t fullwidth;        /* Display width before horizontal trimming. */
     struct abuf ab;
 
-    if (linenoiseRenderBuffer(l,&render,&len,&pos) == -1) return;
+    /* One row only: hard newlines have to be shown as markers here. */
+    if (linenoiseRenderBuffer(l,&render,&len,&pos,1) == -1) return;
     buf = render;
 
     /* Calculate the display width up to cursor and total display width. */
@@ -1396,7 +1605,7 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
             abAppend(&ab,buf,len);
         }
         /* Show hints if any. */
-        refreshShowHints(&ab,l,pwidth,fullwidth);
+        refreshShowHints(&ab,l,pwidth+fullwidth);
     }
 
     /* Erase to right */
@@ -1422,14 +1631,17 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
  * Flags is REFRESH_* macros. The function can just remove the old
  * prompt, just write it, or both.
  *
- * This function is UTF-8 aware and uses display widths for positioning. */
+ * This function is UTF-8 aware and uses display widths for positioning. Hard
+ * newlines in the buffer are painted as real terminal rows, so the row and
+ * cursor math walks the rendered text instead of dividing its total width. */
 static void refreshMultiLine(struct linenoiseState *l, int flags) {
     char seq[64];
     size_t pwidth = utf8StrWidth(l->prompt, l->plen);  /* Prompt display width */
+    size_t cols = l->cols ? l->cols : 80;
     char *render = NULL;
     size_t render_len, render_pos;
-    size_t bufwidth;
-    size_t poswidth;
+    int end_row, end_col, end_pending;   /* Geometry of the whole render. */
+    int cur_pending;    /* Deferred wrap at the cursor, same row either way. */
     int rows; /* rows used by current rendered buffer. */
     int rpos = l->oldrpos;   /* cursor relative row from previous refresh. */
     int rpos2; /* rpos after refresh. */
@@ -1441,13 +1653,19 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
     int fd = l->ofd, j;
     struct abuf ab;
 
-    if (linenoiseRenderBuffer(l,&render,&render_len,&render_pos) == -1) return;
-    bufwidth = utf8StrWidth(render, render_len);
-    poswidth = utf8StrWidth(render, render_pos);
-    rows = (pwidth+bufwidth+l->cols-1)/l->cols;
-    int cursor_wrap_row = l->pos &&
-        render_pos == render_len &&
-        (poswidth+pwidth) % l->cols == 0;
+    /* Masked input is painted as one asterisk per character on a single row,
+     * so it needs the marker variant; everything else gets real newlines. */
+    if (linenoiseRenderBuffer(l,&render,&render_len,&render_pos,maskmode) == -1)
+        return;
+    linenoiseGeometry(render,render_len,pwidth,cols,&end_row,&end_col,&end_pending);
+    linenoiseGeometry(render,render_pos,pwidth,cols,&rpos2,&col,&cur_pending);
+
+    /* Text stopping exactly on the right margin has not made the terminal
+     * move to the next row yet, so that row is not painted and not counted.
+     * When the cursor is there we do materialize it below, and then it is a
+     * row of the prompt like any other. */
+    rows = end_row - (end_pending ? 1 : 0);
+    int cursor_wrap_row = end_pending && render_pos == render_len && render_pos;
     if (cursor_wrap_row) rows++;
 
     /* First step: clear all the lines used before. To do so start by
@@ -1512,11 +1730,22 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
                 i += utf8NextCharLen(render, i, render_len);
             }
         } else {
-            abAppend(&ab,render,render_len);
+            /* Raw mode cleared OPOST, so a bare LF would drop one row while
+             * keeping the column and stair-step the input. Write CR LF for
+             * every hard newline instead, which also resolves a deferred
+             * wrap without skipping a row. */
+            size_t i, start = 0;
+            for (i = 0; i < render_len; i++) {
+                if (render[i] != '\n') continue;
+                abAppend(&ab,render+start,(int)(i-start));
+                abAppend(&ab,"\r\n",2);
+                start = i+1;
+            }
+            abAppend(&ab,render+start,(int)(render_len-start));
         }
 
-        /* Show hints if any. */
-        refreshShowHints(&ab,l,pwidth,bufwidth);
+        /* Show hints if any, right where the last row ended. */
+        refreshShowHints(&ab,l,(size_t)end_col);
 
         /* If we are at the very end of the screen with our prompt, we need to
          * emit a newline and move the prompt to the first column. */
@@ -1527,16 +1756,13 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
             abAppend(&ab,seq,strlen(seq));
         }
 
-        /* Move cursor to right position. */
-        rpos2 = (pwidth+poswidth+l->cols)/l->cols; /* Current cursor relative row */
         lndebug("rpos2 %d", rpos2);
 
         if (linenoiseStatusActive(l)) {
             refreshStatusLine(&ab, l);
         }
 
-        /* Set column. */
-        col = (pwidth+poswidth) % l->cols;
+        /* Set column, already known from the cursor walk above. */
         if (layout_prompt_row > 0) {
             /* The owner has explicitly anchored the prompt block.  Avoid the
              * relative "go up from status row" cursor motion here: after the
@@ -1692,8 +1918,13 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
                              memchr(c, '\r', clen) != NULL;
 
         if (linenoiseEditInsertNoRefresh(l,c,clen) == -1) return 0;
+        /* The shortcut below appends the raw bytes and accounts for their
+         * width with utf8StrWidth(), which counts a newline as zero columns.
+         * A buffer that already holds newlines renders them as one-column
+         * markers instead, so it must take the full refresh path. */
         if (!needs_refresh && !mlmode && !linenoiseStatusActive(l) &&
             !l->oldstatusrows && !hintsCallback &&
+            memchr(l->buf,'\n',l->len) == NULL &&
             (maskmode || l->fold_count == 0))
         {
             size_t bufwidth = utf8StrWidth(l->buf,l->len);
@@ -1871,7 +2102,7 @@ void linenoiseEditHistoryNext(struct linenoiseState *l, int dir) {
          * If the recalled entry needs folding, create one display fold now
          * so text typed after recall remains outside the folded range. */
         if (linenoiseBuildHistoryFold(l,&f))
-            linenoiseFoldAdd(l,f.start,f.end);
+            linenoiseFoldInsert(l,f.start,f.end,0);
         refreshLine(l);
     }
 }
@@ -2031,37 +2262,30 @@ static int pasteBufferReserve(char **buf, size_t *cap, size_t len, size_t need) 
     return 0;
 }
 
-/* Append bytes to the temporary paste buffer, growing both it and l->buf as
- * needed. Return -1 if the paste is too large or allocation fails. */
-static int pasteBufferAppend(struct linenoiseState *l, char **buf, size_t *cap,
-                             size_t *len, const char *s, size_t slen, size_t maxlen) {
-    size_t needed;
-
-    if (*len > maxlen || slen > maxlen-*len) return -1;
+/* Append bytes to the temporary paste buffer. Return -1 if the paste is too
+ * large or allocation fails. Whether the edit buffer can hold the result is
+ * not decided here: the paste is collected first, because identical bytes may
+ * expand an existing fold instead of being inserted at all. */
+static int pasteBufferAppend(char **buf, size_t *cap, size_t *len,
+                             const char *s, size_t slen) {
     if (*len > SIZE_MAX-slen) return -1;
-    needed = *len+slen;
-    if (l->len > SIZE_MAX-needed) return -1;
-    if (linenoiseEditGrow(l,l->len+needed) == -1) return -1;
     if (pasteBufferReserve(buf,cap,*len,slen) == -1) return -1;
     memcpy(*buf+*len,s,slen);
-    *len = needed;
+    *len += slen;
     return 0;
 }
 
 /* Read a bracketed paste until ESC[201~ and insert the real bytes. If folding
- * is needed, remember the inserted range so only rendering is shortened. */
+ * is needed, remember the inserted range so only rendering is shortened. The
+ * paste is dropped, with a beep, only when it is over PASTE_MAX_BYTES or the
+ * edit buffer cannot hold it: running out of fold slots just leaves the text
+ * unfolded rather than silently losing it. */
 static void linenoiseEditPaste(struct linenoiseState *l) {
     static const char END[] = "\x1b[201~";
     const size_t ENDLEN = sizeof(END)-1;
     char *buf = NULL;
     size_t cap = 0, len = 0, match = 0;
-    size_t maxlen = l->buflen_max ? l->buflen_max : l->buflen;
     int overflowed = 0;
-
-    maxlen = maxlen > l->len ? maxlen - l->len : 0;
-    if (maxlen > PASTE_MAX_BYTES) maxlen = PASTE_MAX_BYTES;
-    /* Once all fold slots are used, consume later pastes without storing them. */
-    if (l->fold_count == LINENOISE_MAX_FOLDS) maxlen = 0;
 
     while (1) {
         char c;
@@ -2078,7 +2302,7 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
 
         if (match > 0) {
             if (!overflowed &&
-                pasteBufferAppend(l,&buf,&cap,&len,END,match,maxlen) == -1)
+                pasteBufferAppend(&buf,&cap,&len,END,match) == -1)
                 overflowed = 1;
             match = 0;
             if (c == END[0]) {
@@ -2087,8 +2311,7 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
             }
         }
 
-        if (!overflowed &&
-            pasteBufferAppend(l,&buf,&cap,&len,&c,1,maxlen) == -1)
+        if (!overflowed && pasteBufferAppend(&buf,&cap,&len,&c,1) == -1)
             overflowed = 1;
     }
 
@@ -2114,17 +2337,37 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
         len = w;
     }
 
-    if (!maskmode && shouldFoldText(buf,len)) {
+    /* Pasting the very same text again expands its placeholder instead of
+     * inserting a second copy: this is how the user sees what is hidden.
+     * The cursor is already at the end of the revealed range, exactly where
+     * an ordinary paste of the same text would have left it. */
+    if (!maskmode) {
+        int j = linenoiseFoldMatch(l,buf,len);
+        if (j != -1) {
+            if (linenoiseFoldExpand(l,j))
+                refreshLine(l);
+            else
+                linenoiseBeep();
+            free(buf);
+            return;
+        }
+    }
+
+    /* The real bytes always enter the buffer first, then the range is marked
+     * as folded, and only then we repaint: raw pasted newlines must never
+     * reach the terminal. */
+    {
         size_t start = l->pos;
         if (linenoiseEditInsertNoRefresh(l,buf,len) == -1) {
             free(buf);
             linenoiseBeep();
             return;
         }
-        linenoiseFoldAdd(l,start,start+len);
+        /* Point the inline hint at the fold just created, so the newest
+         * placeholder is the one advertising how to expand it. */
+        if (!maskmode && shouldFoldText(buf,len))
+            l->fold_hint_id = linenoiseFoldAdd(l,start,start+len);
         refreshLine(l);
-    } else {
-        linenoiseEditInsert(l,buf,len);
     }
     free(buf);
 }
@@ -2176,10 +2419,14 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
     }
 
     switch(c) {
-    case ENTER:    /* enter */
+    case ENTER: {  /* enter */
+        int hinted = l->fold_hint_id != 0;
         history_len--;
         free(history[history_len]);
         if (mlmode) linenoiseEditMoveEnd(l);
+        /* The accepted line stays frozen on screen above the answer, so drop
+         * the transient "paste again" hint before the last repaint. */
+        l->fold_hint_id = 0;
         if (hintsCallback) {
             /* Force a refresh without hints to leave the previous
              * line as the user typed it after a newline. */
@@ -2187,8 +2434,11 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             hintsCallback = NULL;
             refreshLine(l);
             hintsCallback = hc;
+        } else if (hinted) {
+            refreshLine(l);
         }
         return strdup(l->buf);
+    }
     case CTRL_C:     /* ctrl-c */
         errno = EAGAIN;
         return NULL;
@@ -2224,6 +2474,7 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             memmove(l->buf + prevstart + currlen, l->buf + prevstart, prevlen);
             memcpy(l->buf + prevstart, tmp, currlen);
             if (l->pos + currlen <= l->len) l->pos += currlen;
+            l->fold_hint_id = 0; /* Content changed without moving any fold. */
             refreshLine(l);
         }
         break;
