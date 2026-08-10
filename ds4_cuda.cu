@@ -13175,6 +13175,55 @@ __global__ static void dspark_markov_argmax_kernel(
     }
 }
 
+/* DSpark confidence probe: logit = dot(proj, [hidden ; markov_state]) where
+ * markov_state is the dequantized markov_w1 row of the previous token.  One
+ * small launch plus a 4-byte readback replaces a 28 KB hidden readback and a
+ * host-side matvec per proposed draft token. */
+__global__ static void dspark_confidence_kernel(
+        float *out_logit,
+        const float *hidden,
+        const unsigned char *w1_row,
+        const unsigned char *proj,
+        uint32_t proj_type,
+        uint32_t n_embd,
+        uint32_t rank_blocks) {
+    __shared__ float state[256];
+    const uint32_t tid = threadIdx.x;
+    if (tid < rank_blocks * 32u) {
+        const uint32_t b = tid >> 5, k = tid & 31u;
+        const unsigned char *blk = w1_row + (uint64_t)b * 34u;
+        const float d = __half2float(*(const __half *)blk);
+        state[tid] = d * (float)((const int8_t *)(blk + 2))[k];
+    }
+    __syncthreads();
+
+    const uint32_t feat = n_embd + rank_blocks * 32u;
+    float acc = 0.0f;
+    for (uint32_t i = tid; i < feat; i += blockDim.x) {
+        const float x = i < n_embd ? hidden[i] : state[i - n_embd];
+        float w;
+        if (proj_type == 0u) {
+            w = ((const float *)proj)[i];
+        } else if (proj_type == 1u) {
+            w = __half2float(((const __half *)proj)[i]);
+        } else {
+            const unsigned char *blk = proj + (uint64_t)(i >> 5) * 34u;
+            w = __half2float(*(const __half *)blk) *
+                (float)((const int8_t *)(blk + 2))[i & 31u];
+        }
+        acc += w * x;
+    }
+
+    __shared__ float sums[256];
+    sums[tid] = acc;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) sums[tid] += sums[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0u) *out_logit = sums[0];
+}
+
 __global__ static void indexer_top1_kernel(
         uint32_t *selected,
         const float *scores,
@@ -14087,6 +14136,59 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
                 w1_row, w2, vocab, rank_blocks);
         rc = cuda_ok(cudaGetLastError(), "dspark markov argmax launch");
     }
+    if (logical_tier != dev_save) (void)cudaSetDevice(dev_save);
+    return rc;
+}
+
+extern "C" int ds4_gpu_dspark_confidence_tensor(
+        ds4_gpu_tensor       *out_logit,
+        const ds4_gpu_tensor *hidden_row,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              proj_offset,
+        uint32_t              proj_type,
+        uint64_t              w1_offset,
+        uint32_t              prev_token,
+        uint32_t              n_embd,
+        uint32_t              rank) {
+    if (!out_logit || !hidden_row || !model_map || n_embd == 0 ||
+        rank == 0 || (rank & 31u) != 0u || rank > 256u ||
+        out_logit->bytes < sizeof(float) ||
+        hidden_row->bytes < (uint64_t)n_embd * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t rank_blocks = rank / 32u;
+    const uint64_t w1_row_bytes = (uint64_t)rank_blocks * 34u;
+    const uint64_t feat = (uint64_t)n_embd + rank;
+    uint64_t proj_bytes;
+    if (proj_type == 0u) proj_bytes = feat * sizeof(float);
+    else if (proj_type == 1u) proj_bytes = feat * sizeof(uint16_t);
+    else if (proj_type == 8u) proj_bytes = ((feat + 31u) / 32u) * 34u;
+    else return 0;
+    if (w1_offset > model_size ||
+        (uint64_t)prev_token * w1_row_bytes + w1_row_bytes >
+            model_size - w1_offset ||
+        proj_offset > model_size || proj_bytes > model_size - proj_offset) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(hidden_row);
+    const unsigned char *w1_row = (const unsigned char *)cuda_resolve_weight_ptr(
+            model_map, w1_offset + (uint64_t)prev_token * w1_row_bytes,
+            w1_row_bytes, logical_tier, "dspark_confidence_w1_row");
+    const unsigned char *proj = (const unsigned char *)cuda_resolve_weight_ptr(
+            model_map, proj_offset, proj_bytes, logical_tier,
+            "dspark_confidence_proj");
+    if (!w1_row || !proj) return 0;
+    int dev_save = 0;
+    if (cudaGetDevice(&dev_save) != cudaSuccess) return 0;
+    if (logical_tier != dev_save && cudaSetDevice(logical_tier) != cudaSuccess) {
+        return 0;
+    }
+    dspark_confidence_kernel<<<1, 256>>>(
+            (float *)out_logit->ptr,
+            (const float *)hidden_row->ptr,
+            w1_row, proj, proj_type, n_embd, rank_blocks);
+    const int rc = cuda_ok(cudaGetLastError(), "dspark confidence launch");
     if (logical_tier != dev_save) (void)cudaSetDevice(dev_save);
     return rc;
 }

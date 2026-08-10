@@ -33464,6 +33464,66 @@ static bool dspark_eval_confidence_probe(
     return true;
 }
 
+#ifndef __APPLE__
+/* GPU confidence probe: the same logit the CPU matvec computes (up to
+ * floating-point reduction order), evaluated in place from the batch hidden
+ * row and the GPU-resident support weights.  Replaces a 28 KB device-to-host
+ * hidden readback plus a host matvec per drafted token with one small launch
+ * and a 4-byte readback.  Only proposal gating consumes the value, so
+ * reduction-order noise cannot change committed output. */
+static bool dspark_eval_confidence_gpu(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        uint32_t                  hidden_row,
+        int                       prev_token,
+        float                    *out_logit) {
+    static int disabled = -1;
+    if (disabled < 0) {
+        disabled = getenv("DS4_DSPARK_NO_GPU_CONFIDENCE") != NULL ? 1 : 0;
+    }
+    if (disabled || !g || !g->dspark_draft_tokens ||
+        !metal_graph_batch_ffn_norm(g) ||
+        dw->markov_rank == 0 || (dw->markov_rank & 31u) != 0 ||
+        dw->markov_rank > 256u) {
+        return false;
+    }
+    const ds4_dspark_stage_weights *final =
+        &dw->stage[dw->n_stages - 1u];
+    if (final->markov_w1->type != DS4_TENSOR_Q8_0) return false;
+    const uint64_t hidden_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    if (ds4_gpu_tensor_bytes(metal_graph_batch_ffn_norm(g)) <
+        ((uint64_t)hidden_row + 1u) * hidden_bytes) {
+        return false;
+    }
+    ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+            metal_graph_batch_ffn_norm(g),
+            (uint64_t)hidden_row * hidden_bytes,
+            hidden_bytes);
+    bool ok = row &&
+        ds4_gpu_dspark_confidence_tensor(
+                g->dspark_draft_tokens,
+                row,
+                dspark_model->map,
+                dspark_model->size,
+                final->confidence_proj->abs_offset,
+                final->confidence_proj->type,
+                final->markov_w1->abs_offset,
+                (uint32_t)prev_token,
+                (uint32_t)DS4_N_EMBD,
+                dw->markov_rank) != 0;
+    if (ok) {
+        float v = 0.0f;
+        ok = ds4_gpu_tensor_read(g->dspark_draft_tokens, 0,
+                                 &v, sizeof(v)) != 0 &&
+             isfinite(v);
+        if (ok) *out_logit = v;
+    }
+    ds4_gpu_tensor_free(row);
+    return ok;
+}
+#endif
+
 static bool dspark_apply_markov_confidence_lazy_runtime(
         ds4_gpu_graph          *g,
         const ds4_model        *dspark_model,
@@ -33523,24 +33583,33 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
             break;
         }
         float confidence_logit = 0.0f;
+        bool markov_state_valid = false;
         if (draft == 0 && reuse_first_confidence) {
             confidence_logit = *confidence0;
         } else {
-            ok = dspark_dense_row_to_f32(markov_state,
-                                         dspark_model,
-                                         final->markov_w1,
-                                         (uint32_t)prev_token);
-            if (!ok) break;
+#ifndef __APPLE__
+            if (!dspark_eval_confidence_gpu(g, dspark_model, dw,
+                                            draft, prev_token,
+                                            &confidence_logit))
+#endif
+            {
+                ok = dspark_dense_row_to_f32(markov_state,
+                                             dspark_model,
+                                             final->markov_w1,
+                                             (uint32_t)prev_token);
+                if (!ok) break;
+                markov_state_valid = true;
 
-            ok = ds4_gpu_tensor_read(metal_graph_batch_ffn_norm(g),
-                                     (uint64_t)draft * hidden_bytes,
-                                     features,
-                                     hidden_bytes) != 0;
-            if (!ok) break;
-            matvec_any(&confidence_logit,
-                       dspark_model,
-                       final->confidence_proj,
-                       features);
+                ok = ds4_gpu_tensor_read(metal_graph_batch_ffn_norm(g),
+                                         (uint64_t)draft * hidden_bytes,
+                                         features,
+                                         hidden_bytes) != 0;
+                if (!ok) break;
+                matvec_any(&confidence_logit,
+                           dspark_model,
+                           final->confidence_proj,
+                           features);
+            }
         }
         if (draft == 0 && confidence0) *confidence0 = confidence_logit;
         if (confidence_len) *confidence_len = draft + 1u;
@@ -33596,6 +33665,19 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                                      (uint64_t)draft * logits_bytes,
                                      logits,
                                      logits_bytes) != 0;
+            if (ok) {
+                /* The GPU confidence probe and the reused first confidence
+                 * skip the host markov_state fill; re-derive it before any
+                 * CPU markov consumer runs. */
+                if (!markov_state_valid && !dspark_markov_bias_disabled()) {
+                    ok = dspark_dense_row_to_f32(markov_state,
+                                                 dspark_model,
+                                                 final->markov_w1,
+                                                 (uint32_t)prev_token);
+                    if (!ok) break;
+                    markov_state_valid = true;
+                }
+            }
             if (ok) {
                 uint32_t fused_token = 0;
                 if (dspark_markov_bias_disabled()) {
@@ -33668,6 +33750,12 @@ static bool dspark_eval_confidence0_runtime(
 
     const ds4_dspark_stage_weights *final =
         &dw->stage[dw->n_stages - 1u];
+#ifndef __APPLE__
+    if (dspark_eval_confidence_gpu(g, dspark_model, dw,
+                                   0, first_prev_token, confidence0)) {
+        return true;
+    }
+#endif
     if (ok) {
         ok = dspark_dense_row_to_f32(markov_state,
                                      dspark_model,

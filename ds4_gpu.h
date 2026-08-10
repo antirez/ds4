@@ -507,6 +507,16 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+int ds4_gpu_dspark_confidence_tensor(ds4_gpu_tensor *out_logit,
+                                     const ds4_gpu_tensor *hidden_row,
+                                     const void *model_map,
+                                     uint64_t model_size,
+                                     uint64_t proj_offset,
+                                     uint32_t proj_type,
+                                     uint64_t w1_offset,
+                                     uint32_t prev_token,
+                                     uint32_t n_embd,
+                                     uint32_t rank);
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
