@@ -62697,6 +62697,56 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (drafts[0] == eos_token) draft_n = 1;
 
     ds4_engine *e = s->engine;
+
+    /* Single-token drafts: the suffix verifier cannot check anything (the
+     * only proposed token was already matched against the target argmax
+     * above, and commit_drafts would be 1 unconditionally), so the batch
+     * forward pass plus the frontier snapshot only re-derive state that
+     * ordinary decode produces directly.  Decode the draft through the
+     * single-token path instead: it keeps the decode-graph fast kernels,
+     * skips the snapshot round trip, and leaves exactly the state plain
+     * decode would have left.  TP keeps the mirrored verify protocol so
+     * leader and worker stay in lockstep. */
+    if (draft_n == 1 && !ds4_session_tp_leader(s)) {
+        const double replay_t0 = stats_enabled ? now_sec() : 0.0;
+        if (!metal_graph_eval_token_raw_swa(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            drafts[0],
+                                            (uint32_t)s->checkpoint.len,
+                                            s->logits)) {
+            snprintf(err, errlen, "%s decode failed",
+                     ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            if (stats_enabled) {
+                s->dspark_stats.verifier_errors++;
+                s->dspark_stats.replay_ms += (now_sec() - replay_t0) * 1000.0;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            }
+            DS4_DSPARK_STATS_FINISH();
+            return -1;
+        }
+        token_vec_push(&s->checkpoint, drafts[0]);
+        accepted[n_accept++] = drafts[0];
+        s->checkpoint_valid = true;
+        ds4_session_dspark_capture_note_checkpoint(s);
+        if (stats_enabled) {
+            s->dspark_stats.replay_ms += (now_sec() - replay_t0) * 1000.0;
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.accepted_draft_tokens += 1u;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 1u);
+        }
+        ds4_session_dspark_scheduler_note(s, 1u, false,
+                                          DS4_DSPARK_SCHED_EXTRA_MS());
+        if (spec_log) {
+            fprintf(stderr,
+                    "ds4: DSpark spec single-draft decode accepted=%d\n",
+                    n_accept);
+        }
+        DS4_DSPARK_STATS_FINISH();
+        return n_accept;
+    }
+
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     int row_tops_buf[DS4_DSPARK_MAX_BLOCK_SIZE];
