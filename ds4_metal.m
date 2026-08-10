@@ -2432,6 +2432,22 @@ int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
+/* Admit pre-M5 Apple silicon to the decode in-place-pair and compact affine
+ * RoPE specialisation. The three sites that select it, and the two fuse
+ * predicates that mirror it, all tested the device name for "M3" or "M5". An
+ * M3 Ultra satisfies both that name test and ds4_gpu_device_is_pre_m5_apple_
+ * silicon(), so e6a6ab5's ported decode fusions were exercised there while
+ * every other pre-M5 part silently fell through to the unfused path: the gate
+ * was a device-name test where the rest of the port used a family predicate.
+ *
+ * Decode only. Callers pair this with n_tok == 1, so long prefill keeps the
+ * proven shared4 schedule and the YaRN fast-math caveat recorded at the
+ * shared-coefficient site cannot apply. */
+static int ds4_gpu_decode_rope_pair_affine_pre_m5(void) {
+    return ds4_gpu_device_is_pre_m5_apple_silicon() &&
+           getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_ROPE_PAIR_AFFINE") == NULL;
+}
+
 int ds4_gpu_device_is_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M5", 8) == 0 &&
            (g_metal_device_name[8] == '\0' ||
@@ -3464,7 +3480,9 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_name_contains("M3") &&
+        !ds4_gpu_device_name_contains("M5") &&
+        !ds4_gpu_decode_rope_pair_affine_pre_m5()) return 0;
     return 1;
 }
 
@@ -5772,7 +5790,8 @@ static int ds4_gpu_encode_rope_tail_inplace(
         args->mode == 0 && !args->src2 &&
         lane_compatible &&
         (ds4_gpu_device_name_contains("M3") ||
-         (ds4_gpu_device_name_contains("M5") && n_tok == 1u));
+         ((ds4_gpu_device_name_contains("M5") ||
+           ds4_gpu_decode_rope_pair_affine_pre_m5()) && n_tok == 1u));
     const bool use_shared_coeff =
         use_inplace_pair &&
         g_rope_tail_inplace_pair_shared4_pipeline != nil &&
@@ -5789,7 +5808,8 @@ static int ds4_gpu_encode_rope_tail_inplace(
         getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") == NULL &&
         n_tok == 1u &&
         (ds4_gpu_device_name_contains("M3") ||
-         ds4_gpu_device_name_contains("M5"));
+         ds4_gpu_device_name_contains("M5") ||
+         ds4_gpu_decode_rope_pair_affine_pre_m5());
 
     int32_t pos_stack[256];
     int32_t *pos = NULL;
@@ -21866,7 +21886,9 @@ int ds4_gpu_kv_rope_fp8_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_name_contains("M3") &&
+        !ds4_gpu_device_name_contains("M5") &&
+        !ds4_gpu_decode_rope_pair_affine_pre_m5()) return 0;
     return 1;
 }
 
