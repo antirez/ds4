@@ -593,6 +593,7 @@ typedef struct {
     /* Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
+    bool responses_custom;
     char **prop;
     int len;
     int cap;
@@ -1491,6 +1492,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
     if (*p != '{') return;
     p++;
     tool_schema_order order = {0};
+    char *type = NULL;
     json_ws(&p);
     while (*p && *p != '}') {
         char *key = NULL;
@@ -1501,7 +1503,12 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
             goto done;
         }
         p++;
-        if (!strcmp(key, "name")) {
+        if (!strcmp(key, "type")) {
+            if (!json_string_replace(&p, &type)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "name")) {
             if (!json_string_replace(&p, &order.name)) {
                 free(key);
                 goto done;
@@ -1527,10 +1534,12 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
         if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
         order.responses_tool_search = responses_tool_search;
+        order.responses_custom = type && !strcmp(type, "custom");
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
     }
 done:
+    free(type);
     tool_schema_order_free(&order);
 }
 
@@ -6946,17 +6955,14 @@ typedef struct {
 static bool responses_tool_call_is_tool_search(const tool_call *tc,
                                                const tool_schema_order *order) {
     return tc && tc->name && !strcmp(tc->name, "tool_search") &&
-           (!order || order->responses_tool_search);
+           order && order->responses_tool_search;
 }
 
-/* The internal tool_call doesn't track whether it came from a function_call or
- * a custom_tool_call (or what tool kind is registered). For round-trip
- * correctness with the rare custom_tool_call clients, we preserve any provided
- * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
- * defaults to function_call because Codex CLI registers all its tools as
- * function tools. */
+/* Recover the Responses discriminator from request-time registration metadata.
+ * Unknown tools retain the compatibility default of function_call. */
 static void responses_tool_items_build(responses_tool_item **out,
                                        const tool_calls *calls,
+                                       const tool_schema_orders *orders,
                                        int starting_output_index) {
     *out = NULL;
     if (!calls || calls->len == 0) return;
@@ -6969,10 +6975,46 @@ static void responses_tool_items_build(responses_tool_item **out,
         } else {
             responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
         }
-        items[i].is_custom = false;
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, calls->v[i].name);
+        items[i].is_custom = order && order->responses_custom;
         items[i].output_index = starting_output_index + i;
     }
     *out = items;
+}
+
+/* DSML represents arguments as an object. A Responses custom tool instead
+ * accepts free-form input, so unwrap exactly one string-valued property. Any
+ * other shape is preserved verbatim rather than guessed at or discarded. */
+static void responses_append_custom_input(buf *b, const char *arguments) {
+    const char *raw = arguments ? arguments : "";
+    const char *p = raw;
+    char *key = NULL;
+    char *value = NULL;
+    json_ws(&p);
+    if (*p != '{') goto fallback;
+    p++;
+    json_ws(&p);
+    if (!json_string(&p, &key)) goto fallback;
+    json_ws(&p);
+    if (*p != ':') goto fallback;
+    p++;
+    json_ws(&p);
+    if (!json_string(&p, &value)) goto fallback;
+    json_ws(&p);
+    if (*p != '}') goto fallback;
+    p++;
+    json_ws(&p);
+    if (*p) goto fallback;
+    json_escape(b, value);
+    free(key);
+    free(value);
+    return;
+
+fallback:
+    free(key);
+    free(value);
+    json_escape(b, raw);
 }
 
 static void responses_append_function_call_item(buf *b, const tool_call *tc,
@@ -7009,7 +7051,7 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
     if (!with_args) {
         buf_puts(b, "\"\"");
     } else if (item->is_custom) {
-        json_escape(b, tc->arguments ? tc->arguments : "");
+        responses_append_custom_input(b, tc->arguments);
     } else {
         append_json_object_string(b, tc->arguments);
     }
@@ -7039,22 +7081,22 @@ static bool responses_sse_function_call_event(int fd, responses_stream *st,
     return ok;
 }
 
-/* Stream function-call arguments as a single delta + done, since DS4 generates
- * the whole DSML invoke as one unit before the worker decides which tool was
- * called. Clients that follow the OpenAI Responses lifecycle expect both
- * events between output_item.added (in_progress) and output_item.done. */
-static bool responses_sse_function_call_arguments_done(int fd, responses_stream *st,
-                                                       const tool_call *tc,
-                                                       const responses_tool_item *item,
-                                                       const tool_schema_orders *orders) {
+/* Stream the generated payload as one delta + done pair because DS4 recovers
+ * the complete DSML invocation before it identifies the registered tool kind. */
+static bool responses_sse_tool_call_payload_done(int fd, responses_stream *st,
+                                                 const tool_call *tc,
+                                                 const responses_tool_item *item,
+                                                 const tool_schema_orders *orders) {
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
-    if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
+    if (responses_tool_call_is_tool_search(tc, order)) return true;
     buf args = {0};
-    append_json_object_string(&args, tc->arguments);
+    if (item->is_custom) responses_append_custom_input(&args, tc->arguments);
+    else append_json_object_string(&args, tc->arguments);
     buf b = {0};
     buf_printf(&b,
-        "{\"type\":\"response.function_call_arguments.delta\","
+        "{\"type\":\"response.%s.delta\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":",
+        item->is_custom ? "custom_tool_call_input" : "function_call_arguments",
         item->fc_id, item->output_index);
     buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
     buf_putc(&b, '}');
@@ -7067,16 +7109,20 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
 
     buf_free(&b);
     buf_printf(&b,
-        "{\"type\":\"response.function_call_arguments.done\","
-        "\"item_id\":\"%s\",\"output_index\":%d,\"name\":",
+        "{\"type\":\"response.%s.done\","
+        "\"item_id\":\"%s\",\"output_index\":%d",
+        item->is_custom ? "custom_tool_call_input" : "function_call_arguments",
         item->fc_id, item->output_index);
-    json_escape(&b, order && order->wire_name ? order->wire_name :
-                    (tc->name ? tc->name : ""));
-    if (order && order->namespace) {
-        buf_puts(&b, ",\"namespace\":");
-        json_escape(&b, order->namespace);
+    if (!item->is_custom) {
+        buf_puts(&b, ",\"name\":");
+        json_escape(&b, order && order->wire_name ? order->wire_name :
+                        (tc->name ? tc->name : ""));
+        if (order && order->namespace) {
+            buf_puts(&b, ",\"namespace\":");
+            json_escape(&b, order->namespace);
+        }
     }
-    buf_puts(&b, ",\"arguments\":");
+    buf_printf(&b, ",\"%s\":", item->is_custom ? "input" : "arguments");
     buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
     buf_putc(&b, '}');
     ok = responses_sse_emit_event(fd, st, b.ptr);
@@ -7357,16 +7403,17 @@ static bool responses_sse_finish_live(int fd, const request *r,
         st->message_item_closed = true;
     }
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, st->next_output_index);
+    responses_tool_items_build(&items, calls, &r->tool_orders,
+                               st->next_output_index);
     if (items && calls) st->next_output_index += calls->len;
     bool ok = true;
     if (items && calls) {
         for (int i = 0; i < calls->len && ok; i++) {
             ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
                                                    &r->tool_orders, finish, false);
-            if (ok) ok = responses_sse_function_call_arguments_done(fd, st, &calls->v[i],
-                                                                    &items[i],
-                                                                    &r->tool_orders);
+            if (ok) ok = responses_sse_tool_call_payload_done(fd, st, &calls->v[i],
+                                                              &items[i],
+                                                              &r->tool_orders);
             if (ok) ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
                                                            &r->tool_orders, finish, true);
         }
@@ -7389,7 +7436,7 @@ static bool responses_final_response(int fd, bool enable_cors,
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, 0);
+    responses_tool_items_build(&items, calls, &r->tool_orders, 0);
 
     long now = (long)time(NULL);
     const char *status = responses_status_for_finish(finish);
@@ -13710,6 +13757,78 @@ static void test_tool_schema_order_from_responses_tool_search(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_responses_custom_tool_kind_and_input(void) {
+    const char *json =
+        "[{\"type\":\"custom\",\"name\":\"apply_patch\","
+        "\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\"}}]";
+    const char *p = json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    const tool_schema_order *order =
+        tool_schema_orders_find(&orders, "apply_patch");
+    TEST_ASSERT(order && order->responses_custom);
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_patch");
+    tc.name = xstrdup("apply_patch");
+    tc.arguments = xstrdup("{\"payload\":\"*** Begin Patch\\n*** End Patch\"}");
+    tool_calls_push(&calls, tc);
+
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, &calls, &orders, 0);
+    TEST_ASSERT(items != NULL);
+    TEST_ASSERT(items && items[0].is_custom);
+
+    buf out = {0};
+    responses_append_function_call_item(&out, &calls.v[0], &items[0],
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"custom_tool_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"input\":\"*** Begin Patch\\n*** End Patch\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"arguments\"") == NULL);
+
+    const char *fallbacks[] = {
+        "raw input",
+        "{bad json",
+        "{\"first\":\"one\",\"second\":\"two\"}",
+        "{\"count\":2}",
+    };
+    for (size_t i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
+        buf_free(&out);
+        responses_append_custom_input(&out, fallbacks[i]);
+        buf expected = {0};
+        json_escape(&expected, fallbacks[i]);
+        TEST_ASSERT(out.ptr && expected.ptr && !strcmp(out.ptr, expected.ptr));
+        buf_free(&expected);
+    }
+
+    responses_tool_item *unknown = NULL;
+    responses_tool_items_build(&unknown, &calls, NULL, 0);
+    TEST_ASSERT(unknown && !unknown[0].is_custom);
+    free(unknown);
+
+    const char *input_json =
+        "[{\"type\":\"custom_tool_call\",\"id\":\"fc_patch\","
+        "\"call_id\":\"call_patch\",\"name\":\"apply_patch\","
+        "\"input\":\"raw patch\"},{\"type\":\"custom_tool_call_output\","
+        "\"call_id\":\"call_patch\",\"output\":\"Done\"}]";
+    const char *input_p = input_json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].id, "call_patch"));
+    TEST_ASSERT(!strcmp(msgs.v[1].tool_call_id, "call_patch"));
+    chat_msgs_free(&msgs);
+
+    buf_free(&out);
+    free(items);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
 static void test_responses_function_named_tool_search_stays_function_call(void) {
     const char *json =
         "[{\"type\":\"function\",\"function\":{\"name\":\"tool_search\","
@@ -13944,6 +14063,234 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static int test_count_substring(const char *text, const char *needle) {
+    int count = 0;
+    size_t len = strlen(needle);
+    while ((text = strstr(text, needle)) != NULL) {
+        count++;
+        text += len;
+    }
+    return count;
+}
+
+static char *test_responses_finish_sse(const request *r,
+                                       const tool_calls *calls) {
+    responses_stream st;
+    responses_stream_init(r, &st);
+    st.active = true;
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return xstrdup("");
+    TEST_ASSERT(responses_sse_finish_live(sv[0], r, &st, "", 0, NULL,
+                                          calls, "tool_calls", 4, 2, 1));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+    responses_stream_free(&st);
+    return out;
+}
+
+static void test_responses_custom_tool_stream_events(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_NONE;
+    const char *tools_json =
+        "[{\"type\":\"custom\",\"name\":\"apply_patch\"}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &r.tool_orders));
+    tool_calls calls = {0};
+    tool_call final_tc = {0};
+    final_tc.id = xstrdup("call_patch");
+    final_tc.name = xstrdup("apply_patch");
+    final_tc.arguments = xstrdup("{\"payload\":\"raw patch\"}");
+    tool_calls_push(&calls, final_tc);
+
+    char *stream = test_responses_finish_sse(&r, &calls);
+    TEST_ASSERT(strstr(stream, "\"type\":\"custom_tool_call\"") != NULL);
+    TEST_ASSERT(strstr(stream,
+        "\"type\":\"response.custom_tool_call_input.delta\"") != NULL);
+    TEST_ASSERT(strstr(stream,
+        "\"type\":\"response.custom_tool_call_input.done\"") != NULL);
+    TEST_ASSERT(strstr(stream, "\"call_id\":\"call_patch\"") != NULL);
+    TEST_ASSERT(strstr(stream, "\"input\":\"raw patch\"") != NULL);
+    TEST_ASSERT(strstr(stream, "response.function_call_arguments") == NULL);
+    const char *id = strstr(stream, "\"id\":\"fc_");
+    TEST_ASSERT(id != NULL);
+    if (id) {
+        id += strlen("\"id\":\"");
+        const char *id_end = strchr(id, '"');
+        TEST_ASSERT(id_end != NULL);
+        if (id_end) {
+            buf item_id = {0};
+            buf_append(&item_id, id, (size_t)(id_end - id));
+            TEST_ASSERT(test_count_substring(stream, item_id.ptr) == 5);
+            buf_free(&item_id);
+        }
+    }
+    TEST_ASSERT(test_count_substring(stream, "\"output_index\":0") == 4);
+    TEST_ASSERT(test_count_substring(stream,
+        "\"call_id\":\"call_patch\"") == 3);
+    free(stream);
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(responses_final_response(sv[0], false, &r, "ignored",
+                                             "", "", &calls, "tool_calls",
+                                             4, 2));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"type\":\"custom_tool_call\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"call_id\":\"call_patch\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"input\":\"raw patch\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"arguments\"") == NULL);
+
+        const char *emitted = strstr(out, "\"call_id\":\"");
+        TEST_ASSERT(emitted != NULL);
+        if (emitted) {
+            emitted += strlen("\"call_id\":\"");
+            const char *end = strchr(emitted, '"');
+            TEST_ASSERT(end != NULL);
+            if (end) {
+                buf continuation = {0};
+                buf_puts(&continuation,
+                    "[{\"type\":\"custom_tool_call_output\",\"call_id\":");
+                json_escape_n(&continuation, emitted, (size_t)(end - emitted));
+                buf_puts(&continuation, ",\"output\":\"Done\"}]");
+                const char *input_p = continuation.ptr;
+                chat_msgs msgs = {0};
+                TEST_ASSERT(parse_responses_input(&input_p, &msgs, NULL, NULL));
+                TEST_ASSERT(msgs.len == 1);
+                TEST_ASSERT(msgs.v[0].tool_call_id != NULL);
+                TEST_ASSERT(msgs.v[0].tool_call_id &&
+                    strlen(msgs.v[0].tool_call_id) == (size_t)(end - emitted) &&
+                    !memcmp(msgs.v[0].tool_call_id, emitted,
+                            (size_t)(end - emitted)));
+                chat_msgs_free(&msgs);
+                buf_free(&continuation);
+            }
+        }
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    free(schemas);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+static void test_responses_control_tool_stream_events(void) {
+    const char *tools_json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"tool_search\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &r.tool_orders));
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_function");
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"query\":\"local\"}");
+    tool_calls_push(&calls, tc);
+    char *out = test_responses_finish_sse(&r, &calls);
+    TEST_ASSERT(strstr(out, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(out, "response.function_call_arguments.delta") != NULL);
+    TEST_ASSERT(strstr(out, "response.function_call_arguments.done") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_search_call\"") == NULL);
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(responses_final_response(sv[0], false, &r, "ignored",
+                                             "", "", &calls, "tool_calls",
+                                             4, 2));
+        shutdown(sv[0], SHUT_WR);
+        char *final = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(final, "\"type\":\"function_call\"") != NULL);
+        TEST_ASSERT(strstr(final,
+            "\"arguments\":\"{\\\"query\\\":\\\"local\\\"}\"") != NULL);
+        TEST_ASSERT(strstr(final, "\"input\"") == NULL);
+        free(final);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    free(out);
+    free(schemas);
+    tool_calls_free(&calls);
+    request_free(&r);
+
+    tools_json =
+        "[{\"type\":\"namespace\",\"name\":\"mcp__search__\",\"tools\":["
+        "{\"type\":\"function\",\"name\":\"lookup\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}]";
+    tools_p = tools_json;
+    schemas = NULL;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &r.tool_orders));
+    tc = (tool_call){0};
+    tc.id = xstrdup("call_namespace");
+    tc.name = xstrdup("mcp__search__lookup");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+    out = test_responses_finish_sse(&r, &calls);
+    TEST_ASSERT(strstr(out, "\"name\":\"lookup\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"namespace\":\"mcp__search__\"") != NULL);
+    TEST_ASSERT(strstr(out, "response.function_call_arguments.done") != NULL);
+    free(out);
+    free(schemas);
+    tool_calls_free(&calls);
+    request_free(&r);
+
+    tools_json =
+        "[{\"type\":\"tool_search\",\"execution\":\"client\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}]";
+    tools_p = tools_json;
+    schemas = NULL;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &r.tool_orders));
+    tc = (tool_call){0};
+    tc.id = xstrdup("call_hosted");
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"query\":\"remote\"}");
+    tool_calls_push(&calls, tc);
+    out = test_responses_finish_sse(&r, &calls);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_search_call\"") != NULL);
+    TEST_ASSERT(strstr(out, "response.function_call_arguments") == NULL);
+    TEST_ASSERT(strstr(out, "response.custom_tool_call_input") == NULL);
+    free(out);
+    free(schemas);
+    tool_calls_free(&calls);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_NONE;
+    tc = (tool_call){0};
+    tc.id = xstrdup("call_unknown");
+    tc.name = xstrdup("tool_search");
+    tc.arguments = xstrdup("{\"query\":\"unknown\"}");
+    tool_calls_push(&calls, tc);
+    out = test_responses_finish_sse(&r, &calls);
+    TEST_ASSERT(strstr(out, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(out, "response.function_call_arguments.delta") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_search_call\"") == NULL);
+    TEST_ASSERT(strstr(out, "response.custom_tool_call_input") == NULL);
+    free(out);
+    tool_calls_free(&calls);
+    request_free(&r);
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -18327,12 +18674,15 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
+    test_responses_custom_tool_kind_and_input();
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
     test_responses_input_tool_search_output_loads_tools();
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
+    test_responses_custom_tool_stream_events();
+    test_responses_control_tool_stream_events();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
