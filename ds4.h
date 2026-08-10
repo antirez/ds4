@@ -376,6 +376,11 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+/* Byte offset of the compressor-state partial count for layer il_target within
+ * a payload ds4_session_save_payload would write now; false for ratio-0/4
+ * layers or unsupported backends. */
+bool ds4_test_payload_partial_offset(ds4_session *s, uint32_t il_target,
+                                     uint64_t *offset_out);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
@@ -448,10 +453,14 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+/* Bumped 2 -> 3: single-lane compressor layers serialize only the occupied
+ * partial = checkpoint_len % ratio rows of the in-progress block, prefixed by
+ * a u32 count.  Ratio-4 layers stay byte-identical. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(3)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
-#define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
+/* Bumped 1 -> 2: same frontier-state occupancy change as the full payload. */
+#define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(2)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
