@@ -117,6 +117,8 @@ typedef struct {
 
 #include "rocm/ds4_rocm_attention_launch.cuh"
 
+#include "rocm/ds4_rocm_dspark.cuh"
+
 #include "rocm/ds4_rocm_shared_expert.cuh"
 
 #include "rocm/ds4_rocm_misc_launch.cuh"
