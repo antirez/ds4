@@ -35,7 +35,8 @@ enum {
      * compressed scores in shared memory.  The host routes larger unmasked
      * decode calls to the online attention kernel so this fixed buffer never
      * becomes an out-of-bounds write at long context. */
-    DS4_CUDA_ATTENTION_SCORE_CAP = 8192u,
+    /* 1M HCA has 8192 compressed rows plus up to 256 raw rows. */
+    DS4_CUDA_ATTENTION_SCORE_CAP = 8448u,
     DS4_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
     DS4_CUDA_TOPK_MERGE_GROUP = 8u,
     /* perf-02 split-KV: fixed logical rows per chunk (shared scores = 2KB),
@@ -13937,7 +13938,12 @@ static int indexer_scores_launch(
         scores, q, weights, index_comp, n_comp, n_tokens, pos0,
         n_head, head_dim, ratio, scale);
     if (mxf4 != 0) return mxf4 > 0;
+    /* The tensor-core scorer overtakes the direct B1 kernel once the
+     * compressed history is long enough; keep the exact path for quality
+     * mode and short contexts where launch/staging overhead dominates. */
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
+        (g_quality_mode || n_comp < 8192u ||
+         getenv("DS4_CUDA_NO_INDEXER_WMMA") != NULL) &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
