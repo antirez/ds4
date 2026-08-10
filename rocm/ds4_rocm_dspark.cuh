@@ -121,8 +121,63 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
             (const float *)q->ptr,
             (const float *)raw_kv->ptr,
             n_tokens, n_raw, raw_cap, raw_start, n_head, head_dim);
-    return cuda_ok(cudaGetLastError(),
-                   "dspark attention noncausal raw batch heads launch");
+    if (!cuda_ok(cudaGetLastError(),
+                 "dspark attention noncausal raw batch heads launch")) {
+        return 0;
+    }
+    /* Same opt-in CPU cross-check the CUDA path carries, in double precision. */
+    static int verify_left = -1;
+    if (verify_left < 0) {
+        verify_left = getenv("DS4_DSPARK_VERIFY_NONCAUSAL") != NULL ? 3 : 0;
+    }
+    if (verify_left > 0) {
+        verify_left--;
+        (void)cudaDeviceSynchronize();
+        const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+        const uint64_t kn = (uint64_t)raw_cap * head_dim;
+        std::vector<float> hq(qn), hkv(kn), hout(qn), hsink(n_head);
+        (void)cudaMemcpy(hq.data(), q->ptr, qn * 4, cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hkv.data(), raw_kv->ptr, kn * 4, cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hout.data(), heads->ptr, qn * 4, cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hsink.data(), sinks, (uint64_t)n_head * 4, cudaMemcpyDeviceToHost);
+        double max_abs = 0.0, max_rel = 0.0;
+        const double dscale = 1.0 / sqrt((double)head_dim);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t h = 0; h < n_head; h++) {
+                std::vector<double> sc(n_raw);
+                double mx = (double)hsink[h];
+                for (uint32_t r = 0; r < n_raw; r++) {
+                    const uint32_t row = (raw_start + r) % raw_cap;
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        dot += (double)hq[((uint64_t)t * n_head + h) * head_dim + d] *
+                               (double)hkv[(uint64_t)row * head_dim + d];
+                    }
+                    sc[r] = dot * dscale;
+                    if (sc[r] > mx) mx = sc[r];
+                }
+                double den = exp((double)hsink[h] - mx);
+                for (uint32_t r = 0; r < n_raw; r++) den += exp(sc[r] - mx);
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    double acc = 0.0;
+                    for (uint32_t r = 0; r < n_raw; r++) {
+                        const uint32_t row = (raw_start + r) % raw_cap;
+                        acc += exp(sc[r] - mx) * (double)hkv[(uint64_t)row * head_dim + d];
+                    }
+                    const double ref = acc / den;
+                    const double got = (double)hout[((uint64_t)t * n_head + h) * head_dim + d];
+                    const double ad = fabs(ref - got);
+                    if (ad > max_abs) max_abs = ad;
+                    if (fabs(ref) > 1e-3 && ad / fabs(ref) > max_rel) max_rel = ad / fabs(ref);
+                }
+            }
+        }
+        fprintf(stderr,
+                "ds4: DSpark noncausal verify n_tok=%u n_raw=%u start=%u cap=%u "
+                "max_abs=%.3e max_rel=%.3e\n",
+                n_tokens, n_raw, raw_start, raw_cap, max_abs, max_rel);
+    }
+    return 1;
 }
 
 /* Markov correction over the base logits: adds a low-rank q8-style term keyed
