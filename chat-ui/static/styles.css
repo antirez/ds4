@@ -294,7 +294,8 @@ body {
 }
 
 .msg .bubble {
-  padding: 0.85rem 1rem;
+  position: relative;
+  padding: 0.85rem 2.45rem 0.85rem 1rem;
   border-radius: var(--radius);
   background: var(--panel);
   border: 1px solid var(--line);
@@ -314,10 +315,67 @@ body {
 
 .msg .bubble.think {
   margin-bottom: 0.45rem;
+  padding-right: 1rem;
   color: var(--muted);
   font-size: 0.86rem;
   border-style: dashed;
   background: rgba(255, 255, 255, 0.02);
+}
+
+.msg .bubble-body {
+  min-height: 1.2em;
+}
+
+.msg .copy-btn {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.28rem;
+  min-width: 1.65rem;
+  height: 1.65rem;
+  padding: 0 0.35rem;
+  border-radius: 8px;
+  border: 1px solid rgba(232, 196, 120, 0.28);
+  background: rgba(7, 11, 20, 0.72);
+  color: var(--amber);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  opacity: 0.88;
+  transition: opacity 0.15s ease, border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.msg .copy-btn:hover,
+.msg .copy-btn:focus-visible {
+  opacity: 1;
+  border-color: rgba(78, 205, 196, 0.5);
+  color: var(--teal);
+  outline: none;
+}
+
+.msg .copy-btn:focus-visible {
+  outline: 2px solid rgba(78, 205, 196, 0.45);
+  outline-offset: 1px;
+}
+
+.msg .copy-btn.is-copied {
+  opacity: 1;
+  color: var(--teal);
+  border-color: rgba(78, 205, 196, 0.55);
+  background: rgba(78, 205, 196, 0.12);
+}
+
+.msg .copy-btn .copy-feedback {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .msg .bubble.streaming::after {

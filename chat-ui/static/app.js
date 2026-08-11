@@ -51,6 +51,80 @@
       .replace(/"/g, "&quot;");
   }
 
+  const COPY_ICON =
+    '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.75"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" fill="none" stroke="currentColor" stroke-width="1.75"/></svg>';
+  const CHECK_ICON =
+    '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><path d="M5 12.5l4.2 4.2L19 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+  function setBubbleText(bubble, text) {
+    const body = bubble.querySelector(".bubble-body");
+    if (body) {
+      body.textContent = text || "";
+      return;
+    }
+    bubble.textContent = text || "";
+  }
+
+  async function copyTextToClipboard(text) {
+    const value = String(text || "");
+    if (!value) return false;
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      try {
+        await navigator.clipboard.writeText(value);
+        return true;
+      } catch {
+        /* fall through */
+      }
+    }
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    ta.style.top = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    ta.remove();
+    return ok;
+  }
+
+  function makeCopyButton(getText) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "copy-btn";
+    btn.setAttribute("aria-label", "Copy");
+    btn.title = "Copy";
+    btn.innerHTML = COPY_ICON;
+    let resetTimer = null;
+    btn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const text = String(getText() || "").trim();
+      if (!text) return;
+      const ok = await copyTextToClipboard(text);
+      if (!ok) return;
+      btn.classList.add("is-copied");
+      btn.setAttribute("aria-label", "Copied");
+      btn.title = "Copied";
+      btn.innerHTML = `${CHECK_ICON}<span class="copy-feedback">Copied</span>`;
+      if (resetTimer) clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        btn.classList.remove("is-copied");
+        btn.setAttribute("aria-label", "Copy");
+        btn.title = "Copy";
+        btn.innerHTML = COPY_ICON;
+        resetTimer = null;
+      }, 1000);
+    });
+    return btn;
+  }
+
   function fmtTime(iso) {
     if (!iso) return "";
     try {
@@ -196,7 +270,18 @@
     }
     const bubble = document.createElement("div");
     bubble.className = "bubble" + (streaming ? " streaming" : "");
-    bubble.textContent = msg.content || (streaming ? "" : "");
+    const body = document.createElement("div");
+    body.className = "bubble-body";
+    body.textContent = msg.content || (streaming ? "" : "");
+    bubble.appendChild(
+      makeCopyButton(() => {
+        const main = (body.textContent || "").trim();
+        if (main) return main;
+        const think = wrap.querySelector(".bubble.think");
+        return think ? (think.textContent || "").trim() : "";
+      })
+    );
+    bubble.appendChild(body);
     wrap.appendChild(bubble);
     if (msg.files && msg.files.length) {
       const files = document.createElement("div");
@@ -560,7 +645,7 @@
             }
             if (delta.content) {
               assistantMsg.content += delta.content;
-              bubble.textContent = assistantMsg.content;
+              setBubbleText(bubble, assistantMsg.content);
               els.transcript.scrollTop = els.transcript.scrollHeight;
             }
           } catch {
@@ -575,7 +660,7 @@
       }
       if (!assistantMsg.reasoning) delete assistantMsg.reasoning;
       bubble.classList.remove("streaming");
-      bubble.textContent = assistantMsg.content;
+      setBubbleText(bubble, assistantMsg.content);
       await saveCurrent();
       setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
       // Speak final answer text only (not reasoning dumps).
@@ -584,7 +669,7 @@
       stopSpeaking();
       assistantMsg.content = `Error: ${err.message}`;
       bubble.classList.remove("streaming");
-      bubble.textContent = assistantMsg.content;
+      setBubbleText(bubble, assistantMsg.content);
       await saveCurrent();
       setStatus(`Request failed: ${err.message}`, false);
     } finally {
