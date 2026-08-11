@@ -1023,6 +1023,15 @@ OCR dependencies on macOS:
 brew install tesseract poppler
 ```
 
+Toggle **Web** in the composer to pull internet context into the next turn.
+The UI searches DuckDuckGo’s HTML endpoint (no API key), fetches a few top
+pages, and prepends a text block to the user message before calling
+`ds4-server`. This is separate from `ds4-agent`’s Chrome-backed
+`google_search` / `visit_page` tools; the OpenAI-compatible server accepts
+client tool schemas but does not register web tools by itself. No extra pip
+packages are required for Web mode (stdlib `urllib` only). Be polite with
+rate limits.
+
 Hard-refresh the browser (Cmd+Shift+R) after updating `chat-ui/` so CSS/JS reload.
 
 This UI store is separate from `ds4-agent` KV sessions in `~/.ds4/kvcache`

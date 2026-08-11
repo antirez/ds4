@@ -389,7 +389,7 @@ body {
 
 .composer-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   gap: 0.55rem;
   align-items: end;
 }
@@ -414,6 +414,39 @@ body {
 }
 
 .attach-btn:hover {
+  border-color: rgba(78, 205, 196, 0.45);
+}
+
+.web-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  height: 2.75rem;
+  padding: 0 0.85rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.88rem;
+  user-select: none;
+}
+
+.web-toggle input {
+  accent-color: var(--teal);
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+.web-toggle:has(input:checked) {
+  color: var(--text);
+  border-color: rgba(78, 205, 196, 0.55);
+  background: rgba(78, 205, 196, 0.1);
+}
+
+.web-toggle:hover {
   border-color: rgba(78, 205, 196, 0.45);
 }
 
@@ -519,7 +552,7 @@ textarea#prompt:focus {
   }
 
   .composer-row {
-    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-columns: auto auto minmax(0, 1fr);
   }
 
   .btn.send {

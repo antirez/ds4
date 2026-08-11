@@ -51,11 +51,15 @@
             <input type="file" id="fileInput" multiple accept=".txt,.md,.py,.c,.h,.cpp,.hpp,.js,.ts,.tsx,.jsx,.json,.csv,.toml,.yaml,.yml,.rs,.go,.java,.sh,.css,.html,.xml,.sql,.ini,.cfg,.log,.png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,.bmp,.pdf,text/*,image/*,application/pdf" />
             <span>Attach</span>
           </label>
+          <label class="web-toggle" title="Search the web (DuckDuckGo HTML, no API key) and inject context">
+            <input type="checkbox" id="webToggle" />
+            <span>Web</span>
+          </label>
           <textarea id="prompt" rows="2" placeholder="Message DwarfStar…"></textarea>
           <button type="button" class="btn primary send" id="sendBtn">Send</button>
         </div>
         <p class="composer-note">
-          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only.
+          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> to pull free DuckDuckGo results into the turn.
         </p>
       </section>
     </main>

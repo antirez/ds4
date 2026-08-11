@@ -25,6 +25,7 @@
     deleteBtn: document.getElementById("deleteBtn"),
     fileInput: document.getElementById("fileInput"),
     attachBar: document.getElementById("attachBar"),
+    webToggle: document.getElementById("webToggle"),
     composerNote: document.querySelector(".composer-note"),
   };
 
@@ -228,9 +229,13 @@
     });
   }
 
-  function buildUserContent(text, files) {
-    if (!files.length) return text;
-    const parts = [text.trim()];
+  function buildUserContent(text, files, webContext) {
+    const parts = [];
+    if (webContext) {
+      parts.push(String(webContext).trim());
+      parts.push("");
+    }
+    parts.push((text || "").trim());
     for (const f of files) {
       if (f.source === "ocr") {
         const via = f.method === "text" ? "extracted text" : "OCR";
@@ -243,7 +248,20 @@
         );
       }
     }
-    return parts.join("").trim();
+    return parts.join("\n").trim();
+  }
+
+  async function fetchWebContext(query) {
+    const data = await api("/api/web-context", {
+      method: "POST",
+      body: JSON.stringify({
+        query,
+        max_results: 5,
+        max_fetch: 3,
+        fetch_pages: true,
+      }),
+    });
+    return data;
   }
 
   async function saveCurrent() {
@@ -349,7 +367,37 @@
     if (!text && !pendingFiles.length) return;
 
     const files = pendingFiles.slice();
-    const content = buildUserContent(text, files);
+    const useWeb = !!(els.webToggle && els.webToggle.checked);
+    if (useWeb && !text) {
+      window.alert("Web search needs a text query in the message box.");
+      return;
+    }
+
+    busy = true;
+    els.sendBtn.disabled = true;
+
+    let webContext = "";
+    let webMeta = null;
+    try {
+      if (useWeb) {
+        setStatus("Web search running…", null);
+        webMeta = await fetchWebContext(text);
+        webContext = (webMeta && webMeta.context) || "";
+        if (!webContext) {
+          throw new Error("web search returned empty context");
+        }
+        const n = (webMeta.results && webMeta.results.length) || 0;
+        setStatus(`Web ok · ${n} results · ${webMeta.pages_fetched || 0} pages`, true);
+      }
+    } catch (err) {
+      busy = false;
+      els.sendBtn.disabled = false;
+      setStatus(`Web failed: ${err.message}`, false);
+      window.alert(`Web search failed: ${err.message}`);
+      return;
+    }
+
+    const content = buildUserContent(text, files, webContext);
     const userMsg = {
       role: "user",
       content,
@@ -361,6 +409,12 @@
         return f.name;
       }),
     };
+    if (useWeb) {
+      userMsg.web = {
+        provider: (webMeta && webMeta.provider) || "duckduckgo-html",
+        results: (webMeta && webMeta.results) || [],
+      };
+    }
 
     // Preview size after this turn (exclude prior UI Error assistants).
     const preview = apiMessages().concat([{ role: "user", content }]);
@@ -368,7 +422,11 @@
       const proceed = window.confirm(
         "This turn looks close to or over the model context window. Send anyway?"
       );
-      if (!proceed) return;
+      if (!proceed) {
+        busy = false;
+        els.sendBtn.disabled = false;
+        return;
+      }
     }
 
     current.messages.push(userMsg);
@@ -385,8 +443,6 @@
     let thinkEl = node.querySelector(".bubble.think");
     const bubble = node.querySelector(".bubble:not(.think)");
 
-    busy = true;
-    els.sendBtn.disabled = true;
     try {
       const res = await fetch("/v1/chat/completions", {
         method: "POST",
@@ -547,14 +603,18 @@
   async function boot() {
     try {
       const health = await api("/api/health");
-      if (health?.ocr && els.composerNote) {
-        const ocr = health.ocr;
-        if (!ocr.images) {
+      if (els.composerNote) {
+        const ocr = health?.ocr;
+        const webBit = health?.web?.enabled
+          ? " Toggle Web for free DuckDuckGo context (no API key)."
+          : "";
+        if (ocr && !ocr.images) {
           els.composerNote.textContent =
-            "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler";
+            "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler." + webBit;
         } else {
           els.composerNote.textContent =
-            "Text/code are inlined. Images and PDFs are OCR’d to text locally (model is text-only).";
+            "Text/code are inlined. Images and PDFs are OCR’d to text locally (model is text-only)." +
+            webBit;
         }
       }
     } catch {
