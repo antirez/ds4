@@ -10747,14 +10747,18 @@ static char *strip_transient_blocks(const char *text) {
             p = open + 1;
             continue;
         }
-        /* Clients append these blocks with separator whitespace that vanishes
-         * from the replay together with the block, so drop it from the key
-         * as well. */
+        /* Clients wrap these blocks with separator whitespace that vanishes
+         * from the replay together with the block, so drop it from the key as
+         * well.  A block may be appended after the user's content (OpenCode's
+         * <environment_details>, separator before) or prepended before it
+         * (Claude Code's <system-reminder>, separator after), so trim on both
+         * sides. */
         size_t keep = (size_t)(open - p);
         while (keep > 0 && isspace((unsigned char)p[keep - 1])) keep--;
         buf_append(&out, p, keep);
         stripped = true;
         p = close;
+        while (*p && isspace((unsigned char)*p)) p++;
     }
     if (!stripped) {
         buf_free(&out);
@@ -16855,6 +16859,21 @@ static void test_strip_transient_blocks(void) {
         "a<environment_details>1</environment_details>"
         "b<system-reminder>2</system-reminder>c");
     TEST_ASSERT(s && !strcmp(s, "abc"));
+    free(s);
+
+    /* Prepended block: Claude Code injects the block *before* the user's own
+     * content, with a trailing separator newline that vanishes from the replay
+     * together with the block.  Drop it too, symmetric with the leading side. */
+    s = strip_transient_blocks(
+        "<system-reminder>plan mode</system-reminder>\nHere is a document");
+    TEST_ASSERT(s && !strcmp(s, "Here is a document"));
+    free(s);
+
+    /* Consecutive prepended blocks separated by whitespace collapse cleanly. */
+    s = strip_transient_blocks(
+        "<system-reminder>1</system-reminder>\n"
+        "<environment_details>2</environment_details>\ncontent");
+    TEST_ASSERT(s && !strcmp(s, "content"));
     free(s);
 
     /* Unterminated block stays in place. */
