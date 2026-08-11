@@ -26,6 +26,8 @@
     fileInput: document.getElementById("fileInput"),
     attachBar: document.getElementById("attachBar"),
     webToggle: document.getElementById("webToggle"),
+    ttsToggle: document.getElementById("ttsToggle"),
+    ttsStopBtn: document.getElementById("ttsStopBtn"),
     composerNote: document.querySelector(".composer-note"),
   };
 
@@ -36,6 +38,10 @@
   let busy = false;
   let modelId = "deepseek-v4-flash";
   let contextLength = 100000;
+  /** @type {HTMLAudioElement|null} */
+  let ttsAudio = null;
+  let ttsToken = 0;
+  let ttsAvailable = true;
 
   function escapeHtml(s) {
     return String(s)
@@ -264,6 +270,72 @@
     return data;
   }
 
+  function setTtsSpeaking(active) {
+    if (els.ttsStopBtn) els.ttsStopBtn.disabled = !active;
+  }
+
+  function stopSpeaking() {
+    ttsToken += 1;
+    if (ttsAudio) {
+      try {
+        ttsAudio.pause();
+        ttsAudio.removeAttribute("src");
+        ttsAudio.load();
+      } catch {
+        /* ignore */
+      }
+      ttsAudio = null;
+    }
+    setTtsSpeaking(false);
+  }
+
+  async function speakFinal(text) {
+    if (!els.ttsToggle || !els.ttsToggle.checked) return;
+    if (!ttsAvailable) return;
+    const spoken = String(text || "").trim();
+    if (!spoken || spoken.startsWith("Error:")) return;
+
+    stopSpeaking();
+    const token = ttsToken;
+    setTtsSpeaking(true);
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: spoken }),
+      });
+      if (token !== ttsToken) return;
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(parseErrorPayload(errText) || res.statusText);
+      }
+      const blob = await res.blob();
+      if (token !== ttsToken) return;
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      ttsAudio = audio;
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (ttsAudio === audio) {
+          ttsAudio = null;
+          setTtsSpeaking(false);
+        }
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(url);
+        if (ttsAudio === audio) {
+          ttsAudio = null;
+          setTtsSpeaking(false);
+        }
+      };
+      await audio.play();
+    } catch (err) {
+      if (token !== ttsToken) return;
+      setTtsSpeaking(false);
+      setStatus(`TTS failed: ${err.message}`, false);
+    }
+  }
+
   async function saveCurrent() {
     if (!current) return;
     if (!current.title || current.title === "New chat") {
@@ -375,6 +447,7 @@
 
     busy = true;
     els.sendBtn.disabled = true;
+    stopSpeaking();
 
     let webContext = "";
     let webMeta = null;
@@ -505,7 +578,10 @@
       bubble.textContent = assistantMsg.content;
       await saveCurrent();
       setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
+      // Speak final answer text only (not reasoning dumps).
+      speakFinal(assistantMsg.content);
     } catch (err) {
+      stopSpeaking();
       assistantMsg.content = `Error: ${err.message}`;
       bubble.classList.remove("streaming");
       bubble.textContent = assistantMsg.content;
@@ -593,6 +669,22 @@
   els.sendBtn.addEventListener("click", () => sendMessage());
   els.fileInput.addEventListener("change", (e) => onFilesSelected(e.target.files));
   els.railToggle.addEventListener("click", () => els.rail.classList.toggle("open"));
+  if (els.ttsStopBtn) els.ttsStopBtn.addEventListener("click", () => stopSpeaking());
+  if (els.ttsToggle) {
+    try {
+      els.ttsToggle.checked = localStorage.getItem("ds4-tts-read-aloud") === "1";
+    } catch {
+      /* private mode */
+    }
+    els.ttsToggle.addEventListener("change", () => {
+      try {
+        localStorage.setItem("ds4-tts-read-aloud", els.ttsToggle.checked ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      if (!els.ttsToggle.checked) stopSpeaking();
+    });
+  }
   els.prompt.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -603,18 +695,31 @@
   async function boot() {
     try {
       const health = await api("/api/health");
+      const tts = health?.tts;
+      ttsAvailable = !tts || tts.available !== false;
+      if (els.ttsToggle && !ttsAvailable) {
+        els.ttsToggle.disabled = true;
+        els.ttsToggle.checked = false;
+        els.ttsToggle.title = "Local TTS unavailable on this host";
+      }
       if (els.composerNote) {
         const ocr = health?.ocr;
         const webBit = health?.web?.enabled
           ? " Toggle Web for free DuckDuckGo context (no API key)."
           : "";
+        const ttsBit = ttsAvailable
+          ? " Toggle Read aloud for local TTS (macOS say; optional Piper via DS4_PIPER_MODEL)."
+          : " Read aloud needs macOS say+afconvert (or Piper).";
         if (ocr && !ocr.images) {
           els.composerNote.textContent =
-            "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler." + webBit;
+            "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler." +
+            webBit +
+            ttsBit;
         } else {
           els.composerNote.textContent =
             "Text/code are inlined. Images and PDFs are OCR’d to text locally (model is text-only)." +
-            webBit;
+            webBit +
+            ttsBit;
         }
       }
     } catch {

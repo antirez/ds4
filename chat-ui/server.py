@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ocr import OcrError, extract_attachment, tooling_status  # noqa: E402
+from tts import TtsError, synthesize_wav, tooling_status as tts_tooling_status  # noqa: E402
 from web_context import build_web_context  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -276,6 +277,7 @@ class ChatUIHandler(BaseHTTPRequestHandler):
                     "api_base": self.api_base,
                     "chats_dir": str(self.chats_dir),
                     "ocr": tooling_status(),
+                    "tts": tts_tooling_status(),
                     "web": {
                         "enabled": True,
                         "provider": "duckduckgo-html",
@@ -334,6 +336,10 @@ class ChatUIHandler(BaseHTTPRequestHandler):
 
         if path == "/api/web-context":
             self._handle_web_context()
+            return
+
+        if path == "/api/tts":
+            self._handle_tts()
             return
 
         if path.startswith("/v1/"):
@@ -426,6 +432,37 @@ class ChatUIHandler(BaseHTTPRequestHandler):
             result = extract_attachment(filename.strip(), data)
             self._send_json(HTTPStatus.OK, result)
         except OcrError as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except OSError as exc:
+            self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def _handle_tts(self) -> None:
+        try:
+            raw = self._read_body()
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if not isinstance(payload, dict):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "body must be a JSON object")
+            return
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "text required")
+            return
+        voice = payload.get("voice")
+        if voice is not None and not isinstance(voice, str):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "voice must be a string")
+            return
+        try:
+            wav, engine = synthesize_wav(text, voice=voice)
+            self._send(
+                HTTPStatus.OK,
+                wav,
+                "audio/wav",
+                extra=[("X-TTS-Engine", engine)],
+            )
+        except TtsError as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except OSError as exc:
             self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))

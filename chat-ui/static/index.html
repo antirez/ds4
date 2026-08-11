@@ -55,11 +55,16 @@
             <input type="checkbox" id="webToggle" />
             <span>Web</span>
           </label>
+          <label class="web-toggle" title="Read assistant answers aloud with local TTS (macOS say, or Piper if installed)">
+            <input type="checkbox" id="ttsToggle" />
+            <span>Read aloud</span>
+          </label>
+          <button type="button" class="btn ghost" id="ttsStopBtn" title="Stop reading aloud" disabled>Stop</button>
           <textarea id="prompt" rows="2" placeholder="Message DwarfStar…"></textarea>
           <button type="button" class="btn primary send" id="sendBtn">Send</button>
         </div>
         <p class="composer-note">
-          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> to pull free DuckDuckGo results into the turn.
+          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for local TTS.
         </p>
       </section>
     </main>

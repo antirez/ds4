@@ -382,9 +382,14 @@ body {
 
 .composer-row {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto auto auto minmax(0, 1fr) auto;
   gap: 0.55rem;
   align-items: end;
+}
+
+#ttsStopBtn {
+  height: 2.75rem;
+  padding: 0 0.85rem;
 }
 
 .attach-btn {
@@ -545,7 +550,7 @@ textarea#prompt:focus {
   }
 
   .composer-row {
-    grid-template-columns: auto auto minmax(0, 1fr);
+    grid-template-columns: auto auto auto auto minmax(0, 1fr);
   }
 
   .btn.send {

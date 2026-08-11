@@ -1032,7 +1032,21 @@ client tool schemas but does not register web tools by itself. No extra pip
 packages are required for Web mode (stdlib `urllib` only). Be polite with
 rate limits.
 
-Hard-refresh the browser (Cmd+Shift+R) after updating `chat-ui/` so CSS/JS reload.
+Toggle **Read aloud** to have new assistant answers spoken locally. The UI
+calls `/api/tts`, which synthesizes WAV on the machine running chat-ui — by
+default with macOS `say` + `afconvert` (no install, no API key). Reasoning
+blocks are not spoken; only the final answer text is. Use **Stop** to interrupt
+playback. Optional neural voices: install [Piper](https://github.com/rhasspy/piper)
+and set `DS4_PIPER_MODEL` to a local `.onnx` voice file before starting chat-ui;
+otherwise it falls back to `say`. Smoke-test without the UI:
+
+```sh
+python3 chat-ui/tts.py "Hello from DwarfStar."
+# writes ./tts-smoke.wav
+```
+
+Restart chat-ui after pulling this change so `/api/tts` is registered. Then
+hard-refresh the browser (Cmd+Shift+R) so CSS/JS reload.
 
 This UI store is separate from `ds4-agent` KV sessions in `~/.ds4/kvcache`
 (`/save`, `/list`, `/switch`).
