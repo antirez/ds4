@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ocr import OcrError, extract_attachment, tooling_status  # noqa: E402
+from web_context import build_web_context  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_API = "http://127.0.0.1:8000"
@@ -275,6 +276,11 @@ class ChatUIHandler(BaseHTTPRequestHandler):
                     "api_base": self.api_base,
                     "chats_dir": str(self.chats_dir),
                     "ocr": tooling_status(),
+                    "web": {
+                        "enabled": True,
+                        "provider": "duckduckgo-html",
+                        "api_key_required": False,
+                    },
                 },
             )
             return
@@ -324,6 +330,10 @@ class ChatUIHandler(BaseHTTPRequestHandler):
 
         if path == "/api/ocr":
             self._handle_ocr()
+            return
+
+        if path == "/api/web-context":
+            self._handle_web_context()
             return
 
         if path.startswith("/v1/"):
@@ -419,6 +429,47 @@ class ChatUIHandler(BaseHTTPRequestHandler):
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except OSError as exc:
             self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def _handle_web_context(self) -> None:
+        try:
+            raw = self._read_body()
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if not isinstance(payload, dict):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "body must be a JSON object")
+            return
+        query = payload.get("query")
+        if not isinstance(query, str) or not query.strip():
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "query required")
+            return
+        max_results = payload.get("max_results", 5)
+        max_fetch = payload.get("max_fetch", 3)
+        fetch_pages = payload.get("fetch_pages", True)
+        if not isinstance(max_results, int) or not (1 <= max_results <= 10):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "max_results must be 1..10")
+            return
+        if not isinstance(max_fetch, int) or not (0 <= max_fetch <= 5):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "max_fetch must be 0..5")
+            return
+        if not isinstance(fetch_pages, bool):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "fetch_pages must be a boolean")
+            return
+        try:
+            result = build_web_context(
+                query.strip(),
+                max_results=max_results,
+                max_fetch=max_fetch,
+                fetch_pages=fetch_pages,
+            )
+            self._send_json(HTTPStatus.OK, result)
+        except ValueError as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except RuntimeError as exc:
+            self._send_error_json(HTTPStatus.BAD_GATEWAY, str(exc))
+        except (OSError, URLError, HTTPError) as exc:
+            self._send_error_json(HTTPStatus.BAD_GATEWAY, f"web context failed: {exc}")
 
     def _proxy(self, path_qs: str) -> None:
         try:
