@@ -160,7 +160,7 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* —— Summarize / RAM progress —— */
+/* —— Summarize / RAM progress (stacked in .stage-status) —— */
 .summarize-progress {
   display: flex;
   flex-direction: column;
@@ -168,6 +168,8 @@ body {
   padding: 0.45rem 1rem 0.55rem;
   border-bottom: 1px solid var(--line);
   background: rgba(6, 8, 7, 0.88);
+  position: relative;
+  z-index: 0;
 }
 
 .summarize-progress[hidden] {
@@ -198,6 +200,7 @@ body {
   font-size: 0.78rem;
   color: var(--text);
   letter-spacing: 0.01em;
+  line-height: 1.35;
 }
 
 .ram-notice {
@@ -210,6 +213,8 @@ body {
   font-size: 0.82rem;
   line-height: 1.35;
   border-left: 3px solid var(--accent);
+  position: relative;
+  z-index: 0;
 }
 
 .ram-notice.is-locked {
@@ -220,6 +225,12 @@ body {
 
 .ram-notice[hidden] {
   display: none !important;
+}
+
+/* Space between notice and progress when both are visible */
+.ram-notice:not([hidden]) + .summarize-progress:not([hidden]) {
+  margin-top: 0;
+  border-top: 1px solid rgba(198, 241, 53, 0.18);
 }
 
 @keyframes summarize-indeterminate {
@@ -364,11 +375,20 @@ body {
 /* —— Stage —— */
 .stage {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* head | status stack | transcript | composer — status must not steal the 1fr row */
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
+}
+
+.stage-status {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-height: 0;
+  flex-shrink: 0;
 }
 
 .stage-head {
