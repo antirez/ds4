@@ -10,10 +10,12 @@ import html
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
+
+from search_intent import rewrite_search_query
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -448,16 +450,15 @@ def _join_query_terms(terms: list[str], *, max_words: int) -> str:
     return " ".join(out).strip()
 
 
-def derive_search_query(
+def heuristic_search_query(
     current: str,
     messages: list[dict[str, Any]] | None = None,
     *,
     max_words: int = 12,
 ) -> str:
-    """Build a short DuckDuckGo query from the current ask plus recent chat.
+    """Keyword fallback: current ask plus topic nouns from recent turns.
 
-    Uses conversation topic when the latest message is referential or thin.
-    Does not dump the transcript; prefers keyword/phrase form.
+    Used when the intent-rewrite LLM call is skipped or fails.
     """
     plain = _plain_chat_text(current)
     plain = _LEAD_IN_RE.sub("", plain).strip()
@@ -490,6 +491,42 @@ def derive_search_query(
     if intent:
         return _join_query_terms(intent, max_words=max_words)
     return plain[:120].strip()
+
+
+def derive_search_query(
+    current: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    max_words: int = 12,
+    api_base: str | None = None,
+    model: str | None = None,
+    llm_timeout_s: float = 20.0,
+    completion_fn: Callable[..., str] | None = None,
+) -> str:
+    """Resolve search intent from the latest message given recent turns.
+
+    Preferred path: one short non-streaming upstream completion that answers
+    "the user said X; given X-1..X-4, what do they mean?" — that text is the
+    DuckDuckGo query. On miss or failure, fall back to heuristic_search_query.
+    """
+    plain = _plain_chat_text(current)
+    if not plain.strip():
+        return ""
+
+    if api_base or completion_fn is not None:
+        rewritten = rewrite_search_query(
+            plain,
+            messages,
+            api_base=api_base or "",
+            model=model,
+            timeout_s=llm_timeout_s,
+            max_words=max_words,
+            completion_fn=completion_fn,
+        )
+        if rewritten:
+            return rewritten
+
+    return heuristic_search_query(plain, messages, max_words=max_words)
 
 
 def assemble_context(

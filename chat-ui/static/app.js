@@ -197,7 +197,7 @@
     thinkEl.textContent = text || "";
   }
 
-  function showWebSearchLoader() {
+  function showWebSearchLoader(label) {
     hideWebSearchLoader();
     const empty = els.transcript.querySelector(".empty");
     if (empty) empty.remove();
@@ -205,14 +205,23 @@
     el.className = "web-search-loader";
     el.setAttribute("role", "status");
     el.setAttribute("aria-live", "polite");
+    const text = label ? `Searching: ${label}` : "Searching the web…";
     el.innerHTML =
       '<span class="web-search-spinner" aria-hidden="true"></span>' +
-      "<span>Searching the web…</span>";
+      `<span>${escapeHtml(text)}</span>`;
     els.transcript.appendChild(el);
     webSearchLoaderEl = el;
     els.transcript.scrollTop = els.transcript.scrollHeight;
     if (els.statusLine) els.statusLine.classList.add("status-searching");
-    setStatus("Searching the web…", null);
+    setStatus(text, null);
+  }
+
+  function setWebSearchLoaderQuery(query) {
+    if (!webSearchLoaderEl || !query) return;
+    const label = `Searching: ${query}`;
+    const span = webSearchLoaderEl.querySelector("span:not(.web-search-spinner)");
+    if (span) span.textContent = label;
+    setStatus(label, null);
   }
 
   function hideWebSearchLoader() {
@@ -950,12 +959,14 @@
       body: JSON.stringify({
         query,
         messages: recentSearchMessages(),
+        model: modelId,
         max_results: 8,
         max_fetch: 5,
         fetch_pages: true,
       }),
       signal,
     });
+    if (data && data.query) setWebSearchLoaderQuery(data.query);
     return data;
   }
 
@@ -1182,8 +1193,11 @@
         const tried = webMeta.pages_attempted || pages;
         const fails = (webMeta.errors && webMeta.errors.length) || 0;
         hideWebSearchLoader();
+        const qLabel = (webMeta.query || "").trim();
         setStatus(
-          `Web ok · ${n} results · ${pages}/${tried} pages` +
+          `Web ok` +
+            (qLabel ? ` · ${qLabel}` : "") +
+            ` · ${n} results · ${pages}/${tried} pages` +
             (fails ? ` · ${fails} fetch issues` : ""),
           true
         );

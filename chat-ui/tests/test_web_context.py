@@ -11,6 +11,7 @@ CHAT_UI_DIR = Path(__file__).resolve().parents[1]
 if str(CHAT_UI_DIR) not in sys.path:
     sys.path.insert(0, str(CHAT_UI_DIR))
 
+import search_intent as si  # noqa: E402
 import web_context as wc  # noqa: E402
 
 
@@ -72,7 +73,57 @@ class AssembleContextTests(unittest.TestCase):
         self.assertLessEqual(len(ctx), 5000)
 
 
+class IntentRewritePromptTests(unittest.TestCase):
+    def test_prompt_includes_prior_turns_and_latest(self) -> None:
+        messages = [
+            {"role": "user", "content": "Tell me about DeepSeek V4 Flash"},
+            {
+                "role": "assistant",
+                "content": "DeepSeek V4 Flash is a fast open-weight model.",
+            },
+            {"role": "user", "content": "How big is the context window?"},
+            {"role": "assistant", "content": "It targets a long context window."},
+        ]
+        built = si.build_intent_rewrite_messages(
+            "What's the release date?",
+            messages,
+            prior_limit=4,
+        )
+        self.assertEqual(built[0]["role"], "system")
+        self.assertIn("web search query", built[0]["content"].lower())
+        user = built[1]["content"]
+        self.assertIn("DeepSeek V4 Flash", user)
+        self.assertIn("Latest user message: What's the release date?", user)
+        self.assertIn("User:", user)
+        self.assertIn("Assistant:", user)
+
+    def test_prior_limit_keeps_last_n_only(self) -> None:
+        messages = [
+            {"role": "user", "content": f"turn {i}"}
+            for i in range(1, 8)
+        ]
+        prior = si.select_prior_messages(messages, limit=4)
+        self.assertEqual([m["content"] for m in prior], [
+            "turn 4", "turn 5", "turn 6", "turn 7",
+        ])
+
+    def test_sanitize_strips_quotes_and_clamps_words(self) -> None:
+        self.assertEqual(
+            si.sanitize_rewritten_query('"DeepSeek V4 Flash release date"'),
+            "DeepSeek V4 Flash release date",
+        )
+        self.assertEqual(
+            si.sanitize_rewritten_query("Query: DeepSeek V4 Flash release date"),
+            "DeepSeek V4 Flash release date",
+        )
+        long = " ".join(f"w{i}" for i in range(20))
+        out = si.sanitize_rewritten_query(long, max_words=12)
+        self.assertEqual(len(out.split()), 12)
+
+
 class DeriveSearchQueryTests(unittest.TestCase):
+    """Fallback path (no live LLM): heuristic keyword/topic resolution."""
+
     def test_follow_up_uses_prior_topic(self) -> None:
         messages = [
             {"role": "user", "content": "Tell me about DeepSeek V4 Flash"},
@@ -109,6 +160,56 @@ class DeriveSearchQueryTests(unittest.TestCase):
         # Prefer a compact search phrase over dumping both sentences.
         self.assertLessEqual(len(q.split()), 12)
         self.assertNotIn("we discussed", low)
+
+    def test_llm_rewrite_preferred_when_available(self) -> None:
+        messages = [
+            {"role": "user", "content": "Tell me about DeepSeek V4 Flash"},
+            {
+                "role": "assistant",
+                "content": "DeepSeek V4 Flash is a fast open-weight model.",
+            },
+        ]
+
+        def fake_completion(
+            api_base: str,
+            *,
+            model: str,
+            messages: list[dict[str, str]],
+            timeout_s: float,
+        ) -> str:
+            self.assertTrue(api_base)
+            self.assertEqual(messages[0]["role"], "system")
+            return "DeepSeek V4 Flash release date"
+
+        q = wc.derive_search_query(
+            "What's the release date?",
+            messages,
+            api_base="http://127.0.0.1:8000",
+            completion_fn=fake_completion,
+        )
+        self.assertEqual(q, "DeepSeek V4 Flash release date")
+
+    def test_llm_failure_falls_back_to_heuristic(self) -> None:
+        messages = [
+            {"role": "user", "content": "Tell me about DeepSeek V4 Flash"},
+            {
+                "role": "assistant",
+                "content": "DeepSeek V4 Flash is a fast open-weight model.",
+            },
+        ]
+
+        def boom(*_args, **_kwargs) -> str:
+            raise TimeoutError("upstream slow")
+
+        q = wc.derive_search_query(
+            "What's the release date?",
+            messages,
+            api_base="http://127.0.0.1:8000",
+            completion_fn=boom,
+        )
+        low = q.lower()
+        self.assertIn("deepseek", low)
+        self.assertTrue("release" in low or "date" in low)
 
 
 class LiveSearchSmokeTests(unittest.TestCase):

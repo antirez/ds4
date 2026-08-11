@@ -742,7 +742,17 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         if not isinstance(fetch_pages, bool):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "fetch_pages must be a boolean")
             return
-        search_query = derive_search_query(query.strip(), recent)
+        model = payload.get("model")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "model must be a non-empty string")
+            return
+        model_id = model.strip() if isinstance(model, str) else None
+        search_query = derive_search_query(
+            query.strip(),
+            recent,
+            api_base=self.api_base,
+            model=model_id,
+        )
         if not search_query:
             self._send_error_json(HTTPStatus.BAD_REQUEST, "query required")
             return
