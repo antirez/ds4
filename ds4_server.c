@@ -593,6 +593,10 @@ typedef struct {
     /* Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
+    /* Registered as a Responses freeform tool, {"type":"custom"}. Its calls go
+     * back as custom_tool_call with raw text input instead of function_call
+     * with a JSON argument object. */
+    bool is_custom;
     char **prop;
     int len;
     int cap;
@@ -1514,6 +1518,20 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
             }
             parse_schema_properties(schema, &order);
             free(schema);
+        } else if (!strcmp(key, "type")) {
+            /* Freeform Responses tools arrive as {"type":"custom",...} and are
+             * registered from their raw JSON. The kind has to survive here
+             * because it is all the reply serializer has left to tell a custom
+             * tool from a function. A non-string type is not ours: skip it
+             * rather than dropping the whole registration. */
+            char *type = NULL;
+            if (json_string(&p, &type)) {
+                order.is_custom = !strcmp(type, "custom");
+                free(type);
+            } else if (!json_skip_value(&p)) {
+                free(key);
+                goto done;
+            }
         } else if (!json_skip_value(&p)) {
             free(key);
             goto done;
@@ -6950,14 +6968,15 @@ static bool responses_tool_call_is_tool_search(const tool_call *tc,
 }
 
 /* The internal tool_call doesn't track whether it came from a function_call or
- * a custom_tool_call (or what tool kind is registered). For round-trip
- * correctness with the rare custom_tool_call clients, we preserve any provided
- * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
- * defaults to function_call because Codex CLI registers all its tools as
- * function tools. */
+ * a custom_tool_call, so the discriminator is recovered from the tool the
+ * client registered: a call to a {"type":"custom"} tool has to go back as a
+ * custom_tool_call. Codex advertises apply_patch that way and aborts the turn
+ * when the call returns as a function_call. For round-trip correctness we also
+ * preserve any provided call_id verbatim and pre-assign a stable fc_id. */
 static void responses_tool_items_build(responses_tool_item **out,
                                        const tool_calls *calls,
-                                       int starting_output_index) {
+                                       int starting_output_index,
+                                       const tool_schema_orders *orders) {
     *out = NULL;
     if (!calls || calls->len == 0) return;
     responses_tool_item *items = xmalloc((size_t)calls->len * sizeof(*items));
@@ -6969,10 +6988,44 @@ static void responses_tool_items_build(responses_tool_item **out,
         } else {
             responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
         }
-        items[i].is_custom = false;
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, calls->v[i].name);
+        items[i].is_custom = order && order->is_custom;
         items[i].output_index = starting_output_index + i;
     }
     *out = items;
+}
+
+/* A freeform tool takes raw text, but the model answers every tool with a DSML
+ * invoke, so its one argument arrives wrapped: {"patch":"*** Begin Patch..."}.
+ * The wrapper is an artifact of how the call was generated, not something the
+ * client asked for, so a lone string parameter is handed back unwrapped and
+ * becomes the tool input verbatim. Anything else has no unambiguous text form:
+ * no parameters means no input, and several parameters (or a non-string one)
+ * keep the argument blob as it stands rather than inventing a reading of it.
+ * Returns NULL when there is nothing to unwrap. */
+static char *custom_tool_input_from_arguments(const char *arguments) {
+    if (!arguments) return NULL;
+    const char *p = arguments;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    if (*p == '}') return xstrdup("");
+    char *key = NULL;
+    if (!json_string(&p, &key)) return NULL;
+    free(key);
+    json_ws(&p);
+    if (*p != ':') return NULL;
+    p++;
+    char *value = NULL;
+    if (!json_string(&p, &value)) return NULL;
+    json_ws(&p);
+    if (*p != '}') {
+        free(value);
+        return NULL;
+    }
+    return value;
 }
 
 static void responses_append_function_call_item(buf *b, const tool_call *tc,
@@ -7009,7 +7062,9 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
     if (!with_args) {
         buf_puts(b, "\"\"");
     } else if (item->is_custom) {
-        json_escape(b, tc->arguments ? tc->arguments : "");
+        char *input = custom_tool_input_from_arguments(tc->arguments);
+        json_escape(b, input ? input : (tc->arguments ? tc->arguments : ""));
+        free(input);
     } else {
         append_json_object_string(b, tc->arguments);
     }
@@ -7357,7 +7412,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
         st->message_item_closed = true;
     }
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, st->next_output_index);
+    responses_tool_items_build(&items, calls, st->next_output_index, &r->tool_orders);
     if (items && calls) st->next_output_index += calls->len;
     bool ok = true;
     if (items && calls) {
@@ -7389,7 +7444,7 @@ static bool responses_final_response(int fd, bool enable_cors,
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, 0);
+    responses_tool_items_build(&items, calls, 0, &r->tool_orders);
 
     long now = (long)time(NULL);
     const char *status = responses_status_for_finish(finish);
@@ -13918,6 +13973,154 @@ static void test_responses_output_sends_tool_search_call_item(void) {
     tool_calls_free(&calls);
 }
 
+/* Codex registers apply_patch as a freeform {"type":"custom"} tool and rejects
+ * the turn if the call comes back as a function_call, so the reply has to carry
+ * the custom_tool_call type with the patch as raw input. The same request also
+ * registers an ordinary function, because the kind is per tool: one client
+ * mixes both and each has to keep its own shape. */
+static void test_responses_custom_tool_call_round_trips_freeform_input(void) {
+    const char *tools_json =
+        "[{\"type\":\"custom\",\"name\":\"apply_patch\","
+        "\"description\":\"Apply a patch to the workspace\","
+        "\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\","
+        "\"definition\":\"start: TEXT\"}},"
+        "{\"type\":\"function\",\"name\":\"write_file\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"}}}}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+
+    const tool_schema_order *custom_order = tool_schema_orders_find(&orders, "apply_patch");
+    TEST_ASSERT(custom_order && custom_order->is_custom);
+    const tool_schema_order *function_order = tool_schema_orders_find(&orders, "write_file");
+    TEST_ASSERT(function_order && !function_order->is_custom);
+
+    const char *patch_text =
+        "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch";
+
+    tool_calls calls = {0};
+    tool_call patch_call = {0};
+    patch_call.id = xstrdup("call_patch");
+    patch_call.name = xstrdup("apply_patch");
+    buf patch_args = {0};
+    buf_puts(&patch_args, "{\"patch\":");
+    json_escape(&patch_args, patch_text);
+    buf_putc(&patch_args, '}');
+    patch_call.arguments = buf_take(&patch_args);
+    tool_calls_push(&calls, patch_call);
+
+    tool_call write_call = {0};
+    write_call.id = xstrdup("call_write");
+    write_call.name = xstrdup("write_file");
+    write_call.arguments = xstrdup("{\"path\":\"a.txt\"}");
+    tool_calls_push(&calls, write_call);
+
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, &calls, 0, &orders);
+    TEST_ASSERT(items != NULL);
+    TEST_ASSERT(items[0].is_custom);
+    TEST_ASSERT(!items[1].is_custom);
+
+    buf out = {0};
+    responses_append_function_call_item(&out, &calls.v[0], &items[0],
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"custom_tool_call\"") != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") == NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"call_id\":\"call_patch\"") != NULL);
+    /* The lone DSML parameter is the tool input: it goes out as the patch text
+     * itself, not as the {"patch": ...} object the model wrapped it in. */
+    buf expect_input = {0};
+    buf_puts(&expect_input, "\"input\":");
+    json_escape(&expect_input, patch_text);
+    TEST_ASSERT(strstr(out.ptr, expect_input.ptr) != NULL);
+    TEST_ASSERT(strstr(out.ptr, "\"arguments\":") == NULL);
+
+    buf write_out = {0};
+    responses_append_function_call_item(&write_out, &calls.v[1], &items[1],
+                                        "completed", true, &orders);
+    TEST_ASSERT(strstr(write_out.ptr, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(write_out.ptr, "\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"") != NULL);
+
+    /* Replay what we just emitted, with the output Codex sends back for it. */
+    buf replay = {0};
+    buf_putc(&replay, '[');
+    buf_append(&replay, out.ptr, out.len);
+    buf_puts(&replay, ",{\"type\":\"custom_tool_call_output\","
+                      "\"call_id\":\"call_patch\","
+                      "\"output\":\"Success. Updated the following files:\\nM a.txt\"}]");
+    const char *replay_p = replay.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&replay_p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(!strcmp(msgs.v[0].role, "assistant"));
+    TEST_ASSERT(msgs.v[0].calls.len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "apply_patch"));
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].id, "call_patch"));
+    /* custom_tool_call carries the blob as free text, so the patch survives the
+     * hop unchanged instead of coming back re-wrapped. */
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].arguments, patch_text));
+    TEST_ASSERT(!strcmp(msgs.v[1].role, "tool"));
+    TEST_ASSERT(strstr(msgs.v[1].content, "Updated the following files") != NULL);
+
+    chat_msgs_free(&msgs);
+    buf_free(&replay);
+    buf_free(&expect_input);
+    buf_free(&write_out);
+    buf_free(&out);
+    free(items);
+    tool_calls_free(&calls);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+/* Only a lone string parameter has an unambiguous freeform reading. An empty
+ * argument object means no input, and anything richer stays as it is rather
+ * than being guessed at. */
+static void test_responses_custom_tool_call_input_edge_cases(void) {
+    const char *tools_json =
+        "[{\"type\":\"custom\",\"name\":\"freeform\"}]";
+    const char *tools_p = tools_json;
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+
+    const char *cases[][2] = {
+        {"{}", "\"input\":\"\""},
+        {"{\"a\":\"x\",\"b\":\"y\"}",
+         "\"input\":\"{\\\"a\\\":\\\"x\\\",\\\"b\\\":\\\"y\\\"}\""},
+        {"{\"count\":5}", "\"input\":\"{\\\"count\\\":5}\""},
+        {"already raw text", "\"input\":\"already raw text\""},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        tool_calls calls = {0};
+        tool_call tc = {0};
+        tc.id = xstrdup("call_freeform");
+        tc.name = xstrdup("freeform");
+        tc.arguments = xstrdup(cases[i][0]);
+        tool_calls_push(&calls, tc);
+
+        responses_tool_item *items = NULL;
+        responses_tool_items_build(&items, &calls, 0, &orders);
+        TEST_ASSERT(items && items[0].is_custom);
+
+        buf out = {0};
+        responses_append_function_call_item(&out, &calls.v[0], &items[0],
+                                            "completed", true, &orders);
+        TEST_ASSERT(strstr(out.ptr, "\"type\":\"custom_tool_call\"") != NULL);
+        TEST_ASSERT(strstr(out.ptr, cases[i][1]) != NULL);
+
+        buf_free(&out);
+        free(items);
+        tool_calls_free(&calls);
+    }
+
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
 static tool_calls make_swapped_bash_call(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -18333,6 +18536,8 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
+    test_responses_custom_tool_call_round_trips_freeform_input();
+    test_responses_custom_tool_call_input_edge_cases();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
