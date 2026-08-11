@@ -476,6 +476,15 @@ body {
   background: var(--accent-wash);
 }
 
+.msg.notice .role {
+  color: var(--warn, #b45309);
+}
+
+.msg.notice .bubble {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--warn, #b45309) 12%, var(--panel));
+}
+
 .msg .bubble {
   position: relative;
   padding: 0.85rem 4.6rem 0.85rem 1rem;
@@ -1054,6 +1063,11 @@ textarea#prompt {
   font: inherit;
   line-height: 1.35;
   transition: border-color 0.15s ease;
+}
+
+textarea#prompt:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 textarea#prompt:hover {

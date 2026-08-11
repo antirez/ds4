@@ -503,6 +503,10 @@
     return c.startsWith("Error:");
   }
 
+  function isUiNoticeMessage(msg) {
+    return !!(msg && msg.ui_notice);
+  }
+
   function estimateTokens(text) {
     // Rough local estimate; server tokenizer is authoritative.
     return Math.ceil(String(text || "").length / 4);
@@ -655,6 +659,46 @@
     );
   }
 
+  /** Per-chat lock after RAM auto-fork; persists on chat JSON across reloads. */
+  function chatPromptingLocked() {
+    return !!(current && current.prompting_locked);
+  }
+
+  function promptingEffectivelyLocked() {
+    return ramPressureLocked() || chatPromptingLocked();
+  }
+
+  function chatPromptLockReason() {
+    if (!chatPromptingLocked()) return "";
+    const title = current.continued_in_title || "the summarized chat";
+    const id = current.continued_in_chat_id;
+    if (id) {
+      return (
+        `Prompting locked (low RAM auto-summarize). Continue in “${title}” (${id}).`
+      );
+    }
+    return "Prompting locked (low RAM auto-summarize). Continue in the summarized chat.";
+  }
+
+  function promptingLockReason() {
+    if (chatPromptingLocked()) return chatPromptLockReason();
+    return ramLockReason();
+  }
+
+  function ramPromptLockNoticeText(continuedTitle, continuedId) {
+    const title = continuedTitle || "the summarized chat";
+    if (continuedId) {
+      return (
+        `This chat was automatically summarized due to low free RAM. ` +
+        `Prompting is disabled here — continue in “${title}” (${continuedId}).`
+      );
+    }
+    return (
+      `This chat was automatically summarized due to low free RAM. ` +
+      `Prompting is disabled here — continue in “${title}”.`
+    );
+  }
+
   function wantForceRamPressure() {
     try {
       if (new URLSearchParams(location.search).get("forceRamPressure") === "1") {
@@ -685,14 +729,22 @@
     labelEl.title = locked ? reason : defaultTitle;
   }
 
-  /** Grey out / block send, web, and attach while the pressure latch is set. */
+  /** Grey out / block send, web, and attach while global RAM latch or this chat is prompt-locked. */
   function updateRamPressureUi() {
-    const locked = ramPressureLocked();
-    const reason = ramLockReason();
+    const locked = promptingEffectivelyLocked();
+    const reason = promptingLockReason();
 
     if (els.sendBtn) {
       els.sendBtn.disabled = busy || locked;
       els.sendBtn.title = locked ? reason : "";
+    }
+
+    if (els.prompt) {
+      els.prompt.disabled = locked;
+      els.prompt.placeholder = locked
+        ? "Prompting disabled on this chat…"
+        : "Message DwarfStar…";
+      els.prompt.title = locked ? reason : "";
     }
 
     if (els.webToggle) {
@@ -732,6 +784,9 @@
       }
     } else {
       els.ramNotice.classList.remove("is-locked");
+      if (!ramNoticeTimer) {
+        els.ramNotice.hidden = true;
+      }
     }
   }
 
@@ -743,8 +798,8 @@
     ramNoticeTimer = setTimeout(() => {
       ramNoticeTimer = null;
       if (!els.ramNotice) return;
-      if (ramPressureLatched) {
-        els.ramNotice.textContent = ramLockReason();
+      if (promptingEffectivelyLocked()) {
+        els.ramNotice.textContent = promptingLockReason();
         els.ramNotice.hidden = false;
         els.ramNotice.classList.add("is-locked");
       } else {
@@ -873,7 +928,9 @@
   }
 
   function filterWorkingMessages(messages) {
-    return (messages || []).filter((m) => !isUiFailureAssistant(m));
+    return (messages || []).filter(
+      (m) => !isUiFailureAssistant(m) && !isUiNoticeMessage(m)
+    );
   }
 
   function keepRecentForPass(force, pass) {
@@ -1199,6 +1256,34 @@
     }
   }
 
+  async function lockSourceChatAfterRamFork(sourceChat, continuedChat) {
+    if (!sourceChat || !sourceChat.id || !continuedChat) return;
+    const continuedTitle = continuedChat.title || "summarized chat";
+    const continuedId = continuedChat.id;
+    const notice = ramPromptLockNoticeText(continuedTitle, continuedId);
+    if (!Array.isArray(sourceChat.messages)) sourceChat.messages = [];
+    const already = sourceChat.messages.some(
+      (m) =>
+        isUiNoticeMessage(m) && m.notice_kind === "prompting_locked_low_ram"
+    );
+    if (!already) {
+      sourceChat.messages.push({
+        role: "assistant",
+        content: notice,
+        ui_notice: true,
+        notice_kind: "prompting_locked_low_ram",
+      });
+    }
+    sourceChat.prompting_locked = true;
+    sourceChat.prompting_lock_reason = "low_ram";
+    sourceChat.continued_in_chat_id = continuedId;
+    sourceChat.continued_in_title = continuedTitle;
+    await api(`/api/chats/${sourceChat.id}`, {
+      method: "PUT",
+      body: JSON.stringify(sourceChat),
+    });
+  }
+
   async function forkSummarizedChat(sourceMessages, sourceTitle, opts = {}) {
     const reason = opts.reason || "fork";
     const signal = opts.signal;
@@ -1221,6 +1306,10 @@
       }),
     });
     created.messages = result.messages;
+    // RAM auto-path only: lock prompting on the source chat before switching.
+    if (opts.lockSourcePrompting && opts.sourceChat) {
+      await lockSourceChatAfterRamFork(opts.sourceChat, created);
+    }
     current = created;
     pendingFiles = [];
     renderAttachBar();
@@ -1228,7 +1317,8 @@
     renderTranscript();
     await saveCurrent();
     await refreshList();
-    return { ok: true };
+    updateRamPressureUi();
+    return { ok: true, chat: created };
   }
 
   async function summarizeToNewChat() {
@@ -1328,6 +1418,7 @@
       annotateStoppedForRam();
       renderTranscript();
       await saveCurrent();
+      const sourceChat = current;
       const sourceTitle = current.title || "chat";
       const sourceMessages = JSON.parse(JSON.stringify(current.messages || []));
       if (filterWorkingMessages(sourceMessages).length < 2) {
@@ -1341,11 +1432,13 @@
       const forked = await forkSummarizedChat(sourceMessages, sourceTitle, {
         reason: "ram",
         signal: gen.signal,
+        lockSourcePrompting: true,
+        sourceChat,
       });
       if (forked.ok) {
         const done =
           `Switched to summarized chat. ` +
-          `(Low RAM: ${freeGib.toFixed(1)} GiB free; original left unchanged.)`;
+          `(Low RAM: ${freeGib.toFixed(1)} GiB free; original left read-only for prompts.)`;
         showRamNotice(done);
         setStatus(done, true);
         warnIfHuge(apiMessages());
@@ -1438,10 +1531,18 @@
 
   function renderMessage(msg, streaming) {
     const wrap = document.createElement("article");
-    wrap.className = `msg ${msg.role}` + (isSummaryMessage(msg) ? " summary" : "");
+    const notice = isUiNoticeMessage(msg);
+    wrap.className =
+      `msg ${msg.role}` +
+      (isSummaryMessage(msg) ? " summary" : "") +
+      (notice ? " notice" : "");
     const role = document.createElement("p");
     role.className = "role";
-    role.textContent = isSummaryMessage(msg) ? "summary" : msg.role;
+    role.textContent = notice
+      ? "notice"
+      : isSummaryMessage(msg)
+        ? "summary"
+        : msg.role;
     wrap.appendChild(role);
     if (msg.reasoning) {
       wrap.appendChild(createThinkMirror(msg, msg.reasoning));
@@ -1532,6 +1633,7 @@
     for (const m of msgs) {
       if (m.role !== "user" && m.role !== "assistant") continue;
       if (m.role === "assistant" && isUiFailureAssistant(m)) continue;
+      if (isUiNoticeMessage(m)) continue;
       let content = String(m.content || "");
       content = content.replace(
         /----- web context[\s\S]*?----- end web context -----\s*/gi,
@@ -1682,6 +1784,7 @@
     renderAttachBar();
     els.chatTitle.textContent = current.title;
     renderTranscript();
+    updateRamPressureUi();
     await refreshList();
     els.prompt.focus();
   }
@@ -1692,6 +1795,7 @@
     renderAttachBar();
     els.chatTitle.textContent = current.title;
     renderTranscript();
+    updateRamPressureUi();
     await refreshList();
     warnIfHuge(apiMessages());
     els.rail.classList.remove("open");
@@ -1721,7 +1825,7 @@
   function apiMessages() {
     return (current.messages || [])
       .filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant")
-      .filter((m) => !isUiFailureAssistant(m))
+      .filter((m) => !isUiFailureAssistant(m) && !isUiNoticeMessage(m))
       .map((m) => ({ role: m.role, content: m.content || "" }));
   }
 
@@ -1755,8 +1859,8 @@
 
   async function sendMessage() {
     if (busy || !current) return;
-    if (ramPressureLocked()) {
-      const reason = ramLockReason();
+    if (promptingEffectivelyLocked()) {
+      const reason = promptingLockReason();
       setStatus(reason, false);
       showRamNotice(reason);
       return;
@@ -2107,8 +2211,8 @@
   }
 
   async function onFilesSelected(fileList) {
-    if (ramPressureLocked()) {
-      const reason = ramLockReason();
+    if (promptingEffectivelyLocked()) {
+      const reason = promptingLockReason();
       setStatus(reason, false);
       showRamNotice(reason);
       if (els.fileInput) els.fileInput.value = "";
