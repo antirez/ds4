@@ -1003,13 +1003,21 @@ There is no built-in web chat in `ds4-server` itself. A small local UI lives in
 server on port 8000, and stores conversations as JSON under `~/.ds4/chats`.
 
 ```sh
-# terminal 1 — inference server (Metal example)
-./ds4-server --metal --host 127.0.0.1 --port 8000 --ctx 8192
+# terminal 1 — inference server (Metal, Mac-safe --ctx = RAM - 6GiB policy)
+make run-server-mac
+# or: ./scripts/run-ds4-server-mac.sh
+# inspect only: make safe-ctx   /   python3 scripts/safe_ctx.py
 
 # terminal 2 — chat UI
 make chat-ui
 # or: python3 chat-ui/server.py --host 127.0.0.1 --port 8787
 ```
+
+On macOS the helper sizes `--ctx` so estimated resident model + context stays
+at or under **total RAM − 6 GiB** (headroom for the OS, chat-ui, and browser).
+It uses the README Flash figure of ~26 GiB context pressure per 1M tokens.
+Override with `DS4_CTX=...` only if you accept the risk; the launcher refuses
+values above the safe budget.
 
 Open http://127.0.0.1:8787 . Use **New chat** to start, send messages as usual,
 and pick an older entry in the left list to resume. Attach text or code files
