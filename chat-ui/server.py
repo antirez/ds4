@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import platform
 import re
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -26,12 +28,235 @@ from ocr import OcrError, extract_attachment, tooling_status  # noqa: E402
 from tts import TtsError, synthesize_wav, tooling_status as tts_tooling_status  # noqa: E402
 from web_context import build_web_context  # noqa: E402
 
+_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+try:
+    import safe_ctx as _safe_ctx  # noqa: E402
+except ImportError:  # pragma: no cover - optional helper
+    _safe_ctx = None  # type: ignore
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_API = "http://127.0.0.1:8000"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 MAX_BODY = 32 * 1024 * 1024
 CHAT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def ram_policy_status() -> dict[str, Any]:
+    """Mac-safe ctx policy: model + KV <= RAM - 6 GiB."""
+    if _safe_ctx is None:
+        return {"available": False, "error": "safe_ctx helper missing"}
+    try:
+        ram_gib = _safe_ctx.total_ram_bytes() / _safe_ctx.GIB
+        model = _safe_ctx.find_model(None, REPO_ROOT)
+        model_gib = _safe_ctx.estimate_model_gib(model, None, _safe_ctx.DEFAULT_RESIDENT_FACTOR)
+        reserve = _safe_ctx.DEFAULT_RESERVE_GIB
+        safe = _safe_ctx.max_safe_ctx(ram_gib=ram_gib, model_gib=model_gib, reserve_gib=reserve)
+        safe_aligned = max(0, (safe // 1024) * 1024)
+        return {
+            "available": True,
+            "reserve_gib": reserve,
+            "ram_gib": round(ram_gib, 2),
+            "ceiling_gib": round(ram_gib - reserve, 2),
+            "model_gib": round(model_gib, 2),
+            "model_path": str(model) if model else None,
+            "safe_ctx": safe_aligned,
+            "kv_gib_per_mtoken": _safe_ctx.KV_GIB_PER_MTOKEN,
+            "policy": "planned_model_plus_ctx <= RAM - 6GiB",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": str(exc)}
+
+
+def _read_proc_meminfo() -> dict[str, int]:
+    """Parse /proc/meminfo into byte counts keyed by field name."""
+    info: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        parts = val.split()
+        if parts:
+            info[key] = int(parts[0]) * 1024
+    return info
+
+
+def _parse_vm_stat_pages(raw: str) -> dict[str, int]:
+    """Parse `vm_stat` text into page counts keyed by field name."""
+    stats: dict[str, int] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        digits = "".join(ch for ch in val if ch.isdigit())
+        if digits:
+            stats[key.strip().strip('"')] = int(digits)
+    return stats
+
+
+def _activity_monitor_used_pages(stats: dict[str, int]) -> int | None:
+    """Activity Monitor Memory Used in pages: app + wired + compressed.
+
+    App Memory ≈ internal (anonymous) pages minus purgeable pages.
+    """
+    internal = stats.get("Pages internal")
+    if internal is None:
+        internal = stats.get("Anonymous pages")
+    wired = stats.get("Pages wired down")
+    compressor = stats.get("Pages occupied by compressor")
+    if internal is None or wired is None or compressor is None:
+        return None
+    purgeable = stats.get("Pages purgeable", 0)
+    app_pages = max(0, int(internal) - int(purgeable))
+    return app_pages + int(wired) + int(compressor)
+
+
+def _darwin_memory_used_host_statistics64(page_size: int) -> int | None:
+    """Memory Used via mach host_statistics64 (HOST_VM_INFO64)."""
+    import ctypes
+    import ctypes.util
+
+    lib_name = ctypes.util.find_library("c")
+    if not lib_name:
+        return None
+    libc = ctypes.CDLL(lib_name, use_errno=True)
+
+    class VmStatistics64(ctypes.Structure):
+        _fields_ = [
+            ("free_count", ctypes.c_uint32),
+            ("active_count", ctypes.c_uint32),
+            ("inactive_count", ctypes.c_uint32),
+            ("wire_count", ctypes.c_uint32),
+            ("zero_fill_count", ctypes.c_uint64),
+            ("reactivations", ctypes.c_uint64),
+            ("pageins", ctypes.c_uint64),
+            ("pageouts", ctypes.c_uint64),
+            ("faults", ctypes.c_uint64),
+            ("cow_faults", ctypes.c_uint64),
+            ("lookups", ctypes.c_uint64),
+            ("hits", ctypes.c_uint64),
+            ("purges", ctypes.c_uint64),
+            ("purgeable_count", ctypes.c_uint32),
+            ("speculative_count", ctypes.c_uint32),
+            ("decompressions", ctypes.c_uint64),
+            ("compressions", ctypes.c_uint64),
+            ("swapins", ctypes.c_uint64),
+            ("swapouts", ctypes.c_uint64),
+            ("compressor_page_count", ctypes.c_uint32),
+            ("throttled_count", ctypes.c_uint32),
+            ("external_page_count", ctypes.c_uint32),
+            ("internal_page_count", ctypes.c_uint32),
+            ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+        ]
+
+    HOST_VM_INFO64 = 4
+    mach_host_self = libc.mach_host_self
+    mach_host_self.restype = ctypes.c_uint
+    host_statistics64 = libc.host_statistics64
+    host_statistics64.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    host_statistics64.restype = ctypes.c_int
+
+    info = VmStatistics64()
+    count = ctypes.c_uint(ctypes.sizeof(VmStatistics64) // ctypes.sizeof(ctypes.c_int))
+    kr = host_statistics64(
+        mach_host_self(), HOST_VM_INFO64, ctypes.byref(info), ctypes.byref(count)
+    )
+    if kr != 0:
+        return None
+    app_pages = max(0, int(info.internal_page_count) - int(info.purgeable_count))
+    used_pages = app_pages + int(info.wire_count) + int(info.compressor_page_count)
+    return used_pages * int(page_size)
+
+
+def _darwin_memory_used_bytes(page_size: int) -> tuple[int | None, str]:
+    """Return (used_bytes, source) matching Activity Monitor Memory Used."""
+    used = _darwin_memory_used_host_statistics64(page_size)
+    if used is not None:
+        return used, "host_statistics64"
+    raw = subprocess.check_output(["vm_stat"], text=True)
+    pages_used = _activity_monitor_used_pages(_parse_vm_stat_pages(raw))
+    if pages_used is None:
+        return None, "unknown"
+    return pages_used * int(page_size), "vm_stat_activity_monitor"
+
+
+def system_ram_status() -> dict[str, Any]:
+    """Live occupied / total RAM for the UI status bar."""
+    try:
+        if _safe_ctx is not None:
+            total = int(_safe_ctx.total_ram_bytes())
+        elif platform.system() == "Darwin":
+            total = int(
+                subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+            )
+        else:
+            meminfo = _read_proc_meminfo()
+            if "MemTotal" in meminfo:
+                total = meminfo["MemTotal"]
+            else:
+                import os
+
+                pages = int(os.sysconf("SC_PHYS_PAGES"))
+                page = int(os.sysconf("SC_PAGE_SIZE"))
+                total = pages * page
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": f"total ram: {exc}"}
+
+    used = None
+    source = "unknown"
+    try:
+        if platform.system() == "Darwin":
+            page_size = int(
+                subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True).strip()
+            )
+            used, source = _darwin_memory_used_bytes(page_size)
+        else:
+            meminfo = _read_proc_meminfo()
+            if "MemTotal" in meminfo and "MemAvailable" in meminfo:
+                total = meminfo["MemTotal"]
+                used = total - meminfo["MemAvailable"]
+                source = "meminfo"
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "available": False,
+            "total_bytes": total,
+            "error": str(exc),
+        }
+
+    if used is None:
+        return {"available": False, "total_bytes": total, "error": "unsupported platform"}
+
+    used = max(0, min(int(used), int(total)))
+    free = int(total) - used
+    pct = (100.0 * used / total) if total else 0.0
+    gib = 1024**3
+    # free_bytes = total - used (macOS used ≈ Activity Monitor Memory Used).
+    # Chat-ui client treats free < safe_ctx reserve (6 GiB) as pressure.
+    return {
+        "available": True,
+        "total_bytes": int(total),
+        "used_bytes": used,
+        "free_bytes": free,
+        "used_gib": round(used / gib, 2),
+        "free_gib": round(free / gib, 2),
+        "total_gib": round(total / gib, 2),
+        "percent": round(pct, 1),
+        "source": source,
+        "pressure_trigger_gib": (
+            float(_safe_ctx.RAM_PRESSURE_TRIGGER_GIB) if _safe_ctx else 6.0
+        ),
+        "pressure_clear_gib": (
+            float(_safe_ctx.RAM_PRESSURE_CLEAR_GIB) if _safe_ctx else 7.0
+        ),
+    }
 
 
 def format_upstream_error(exc: BaseException) -> str:
@@ -283,8 +508,14 @@ class ChatUIHandler(BaseHTTPRequestHandler):
                         "provider": "duckduckgo-html",
                         "api_key_required": False,
                     },
+                    "ram_policy": ram_policy_status(),
+                    "system_ram": system_ram_status(),
                 },
             )
+            return
+
+        if path == "/api/ram":
+            self._send_json(HTTPStatus.OK, system_ram_status())
             return
 
         if path == "/api/chats":
