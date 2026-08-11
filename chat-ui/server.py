@@ -481,14 +481,14 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         if not isinstance(query, str) or not query.strip():
             self._send_error_json(HTTPStatus.BAD_REQUEST, "query required")
             return
-        max_results = payload.get("max_results", 5)
-        max_fetch = payload.get("max_fetch", 3)
+        max_results = payload.get("max_results", 8)
+        max_fetch = payload.get("max_fetch", 5)
         fetch_pages = payload.get("fetch_pages", True)
-        if not isinstance(max_results, int) or not (1 <= max_results <= 10):
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "max_results must be 1..10")
+        if not isinstance(max_results, int) or not (1 <= max_results <= 12):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "max_results must be 1..12")
             return
-        if not isinstance(max_fetch, int) or not (0 <= max_fetch <= 5):
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "max_fetch must be 0..5")
+        if not isinstance(max_fetch, int) or not (0 <= max_fetch <= 8):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "max_fetch must be 0..8")
             return
         if not isinstance(fetch_pages, bool):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "fetch_pages must be a boolean")

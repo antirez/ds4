@@ -21,11 +21,11 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 DDG_HTML = "https://html.duckduckgo.com/html/"
-MAX_RESULTS_DEFAULT = 5
-MAX_FETCH_DEFAULT = 3
-MAX_SNIPPET_CHARS = 280
-MAX_PAGE_CHARS = 2500
-MAX_CONTEXT_CHARS = 12000
+MAX_RESULTS_DEFAULT = 8
+MAX_FETCH_DEFAULT = 5
+MAX_SNIPPET_CHARS = 320
+MAX_PAGE_CHARS = 1800
+MAX_CONTEXT_CHARS = 16000
 FETCH_TIMEOUT_S = 12
 SEARCH_TIMEOUT_S = 20
 
@@ -146,6 +146,13 @@ def _http_url(url: str) -> bool:
     return p.scheme in ("http", "https") and bool(p.netloc)
 
 
+def _host(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+
+
 def _unwrap_ddg_url(href: str) -> str:
     if not href:
         return ""
@@ -225,26 +232,146 @@ def fetch_page_text(url: str, max_chars: int = MAX_PAGE_CHARS) -> dict[str, str]
     final, html_text = _http_get(url, FETCH_TIMEOUT_S)
     # Prefer HTML extraction; fall back to plain text.
     ctype_hint = html_text.lstrip()[:40].lower()
+    text = ""
+    title = ""
     if "<html" in ctype_hint or "<!doctype" in ctype_hint or "<head" in html_text[:500].lower():
         extractor = _TextExtractor()
         try:
             extractor.feed(html_text)
             extractor.close()
-        except Exception:
-            text = re.sub(r"<[^>]+>", " ", html_text)
-        else:
             text = extractor.text()
             title = _clean_text(extractor.title)
-            return {
-                "url": final,
-                "title": title,
-                "text": text[:max_chars],
-            }
+        except Exception:
+            text = re.sub(r"<[^>]+>", " ", html_text)
     else:
         text = html_text
     text = _clean_text(text)
     text = re.sub(r"\s+", " ", text)
-    return {"url": final, "title": "", "text": text[:max_chars]}
+    return {"url": final, "title": title, "text": text[:max_chars]}
+
+
+def _ordered_fetch_candidates(hits: list[SearchHit]) -> list[SearchHit]:
+    """Prefer host diversity so one domain does not consume every fetch slot."""
+    primary: list[SearchHit] = []
+    secondary: list[SearchHit] = []
+    seen_hosts: set[str] = set()
+    for hit in hits:
+        host = _host(hit.url)
+        if host and host in seen_hosts:
+            secondary.append(hit)
+        else:
+            if host:
+                seen_hosts.add(host)
+            primary.append(hit)
+    return primary + secondary
+
+
+def fetch_pages_until(
+    hits: list[SearchHit],
+    *,
+    max_fetch: int,
+    max_chars: int = MAX_PAGE_CHARS,
+) -> tuple[list[dict[str, str]], list[str], int]:
+    """Fetch until max_fetch successful pages, skipping failures and trying later hits."""
+    want = max(0, max_fetch)
+    if want == 0 or not hits:
+        return [], [], 0
+    pages: list[dict[str, str]] = []
+    errors: list[str] = []
+    seen_final: set[str] = set()
+    attempted = 0
+    for hit in _ordered_fetch_candidates(hits):
+        if len(pages) >= want:
+            break
+        attempted += 1
+        try:
+            page = fetch_page_text(hit.url, max_chars=max_chars)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            errors.append(f"{hit.url}: {exc}")
+            continue
+        text = (page.get("text") or "").strip()
+        if not text:
+            errors.append(f"{hit.url}: empty page text")
+            continue
+        final = page.get("url") or hit.url
+        if final in seen_final:
+            continue
+        seen_final.add(final)
+        if not page.get("title"):
+            page["title"] = hit.title
+        pages.append(page)
+    return pages, errors, attempted
+
+
+def _clip(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1].rstrip() + "…"
+
+
+def assemble_context(
+    query: str,
+    hits: list[SearchHit],
+    pages: list[dict[str, str]],
+    errors: list[str],
+    *,
+    max_chars: int = MAX_CONTEXT_CHARS,
+) -> str:
+    """Build the prompt block, budgeting space so later pages are not wiped."""
+    header = [
+        "----- web context (DuckDuckGo HTML, no API key) -----",
+        f"Query: {query}",
+        "",
+        "Search results:",
+    ]
+    if not hits:
+        header.append("(no results)")
+    for i, hit in enumerate(hits, 1):
+        header.append(f"{i}. {hit.title}")
+        header.append(f"   URL: {hit.url}")
+        if hit.snippet:
+            header.append(f"   {hit.snippet}")
+
+    footer: list[str] = []
+    if errors:
+        footer.append("Fetch notes:")
+        for err in errors[:8]:
+            footer.append(f"- {err}")
+    footer.append("----- end web context -----")
+
+    head_text = "\n".join(header)
+    foot_text = "\n".join(footer)
+    reserved = len(head_text) + len(foot_text) + 64
+    budget = max(0, max_chars - reserved)
+
+    page_blocks: list[str] = []
+    if pages and budget > 80:
+        page_blocks.append("Fetched page text:")
+        budget -= len(page_blocks[0]) + 1
+        per = max(400, budget // max(1, len(pages)))
+        for page in pages:
+            if budget < 120:
+                break
+            title = page.get("title") or page.get("url") or "page"
+            body = _clip(page.get("text") or "", min(MAX_PAGE_CHARS, per, budget - 80))
+            block = f"### {title}\nURL: {page.get('url', '')}\n{body}\n"
+            if len(block) > budget:
+                block = _clip(block, budget)
+            page_blocks.append(block.rstrip())
+            budget -= len(block) + 1
+
+    parts = [head_text]
+    if page_blocks:
+        parts.append("\n".join(page_blocks))
+    parts.append(foot_text)
+    context = "\n\n".join(parts).strip()
+    if len(context) > max_chars:
+        context = _clip(context, max_chars)
+    return context
 
 
 def build_web_context(
@@ -259,52 +386,18 @@ def build_web_context(
     if not q:
         raise ValueError("query required")
 
-    errors: list[str] = []
     try:
         hits = search_duckduckgo(q, max_results=max_results)
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(f"web search failed: {exc}") from exc
 
     pages: list[dict[str, str]] = []
+    errors: list[str] = []
+    attempted = 0
     if fetch_pages:
-        for hit in hits[: max(0, max_fetch)]:
-            try:
-                page = fetch_page_text(hit.url)
-                if page.get("text"):
-                    pages.append(page)
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-                errors.append(f"{hit.url}: {exc}")
+        pages, errors, attempted = fetch_pages_until(hits, max_fetch=max_fetch)
 
-    lines: list[str] = [
-        "----- web context (DuckDuckGo HTML, no API key) -----",
-        f"Query: {q}",
-        "",
-        "Search results:",
-    ]
-    if not hits:
-        lines.append("(no results)")
-    for i, hit in enumerate(hits, 1):
-        lines.append(f"{i}. {hit.title}")
-        lines.append(f"   URL: {hit.url}")
-        if hit.snippet:
-            lines.append(f"   {hit.snippet}")
-    if pages:
-        lines.append("")
-        lines.append("Fetched page text:")
-        for page in pages:
-            title = page.get("title") or page.get("url") or "page"
-            lines.append(f"### {title}")
-            lines.append(f"URL: {page.get('url', '')}")
-            lines.append(page.get("text", ""))
-            lines.append("")
-    if errors:
-        lines.append("Fetch notes:")
-        for err in errors[:8]:
-            lines.append(f"- {err}")
-    lines.append("----- end web context -----")
-    context = "\n".join(lines).strip()
-    if len(context) > MAX_CONTEXT_CHARS:
-        context = context[: MAX_CONTEXT_CHARS - 20].rstrip() + "\n…[truncated]"
+    context = assemble_context(q, hits, pages, errors)
 
     return {
         "query": q,
@@ -312,6 +405,7 @@ def build_web_context(
             {"title": h.title, "url": h.url, "snippet": h.snippet} for h in hits
         ],
         "pages_fetched": len(pages),
+        "pages_attempted": attempted,
         "errors": errors,
         "context": context,
         "provider": "duckduckgo-html",
