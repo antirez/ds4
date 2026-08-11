@@ -996,6 +996,38 @@ Start a local OpenAI/Anthropic-compatible server:
 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
+### Local browser chat UI
+
+There is no built-in web chat in `ds4-server` itself. A small local UI lives in
+`chat-ui/`: it serves a page on port 8787, proxies OpenAI chat calls to the
+server on port 8000, and stores conversations as JSON under `~/.ds4/chats`.
+
+```sh
+# terminal 1 — inference server (Metal example)
+./ds4-server --metal --host 127.0.0.1 --port 8000 --ctx 8192
+
+# terminal 2 — chat UI
+make chat-ui
+# or: python3 chat-ui/server.py --host 127.0.0.1 --port 8787
+```
+
+Open http://127.0.0.1:8787 . Use **New chat** to start, send messages as usual,
+and pick an older entry in the left list to resume. Attach text or code files
+from the composer; their contents are inlined into the prompt. Images and PDFs
+are run through local OCR (`tesseract` + Poppler) and the extracted text is
+inlined the same way — the HTTP API remains text-only (no native vision).
+
+OCR dependencies on macOS:
+
+```sh
+brew install tesseract poppler
+```
+
+Hard-refresh the browser (Cmd+Shift+R) after updating `chat-ui/` so CSS/JS reload.
+
+This UI store is separate from `ds4-agent` KV sessions in `~/.ds4/kvcache`
+(`/save`, `/list`, `/switch`).
+
 Use `--chdir /path/to/ds4` when launching `ds4-server` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
