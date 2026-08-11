@@ -273,17 +273,10 @@ body {
 }
 
 .msg {
-  max-width: min(720px, 92%);
+  max-width: 100%;
+  width: 100%;
+  align-self: stretch;
   animation: rise 0.35s ease both;
-}
-
-.msg.user {
-  align-self: flex-end;
-}
-
-.msg.assistant,
-.msg.system {
-  align-self: flex-start;
 }
 
 .msg .role {
