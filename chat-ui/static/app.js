@@ -74,6 +74,9 @@
   let audioUnlocked = false;
   /** @type {AbortController|null} */
   let generationAbort = null;
+  /** Separate from generation — RAM abort must not cancel summarize/compress. */
+  /** @type {AbortController|null} */
+  let summarizeAbort = null;
   let ramAbortRequested = false;
   let ramPressureLatched = false;
   let ramFallbackRunning = false;
@@ -630,6 +633,23 @@
     if (generationAbort === controller) generationAbort = null;
   }
 
+  function beginSummarize() {
+    if (summarizeAbort) {
+      try {
+        summarizeAbort.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    summarizeAbort = new AbortController();
+    return summarizeAbort;
+  }
+
+  function endSummarize(controller) {
+    if (summarizeAbort === controller) summarizeAbort = null;
+  }
+
+  /** Abort generate/web only — never touches summarizeAbort / in-flight compress. */
   function abortGenerationForRam() {
     ramAbortRequested = true;
     if (!generationAbort) return false;
@@ -729,7 +749,10 @@
     labelEl.title = locked ? reason : defaultTitle;
   }
 
-  /** Grey out / block send, web, and attach while global RAM latch or this chat is prompt-locked. */
+  /**
+   * Grey out / block send, web, and attach while global RAM latch or this chat is prompt-locked.
+   * Summarize / Summarize-to-new-chat stay available — refreshSummarizeButtons owns those.
+   */
   function updateRamPressureUi() {
     const locked = promptingEffectivelyLocked();
     const reason = promptingLockReason();
@@ -1132,6 +1155,7 @@
     };
   }
 
+  /** Busy / mutex only — never gated by ramPressureLocked or prompting_locked. */
   function refreshSummarizeButtons() {
     const locked = busy || summarizeInFlight;
     if (els.summarizeBtn) els.summarizeBtn.disabled = locked;
@@ -1231,12 +1255,12 @@
     setChatBusy(true);
     showSummarizeLoader("Summarizing conversation…");
     notifySummarizePhase("Summarizing conversation…");
-    const gen = beginGeneration();
+    const sum = beginSummarize();
     try {
       const result = await compressHistoryIfNeeded("", {
         force: true,
         reason: "manual",
-        signal: gen.signal,
+        signal: sum.signal,
       });
       if (result.compressed) {
         setStatus("Summary ready.", true);
@@ -1249,7 +1273,7 @@
         setStatus(`Summarize failed: ${err.message}`, false);
       }
     } finally {
-      endGeneration(gen);
+      endSummarize(sum);
       hideSummarizeLoader();
       endSummarizeLock();
       setChatBusy(false);
@@ -1334,11 +1358,11 @@
     setChatBusy(true);
     showSummarizeLoader("Summarizing conversation…");
     notifySummarizePhase("Summarizing conversation…");
-    const gen = beginGeneration();
+    const sum = beginSummarize();
     try {
       const forked = await forkSummarizedChat(sourceMessages, sourceTitle, {
         reason: "fork",
-        signal: gen.signal,
+        signal: sum.signal,
       });
       if (!forked.ok) {
         setStatus("Nothing left to compress for a new chat.", null);
@@ -1351,7 +1375,7 @@
         setStatus(`Summarize to new chat failed: ${err.message}`, false);
       }
     } finally {
-      endGeneration(gen);
+      endSummarize(sum);
       hideSummarizeLoader();
       endSummarizeLock();
       setChatBusy(false);
@@ -1380,6 +1404,7 @@
     // Client poll of /api/ram aborts UI-owned work; bare ds4-server is not killed.
     if (ramFallbackRunning) return;
     // Latch/notice already set by poll; never start a second compress.
+    // Abort generate/web only — leave in-flight summarizeAbort alone.
     if (summarizeInFlight) {
       const notice =
         `Low RAM (${freeGib.toFixed(1)} GiB free) — summarize already in progress…`;
@@ -1405,7 +1430,7 @@
     notifySummarizePhase(notice, { ramNotice: true });
     abortGenerationForRam();
     setChatBusy(true);
-    const gen = beginGeneration();
+    const sum = beginSummarize();
     try {
       await new Promise((r) => setTimeout(r, 50));
       if (!current) {
@@ -1431,7 +1456,7 @@
       }
       const forked = await forkSummarizedChat(sourceMessages, sourceTitle, {
         reason: "ram",
-        signal: gen.signal,
+        signal: sum.signal,
         lockSourcePrompting: true,
         sourceChat,
       });
@@ -1454,7 +1479,7 @@
         setStatus(`Low free RAM fallback failed: ${err.message}`, false);
       }
     } finally {
-      endGeneration(gen);
+      endSummarize(sum);
       hideSummarizeLoader();
       ramFallbackRunning = false;
       ramAbortRequested = false;
@@ -1942,6 +1967,7 @@
     }
 
     let sendSummarizeHeld = false;
+    let sum = null;
     try {
       setActivity("Preparing…");
       if (!(await acquireSummarizeLockWaiting())) {
@@ -1951,13 +1977,16 @@
         return;
       }
       sendSummarizeHeld = true;
+      sum = beginSummarize();
       let compressed;
       try {
         compressed = await compressHistoryIfNeeded(content, {
-          signal,
+          signal: sum.signal,
           reason: "auto",
         });
       } finally {
+        endSummarize(sum);
+        sum = null;
         if (sendSummarizeHeld) {
           endSummarizeLock();
           sendSummarizeHeld = false;
@@ -1984,6 +2013,10 @@
         }
       }
     } catch (err) {
+      if (sum) {
+        endSummarize(sum);
+        sum = null;
+      }
       if (sendSummarizeHeld) {
         endSummarizeLock();
         sendSummarizeHeld = false;
@@ -2031,6 +2064,7 @@
       }
       if (isContextLengthError(err.message)) {
         let retrySummarizeHeld = false;
+        let retrySum = null;
         try {
           if (!(await acquireSummarizeLockWaiting())) {
             throw new Error("Wait for summarize to finish");
@@ -2042,10 +2076,18 @@
             if (current.messages[current.messages.length - 1] === assistantMsg) {
               current.messages.pop();
             }
-            await compressHistoryIfNeeded("", { signal, reason: "auto" });
+            retrySum = beginSummarize();
+            await compressHistoryIfNeeded("", {
+              signal: retrySum.signal,
+              reason: "auto",
+            });
             hideSummarizeLoader();
             notifySummarizePhase("Summary ready.");
           } finally {
+            if (retrySum) {
+              endSummarize(retrySum);
+              retrySum = null;
+            }
             if (retrySummarizeHeld) {
               endSummarizeLock();
               retrySummarizeHeld = false;
@@ -2064,6 +2106,10 @@
           setActivity("Waiting for the model…", { transcript: false });
           await streamAssistantInto(assistantMsg, node, signal);
         } catch (retryErr) {
+          if (retrySum) {
+            endSummarize(retrySum);
+            retrySum = null;
+          }
           if (retrySummarizeHeld) {
             endSummarizeLock();
             retrySummarizeHeld = false;
