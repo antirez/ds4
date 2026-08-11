@@ -72,6 +72,45 @@ class AssembleContextTests(unittest.TestCase):
         self.assertLessEqual(len(ctx), 5000)
 
 
+class DeriveSearchQueryTests(unittest.TestCase):
+    def test_follow_up_uses_prior_topic(self) -> None:
+        messages = [
+            {"role": "user", "content": "Tell me about DeepSeek V4 Flash"},
+            {
+                "role": "assistant",
+                "content": "DeepSeek V4 Flash is a fast open-weight model.",
+            },
+        ]
+        q = wc.derive_search_query("What's the release date?", messages)
+        low = q.lower()
+        self.assertIn("deepseek", low)
+        self.assertTrue("release" in low or "date" in low)
+        self.assertLessEqual(len(q.split()), 12)
+
+    def test_self_contained_query_keeps_current_ask(self) -> None:
+        messages = [
+            {"role": "user", "content": "Earlier we talked about weather in Rome"},
+            {"role": "assistant", "content": "Rome is mild this week."},
+        ]
+        q = wc.derive_search_query("DeepSeek V4 Flash release date", messages)
+        low = q.lower()
+        self.assertIn("deepseek", low)
+        self.assertNotIn("rome", low)
+        self.assertNotIn("weather", low)
+
+    def test_multi_sentence_current_keeps_subject(self) -> None:
+        q = wc.derive_search_query(
+            "We discussed DeepSeek V4 Flash earlier. What's the launch window?",
+            [],
+        )
+        low = q.lower()
+        self.assertIn("deepseek", low)
+        self.assertTrue("launch" in low or "window" in low)
+        # Prefer a compact search phrase over dumping both sentences.
+        self.assertLessEqual(len(q.split()), 12)
+        self.assertNotIn("we discussed", low)
+
+
 class LiveSearchSmokeTests(unittest.TestCase):
     def test_live_search_returns_multiple_hits(self) -> None:
         try:

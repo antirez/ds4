@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ocr import OcrError, extract_attachment, tooling_status  # noqa: E402
 from tts import TtsError, synthesize_wav, tooling_status as tts_tooling_status  # noqa: E402
-from web_context import build_web_context  # noqa: E402
+from web_context import build_web_context, derive_search_query  # noqa: E402
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS) not in sys.path:
@@ -712,6 +712,24 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         if not isinstance(query, str) or not query.strip():
             self._send_error_json(HTTPStatus.BAD_REQUEST, "query required")
             return
+        messages = payload.get("messages")
+        recent: list[dict[str, str]] | None = None
+        if messages is not None:
+            if not isinstance(messages, list):
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "messages must be a list")
+                return
+            recent = []
+            for item in messages[-12:]:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                content = item.get("content")
+                if role not in ("user", "assistant") or not isinstance(content, str):
+                    continue
+                text = content.strip()
+                if not text:
+                    continue
+                recent.append({"role": role, "content": text[:2000]})
         max_results = payload.get("max_results", 8)
         max_fetch = payload.get("max_fetch", 5)
         fetch_pages = payload.get("fetch_pages", True)
@@ -724,9 +742,13 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         if not isinstance(fetch_pages, bool):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "fetch_pages must be a boolean")
             return
+        search_query = derive_search_query(query.strip(), recent)
+        if not search_query:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "query required")
+            return
         try:
             result = build_web_context(
-                query.strip(),
+                search_query,
                 max_results=max_results,
                 max_fetch=max_fetch,
                 fetch_pages=fetch_pages,

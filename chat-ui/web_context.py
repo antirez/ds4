@@ -313,6 +313,185 @@ def _clip(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+_WEB_BLOCK_RE = re.compile(
+    r"----- web context \(.*?----- end web context -----",
+    re.DOTALL | re.IGNORECASE,
+)
+_ATTACH_BLOCK_RE = re.compile(
+    r"----- attached .*?----- end (?:file: )?[^\n-]+ -----",
+    re.DOTALL | re.IGNORECASE,
+)
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+./-]{1,}|[0-9]+(?:\.[0-9]+)?")
+_REF_START_RE = re.compile(
+    r"^(?:what about|how about|and(?: then)?|also|same for|same with|"
+    r"what(?:'s| is| are)? (?:the|its|their)|when (?:was|is|did) (?:it|that|this)|"
+    r"tell me more|more (?:on|about)|continue|follow ?up)\b",
+    re.IGNORECASE,
+)
+_PRONOUN_RE = re.compile(
+    r"\b(?:it|its|that|this|those|these|they|them|their|same|above|previous)\b",
+    re.IGNORECASE,
+)
+_LEAD_IN_RE = re.compile(
+    r"^(?:please |can you |could you |would you |tell me |search (?:for |the web for )?|"
+    r"look up |find (?:me )?|google |web search )\s*",
+    re.IGNORECASE,
+)
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "if", "then", "so", "to", "of", "in",
+        "on", "for", "from", "with", "as", "at", "by", "into", "about", "over",
+        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does",
+        "did", "doing", "have", "has", "had", "having", "can", "could", "would",
+        "should", "may", "might", "will", "shall", "not", "no", "yes", "just",
+        "than", "that", "this", "these", "those", "it", "its", "they", "them",
+        "their", "we", "you", "your", "i", "me", "my", "our", "ours", "what",
+        "which", "who", "whom", "when", "where", "why", "how", "there", "here",
+        "also", "very", "really", "please", "tell", "give", "show", "find",
+        "look", "search", "web", "google", "info", "information", "something",
+        "anything", "everything", "more", "some", "any", "all", "same", "again",
+        "still", "already", "maybe", "perhaps", "like", "know", "think", "want",
+        "need", "get", "got", "make", "made", "using", "use", "used", "via",
+        "per", "vs", "etc", "ok", "okay", "thanks", "thank", "hi", "hello",
+        "hey", "conversation", "summary", "assistant", "user",
+        "discussed", "discuss", "earlier", "previously", "mentioned",
+        "talking", "talk", "talked", "above", "before",
+    }
+)
+
+
+def _plain_chat_text(content: str) -> str:
+    """Drop injected web/attachment blocks; keep the human-readable chat text."""
+    text = content or ""
+    text = _WEB_BLOCK_RE.sub(" ", text)
+    text = _ATTACH_BLOCK_RE.sub(" ", text)
+    text = text.replace("[conversation summary]", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _content_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for tok in _TOKEN_RE.findall(text or ""):
+        low = tok.lower().strip("._/-")
+        if not low or low in _STOPWORDS:
+            continue
+        if len(low) < 2 and not low.isdigit():
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        terms.append(tok)
+    return terms
+
+
+def _needs_context(current: str, intent_terms: list[str]) -> bool:
+    stripped = (current or "").strip()
+    if not stripped:
+        return True
+    if len(intent_terms) < 3:
+        return True
+    if _REF_START_RE.search(stripped):
+        return True
+    pronouns = len(_PRONOUN_RE.findall(stripped))
+    words = max(1, len(stripped.split()))
+    if pronouns >= 1 and len(intent_terms) < 5:
+        return True
+    if pronouns / words >= 0.2:
+        return True
+    return False
+
+
+def _topic_terms(messages: list[dict[str, Any]], *, limit: int = 6) -> list[str]:
+    """Collect distinctive terms from recent turns, newest first."""
+    topic: list[str] = []
+    seen: set[str] = set()
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        plain = _plain_chat_text(str(msg.get("content") or ""))
+        if not plain:
+            continue
+        # User turns carry the ask; assistant turns help name the subject.
+        weight_cap = 5 if role == "user" else 3
+        added = 0
+        for term in _content_terms(plain):
+            low = term.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            topic.append(term)
+            added += 1
+            if len(topic) >= limit or added >= weight_cap:
+                break
+        if len(topic) >= limit:
+            break
+    # Newest substantive turn first, terms kept in natural phrase order.
+    return topic
+
+
+def _join_query_terms(terms: list[str], *, max_words: int) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        low = term.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(term)
+        if len(out) >= max_words:
+            break
+    return " ".join(out).strip()
+
+
+def derive_search_query(
+    current: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    max_words: int = 12,
+) -> str:
+    """Build a short DuckDuckGo query from the current ask plus recent chat.
+
+    Uses conversation topic when the latest message is referential or thin.
+    Does not dump the transcript; prefers keyword/phrase form.
+    """
+    plain = _plain_chat_text(current)
+    plain = _LEAD_IN_RE.sub("", plain).strip()
+    plain = re.sub(r"[?！？]+$", "", plain).strip()
+    if not plain:
+        return ""
+
+    intent = _content_terms(plain)
+    recent = list(messages or [])[-12:]
+
+    if not _needs_context(plain, intent):
+        # Already self-contained: keep a short phrase, or keywordize longer prose.
+        words = plain.split()
+        multi_sentence = len(re.findall(r"[.!?]+", plain)) >= 1
+        if (
+            not multi_sentence
+            and len(words) <= max_words
+            and len(plain) <= 120
+        ):
+            return plain
+        return _join_query_terms(intent, max_words=max_words) or plain[:120].strip()
+
+    topic = _topic_terms(recent, limit=6)
+    topic_fresh = [t for t in topic if t.lower() not in {x.lower() for x in intent}]
+    # Lead with subject from prior turns, then the current intent words.
+    merged = topic_fresh[:4] + intent
+    q = _join_query_terms(merged, max_words=max_words)
+    if q:
+        return q
+    if intent:
+        return _join_query_terms(intent, max_words=max_words)
+    return plain[:120].strip()
+
+
 def assemble_context(
     query: str,
     hits: list[SearchHit],
