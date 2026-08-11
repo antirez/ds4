@@ -45,7 +45,9 @@ class RamPressureLatchTests(unittest.TestCase):
 
     def test_evaluate_transitions(self) -> None:
         self.assertEqual(sc.evaluate_ram_pressure(5.9, False), "trigger")
+        self.assertEqual(sc.evaluate_ram_pressure(6.0, False), "trigger")
         self.assertEqual(sc.evaluate_ram_pressure(5.9, True), "hold")
+        self.assertEqual(sc.evaluate_ram_pressure(6.0, True), "hold")
         self.assertEqual(sc.evaluate_ram_pressure(6.5, True), "idle")
         self.assertEqual(sc.evaluate_ram_pressure(7.1, True), "clear")
         self.assertEqual(sc.evaluate_ram_pressure(8.0, False), "idle")

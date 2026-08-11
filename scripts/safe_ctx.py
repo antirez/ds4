@@ -27,7 +27,7 @@ KV_GIB_PER_MTOKEN = 26.0
 # than under-counting; override with --model-gib / --resident-factor if needed.
 DEFAULT_RESIDENT_FACTOR = 1.0
 DEFAULT_RESERVE_GIB = 6.0
-# Chat-ui low-RAM fallback: trigger when free < reserve, clear latch a bit above.
+# Chat-ui low-RAM fallback: trigger when free <= reserve, clear latch a bit above.
 RAM_PRESSURE_TRIGGER_GIB = DEFAULT_RESERVE_GIB
 RAM_PRESSURE_CLEAR_GIB = 7.0
 MODEL_MAX_CTX = 1_000_000
@@ -110,10 +110,10 @@ def evaluate_ram_pressure(
     """Latch helper for continuous free-RAM monitoring.
 
     Returns one of: trigger, hold, clear, idle.
-    Trigger when free drops below trigger_gib while not latched; stay held until
+    Trigger when free is at or below trigger_gib while not latched; stay held until
     free rises above clear_gib (hysteresis), then clear.
     """
-    if free_gib < trigger_gib:
+    if free_gib <= trigger_gib:
         return "hold" if latched else "trigger"
     if latched and free_gib > clear_gib:
         return "clear"
