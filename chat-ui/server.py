@@ -239,7 +239,7 @@ def system_ram_status() -> dict[str, Any]:
     pct = (100.0 * used / total) if total else 0.0
     gib = 1024**3
     # free_bytes = total - used (macOS used ≈ Activity Monitor Memory Used).
-    # Chat-ui client treats free < safe_ctx reserve (6 GiB) as pressure.
+    # Chat-ui client treats free <= safe_ctx reserve (6 GiB) as pressure.
     return {
         "available": True,
         "total_bytes": int(total),
