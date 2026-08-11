@@ -6714,3 +6714,111 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// DSpark draft proposal: fused markov bias + argmax over one base-logits
+// row. Stage one dequants the rank<=256 markov state from the previous
+// token's Q8 row and grid-strides the vocab keeping one best pair per
+// threadgroup; stage two folds the partials into the packed
+// (monotonic-value, ~index) key the session consumes. Ties resolve to the
+// smaller index, matching the CPU argmax.
+kernel void kernel_dspark_markov_argmax_stage1_f32(
+        device const float *logits      [[buffer(0)]],
+        device const uchar *w1_row      [[buffer(1)]],
+        device const uchar *w2          [[buffer(2)]],
+        device float2      *partials    [[buffer(3)]],
+        constant uint      &vocab       [[buffer(4)]],
+        constant uint      &rank_blocks [[buffer(5)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid  [[thread_position_in_threadgroup]],
+        uint ntg  [[threadgroups_per_grid]],
+        uint nth  [[threads_per_threadgroup]]) {
+    threadgroup float state[256];
+    if (tid < rank_blocks * 32u) {
+        const uint b = tid >> 5, k = tid & 31u;
+        device const uchar *blk = w1_row + (ulong)b * 34u;
+        const float d = float(*(device const half *)blk);
+        state[tid] = d * float(((device const char *)(blk + 2))[k]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_v = -INFINITY;
+    uint best_i = 0u;
+    for (uint i = tgid * nth + tid; i < vocab; i += ntg * nth) {
+        device const uchar *row = w2 + (ulong)i * rank_blocks * 34u;
+        float acc = 0.0f;
+        for (uint b = 0; b < rank_blocks; b++) {
+            device const uchar *blk = row + (ulong)b * 34u;
+            const float d = float(*(device const half *)blk);
+            device const char *q = (device const char *)(blk + 2);
+            float s = 0.0f;
+            FOR_UNROLL (uint k = 0; k < 32u; k++) {
+                s += float(q[k]) * state[b * 32u + k];
+            }
+            acc += d * s;
+        }
+        const float v = logits[i] + acc;
+        if (v > best_v || (v == best_v && i < best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+
+    threadgroup float vals[256];
+    threadgroup uint  idxs[256];
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = vals[tid + stride];
+            const uint  oi = idxs[tid + stride];
+            if (ov > vals[tid] || (ov == vals[tid] && oi < idxs[tid])) {
+                vals[tid] = ov;
+                idxs[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        partials[tgid] = float2(vals[0], as_type<float>(idxs[0]));
+    }
+}
+
+kernel void kernel_dspark_markov_argmax_stage2_f32(
+        device const float2 *partials [[buffer(0)]],
+        device ulong        *out_key  [[buffer(1)]],
+        constant uint       &count    [[buffer(2)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    threadgroup float vals[128];
+    threadgroup uint  idxs[128];
+    float best_v = -INFINITY;
+    uint best_i = 0u;
+    for (uint i = tid; i < count; i += nth) {
+        const float v = partials[i].x;
+        const uint ix = as_type<uint>(partials[i].y);
+        if (v > best_v || (v == best_v && ix < best_i)) {
+            best_v = v;
+            best_i = ix;
+        }
+    }
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = vals[tid + stride];
+            const uint  oi = idxs[tid + stride];
+            if (ov > vals[tid] || (ov == vals[tid] && oi < idxs[tid])) {
+                vals[tid] = ov;
+                idxs[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const uint f = as_type<uint>(vals[0]);
+        const uint fkey = (f & 0x80000000u) ? ~f : (f | 0x80000000u);
+        out_key[0] = ((ulong)fkey << 32) | (ulong)(~idxs[0] & 0xffffffffu);
+    }
+}

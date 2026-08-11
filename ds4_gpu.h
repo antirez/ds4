@@ -913,6 +913,46 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
         float                 beta_slow,
         float                 rms_eps);
 
+/* Batch-path M5 fusion: replay the per-token compressor state-update loop
+ * (speculative verify and unaligned prefill chunks) in one sequential
+ * single-threadgroup dispatch: store, and per emitted row pool + norm +
+ * rope + quantize (+ F16 commit for attention) + ratio-4 shift, plus the
+ * speculative prefix state captures.  Bit-exact vs the per-token dispatch
+ * chain.  Returns 1 when fused, 0 to fall back to the host loop. */
+int ds4_gpu_dsv4_comp_rows_update_tensor(
+        const ds4_gpu_tensor *batch_kv,
+        const ds4_gpu_tensor *batch_sc,
+        uint32_t              row_stride,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *work,
+        ds4_gpu_tensor       *comp_cache,
+        uint32_t              comp_row0,
+        uint64_t              cache_row_bytes,
+        int                   out_f16,
+        int                   quant_mode,
+        ds4_gpu_tensor       *prefix_kv,
+        ds4_gpu_tensor       *prefix_score,
+        uint32_t              capture_slots,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ape_offset,
+        uint32_t              ape_type,
+        uint64_t              norm_offset,
+        uint32_t              head_dim,
+        uint32_t              ratio,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              n_rot,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 rms_eps);
+
 /* Decode-only M5 fusion: q_a/kv Q8 pair projection + F16 quad compressor
  * projection/store in one dispatch.  Bit-exact vs the separate dispatches.
  * Returns 1 when fused, 0 to fall back, -1 on error. */

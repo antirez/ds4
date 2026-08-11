@@ -430,30 +430,29 @@ kernel void kernel_dsv4_compressor_exact_softmax_product_ratio4(
     (void)softmax_scratch;
 }
 
-// Exact one-dispatch ratio-4 decode pool. This specializes the three-dispatch
-// pack -> exact softmax/product -> sum_rows chain above without changing any
-// floating-point operation or reduction topology. The normalized softmax and
-// product are still materialized and volatile-reloaded through device memory.
-// The two simd_sum calls in the final reduction execute under an eight-lane
-// active mask, exactly matching kernel_sum_rows_f32_f32's original TG8.
-kernel void kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml(
-        constant ds4_metal_args_dsv4_compressor_pack_ratio4 & args,
+// Shared body of the exact ratio-4 decode pool below: one state column per
+// 32-lane cohort. Extracted so the batch-path fused kernel in dsv4_rope.metal
+// (kernel_dsv4_comp_rows_update_f32) runs the same source per column with its
+// own simdgroup playing the standalone kernel's 32-thread threadgroup. All
+// simd_max/simd_sum active-lane masks, the volatile device store/reload
+// boundaries, and the eight-lane sum_rows topology are preserved verbatim.
+// `sum_scratch` must be a 32-float threadgroup region private to the calling
+// cohort; the threadgroup barriers inside are a superset of the standalone
+// kernel's (they span the whole calling threadgroup) which only strengthens
+// ordering and changes no arithmetic.
+static void ds4_dsv4_compressor_exact_pool_ratio4_col(
         device const float * state_kv,
         device const float * state_score,
         device       float * softmax,
         device       float * product,
         device       float * dst,
-        threadgroup  float * sum_scratch [[threadgroup(0)]],
-        uint col [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]]) {
-    if (col >= args.head_dim || args.n_comp != 1u ||
-        args.n_threads != 32u) {
-        return;
-    }
-
-    const uint64_t state_row_stride = 2ull * args.head_dim;
-    const float scale = (float)args.replay;
-    const float zero = (float)(args.n_comp - 1u);
+        threadgroup  float * sum_scratch,
+        uint head_dim,
+        float scale,
+        float zero,
+        uint col,
+        uint tid) {
+    const uint64_t state_row_stride = 2ull * head_dim;
 
     // Match the packed float4 ownership: lane 0 owns rows 0..3 and lane 1
     // rows 4..7. The gather itself is an integer-addressed bit-preserving load.
@@ -463,7 +462,7 @@ kernel void kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml(
         for (uint j = 0u; j < 4u; ++j) {
             const uint row = row0 + j;
             const uint64_t src = (uint64_t)row * state_row_stride +
-                                 (row >= 4u ? args.head_dim : 0u) + col;
+                                 (row >= 4u ? head_dim : 0u) + col;
             score_values[j] = state_score[src];
         }
     }
@@ -506,7 +505,7 @@ kernel void kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml(
     if (tid < 4u) {
         for (uint i0 = tid; i0 < 8u; i0 += 4u) {
             const uint64_t src = (uint64_t)i0 * state_row_stride +
-                                 (i0 >= 4u ? args.head_dim : 0u) + col;
+                                 (i0 >= 4u ? head_dim : 0u) + col;
             float value = state_kv[src];
             value *= reloaded_softmax[i0];
             product_row[i0] = value;
@@ -539,6 +538,40 @@ kernel void kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml(
             dst[col] = row_sum;
         }
     }
+}
+
+// Exact one-dispatch ratio-4 decode pool. This specializes the three-dispatch
+// pack -> exact softmax/product -> sum_rows chain above without changing any
+// floating-point operation or reduction topology. The normalized softmax and
+// product are still materialized and volatile-reloaded through device memory.
+// The two simd_sum calls in the final reduction execute under an eight-lane
+// active mask, exactly matching kernel_sum_rows_f32_f32's original TG8.
+kernel void kernel_dsv4_compressor_exact_pool_ratio4_decode_ggml(
+        constant ds4_metal_args_dsv4_compressor_pack_ratio4 & args,
+        device const float * state_kv,
+        device const float * state_score,
+        device       float * softmax,
+        device       float * product,
+        device       float * dst,
+        threadgroup  float * sum_scratch [[threadgroup(0)]],
+        uint col [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (col >= args.head_dim || args.n_comp != 1u ||
+        args.n_threads != 32u) {
+        return;
+    }
+
+    ds4_dsv4_compressor_exact_pool_ratio4_col(state_kv,
+                                              state_score,
+                                              softmax,
+                                              product,
+                                              dst,
+                                              sum_scratch,
+                                              args.head_dim,
+                                              (float)args.replay,
+                                              (float)(args.n_comp - 1u),
+                                              col,
+                                              tid);
 }
 
 // Ratio-4 compression keeps two 4-row halves of recurrent state. After an
