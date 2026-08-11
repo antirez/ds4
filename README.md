@@ -1036,23 +1036,31 @@ Toggle **Read aloud** to have new assistant answers spoken locally after they
 finish streaming. Each message also has a **speaker** control (top-right, next
 to Copy) to read that box on demand — useful for older turns or when the
 browser blocks autoplay. The UI calls `/api/tts`, which synthesizes WAV on the
-machine running chat-ui — by default with macOS `say` + `afconvert` (no install,
-no API key). Reasoning blocks are not spoken; only the final answer text is.
-Use **Stop** to interrupt playback. Optional neural voices: install
-[Piper](https://github.com/rhasspy/piper) and set `DS4_PIPER_MODEL` to a local
-`.onnx` voice file before starting chat-ui; otherwise it falls back to `say`.
-Smoke-test without the UI:
+machine running chat-ui. **Piper** (local neural TTS, no API key) is preferred
+when installed; otherwise it falls back to macOS `say` + `afconvert`. Reasoning
+blocks are not spoken; only the final answer text is. Use **Stop** to interrupt
+playback.
+
+Install Piper and the default English voice (`en_US-lessac-medium`) under
+`~/.ds4/piper`:
+
+```sh
+python3 chat-ui/install_piper.py
+# or: make install-piper
+```
+
+Overrides: `DS4_PIPER_BIN`, `DS4_PIPER_MODEL`, `DS4_PIPER_ROOT`. Smoke-test:
 
 ```sh
 python3 chat-ui/tts.py "Hello from DwarfStar."
-# writes ./tts-smoke.wav
+# writes ./tts-smoke.wav ; expect engine=piper after install
 python3 -m unittest discover -s chat-ui/tests -v
 # or: make test-chat-ui
 ```
 
-Restart chat-ui after pulling TTS changes so `/api/tts` is registered (an older
-chat-ui process will 404 that route). Then hard-refresh the browser
-(Cmd+Shift+R) so CSS/JS reload.
+Restart chat-ui after installing Piper or pulling TTS changes so `/api/tts` /
+engine discovery refresh (an older chat-ui process may 404 that route). Then
+hard-refresh the browser (Cmd+Shift+R) so CSS/JS reload.
 
 This UI store is separate from `ds4-agent` KV sessions in `~/.ds4/kvcache`
 (`/save`, `/list`, `/switch`).

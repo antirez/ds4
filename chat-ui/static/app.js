@@ -887,7 +887,7 @@
         } else {
           els.ttsToggle.disabled = false;
           els.ttsToggle.title =
-            "Read assistant answers aloud with local TTS (macOS say, or Piper if installed)";
+            "Read assistant answers aloud (Piper preferred; macOS say fallback)";
         }
       }
       if (els.composerNote) {
@@ -898,7 +898,7 @@
         const ttsBit = ttsAvailable
           ? " Toggle Read aloud for new answers, or use the speaker icon on any message."
           : tts
-            ? " Read aloud needs macOS say+afconvert (or Piper)."
+            ? " Read aloud needs Piper (make install-piper) or macOS say+afconvert."
             : " Restart chat-ui to enable Read aloud (/api/tts).";
         if (ocr && !ocr.images) {
           els.composerNote.textContent =

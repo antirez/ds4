@@ -60,6 +60,15 @@ class SynthesizeTests(unittest.TestCase):
         status = tts.tooling_status(self.tools)
         self.assertTrue(status["available"])
         self.assertEqual(status["engine"], self.tools.engine)
+        self.assertEqual(status["prefer"], "piper")
+
+    def test_prefers_piper_when_available(self) -> None:
+        tools = tts.discover_tools()
+        if not (tools.piper and tools.piper_model):
+            self.skipTest("piper not installed locally")
+        wav, engine = tts.synthesize_wav("Prefer Piper over macOS say.", tools=tools)
+        self.assertEqual(engine, "piper")
+        self.assertEqual(wav[:4], b"RIFF")
 
 
 class ApiTtsIntegrationTests(unittest.TestCase):
