@@ -1,0 +1,70 @@
+---
+description: Distinctive cooler desktop styling for ds4 local LLM chat-ui (rail/stage/transcript/composer)
+globs: chat-ui/static/**/*.{css,html,js}
+alwaysApply: false
+---
+
+# Desktop web styling (ds4 chat-ui)
+
+Local desktop web app — not mobile, not a marketing landing page. Restyle toward a **cool, atmospheric tool UI** with clear hierarchy and little chrome. Prefer CSS custom properties in `styles.css`; keep HTML structure (`shell` / `rail` / `stage` / `transcript` / `composer`) unless a layout change is required for clarity.
+
+## Composition
+
+- One job per region: rail = chats; stage-head = title/actions; transcript = messages; composer = input.
+- Whitespace separates; do not stack nested gray boxes, thin borders on every tile, or card-in-card.
+- Cards only when they hold interaction (composer, attach chips, controls). Message text should stay calm and readable — not gamified chrome.
+- Atmosphere on the canvas is welcome (subtle gradients, grain, depth). Avoid flat single-color fills as the whole look.
+
+## Surfaces & controls
+
+- Primary actions: tangible weight via **broad radii** (~12–16px) and **offset bottom borders**, not muddy multi-layer shadows or glow.
+- Press/hover: short CSS transition; optional `translateY` that collapses the offset border on `:active`.
+- Group only when needed with one quiet surface — not a bento of bordered panels.
+- Icons/marks: purposeful only (brand mark, attach, status). No decorative emoji chrome or icon spam.
+
+## Tokens & type
+
+Define roles as CSS variables (extend existing `:root` tokens; do not scatter one-off hex):
+
+| Role | Intent |
+|------|--------|
+| canvas / ink | deep cool base |
+| text / muted | high-contrast body + secondary |
+| accent | sharp cool or warm accent (teal/amber family OK) |
+| danger | semantic errors only |
+| radius / fonts | shared geometry and type |
+
+- Typography: expressive display + mono for code/meta. Prefer **weight over size jumps**.
+- Do **not** default to Inter, Roboto, Arial, or bare `system-ui` stacks.
+
+## Motion
+
+- Prefer CSS `transition` / limited `@keyframes` for state and press feedback.
+- A few intentional motions beat constant animation. Respect `prefers-reduced-motion: reduce`.
+- No infinite glow pulses, shimmer spam, or decorative particle noise that competes with reading.
+
+## Hard avoids (AI-generic / cliché)
+
+- Purple-on-white or purple→indigo gradient themes
+- Warm cream canvas near `#F4F1EA` with terracotta + display serif
+- Broadsheet look: hairline rules, zero radius, dense newspaper columns
+- Soft neumorphism, heavy blur/vibrancy stacks, rounded-full pill clusters
+- Generic “AI chat” glow, badge stickers, and multi-shadow card grids
+
+## Before restyling
+
+1. Note current hierarchy and token usage in `styles.css` / `index.html`.
+2. List what to remove (borders, nested cards, redundant chrome) vs what needs weight (primary CTAs, composer).
+3. Map colors to semantic variables; keep light/dark coherent if both exist.
+4. Verify desktop widths (rail + stage) and readable transcript contrast.
+
+## Checklist
+
+```
+- [ ] Regions stay single-purpose; whitespace over nested boxes
+- [ ] Controls use tokenized color/radius; offset depth on primary actions
+- [ ] Type pairing is distinctive; no Inter/Roboto/Arial defaults
+- [ ] Atmosphere without flat-only OR glow/pill spam
+- [ ] Motion is purposeful; reduced-motion honored
+- [ ] Hard avoids above not introduced
+```
