@@ -1321,7 +1321,13 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2(
     }
 }
 
-kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
+// COMB_TGS selects how the 16 comb rows spread over producer groups: 4 keeps
+// the shipped cluster2 packing (groups 2..5, both clusters live); 8 gives
+// every comb group one live NR0=2 cluster (groups 2..9, grid 6 -> 10).
+// Groups 0/1 and every per-row lane traversal, reduce tree and epilogue are
+// identical in both shapes, so outputs are bit-identical across COMB_TGS.
+template<short COMB_TGS>
+void kernel_dsv4_hc_producer_pre_norm_impl(
         constant ds4_metal_args_hc_norm_mix & args,
         constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
         device const char  * x,
@@ -1334,10 +1340,10 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
         device const char  * norm_weight,
         device       char  * norm_dst,
         device atomic_uint * completion,
-        threadgroup  char  * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     constexpr short NSG_CLUSTER = 8;
     constexpr short NCLUSTER = 2;
     constexpr short NSG_TOTAL = NSG_CLUSTER * NCLUSTER;
@@ -1380,7 +1386,11 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
     const short cluster = sgitg / NSG_CLUSTER;
     const short local_sg = sgitg - cluster*NSG_CLUSTER;
     const int nb = args.n/NB;
-    const int r0 = (int)tgpig.x*(NCLUSTER*NR0) + cluster*NR0;
+    const bool cluster_active =
+        COMB_TGS == 4 || tgpig.x < 2 || cluster == 0;
+    const int r0 = (COMB_TGS == 4 || tgpig.x < 2)
+        ? (int)tgpig.x*(NCLUSTER*NR0) + cluster*NR0
+        : 2*(NCLUSTER*NR0) + ((int)tgpig.x - 2)*NR0;
 
     device const half4 *ax4[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
@@ -1392,7 +1402,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
     const short ix = tiisg/(NW/NF);
     const short il = tiisg%(NW/NF);
     const int ib0 = local_sg*NF + ix;
-    for (int ib = ib0; ib < nb; ib += NSG_CLUSTER*NF) {
+    for (int ib = ib0; cluster_active && ib < nb; ib += NSG_CLUSTER*NF) {
         float4 yl4[NF4];
         FOR_UNROLL (short i = 0; i < NF4; ++i) {
             yl4[i] = x4[(ib*NB + il*NF)/4 + i]*scale;
@@ -1429,7 +1439,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
     if (local_sg == 0) {
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
             const float tot = simd_sum(cluster_shmem[row][tiisg]);
-            if (tiisg == 0 && r0 + row < args.out_dim) {
+            if (tiisg == 0 && cluster_active && r0 + row < args.out_dim) {
                 mixes_f32[r0 + row] = tot;
             }
         }
@@ -1528,7 +1538,7 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
 
     const uint old = atomic_fetch_add_explicit(
         completion, 1u, memory_order_relaxed);
-    if (old + 1u != 4u) {
+    if (old + 1u != (uint)COMB_TGS) {
         return;
     }
     atomic_thread_fence(mem_flags::mem_device,
@@ -1541,4 +1551,39 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
                         memory_order_seq_cst,
                         thread_scope_device);
     atomic_store_explicit(completion, 0u, memory_order_relaxed);
+}
+
+#define DS4_HC_PRODUCER_PRE_NORM_PARAMS \
+        constant ds4_metal_args_hc_norm_mix & args, \
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args, \
+        device const char  * x, \
+        device const char  * weight, \
+        device       char  * dst, \
+        device const float * hc_scale, \
+        device const float * hc_base, \
+        device       char  * split, \
+        device       char  * collapse_dst, \
+        device const char  * norm_weight, \
+        device       char  * norm_dst, \
+        device atomic_uint * completion, \
+        threadgroup  char  * shmem [[threadgroup(0)]], \
+        uint3  tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]
+
+#define DS4_HC_PRODUCER_PRE_NORM_ARGS \
+        args, split_args, x, weight, dst, hc_scale, hc_base, split, \
+        collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, \
+        tiisg, sgitg
+
+[[host_name("kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm")]]
+kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
+        DS4_HC_PRODUCER_PRE_NORM_PARAMS) {
+    kernel_dsv4_hc_producer_pre_norm_impl<4>(DS4_HC_PRODUCER_PRE_NORM_ARGS);
+}
+
+[[host_name("kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm_spread")]]
+kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm_spread(
+        DS4_HC_PRODUCER_PRE_NORM_PARAMS) {
+    kernel_dsv4_hc_producer_pre_norm_impl<8>(DS4_HC_PRODUCER_PRE_NORM_ARGS);
 }

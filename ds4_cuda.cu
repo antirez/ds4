@@ -15877,6 +15877,76 @@ extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
     return 0;
 }
 
+/* Metal-only batch-path compressor rows-update fusion; CUDA keeps the
+ * per-token host loop. */
+extern "C" int ds4_gpu_dsv4_comp_rows_update_tensor(
+        const ds4_gpu_tensor *batch_kv,
+        const ds4_gpu_tensor *batch_sc,
+        uint32_t              row_stride,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *work,
+        ds4_gpu_tensor       *comp_cache,
+        uint32_t              comp_row0,
+        uint64_t              cache_row_bytes,
+        int                   out_f16,
+        int                   quant_mode,
+        ds4_gpu_tensor       *prefix_kv,
+        ds4_gpu_tensor       *prefix_score,
+        uint32_t              capture_slots,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ape_offset,
+        uint32_t              ape_type,
+        uint64_t              norm_offset,
+        uint32_t              head_dim,
+        uint32_t              ratio,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              n_rot,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 rms_eps) {
+    (void)batch_kv;
+    (void)batch_sc;
+    (void)row_stride;
+    (void)state_kv;
+    (void)state_score;
+    (void)work;
+    (void)comp_cache;
+    (void)comp_row0;
+    (void)cache_row_bytes;
+    (void)out_f16;
+    (void)quant_mode;
+    (void)prefix_kv;
+    (void)prefix_score;
+    (void)capture_slots;
+    (void)model_map;
+    (void)model_size;
+    (void)ape_offset;
+    (void)ape_type;
+    (void)norm_offset;
+    (void)head_dim;
+    (void)ratio;
+    (void)pos0;
+    (void)n_tokens;
+    (void)n_rot;
+    (void)n_ctx_orig;
+    (void)freq_base;
+    (void)freq_scale;
+    (void)ext_factor;
+    (void)attn_factor;
+    (void)beta_fast;
+    (void)beta_slow;
+    (void)rms_eps;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;

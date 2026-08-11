@@ -1213,6 +1213,382 @@ static void test_metal_f16_compressor_pair_state_store_exact(void) {
         512, 128, 255, 1, 43, false);
 }
 
+/* Bit-exact check for the fused batch-path compressor rows update
+ * (ds4_gpu_dsv4_comp_rows_update_tensor): replays the exact per-token wrapper
+ * chain the ds4.c fallback loop issues (compressor update with the decode
+ * pool, per-emit FP8/QAT quantize, F16 commit for the attention layout, and
+ * the speculative prefix state capture copies) on one buffer set, runs the
+ * single fused dispatch on an identical second set, and compares every output
+ * buffer bit for bit. */
+static void test_metal_comp_rows_update_exact_case(
+        uint32_t head_dim,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t ape_type,
+        int      out_f16,
+        uint32_t capture_slots,
+        uint32_t seed) {
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint32_t n_rot = 64u;
+    const int quant_mode = out_f16 ? 0 : 1;
+    const uint32_t n_emit = (pos0 + n_tokens) / ratio - pos0 / ratio;
+    const uint32_t comp_row0 = pos0 / ratio;
+    const uint32_t cache_rows = comp_row0 + n_emit + 1u;
+    const uint32_t capture_eff =
+        capture_slots < n_tokens - 1u ? capture_slots : n_tokens - 1u;
+    const uint32_t n_ctx_orig = (seed & 1u) ? 4096u : 0u;
+    const float ext_factor = (seed & 1u) ? 1.0f : 0.0f;
+    const float attn_factor = (seed & 1u) ? 1.03f : 1.0f;
+
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t ape_elem_bytes = ape_type == 1u ? 2u : 4u;
+    const uint64_t ape_bytes = (uint64_t)ratio * width * ape_elem_bytes;
+    const uint64_t norm_offset = test_round_up_u64(ape_bytes, page);
+    const uint64_t model_bytes = test_round_up_u64(
+        norm_offset + (uint64_t)head_dim * sizeof(float), page);
+
+    const uint64_t batch_count = (uint64_t)n_tokens * width;
+    const uint64_t batch_bytes = batch_count * sizeof(float);
+    const uint64_t state_count = (uint64_t)state_rows * width;
+    const uint64_t state_bytes = state_count * sizeof(float);
+    const uint64_t cache_elem = out_f16 ? sizeof(uint16_t) : sizeof(float);
+    const uint64_t cache_count = (uint64_t)cache_rows * head_dim;
+    const uint64_t cache_bytes = cache_count * cache_elem;
+    const uint64_t stage_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t prefix_count =
+        (uint64_t)(capture_eff ? capture_eff : 1u) * state_count;
+    const uint64_t prefix_bytes = prefix_count * sizeof(float);
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page,
+                               (size_t)model_bytes) == 0);
+    ds4_gpu_tensor *batch_kv = ds4_gpu_tensor_alloc(batch_bytes);
+    ds4_gpu_tensor *batch_sc = ds4_gpu_tensor_alloc(batch_bytes);
+    ds4_gpu_tensor *ref_state_kv = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *ref_state_sc = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *fus_state_kv = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *fus_state_sc = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *ref_stage = ds4_gpu_tensor_alloc(stage_bytes);
+    ds4_gpu_tensor *fus_stage = ds4_gpu_tensor_alloc(stage_bytes);
+    ds4_gpu_tensor *ref_cache = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *fus_cache = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *ref_prefix_kv = ds4_gpu_tensor_alloc(prefix_bytes);
+    ds4_gpu_tensor *ref_prefix_sc = ds4_gpu_tensor_alloc(prefix_bytes);
+    ds4_gpu_tensor *fus_prefix_kv = ds4_gpu_tensor_alloc(prefix_bytes);
+    ds4_gpu_tensor *fus_prefix_sc = ds4_gpu_tensor_alloc(prefix_bytes);
+
+    float *host_a = malloc((size_t)batch_bytes);
+    float *host_b = malloc((size_t)batch_bytes);
+    float *ref_state_host = malloc((size_t)state_bytes);
+    float *fus_state_host = malloc((size_t)state_bytes);
+    uint8_t *ref_cache_host = malloc((size_t)cache_bytes);
+    uint8_t *fus_cache_host = malloc((size_t)cache_bytes);
+    float *ref_prefix_host = malloc((size_t)prefix_bytes);
+    float *fus_prefix_host = malloc((size_t)prefix_bytes);
+    float *ref_stage_host = malloc((size_t)stage_bytes);
+    float *fus_stage_host = malloc((size_t)stage_bytes);
+
+    const bool allocated = model_raw && batch_kv && batch_sc &&
+        ref_state_kv && ref_state_sc && fus_state_kv && fus_state_sc &&
+        ref_stage && fus_stage && ref_cache && fus_cache &&
+        ref_prefix_kv && ref_prefix_sc && fus_prefix_kv && fus_prefix_sc &&
+        host_a && host_b && ref_state_host && fus_state_host &&
+        ref_cache_host && fus_cache_host && ref_prefix_host &&
+        fus_prefix_host && ref_stage_host && fus_stage_host;
+    TEST_ASSERT(allocated);
+
+    size_t state_kv_mm = 0, state_sc_mm = 0, cache_mm = 0;
+    size_t prefix_kv_mm = 0, prefix_sc_mm = 0, stage_mm = 0;
+
+    if (allocated) {
+        memset(model_raw, 0, (size_t)model_bytes);
+        if (ape_type == 1u) {
+            uint16_t *ape = (uint16_t *)model_raw;
+            for (uint64_t i = 0; i < (uint64_t)ratio * width; i++) {
+                const int value = (int)((i * 13u + (i ^ (i >> 3u)) * 7u +
+                                         seed * 17u) % 61u) - 30;
+                ape[i] = test_float_to_f16((float)value / 80.0f);
+            }
+        } else {
+            float *ape = (float *)model_raw;
+            for (uint64_t i = 0; i < (uint64_t)ratio * width; i++) {
+                const int value = (int)((i * 13u + (i ^ (i >> 3u)) * 7u +
+                                         seed * 17u) % 61u) - 30;
+                ape[i] = (float)value / 80.0f;
+            }
+        }
+        float *norm = (float *)((uint8_t *)model_raw + norm_offset);
+        for (uint32_t i = 0; i < head_dim; i++) {
+            norm[i] = 0.75f + (float)((i * 7u + seed * 3u) % 23u) / 64.0f;
+        }
+
+        for (uint64_t i = 0; i < batch_count; i++) {
+            const int kv_value =
+                (int)((i * 29u + (i ^ (i >> 4u)) * 9u + seed * 11u) % 127u) -
+                63;
+            const int sc_value =
+                (int)((i * 23u + (i ^ (i >> 5u)) * 13u + seed * 7u) % 113u) -
+                56;
+            host_a[i] = (float)kv_value / 88.0f;
+            host_b[i] = (float)sc_value / 96.0f;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(batch_kv, 0, host_a,
+                                         batch_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(batch_sc, 0, host_b,
+                                         batch_bytes) != 0);
+
+        for (uint64_t i = 0; i < state_count; i++) {
+            const int kv_value = (int)((i * 5u + seed * 13u) % 97u) - 48;
+            ref_state_host[i] = (float)kv_value / 64.0f;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_state_kv, 0, ref_state_host,
+                                         state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(fus_state_kv, 0, ref_state_host,
+                                         state_bytes) != 0);
+        for (uint64_t i = 0; i < state_count; i++) {
+            const int sc_value = (int)((i * 7u + seed * 5u) % 101u) - 50;
+            ref_state_host[i] = (float)sc_value / 72.0f;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_state_sc, 0, ref_state_host,
+                                         state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(fus_state_sc, 0, ref_state_host,
+                                         state_bytes) != 0);
+
+        for (uint64_t i = 0; i < cache_bytes; i++) {
+            ref_cache_host[i] = (uint8_t)(0xA5u ^ (i & 0xffu));
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_cache, 0, ref_cache_host,
+                                         cache_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(fus_cache, 0, ref_cache_host,
+                                         cache_bytes) != 0);
+        for (uint32_t i = 0; i < head_dim; i++) {
+            const uint32_t poison = 0x7fc02001u + (i & 0x3ffu);
+            memcpy(ref_stage_host + i, &poison, sizeof(poison));
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_stage, 0, ref_stage_host,
+                                         stage_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(fus_stage, 0, ref_stage_host,
+                                         stage_bytes) != 0);
+        for (uint64_t i = 0; i < prefix_count; i++) {
+            const uint32_t poison = 0x7fc03001u + (uint32_t)(i & 0x3ffu);
+            memcpy(ref_prefix_host + i, &poison, sizeof(poison));
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_prefix_kv, 0, ref_prefix_host,
+                                         prefix_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(ref_prefix_sc, 0, ref_prefix_host,
+                                         prefix_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(fus_prefix_kv, 0, ref_prefix_host,
+                                         prefix_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(fus_prefix_sc, 0, ref_prefix_host,
+                                         prefix_bytes) != 0);
+
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+        ds4_gpu_set_quality(false);
+
+        /* Reference: the exact wrapper chain of the ds4.c fallback loop. */
+        uint32_t comp_row = comp_row0;
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint32_t pos = pos0 + t;
+            const bool emit = ((pos + 1u) % ratio) == 0u;
+            ds4_gpu_tensor *kv_view = ds4_gpu_tensor_view(
+                batch_kv, (uint64_t)t * width * sizeof(float),
+                (uint64_t)width * sizeof(float));
+            ds4_gpu_tensor *sc_view = ds4_gpu_tensor_view(
+                batch_sc, (uint64_t)t * width * sizeof(float),
+                (uint64_t)width * sizeof(float));
+            TEST_ASSERT(kv_view && sc_view);
+            TEST_ASSERT(ds4_gpu_compressor_update_tensor(
+                            kv_view, sc_view, ref_state_kv, ref_state_sc,
+                            out_f16 ? ref_stage : ref_cache,
+                            model_raw, model_bytes, 0, ape_type,
+                            norm_offset, 0, head_dim, ratio, pos,
+                            out_f16 ? 0u : comp_row,
+                            n_rot, n_ctx_orig,
+                            10000.0f, 1.0f, ext_factor, attn_factor,
+                            32.0f, 1.0f, 1.0e-6f,
+                            false, true, false) != 0);
+            if (emit) {
+                ds4_gpu_tensor *row_view = out_f16
+                    ? ds4_gpu_tensor_view(ref_stage, 0, stage_bytes)
+                    : ds4_gpu_tensor_view(
+                          ref_cache,
+                          (uint64_t)comp_row * head_dim * sizeof(float),
+                          (uint64_t)head_dim * sizeof(float));
+                TEST_ASSERT(row_view != NULL);
+                if (quant_mode == 0) {
+                    TEST_ASSERT(ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                                    row_view, 1, head_dim, n_rot) != 0);
+                } else {
+                    TEST_ASSERT(ds4_gpu_dsv4_indexer_qat_tensor(
+                                    row_view, 1, head_dim) != 0);
+                }
+                ds4_gpu_tensor_free(row_view);
+                if (out_f16) {
+                    TEST_ASSERT(ds4_gpu_tensor_copy_f32_to_f16(
+                                    ref_cache,
+                                    (uint64_t)comp_row * head_dim *
+                                        sizeof(uint16_t),
+                                    ref_stage, 0, head_dim) != 0);
+                }
+                comp_row++;
+            }
+            if (t + 1u < n_tokens && t < capture_eff) {
+                /* ds4_gpu_tensor_copy encodes onto the command batch the
+                 * runtime graph keeps open; open one for the two blits. */
+                TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+                TEST_ASSERT(ds4_gpu_tensor_copy(
+                                ref_prefix_kv, (uint64_t)t * state_bytes,
+                                ref_state_kv, 0, state_bytes) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_copy(
+                                ref_prefix_sc, (uint64_t)t * state_bytes,
+                                ref_state_sc, 0, state_bytes) != 0);
+                TEST_ASSERT(ds4_gpu_end_commands() != 0);
+            }
+            ds4_gpu_tensor_free(sc_view);
+            ds4_gpu_tensor_free(kv_view);
+        }
+
+        /* Fused: one dispatch. */
+        TEST_ASSERT(ds4_gpu_dsv4_comp_rows_update_tensor(
+                        batch_kv, batch_sc, width,
+                        fus_state_kv, fus_state_sc,
+                        out_f16 ? fus_stage : NULL,
+                        fus_cache, comp_row0,
+                        (uint64_t)head_dim * cache_elem,
+                        out_f16, quant_mode,
+                        capture_eff ? fus_prefix_kv : NULL,
+                        capture_eff ? fus_prefix_sc : NULL,
+                        capture_slots,
+                        model_raw, model_bytes, 0, ape_type, norm_offset,
+                        head_dim, ratio, pos0, n_tokens, n_rot, n_ctx_orig,
+                        10000.0f, 1.0f, ext_factor, attn_factor,
+                        32.0f, 1.0f, 1.0e-6f) == 1);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(ref_state_kv, 0, ref_state_host,
+                                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(fus_state_kv, 0, fus_state_host,
+                                        state_bytes) != 0);
+        for (uint64_t i = 0; i < state_count; i++) {
+            if (memcmp(ref_state_host + i, fus_state_host + i,
+                       sizeof(float)) != 0) state_kv_mm++;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_read(ref_state_sc, 0, ref_state_host,
+                                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(fus_state_sc, 0, fus_state_host,
+                                        state_bytes) != 0);
+        for (uint64_t i = 0; i < state_count; i++) {
+            if (memcmp(ref_state_host + i, fus_state_host + i,
+                       sizeof(float)) != 0) state_sc_mm++;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_read(ref_cache, 0, ref_cache_host,
+                                        cache_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(fus_cache, 0, fus_cache_host,
+                                        cache_bytes) != 0);
+        for (uint64_t i = 0; i < cache_count; i++) {
+            if (memcmp(ref_cache_host + i * cache_elem,
+                       fus_cache_host + i * cache_elem,
+                       (size_t)cache_elem) != 0) cache_mm++;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_read(ref_stage, 0, ref_stage_host,
+                                        stage_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(fus_stage, 0, fus_stage_host,
+                                        stage_bytes) != 0);
+        if (out_f16) {
+            for (uint32_t i = 0; i < head_dim; i++) {
+                if (memcmp(ref_stage_host + i, fus_stage_host + i,
+                           sizeof(float)) != 0) stage_mm++;
+            }
+        }
+        TEST_ASSERT(ds4_gpu_tensor_read(ref_prefix_kv, 0, ref_prefix_host,
+                                        prefix_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(fus_prefix_kv, 0, fus_prefix_host,
+                                        prefix_bytes) != 0);
+        for (uint64_t i = 0; i < prefix_count; i++) {
+            if (memcmp(ref_prefix_host + i, fus_prefix_host + i,
+                       sizeof(float)) != 0) prefix_kv_mm++;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_read(ref_prefix_sc, 0, ref_prefix_host,
+                                        prefix_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(fus_prefix_sc, 0, fus_prefix_host,
+                                        prefix_bytes) != 0);
+        for (uint64_t i = 0; i < prefix_count; i++) {
+            if (memcmp(ref_prefix_host + i, fus_prefix_host + i,
+                       sizeof(float)) != 0) prefix_sc_mm++;
+        }
+    }
+
+    fprintf(stderr,
+            "ds4-test: comp rows update exact head_dim=%u ratio=%u pos0=%u "
+            "n_tokens=%u n_emit=%u ape=%s out=%s capture=%u "
+            "mm state=%zu/%zu cache=%zu stage=%zu prefix=%zu/%zu\n",
+            head_dim, ratio, pos0, n_tokens, n_emit,
+            ape_type == 1u ? "f16" : "f32",
+            out_f16 ? "f16" : "f32", capture_eff,
+            state_kv_mm, state_sc_mm, cache_mm, stage_mm,
+            prefix_kv_mm, prefix_sc_mm);
+    TEST_ASSERT(state_kv_mm == 0);
+    TEST_ASSERT(state_sc_mm == 0);
+    TEST_ASSERT(cache_mm == 0);
+    TEST_ASSERT(stage_mm == 0);
+    TEST_ASSERT(prefix_kv_mm == 0);
+    TEST_ASSERT(prefix_sc_mm == 0);
+
+    free(fus_stage_host);
+    free(ref_stage_host);
+    free(fus_prefix_host);
+    free(ref_prefix_host);
+    free(fus_cache_host);
+    free(ref_cache_host);
+    free(fus_state_host);
+    free(ref_state_host);
+    free(host_b);
+    free(host_a);
+    ds4_gpu_tensor_free(fus_prefix_sc);
+    ds4_gpu_tensor_free(fus_prefix_kv);
+    ds4_gpu_tensor_free(ref_prefix_sc);
+    ds4_gpu_tensor_free(ref_prefix_kv);
+    ds4_gpu_tensor_free(fus_cache);
+    ds4_gpu_tensor_free(ref_cache);
+    ds4_gpu_tensor_free(fus_stage);
+    ds4_gpu_tensor_free(ref_stage);
+    ds4_gpu_tensor_free(fus_state_sc);
+    ds4_gpu_tensor_free(fus_state_kv);
+    ds4_gpu_tensor_free(ref_state_sc);
+    ds4_gpu_tensor_free(ref_state_kv);
+    ds4_gpu_tensor_free(batch_sc);
+    ds4_gpu_tensor_free(batch_kv);
+    free(model_raw);
+}
+
+static void test_metal_comp_rows_update_exact(void) {
+    /* Speculative-verify shapes: n_tokens 2..6 crossed with every ratio-4
+     * phase of pos0, for the attention (512, F16 commit, FP8 tail) and
+     * indexer (128, in-place F32, Hadamard+FP4) compressors.  Emits per
+     * chunk range over 0, 1, and 2. */
+    uint32_t seed = 51u;
+    for (uint32_t n_tokens = 2u; n_tokens <= 6u; n_tokens++) {
+        for (uint32_t rem = 0u; rem < 4u; rem++) {
+            const uint32_t pos0 = 8u + rem;
+            test_metal_comp_rows_update_exact_case(
+                512, 4, pos0, n_tokens, rem & 1u, 1, 4, seed++);
+            test_metal_comp_rows_update_exact_case(
+                128, 4, pos0, n_tokens, (rem >> 1u) & 1u, 0, 4, seed++);
+        }
+    }
+    /* Ratio-128 layers reach the same host loop with the generic pool
+     * chain: cover no-emit, mid-chunk emit, last-token emit, and
+     * first-token emit, plus a capture-disabled chunk. */
+    test_metal_comp_rows_update_exact_case(512, 128, 120, 6, 0, 1, 4, 91);
+    test_metal_comp_rows_update_exact_case(512, 128, 124, 6, 1, 1, 4, 92);
+    test_metal_comp_rows_update_exact_case(512, 128, 126, 2, 0, 1, 4, 93);
+    test_metal_comp_rows_update_exact_case(512, 128, 255, 3, 1, 1, 4, 94);
+    test_metal_comp_rows_update_exact_case(512, 128, 124, 6, 0, 1, 0, 95);
+    test_metal_comp_rows_update_exact_case(512, 4, 10, 5, 0, 1, 0, 96);
+}
+
 static void test_metal_compressor_ape_add_exact_case(
         uint32_t head_dim,
         uint32_t ratio,
@@ -4552,6 +4928,7 @@ static void test_metal_kernel_group(void) {
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
     test_metal_f16_compressor_pair_state_store_exact();
+    test_metal_comp_rows_update_exact();
     test_metal_compressor_ape_add_exact();
     test_metal_compressor_ratio4_pack_exact();
     test_metal_compressor_ratio4_replay_pack_exact();
