@@ -20007,9 +20007,17 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos) {
     if (!g_initialized && !ds4_gpu_init()) return -1;
-    if ((g_quality_mode ||
-         (!ds4_gpu_device_name_contains("M3") &&
-          !ds4_gpu_device_name_contains("M5"))) ||
+    /* Same device-name-vs-family mismatch 01a56db and ba132ba fixed elsewhere.
+     * test_metal_f16_compressor_pair_state_store_exact_case asserts this
+     * returns 1 with no hardware guard (tests/ds4_test.c:1093-1098), so on any
+     * part that is neither M3 nor M5 it failed at the first call and every
+     * comparison below it then read an unwritten destination. */
+    const bool family_ok =
+        ds4_gpu_device_name_contains("M3") ||
+        ds4_gpu_device_name_contains("M5") ||
+        (ds4_gpu_device_is_pre_m5_apple_silicon() &&
+         getenv("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_PAIR_STORE") == NULL);
+    if (g_quality_mode || !family_ok ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ") != NULL ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE") != NULL) {
         return 0;
