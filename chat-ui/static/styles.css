@@ -300,6 +300,8 @@ body {
 
 .stage-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 0.4rem;
 }
 
@@ -381,12 +383,112 @@ body {
 
 .msg .bubble.think {
   margin-bottom: 0.45rem;
-  padding-right: 1rem;
+  padding: 0.55rem 1rem 0.7rem;
   color: var(--muted);
   font-size: 0.86rem;
   border-style: dashed;
   background: rgba(255, 255, 255, 0.02);
+  max-height: none;
+  overflow: visible;
+}
+
+.msg .bubble.think .think-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0 0 0.35rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+}
+
+.msg .bubble.think .think-toggle:hover,
+.msg .bubble.think .think-toggle:focus-visible {
+  color: var(--amber);
+  outline: none;
+}
+
+.msg .bubble.think .think-toggle:focus-visible {
+  box-shadow: 0 0 0 2px rgba(232, 196, 120, 0.35);
+  border-radius: 4px;
+}
+
+.msg .bubble.think .think-chevron::before {
+  content: "▸";
+  display: inline-block;
+  font-size: 0.85em;
+  transition: transform 0.15s ease;
+}
+
+.msg .bubble.think.expanded .think-chevron::before {
+  transform: rotate(90deg);
+}
+
+.msg .bubble.think .think-body {
   white-space: pre-wrap;
+  line-height: 1.45;
+  max-height: calc(1.45em * 6);
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+}
+
+.msg .bubble.think.expanded .think-body {
+  max-height: min(45vh, 22rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+
+@keyframes ds4-spin {
+  to { transform: rotate(360deg); }
+}
+
+.web-search-loader {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 0.35rem 0 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px dashed rgba(78, 205, 196, 0.35);
+  border-radius: var(--radius);
+  background: rgba(78, 205, 196, 0.06);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.web-search-spinner,
+#statusLine.status-searching::before {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border: 2px solid rgba(78, 205, 196, 0.22);
+  border-top-color: var(--teal);
+  border-radius: 50%;
+  animation: ds4-spin 0.7s linear infinite;
+  flex-shrink: 0;
+  vertical-align: -0.1em;
+}
+
+#statusLine.status-searching {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+#statusLine.status-searching::before {
+  content: "";
 }
 
 .msg .bubble-body {

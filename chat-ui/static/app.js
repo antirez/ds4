@@ -31,6 +31,8 @@
     newChatBtn: document.getElementById("newChatBtn"),
     renameBtn: document.getElementById("renameBtn"),
     deleteBtn: document.getElementById("deleteBtn"),
+    summarizeBtn: document.getElementById("summarizeBtn"),
+    summarizeForkBtn: document.getElementById("summarizeForkBtn"),
     fileInput: document.getElementById("fileInput"),
     attachBar: document.getElementById("attachBar"),
     webToggle: document.getElementById("webToggle"),
@@ -45,6 +47,10 @@
   let current = null;
   /** @type {{name:string,text:string,bytes:number,source?:string,method?:string}[]} */
   let pendingFiles = [];
+  /** @type {WeakMap<object, boolean>} session expand state for reasoning mirrors */
+  const thinkExpandedByMsg = new WeakMap();
+  /** @type {HTMLElement|null} */
+  let webSearchLoaderEl = null;
   let busy = false;
   let modelId = "deepseek-v4-flash";
   let contextLength = 100000;
@@ -120,11 +126,17 @@
     bubble.textContent = raw;
   }
 
+  function thinkBodyText(wrap) {
+    const body = wrap.querySelector(".think-body");
+    if (body) return (body.textContent || "").trim();
+    const think = wrap.querySelector(".bubble.think");
+    return think ? (think.textContent || "").trim() : "";
+  }
+
   function messageCopyText(wrap, body) {
     const raw = (body.dataset.raw || "").trim();
     if (raw) return raw;
-    const think = wrap.querySelector(".bubble.think");
-    return think ? (think.textContent || "").trim() : "";
+    return thinkBodyText(wrap);
   }
 
   function messagePreviewText(wrap, body) {
@@ -134,8 +146,81 @@
       : body.innerText || body.textContent || "";
     const main = String(visible || "").replace(/\u00a0/g, " ").trim();
     if (main) return main;
-    const think = wrap.querySelector(".bubble.think");
-    return think ? (think.textContent || "").trim() : "";
+    return thinkBodyText(wrap);
+  }
+
+  function isThinkExpanded(msg) {
+    return !!(msg && thinkExpandedByMsg.get(msg));
+  }
+
+  function setThinkExpanded(msg, expanded) {
+    if (msg) thinkExpandedByMsg.set(msg, !!expanded);
+  }
+
+  function createThinkMirror(msg, text) {
+    const expanded = isThinkExpanded(msg);
+    const think = document.createElement("div");
+    think.className = "bubble think" + (expanded ? " expanded" : "");
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "think-toggle";
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const label = document.createElement("span");
+    label.className = "think-label";
+    label.textContent = "Reasoning";
+    const chevron = document.createElement("span");
+    chevron.className = "think-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    toggle.appendChild(label);
+    toggle.appendChild(chevron);
+    const body = document.createElement("div");
+    body.className = "think-body";
+    body.textContent = text != null ? text : (msg && msg.reasoning) || "";
+    toggle.addEventListener("click", () => {
+      const next = !think.classList.contains("expanded");
+      think.classList.toggle("expanded", next);
+      toggle.setAttribute("aria-expanded", next ? "true" : "false");
+      setThinkExpanded(msg, next);
+    });
+    think.appendChild(toggle);
+    think.appendChild(body);
+    return think;
+  }
+
+  function setThinkMirrorText(thinkEl, text) {
+    if (!thinkEl) return;
+    const body = thinkEl.querySelector(".think-body");
+    if (body) {
+      body.textContent = text || "";
+      return;
+    }
+    thinkEl.textContent = text || "";
+  }
+
+  function showWebSearchLoader() {
+    hideWebSearchLoader();
+    const empty = els.transcript.querySelector(".empty");
+    if (empty) empty.remove();
+    const el = document.createElement("div");
+    el.className = "web-search-loader";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.innerHTML =
+      '<span class="web-search-spinner" aria-hidden="true"></span>' +
+      "<span>Searching the web…</span>";
+    els.transcript.appendChild(el);
+    webSearchLoaderEl = el;
+    els.transcript.scrollTop = els.transcript.scrollHeight;
+    if (els.statusLine) els.statusLine.classList.add("status-searching");
+    setStatus("Searching the web…", null);
+  }
+
+  function hideWebSearchLoader() {
+    if (webSearchLoaderEl) {
+      webSearchLoaderEl.remove();
+      webSearchLoaderEl = null;
+    }
+    if (els.statusLine) els.statusLine.classList.remove("status-searching");
   }
 
   async function unlockAudio() {
@@ -376,9 +461,7 @@
   }
 
   function workingMessages() {
-    return (current && current.messages ? current.messages : []).filter(
-      (m) => !isUiFailureAssistant(m)
-    );
+    return filterWorkingMessages(current && current.messages ? current.messages : []);
   }
 
   function formatForSummary(msgs) {
@@ -430,9 +513,14 @@
     return text;
   }
 
-  async function compressHistoryOnce(signal) {
-    const base = workingMessages();
-    if (base.length <= KEEP_RECENT_MESSAGES + 1) return false;
+  function filterWorkingMessages(messages) {
+    return (messages || []).filter((m) => !isUiFailureAssistant(m));
+  }
+
+  /** One compress pass over a message list; does not touch `current` or disk. */
+  async function buildCompressedMessages(messages, signal) {
+    const base = filterWorkingMessages(messages);
+    if (base.length <= KEEP_RECENT_MESSAGES + 1) return null;
 
     const keep = KEEP_RECENT_MESSAGES;
     let older = base.slice(0, Math.max(1, base.length - keep));
@@ -448,61 +536,190 @@
     }
 
     const summaryText = await requestSummary(formatForSummary(chunk), signal);
-    const summaryMsg = {
-      role: "system",
-      content: `${SUMMARY_PREFIX}\n${summaryText}`,
-      compressed: true,
-    };
-    current.messages = [summaryMsg, ...leftover, ...recent];
+    return [
+      {
+        role: "system",
+        content: `${SUMMARY_PREFIX}\n${summaryText}`,
+        compressed: true,
+      },
+      ...leftover,
+      ...recent,
+    ];
+  }
+
+  async function compressHistoryOnce(signal) {
+    const next = await buildCompressedMessages(workingMessages(), signal);
+    if (!next) return false;
+    current.messages = next;
     renderTranscript();
     await saveCurrent();
     return true;
   }
 
-  async function compressHistoryIfNeeded(pendingUserContent, opts = {}) {
+  function summarizePassStatus(reason, pass, est) {
+    if (reason === "manual" || reason === "fork") {
+      return `Summarizing older turns (pass ${pass})…`;
+    }
+    if (reason === "ram") {
+      return `Low free RAM — summarizing older turns (pass ${pass})…`;
+    }
+    return (
+      `Context ~${est.toLocaleString()} / ${contextLength.toLocaleString()} — ` +
+      `summarizing older turns (pass ${pass})…`
+    );
+  }
+
+  /**
+   * Compress a message array in memory (force ignores auto token threshold).
+   * When applyToCurrent is true, also updates the open chat and saves it.
+   */
+  async function compressMessagesList(messages, opts = {}) {
     const force = !!opts.force;
     const signal = opts.signal;
-    if (!current) return { compressed: false, stillHuge: false };
+    const reason = opts.reason || (force ? "ram" : "auto");
+    const pendingUserContent = opts.pendingUserContent || "";
+    const applyToCurrent = !!opts.applyToCurrent;
+    let msgs = filterWorkingMessages(messages);
     let compressed = false;
     for (let pass = 1; pass <= MAX_COMPRESS_PASSES; pass++) {
-      const base = workingMessages();
       const preview = pendingUserContent
-        ? base.concat([{ role: "user", content: pendingUserContent }])
-        : base.slice();
+        ? msgs.concat([{ role: "user", content: pendingUserContent }])
+        : msgs.slice();
       const est = historyTokenEstimate(preview);
       const trigger = Math.floor(contextLength * CONTEXT_SUMMARIZE_RATIO);
       const hard = Math.floor(contextLength * CONTEXT_HARD_RATIO);
       if (!force && est < trigger) {
-        return { compressed, stillHuge: est >= hard };
+        return { messages: msgs, compressed, stillHuge: est >= hard };
       }
-      if (base.length <= KEEP_RECENT_MESSAGES + 1) {
-        return { compressed, stillHuge: est >= hard };
+      if (msgs.length <= KEEP_RECENT_MESSAGES + 1) {
+        return { messages: msgs, compressed, stillHuge: est >= hard };
       }
-      setStatus(
-        force
-          ? `Low free RAM — summarizing older turns (pass ${pass})…`
-          : `Context ~${est.toLocaleString()} / ${contextLength.toLocaleString()} — summarizing older turns (pass ${pass})…`,
-        null
-      );
+      setStatus(summarizePassStatus(reason, pass, est), null);
       try {
-        const did = await compressHistoryOnce(signal);
-        if (!did) return { compressed, stillHuge: true };
+        const next = await buildCompressedMessages(msgs, signal);
+        if (!next) return { messages: msgs, compressed, stillHuge: true };
+        msgs = next;
         compressed = true;
+        if (applyToCurrent && current) {
+          current.messages = msgs;
+          renderTranscript();
+          await saveCurrent();
+        }
       } catch (err) {
         if (isAbortError(err)) throw err;
-        setStatus(`Auto-summarize failed: ${err.message}`, false);
-        return { compressed, stillHuge: true };
+        const label =
+          reason === "manual" || reason === "fork" ? "Summarize" : "Auto-summarize";
+        setStatus(`${label} failed: ${err.message}`, false);
+        return { messages: msgs, compressed, stillHuge: true };
       }
     }
     const est = historyTokenEstimate(
       pendingUserContent
-        ? workingMessages().concat([{ role: "user", content: pendingUserContent }])
-        : workingMessages()
+        ? msgs.concat([{ role: "user", content: pendingUserContent }])
+        : msgs
     );
     return {
+      messages: msgs,
       compressed,
       stillHuge: est >= Math.floor(contextLength * CONTEXT_HARD_RATIO),
     };
+  }
+
+  async function compressHistoryIfNeeded(pendingUserContent, opts = {}) {
+    if (!current) return { compressed: false, stillHuge: false };
+    const force = !!opts.force;
+    const result = await compressMessagesList(workingMessages(), {
+      force,
+      signal: opts.signal,
+      reason: opts.reason || (force ? "ram" : "auto"),
+      pendingUserContent: pendingUserContent || "",
+      applyToCurrent: true,
+    });
+    return {
+      compressed: result.compressed,
+      stillHuge: result.stillHuge,
+    };
+  }
+
+  function setSummarizeBusy(on) {
+    if (els.summarizeBtn) els.summarizeBtn.disabled = on;
+    if (els.summarizeForkBtn) els.summarizeForkBtn.disabled = on;
+  }
+
+  function setChatBusy(on) {
+    busy = on;
+    els.sendBtn.disabled = on;
+    setSummarizeBusy(on);
+  }
+
+  async function summarizeInPlace() {
+    if (!current || busy || ramFallbackRunning) return;
+    if (workingMessages().length <= KEEP_RECENT_MESSAGES + 1) {
+      setStatus("Not enough history to summarize.", null);
+      return;
+    }
+    setChatBusy(true);
+    try {
+      const result = await compressHistoryIfNeeded("", {
+        force: true,
+        reason: "manual",
+      });
+      if (result.compressed) {
+        setStatus("History summarized in this chat.", true);
+        warnIfHuge(apiMessages());
+      } else {
+        setStatus("Nothing left to compress in this chat.", null);
+      }
+    } catch (err) {
+      if (!isAbortError(err)) {
+        setStatus(`Summarize failed: ${err.message}`, false);
+      }
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function summarizeToNewChat() {
+    if (!current || busy || ramFallbackRunning) return;
+    const sourceTitle = current.title || "chat";
+    const sourceMessages = JSON.parse(JSON.stringify(current.messages || []));
+    if (filterWorkingMessages(sourceMessages).length <= KEEP_RECENT_MESSAGES + 1) {
+      setStatus("Not enough history to summarize into a new chat.", null);
+      return;
+    }
+    setChatBusy(true);
+    try {
+      const result = await compressMessagesList(sourceMessages, {
+        force: true,
+        reason: "fork",
+        applyToCurrent: false,
+      });
+      if (!result.compressed) {
+        setStatus("Nothing left to compress for a new chat.", null);
+        return;
+      }
+      const created = await api("/api/chats", {
+        method: "POST",
+        body: JSON.stringify({
+          title: `Summary · ${String(sourceTitle).slice(0, 40)}`,
+        }),
+      });
+      created.messages = result.messages;
+      current = created;
+      pendingFiles = [];
+      renderAttachBar();
+      els.chatTitle.textContent = current.title;
+      renderTranscript();
+      await saveCurrent();
+      setStatus("Opened new chat from summary. Original left unchanged.", true);
+      warnIfHuge(apiMessages());
+    } catch (err) {
+      if (!isAbortError(err)) {
+        setStatus(`Summarize to new chat failed: ${err.message}`, false);
+      }
+    } finally {
+      setChatBusy(false);
+    }
   }
 
   async function handleRamPressure(freeGib) {
@@ -533,7 +750,7 @@
       }
       renderTranscript();
       await saveCurrent();
-      const result = await compressHistoryIfNeeded("", { force: true });
+      const result = await compressHistoryIfNeeded("", { force: true, reason: "ram" });
       if (result.compressed) {
         setStatus(
           `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped; history compressed.`,
@@ -552,8 +769,7 @@
     } finally {
       ramFallbackRunning = false;
       ramAbortRequested = false;
-      busy = false;
-      els.sendBtn.disabled = false;
+      setChatBusy(false);
     }
   }
 
@@ -628,10 +844,7 @@
     role.textContent = isSummaryMessage(msg) ? "summary" : msg.role;
     wrap.appendChild(role);
     if (msg.reasoning) {
-      const think = document.createElement("div");
-      think.className = "bubble think";
-      think.textContent = msg.reasoning;
-      wrap.appendChild(think);
+      wrap.appendChild(createThinkMirror(msg, msg.reasoning));
     }
     const bubble = document.createElement("div");
     bubble.className = "bubble" + (streaming ? " streaming" : "");
@@ -708,11 +921,35 @@
     return parts.join("\n").trim();
   }
 
+  function recentSearchMessages() {
+    const msgs = (current && current.messages) || [];
+    const out = [];
+    for (const m of msgs) {
+      if (m.role !== "user" && m.role !== "assistant") continue;
+      if (m.role === "assistant" && isUiFailureAssistant(m)) continue;
+      let content = String(m.content || "");
+      content = content.replace(
+        /----- web context[\s\S]*?----- end web context -----\s*/gi,
+        ""
+      );
+      content = content.replace(
+        /----- attached[\s\S]*?----- end [^\n-]+ -----\s*/gi,
+        ""
+      );
+      content = content.trim();
+      if (!content) continue;
+      if (content.length > 800) content = content.slice(0, 800);
+      out.push({ role: m.role, content });
+    }
+    return out.slice(-8);
+  }
+
   async function fetchWebContext(query, signal) {
     const data = await api("/api/web-context", {
       method: "POST",
       body: JSON.stringify({
         query,
+        messages: recentSearchMessages(),
         max_results: 8,
         max_fetch: 5,
         fetch_pages: true,
@@ -925,8 +1162,7 @@
       return;
     }
 
-    busy = true;
-    els.sendBtn.disabled = true;
+    setChatBusy(true);
     stopSpeaking();
     const gen = beginGeneration();
     const signal = gen.signal;
@@ -935,7 +1171,7 @@
     let webMeta = null;
     try {
       if (useWeb) {
-        setStatus("Web search running…", null);
+        showWebSearchLoader();
         webMeta = await fetchWebContext(text, signal);
         webContext = (webMeta && webMeta.context) || "";
         if (!webContext) {
@@ -945,6 +1181,7 @@
         const pages = webMeta.pages_fetched || 0;
         const tried = webMeta.pages_attempted || pages;
         const fails = (webMeta.errors && webMeta.errors.length) || 0;
+        hideWebSearchLoader();
         setStatus(
           `Web ok · ${n} results · ${pages}/${tried} pages` +
             (fails ? ` · ${fails} fetch issues` : ""),
@@ -952,14 +1189,13 @@
         );
       }
     } catch (err) {
+      hideWebSearchLoader();
       endGeneration(gen);
       if (ramAbortRequested || isAbortError(err)) {
-        busy = false;
-        els.sendBtn.disabled = false;
+        setChatBusy(false);
         return;
       }
-      busy = false;
-      els.sendBtn.disabled = false;
+      setChatBusy(false);
       setStatus(`Web failed: ${err.message}`, false);
       window.alert(`Web search failed: ${err.message}`);
       return;
@@ -998,20 +1234,17 @@
         );
         if (!proceed) {
           endGeneration(gen);
-          busy = false;
-          els.sendBtn.disabled = false;
+          setChatBusy(false);
           return;
         }
       }
     } catch (err) {
       endGeneration(gen);
       if (ramAbortRequested || isAbortError(err)) {
-        busy = false;
-        els.sendBtn.disabled = false;
+        setChatBusy(false);
         return;
       }
-      busy = false;
-      els.sendBtn.disabled = false;
+      setChatBusy(false);
       setStatus(`Auto-summarize failed: ${err.message}`, false);
       return;
     }
@@ -1035,8 +1268,7 @@
         const bubble = node.querySelector(".bubble:not(.think)");
         if (bubble) bubble.classList.remove("streaming");
         // handleRamPressure owns status, cleanup, and summarize
-        busy = false;
-        els.sendBtn.disabled = false;
+        setChatBusy(false);
         endGeneration(gen);
         return;
       }
@@ -1062,8 +1294,7 @@
           if (ramAbortRequested || isAbortError(retryErr)) {
             const bubble = node.querySelector(".bubble:not(.think)");
             if (bubble) bubble.classList.remove("streaming");
-            busy = false;
-            els.sendBtn.disabled = false;
+            setChatBusy(false);
             endGeneration(gen);
             return;
           }
@@ -1076,8 +1307,7 @@
           }
           await saveCurrent();
           setStatus(`Request failed: ${retryErr.message}`, false);
-          busy = false;
-          els.sendBtn.disabled = false;
+          setChatBusy(false);
           endGeneration(gen);
           els.prompt.focus();
           return;
@@ -1092,8 +1322,7 @@
         }
         await saveCurrent();
         setStatus(`Request failed: ${err.message}`, false);
-        busy = false;
-        els.sendBtn.disabled = false;
+        setChatBusy(false);
         endGeneration(gen);
         els.prompt.focus();
         return;
@@ -1101,8 +1330,7 @@
     }
 
     endGeneration(gen);
-    busy = false;
-    els.sendBtn.disabled = false;
+    setChatBusy(false);
     els.prompt.focus();
   }
 
@@ -1146,11 +1374,11 @@
           if (delta.reasoning_content) {
             assistantMsg.reasoning = (assistantMsg.reasoning || "") + delta.reasoning_content;
             if (!thinkEl) {
-              thinkEl = document.createElement("div");
-              thinkEl.className = "bubble think";
+              thinkEl = createThinkMirror(assistantMsg, assistantMsg.reasoning);
               node.insertBefore(thinkEl, bubble);
+            } else {
+              setThinkMirrorText(thinkEl, assistantMsg.reasoning);
             }
-            thinkEl.textContent = assistantMsg.reasoning;
             els.transcript.scrollTop = els.transcript.scrollHeight;
           }
           if (delta.content) {
@@ -1255,6 +1483,12 @@
   els.newChatBtn.addEventListener("click", () => createChat());
   els.renameBtn.addEventListener("click", () => renameChat());
   els.deleteBtn.addEventListener("click", () => deleteChat());
+  if (els.summarizeBtn) {
+    els.summarizeBtn.addEventListener("click", () => summarizeInPlace());
+  }
+  if (els.summarizeForkBtn) {
+    els.summarizeForkBtn.addEventListener("click", () => summarizeToNewChat());
+  }
   els.sendBtn.addEventListener("click", () => sendMessage());
   els.fileInput.addEventListener("change", (e) => onFilesSelected(e.target.files));
   els.railToggle.addEventListener("click", () => els.rail.classList.toggle("open"));
@@ -1348,16 +1582,20 @@
           : tts
             ? " Read aloud needs Piper (make install-piper) or macOS say+afconvert."
             : " Restart chat-ui to enable Read aloud (/api/tts).";
+        const summarizeBit =
+          " Use Summarize to compress this chat, or To new chat to fork a summarized copy.";
         if (ocr && !ocr.images) {
           els.composerNote.textContent =
             "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler." +
             webBit +
-            ttsBit;
+            ttsBit +
+            summarizeBit;
         } else {
           els.composerNote.textContent =
             "Text/code are inlined. Images and PDFs are OCR’d to text locally (model is text-only)." +
             webBit +
-            ttsBit;
+            ttsBit +
+            summarizeBit;
         }
       }
     } catch {
