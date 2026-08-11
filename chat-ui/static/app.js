@@ -41,7 +41,8 @@
   /** @type {HTMLAudioElement|null} */
   let ttsAudio = null;
   let ttsToken = 0;
-  let ttsAvailable = true;
+  let ttsAvailable = false;
+  let audioUnlocked = false;
 
   function escapeHtml(s) {
     return String(s)
@@ -55,6 +56,8 @@
     '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.75"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" fill="none" stroke="currentColor" stroke-width="1.75"/></svg>';
   const CHECK_ICON =
     '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><path d="M5 12.5l4.2 4.2L19 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const SPEAK_ICON =
+    '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><path d="M4 9v6h3l5 4V5L7 9H4z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/><path d="M16 9.5a3.5 3.5 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><path d="M18.2 7a6 6 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>';
 
   function setBubbleText(bubble, text) {
     const body = bubble.querySelector(".bubble-body");
@@ -63,6 +66,36 @@
       return;
     }
     bubble.textContent = text || "";
+  }
+
+  async function unlockAudio() {
+    if (audioUnlocked) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        const ctx = new AC();
+        if (ctx.state === "suspended") await ctx.resume();
+        const buf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+        audioUnlocked = true;
+        return;
+      }
+    } catch {
+      /* fall through */
+    }
+    try {
+      const silent =
+        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+      const a = new Audio(silent);
+      await a.play();
+      a.pause();
+      audioUnlocked = true;
+    } catch {
+      /* browser may still allow play() after a later click */
+    }
   }
 
   async function copyTextToClipboard(text) {
@@ -97,7 +130,7 @@
   function makeCopyButton(getText) {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "copy-btn";
+    btn.className = "msg-action-btn copy-btn";
     btn.setAttribute("aria-label", "Copy");
     btn.title = "Copy";
     btn.innerHTML = COPY_ICON;
@@ -123,6 +156,34 @@
       }, 1000);
     });
     return btn;
+  }
+
+  function makeSpeakButton(getText) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "msg-action-btn speak-btn";
+    btn.setAttribute("aria-label", "Read aloud");
+    btn.title = "Read this message aloud";
+    btn.innerHTML = SPEAK_ICON;
+    btn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const text = String(getText() || "").trim();
+      if (!text) {
+        setStatus("Nothing to read in this message.", false);
+        return;
+      }
+      await unlockAudio();
+      await speakFinal(text, { force: true });
+    });
+    return btn;
+  }
+
+  function messageSpeakText(wrap, body) {
+    const main = (body.textContent || "").trim();
+    if (main) return main;
+    const think = wrap.querySelector(".bubble.think");
+    return think ? (think.textContent || "").trim() : "";
   }
 
   function fmtTime(iso) {
@@ -273,14 +334,12 @@
     const body = document.createElement("div");
     body.className = "bubble-body";
     body.textContent = msg.content || (streaming ? "" : "");
-    bubble.appendChild(
-      makeCopyButton(() => {
-        const main = (body.textContent || "").trim();
-        if (main) return main;
-        const think = wrap.querySelector(".bubble.think");
-        return think ? (think.textContent || "").trim() : "";
-      })
-    );
+    const actions = document.createElement("div");
+    actions.className = "bubble-actions";
+    const getText = () => messageSpeakText(wrap, body);
+    actions.appendChild(makeSpeakButton(getText));
+    actions.appendChild(makeCopyButton(getText));
+    bubble.appendChild(actions);
     bubble.appendChild(body);
     wrap.appendChild(bubble);
     if (msg.files && msg.files.length) {
@@ -374,16 +433,28 @@
     setTtsSpeaking(false);
   }
 
-  async function speakFinal(text) {
-    if (!els.ttsToggle || !els.ttsToggle.checked) return;
-    if (!ttsAvailable) return;
+  async function speakFinal(text, opts = {}) {
+    const force = !!opts.force;
+    if (!force && (!els.ttsToggle || !els.ttsToggle.checked)) return;
+    if (!ttsAvailable) {
+      if (force || (els.ttsToggle && els.ttsToggle.checked)) {
+        setStatus(
+          "TTS unavailable — restart chat-ui so /api/tts is loaded, then hard-refresh.",
+          false
+        );
+      }
+      return;
+    }
     const spoken = String(text || "").trim();
     if (!spoken || spoken.startsWith("Error:")) return;
 
     stopSpeaking();
     const token = ttsToken;
     setTtsSpeaking(true);
+    setStatus("Speaking…", true);
     try {
+      await unlockAudio();
+      if (token !== ttsToken) return;
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -392,6 +463,9 @@
       if (token !== ttsToken) return;
       if (!res.ok) {
         const errText = await res.text();
+        if (res.status === 404) {
+          throw new Error(" /api/tts missing — restart chat-ui, then hard-refresh");
+        }
         throw new Error(parseErrorPayload(errText) || res.statusText);
       }
       const blob = await res.blob();
@@ -404,6 +478,7 @@
         if (ttsAudio === audio) {
           ttsAudio = null;
           setTtsSpeaking(false);
+          setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
         }
       };
       audio.onerror = () => {
@@ -417,7 +492,15 @@
     } catch (err) {
       if (token !== ttsToken) return;
       setTtsSpeaking(false);
-      setStatus(`TTS failed: ${err.message}`, false);
+      const name = err && err.name;
+      if (name === "NotAllowedError") {
+        setStatus(
+          "Browser blocked autoplay — click the speaker icon on a message to read it.",
+          false
+        );
+      } else {
+        setStatus(`TTS failed: ${err.message}`, false);
+      }
     }
   }
 
@@ -522,6 +605,10 @@
     if (busy || !current) return;
     const text = els.prompt.value.trim();
     if (!text && !pendingFiles.length) return;
+
+    if (els.ttsToggle && els.ttsToggle.checked) {
+      await unlockAudio();
+    }
 
     const files = pendingFiles.slice();
     const useWeb = !!(els.webToggle && els.webToggle.checked);
@@ -664,7 +751,14 @@
       await saveCurrent();
       setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
       // Speak final answer text only (not reasoning dumps).
-      speakFinal(assistantMsg.content);
+      const answer = (assistantMsg.content || "").trim();
+      if (els.ttsToggle && els.ttsToggle.checked) {
+        if (answer) {
+          await speakFinal(answer);
+        } else {
+          setStatus("Read aloud skipped: empty answer text (thinking-only).", null);
+        }
+      }
     } catch (err) {
       stopSpeaking();
       assistantMsg.content = `Error: ${err.message}`;
@@ -761,13 +855,14 @@
     } catch {
       /* private mode */
     }
-    els.ttsToggle.addEventListener("change", () => {
+    els.ttsToggle.addEventListener("change", async () => {
       try {
         localStorage.setItem("ds4-tts-read-aloud", els.ttsToggle.checked ? "1" : "0");
       } catch {
         /* ignore */
       }
       if (!els.ttsToggle.checked) stopSpeaking();
+      else await unlockAudio();
     });
   }
   els.prompt.addEventListener("keydown", (e) => {
@@ -781,11 +876,19 @@
     try {
       const health = await api("/api/health");
       const tts = health?.tts;
-      ttsAvailable = !tts || tts.available !== false;
-      if (els.ttsToggle && !ttsAvailable) {
-        els.ttsToggle.disabled = true;
-        els.ttsToggle.checked = false;
-        els.ttsToggle.title = "Local TTS unavailable on this host";
+      ttsAvailable = !!(tts && tts.available);
+      if (els.ttsToggle) {
+        if (!ttsAvailable) {
+          els.ttsToggle.disabled = true;
+          els.ttsToggle.checked = false;
+          els.ttsToggle.title = tts
+            ? "Local TTS tools missing on this host"
+            : "Restart chat-ui to enable /api/tts, then hard-refresh";
+        } else {
+          els.ttsToggle.disabled = false;
+          els.ttsToggle.title =
+            "Read assistant answers aloud with local TTS (macOS say, or Piper if installed)";
+        }
       }
       if (els.composerNote) {
         const ocr = health?.ocr;
@@ -793,8 +896,10 @@
           ? " Toggle Web for free DuckDuckGo context (no API key)."
           : "";
         const ttsBit = ttsAvailable
-          ? " Toggle Read aloud for local TTS (macOS say; optional Piper via DS4_PIPER_MODEL)."
-          : " Read aloud needs macOS say+afconvert (or Piper).";
+          ? " Toggle Read aloud for new answers, or use the speaker icon on any message."
+          : tts
+            ? " Read aloud needs macOS say+afconvert (or Piper)."
+            : " Restart chat-ui to enable Read aloud (/api/tts).";
         if (ocr && !ocr.images) {
           els.composerNote.textContent =
             "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler." +
