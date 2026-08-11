@@ -3,6 +3,14 @@
   const MAX_TOTAL_ATTACH = 1.5 * 1024 * 1024;
   const MAX_OCR_UPLOAD = 12 * 1024 * 1024;
   const CONTEXT_WARN_RATIO = 0.85;
+  const CONTEXT_SUMMARIZE_RATIO = 0.72;
+  const CONTEXT_HARD_RATIO = 0.95;
+  const KEEP_RECENT_MESSAGES = 6;
+  const MAX_COMPRESS_PASSES = 4;
+  const SUMMARY_PREFIX = "[conversation summary]";
+  // Same 6 GiB reserve as scripts/safe_ctx.py DEFAULT_RESERVE_GIB / RAM_PRESSURE_*.
+  const RAM_PRESSURE_TRIGGER_GIB = 6;
+  const RAM_PRESSURE_CLEAR_GIB = 7;
   const TEXT_EXT = new Set([
     "txt", "md", "py", "c", "h", "cpp", "hpp", "cc", "js", "ts", "tsx", "jsx",
     "json", "csv", "toml", "yaml", "yml", "rs", "go", "java", "sh", "bash",
@@ -29,6 +37,8 @@
     ttsToggle: document.getElementById("ttsToggle"),
     ttsStopBtn: document.getElementById("ttsStopBtn"),
     composerNote: document.querySelector(".composer-note"),
+    ramStatus: document.getElementById("ram-status"),
+    ramMeterFill: document.getElementById("ram-meter-fill"),
   };
 
   /** @type {{id:string,title:string,messages:any[],created_at?:string,updated_at?:string}|null} */
@@ -38,11 +48,19 @@
   let busy = false;
   let modelId = "deepseek-v4-flash";
   let contextLength = 100000;
+  let safeCtx = null;
   /** @type {HTMLAudioElement|null} */
   let ttsAudio = null;
   let ttsToken = 0;
   let ttsAvailable = false;
   let audioUnlocked = false;
+  /** @type {AbortController|null} */
+  let generationAbort = null;
+  let ramAbortRequested = false;
+  let ramPressureLatched = false;
+  let ramFallbackRunning = false;
+  let ramTriggerGib = RAM_PRESSURE_TRIGGER_GIB;
+  let ramClearGib = RAM_PRESSURE_CLEAR_GIB;
 
   function escapeHtml(s) {
     return String(s)
@@ -298,17 +316,250 @@
     els.statusLine.style.color = ok === false ? "var(--danger)" : ok ? "var(--teal)" : "var(--muted)";
   }
 
+  function isAbortError(err) {
+    if (!err) return false;
+    if (err.name === "AbortError") return true;
+    return /aborted|AbortError/i.test(String(err.message || ""));
+  }
+
+  function beginGeneration() {
+    if (generationAbort) {
+      try {
+        generationAbort.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    generationAbort = new AbortController();
+    return generationAbort;
+  }
+
+  function endGeneration(controller) {
+    if (generationAbort === controller) generationAbort = null;
+  }
+
+  function abortGenerationForRam() {
+    ramAbortRequested = true;
+    if (!generationAbort) return false;
+    try {
+      generationAbort.abort();
+    } catch {
+      /* ignore */
+    }
+    return true;
+  }
+
+  /** Mirror of safe_ctx.evaluate_ram_pressure (trigger <6 GiB, clear >7 GiB). */
+  function evaluateRamPressure(freeGib, latched) {
+    if (freeGib < ramTriggerGib) return latched ? "hold" : "trigger";
+    if (latched && freeGib > ramClearGib) return "clear";
+    return "idle";
+  }
+
   function warnIfHuge(messages) {
     const est = historyTokenEstimate(messages);
     const limit = Math.floor(contextLength * CONTEXT_WARN_RATIO);
     if (est >= limit) {
       setStatus(
-        `History ~${est.toLocaleString()} tokens (ctx ${contextLength.toLocaleString()}). Trim or start a new chat before send.`,
+        `History ~${est.toLocaleString()} tokens (ctx ${contextLength.toLocaleString()}). Auto-summarize will run on send if needed.`,
         false
       );
       return true;
     }
     return false;
+  }
+
+  function isSummaryMessage(msg) {
+    if (!msg) return false;
+    if (msg.compressed) return true;
+    return String(msg.content || "").startsWith(SUMMARY_PREFIX);
+  }
+
+  function workingMessages() {
+    return (current && current.messages ? current.messages : []).filter(
+      (m) => !isUiFailureAssistant(m)
+    );
+  }
+
+  function formatForSummary(msgs) {
+    return msgs
+      .map((m) => {
+        const role = (m.role || "unknown").toUpperCase();
+        let content = String(m.content || "").trim();
+        if (content.length > 14000) {
+          content = content.slice(0, 14000) + "\n…[clipped for summary]";
+        }
+        return `${role}:\n${content}`;
+      })
+      .join("\n\n---\n\n");
+  }
+
+  async function requestSummary(excerpt, signal) {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        model: modelId,
+        stream: false,
+        temperature: 0.2,
+        max_tokens: 2048,
+        thinking: { type: "disabled" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You compress conversation history for a continuing chat. " +
+              "Write a dense factual summary: goals, constraints, decisions, key facts, numbers, " +
+              "names, file/topic references, and open questions. No preamble or meta commentary.",
+          },
+          {
+            role: "user",
+            content: "Summarize this conversation excerpt:\n\n" + excerpt,
+          },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(parseErrorPayload(errText) || res.statusText);
+    }
+    const data = await res.json();
+    const text = (data?.choices?.[0]?.message?.content || "").trim();
+    if (!text) throw new Error("empty summary from model");
+    return text;
+  }
+
+  async function compressHistoryOnce(signal) {
+    const base = workingMessages();
+    if (base.length <= KEEP_RECENT_MESSAGES + 1) return false;
+
+    const keep = KEEP_RECENT_MESSAGES;
+    let older = base.slice(0, Math.max(1, base.length - keep));
+    const recent = base.slice(older.length);
+    const summarizeBudget = Math.max(2048, Math.floor(contextLength * 0.5));
+
+    let chunk = older;
+    let leftover = [];
+    while (chunk.length > 2 && historyTokenEstimate(chunk) > summarizeBudget) {
+      const half = Math.max(1, Math.ceil(chunk.length / 2));
+      leftover = chunk.slice(half).concat(leftover);
+      chunk = chunk.slice(0, half);
+    }
+
+    const summaryText = await requestSummary(formatForSummary(chunk), signal);
+    const summaryMsg = {
+      role: "system",
+      content: `${SUMMARY_PREFIX}\n${summaryText}`,
+      compressed: true,
+    };
+    current.messages = [summaryMsg, ...leftover, ...recent];
+    renderTranscript();
+    await saveCurrent();
+    return true;
+  }
+
+  async function compressHistoryIfNeeded(pendingUserContent, opts = {}) {
+    const force = !!opts.force;
+    const signal = opts.signal;
+    if (!current) return { compressed: false, stillHuge: false };
+    let compressed = false;
+    for (let pass = 1; pass <= MAX_COMPRESS_PASSES; pass++) {
+      const base = workingMessages();
+      const preview = pendingUserContent
+        ? base.concat([{ role: "user", content: pendingUserContent }])
+        : base.slice();
+      const est = historyTokenEstimate(preview);
+      const trigger = Math.floor(contextLength * CONTEXT_SUMMARIZE_RATIO);
+      const hard = Math.floor(contextLength * CONTEXT_HARD_RATIO);
+      if (!force && est < trigger) {
+        return { compressed, stillHuge: est >= hard };
+      }
+      if (base.length <= KEEP_RECENT_MESSAGES + 1) {
+        return { compressed, stillHuge: est >= hard };
+      }
+      setStatus(
+        force
+          ? `Low free RAM — summarizing older turns (pass ${pass})…`
+          : `Context ~${est.toLocaleString()} / ${contextLength.toLocaleString()} — summarizing older turns (pass ${pass})…`,
+        null
+      );
+      try {
+        const did = await compressHistoryOnce(signal);
+        if (!did) return { compressed, stillHuge: true };
+        compressed = true;
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        setStatus(`Auto-summarize failed: ${err.message}`, false);
+        return { compressed, stillHuge: true };
+      }
+    }
+    const est = historyTokenEstimate(
+      pendingUserContent
+        ? workingMessages().concat([{ role: "user", content: pendingUserContent }])
+        : workingMessages()
+    );
+    return {
+      compressed,
+      stillHuge: est >= Math.floor(contextLength * CONTEXT_HARD_RATIO),
+    };
+  }
+
+  async function handleRamPressure(freeGib) {
+    // Client poll of /api/ram aborts UI-owned work; bare ds4-server is not killed.
+    if (ramFallbackRunning) return;
+    ramFallbackRunning = true;
+    stopSpeaking();
+    setStatus(
+      `Free RAM ${freeGib.toFixed(1)} GiB below ${ramTriggerGib} GiB reserve — stopping generation and compressing history…`,
+      false
+    );
+    abortGenerationForRam();
+    try {
+      await new Promise((r) => setTimeout(r, 50));
+      if (!current) return;
+      const msgs = current.messages || [];
+      const last = msgs[msgs.length - 1];
+      if (last && last.role === "assistant") {
+        const empty =
+          !String(last.content || "").trim() && !String(last.reasoning || "").trim();
+        if (empty) {
+          msgs.pop();
+        } else if (!/\[stopped: low free RAM\]/.test(String(last.content || ""))) {
+          last.content =
+            (String(last.content || "").trim() ? String(last.content).trim() + "\n\n" : "") +
+            "[stopped: low free RAM]";
+        }
+      }
+      renderTranscript();
+      await saveCurrent();
+      const result = await compressHistoryIfNeeded("", { force: true });
+      if (result.compressed) {
+        setStatus(
+          `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped; history compressed.`,
+          false
+        );
+      } else {
+        setStatus(
+          `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped. Little history left to compress.`,
+          false
+        );
+      }
+    } catch (err) {
+      if (!isAbortError(err)) {
+        setStatus(`Low free RAM fallback failed: ${err.message}`, false);
+      }
+    } finally {
+      ramFallbackRunning = false;
+      ramAbortRequested = false;
+      busy = false;
+      els.sendBtn.disabled = false;
+    }
+  }
+
+  function isContextLengthError(message) {
+    const m = String(message || "");
+    return /context_length_exceeded|configured context size|Prompt has \d+ tokens/i.test(m);
   }
 
   async function refreshModels() {
@@ -317,7 +568,15 @@
       const row = data?.data?.[0];
       if (row?.id) modelId = row.id;
       if (row?.context_length) contextLength = row.context_length;
-      setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
+      let status = `API up · model ${modelId} · ctx ${contextLength.toLocaleString()}`;
+      let ok = true;
+      if (safeCtx && contextLength > safeCtx) {
+        status += ` · above safe ${safeCtx.toLocaleString()} (RAM-6GiB)`;
+        ok = false;
+      } else if (safeCtx) {
+        status += ` · safe≤${safeCtx.toLocaleString()}`;
+      }
+      setStatus(status, ok);
       if (current) warnIfHuge(apiMessages());
     } catch (err) {
       setStatus(`ds4-server unreachable (${err.message}). Start it on :8000.`, false);
@@ -363,10 +622,10 @@
 
   function renderMessage(msg, streaming) {
     const wrap = document.createElement("article");
-    wrap.className = `msg ${msg.role}`;
+    wrap.className = `msg ${msg.role}` + (isSummaryMessage(msg) ? " summary" : "");
     const role = document.createElement("p");
     role.className = "role";
-    role.textContent = msg.role;
+    role.textContent = isSummaryMessage(msg) ? "summary" : msg.role;
     wrap.appendChild(role);
     if (msg.reasoning) {
       const think = document.createElement("div");
@@ -449,15 +708,16 @@
     return parts.join("\n").trim();
   }
 
-  async function fetchWebContext(query) {
+  async function fetchWebContext(query, signal) {
     const data = await api("/api/web-context", {
       method: "POST",
       body: JSON.stringify({
         query,
-        max_results: 5,
-        max_fetch: 3,
+        max_results: 8,
+        max_fetch: 5,
         fetch_pages: true,
       }),
+      signal,
     });
     return data;
   }
@@ -668,21 +928,36 @@
     busy = true;
     els.sendBtn.disabled = true;
     stopSpeaking();
+    const gen = beginGeneration();
+    const signal = gen.signal;
 
     let webContext = "";
     let webMeta = null;
     try {
       if (useWeb) {
         setStatus("Web search running…", null);
-        webMeta = await fetchWebContext(text);
+        webMeta = await fetchWebContext(text, signal);
         webContext = (webMeta && webMeta.context) || "";
         if (!webContext) {
           throw new Error("web search returned empty context");
         }
         const n = (webMeta.results && webMeta.results.length) || 0;
-        setStatus(`Web ok · ${n} results · ${webMeta.pages_fetched || 0} pages`, true);
+        const pages = webMeta.pages_fetched || 0;
+        const tried = webMeta.pages_attempted || pages;
+        const fails = (webMeta.errors && webMeta.errors.length) || 0;
+        setStatus(
+          `Web ok · ${n} results · ${pages}/${tried} pages` +
+            (fails ? ` · ${fails} fetch issues` : ""),
+          true
+        );
       }
     } catch (err) {
+      endGeneration(gen);
+      if (ramAbortRequested || isAbortError(err)) {
+        busy = false;
+        els.sendBtn.disabled = false;
+        return;
+      }
       busy = false;
       els.sendBtn.disabled = false;
       setStatus(`Web failed: ${err.message}`, false);
@@ -709,17 +984,36 @@
       };
     }
 
-    // Preview size after this turn (exclude prior UI Error assistants).
-    const preview = apiMessages().concat([{ role: "user", content }]);
-    if (warnIfHuge(preview)) {
-      const proceed = window.confirm(
-        "This turn looks close to or over the model context window. Send anyway?"
-      );
-      if (!proceed) {
+    try {
+      const compressed = await compressHistoryIfNeeded(content, { signal });
+      if (compressed.compressed) {
+        setStatus("History compressed — continuing send…", true);
+      }
+      const preview = workingMessages().concat([{ role: "user", content }]);
+      const est = historyTokenEstimate(preview);
+      if (compressed.stillHuge || est >= Math.floor(contextLength * CONTEXT_HARD_RATIO)) {
+        const proceed = window.confirm(
+          `Still ~${est.toLocaleString()} tokens after auto-summarize ` +
+            `(ctx ${contextLength.toLocaleString()}). Send anyway?`
+        );
+        if (!proceed) {
+          endGeneration(gen);
+          busy = false;
+          els.sendBtn.disabled = false;
+          return;
+        }
+      }
+    } catch (err) {
+      endGeneration(gen);
+      if (ramAbortRequested || isAbortError(err)) {
         busy = false;
         els.sendBtn.disabled = false;
         return;
       }
+      busy = false;
+      els.sendBtn.disabled = false;
+      setStatus(`Auto-summarize failed: ${err.message}`, false);
+      return;
     }
 
     current.messages.push(userMsg);
@@ -731,93 +1025,161 @@
 
     const assistantMsg = { role: "assistant", content: "", reasoning: "" };
     current.messages.push(assistantMsg);
-    const node = renderMessage(assistantMsg, true);
+    let node = renderMessage(assistantMsg, true);
     els.transcript.appendChild(node);
-    let thinkEl = node.querySelector(".bubble.think");
-    const bubble = node.querySelector(".bubble:not(.think)");
 
     try {
-      const res = await fetch("/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: modelId,
-          messages: apiMessages().slice(0, -1),
-          stream: true,
-          temperature: 0.7,
-        }),
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(parseErrorPayload(errText) || res.statusText);
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n");
-        buffer = parts.pop() || "";
-        for (const line of parts) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const payload = trimmed.slice(5).trim();
-          if (payload === "[DONE]") continue;
-          try {
-            const json = JSON.parse(payload);
-            const delta = json.choices?.[0]?.delta || {};
-            if (delta.reasoning_content) {
-              assistantMsg.reasoning = (assistantMsg.reasoning || "") + delta.reasoning_content;
-              if (!thinkEl) {
-                thinkEl = document.createElement("div");
-                thinkEl.className = "bubble think";
-                node.insertBefore(thinkEl, bubble);
-              }
-              thinkEl.textContent = assistantMsg.reasoning;
-              els.transcript.scrollTop = els.transcript.scrollHeight;
-            }
-            if (delta.content) {
-              assistantMsg.content += delta.content;
-              setBubbleText(bubble, assistantMsg.content);
-              els.transcript.scrollTop = els.transcript.scrollHeight;
-            }
-          } catch {
-            /* ignore partial SSE JSON */
-          }
-        }
-      }
-      if (!assistantMsg.content && !assistantMsg.reasoning) {
-        assistantMsg.content = "(empty reply)";
-      } else if (!assistantMsg.content && assistantMsg.reasoning) {
-        assistantMsg.content = "";
-      }
-      if (!assistantMsg.reasoning) delete assistantMsg.reasoning;
-      bubble.classList.remove("streaming");
-      setBubbleText(bubble, assistantMsg.content);
-      await saveCurrent();
-      setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
-      // Speak final answer text only (not reasoning dumps).
-      const spoken = messagePreviewText(node, bubble.querySelector(".bubble-body") || bubble);
-      if (els.ttsToggle && els.ttsToggle.checked) {
-        if (spoken) {
-          await speakFinal(spoken);
-        } else {
-          setStatus("Read aloud skipped: empty answer text (thinking-only).", null);
-        }
-      }
+      await streamAssistantInto(assistantMsg, node, signal);
     } catch (err) {
-      stopSpeaking();
-      assistantMsg.content = `Error: ${err.message}`;
-      bubble.classList.remove("streaming");
-      setBubbleText(bubble, assistantMsg.content);
-      await saveCurrent();
-      setStatus(`Request failed: ${err.message}`, false);
-    } finally {
-      busy = false;
-      els.sendBtn.disabled = false;
-      els.prompt.focus();
+      if (ramAbortRequested || isAbortError(err)) {
+        const bubble = node.querySelector(".bubble:not(.think)");
+        if (bubble) bubble.classList.remove("streaming");
+        // handleRamPressure owns status, cleanup, and summarize
+        busy = false;
+        els.sendBtn.disabled = false;
+        endGeneration(gen);
+        return;
+      }
+      if (isContextLengthError(err.message)) {
+        try {
+          setStatus("Hit context limit — compressing and retrying once…", null);
+          if (current.messages[current.messages.length - 1] === assistantMsg) {
+            current.messages.pop();
+          }
+          await compressHistoryIfNeeded("", { signal });
+          assistantMsg.content = "";
+          delete assistantMsg.reasoning;
+          current.messages.push(assistantMsg);
+          renderTranscript();
+          const fresh = renderMessage(assistantMsg, true);
+          const last = els.transcript.lastElementChild;
+          if (last) last.replaceWith(fresh);
+          else els.transcript.appendChild(fresh);
+          node = fresh;
+          await saveCurrent();
+          await streamAssistantInto(assistantMsg, node, signal);
+        } catch (retryErr) {
+          if (ramAbortRequested || isAbortError(retryErr)) {
+            const bubble = node.querySelector(".bubble:not(.think)");
+            if (bubble) bubble.classList.remove("streaming");
+            busy = false;
+            els.sendBtn.disabled = false;
+            endGeneration(gen);
+            return;
+          }
+          stopSpeaking();
+          assistantMsg.content = `Error: ${retryErr.message}`;
+          const bubble = node.querySelector(".bubble:not(.think)");
+          if (bubble) {
+            bubble.classList.remove("streaming");
+            setBubbleText(bubble, assistantMsg.content);
+          }
+          await saveCurrent();
+          setStatus(`Request failed: ${retryErr.message}`, false);
+          busy = false;
+          els.sendBtn.disabled = false;
+          endGeneration(gen);
+          els.prompt.focus();
+          return;
+        }
+      } else {
+        stopSpeaking();
+        assistantMsg.content = `Error: ${err.message}`;
+        const bubble = node.querySelector(".bubble:not(.think)");
+        if (bubble) {
+          bubble.classList.remove("streaming");
+          setBubbleText(bubble, assistantMsg.content);
+        }
+        await saveCurrent();
+        setStatus(`Request failed: ${err.message}`, false);
+        busy = false;
+        els.sendBtn.disabled = false;
+        endGeneration(gen);
+        els.prompt.focus();
+        return;
+      }
+    }
+
+    endGeneration(gen);
+    busy = false;
+    els.sendBtn.disabled = false;
+    els.prompt.focus();
+  }
+
+  async function streamAssistantInto(assistantMsg, node, signal) {
+    let thinkEl = node.querySelector(".bubble.think");
+    const bubble = node.querySelector(".bubble:not(.think)");
+    if (!bubble) throw new Error("missing assistant bubble");
+
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        model: modelId,
+        messages: apiMessages().slice(0, -1),
+        stream: true,
+        temperature: 0.7,
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(parseErrorPayload(errText) || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n");
+      buffer = parts.pop() || "";
+      for (const line of parts) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const json = JSON.parse(payload);
+          const delta = json.choices?.[0]?.delta || {};
+          if (delta.reasoning_content) {
+            assistantMsg.reasoning = (assistantMsg.reasoning || "") + delta.reasoning_content;
+            if (!thinkEl) {
+              thinkEl = document.createElement("div");
+              thinkEl.className = "bubble think";
+              node.insertBefore(thinkEl, bubble);
+            }
+            thinkEl.textContent = assistantMsg.reasoning;
+            els.transcript.scrollTop = els.transcript.scrollHeight;
+          }
+          if (delta.content) {
+            assistantMsg.content += delta.content;
+            setBubbleText(bubble, assistantMsg.content);
+            els.transcript.scrollTop = els.transcript.scrollHeight;
+          }
+        } catch {
+          /* ignore partial SSE JSON */
+        }
+      }
+    }
+    if (!assistantMsg.content && !assistantMsg.reasoning) {
+      assistantMsg.content = "(empty reply)";
+    } else if (!assistantMsg.content && assistantMsg.reasoning) {
+      assistantMsg.content = "";
+    }
+    if (!assistantMsg.reasoning) delete assistantMsg.reasoning;
+    bubble.classList.remove("streaming");
+    setBubbleText(bubble, assistantMsg.content);
+    await saveCurrent();
+    setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
+    const spoken = messagePreviewText(node, bubble.querySelector(".bubble-body") || bubble);
+    if (els.ttsToggle && els.ttsToggle.checked) {
+      if (spoken) {
+        await speakFinal(spoken);
+      } else {
+        setStatus("Read aloud skipped: empty answer text (thinking-only).", null);
+      }
     }
   }
 
@@ -920,9 +1282,47 @@
     }
   });
 
+  async function pollRam() {
+    if (!els.ramStatus || !els.ramMeterFill) return;
+    try {
+      const ram = await api("/api/ram");
+      if (!ram?.available) throw new Error(ram?.error || "unavailable");
+      const used = Number(ram.used_gib);
+      const total = Number(ram.total_gib);
+      const pct = Number(ram.percent);
+      const freeGib =
+        ram.free_gib != null
+          ? Number(ram.free_gib)
+          : Number(ram.free_bytes) / (1024 ** 3);
+      if (ram.pressure_trigger_gib != null) {
+        ramTriggerGib = Number(ram.pressure_trigger_gib);
+      }
+      if (ram.pressure_clear_gib != null) {
+        ramClearGib = Number(ram.pressure_clear_gib);
+      }
+      els.ramStatus.textContent = `${used.toFixed(1)} / ${total.toFixed(1)} GiB (${pct.toFixed(0)}%) · ${freeGib.toFixed(1)} free`;
+      els.ramMeterFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      const action = evaluateRamPressure(freeGib, ramPressureLatched);
+      if (action === "trigger") {
+        ramPressureLatched = true;
+        void handleRamPressure(freeGib);
+      } else if (action === "clear") {
+        ramPressureLatched = false;
+      }
+    } catch {
+      els.ramStatus.textContent = "RAM —";
+      els.ramMeterFill.style.width = "0%";
+    }
+  }
+
   async function boot() {
+    pollRam();
+    setInterval(pollRam, 2000);
     try {
       const health = await api("/api/health");
+      if (health?.ram_policy?.available && health.ram_policy.safe_ctx) {
+        safeCtx = health.ram_policy.safe_ctx;
+      }
       const tts = health?.tts;
       ttsAvailable = !!(tts && tts.available);
       if (els.ttsToggle) {

@@ -64,10 +64,18 @@
           <button type="button" class="btn primary send" id="sendBtn">Send</button>
         </div>
         <p class="composer-note">
-          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for new answers. Use the speaker icon on any message to read that box on demand.
+          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for new answers. Near the context limit, older turns are auto-summarized. Use the speaker icon on any message to read that box on demand.
         </p>
       </section>
     </main>
+  </div>
+
+  <div class="status-bar" id="status-bar" role="status" aria-live="polite">
+    <div class="status-bar-ram" title="System memory">
+      <span class="status-bar-label">RAM</span>
+      <div class="status-bar-meter" aria-hidden="true"><div class="status-bar-meter-fill" id="ram-meter-fill"></div></div>
+      <span class="status-bar-value" id="ram-status">—</span>
+    </div>
   </div>
 
   <script src="/vendor/marked.min.js"></script>

@@ -30,7 +30,11 @@ body {
 }
 
 body {
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -90,9 +94,63 @@ body {
   z-index: 2;
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
-  height: 100vh;
-  height: 100dvh;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
+}
+
+.status-bar {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  padding: 0 0.75rem;
+  border-top: 1px solid var(--line);
+  background: rgba(7, 11, 20, 0.92);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  user-select: none;
+}
+
+.status-bar-ram {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.status-bar-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.status-bar-meter {
+  width: 72px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(237, 241, 247, 0.12);
+  overflow: hidden;
+}
+
+.status-bar-meter-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--teal);
+  transition: width 0.35s ease;
+}
+
+.status-bar-value {
+  color: var(--text);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .rail {
@@ -291,6 +349,15 @@ body {
 .msg.user .role {
   text-align: right;
   color: var(--amber);
+}
+
+.msg.summary .role {
+  color: var(--teal);
+}
+
+.msg.summary .bubble {
+  border-style: dashed;
+  background: rgba(78, 205, 196, 0.06);
 }
 
 .msg .bubble {
