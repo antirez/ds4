@@ -17402,8 +17402,16 @@ int ds4_gpu_indexer_score_one_tensor(
         }
 
         if (n_head == 64 && head_dim == 128) {
-            id<MTLComputePipelineState> direct_pipeline =
-                ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
+            /* Same lightning-indexer organization for decode: one kernel,
+             * causal masking off (n_tokens==1).
+             * DS4_METAL_DISABLE_INDEXER_LLT rolls back (A/B control). */
+            const bool score_llt =
+                getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
+            const bool score_nsg4 = getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL;
+            id<MTLComputePipelineState> direct_pipeline = score_llt
+                ? ds4_gpu_get_pipeline(score_nsg4 ? "kernel_dsv4_indexer_scores_llt_nsg4"
+                                                  : "kernel_dsv4_indexer_scores_llt")
+                : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
@@ -17432,9 +17440,21 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            if (score_llt && score_nsg4) {
+                [enc setThreadgroupMemoryLength:(32u*128u + 8u*128u) * sizeof(uint16_t) +
+                                                (8u + 256u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else if (score_llt) {
+                [enc setThreadgroupMemoryLength:(64u*128u + 8u*128u) * sizeof(uint16_t) +
+                                                (8u + 512u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer direct score")) return 0;
@@ -17555,10 +17575,24 @@ static int ds4_gpu_indexer_scores_batch_tensor(
          * those paths keep the older direct/tiled score kernels.
          */
         const bool use_nax = ds4_gpu_mpp_available() && n_tokens >= 16u;
+        /* Lightning-indexer-organized scorer (ported from llama.cpp) is the
+         * default pre-M5/NAX schedule; DS4_METAL_DISABLE_INDEXER_LLT rolls
+         * back to the tiled kernel (A/B control). */
+        const bool use_llt = !use_nax && !g_quality_mode &&
+            getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
+        const char *llt_nb = getenv("DS4_METAL_INDEXER_LLT_NBPTG");
+        const char *llt_name =
+            (llt_nb && llt_nb[0] == '3' && llt_nb[1] == '2' && llt_nb[2] == '\0') ? "kernel_dsv4_indexer_scores_llt32" :
+            (llt_nb && llt_nb[0] == '1' && llt_nb[1] == '6' && llt_nb[2] == '\0') ? "kernel_dsv4_indexer_scores_llt16" :
+            "kernel_dsv4_indexer_scores_llt";
+        if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
+            llt_name = "kernel_dsv4_indexer_scores_llt_nsg4";
+        }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32"
-                            : "kernel_dsv4_indexer_scores_tiled"));
+                            : (use_llt ? llt_name
+                                       : "kernel_dsv4_indexer_scores_tiled")));
         if (!pipeline) return 0;
 
         ds4_gpu_dsv4_indexer_scores_fused_args args = {
@@ -17606,7 +17640,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-        } else {
+        } else if (!use_llt) {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;
@@ -17616,6 +17650,22 @@ static int ds4_gpu_indexer_scores_batch_tensor(
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        } else if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
+            /* NSG=4: sk[32x128]half + sq[8x128]half + sw[8] + sqk[256] f32 */
+            [enc setThreadgroupMemoryLength:(32u*128u + 8u*128u) * sizeof(uint16_t) +
+                                            (8u + 256u) * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
+                                                  ((NSUInteger)n_tokens + 7u) / 8u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            /* sk[NKxDK]half + sq[NHPTGxDK]half + sw[NHPTG] + sqk[512] f32 */
+            [enc setThreadgroupMemoryLength:(64u*128u + 8u*128u) * sizeof(uint16_t) +
+                                            (8u + 512u) * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u,
+                                                  ((NSUInteger)n_tokens + 7u) / 8u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
 
