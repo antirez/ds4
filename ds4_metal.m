@@ -42682,8 +42682,13 @@ int ds4_gpu_output_hc_weights_tensor(
         const bool use_weights4 =
             weights4_shape && !g_quality_mode &&
             g_output_hc_weights4_pipeline != nil &&
+            /* The test flag arm already drives this kernel on every family, so
+             * test_metal_output_hc_weights4_exact has been proving it exact on
+             * Apple8 all along - only production was held to the M3 name. */
             (ds4_gpu_device_name_contains("M3") ||
-             (g_test_flags & DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4) != 0u) &&
+             (g_test_flags & DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4) != 0u ||
+             (ds4_gpu_device_is_pre_m5_apple_silicon() &&
+              getenv("DS4_METAL_DISABLE_PRE_M5_OUTPUT_HC_WEIGHTS4") == NULL)) &&
             g_output_hc_weights4_pipeline.maxTotalThreadsPerThreadgroup >= 2u;
         if (require_weights4 && weights4_shape && !use_weights4) {
             fprintf(stderr,
