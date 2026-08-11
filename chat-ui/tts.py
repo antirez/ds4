@@ -1,4 +1,4 @@
-"""Local text-to-speech for chat-ui (macOS say, optional Piper)."""
+"""Local text-to-speech for chat-ui (Piper preferred, macOS say fallback)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ PIPER_TIMEOUT_SEC = 180
 
 # Prefer a natural English voice when present; otherwise the system default.
 PREFERRED_SAY_VOICES = ("Samantha", "Daniel", "Karen", "Moira", "Alex", "Fred")
+DEFAULT_PIPER_VOICE = "en_US-lessac-medium"
+
+CHAT_UI_DIR = Path(__file__).resolve().parent
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,7 @@ class TtsTooling:
     afconvert: str | None
     piper: str | None
     piper_model: str | None
+    piper_config: str | None = None
 
     @property
     def available(self) -> bool:
@@ -44,16 +48,70 @@ class TtsError(RuntimeError):
     """Raised when speech cannot be synthesized."""
 
 
+def piper_root() -> Path:
+    override = (os.environ.get("DS4_PIPER_ROOT") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".ds4" / "piper"
+
+
+def _first_existing_file(candidates: list[Path]) -> Path | None:
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_piper_bin() -> str | None:
+    env = (os.environ.get("DS4_PIPER_BIN") or "").strip()
+    if env:
+        path = Path(env).expanduser()
+        if path.is_file():
+            return str(path)
+    which = shutil.which("piper")
+    if which:
+        return which
+    found = _first_existing_file(
+        [
+            piper_root() / "venv" / "bin" / "piper",
+            CHAT_UI_DIR / ".venv-piper" / "bin" / "piper",
+        ]
+    )
+    return str(found) if found else None
+
+
+def _resolve_piper_model() -> tuple[str | None, str | None]:
+    env = (os.environ.get("DS4_PIPER_MODEL") or "").strip()
+    candidates: list[Path] = []
+    if env:
+        candidates.append(Path(env).expanduser())
+    voices = piper_root() / "voices"
+    candidates.append(voices / f"{DEFAULT_PIPER_VOICE}.onnx")
+    if voices.is_dir():
+        candidates.extend(sorted(voices.glob("*.onnx")))
+    model = _first_existing_file(candidates)
+    if not model:
+        return None, None
+    config = model.with_suffix(model.suffix + ".json")  # file.onnx.json
+    if not config.is_file():
+        alt = Path(str(model) + ".json")
+        config_path = alt if alt.is_file() else None
+    else:
+        config_path = config
+    return str(model), str(config_path) if config_path else None
+
+
 def discover_tools() -> TtsTooling:
-    piper = shutil.which("piper")
-    model = (os.environ.get("DS4_PIPER_MODEL") or "").strip() or None
-    if model and not Path(model).is_file():
-        model = None
+    model, config = _resolve_piper_model()
     return TtsTooling(
         say=shutil.which("say"),
         afconvert=shutil.which("afconvert"),
-        piper=piper,
+        piper=_resolve_piper_bin(),
         piper_model=model,
+        piper_config=config,
     )
 
 
@@ -61,23 +119,29 @@ def tooling_status(tools: TtsTooling | None = None) -> dict[str, object]:
     t = tools or discover_tools()
     missing: list[str] = []
     if not t.available:
-        if not t.say:
-            missing.append("say (macOS)")
-        if t.say and not t.afconvert:
-            missing.append("afconvert (macOS)")
+        if not t.piper and not (t.say and t.afconvert):
+            missing.append("piper (run: python3 chat-ui/install_piper.py)")
         if t.piper and not t.piper_model:
-            missing.append("DS4_PIPER_MODEL (path to .onnx)")
+            missing.append("piper voice model (.onnx)")
+        if not t.say:
+            missing.append("say (macOS fallback)")
+        if t.say and not t.afconvert:
+            missing.append("afconvert (macOS fallback)")
     return {
         "available": t.available,
         "engine": t.engine,
+        "prefer": "piper",
         "say": t.say,
         "afconvert": t.afconvert,
         "piper": t.piper,
         "piper_model": t.piper_model,
+        "piper_config": t.piper_config,
+        "piper_root": str(piper_root()),
         "missing": missing,
         "install_hint": (
-            "Built-in on macOS (say + afconvert). Optional neural: install Piper "
-            "and set DS4_PIPER_MODEL=/path/to/voice.onnx"
+            "Preferred: python3 chat-ui/install_piper.py "
+            "(local neural Piper under ~/.ds4/piper). "
+            "Fallback: macOS say + afconvert."
         ),
         "max_chars": MAX_TTS_CHARS,
     }
@@ -180,6 +244,8 @@ def _synthesize_piper(text: str, tools: TtsTooling) -> bytes:
             "--output_file",
             str(wav_path),
         ]
+        if tools.piper_config:
+            cmd.extend(["--config", tools.piper_config])
         _run(cmd, timeout=PIPER_TIMEOUT_SEC, stdin_text=text)
         data = wav_path.read_bytes()
     if len(data) < 44:
@@ -193,7 +259,7 @@ def synthesize_wav(
     voice: str | None = None,
     tools: TtsTooling | None = None,
 ) -> tuple[bytes, str]:
-    """Return (wav_bytes, engine_name)."""
+    """Return (wav_bytes, engine_name). Prefers Piper when installed."""
     t = tools or discover_tools()
     spoken = prepare_text(text)
     if t.piper and t.piper_model:
@@ -201,8 +267,8 @@ def synthesize_wav(
     if t.say and t.afconvert:
         return _synthesize_say(spoken, t, voice), "say"
     raise TtsError(
-        "no local TTS engine available; need macOS say+afconvert "
-        "or Piper with DS4_PIPER_MODEL"
+        "no local TTS engine available; run: python3 chat-ui/install_piper.py "
+        "(or use macOS say + afconvert)"
     )
 
 
