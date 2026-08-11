@@ -41,6 +41,41 @@ class PrepareTextTests(unittest.TestCase):
         with self.assertRaises(tts.TtsError):
             tts.prepare_text("```\nonly code\n```")
 
+    def test_arrows_sound_conversational(self) -> None:
+        out = tts.prepare_text("Heat → steam => motion <- source")
+        self.assertNotRegex(out, r"[→⇒←]|=>|->|<-")
+        self.assertIn(" to ", out)
+        self.assertIn(" from ", out)
+        lower = out.lower()
+        self.assertNotIn("arrow", lower)
+
+    def test_comparisons_not_confused_with_arrows(self) -> None:
+        out = tts.prepare_text("if n <= 3 and m >= 1")
+        self.assertIn("less than or equal to", out)
+        self.assertIn("greater than or equal to", out)
+        self.assertNotIn(" from ", out)
+
+    def test_bullets_and_checks(self) -> None:
+        out = tts.prepare_text("• first\n✓ done\n✗ skip")
+        self.assertIn("yes", out.lower())
+        self.assertIn("no", out.lower())
+        self.assertNotRegex(out, r"[•✓✗]")
+
+    def test_dashes_as_pauses(self) -> None:
+        out = tts.prepare_text("warm — then cool - finally done -- end")
+        self.assertNotIn("-", out)
+        self.assertNotRegex(out, r"[—–―]")
+
+    def test_hyphen_compounds_and_ranges(self) -> None:
+        out = tts.prepare_text("Ankle-to-Crown Traction, pages 3-5, well-known")
+        self.assertNotIn("-", out)
+        self.assertIn("Ankle to Crown", out)
+        self.assertIn("3 to 5", out)
+        self.assertIn("well known", out)
+        neg = tts.prepare_text("value is -3 degrees")
+        self.assertNotIn("-", neg)
+        self.assertIn("minus 3", neg)
+
 
 class SynthesizeTests(unittest.TestCase):
     @classmethod

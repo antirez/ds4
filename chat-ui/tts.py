@@ -147,6 +147,76 @@ def tooling_status(tools: TtsTooling | None = None) -> dict[str, object]:
     }
 
 
+# Longer tokens first. Keep ASCII "<=" / ">=" as comparisons, not arrows.
+_SPEAK_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pat), repl)
+    for pat, repl in (
+        (r"<=>|<->|⇔|↔", " back and forth with "),
+        (r"=>|->|→|⇒|⟶|➔|➜|➝|➞|➢|➤", " to "),
+        (r"<-|←|⇐|⟵", " from "),
+        (r"↑|⬆", " up "),
+        (r"↓|⬇", " down "),
+        (r">=|≥", " greater than or equal to "),
+        (r"<=|≤", " less than or equal to "),
+        (r"≠|!=", " not equal to "),
+        (r"≈|~=", " approximately "),
+        (r"±", " plus or minus "),
+        (r"×|✕|✖", " times "),
+        (r"÷", " divided by "),
+        (r"∞", " infinity "),
+        (r"°", " degrees "),
+        (r"✓|✔|✅", " yes "),
+        (r"✗|✘|❌", " no "),
+        (r"…", ", "),
+        (r"(?<=\w)\.\.\.(?=\s|$)", ", "),
+        (r"[•▪▫◦▸►‣⁃]", ", "),
+        (r"&", " and "),
+        (r"©", " copyright "),
+        (r"®", " registered "),
+        (r"™", " trademark "),
+    )
+)
+
+_MINUS_TOKEN = " <<MINUS>> "
+
+
+def _rewrite_dashes(text: str) -> str:
+    """Remove dash/hyphen characters so TTS does not say 'dash'."""
+    out = text
+    # Protect numeric negatives before stripping hyphens: -3 -> minus 3
+    out = re.sub(r"(?<![\w.])-(?=\d)", _MINUS_TOKEN, out)
+    # Unicode dashes and long ASCII rules -> pause
+    out = re.sub(r"[—–―‒⁓]+", ", ", out)
+    out = re.sub(r"-{2,}", ", ", out)
+    # Spaced hyphen separators
+    out = re.sub(r"\s+-\s+", ", ", out)
+    # Markdown / list markers at line start
+    out = re.sub(r"(?m)^[ \t]*-\s+", "", out)
+    # Numeric ranges: 3-5 -> 3 to 5
+    out = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " to ", out)
+    # Compound words / titles: Ankle-to-Crown -> Ankle to Crown
+    out = re.sub(r"(?<=[A-Za-z0-9])-(?=[A-Za-z0-9])", " ", out)
+    # Any leftover hyphen-minus
+    out = out.replace("-", ", ")
+    out = out.replace(_MINUS_TOKEN, " minus ")
+    return out
+
+
+def speak_friendly(text: str) -> str:
+    """Rewrite symbols into short phrases that sound natural when spoken."""
+    out = text
+    for pattern, repl in _SPEAK_REPLACEMENTS:
+        out = pattern.sub(repl, out)
+    out = _rewrite_dashes(out)
+    # Collapse whitespace introduced by replacements; keep paragraph breaks.
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    out = re.sub(r"(,\s*){2,}", ", ", out)
+    return out.strip()
+
+
 def prepare_text(text: str) -> str:
     """Keep spoken output short and skip heavy code dumps."""
     if not isinstance(text, str):
@@ -157,6 +227,7 @@ def prepare_text(text: str) -> str:
     # Drop fenced code blocks; they read poorly aloud.
     cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    cleaned = speak_friendly(cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
