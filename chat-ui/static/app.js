@@ -389,6 +389,7 @@
   }
 
   function chatListMeta(chat) {
+    // List rows from /api/chats omit messages; prefer server token_estimate.
     const toks =
       chat.token_estimate != null
         ? chat.token_estimate
@@ -396,7 +397,10 @@
     const size =
       chat.size_label ||
       (chat.size_bytes != null ? formatSizeLabel(chat.size_bytes) : "");
-    const parts = [`${formatTokenEstimate(toks)} tok`];
+    const when = fmtTime(chat.updated_at);
+    const parts = [];
+    if (when) parts.push(`Updated ${when}`);
+    parts.push(`${formatTokenEstimate(toks)} tok`);
     if (size) parts.push(size);
     return parts.join(" · ");
   }
