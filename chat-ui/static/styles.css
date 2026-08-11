@@ -611,7 +611,8 @@ body {
   -webkit-mask-image: none;
 }
 
-/* Web search loader */
+/* Activity / web search loader */
+.activity-loader,
 .web-search-loader {
   display: flex;
   align-items: center;
@@ -627,8 +628,10 @@ body {
   animation: rise 0.3s ease both;
 }
 
+.activity-spinner,
 .web-search-spinner,
 #statusLine.status-searching::before,
+#statusLine.status-activity::before,
 #statusLine.status-summarizing::before {
   display: inline-block;
   width: 0.85em;
@@ -642,6 +645,7 @@ body {
 }
 
 #statusLine.status-searching,
+#statusLine.status-activity,
 #statusLine.status-summarizing {
   display: inline-flex;
   align-items: center;
@@ -649,8 +653,14 @@ body {
 }
 
 #statusLine.status-searching::before,
+#statusLine.status-activity::before,
 #statusLine.status-summarizing::before {
   content: "";
+}
+
+.activity-loader .activity-label {
+  color: var(--text);
+  letter-spacing: 0.01em;
 }
 
 .msg .bubble-body {
@@ -1134,6 +1144,7 @@ textarea#prompt:focus {
 
   .msg,
   .empty,
+  .activity-loader,
   .web-search-loader {
     animation: none;
   }
