@@ -6,6 +6,8 @@
   const CONTEXT_SUMMARIZE_RATIO = 0.72;
   const CONTEXT_HARD_RATIO = 0.95;
   const KEEP_RECENT_MESSAGES = 6;
+  /** Manual / fork / RAM force: keep a short tail so compress can actually shrink. */
+  const FORCE_KEEP_RECENT_MESSAGES = 2;
   const MAX_COMPRESS_PASSES = 4;
   const SUMMARY_PREFIX = "[conversation summary]";
   // Same 6 GiB reserve as scripts/safe_ctx.py DEFAULT_RESERVE_GIB / RAM_PRESSURE_*.
@@ -41,6 +43,9 @@
     composerNote: document.querySelector(".composer-note"),
     ramStatus: document.getElementById("ram-status"),
     ramMeterFill: document.getElementById("ram-meter-fill"),
+    summarizeProgress: document.getElementById("summarizeProgress"),
+    summarizeProgressLabel: document.getElementById("summarizeProgressLabel"),
+    ramNotice: document.getElementById("ramNotice"),
   };
 
   /** @type {{id:string,title:string,messages:any[],created_at?:string,updated_at?:string}|null} */
@@ -49,8 +54,13 @@
   let pendingFiles = [];
   /** @type {WeakMap<object, boolean>} session expand state for reasoning mirrors */
   const thinkExpandedByMsg = new WeakMap();
+  /** @type {WeakMap<object, boolean>} session expand state for web-context panels */
+  const webExpandedByMsg = new WeakMap();
   /** @type {HTMLElement|null} */
-  let webSearchLoaderEl = null;
+  let activityLoaderEl = null;
+  let activityToken = 0;
+  /** @type {ReturnType<typeof setTimeout>|null} */
+  let activityPhaseTimer = null;
   let busy = false;
   let modelId = "deepseek-v4-flash";
   let contextLength = 100000;
@@ -67,6 +77,9 @@
   let ramFallbackRunning = false;
   let ramTriggerGib = RAM_PRESSURE_TRIGGER_GIB;
   let ramClearGib = RAM_PRESSURE_CLEAR_GIB;
+  let lastRamActionLogged = null;
+  let ramNoticeTimer = null;
+  let summarizeLoaderDepth = 0;
 
   function escapeHtml(s) {
     return String(s)
@@ -197,39 +210,164 @@
     thinkEl.textContent = text || "";
   }
 
-  function showWebSearchLoader(label) {
-    hideWebSearchLoader();
+  const WEB_CONTEXT_RE =
+    /----- web context[\s\S]*?----- end web context -----\s*/i;
+
+  function extractWebContextBlock(content) {
+    const raw = String(content || "");
+    const match = raw.match(WEB_CONTEXT_RE);
+    if (!match) return { web: "", rest: raw };
+    const web = match[0].trim();
+    const rest = (raw.slice(0, match.index) + raw.slice(match.index + match[0].length))
+      .replace(/^\s+/, "")
+      .replace(/\s+$/, "");
+    return { web, rest };
+  }
+
+  function isWebExpanded(msg) {
+    return !!(msg && webExpandedByMsg.get(msg));
+  }
+
+  function setWebExpanded(msg, expanded) {
+    if (msg) webExpandedByMsg.set(msg, !!expanded);
+  }
+
+  function createWebMirror(msg, text) {
+    const expanded = isWebExpanded(msg);
+    const web = document.createElement("div");
+    web.className = "bubble webctx" + (expanded ? " expanded" : "");
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "webctx-toggle";
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const label = document.createElement("span");
+    label.className = "webctx-label";
+    label.textContent = "Web context";
+    const chevron = document.createElement("span");
+    chevron.className = "webctx-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    toggle.appendChild(label);
+    toggle.appendChild(chevron);
+    const body = document.createElement("div");
+    body.className = "webctx-body";
+    body.textContent = text != null ? text : "";
+    toggle.addEventListener("click", () => {
+      const next = !web.classList.contains("expanded");
+      web.classList.toggle("expanded", next);
+      toggle.setAttribute("aria-expanded", next ? "true" : "false");
+      setWebExpanded(msg, next);
+    });
+    web.appendChild(toggle);
+    web.appendChild(body);
+    return web;
+  }
+
+  function contentBubbleEl(node) {
+    return node.querySelector(".bubble-main") || node.querySelector(".bubble:not(.think):not(.webctx)");
+  }
+
+  function clearActivityPhaseTimer() {
+    if (activityPhaseTimer != null) {
+      clearTimeout(activityPhaseTimer);
+      activityPhaseTimer = null;
+    }
+  }
+
+  /** Drop the in-flight activity row / spinner class (status text left alone). */
+  function clearActivity() {
+    activityToken += 1;
+    clearActivityPhaseTimer();
+    if (activityLoaderEl) {
+      activityLoaderEl.remove();
+      activityLoaderEl = null;
+    }
+    if (els.statusLine) {
+      els.statusLine.classList.remove("status-searching", "status-activity");
+    }
+  }
+
+  /**
+   * Human-readable pipeline phase. Updates status line; optionally a transcript row
+   * (same chrome as the old web-search loader).
+   * @param {string} message
+   * @param {{ transcript?: boolean, searching?: boolean }} [opts]
+   */
+  function setActivity(message, opts = {}) {
+    const text = String(message || "").trim();
+    if (!text) {
+      clearActivity();
+      return;
+    }
+    const showTranscript = opts.transcript !== false;
+    const searching = !!opts.searching;
+    const summarizing = summarizeLoaderDepth > 0;
+
+    if (els.statusLine) {
+      els.statusLine.classList.remove("status-searching", "status-activity");
+      if (!summarizing) {
+        els.statusLine.classList.add(searching ? "status-searching" : "status-activity");
+      }
+    }
+    setStatus(text, null);
+
+    if (!showTranscript || summarizing) {
+      if (activityLoaderEl) {
+        const span = activityLoaderEl.querySelector(".activity-label");
+        if (span) span.textContent = text;
+      }
+      return;
+    }
+
     const empty = els.transcript.querySelector(".empty");
     if (empty) empty.remove();
-    const el = document.createElement("div");
-    el.className = "web-search-loader";
-    el.setAttribute("role", "status");
-    el.setAttribute("aria-live", "polite");
-    const text = label ? `Searching: ${label}` : "Searching the web…";
-    el.innerHTML =
-      '<span class="web-search-spinner" aria-hidden="true"></span>' +
-      `<span>${escapeHtml(text)}</span>`;
-    els.transcript.appendChild(el);
-    webSearchLoaderEl = el;
+
+    if (!activityLoaderEl) {
+      const el = document.createElement("div");
+      el.className = "activity-loader" + (searching ? " web-search-loader" : "");
+      el.setAttribute("role", "status");
+      el.setAttribute("aria-live", "polite");
+      el.innerHTML =
+        '<span class="activity-spinner web-search-spinner" aria-hidden="true"></span>' +
+        `<span class="activity-label">${escapeHtml(text)}</span>`;
+      els.transcript.appendChild(el);
+      activityLoaderEl = el;
+    } else {
+      activityLoaderEl.className =
+        "activity-loader" + (searching ? " web-search-loader" : "");
+      const span = activityLoaderEl.querySelector(".activity-label");
+      if (span) span.textContent = text;
+    }
     els.transcript.scrollTop = els.transcript.scrollHeight;
-    if (els.statusLine) els.statusLine.classList.add("status-searching");
-    setStatus(text, null);
+  }
+
+  function showWebSearchLoader(label) {
+    setActivity(label ? `Searching: ${label}` : "Searching the web…", {
+      searching: true,
+    });
   }
 
   function setWebSearchLoaderQuery(query) {
-    if (!webSearchLoaderEl || !query) return;
-    const label = `Searching: ${query}`;
-    const span = webSearchLoaderEl.querySelector("span:not(.web-search-spinner)");
-    if (span) span.textContent = label;
-    setStatus(label, null);
+    if (!query) return;
+    setActivity(`Searching: ${query}`, { searching: true });
   }
 
   function hideWebSearchLoader() {
-    if (webSearchLoaderEl) {
-      webSearchLoaderEl.remove();
-      webSearchLoaderEl = null;
-    }
-    if (els.statusLine) els.statusLine.classList.remove("status-searching");
+    clearActivity();
+  }
+
+  /** Timed web-pipeline labels while /api/web-context is in flight (no SSE). */
+  function startWebActivityPhases() {
+    const token = ++activityToken;
+    clearActivityPhaseTimer();
+    setActivity("Resolving search intent…", { searching: true });
+    activityPhaseTimer = setTimeout(() => {
+      if (token !== activityToken) return;
+      setActivity("Searching the web…", { searching: true });
+      activityPhaseTimer = setTimeout(() => {
+        if (token !== activityToken) return;
+        setActivity("Reading pages…", { searching: true });
+      }, 2200);
+    }, 850);
   }
 
   async function unlockAudio() {
@@ -444,6 +582,17 @@
   }
 
   function setStatus(text, ok) {
+    if (ok === true || ok === false) {
+      activityToken += 1;
+      clearActivityPhaseTimer();
+      if (activityLoaderEl) {
+        activityLoaderEl.remove();
+        activityLoaderEl = null;
+      }
+      if (els.statusLine) {
+        els.statusLine.classList.remove("status-searching", "status-activity");
+      }
+    }
     els.statusLine.textContent = text;
     els.statusLine.style.color = ok === false ? "var(--danger)" : ok ? "var(--teal)" : "var(--muted)";
   }
@@ -481,11 +630,73 @@
     return true;
   }
 
-  /** Mirror of safe_ctx.evaluate_ram_pressure (trigger <6 GiB, clear >7 GiB). */
+  /** Mirror of safe_ctx.evaluate_ram_pressure (trigger <=6 GiB, clear >7 GiB). */
   function evaluateRamPressure(freeGib, latched) {
-    if (freeGib < ramTriggerGib) return latched ? "hold" : "trigger";
+    if (!Number.isFinite(freeGib)) return "idle";
+    if (freeGib <= ramTriggerGib) return latched ? "hold" : "trigger";
     if (latched && freeGib > ramClearGib) return "clear";
     return "idle";
+  }
+
+  function wantForceRamPressure() {
+    try {
+      if (new URLSearchParams(location.search).get("forceRamPressure") === "1") {
+        return true;
+      }
+      return localStorage.getItem("ds4-force-ram-pressure") === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function logRamPressureEval(freeGib, action) {
+    if (action === lastRamActionLogged) return;
+    lastRamActionLogged = action;
+    console.debug("[ram-pressure]", {
+      free_gib: Number(Number(freeGib).toFixed(2)),
+      action,
+      trigger: ramTriggerGib,
+      clear: ramClearGib,
+      latched: ramPressureLatched,
+    });
+  }
+
+  function showRamNotice(text) {
+    if (!els.ramNotice) return;
+    els.ramNotice.textContent = text;
+    els.ramNotice.hidden = false;
+    if (ramNoticeTimer) clearTimeout(ramNoticeTimer);
+    ramNoticeTimer = setTimeout(() => {
+      if (els.ramNotice) els.ramNotice.hidden = true;
+    }, 14000);
+  }
+
+  function showSummarizeLoader(label) {
+    summarizeLoaderDepth += 1;
+    if (els.summarizeProgress) {
+      els.summarizeProgress.hidden = false;
+      els.summarizeProgress.setAttribute("aria-hidden", "false");
+    }
+    if (els.summarizeProgressLabel) {
+      els.summarizeProgressLabel.textContent = label || "Summarizing…";
+    }
+    if (els.statusLine) els.statusLine.classList.add("status-summarizing");
+  }
+
+  function setSummarizeLoaderLabel(label) {
+    if (els.summarizeProgressLabel && label) {
+      els.summarizeProgressLabel.textContent = label;
+    }
+  }
+
+  function hideSummarizeLoader() {
+    summarizeLoaderDepth = Math.max(0, summarizeLoaderDepth - 1);
+    if (summarizeLoaderDepth > 0) return;
+    if (els.summarizeProgress) {
+      els.summarizeProgress.hidden = true;
+      els.summarizeProgress.setAttribute("aria-hidden", "true");
+    }
+    if (els.statusLine) els.statusLine.classList.remove("status-summarizing");
   }
 
   function warnIfHuge(messages) {
@@ -564,33 +775,67 @@
     return (messages || []).filter((m) => !isUiFailureAssistant(m));
   }
 
-  /** One compress pass over a message list; does not touch `current` or disk. */
-  async function buildCompressedMessages(messages, signal) {
-    const base = filterWorkingMessages(messages);
-    if (base.length <= KEEP_RECENT_MESSAGES + 1) return null;
+  function keepRecentForPass(force, pass) {
+    const baseKeep = force ? FORCE_KEEP_RECENT_MESSAGES : KEEP_RECENT_MESSAGES;
+    // Each pass drops two more recent msgs so a stuck fat tail can shrink.
+    return Math.max(0, baseKeep - (Math.max(1, pass) - 1) * 2);
+  }
 
-    const keep = KEEP_RECENT_MESSAGES;
-    let older = base.slice(0, Math.max(1, base.length - keep));
-    const recent = base.slice(older.length);
-    const summarizeBudget = Math.max(2048, Math.floor(contextLength * 0.5));
+  /**
+   * Pure slice planner (mirrored in chat-ui/compress_history.py).
+   * Returns null when there is nothing older than the keep tail to summarize.
+   */
+  function planCompressSlices(messages, keepRecent, opts = {}) {
+    const base = Array.isArray(messages) ? messages.slice() : [];
+    if (base.length < 2) return null;
+    const keep = Math.max(0, Math.min(Number(keepRecent) || 0, base.length - 1));
+    const older = base.slice(0, base.length - keep);
+    const recent = base.slice(base.length - keep);
+    if (!older.length) return null;
 
+    const allowLeftover = opts.allowLeftover !== false;
+    const summarizeBudget = opts.summarizeBudget;
     let chunk = older;
     let leftover = [];
-    while (chunk.length > 2 && historyTokenEstimate(chunk) > summarizeBudget) {
-      const half = Math.max(1, Math.ceil(chunk.length / 2));
-      leftover = chunk.slice(half).concat(leftover);
-      chunk = chunk.slice(0, half);
+    if (
+      allowLeftover &&
+      Number.isFinite(summarizeBudget) &&
+      summarizeBudget > 0
+    ) {
+      while (chunk.length > 2 && historyTokenEstimate(chunk) > summarizeBudget) {
+        const half = Math.max(1, Math.ceil(chunk.length / 2));
+        leftover = chunk.slice(half).concat(leftover);
+        chunk = chunk.slice(0, half);
+      }
     }
+    return { older, recent, chunk, leftover, keep };
+  }
 
-    const summaryText = await requestSummary(formatForSummary(chunk), signal);
+  /** One compress pass over a message list; does not touch `current` or disk. */
+  async function buildCompressedMessages(messages, signal, opts = {}) {
+    const keepRecent =
+      opts.keepRecent != null ? opts.keepRecent : KEEP_RECENT_MESSAGES;
+    const allowLeftover = opts.allowLeftover !== false;
+    const base = filterWorkingMessages(messages);
+    const summarizeBudget = Math.max(2048, Math.floor(contextLength * 0.5));
+    const plan = planCompressSlices(base, keepRecent, {
+      allowLeftover,
+      summarizeBudget,
+    });
+    if (!plan) return null;
+
+    const summaryText = await requestSummary(
+      formatForSummary(plan.chunk),
+      signal
+    );
     return [
       {
         role: "system",
         content: `${SUMMARY_PREFIX}\n${summaryText}`,
         compressed: true,
       },
-      ...leftover,
-      ...recent,
+      ...plan.leftover,
+      ...plan.recent,
     ];
   }
 
@@ -604,11 +849,14 @@
   }
 
   function summarizePassStatus(reason, pass, est) {
-    if (reason === "manual" || reason === "fork") {
+    if (reason === "manual") {
       return `Summarizing older turns (pass ${pass})…`;
     }
+    if (reason === "fork") {
+      return `Summarizing into a new chat (pass ${pass})…`;
+    }
     if (reason === "ram") {
-      return `Low free RAM — summarizing older turns (pass ${pass})…`;
+      return `Low free RAM — summarizing into a new chat (pass ${pass})…`;
     }
     return (
       `Context ~${est.toLocaleString()} / ${contextLength.toLocaleString()} — ` +
@@ -628,48 +876,88 @@
     const applyToCurrent = !!opts.applyToCurrent;
     let msgs = filterWorkingMessages(messages);
     let compressed = false;
-    for (let pass = 1; pass <= MAX_COMPRESS_PASSES; pass++) {
-      const preview = pendingUserContent
-        ? msgs.concat([{ role: "user", content: pendingUserContent }])
-        : msgs.slice();
-      const est = historyTokenEstimate(preview);
-      const trigger = Math.floor(contextLength * CONTEXT_SUMMARIZE_RATIO);
-      const hard = Math.floor(contextLength * CONTEXT_HARD_RATIO);
-      if (!force && est < trigger) {
-        return { messages: msgs, compressed, stillHuge: est >= hard };
-      }
-      if (msgs.length <= KEEP_RECENT_MESSAGES + 1) {
-        return { messages: msgs, compressed, stillHuge: est >= hard };
-      }
-      setStatus(summarizePassStatus(reason, pass, est), null);
-      try {
-        const next = await buildCompressedMessages(msgs, signal);
-        if (!next) return { messages: msgs, compressed, stillHuge: true };
-        msgs = next;
-        compressed = true;
-        if (applyToCurrent && current) {
-          current.messages = msgs;
-          renderTranscript();
-          await saveCurrent();
+    let loaderOwned = false;
+    try {
+      for (let pass = 1; pass <= MAX_COMPRESS_PASSES; pass++) {
+        const preview = pendingUserContent
+          ? msgs.concat([{ role: "user", content: pendingUserContent }])
+          : msgs.slice();
+        const est = historyTokenEstimate(preview);
+        const trigger = Math.floor(contextLength * CONTEXT_SUMMARIZE_RATIO);
+        const hard = Math.floor(contextLength * CONTEXT_HARD_RATIO);
+        if (!force && est < trigger) {
+          return { messages: msgs, compressed, stillHuge: est >= hard };
         }
-      } catch (err) {
-        if (isAbortError(err)) throw err;
-        const label =
-          reason === "manual" || reason === "fork" ? "Summarize" : "Auto-summarize";
-        setStatus(`${label} failed: ${err.message}`, false);
-        return { messages: msgs, compressed, stillHuge: true };
+        const keepRecent = keepRecentForPass(force, pass);
+        // Need at least one message beyond the keep tail (old keep+1 gate
+        // froze force passes at summary+6 and could not shrink further).
+        if (msgs.length <= keepRecent || msgs.length < 2) {
+          return { messages: msgs, compressed, stillHuge: est >= hard };
+        }
+        const passStatus = summarizePassStatus(reason, pass, est);
+        setActivity(
+          reason === "auto" || reason === "manual" || reason === "ram" || reason === "fork"
+            ? "Summarizing context…"
+            : passStatus,
+          { transcript: false }
+        );
+        setStatus(passStatus, null);
+        if (!loaderOwned) {
+          showSummarizeLoader(passStatus);
+          loaderOwned = true;
+        } else {
+          setSummarizeLoaderLabel(passStatus);
+        }
+        try {
+          const beforeTok = historyTokenEstimate(msgs);
+          const next = await buildCompressedMessages(msgs, signal, {
+            keepRecent,
+            // Force/fork: summarize the whole older block; leftover would
+            // retain fat mid-history and defeat the shrink goal.
+            allowLeftover: !force,
+          });
+          if (!next) return { messages: msgs, compressed, stillHuge: true };
+          const afterTok = historyTokenEstimate(next);
+          if (afterTok >= beforeTok) {
+            // Do not keep a larger history; later passes use a shorter keep.
+            if (pass < MAX_COMPRESS_PASSES && keepRecent > 0) continue;
+            return { messages: msgs, compressed, stillHuge: true };
+          }
+          msgs = next;
+          compressed = true;
+          if (applyToCurrent && current) {
+            current.messages = msgs;
+            renderTranscript();
+            await saveCurrent();
+          }
+          // Force target is summary + short tail. Only peel further (keep→0)
+          // when still at/over the hard context ceiling.
+          if (force && afterTok < hard) {
+            return { messages: msgs, compressed, stillHuge: false };
+          }
+        } catch (err) {
+          if (isAbortError(err)) throw err;
+          const label =
+            reason === "manual" || reason === "fork" || reason === "ram"
+              ? "Summarize"
+              : "Auto-summarize";
+          setStatus(`${label} failed: ${err.message}`, false);
+          return { messages: msgs, compressed, stillHuge: true };
+        }
       }
+      const est = historyTokenEstimate(
+        pendingUserContent
+          ? msgs.concat([{ role: "user", content: pendingUserContent }])
+          : msgs
+      );
+      return {
+        messages: msgs,
+        compressed,
+        stillHuge: est >= Math.floor(contextLength * CONTEXT_HARD_RATIO),
+      };
+    } finally {
+      if (loaderOwned) hideSummarizeLoader();
     }
-    const est = historyTokenEstimate(
-      pendingUserContent
-        ? msgs.concat([{ role: "user", content: pendingUserContent }])
-        : msgs
-    );
-    return {
-      messages: msgs,
-      compressed,
-      stillHuge: est >= Math.floor(contextLength * CONTEXT_HARD_RATIO),
-    };
   }
 
   async function compressHistoryIfNeeded(pendingUserContent, opts = {}) {
@@ -701,15 +989,18 @@
 
   async function summarizeInPlace() {
     if (!current || busy || ramFallbackRunning) return;
-    if (workingMessages().length <= KEEP_RECENT_MESSAGES + 1) {
+    if (workingMessages().length < 2) {
       setStatus("Not enough history to summarize.", null);
       return;
     }
     setChatBusy(true);
+    showSummarizeLoader("Summarizing this chat…");
+    const gen = beginGeneration();
     try {
       const result = await compressHistoryIfNeeded("", {
         force: true,
         reason: "manual",
+        signal: gen.signal,
       });
       if (result.compressed) {
         setStatus("History summarized in this chat.", true);
@@ -722,8 +1013,39 @@
         setStatus(`Summarize failed: ${err.message}`, false);
       }
     } finally {
+      endGeneration(gen);
+      hideSummarizeLoader();
       setChatBusy(false);
     }
+  }
+
+  async function forkSummarizedChat(sourceMessages, sourceTitle, opts = {}) {
+    const reason = opts.reason || "fork";
+    const signal = opts.signal;
+    const result = await compressMessagesList(sourceMessages, {
+      force: true,
+      reason,
+      applyToCurrent: false,
+      signal,
+    });
+    if (!result.compressed) {
+      return { ok: false, reason: "nothing" };
+    }
+    const created = await api("/api/chats", {
+      method: "POST",
+      body: JSON.stringify({
+        title: `Summary · ${String(sourceTitle || "chat").slice(0, 40)}`,
+      }),
+    });
+    created.messages = result.messages;
+    current = created;
+    pendingFiles = [];
+    renderAttachBar();
+    els.chatTitle.textContent = current.title;
+    renderTranscript();
+    await saveCurrent();
+    await refreshList();
+    return { ok: true };
   }
 
   async function summarizeToNewChat() {
@@ -735,29 +1057,17 @@
       return;
     }
     setChatBusy(true);
+    showSummarizeLoader("Summarizing into a new chat…");
+    const gen = beginGeneration();
     try {
-      const result = await compressMessagesList(sourceMessages, {
-        force: true,
+      const forked = await forkSummarizedChat(sourceMessages, sourceTitle, {
         reason: "fork",
-        applyToCurrent: false,
+        signal: gen.signal,
       });
-      if (!result.compressed) {
+      if (!forked.ok) {
         setStatus("Nothing left to compress for a new chat.", null);
         return;
       }
-      const created = await api("/api/chats", {
-        method: "POST",
-        body: JSON.stringify({
-          title: `Summary · ${String(sourceTitle).slice(0, 40)}`,
-        }),
-      });
-      created.messages = result.messages;
-      current = created;
-      pendingFiles = [];
-      renderAttachBar();
-      els.chatTitle.textContent = current.title;
-      renderTranscript();
-      await saveCurrent();
       setStatus("Opened new chat from summary. Original left unchanged.", true);
       warnIfHuge(apiMessages());
     } catch (err) {
@@ -765,7 +1075,27 @@
         setStatus(`Summarize to new chat failed: ${err.message}`, false);
       }
     } finally {
+      endGeneration(gen);
+      hideSummarizeLoader();
       setChatBusy(false);
+    }
+  }
+
+  function annotateStoppedForRam() {
+    if (!current) return;
+    const msgs = current.messages || [];
+    const last = msgs[msgs.length - 1];
+    if (!(last && last.role === "assistant")) return;
+    const empty =
+      !String(last.content || "").trim() && !String(last.reasoning || "").trim();
+    if (empty) {
+      msgs.pop();
+      return;
+    }
+    if (!/\[stopped: low free RAM\]/.test(String(last.content || ""))) {
+      last.content =
+        (String(last.content || "").trim() ? String(last.content).trim() + "\n\n" : "") +
+        "[stopped: low free RAM]";
     }
   }
 
@@ -774,38 +1104,51 @@
     if (ramFallbackRunning) return;
     ramFallbackRunning = true;
     stopSpeaking();
-    setStatus(
-      `Free RAM ${freeGib.toFixed(1)} GiB below ${ramTriggerGib} GiB reserve — stopping generation and compressing history…`,
-      false
-    );
+    const notice =
+      `Low RAM (${freeGib.toFixed(1)} GiB free) — summarizing into a new chat…`;
+    showRamNotice(notice);
+    setStatus(notice, false);
     abortGenerationForRam();
+    setChatBusy(true);
+    showSummarizeLoader(notice);
+    const gen = beginGeneration();
     try {
       await new Promise((r) => setTimeout(r, 50));
-      if (!current) return;
-      const msgs = current.messages || [];
-      const last = msgs[msgs.length - 1];
-      if (last && last.role === "assistant") {
-        const empty =
-          !String(last.content || "").trim() && !String(last.reasoning || "").trim();
-        if (empty) {
-          msgs.pop();
-        } else if (!/\[stopped: low free RAM\]/.test(String(last.content || ""))) {
-          last.content =
-            (String(last.content || "").trim() ? String(last.content).trim() + "\n\n" : "") +
-            "[stopped: low free RAM]";
-        }
-      }
-      renderTranscript();
-      await saveCurrent();
-      const result = await compressHistoryIfNeeded("", { force: true, reason: "ram" });
-      if (result.compressed) {
+      if (!current) {
         setStatus(
-          `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped; history compressed.`,
+          `Low free RAM (${freeGib.toFixed(1)} GiB): nothing open to summarize.`,
           false
         );
+        return;
+      }
+      annotateStoppedForRam();
+      renderTranscript();
+      await saveCurrent();
+      const sourceTitle = current.title || "chat";
+      const sourceMessages = JSON.parse(JSON.stringify(current.messages || []));
+      if (filterWorkingMessages(sourceMessages).length < 2) {
+        setStatus(
+          `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped. ` +
+            "Little history left to summarize into a new chat.",
+          false
+        );
+        return;
+      }
+      const forked = await forkSummarizedChat(sourceMessages, sourceTitle, {
+        reason: "ram",
+        signal: gen.signal,
+      });
+      if (forked.ok) {
+        const done =
+          `Low RAM (${freeGib.toFixed(1)} GiB free) — opened summarized new chat. ` +
+          "Original left unchanged.";
+        showRamNotice(done);
+        setStatus(done, false);
+        warnIfHuge(apiMessages());
       } else {
         setStatus(
-          `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped. Little history left to compress.`,
+          `Low free RAM (${freeGib.toFixed(1)} GiB): generation stopped. ` +
+            "Nothing left to compress for a new chat.",
           false
         );
       }
@@ -814,6 +1157,8 @@
         setStatus(`Low free RAM fallback failed: ${err.message}`, false);
       }
     } finally {
+      endGeneration(gen);
+      hideSummarizeLoader();
       ramFallbackRunning = false;
       ramAbortRequested = false;
       setChatBusy(false);
@@ -893,14 +1238,19 @@
     if (msg.reasoning) {
       wrap.appendChild(createThinkMirror(msg, msg.reasoning));
     }
+    const split = extractWebContextBlock(msg.content || "");
+    if (split.web) {
+      wrap.appendChild(createWebMirror(msg, split.web));
+    }
+    const displayContent = split.web ? split.rest : msg.content || "";
     const bubble = document.createElement("div");
-    bubble.className = "bubble" + (streaming ? " streaming" : "");
+    bubble.className = "bubble bubble-main" + (streaming ? " streaming" : "");
     const body = document.createElement("div");
     body.className = "bubble-body";
-    body.dataset.raw = msg.content || "";
+    body.dataset.raw = displayContent;
     const preview = document.createElement("div");
     preview.className = "md-preview";
-    preview.innerHTML = renderMarkdownHtml(msg.content || (streaming ? "" : ""));
+    preview.innerHTML = renderMarkdownHtml(displayContent || (streaming ? "" : ""));
     body.appendChild(preview);
     const actions = document.createElement("div");
     actions.className = "bubble-actions";
@@ -1215,12 +1565,13 @@
     stopSpeaking();
     const gen = beginGeneration();
     const signal = gen.signal;
+    setActivity("Preparing…");
 
     let webContext = "";
     let webMeta = null;
     try {
       if (useWeb) {
-        showWebSearchLoader();
+        startWebActivityPhases();
         webMeta = await fetchWebContext(text, signal);
         webContext = (webMeta && webMeta.context) || "";
         if (!webContext) {
@@ -1244,7 +1595,7 @@
       hideWebSearchLoader();
       endGeneration(gen);
       if (ramAbortRequested || isAbortError(err)) {
-        setChatBusy(false);
+        if (!ramFallbackRunning) setChatBusy(false);
         return;
       }
       setChatBusy(false);
@@ -1273,9 +1624,12 @@
     }
 
     try {
+      setActivity("Preparing…");
       const compressed = await compressHistoryIfNeeded(content, { signal });
       if (compressed.compressed) {
-        setStatus("History compressed — continuing send…", true);
+        setActivity("History compressed — continuing…");
+      } else {
+        setActivity("Sending…");
       }
       const preview = workingMessages().concat([{ role: "user", content }]);
       const est = historyTokenEstimate(preview);
@@ -1285,15 +1639,17 @@
             `(ctx ${contextLength.toLocaleString()}). Send anyway?`
         );
         if (!proceed) {
+          clearActivity();
           endGeneration(gen);
           setChatBusy(false);
           return;
         }
       }
     } catch (err) {
+      clearActivity();
       endGeneration(gen);
       if (ramAbortRequested || isAbortError(err)) {
-        setChatBusy(false);
+        if (!ramFallbackRunning) setChatBusy(false);
         return;
       }
       setChatBusy(false);
@@ -1312,25 +1668,30 @@
     current.messages.push(assistantMsg);
     let node = renderMessage(assistantMsg, true);
     els.transcript.appendChild(node);
+    // Bubble is visible — keep phases on the status line only.
+    setActivity("Waiting for the model…", { transcript: false });
 
     try {
       await streamAssistantInto(assistantMsg, node, signal);
     } catch (err) {
       if (ramAbortRequested || isAbortError(err)) {
-        const bubble = node.querySelector(".bubble:not(.think)");
+        clearActivity();
+        const bubble = contentBubbleEl(node);
         if (bubble) bubble.classList.remove("streaming");
         // handleRamPressure owns status, cleanup, and summarize
-        setChatBusy(false);
+        if (!ramFallbackRunning) setChatBusy(false);
         endGeneration(gen);
         return;
       }
       if (isContextLengthError(err.message)) {
         try {
-          setStatus("Hit context limit — compressing and retrying once…", null);
+          setActivity("Hit context limit — summarizing…", { transcript: false });
+          showSummarizeLoader("Context limit — summarizing…");
           if (current.messages[current.messages.length - 1] === assistantMsg) {
             current.messages.pop();
           }
           await compressHistoryIfNeeded("", { signal });
+          hideSummarizeLoader();
           assistantMsg.content = "";
           delete assistantMsg.reasoning;
           current.messages.push(assistantMsg);
@@ -1341,18 +1702,21 @@
           else els.transcript.appendChild(fresh);
           node = fresh;
           await saveCurrent();
+          setActivity("Waiting for the model…", { transcript: false });
           await streamAssistantInto(assistantMsg, node, signal);
         } catch (retryErr) {
+          hideSummarizeLoader();
+          clearActivity();
           if (ramAbortRequested || isAbortError(retryErr)) {
-            const bubble = node.querySelector(".bubble:not(.think)");
+            const bubble = contentBubbleEl(node);
             if (bubble) bubble.classList.remove("streaming");
-            setChatBusy(false);
+            if (!ramFallbackRunning) setChatBusy(false);
             endGeneration(gen);
             return;
           }
           stopSpeaking();
           assistantMsg.content = `Error: ${retryErr.message}`;
-          const bubble = node.querySelector(".bubble:not(.think)");
+          const bubble = contentBubbleEl(node);
           if (bubble) {
             bubble.classList.remove("streaming");
             setBubbleText(bubble, assistantMsg.content);
@@ -1365,9 +1729,10 @@
           return;
         }
       } else {
+        clearActivity();
         stopSpeaking();
         assistantMsg.content = `Error: ${err.message}`;
-        const bubble = node.querySelector(".bubble:not(.think)");
+        const bubble = contentBubbleEl(node);
         if (bubble) {
           bubble.classList.remove("streaming");
           setBubbleText(bubble, assistantMsg.content);
@@ -1388,7 +1753,7 @@
 
   async function streamAssistantInto(assistantMsg, node, signal) {
     let thinkEl = node.querySelector(".bubble.think");
-    const bubble = node.querySelector(".bubble:not(.think)");
+    const bubble = contentBubbleEl(node);
     if (!bubble) throw new Error("missing assistant bubble");
 
     const res = await fetch("/v1/chat/completions", {
@@ -1569,35 +1934,47 @@
   });
 
   async function pollRam() {
-    if (!els.ramStatus || !els.ramMeterFill) return;
     try {
       const ram = await api("/api/ram");
       if (!ram?.available) throw new Error(ram?.error || "unavailable");
       const used = Number(ram.used_gib);
       const total = Number(ram.total_gib);
       const pct = Number(ram.percent);
-      const freeGib =
+      let freeGib =
         ram.free_gib != null
           ? Number(ram.free_gib)
-          : Number(ram.free_bytes) / (1024 ** 3);
+          : ram.free_bytes != null
+            ? Number(ram.free_bytes) / (1024 ** 3)
+            : Number.NaN;
+      if (!Number.isFinite(freeGib) && Number.isFinite(used) && Number.isFinite(total)) {
+        freeGib = total - used;
+      }
       if (ram.pressure_trigger_gib != null) {
         ramTriggerGib = Number(ram.pressure_trigger_gib);
       }
       if (ram.pressure_clear_gib != null) {
         ramClearGib = Number(ram.pressure_clear_gib);
       }
-      els.ramStatus.textContent = `${used.toFixed(1)} / ${total.toFixed(1)} GiB (${pct.toFixed(0)}%) · ${freeGib.toFixed(1)} free`;
-      els.ramMeterFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-      const action = evaluateRamPressure(freeGib, ramPressureLatched);
+      const evalFree =
+        wantForceRamPressure() && !ramPressureLatched
+          ? Math.min(freeGib, ramTriggerGib)
+          : freeGib;
+      if (els.ramStatus && els.ramMeterFill) {
+        const shown = Number.isFinite(freeGib) ? freeGib : 0;
+        els.ramStatus.textContent = `${used.toFixed(1)} / ${total.toFixed(1)} GiB (${pct.toFixed(0)}%) · ${shown.toFixed(1)} free`;
+        els.ramMeterFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      }
+      const action = evaluateRamPressure(evalFree, ramPressureLatched);
+      logRamPressureEval(evalFree, action);
       if (action === "trigger") {
         ramPressureLatched = true;
-        void handleRamPressure(freeGib);
+        void handleRamPressure(Number.isFinite(evalFree) ? evalFree : ramTriggerGib);
       } else if (action === "clear") {
         ramPressureLatched = false;
       }
     } catch {
-      els.ramStatus.textContent = "RAM —";
-      els.ramMeterFill.style.width = "0%";
+      if (els.ramStatus) els.ramStatus.textContent = "RAM —";
+      if (els.ramMeterFill) els.ramMeterFill.style.width = "0%";
     }
   }
 
@@ -1635,7 +2012,7 @@
             ? " Read aloud needs Piper (make install-piper) or macOS say+afconvert."
             : " Restart chat-ui to enable Read aloud (/api/tts).";
         const summarizeBit =
-          " Use Summarize to compress this chat, or To new chat to fork a summarized copy.";
+          " Use Summarize to compress this chat, or Summarize to new chat to fork a summarized copy.";
         if (ocr && !ocr.images) {
           els.composerNote.textContent =
             "Text/code attach works. Image/PDF OCR needs: brew install tesseract poppler." +

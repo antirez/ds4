@@ -160,6 +160,69 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* —— Summarize / RAM progress —— */
+.summarize-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.45rem 1rem 0.55rem;
+  border-bottom: 1px solid var(--line);
+  background: rgba(6, 8, 7, 0.88);
+}
+
+.summarize-progress[hidden] {
+  display: none !important;
+}
+
+.summarize-progress-track {
+  position: relative;
+  height: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: rgba(232, 237, 228, 0.1);
+}
+
+.summarize-progress-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 36%;
+  border-radius: 2px;
+  background: var(--accent);
+  animation: summarize-indeterminate 1.15s ease-in-out infinite;
+}
+
+.summarize-progress-label {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.ram-notice {
+  margin: 0;
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: rgba(198, 241, 53, 0.1);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.ram-notice[hidden] {
+  display: none !important;
+}
+
+@keyframes summarize-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
 /* —— Rail: chats only —— */
 .rail {
   display: flex;
@@ -475,6 +538,79 @@ body {
   -webkit-mask-image: none;
 }
 
+/* Web context panel — same collapse chrome as reasoning */
+.msg .bubble.webctx {
+  margin-bottom: 0.45rem;
+  padding: 0.55rem 1rem 0.7rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  border-style: dashed;
+  border-color: rgba(198, 241, 53, 0.32);
+  background: rgba(198, 241, 53, 0.04);
+  max-height: none;
+  overflow: visible;
+}
+
+.msg .bubble.webctx .webctx-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0 0 0.35rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+}
+
+.msg .bubble.webctx .webctx-toggle:hover,
+.msg .bubble.webctx .webctx-toggle:focus-visible {
+  color: var(--accent);
+  outline: none;
+}
+
+.msg .bubble.webctx .webctx-toggle:focus-visible {
+  box-shadow: 0 0 0 2px rgba(198, 241, 53, 0.4);
+  border-radius: 4px;
+}
+
+.msg .bubble.webctx .webctx-chevron::before {
+  content: "▸";
+  display: inline-block;
+  font-size: 0.85em;
+  transition: transform 0.15s ease;
+}
+
+.msg .bubble.webctx.expanded .webctx-chevron::before {
+  transform: rotate(90deg);
+}
+
+.msg .bubble.webctx .webctx-body {
+  white-space: pre-wrap;
+  line-height: 1.45;
+  max-height: calc(1.45em * 6);
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+}
+
+.msg .bubble.webctx.expanded .webctx-body {
+  max-height: min(45vh, 22rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+
 /* Web search loader */
 .web-search-loader {
   display: flex;
@@ -492,7 +628,8 @@ body {
 }
 
 .web-search-spinner,
-#statusLine.status-searching::before {
+#statusLine.status-searching::before,
+#statusLine.status-summarizing::before {
   display: inline-block;
   width: 0.85em;
   height: 0.85em;
@@ -504,13 +641,15 @@ body {
   vertical-align: -0.1em;
 }
 
-#statusLine.status-searching {
+#statusLine.status-searching,
+#statusLine.status-summarizing {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
 }
 
-#statusLine.status-searching::before {
+#statusLine.status-searching::before,
+#statusLine.status-summarizing::before {
   content: "";
 }
 
@@ -997,5 +1136,11 @@ textarea#prompt:focus {
   .empty,
   .web-search-loader {
     animation: none;
+  }
+
+  .summarize-progress-bar {
+    animation: none;
+    width: 100%;
+    opacity: 0.65;
   }
 }

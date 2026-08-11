@@ -38,11 +38,19 @@
         <h1 id="chatTitle">New chat</h1>
         <div class="stage-actions">
           <button type="button" class="btn ghost" id="summarizeBtn" title="Compress older turns in this chat (force)">Summarize</button>
-          <button type="button" class="btn ghost" id="summarizeForkBtn" title="Summarize into a new chat; leave this one unchanged">To new chat</button>
+          <button type="button" class="btn ghost" id="summarizeForkBtn" title="Summarize into a new chat; leave this one unchanged">Summarize to new chat</button>
           <button type="button" class="btn ghost" id="renameBtn" title="Rename">Rename</button>
           <button type="button" class="btn ghost danger" id="deleteBtn" title="Delete">Delete</button>
         </div>
       </header>
+
+      <div id="summarizeProgress" class="summarize-progress" hidden aria-hidden="true">
+        <div class="summarize-progress-track" aria-hidden="true">
+          <div class="summarize-progress-bar"></div>
+        </div>
+        <span id="summarizeProgressLabel" class="summarize-progress-label">Summarizing…</span>
+      </div>
+      <div id="ramNotice" class="ram-notice" hidden role="status" aria-live="assertive"></div>
 
       <section class="transcript" id="transcript" aria-live="polite"></section>
 
@@ -66,7 +74,7 @@
           <button type="button" class="btn primary send" id="sendBtn">Send</button>
         </div>
         <p class="composer-note">
-          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for new answers. Near the context limit, older turns are auto-summarized; use <strong>Summarize</strong> or <strong>To new chat</strong> to compress manually. Use the speaker icon on any message to read that box on demand.
+          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for new answers. Near the context limit, older turns are auto-summarized; use <strong>Summarize</strong> or <strong>Summarize to new chat</strong> to compress manually. Use the speaker icon on any message to read that box on demand.
         </p>
       </section>
     </main>
