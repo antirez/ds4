@@ -1032,17 +1032,25 @@ brew install tesseract poppler
 ```
 
 Toggle **Web** in the composer to pull internet context into the next turn.
-The UI searches DuckDuckGo’s HTML endpoint (no API key), fetches a few top
-pages, and prepends a text block to the user message before calling
-`ds4-server`. This is separate from `ds4-agent`’s Chrome-backed
-`google_search` / `visit_page` tools; the OpenAI-compatible server accepts
-client tool schemas but does not register web tools by itself. No extra pip
-packages are required for Web mode (stdlib `urllib` only). Be polite with
-rate limits.
+The UI searches DuckDuckGo’s HTML endpoint (no API key), keeps multiple
+result snippets, and fetches several pages (default up to 8 results / 5
+pages). Failed page fetches are skipped so later hits still fill the quota;
+hosts are diversified when possible, and the prompt budget is split across
+pages so one long page does not wipe the rest. This is separate from
+`ds4-agent`’s Chrome-backed `google_search` / `visit_page` tools; the
+OpenAI-compatible server accepts client tool schemas but does not register
+web tools by itself. No extra pip packages are required for Web mode
+(stdlib `urllib` only). Be polite with rate limits. Restart chat-ui after
+pulling web-context changes.
 
 Message bubbles render Markdown as a preview (headings, lists, code, etc.).
 Copy still uses the underlying Markdown source; **Read aloud** / the speaker
 control speak the visible preview text (no raw `**` / `#` markup).
+
+When a send would approach the server `--ctx` limit (~72% by local estimate),
+chat-ui **auto-summarizes** older turns into a compact `summary` system message,
+keeps the latest exchanges, saves the chat, and continues. If the server still
+returns `context_length_exceeded`, it compresses once more and retries.
 
 Toggle **Read aloud** to have new assistant answers spoken locally after they
 finish streaming. Each message also has a **speaker** control (top-right, next
