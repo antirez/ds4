@@ -80,6 +80,9 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
+int ds4_gpu_parallel_ffn_finish_into_hc(const ds4_gpu_tensor *routed_out,
+                                        const ds4_gpu_tensor *shared_out);
+int ds4_gpu_parallel_ffn_island_close(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
         ds4_gpu_tensor       *gate,

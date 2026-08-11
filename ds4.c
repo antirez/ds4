@@ -24941,8 +24941,13 @@ static bool metal_graph_encode_decode_layer_phase(
                 DS4_N_HC) != 0;
     } else if (parallel_full_ffn) {
 #if defined(__APPLE__)
+        /* The join publishes routed/shared outputs inside the still-open
+         * concurrent encoder so the single HC expansion dispatch lands
+         * there too; the island is closed right after it. */
         const bool parallel_joined =
-            ds4_gpu_parallel_ffn_finish() != 0;
+            ds4_gpu_parallel_ffn_finish_into_hc(
+                    metal_graph_routed_out(g),
+                    metal_graph_shared_out(g)) != 0;
         ok = ok && parallel_joined;
 #else
         ok = false;
@@ -24957,6 +24962,9 @@ static bool metal_graph_encode_decode_layer_phase(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
+#if defined(__APPLE__)
+        (void)ds4_gpu_parallel_ffn_island_close();
+#endif
     } else if (ok && fuse_shared_down_hc) {
         if (cuda_tp_moe_peer_tmp) {
             ok = ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(

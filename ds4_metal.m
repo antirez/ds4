@@ -94,6 +94,7 @@ static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_pipeline;
+static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_spread_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
@@ -9386,6 +9387,41 @@ int ds4_gpu_parallel_ffn_finish(void) {
      * safe and idempotent as an explicit abort. */
     ds4_gpu_parallel_ffn_reset_state(YES);
     return completed;
+}
+
+/* Extends the concurrent FFN island through the HC expansion: instead of
+ * closing the encoder at the join, publish the routed and shared outputs
+ * with an explicit barrier and let the next wrapper's single dispatch land
+ * in the same encoder, saving one encoder transition per layer. The caller
+ * must close the island with ds4_gpu_parallel_ffn_island_close immediately
+ * after that dispatch; only the FFN bookkeeping is cleared here so stray
+ * work cannot re-enter the island protocol. Returns the same completion
+ * flag as ds4_gpu_parallel_ffn_finish. */
+int ds4_gpu_parallel_ffn_finish_into_hc(
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *shared_out) {
+    const int completed =
+        g_parallel_q8_pending && g_parallel_q8_encoded &&
+        g_parallel_ffn_stage == 2 && g_batch_encoder_concurrent;
+    id<MTLBuffer> a = routed_out ? ds4_gpu_tensor_buffer(routed_out) : nil;
+    id<MTLBuffer> b = shared_out ? ds4_gpu_tensor_buffer(shared_out) : nil;
+    if (!completed || !a || !b || !g_batch_enc ||
+        getenv("DS4_METAL_DISABLE_M5_FFN_ISLAND_INTO_HC") != NULL) {
+        ds4_gpu_parallel_ffn_reset_state(YES);
+        return completed;
+    }
+    id<MTLResource> published[2] = { a, b };
+    [g_batch_enc memoryBarrierWithResources:published count:2];
+    g_parallel_q8_pending = NO;
+    g_parallel_q8_encoded = NO;
+    g_parallel_ffn_mode = 0;
+    g_parallel_ffn_stage = 0;
+    return completed;
+}
+
+int ds4_gpu_parallel_ffn_island_close(void) {
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    return 1;
 }
 
 
@@ -42637,12 +42673,26 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
             model_map, model_size, norm_weight_offset, out_bytes, &norm_inner);
         if (!mix_weight || !scalebuf || !basebuf || !norm_weight) return 0;
 
-        if (!g_dsv4_hc_producer_pre_norm_pipeline) {
+        /* Spread shape: one live NR0=2 cluster per comb group raises the
+         * grid from 6 to 10 threadgroups; per-row math is identical, so the
+         * outputs are bit-exact across both shapes. Default on M5-class
+         * GPUs, where the wider grid measured ~+0.13% decode. */
+        const bool comb_spread =
+            ds4_gpu_device_is_m5_apple_silicon() &&
+            getenv("DS4_METAL_DISABLE_M5_HC_SPREAD") == NULL;
+        if (comb_spread) {
+            if (!g_dsv4_hc_producer_pre_norm_spread_pipeline) {
+                g_dsv4_hc_producer_pre_norm_spread_pipeline =
+                    ds4_gpu_get_pipeline(
+                    "kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm_spread");
+            }
+        } else if (!g_dsv4_hc_producer_pre_norm_pipeline) {
             g_dsv4_hc_producer_pre_norm_pipeline = ds4_gpu_get_pipeline(
                 "kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm");
         }
-        id<MTLComputePipelineState> producer =
-            g_dsv4_hc_producer_pre_norm_pipeline;
+        id<MTLComputePipelineState> producer = comb_spread
+            ? g_dsv4_hc_producer_pre_norm_spread_pipeline
+            : g_dsv4_hc_producer_pre_norm_pipeline;
         if (!producer || producer.maxTotalThreadsPerThreadgroup < 512u) {
             return 0;
         }
@@ -42718,7 +42768,7 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:10];
         [enc setBuffer:completion offset:0 atIndex:11];
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(6, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(comb_spread ? 10 : 6, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
 
         ds4_gpu_end_compute_encoder(cb, enc);
