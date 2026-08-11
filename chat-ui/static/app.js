@@ -321,7 +321,8 @@
     const empty = els.transcript.querySelector(".empty");
     if (empty) empty.remove();
 
-    if (!activityLoaderEl) {
+    if (!activityLoaderEl || !activityLoaderEl.isConnected) {
+      activityLoaderEl = null;
       const el = document.createElement("div");
       el.className = "activity-loader" + (searching ? " web-search-loader" : "");
       el.setAttribute("role", "status");
@@ -680,7 +681,10 @@
     if (els.summarizeProgressLabel) {
       els.summarizeProgressLabel.textContent = label || "Summarizing…";
     }
-    if (els.statusLine) els.statusLine.classList.add("status-summarizing");
+    if (els.statusLine) {
+      els.statusLine.classList.remove("status-activity", "status-searching");
+      els.statusLine.classList.add("status-summarizing");
+    }
   }
 
   function setSummarizeLoaderLabel(label) {
@@ -1209,6 +1213,9 @@
   }
 
   function renderTranscript() {
+    if (activityLoaderEl) {
+      activityLoaderEl = null;
+    }
     els.transcript.innerHTML = "";
     if (!current || !current.messages.length) {
       const empty = document.createElement("div");
@@ -1656,6 +1663,10 @@
     els.prompt.value = "";
     pendingFiles = [];
     renderAttachBar();
+    // renderTranscript wipes the DOM; drop stale activity node refs first.
+    if (activityLoaderEl) {
+      activityLoaderEl = null;
+    }
     renderTranscript();
     await saveCurrent();
 
@@ -1751,6 +1762,7 @@
     const bubble = contentBubbleEl(node);
     if (!bubble) throw new Error("missing assistant bubble");
 
+    setActivity("Waiting for the model…", { transcript: false });
     const res = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1769,6 +1781,7 @@
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let sawDelta = false;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1783,6 +1796,12 @@
         try {
           const json = JSON.parse(payload);
           const delta = json.choices?.[0]?.delta || {};
+          if (delta.reasoning_content || delta.content) {
+            if (!sawDelta) {
+              sawDelta = true;
+              setActivity("Generating…", { transcript: false });
+            }
+          }
           if (delta.reasoning_content) {
             assistantMsg.reasoning = (assistantMsg.reasoning || "") + delta.reasoning_content;
             if (!thinkEl) {
