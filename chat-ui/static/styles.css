@@ -299,7 +299,6 @@ body {
   border-radius: var(--radius);
   background: var(--panel);
   border: 1px solid var(--line);
-  white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.45;
   font-size: 0.98rem;
@@ -320,10 +319,117 @@ body {
   font-size: 0.86rem;
   border-style: dashed;
   background: rgba(255, 255, 255, 0.02);
+  white-space: pre-wrap;
 }
 
 .msg .bubble-body {
   min-height: 1.2em;
+}
+
+.msg .md-preview {
+  min-height: 1.2em;
+}
+
+.msg .md-preview > :first-child {
+  margin-top: 0;
+}
+
+.msg .md-preview > :last-child {
+  margin-bottom: 0;
+}
+
+.msg .md-preview p,
+.msg .md-preview ul,
+.msg .md-preview ol,
+.msg .md-preview pre,
+.msg .md-preview blockquote,
+.msg .md-preview table {
+  margin: 0.55em 0;
+}
+
+.msg .md-preview h1,
+.msg .md-preview h2,
+.msg .md-preview h3,
+.msg .md-preview h4 {
+  margin: 0.85em 0 0.35em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+  color: var(--text);
+}
+
+.msg .md-preview h1 { font-size: 1.28rem; }
+.msg .md-preview h2 { font-size: 1.14rem; }
+.msg .md-preview h3 { font-size: 1.05rem; }
+
+.msg .md-preview ul,
+.msg .md-preview ol {
+  padding-left: 1.35rem;
+}
+
+.msg .md-preview li + li {
+  margin-top: 0.2rem;
+}
+
+.msg .md-preview a {
+  color: var(--teal);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.msg .md-preview code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(232, 196, 120, 0.14);
+  border-radius: 5px;
+  padding: 0.08em 0.35em;
+}
+
+.msg .md-preview pre {
+  overflow: auto;
+  padding: 0.7rem 0.8rem;
+  border-radius: 10px;
+  border: 1px solid rgba(232, 196, 120, 0.16);
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.msg .md-preview pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-size: 0.84rem;
+  white-space: pre;
+}
+
+.msg .md-preview blockquote {
+  margin-left: 0;
+  padding: 0.15rem 0 0.15rem 0.85rem;
+  border-left: 3px solid rgba(232, 196, 120, 0.45);
+  color: var(--muted);
+}
+
+.msg .md-preview hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 0.9rem 0;
+}
+
+.msg .md-preview table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92em;
+}
+
+.msg .md-preview th,
+.msg .md-preview td {
+  border: 1px solid rgba(232, 196, 120, 0.2);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.msg .md-preview th {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .msg .bubble-actions {

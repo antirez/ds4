@@ -1032,6 +1032,10 @@ client tool schemas but does not register web tools by itself. No extra pip
 packages are required for Web mode (stdlib `urllib` only). Be polite with
 rate limits.
 
+Message bubbles render Markdown as a preview (headings, lists, code, etc.).
+Copy still uses the underlying Markdown source; **Read aloud** / the speaker
+control speak the visible preview text (no raw `**` / `#` markup).
+
 Toggle **Read aloud** to have new assistant answers spoken locally after they
 finish streaming. Each message also has a **speaker** control (top-right, next
 to Copy) to read that box on demand — useful for older turns or when the

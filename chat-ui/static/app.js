@@ -59,13 +59,65 @@
   const SPEAK_ICON =
     '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><path d="M4 9v6h3l5 4V5L7 9H4z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/><path d="M16 9.5a3.5 3.5 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><path d="M18.2 7a6 6 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>';
 
+  function renderMarkdownHtml(src) {
+    const text = String(src || "");
+    if (!text) return "";
+    try {
+      if (typeof marked !== "undefined" && marked.parse) {
+        marked.setOptions({ gfm: true, breaks: true });
+        const html = marked.parse(text);
+        if (typeof DOMPurify !== "undefined" && DOMPurify.sanitize) {
+          return DOMPurify.sanitize(html, {
+            USE_PROFILES: { html: true },
+          });
+        }
+        return html;
+      }
+    } catch {
+      /* fall through */
+    }
+    return escapeHtml(text).replace(/\n/g, "<br>");
+  }
+
+  function ensurePreviewEl(body) {
+    let preview = body.querySelector(".md-preview");
+    if (!preview) {
+      body.textContent = "";
+      preview = document.createElement("div");
+      preview.className = "md-preview";
+      body.appendChild(preview);
+    }
+    return preview;
+  }
+
   function setBubbleText(bubble, text) {
     const body = bubble.querySelector(".bubble-body");
+    const raw = text || "";
     if (body) {
-      body.textContent = text || "";
+      body.dataset.raw = raw;
+      const preview = ensurePreviewEl(body);
+      preview.innerHTML = renderMarkdownHtml(raw);
       return;
     }
-    bubble.textContent = text || "";
+    bubble.textContent = raw;
+  }
+
+  function messageCopyText(wrap, body) {
+    const raw = (body.dataset.raw || "").trim();
+    if (raw) return raw;
+    const think = wrap.querySelector(".bubble.think");
+    return think ? (think.textContent || "").trim() : "";
+  }
+
+  function messagePreviewText(wrap, body) {
+    const preview = body.querySelector(".md-preview");
+    const visible = preview
+      ? (preview.innerText || preview.textContent || "")
+      : body.innerText || body.textContent || "";
+    const main = String(visible || "").replace(/\u00a0/g, " ").trim();
+    if (main) return main;
+    const think = wrap.querySelector(".bubble.think");
+    return think ? (think.textContent || "").trim() : "";
   }
 
   async function unlockAudio() {
@@ -177,13 +229,6 @@
       await speakFinal(text, { force: true });
     });
     return btn;
-  }
-
-  function messageSpeakText(wrap, body) {
-    const main = (body.textContent || "").trim();
-    if (main) return main;
-    const think = wrap.querySelector(".bubble.think");
-    return think ? (think.textContent || "").trim() : "";
   }
 
   function fmtTime(iso) {
@@ -333,12 +378,15 @@
     bubble.className = "bubble" + (streaming ? " streaming" : "");
     const body = document.createElement("div");
     body.className = "bubble-body";
-    body.textContent = msg.content || (streaming ? "" : "");
+    body.dataset.raw = msg.content || "";
+    const preview = document.createElement("div");
+    preview.className = "md-preview";
+    preview.innerHTML = renderMarkdownHtml(msg.content || (streaming ? "" : ""));
+    body.appendChild(preview);
     const actions = document.createElement("div");
     actions.className = "bubble-actions";
-    const getText = () => messageSpeakText(wrap, body);
-    actions.appendChild(makeSpeakButton(getText));
-    actions.appendChild(makeCopyButton(getText));
+    actions.appendChild(makeSpeakButton(() => messagePreviewText(wrap, body)));
+    actions.appendChild(makeCopyButton(() => messageCopyText(wrap, body)));
     bubble.appendChild(actions);
     bubble.appendChild(body);
     wrap.appendChild(bubble);
@@ -751,10 +799,10 @@
       await saveCurrent();
       setStatus(`API up · model ${modelId} · ctx ${contextLength}`, true);
       // Speak final answer text only (not reasoning dumps).
-      const answer = (assistantMsg.content || "").trim();
+      const spoken = messagePreviewText(node, bubble.querySelector(".bubble-body") || bubble);
       if (els.ttsToggle && els.ttsToggle.checked) {
-        if (answer) {
-          await speakFinal(answer);
+        if (spoken) {
+          await speakFinal(spoken);
         } else {
           setStatus("Read aloud skipped: empty answer text (thinking-only).", null);
         }
