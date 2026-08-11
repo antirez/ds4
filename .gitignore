@@ -34,6 +34,8 @@
 *.dSYM/
 __pycache__/
 *.pyc
+chat-ui/.venv-piper/
+/tts-smoke.wav
 /misc/
 .*.swp
 .DS_Store
