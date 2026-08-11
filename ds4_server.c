@@ -2559,8 +2559,13 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     buf_puts(&out, "[gMASK]<sop>");
     if (think) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
-        buf_puts(&out, "<|system|>");
-        buf_puts(&out, effort ? effort : "Reasoning Effort: Max");
+        /* LOW returns no effort text on purpose (like DeepSeek's default).
+         * Falling back to "Max" here would resurrect the exact "low means the
+         * biggest prompt" bug this change fixes, on the GLM path. */
+        if (effort) {
+            buf_puts(&out, "<|system|>");
+            buf_puts(&out, effort);
+        }
     }
     if (tool_schemas && tool_schemas[0]) {
         buf tools = {0};
@@ -14939,6 +14944,26 @@ static void test_render_glm_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+/* A LOW request intentionally carries no effort prefix; the GLM render must not
+ * fall back to "Reasoning Effort: Max" (the "low means the biggest prompt" bug
+ * this change fixes for DeepSeek, on the GLM path). Thinking stays enabled. */
+static void test_render_glm_low_effort_has_no_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "Reasoning Effort:") == NULL);
+    TEST_ASSERT(strstr(prompt, "<|user|>Hello<|assistant|><think>") != NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -17875,6 +17900,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
+    test_render_glm_low_effort_has_no_prefix();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();

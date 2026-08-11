@@ -1333,6 +1333,7 @@ static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
+    case DS4_THINK_LOW:  return NULL; /* low: no effort prefix, like the default */
     case DS4_THINK_NONE: return NULL;
     }
     return NULL;
