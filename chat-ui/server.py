@@ -320,6 +320,35 @@ def write_json(path: Path, data: Any) -> None:
     tmp.replace(path)
 
 
+def estimate_tokens(text: str | None) -> int:
+    """Rough local estimate; matches chat-ui/static/app.js estimateTokens (chars/4)."""
+    return (len(text or "") + 3) // 4
+
+
+def history_token_estimate(messages: Any) -> int:
+    if not isinstance(messages, list):
+        return 0
+    total = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += estimate_tokens(content)
+    return total
+
+
+def format_size_label(size_bytes: int) -> str:
+    n = max(0, int(size_bytes))
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        kb = n / 1024
+        return f"{kb:.0f} KB" if kb >= 10 else f"{kb:.1f} KB"
+    mb = n / (1024 * 1024)
+    return f"{mb:.0f} MB" if mb >= 10 else f"{mb:.1f} MB"
+
+
 def list_chats(chats_dir: Path) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for path in chats_dir.glob("*.json"):
@@ -327,13 +356,21 @@ def list_chats(chats_dir: Path) -> list[dict[str, Any]]:
             data = read_json(path)
         except (OSError, json.JSONDecodeError):
             continue
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            size_bytes = 0
+        messages = data.get("messages") or []
         items.append(
             {
                 "id": data.get("id", path.stem),
                 "title": data.get("title") or "Untitled",
                 "created_at": data.get("created_at"),
                 "updated_at": data.get("updated_at"),
-                "message_count": len(data.get("messages") or []),
+                "message_count": len(messages) if isinstance(messages, list) else 0,
+                "token_estimate": history_token_estimate(messages),
+                "size_bytes": size_bytes,
+                "size_label": format_size_label(size_bytes),
             }
         )
     items.sort(key=lambda row: row.get("updated_at") or "", reverse=True)

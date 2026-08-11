@@ -367,6 +367,40 @@
     return messages.reduce((n, m) => n + estimateTokens(m.content), 0);
   }
 
+  function formatTokenEstimate(n) {
+    const v = Math.max(0, Number(n) || 0);
+    if (v >= 1000) {
+      const k = v / 1000;
+      // Keep one decimal under 100k so "12.4k" stays readable.
+      return (k >= 100 ? k.toFixed(0) : k.toFixed(1).replace(/\.0$/, "")) + "k";
+    }
+    return String(Math.round(v));
+  }
+
+  function formatSizeLabel(bytes) {
+    const n = Math.max(0, Number(bytes) || 0);
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) {
+      const kb = n / 1024;
+      return (kb >= 10 ? kb.toFixed(0) : kb.toFixed(1)) + " KB";
+    }
+    const mb = n / (1024 * 1024);
+    return (mb >= 10 ? mb.toFixed(0) : mb.toFixed(1)) + " MB";
+  }
+
+  function chatListMeta(chat) {
+    const toks =
+      chat.token_estimate != null
+        ? chat.token_estimate
+        : historyTokenEstimate(chat.messages || []);
+    const size =
+      chat.size_label ||
+      (chat.size_bytes != null ? formatSizeLabel(chat.size_bytes) : "");
+    const parts = [`${formatTokenEstimate(toks)} tok`];
+    if (size) parts.push(size);
+    return parts.join(" · ");
+  }
+
   function parseErrorPayload(text) {
     const raw = (text || "").trim();
     if (!raw) return "request failed";
@@ -824,7 +858,7 @@
       btn.type = "button";
       btn.dataset.id = chat.id;
       btn.className = "chat-item" + (current && current.id === chat.id ? " active" : "");
-      btn.innerHTML = `<span class="t">${escapeHtml(chat.title)}</span><span class="m">${chat.message_count || 0} msgs · ${escapeHtml(fmtTime(chat.updated_at))}</span>`;
+      btn.innerHTML = `<span class="t">${escapeHtml(chat.title)}</span><span class="m">${escapeHtml(chatListMeta(chat))}</span>`;
       btn.addEventListener("click", () => openChat(chat.id));
       els.chatList.appendChild(btn);
     }
