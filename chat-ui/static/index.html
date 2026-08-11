@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DwarfStar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="sky" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <div class="shell">
+    <aside class="rail" id="rail">
+      <header class="rail-head">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <p class="brand-name">DwarfStar</p>
+            <p class="brand-sub">ds4 local chat</p>
+          </div>
+        </div>
+        <button type="button" class="btn primary" id="newChatBtn">New chat</button>
+      </header>
+      <nav class="chat-list" id="chatList" aria-label="Saved conversations"></nav>
+      <footer class="rail-foot">
+        <p id="statusLine">Checking server…</p>
+        <p class="hint">Saved under <code>~/.ds4/chats</code></p>
+      </footer>
+    </aside>
+
+    <main class="stage">
+      <header class="stage-head">
+        <button type="button" class="btn ghost rail-toggle" id="railToggle" aria-label="Toggle conversation list">☰</button>
+        <h1 id="chatTitle">New chat</h1>
+        <div class="stage-actions">
+          <button type="button" class="btn ghost" id="renameBtn" title="Rename">Rename</button>
+          <button type="button" class="btn ghost danger" id="deleteBtn" title="Delete">Delete</button>
+        </div>
+      </header>
+
+      <section class="transcript" id="transcript" aria-live="polite"></section>
+
+      <section class="composer" aria-label="Message composer">
+        <div class="attach-bar" id="attachBar" hidden></div>
+        <div class="composer-row">
+          <label class="attach-btn" title="Attach text, code, images, or PDFs">
+            <input type="file" id="fileInput" multiple accept=".txt,.md,.py,.c,.h,.cpp,.hpp,.js,.ts,.tsx,.jsx,.json,.csv,.toml,.yaml,.yml,.rs,.go,.java,.sh,.css,.html,.xml,.sql,.ini,.cfg,.log,.png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,.bmp,.pdf,text/*,image/*,application/pdf" />
+            <span>Attach</span>
+          </label>
+          <textarea id="prompt" rows="2" placeholder="Message DwarfStar…"></textarea>
+          <button type="button" class="btn primary send" id="sendBtn">Send</button>
+        </div>
+        <p class="composer-note">
+          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only.
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
