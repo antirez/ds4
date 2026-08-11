@@ -895,12 +895,7 @@
           return { messages: msgs, compressed, stillHuge: est >= hard };
         }
         const passStatus = summarizePassStatus(reason, pass, est);
-        setActivity(
-          reason === "auto" || reason === "manual" || reason === "ram" || reason === "fork"
-            ? "Summarizing context…"
-            : passStatus,
-          { transcript: false }
-        );
+        setActivity("Summarizing context…", { transcript: false });
         setStatus(passStatus, null);
         if (!loaderOwned) {
           showSummarizeLoader(passStatus);
@@ -1052,7 +1047,7 @@
     if (!current || busy || ramFallbackRunning) return;
     const sourceTitle = current.title || "chat";
     const sourceMessages = JSON.parse(JSON.stringify(current.messages || []));
-    if (filterWorkingMessages(sourceMessages).length <= KEEP_RECENT_MESSAGES + 1) {
+    if (filterWorkingMessages(sourceMessages).length < 2) {
       setStatus("Not enough history to summarize into a new chat.", null);
       return;
     }
