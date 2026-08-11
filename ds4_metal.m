@@ -25997,7 +25997,9 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         getenv("DS4_METAL_DISABLE_GATHERED_KV_STAGE") == NULL &&
         g_flash_kv_stage_f16_pipeline != nil &&
         (ds4_gpu_device_name_contains("M3") ||
-         ds4_gpu_device_name_contains("M5"));
+         ds4_gpu_device_name_contains("M5") ||
+         (ds4_gpu_device_is_pre_m5_apple_silicon() &&
+          getenv("DS4_METAL_DISABLE_PRE_M5_GATHERED_KV_STAGE") == NULL));
     const bool component_disabled = eligible &&
         (ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") > 0 ||
          ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F16_F16_COPY") > 0);
@@ -27769,10 +27771,17 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         getenv("DS4_METAL_DISABLE_M5_PERSISTENT_ZERO_ATTN_MASK") == NULL &&
         (!packed_shape ||
          getenv("DS4_METAL_DISABLE_M5_PACKED_ZERO_MASK") == NULL);
+    /* The pre-M5 arm mirrors the raw-path sibling's !g_quality_mode clause
+     * (ds4_metal.m:26247) but deliberately not its g_tp_split_world == 1
+     * clause: that guard sits on a host-allocation path, and nothing here
+     * depends on the split. */
     const bool use_persistent_zero_mask =
         use_mask == 0u &&
         (ds4_gpu_device_name_contains("M3") ||
-         m5_persistent_zero_mask) &&
+         m5_persistent_zero_mask ||
+         (ds4_gpu_device_is_pre_m5_apple_silicon() &&
+          !g_quality_mode &&
+          getenv("DS4_METAL_DISABLE_PRE_M5_PERSISTENT_ZERO_ATTN_MASK") == NULL)) &&
         getenv("DS4_METAL_DISABLE_PERSISTENT_ZERO_ATTN_MASK") == NULL;
 
     if (!(use_persistent_zero_mask
