@@ -639,6 +639,16 @@
     return "idle";
   }
 
+  function ramPressureLocked() {
+    return ramPressureLatched;
+  }
+
+  function ramLockReason() {
+    return (
+      `Low RAM — send/web disabled until free memory recovers (>${ramClearGib} GiB).`
+    );
+  }
+
   function wantForceRamPressure() {
     try {
       if (new URLSearchParams(location.search).get("forceRamPressure") === "1") {
@@ -662,13 +672,78 @@
     });
   }
 
+  function setControlDisabledChrome(labelEl, locked, defaultTitle, reason) {
+    if (!labelEl) return;
+    labelEl.classList.toggle("is-disabled", locked);
+    labelEl.setAttribute("aria-disabled", locked ? "true" : "false");
+    labelEl.title = locked ? reason : defaultTitle;
+  }
+
+  /** Grey out / block send, web, and attach while the pressure latch is set. */
+  function updateRamPressureUi() {
+    const locked = ramPressureLocked();
+    const reason = ramLockReason();
+
+    if (els.sendBtn) {
+      els.sendBtn.disabled = busy || locked;
+      els.sendBtn.title = locked ? reason : "";
+    }
+
+    if (els.webToggle) {
+      const label = els.webToggle.closest(".web-toggle");
+      if (locked) {
+        els.webToggle.checked = false;
+        els.webToggle.disabled = true;
+      } else {
+        els.webToggle.disabled = false;
+      }
+      setControlDisabledChrome(
+        label,
+        locked,
+        "Search the web (DuckDuckGo HTML, no API key) and inject context",
+        reason
+      );
+    }
+
+    if (els.fileInput) {
+      const label = els.fileInput.closest(".attach-btn");
+      els.fileInput.disabled = locked;
+      setControlDisabledChrome(
+        label,
+        locked,
+        "Attach text, code, images, or PDFs",
+        reason
+      );
+    }
+
+    if (!els.ramNotice) return;
+    if (locked) {
+      els.ramNotice.classList.add("is-locked");
+      // Keep a temporary pressure/summarize notice if one is still showing.
+      if (!ramNoticeTimer) {
+        els.ramNotice.textContent = reason;
+        els.ramNotice.hidden = false;
+      }
+    } else {
+      els.ramNotice.classList.remove("is-locked");
+    }
+  }
+
   function showRamNotice(text) {
     if (!els.ramNotice) return;
     els.ramNotice.textContent = text;
     els.ramNotice.hidden = false;
     if (ramNoticeTimer) clearTimeout(ramNoticeTimer);
     ramNoticeTimer = setTimeout(() => {
-      if (els.ramNotice) els.ramNotice.hidden = true;
+      ramNoticeTimer = null;
+      if (!els.ramNotice) return;
+      if (ramPressureLatched) {
+        els.ramNotice.textContent = ramLockReason();
+        els.ramNotice.hidden = false;
+        els.ramNotice.classList.add("is-locked");
+      } else {
+        els.ramNotice.hidden = true;
+      }
     }, 14000);
   }
 
@@ -690,6 +765,22 @@
   function setSummarizeLoaderLabel(label) {
     if (els.summarizeProgressLabel && label) {
       els.summarizeProgressLabel.textContent = label;
+    }
+  }
+
+  /**
+   * One phase update for summarize/compress work: status line + progress label.
+   * Replaces prior text in place (no stacked banners). RAM paths may also flash ramNotice.
+   */
+  function notifySummarizePhase(message, opts = {}) {
+    const text = String(message || "").trim();
+    if (!text) return;
+    setActivity(text, { transcript: false });
+    if (summarizeLoaderDepth > 0) {
+      setSummarizeLoaderLabel(text);
+    }
+    if (opts.ramNotice) {
+      showRamNotice(text);
     }
   }
 
@@ -853,18 +944,20 @@
   }
 
   function summarizePassStatus(reason, pass, est) {
+    const n = Math.max(1, pass);
+    const passBit = n > 1 ? ` (pass ${n})` : "";
     if (reason === "manual") {
-      return `Summarizing older turns (pass ${pass})…`;
+      return `Summarizing conversation${passBit}…`;
     }
     if (reason === "fork") {
-      return `Summarizing into a new chat (pass ${pass})…`;
+      return `Summarizing conversation${passBit}…`;
     }
     if (reason === "ram") {
-      return `Low free RAM — summarizing into a new chat (pass ${pass})…`;
+      return `Low RAM — summarizing into a new chat${passBit}…`;
     }
     return (
       `Context ~${est.toLocaleString()} / ${contextLength.toLocaleString()} — ` +
-      `summarizing older turns (pass ${pass})…`
+      `summarizing conversation${passBit}…`
     );
   }
 
@@ -899,16 +992,16 @@
           return { messages: msgs, compressed, stillHuge: est >= hard };
         }
         const passStatus = summarizePassStatus(reason, pass, est);
-        setActivity("Summarizing context…", { transcript: false });
-        setStatus(passStatus, null);
         if (!loaderOwned) {
           showSummarizeLoader(passStatus);
           loaderOwned = true;
-        } else {
-          setSummarizeLoaderLabel(passStatus);
         }
+        notifySummarizePhase(passStatus, {
+          ramNotice: reason === "ram",
+        });
         try {
           const beforeTok = historyTokenEstimate(msgs);
+          notifySummarizePhase("Building summary with the model…");
           const next = await buildCompressedMessages(msgs, signal, {
             keepRecent,
             // Force/fork: summarize the whole older block; leftover would
@@ -916,6 +1009,7 @@
             allowLeftover: !force,
           });
           if (!next) return { messages: msgs, compressed, stillHuge: true };
+          notifySummarizePhase("Compressing history…");
           const afterTok = historyTokenEstimate(next);
           if (afterTok >= beforeTok) {
             // Do not keep a larger history; later passes use a shorter keep.
@@ -982,8 +1076,8 @@
 
   function setChatBusy(on) {
     busy = on;
-    els.sendBtn.disabled = on;
     setSummarizeBusy(on);
+    updateRamPressureUi();
   }
 
   async function summarizeInPlace() {
@@ -993,7 +1087,8 @@
       return;
     }
     setChatBusy(true);
-    showSummarizeLoader("Summarizing this chat…");
+    showSummarizeLoader("Summarizing conversation…");
+    notifySummarizePhase("Summarizing conversation…");
     const gen = beginGeneration();
     try {
       const result = await compressHistoryIfNeeded("", {
@@ -1002,7 +1097,7 @@
         signal: gen.signal,
       });
       if (result.compressed) {
-        setStatus("History summarized in this chat.", true);
+        setStatus("Summary ready.", true);
         warnIfHuge(apiMessages());
       } else {
         setStatus("Nothing left to compress in this chat.", null);
@@ -1030,6 +1125,9 @@
     if (!result.compressed) {
       return { ok: false, reason: "nothing" };
     }
+    notifySummarizePhase("Opening summarized chat…", {
+      ramNotice: reason === "ram",
+    });
     const created = await api("/api/chats", {
       method: "POST",
       body: JSON.stringify({
@@ -1056,7 +1154,8 @@
       return;
     }
     setChatBusy(true);
-    showSummarizeLoader("Summarizing into a new chat…");
+    showSummarizeLoader("Summarizing conversation…");
+    notifySummarizePhase("Summarizing conversation…");
     const gen = beginGeneration();
     try {
       const forked = await forkSummarizedChat(sourceMessages, sourceTitle, {
@@ -1067,7 +1166,7 @@
         setStatus("Nothing left to compress for a new chat.", null);
         return;
       }
-      setStatus("Opened new chat from summary. Original left unchanged.", true);
+      setStatus("Switched to summarized chat.", true);
       warnIfHuge(apiMessages());
     } catch (err) {
       if (!isAbortError(err)) {
@@ -1106,10 +1205,10 @@
     const notice =
       `Low RAM (${freeGib.toFixed(1)} GiB free) — summarizing into a new chat…`;
     showRamNotice(notice);
-    setStatus(notice, false);
+    showSummarizeLoader(notice);
+    notifySummarizePhase(notice, { ramNotice: true });
     abortGenerationForRam();
     setChatBusy(true);
-    showSummarizeLoader(notice);
     const gen = beginGeneration();
     try {
       await new Promise((r) => setTimeout(r, 50));
@@ -1139,10 +1238,10 @@
       });
       if (forked.ok) {
         const done =
-          `Low RAM (${freeGib.toFixed(1)} GiB free) — opened summarized new chat. ` +
-          "Original left unchanged.";
+          `Switched to summarized chat. ` +
+          `(Low RAM: ${freeGib.toFixed(1)} GiB free; original left unchanged.)`;
         showRamNotice(done);
-        setStatus(done, false);
+        setStatus(done, true);
         warnIfHuge(apiMessages());
       } else {
         setStatus(
@@ -1549,6 +1648,12 @@
 
   async function sendMessage() {
     if (busy || !current) return;
+    if (ramPressureLocked()) {
+      const reason = ramLockReason();
+      setStatus(reason, false);
+      showRamNotice(reason);
+      return;
+    }
     const text = els.prompt.value.trim();
     if (!text && !pendingFiles.length) return;
 
@@ -1627,8 +1732,12 @@
 
     try {
       setActivity("Preparing…");
-      const compressed = await compressHistoryIfNeeded(content, { signal });
+      const compressed = await compressHistoryIfNeeded(content, {
+        signal,
+        reason: "auto",
+      });
       if (compressed.compressed) {
+        notifySummarizePhase("Summary ready.");
         setActivity("History compressed — continuing…");
       } else {
         setActivity("Sending…");
@@ -1691,13 +1800,14 @@
       }
       if (isContextLengthError(err.message)) {
         try {
-          setActivity("Hit context limit — summarizing…", { transcript: false });
-          showSummarizeLoader("Context limit — summarizing…");
+          showSummarizeLoader("Hit context limit — summarizing…");
+          notifySummarizePhase("Hit context limit — summarizing…");
           if (current.messages[current.messages.length - 1] === assistantMsg) {
             current.messages.pop();
           }
-          await compressHistoryIfNeeded("", { signal });
+          await compressHistoryIfNeeded("", { signal, reason: "auto" });
           hideSummarizeLoader();
+          notifySummarizePhase("Summary ready.");
           assistantMsg.content = "";
           delete assistantMsg.reasoning;
           current.messages.push(assistantMsg);
@@ -1854,6 +1964,13 @@
   }
 
   async function onFilesSelected(fileList) {
+    if (ramPressureLocked()) {
+      const reason = ramLockReason();
+      setStatus(reason, false);
+      showRamNotice(reason);
+      if (els.fileInput) els.fileInput.value = "";
+      return;
+    }
     let total = pendingFiles.reduce((s, f) => s + f.bytes, 0);
     for (const file of Array.from(fileList || [])) {
       const ext = (file.name.split(".").pop() || "").toLowerCase();
@@ -1982,9 +2099,15 @@
       logRamPressureEval(evalFree, action);
       if (action === "trigger") {
         ramPressureLatched = true;
+        updateRamPressureUi();
         void handleRamPressure(Number.isFinite(evalFree) ? evalFree : ramTriggerGib);
       } else if (action === "clear") {
         ramPressureLatched = false;
+        updateRamPressureUi();
+        showRamNotice("Memory recovered — controls unlocked.");
+        setStatus("Memory recovered — controls unlocked.", true);
+      } else if (action === "hold") {
+        updateRamPressureUi();
       }
     } catch {
       if (els.ramStatus) els.ramStatus.textContent = "RAM —";

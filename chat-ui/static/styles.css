@@ -196,18 +196,26 @@ body {
 .summarize-progress-label {
   font-family: var(--font-mono);
   font-size: 0.78rem;
-  color: var(--muted);
+  color: var(--text);
+  letter-spacing: 0.01em;
 }
 
 .ram-notice {
   margin: 0;
   padding: 0.55rem 1rem;
   border-bottom: 1px solid var(--line);
-  background: rgba(198, 241, 53, 0.1);
+  background: rgba(198, 241, 53, 0.12);
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 0.82rem;
   line-height: 1.35;
+  border-left: 3px solid var(--accent);
+}
+
+.ram-notice.is-locked {
+  background: rgba(224, 168, 72, 0.14);
+  border-left-color: rgba(224, 168, 72, 0.85);
+  border-bottom-color: rgba(224, 168, 72, 0.35);
 }
 
 .ram-notice[hidden] {
@@ -980,6 +988,27 @@ body {
 .web-toggle:active {
   transform: translateY(2px);
   border-bottom-width: 1px;
+}
+
+.attach-btn.is-disabled,
+.web-toggle.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  color: var(--muted);
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.22);
+  border-color: var(--line);
+}
+
+.attach-btn.is-disabled:hover,
+.web-toggle.is-disabled:hover {
+  border-color: var(--line);
+}
+
+.attach-btn.is-disabled:active,
+.web-toggle.is-disabled:active {
+  transform: none;
+  border-bottom-width: var(--depth);
 }
 
 .web-toggle {
