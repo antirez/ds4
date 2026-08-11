@@ -8941,7 +8941,13 @@ kernel void kernel_mul_mm_id_mpp(
         + args.nb10*iy);
 
     auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
-    auto tB = tensor(sb, dextents<int32_t, 2>(NR1, NK));
+    /* The staged B tile stores element (n, k) at sb[n*NK + k]: dim0 is K
+     * (stride 1), dim1 is N (stride NK) — the same convention as tA above.
+     * The historical (NR1, NK) extents order only described it correctly
+     * because NR1 == NK == 32; spell it (NK, NR1) so narrower future
+     * instantiations keep the true layout. Identical extents and strides
+     * while NR1 == 32. */
+    auto tB = tensor(sb, dextents<int32_t, 2>(NK, NR1));
 
     matmul2d<
         matmul2d_descriptor(NR1, NR0, NK, false, true, false,
