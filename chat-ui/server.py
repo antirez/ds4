@@ -325,6 +325,23 @@ def estimate_tokens(text: str | None) -> int:
     return (len(text or "") + 3) // 4
 
 
+def message_content_text(content: Any) -> str:
+    """Flatten message content to plain text for token estimates."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
 def history_token_estimate(messages: Any) -> int:
     if not isinstance(messages, list):
         return 0
@@ -332,9 +349,7 @@ def history_token_estimate(messages: Any) -> int:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            total += estimate_tokens(content)
+        total += estimate_tokens(message_content_text(msg.get("content")))
     return total
 
 
