@@ -89,6 +89,13 @@ static const void *g_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
 static int g_model_registered;
+/* Secondary model map (the --mtp support GGUF). Registered ALONGSIDE the
+ * primary: a second model must never evict the primary's ranges, dequant
+ * caches, or host registration the way ds4_gpu_set_model_map does. */
+static const void *g_secondary_host_base;
+static const char *g_secondary_device_base;
+static uint64_t g_secondary_size;
+static int g_secondary_registered;
 static thread_local bool g_glm_mtp_verify_mode;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
@@ -697,11 +704,18 @@ static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
+    if (model_map == g_secondary_host_base && g_secondary_device_base) {
+        return g_secondary_device_base + offset;
+    }
     return (const char *)model_map + offset;
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    if (model_map == g_secondary_host_base && g_secondary_device_base &&
+        bytes <= g_secondary_size && offset <= g_secondary_size - bytes) {
+        return g_secondary_device_base + offset;
+    }
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
@@ -1307,6 +1321,10 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
+    if (model_map == g_secondary_host_base && g_secondary_device_base &&
+        bytes <= g_secondary_size && offset <= g_secondary_size - bytes) {
+        return 1;
+    }
     if (g_model_device_owned || g_model_registered) return 1;
 
     const uint64_t end = offset + bytes;
@@ -2887,6 +2905,13 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
     }
+    if (g_secondary_registered && g_secondary_host_base) {
+        (void)cudaHostUnregister((void *)g_secondary_host_base);
+    }
+    g_secondary_host_base = NULL;
+    g_secondary_device_base = NULL;
+    g_secondary_size = 0;
+    g_secondary_registered = 0;
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
@@ -3783,6 +3808,52 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
+    return 1;
+}
+
+/* Map a SECOND model (the --mtp support GGUF) next to the primary. The
+ * primary setters above are single-model by design: they release every
+ * cached range, free the dequant caches, and unregister the previous host
+ * mapping before taking over the bookkeeping. Routing the support model
+ * through them therefore destroys the primary model's device residency,
+ * and every later primary-weight resolution degrades to a raw unpinned
+ * host pointer (illegal address under the sm_121 TMA matmul kernels).
+ * This entry point touches none of the primary state. */
+extern "C" int ds4_gpu_set_secondary_model_map(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+    (void)map_offset;
+    (void)map_size;
+    (void)max_tensor_bytes;
+    if (!model_map || model_size == 0) return 0;
+    if (g_secondary_host_base == model_map && g_secondary_size == model_size) return 1;
+    if (g_secondary_registered && g_secondary_host_base) {
+        (void)cudaHostUnregister((void *)g_secondary_host_base);
+    }
+    g_secondary_registered = 0;
+    g_secondary_device_base = NULL;
+    g_secondary_host_base = model_map;
+    g_secondary_size = model_size;
+    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (err == cudaSuccess) {
+        void *dev = NULL;
+        err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
+        if (err == cudaSuccess && dev) {
+            g_secondary_device_base = (const char *)dev;
+            g_secondary_registered = 1;
+            fprintf(stderr,
+                    "ds4: CUDA (no-copy) registered %.2f GiB secondary model mapping\n",
+                    (double)model_size / 1073741824.0);
+            return 1;
+        }
+        (void)cudaHostUnregister((void *)model_map);
+    }
+    (void)cudaGetLastError();
+    /* Unified-memory fallback: the raw host pointer is device-accessible on
+     * HMM-capable parts; kernels read the mmap directly, just unpinned. */
+    g_secondary_device_base = (const char *)model_map;
+    fprintf(stderr,
+            "ds4: CUDA secondary model mapping unregistered (HMM direct, %.2f GiB)\n",
+            (double)model_size / 1073741824.0);
     return 1;
 }
 

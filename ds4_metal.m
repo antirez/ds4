@@ -11363,6 +11363,15 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
 
+/* Secondary (support-model) mapping. Metal's view table already holds views
+ * for multiple model_map bases side by side, so the existing range path is
+ * the correct behavior here; the dedicated entry point exists because the
+ * CUDA backend's model-map bookkeeping is single-model and needs a separate
+ * registration to keep a second model from evicting the first. */
+int ds4_gpu_set_secondary_model_map(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+    return ds4_gpu_set_model_map_range(model_map, model_size, map_offset, map_size, max_tensor_bytes);
+}
+
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     return 1;
