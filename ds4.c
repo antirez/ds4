@@ -50018,6 +50018,12 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
             payload_set_err(err, errlen, "failed to read session payload");
             return 1;
         }
+        /* The GPU may have in-flight commands against this tensor (restore
+         * lands mid-enqueue): fence host writes ahead of device reads. */
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to sync accelerator after payload read");
+            return 1;
+        }
         return 0;
     }
     uint64_t done = 0;
