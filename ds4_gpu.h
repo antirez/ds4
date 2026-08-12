@@ -463,6 +463,12 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_tokens,
         uint32_t                n_embd);
 
+/* Zero-copy host access to a shared Metal tensor's backing store (Apple
+ * unified memory): returns NULL for private/device-only storage. Used for
+ * direct read()/write() of session tensors, skipping the staging memcpy. */
+void *ds4_gpu_tensor_host_ptr(ds4_gpu_tensor *tensor, uint64_t offset);
+const void *ds4_gpu_tensor_const_host_ptr(const ds4_gpu_tensor *tensor, uint64_t offset);
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

@@ -8813,6 +8813,22 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return 1;
 }
 
+void *ds4_gpu_tensor_host_ptr(ds4_gpu_tensor *tensor, uint64_t offset) {
+    if (!tensor) return NULL;
+    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+    if (offset > obj.bytes) return NULL;
+    /* shared storage only: private/device buffers have no stable host pointer */
+    if (obj.buffer.storageMode != MTLStorageModeShared &&
+        obj.buffer.storageMode != MTLStorageModeManaged) {
+        return NULL;
+    }
+    return (uint8_t *)[obj.buffer contents] + obj.offset + offset;
+}
+
+const void *ds4_gpu_tensor_const_host_ptr(const ds4_gpu_tensor *tensor, uint64_t offset) {
+    return ds4_gpu_tensor_host_ptr((ds4_gpu_tensor *)tensor, offset);
+}
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
