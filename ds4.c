@@ -38399,7 +38399,7 @@ static int sample_accelerate_exp = -1;
 static bool sample_use_accelerate_exp(void) {
     if (sample_accelerate_exp < 0) {
         const char *e = ds4_env_cached("DS4_SAMPLE_ACCELERATE_EXP");
-        sample_accelerate_exp = (e != NULL && e[0] != '\x5c0' && e[0] != '0') ? 1 : 0;
+        sample_accelerate_exp = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
     }
     return sample_accelerate_exp != 0;
 }
