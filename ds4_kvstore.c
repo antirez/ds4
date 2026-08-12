@@ -467,12 +467,24 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
-    /* Skip the full dir scan + header read of every .kv file when the cache
-     * directory itself has not changed since the last refresh. This runs on
-     * every request lookup; with a populated cache (hundreds of files) the
-     * scan+parse cost is ms-scale per request. Directory mtime changes on
-     * entry create/unlink/rename, which covers cache writes and evictions. */
+    /* GATED-OFF BY DEFAULT (cturing): st_mtime on macOS has SECOND resolution;
+     * a store + refresh within the same second after the recorded stamp silently
+     * misses fresh entries, which shows up as nondeterministic cache lineage
+     * drift. Re-enable only with ns-precision stamps: env KV_REFL_GATE=1. */
+    static int refl_gate_enabled = -1;
+    if (refl_gate_enabled < 0) {
+        const char *e = getenv("DS4_KVSTORE_MTIME_GATE");
+        refl_gate_enabled = e ? atoi(e) : 0;
+    }
+    if (refl_gate_enabled > 0) {
     struct stat dirst;
+    if (stat(kc->dir, &dirst) == 0 &&
+        kc->scanned_dir_mtime == dirst.st_mtime &&
+        kc->scanned_dir_ctime == dirst.st_ctime) {
+        return;
+    }
+    }
+    { struct stat dirst;
     if (stat(kc->dir, &dirst) == 0 &&
         kc->scanned_dir_mtime == dirst.st_mtime &&
         kc->scanned_dir_ctime == dirst.st_ctime) {
@@ -494,6 +506,8 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
     if (stat(kc->dir, &dirst) == 0) {
         kc->scanned_dir_mtime = dirst.st_mtime;
         kc->scanned_dir_ctime = dirst.st_ctime;
+    }
+    (void)dirst;
     }
 }
 
