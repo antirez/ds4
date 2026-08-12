@@ -49975,6 +49975,12 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
         ? NULL : ds4_gpu_tensor_const_host_ptr(tensor, offset);
     if (host) {
         if (bytes == 0) return 0;
+        /* fence: any GPU commands producing this tensor's bytes must complete
+         * before the host reads them for the session file. */
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to sync accelerator before payload write");
+            return 1;
+        }
         if (fwrite(host, 1, (size_t)bytes, fp) != (size_t)bytes) {
             payload_set_err(err, errlen, "failed to write session payload");
             return 1;
