@@ -467,27 +467,20 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
-    /* GATED-OFF BY DEFAULT (cturing): st_mtime on macOS has SECOND resolution;
-     * a store + refresh within the same second after the recorded stamp silently
-     * misses fresh entries, which shows up as nondeterministic cache lineage
-     * drift. Re-enable only with ns-precision stamps: env KV_REFL_GATE=1. */
-    static int refl_gate_enabled = -1;
-    if (refl_gate_enabled < 0) {
+    /* mtime gate: DS4_KVSTORE_MTIME_GATE=1 re-enables. Off by default because
+     * st_mtime has SECOND resolution on macOS; a store followed by a refresh
+     * within the same second silently misses fresh entries, which showed up as
+     * nondeterministic cache lineage drift in deep-context A/B runs. */
+    static int mtime_gate = -1;
+    if (mtime_gate < 0) {
         const char *e = getenv("DS4_KVSTORE_MTIME_GATE");
-        refl_gate_enabled = e ? atoi(e) : 0;
+        mtime_gate = (e && e[0] == '1') ? 1 : 0;
     }
-    if (refl_gate_enabled > 0) {
-    struct stat dirst;
-    if (stat(kc->dir, &dirst) == 0 &&
-        kc->scanned_dir_mtime == dirst.st_mtime &&
-        kc->scanned_dir_ctime == dirst.st_ctime) {
-        return;
-    }
-    }
-    { struct stat dirst;
-    if (stat(kc->dir, &dirst) == 0 &&
-        kc->scanned_dir_mtime == dirst.st_mtime &&
-        kc->scanned_dir_ctime == dirst.st_ctime) {
+    struct stat dirst0;
+    const int have_stamp = stat(kc->dir, &dirst0) == 0;
+    if (mtime_gate && have_stamp &&
+        kc->scanned_dir_mtime == dirst0.st_mtime &&
+        kc->scanned_dir_ctime == dirst0.st_ctime) {
         return;
     }
     ds4_kvstore_clear(kc);
@@ -503,11 +496,9 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         free(path);
     }
     closedir(d);
-    if (stat(kc->dir, &dirst) == 0) {
-        kc->scanned_dir_mtime = dirst.st_mtime;
-        kc->scanned_dir_ctime = dirst.st_ctime;
-    }
-    (void)dirst;
+    if (have_stamp) {
+        kc->scanned_dir_mtime = dirst0.st_mtime;
+        kc->scanned_dir_ctime = dirst0.st_ctime;
     }
 }
 
