@@ -6357,9 +6357,9 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
     const bool causal = args.n_tokens > 1u;
 
     threadgroup half  *sk  = (threadgroup half *)sharedf;        // [NK][DK]
-    threadgroup half  *sq  = sk + NK*DK;                         // [NHPTG][DK]
-    threadgroup float *sw  = sharedf + (NK*DK + NHPTG*DK)/2;     // [NHPTG]
-    threadgroup float *sqk = sw + NHPTG;                         // [NSG*NHPTG*NKPSG]
+    threadgroup half  *sq  = sk + NK*DK;                         // 2 banks [NHPTG][DK]
+    threadgroup float *sw  = sharedf + (NK*DK + 2*NHPTG*DK)/2;   // 2 banks [NHPTG]
+    threadgroup float *sqk = sw + 2*NHPTG;                       // [NSG*NHPTG*NKPSG]
 
     const uint i_kv_0 = tgpig.x * NK;
 
@@ -6399,24 +6399,48 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
 
         float score = 0.0f;
 
-        for (uint i_head = 0; i_head < NH; i_head += NHPTG) {
-            // Stage Q for this head tile: [NHPTG][DK] half, vectorized.
-            for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
-                const uint ih = i4 / DK;
-                const uint d  = i4 - ih*DK;   // multiple of 4
-                device const float *qh = (device const float *)(pq +
-                    (uint64_t)(i_head + ih) * args.q_head_stride);
-                *(threadgroup half4 *)(sq + i4) = half4(((device const float4 *)qh)[d >> 2]);
+        // Double-buffered Q: stage tile t+1 into the alternate sq/sw bank
+        // while tile t's MMA consumes the current bank (device-latency hidden).
+        constexpr uint NTILE = NH / NHPTG;
+        // Pre-stage head tile 0 into bank 0.
+        for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
+            const uint ih = i4 / DK;
+            const uint d  = i4 - ih*DK;   // multiple of 4
+            device const float *qh = (device const float *)(pq +
+                (uint64_t)ih * args.q_head_stride);
+            *(threadgroup half4 *)(sq + i4) = half4(((device const float4 *)qh)[d >> 2]);
+        }
+        if (tiitg < NHPTG) {
+            sw[tiitg] = pw[tiitg] * args.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint tile = 0; tile < NTILE; tile++) {
+            const uint cur = tile & 1u;
+            threadgroup half  *sqc = sq + cur * NHPTG*DK;
+            threadgroup float *swc = sw + cur * NHPTG;
+            // Prefetch tile t+1 into the other bank (no barrier needed yet:
+            // the MMA below reads the other bank exclusively).
+            if (tile + 1 < NTILE) {
+                const uint nxt_head = (tile + 1) * NHPTG;
+                threadgroup half  *sqn = sq + (cur ^ 1u) * NHPTG*DK;
+                threadgroup float *swn = sw + (cur ^ 1u) * NHPTG;
+                for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
+                    const uint ih = i4 / DK;
+                    const uint d  = i4 - ih*DK;
+                    device const float *qh = (device const float *)(pq +
+                        (uint64_t)(nxt_head + ih) * args.q_head_stride);
+                    *(threadgroup half4 *)(sqn + i4) = half4(((device const float4 *)qh)[d >> 2]);
+                }
+                if (tiitg < NHPTG) {
+                    swn[tiitg] = pw[nxt_head + tiitg] * args.scale;
+                }
             }
-            if (tiitg < NHPTG) {
-                sw[tiitg] = pw[i_head + tiitg] * args.scale;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
             for (uint i = 0; i < DK8; i++) {
                 simdgroup_half8x8 mq;
-                simdgroup_load(mq, sq + 8*i, DK, 0, false);
+                simdgroup_load(mq, sqc + 8*i, DK, 0, false);
                 simdgroup_multiply_accumulate(mqk, mq, mk[i], mqk);
             }
             simdgroup_store(mqk, pqk, NKPSG, 0, false);
@@ -6426,7 +6450,7 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
             // over this head tile (ascending head order across tiles).
             if (tiisg < NKPSG) {
                 for (uint ih = 0; ih < NHPTG; ih++) {
-                    score += max(pqk[ih*NKPSG + tiisg], 0.0f) * sw[ih];
+                    score += max(pqk[ih*NKPSG + tiisg], 0.0f) * swc[ih];
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

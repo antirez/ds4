@@ -17441,13 +17441,13 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
             if (score_llt && score_nsg4) {
-                [enc setThreadgroupMemoryLength:(32u*128u + 8u*128u) * sizeof(uint16_t) +
-                                                (8u + 256u) * sizeof(float) atIndex:0];
+                [enc setThreadgroupMemoryLength:(32u*128u + 16u*128u) * sizeof(uint16_t) +
+                                                (16u + 256u) * sizeof(float) atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u, 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             } else if (score_llt) {
-                [enc setThreadgroupMemoryLength:(64u*128u + 8u*128u) * sizeof(uint16_t) +
-                                                (8u + 512u) * sizeof(float) atIndex:0];
+                [enc setThreadgroupMemoryLength:(64u*128u + 16u*128u) * sizeof(uint16_t) +
+                                                (16u + 512u) * sizeof(float) atIndex:0];
                 [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u, 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
@@ -17651,17 +17651,17 @@ static int ds4_gpu_indexer_scores_batch_tensor(
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         } else if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
-            /* NSG=4: sk[32x128]half + sq[8x128]half + sw[8] + sqk[256] f32 */
-            [enc setThreadgroupMemoryLength:(32u*128u + 8u*128u) * sizeof(uint16_t) +
-                                            (8u + 256u) * sizeof(float) atIndex:0];
+            /* NSG=4: sk[32x128]half + sq 2x[8x128]half + sw 2x[8] + sqk[256] f32 */
+            [enc setThreadgroupMemoryLength:(32u*128u + 16u*128u) * sizeof(uint16_t) +
+                                            (16u + 256u) * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else {
-            /* sk[NKxDK]half + sq[NHPTGxDK]half + sw[NHPTG] + sqk[512] f32 */
-            [enc setThreadgroupMemoryLength:(64u*128u + 8u*128u) * sizeof(uint16_t) +
-                                            (8u + 512u) * sizeof(float) atIndex:0];
+            /* sk[NKxDK]half + sq 2x[NHPTGxDK]half + sw 2x[NHPTG] + sqk[512] f32 */
+            [enc setThreadgroupMemoryLength:(64u*128u + 16u*128u) * sizeof(uint16_t) +
+                                            (16u + 512u) * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
