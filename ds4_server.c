@@ -8415,6 +8415,9 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* True when this frontier ends in an assistant tool-call turn rather than
+     * a final answer; only used to label the cache hit source. */
+    bool tool_turn;
 } visible_live_state;
 
 struct server_slot {
@@ -8737,6 +8740,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_text = NULL;
     st->visible_len = 0;
     st->live_tokens = 0;
+    st->tool_turn = false;
     st->valid = false;
 }
 
@@ -8754,13 +8758,15 @@ static void thinking_live_clear(server *s, server_slot *slot) {
 }
 
 static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text) {
+                                   const char *visible_text,
+                                   bool tool_turn) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
     slot->thinking_live.visible_text = xstrdup(visible_text);
     slot->thinking_live.visible_len = strlen(visible_text);
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
+    slot->thinking_live.tool_turn = tool_turn;
     slot->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -10564,6 +10570,26 @@ static bool should_remember_thinking_checkpoint(const request *r,
     return true;
 }
 
+/* Counterpart to should_remember_thinking_checkpoint() for tool-context
+ * conversations (has_tools, or history that already used tools): the chat
+ * template preserves reasoning verbatim in future renders instead of
+ * stripping it, so a plain turn that finished without calling a tool still
+ * renders byte-for-byte into the next request -- exactly like a completed
+ * tool call does.  Without this, such a turn had no visible checkpoint at
+ * all (should_remember_thinking_checkpoint excludes has_tools, and no tool
+ * call means remember_tool_visible_checkpoint's own call site never runs
+ * either), so the next request fell through to raw token matching, which
+ * can never bridge hidden reasoning tokens and forced a huge reprocess. */
+static bool should_remember_tool_context_checkpoint(const request *r,
+                                                    const thinking_state *thinking,
+                                                    const char *finish) {
+    if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES) return false;
+    if (!r->prompt_preserves_reasoning) return false;
+    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    if (thinking && thinking->inside) return false;
+    return true;
+}
+
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -10785,7 +10811,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, slot, visible);
+    thinking_live_remember(s, slot, visible, false);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session), strlen(visible));
@@ -10793,6 +10819,43 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(slot->session), strlen(visible));
     free(visible);
+}
+
+/* Chat/completions and Anthropic have no protocol object that binds the next
+ * request to this live frontier, and the sampled bytes (hidden reasoning,
+ * exact DSML spelling) never token-match the client's replay.  But the text
+ * the next request will render for this turn is predictable: it is the same
+ * prompt_text + suffix that canonicalize_tool_checkpoint() builds for a tool
+ * call, or plain content+eos for a tool-context turn that did not call a
+ * tool this time.  Remember it as a visible key for the live frontier so the
+ * next request continues in memory instead of taking the evict-store +
+ * disk-restore round trip on every agent turn.  calls is NULL and tool_turn
+ * is false for the no-tool-call case; both are non-NULL/true for a
+ * completed tool call. */
+static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
+                                             const job *j, const char *ctx,
+                                             uint64_t trace_id,
+                                             const char *content,
+                                             const char *reasoning,
+                                             const tool_calls *calls,
+                                             bool tool_turn) {
+    if (!j->req.prompt_text || !j->req.prompt_text[0]) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", tool_turn);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), visible.len);
+    trace_event(s, trace_id,
+                "tool live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), visible.len);
+    buf_free(&visible);
+    free(suffix);
 }
 
 /* After a successful tool-call finish, make the live checkpoint match what the
@@ -11282,7 +11345,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                 &effective_prompt);
         if (thinking_cached > 0) {
             cached = thinking_cached;
-            cache_source = "thinking-visible";
+            pthread_mutex_lock(&s->tool_mu);
+            cache_source = slot->thinking_live.tool_turn ?
+                           "tool-visible" : "thinking-visible";
+            pthread_mutex_unlock(&s->tool_mu);
             thinking_live_continuation = true;
             prompt_for_sync = &effective_prompt;
         }
@@ -11637,9 +11703,26 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s, slot);
-        }
+        /* Waypoint snapshots are stored on disk in full (compressed KV,
+         * indexer, and compressor frontiers included -- see
+         * ds4_session_save_payload()), so a snapshot taken mid-tool-call is
+         * exactly as safe to store and later restore as one taken anywhere
+         * else.  Under normal operation such a snapshot is a dead end for
+         * future-prompt matching, since no client ever resumes a conversation
+         * mid-unterminated-DSML; that is why this used to be suppressed
+         * while saw_tool_start/in_tool_call was true.  But agent tool-call
+         * turns can run for hundreds of generated tokens, and if the client
+         * stream dies partway through one (disconnect, local tool-exec
+         * failure causing the client to retry from an earlier point), the
+         * retried prompt still shares a real prefix with this same span up to
+         * wherever it diverges.  Suppressing waypoints for the whole tool-call
+         * duration left long agentic sessions with no recent restart point,
+         * forcing a near-total reprocess on the very failures this cache
+         * exists to avoid.  Keep storing periodic waypoints through tool
+         * calls too; the cost is the same disk write already paid for plain
+         * decode, and prefix matching naturally ignores these entries once
+         * they are no longer a real prefix of the next request. */
+        kv_cache_maybe_store_continued(s, slot);
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -12160,31 +12243,30 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
-            /* Store the post-turn visible transcript plus the live token
-             * frontier.  The next Responses request may replay only this
-             * visible surface, while the real session also contains hidden
-             * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
-                    parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
-            free(visible_suffix);
-        } else {
-            responses_live_clear(s, slot);
-        }
+        /* Store the post-turn visible transcript plus the live token
+         * frontier.  The next Responses request may replay only this
+         * visible surface, while the real session also contains hidden
+         * reasoning and exact sampled tool-call bytes.
+         * Preserve even on streaming errors: the tool calls were generated
+         * successfully; the error was in response delivery. */
+        char *visible_suffix =
+            build_responses_visible_assistant_suffix(&j->req,
+                parsed_content ? parsed_content : "",
+                parsed_reasoning,
+                &parsed_calls);
+        buf visible = {0};
+        buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+        buf_puts(&visible, visible_suffix ? visible_suffix : "");
+        responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
+                                parsed_calls.len ? &parsed_calls : NULL);
+        buf_free(&visible);
+        free(visible_suffix);
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
-        {
+        if (parsed_calls.len) {
+            /* Preserve live state even on streaming errors.  The tool calls
+             * were generated successfully; the error was in response delivery.
+             * This allows continuation via tool-output-ids on retry. */
             anthropic_live_remember(s, slot, &parsed_calls);
         } else {
             anthropic_live_clear(s, slot);
@@ -12206,11 +12288,34 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
+        if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES)
+        {
+            /* Preserve the visible checkpoint even on streaming errors.
+             * The tool calls were successfully generated and the KV cache
+             * is valid; the error was in HTTP response, not generation.
+             * This allows the retry to continue from the tool-call boundary
+             * instead of re-prefilling the entire conversation. */
+            remember_tool_visible_checkpoint(s, slot, j, ctx_span, trace_id,
+                                             parsed_content ? parsed_content : "",
+                                             parsed_reasoning, &parsed_calls, true);
+        } else {
+            thinking_live_clear(s, slot);
+        }
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
+    } else if (!parsed_calls.len &&
+               should_remember_tool_context_checkpoint(&j->req, &thinking, final_finish)) {
+        /* Same rationale as the streaming-error preservation above: has_tools
+         * (or tool-using history) means the chat template keeps reasoning in
+         * future renders, so this turn's generated text is exactly what the
+         * next request will render even though no tool was called.  Without
+         * this, such turns had no visible checkpoint at all and fell through
+         * to raw token matching, which cannot bridge hidden reasoning tokens. */
+        remember_tool_visible_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, NULL, false);
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -12273,7 +12378,11 @@ decode_again:
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
-        request_live_state_clear(s, slot);
+        /* Deliberately do not request_live_state_clear() here: the checkpoint
+         * block above already recorded the post-turn visible frontier.  The KV
+         * rows were written during generation; only HTTP delivery failed, so
+         * the retry must be able to bind to that frontier instead of
+         * re-prefilling the whole conversation. */
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -17242,6 +17351,29 @@ static void test_thinking_checkpoint_remember_gate(void) {
     request_free(&r);
 }
 
+static void test_tool_context_checkpoint_remember_gate(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    thinking_state st = {.inside = true};
+
+    TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "stop"));
+
+    r.prompt_preserves_reasoning = true;
+    TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "stop"));
+
+    st.inside = false;
+    TEST_ASSERT(should_remember_tool_context_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "error"));
+    TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "length"));
+
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "stop"));
+    r.api = API_OPENAI;
+    TEST_ASSERT(should_remember_tool_context_checkpoint(&r, &st, "stop"));
+
+    request_free(&r);
+}
+
 static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_start = false;
     bool saw_end = false;
@@ -18412,6 +18544,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
+    test_tool_context_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
