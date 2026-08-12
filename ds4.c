@@ -49975,17 +49975,9 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
         ? NULL : ds4_gpu_tensor_const_host_ptr(tensor, offset);
     if (host) {
         if (bytes == 0) return 0;
-        const int fd = fileno(fp);
-        const uint8_t *p = (const uint8_t *)host;
-        uint64_t left = bytes;
-        while (left) {
-            const ssize_t w = write(fd, p, (size_t)(left > (uint64_t)SIZE_MAX ? SIZE_MAX : left));
-            if (w <= 0) {
-                payload_set_err(err, errlen, "failed to write session payload");
-                return 1;
-            }
-            p += w;
-            left -= (uint64_t)w;
+        if (fwrite(host, 1, (size_t)bytes, fp) != (size_t)bytes) {
+            payload_set_err(err, errlen, "failed to write session payload");
+            return 1;
         }
         return 0;
     }
@@ -50021,19 +50013,11 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
     void *host = ds4_env_cached("DS4_DISABLE_ZEROCOPY_PAYLOAD_SPANS") != NULL
         ? NULL : ds4_gpu_tensor_host_ptr((ds4_gpu_tensor *)tensor, offset);
     if (host) {
-        const int fd = fileno(fp);
-        uint8_t *p = (uint8_t *)host;
-        uint64_t left = bytes;
-        while (left) {
-            const ssize_t r = read(fd, p, (size_t)(left > (uint64_t)SIZE_MAX ? SIZE_MAX : left));
-            if (r <= 0) {
-                payload_set_err(err, errlen, "failed to read session payload");
-                return 1;
-            }
-            p += r;
-            left -= (uint64_t)r;
-        }
         if (remaining) *remaining -= bytes;
+        if (fread(host, 1, (size_t)bytes, fp) != (size_t)bytes) {
+            payload_set_err(err, errlen, "failed to read session payload");
+            return 1;
+        }
         return 0;
     }
     uint64_t done = 0;
