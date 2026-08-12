@@ -6364,17 +6364,18 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
     const uint i_kv_0 = tgpig.x * NK;
 
     // Stage this threadgroup's K rows once (f32 device -> half, edges zeroed).
-    for (uint i = tiitg; i < NK*DK; i += NTG) {
-        const uint ik = i / DK;
-        const uint d  = i - ik*DK;
+    // Vectorized: float4 loads + half4 stores (DK is a multiple of 4).
+    for (uint i4 = tiitg*4u; i4 < NK*DK; i4 += NTG*4u) {
+        const uint ik = i4 / DK;
+        const uint d  = i4 - ik*DK;    // multiple of 4
         const uint comp = i_kv_0 + ik;
-        half v = half(0.0h);
+        half4 v = half4(0.0h);
         if (comp < args.n_comp) {
             device const float *row = (device const float *)(index_comp +
                 (uint64_t)comp * args.index_row_stride);
-            v = half(row[d]);
+            v = half4(((device const float4 *)row)[d >> 2]);
         }
-        sk[i] = v;
+        *(threadgroup half4 *)(sk + i4) = v;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6399,13 +6400,13 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
         float score = 0.0f;
 
         for (uint i_head = 0; i_head < NH; i_head += NHPTG) {
-            // Stage Q for this head tile: [NHPTG][DK] half.
-            for (uint i = tiitg; i < NHPTG*DK; i += NTG) {
-                const uint ih = i / DK;
-                const uint d  = i - ih*DK;
+            // Stage Q for this head tile: [NHPTG][DK] half, vectorized.
+            for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
+                const uint ih = i4 / DK;
+                const uint d  = i4 - ih*DK;   // multiple of 4
                 device const float *qh = (device const float *)(pq +
                     (uint64_t)(i_head + ih) * args.q_head_stride);
-                sq[i] = half(qh[d]);
+                *(threadgroup half4 *)(sq + i4) = half4(((device const float4 *)qh)[d >> 2]);
             }
             if (tiitg < NHPTG) {
                 sw[tiitg] = pw[i_head + tiitg] * args.scale;

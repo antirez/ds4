@@ -74,6 +74,8 @@ typedef struct {
     ds4_kvstore_entry *entry;
     int len;
     int cap;
+    long scanned_dir_mtime;   /* kv_cache_refresh() skip stamp (0 = unscanned) */
+    long scanned_dir_ctime;
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);

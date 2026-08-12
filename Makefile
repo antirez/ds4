@@ -4,6 +4,14 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 SAMPLING_TEST :=
+# Optional cross-TU optimization for Apple Silicon release builds:
+#   make DS4_LTO=thin
+DS4_LTO ?=
+ifneq ($(strip $(DS4_LTO)),)
+CFLAGS += -flto=$(DS4_LTO)
+OBJCFLAGS += -flto=$(DS4_LTO)
+LDFLAGS += -flto=$(DS4_LTO)
+endif
 else
 NATIVE_CPU_FLAG ?= -march=native
 SAMPLING_TEST := tests/test_sampling

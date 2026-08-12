@@ -707,13 +707,12 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
                 shmem[tiitg] = abs(v);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = 32; stride > 0; stride >>= 1) {
-                if (tiitg < stride) {
-                    shmem[tiitg] = max(shmem[tiitg], shmem[tiitg + stride]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float m64 = simd_max(shmem[tiitg]);
+            if (tiitg < 64u && (tiitg & 31u) == 0u) {
+                shmem[tiitg >> 5u] = m64;
             }
-            const float amax = max(shmem[0], 1.0e-4f);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float amax = max(max(shmem[0], shmem[1]), 1.0e-4f);
             const float scale = exp2(ceil(log2(amax / 448.0f)));
             if (tiitg < 64) {
                 const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;

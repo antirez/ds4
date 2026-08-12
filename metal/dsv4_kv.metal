@@ -137,14 +137,15 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        // 64-value max across two simdgroups: simd_max partials + one exchange
+        // (IEEE max is exact, so this is bit-identical to the barrier tree).
+        const float m64 = simd_max(scratch[tid]);
+        if (tid < 64u && (tid & 31u) == 0u) {
+            scratch[tid >> 5u] = m64;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(max(scratch[0], scratch[1]), 1.0e-4f);
         const float scale = exp2(ceil(log2(amax / 448.0f)));
         if (tid < 64) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
@@ -189,21 +190,8 @@ kernel void kernel_dsv4_indexer_hadamard_fp4_f32(
     }
 
     float v = vals[tid] * 0.08838834764831845f;
-    const uint block = tid >> 5u;
-    const uint lane = tid & 31u;
-    const uint block_base = block * 32u;
-    absbuf[tid] = abs(v);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            absbuf[block_base + lane] = max(absbuf[block_base + lane],
-                                            absbuf[block_base + lane + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float amax = max(absbuf[block_base], 7.052966104933725e-38f);
+    // Per-block (one simdgroup) max via simd_max: IEEE-exact, no barriers.
+    const float amax = max(simd_max(abs(v)), 7.052966104933725e-38f);
     const float scale = exp2(ceil(log2(amax / 6.0f)));
     xr[tid] = dsv4_e2m1fn_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;
 }
@@ -236,15 +224,12 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
             scratch[tid] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float m64 = simd_max(scratch[tid]);
+        if (tid < 64u && (tid & 31u) == 0u) {
+            scratch[tid >> 5u] = m64;
         }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float amax = max(max(scratch[0], scratch[1]), 1.0e-4f);
         const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
