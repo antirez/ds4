@@ -13793,10 +13793,8 @@ static void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
-    pthread_mutex_lock(&j.mu);
     const int enq = enqueue(s, &j);
     if (enq != ENQUEUE_OK) {
-        pthread_mutex_unlock(&j.mu);
         if (enq == ENQUEUE_FULL) {
             http_error_api(fd, s->enable_cors, 429,
                            "server request queue is full; retry later", j.req.api);
