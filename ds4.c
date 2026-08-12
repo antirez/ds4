@@ -15,6 +15,9 @@
  */
 
 #include <errno.h>
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
 #include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
@@ -38386,6 +38389,23 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
     }
 }
 
+#if defined(__APPLE__)
+/* Opt-in Accelerate vForce vvexpf: 2.6-4x faster than scalar expf (measured on
+ * M3 Ultra: 0.35 ns/op vs 1.3 ns/op) but NOT bit-identical (about 15% of
+ * values differ in the last ULP). Calling this changes the sampling stream for
+ * expf-dominated paths, so it is reserved for expf-heavy loops and gated by
+ * DS4_SAMPLE_ACCELERATE_EXP=1. Default is the bit-exact scalar path. */
+static int sample_accelerate_exp = -1;
+static bool sample_use_accelerate_exp(void) {
+    if (sample_accelerate_exp < 0) {
+        const char *e = ds4_env_cached("DS4_SAMPLE_ACCELERATE_EXP");
+        sample_accelerate_exp = (e != NULL && e[0] != ' ' && e[0] != '0') ? 1 : 0;
+    }
+    return sample_accelerate_exp != 0;
+}
+#define SAMPLE_BULK_EXP_BLOCK 2048
+#endif
+
 static bool sample_fast_top_p(
         const float *logits,
         uint32_t     n_vocab,
@@ -38408,6 +38428,45 @@ static bool sample_fast_top_p(
     float sum = 0.0f;
     float heap_sum = 0.0f;
 
+#if defined(__APPLE__)
+    if (sample_use_accelerate_exp()) {
+        /* Bulk expf in vocab-scan order: identical acceptance sequence as the
+         * scalar loop below (heap candidates and sums consume p in the same
+         * order; p values themselves are vForce-computed, so the sampled token
+         * stream may differ from the scalar path). */
+        float xs[SAMPLE_BULK_EXP_BLOCK], ps[SAMPLE_BULK_EXP_BLOCK];
+        int idx[SAMPLE_BULK_EXP_BLOCK];
+        uint32_t nb = 0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            xs[nb] = (v - max_logit) / temperature;
+            idx[nb] = (int)i;
+            nb++;
+            if (nb == SAMPLE_BULK_EXP_BLOCK || i + 1 == n_vocab) {
+                int cnt = (int)nb;
+                vvexpf(ps, xs, &cnt);
+                for (uint32_t j = 0; j < nb; j++) {
+                    const float p = ps[j];
+                    sum += p;
+                    sample_candidate cand = {.id = idx[j], .logit = logits[idx[j]], .prob = p};
+                    if (n < cap) {
+                        heap[n] = cand;
+                        heap_sum += p;
+                        sample_heap_sift_up(heap, n);
+                        n++;
+                    } else if (sample_candidate_gt(cand, heap[0])) {
+                        heap_sum -= heap[0].prob;
+                        heap[0] = cand;
+                        heap_sum += p;
+                        sample_heap_sift_down(heap, n, 0);
+                    }
+                }
+                nb = 0;
+            }
+        }
+    } else
+#endif
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
