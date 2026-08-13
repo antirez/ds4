@@ -66207,26 +66207,29 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
 
     /*
-     * Metal normally benefits from the tiny-batch verifier: it checks two
-     * target positions in one layer-major pass and commits prefix-1 directly
-     * on a partial accept. Like the rest of the non-quality Metal path, it may
-     * pick a different greedy token when batched reductions perturb nearly
-     * tied logits.
-     *
-     * ROCm is different. Its DeepSeek one-token graph uses the prequantized Q8
-     * decode kernels, while the generic N=2 batch graph uses full-F32
-     * activations and loses the paired and HC-expand decode fusions. Running
-     * the exact two-row verifier reuses those Q8 kernels and is faster.
-     * DS4_MTP_BATCH_VERIFY remains an explicit diagnostic rollback to the
-     * generic batch verifier.
+     * The tiny-batch verifier checks several target positions in one
+     * layer-major pass and commits prefix-1 directly on a partial accept, but
+     * its batched reductions can pick a different greedy token than
+     * autoregressive decode when logits are nearly tied.  At MTP draft depth
+     * >= 2 that divergence is not always benign: a perturbed row can make the
+     * committed next-token logits argmax to <｜begin▁of▁sentence｜>, injecting
+     * BOS into the output and cascading into self-restart garbage (issue #750).
+     * MTP is a drafter, not a sampler, so the target stream must stay
+     * bit-identical to ordinary decode.  Make the exact verifier the default on
+     * every backend: the fused two-row verifier for depth 2, and exact
+     * sequential decode of the drafts for depth > 2 (the same kernel the clean
+     * depth-1 path uses).  ROCm gains speed from the exact path too (it reuses
+     * the prequantized Q8 decode kernels that the generic batch graph drops).
+     * DS4_MTP_BATCH_VERIFY opts back into the fast approximate batch verifier
+     * for diagnostics.
      */
-#ifdef DS4_ROCM_BUILD
     const bool prefer_decode2_exact = true;
-#else
-    const bool prefer_decode2_exact = false;
-#endif
     const bool use_decode2_exact =
         draft_n == 2 &&
+        (strict_mtp || prefer_decode2_exact) &&
+        getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+    const bool use_exact_sequential =
+        draft_n > 2 &&
         (strict_mtp || prefer_decode2_exact) &&
         getenv("DS4_MTP_BATCH_VERIFY") == NULL;
     if (use_decode2_exact) {
@@ -66318,7 +66321,51 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
 
-    if (!use_decode2_exact)
+    if (use_exact_sequential) {
+        /*
+         * Depth > 2 has no fused exact verifier, so verify the drafts the same
+         * way the clean depth-1 path emits tokens: decode each proposed token
+         * with the exact raw-SWA kernel and accept the next draft only when it
+         * equals the exact greedy argmax.  This commits accepted tokens as it
+         * goes and stops at the first divergence, so no snapshot/rollback is
+         * needed, and the emitted stream is bit-identical to ordinary decode.
+         */
+        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        const int start = s->checkpoint.len;
+        int committed = 0;
+        bool ok = true;
+        for (int i = 0; i < draft_n && ok && n_accept < accepted_cap; i++) {
+            ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                                &e->model,
+                                                &e->weights,
+                                                drafts[i],
+                                                (uint32_t)(start + i),
+                                                row_logits);
+            if (!ok) break;
+            token_vec_push(&s->checkpoint, drafts[i]);
+            committed++;
+            accepted[n_accept++] = drafts[i];
+            if (drafts[i] == eos_token) break;
+            if (i + 1 < draft_n &&
+                sample_argmax(row_logits, DS4_N_VOCAB) != drafts[i + 1]) break;
+        }
+        if (!ok) {
+            s->checkpoint.len = start;
+            free(row_logits);
+            snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        DS4_MTP_KEEP_ACCEPTED(committed);
+        ds4_session_dspark_capture_note_checkpoint(s);
+        free(row_logits);
+        return n_accept;
+    }
+
+    if (!use_decode2_exact && !use_exact_sequential)
     {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
