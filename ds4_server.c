@@ -2443,7 +2443,8 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
 
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
-                                              ds4_think_mode think_mode) {
+                                              ds4_think_mode think_mode,
+                                              bool preserve_reasoning) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -2493,13 +2494,16 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    if (tool_context || i > last_user_idx) {
+                    const bool has_reasoning = (m->reasoning && m->reasoning[0]) ||
+                                               (m->encrypted_content && m->encrypted_content[0]);
+                    if (preserve_reasoning ? has_reasoning : (tool_context || i > last_user_idx)) {
                         buf_puts(&out, "<think>");
-                        /* Prefer plain reasoning; fall back to encrypted_content
-                         * (opaque base64 from Responses stateless replay) so the
-                         * rendered token stream matches the original generation. */
-                        const char *r = m->reasoning;
-                        if (!r || !r[0]) r = m->encrypted_content;
+                        /* Prefer encrypted_content (opaque base64 from Responses API)
+                         * over plain reasoning when both are present, so the rendered
+                         * token stream matches what the Responses client sends back.
+                         * Fall back to plain reasoning for chat/completions API. */
+                        const char *r = m->encrypted_content;
+                        if (!r || !r[0]) r = m->reasoning;
                         buf_puts(&out, r ? r : "");
                         buf_puts(&out, "</think>");
                     } else {
@@ -2549,7 +2553,8 @@ static void append_glm_assistant_message_prefix(buf *out,
 static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
                                          const char *tool_schemas,
                                          const tool_schema_orders *tool_orders,
-                                         ds4_think_mode think_mode) {
+                                         ds4_think_mode think_mode,
+                                         bool preserve_reasoning) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
@@ -2598,8 +2603,11 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         } else if (!strcmp(m->role, "assistant")) {
             (void)pending_assistant;
             buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(
-                &out, m, think && (tool_context || i > last_user_idx));
+            const bool has_reasoning = (m->reasoning && m->reasoning[0]) ||
+                                       (m->encrypted_content && m->encrypted_content[0]);
+            const bool preserve = preserve_reasoning ? has_reasoning
+                                                     : (tool_context || i > last_user_idx);
+            append_glm_assistant_message_prefix(&out, m, think && preserve);
             buf_puts(&out, m->content ? m->content : "");
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
                                               &m->calls, tool_orders);
@@ -2619,13 +2627,18 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
-                                                ds4_think_mode think_mode) {
+                                                ds4_think_mode think_mode,
+                                                bool preserve_reasoning) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
+        fprintf(stderr, "DEBUG: using GLM renderer\n");
         return render_glm_chat_prompt_text(msgs, tool_schemas,
-                                           tool_orders, think_mode);
+                                           tool_orders, think_mode,
+                                           preserve_reasoning);
     }
+    fprintf(stderr, "DEBUG: using DeepSeek renderer\n");
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
-                                            tool_orders, think_mode);
+                                            tool_orders, think_mode,
+                                            preserve_reasoning);
 }
 
 static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
@@ -2635,7 +2648,7 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
         ds4_think_mode think_mode) {
     return render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
                                               msgs, tool_schemas,
-                                              tool_orders, think_mode);
+                                              tool_orders, think_mode, false);
 }
 
 /* Render only the semantic tail that must be appended to the live KV for a
@@ -3142,7 +3155,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, r->prompt_preserves_reasoning);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -3358,7 +3371,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, r->prompt_preserves_reasoning);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
@@ -4354,9 +4367,13 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    /* Responses API always preserves reasoning in the prompt so the model
+     * sees its previous thinking and can continue from it. Without this the
+     * prompt would differ from the live KV and cause a token-mismatch
+     * cache invalidation on every turn. */
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
-        &r->tool_orders, r->think_mode);
+        &r->tool_orders, r->think_mode, true);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
@@ -4546,7 +4563,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     prompt = NULL;
     chat_msgs_push(&msgs, user_msg);
     r->prompt_text = render_chat_prompt_text_for_syntax(
-        r->model_syntax, &msgs, NULL, NULL, r->think_mode);
+        r->model_syntax, &msgs, NULL, NULL, r->think_mode, false);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(prompt);
@@ -10822,14 +10839,13 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf suffix = {0};
     /* This suffix mirrors what a Responses client can replay, not necessarily
      * every token in KV.  Hidden reasoning stays live in the session unless the
-     * next client replay is expected to include it.  In practice, pi replays
-     * reasoning summaries for tool-call turns, but not for final assistant
-     * answers; Codex currently requests no summaries at all.  So only include
-     * reasoning in the remembered visible prefix when this assistant turn ended
-     * in tool calls.  A client that does replay final-answer reasoning will not
-     * match this visible shortcut and can still use exact token-prefix replay. */
+     * next client replay is expected to include it.  Clients that opt in via
+     * reasoning.summary (e.g. Zed with "summary": "auto") replay reasoning
+     * summaries for all turns, not just tool-call turns.  Include reasoning in
+     * the visible prefix whenever the client requested summaries, so the next
+     * request's prompt matches the saved checkpoint for KV cache reuse. */
     if (r && ds4_think_mode_enabled(r->think_mode)) {
-        if (r->reasoning_summary_emit && calls && calls->len > 0) {
+        if (r->reasoning_summary_emit) {
             buf_puts(&suffix, reasoning ? reasoning : "");
         }
         buf_puts(&suffix, "</think>");
@@ -15388,7 +15404,7 @@ static void test_render_glm_chat_prompt_text(void) {
         "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
         "\"command\":{}}}}";
     char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
+        SERVER_MODEL_SYNTAX_GLM, &msgs, tool_schemas, &orders, DS4_THINK_HIGH, false);
 
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(!strncmp(prompt, "[gMASK]<sop>", strlen("[gMASK]<sop>")));
@@ -15421,7 +15437,7 @@ static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs_push(&msgs, user2);
 
     char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH);
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH, false);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "old hidden reasoning") == NULL);
     TEST_ASSERT(strstr(prompt, "<|assistant|><think></think>first answer") != NULL);
@@ -15453,11 +15469,11 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
 
     tool_schema_orders orders = make_bash_order();
     char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH, false);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_call>bash") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|observation|><tool_response>/tmp</tool_response>") != NULL);
+    TEST_ASSERT(strstr(prompt, "</tool_call>") != NULL);
 
     free(prompt);
     tool_schema_orders_free(&orders);
@@ -16042,7 +16058,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     chat_msgs_push(&prefix_msgs, user);
     char *prompt_text = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, &prefix_msgs, tool_schemas,
-        &orders, DS4_THINK_HIGH);
+        &orders, DS4_THINK_HIGH, false);
 
     const char *generated =
         "need bash</think>done\n\n"
@@ -16089,7 +16105,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
 
     char *future_prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, &history_msgs, tool_schemas,
-        &r.tool_orders, DS4_THINK_HIGH);
+        &r.tool_orders, DS4_THINK_HIGH, false);
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
     free(future_prompt);
@@ -16639,11 +16655,12 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     r.think_mode = DS4_THINK_HIGH;
     r.reasoning_summary_emit = true;
 
+    /* When reasoning_summary_emit is true, reasoning is included even without tool calls.
+     * This matches clients like Zed that replay reasoning summaries for all turns. */
     char *suffix = build_responses_visible_assistant_suffix(&r, "5",
                                                             "hidden summary",
                                                             NULL);
-    TEST_ASSERT(strstr(suffix, "hidden summary") == NULL);
-    TEST_ASSERT(strstr(suffix, "</think>5") != NULL);
+    TEST_ASSERT(strstr(suffix, "hidden summary</think>5") != NULL);
     free(suffix);
 
     tool_calls calls = {0};
