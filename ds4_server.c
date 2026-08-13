@@ -608,6 +608,9 @@ typedef struct {
     char *role;
     char *content;
     char *reasoning;
+    char *encrypted_content; /* Opaque base64 from Responses reasoning.encrypted_content.
+                              * Rendered verbatim in thinking tags so the token stream
+                              * matches the original generation for KV cache reuse. */
     char *tool_call_id;
     char **tool_call_ids;
     int tool_call_ids_len;
@@ -739,6 +742,7 @@ static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
     free(m->reasoning);
+    free(m->encrypted_content);
     free(m->tool_call_id);
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
     free(m->tool_call_ids);
@@ -2491,7 +2495,12 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
                 if (think) {
                     if (tool_context || i > last_user_idx) {
                         buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        /* Prefer plain reasoning; fall back to encrypted_content
+                         * (opaque base64 from Responses stateless replay) so the
+                         * rendered token stream matches the original generation. */
+                        const char *r = m->reasoning;
+                        if (!r || !r[0]) r = m->encrypted_content;
+                        buf_puts(&out, r ? r : "");
                         buf_puts(&out, "</think>");
                     } else {
                         buf_puts(&out, "</think>");
@@ -2528,7 +2537,9 @@ static void append_glm_assistant_message_prefix(buf *out,
     if (text_starts_with_think_tag(content)) return;
     if (preserve_reasoning) {
         buf_puts(out, "<think>");
-        buf_puts(out, m && m->reasoning ? m->reasoning : "");
+        const char *r = m && m->reasoning ? m->reasoning : NULL;
+        if (!r || !r[0]) r = m && m->encrypted_content ? m->encrypted_content : NULL;
+        buf_puts(out, r ? r : "");
         buf_puts(out, "</think>");
     } else {
         buf_puts(out, "<think></think>");
@@ -3514,6 +3525,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
     (*p)++;
 
     buf pending_reasoning = {0};
+    char *pending_encrypted_reasoning = NULL;
 
     json_ws(p);
     while (**p && **p != ']') {
@@ -3530,6 +3542,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *output = NULL;
         char *input_str = NULL;
         char *summary = NULL;
+        char *encrypted_content = NULL;
         char *action = NULL;
         char *result = NULL;
         char *tools_json = NULL;
@@ -3622,6 +3635,11 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     free(key);
                     goto item_fail;
                 }
+            } else if (!strcmp(key, "encrypted_content")) {
+                if (!json_string_replace(p, &encrypted_content)) {
+                    free(key);
+                    goto item_fail;
+                }
             } else if (!strcmp(key, "action")) {
                 if (!json_raw_value_replace(p, &action)) {
                     free(key);
@@ -3673,6 +3691,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted_content);
             free(action);
             free(result);
             free(tools_json);
@@ -3692,6 +3711,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted_content);
             free(action);
             free(result);
             free(tools_json);
@@ -3741,11 +3761,16 @@ item_fail:
             !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call");
         bool is_bookkeeping =
             !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
-        if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
+        if (!consumes_reasoning && !is_bookkeeping &&
+            (pending_reasoning.len || pending_encrypted_reasoning)) {
             chat_msg flush_msg = {0};
             flush_msg.role = xstrdup("assistant");
             flush_msg.content = xstrdup("");
-            flush_msg.reasoning = buf_take(&pending_reasoning);
+            if (pending_reasoning.len) flush_msg.reasoning = buf_take(&pending_reasoning);
+            if (pending_encrypted_reasoning) {
+                flush_msg.encrypted_content = pending_encrypted_reasoning;
+                pending_encrypted_reasoning = NULL;
+            }
             chat_msgs_push(msgs, flush_msg);
         }
         if (!strcmp(t, "message")) {
@@ -3753,8 +3778,12 @@ item_fail:
             msg.role = xstrdup(role ? role : "user");
             msg.content = content ? content : xstrdup("");
             content = NULL;
-            if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
-                msg.reasoning = buf_take(&pending_reasoning);
+            if (!strcmp(msg.role, "assistant")) {
+                if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                if (pending_encrypted_reasoning) {
+                    msg.encrypted_content = pending_encrypted_reasoning;
+                    pending_encrypted_reasoning = NULL;
+                }
             }
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
@@ -3788,12 +3817,20 @@ item_fail:
                     free(last->reasoning);
                     last->reasoning = buf_take(&pending_reasoning);
                 }
+                if (!last->encrypted_content && pending_encrypted_reasoning) {
+                    last->encrypted_content = pending_encrypted_reasoning;
+                    pending_encrypted_reasoning = NULL;
+                }
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
                 msg.role = xstrdup("assistant");
                 msg.content = xstrdup("");
                 if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                if (pending_encrypted_reasoning) {
+                    msg.encrypted_content = pending_encrypted_reasoning;
+                    pending_encrypted_reasoning = NULL;
+                }
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
@@ -3808,7 +3845,11 @@ item_fail:
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "reasoning")) {
             /* Stash so it merges into the next assistant message. summary is the
-             * short-form list, content is the verbose chain. Either can be empty. */
+             * short-form list, content is the verbose chain. Either can be empty.
+             * encrypted_content is opaque base64 from stateless replay (e.g. Zed
+             * with reasoning.encrypted_content); we cannot decrypt it but must
+             * preserve it verbatim so the rendered prompt matches the original
+             * token stream for KV cache reuse. */
             if (summary && summary[0]) {
                 if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
                 buf_puts(&pending_reasoning, summary);
@@ -3816,6 +3857,12 @@ item_fail:
             if (content && content[0]) {
                 if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
                 buf_puts(&pending_reasoning, content);
+            }
+            /* Stash encrypted_content separately — it must not mix with the
+             * plain-text reasoning buffer. */
+            if (encrypted_content && encrypted_content[0]) {
+                free(pending_encrypted_reasoning);
+                pending_encrypted_reasoning = xstrdup(encrypted_content);
             }
         } else if (!strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
                    !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call"))
@@ -3843,12 +3890,20 @@ item_fail:
                     free(last->reasoning);
                     last->reasoning = buf_take(&pending_reasoning);
                 }
+                if (!last->encrypted_content && pending_encrypted_reasoning) {
+                    last->encrypted_content = pending_encrypted_reasoning;
+                    pending_encrypted_reasoning = NULL;
+                }
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
                 msg.role = xstrdup("assistant");
                 msg.content = xstrdup("");
                 if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                if (pending_encrypted_reasoning) {
+                    msg.encrypted_content = pending_encrypted_reasoning;
+                    pending_encrypted_reasoning = NULL;
+                }
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
@@ -3916,6 +3971,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted_content);
             free(action);
             free(result);
             free(tools_json);
@@ -3935,6 +3991,7 @@ item_fail:
         free(output);
         free(input_str);
         free(summary);
+        free(encrypted_content);
         free(action);
         free(result);
         free(tools_json);
@@ -3954,12 +4011,27 @@ item_fail:
         msg.role = xstrdup("assistant");
         msg.content = xstrdup("");
         msg.reasoning = buf_take(&pending_reasoning);
+        if (pending_encrypted_reasoning) {
+            msg.encrypted_content = pending_encrypted_reasoning;
+            pending_encrypted_reasoning = NULL;
+        }
+        chat_msgs_push(msgs, msg);
+    } else if (pending_encrypted_reasoning) {
+        /* encrypted_content without plain reasoning — still need an assistant
+         * message to carry it so the renderer emits the opaque tokens. */
+        chat_msg msg = {0};
+        msg.role = xstrdup("assistant");
+        msg.content = xstrdup("");
+        msg.encrypted_content = pending_encrypted_reasoning;
+        pending_encrypted_reasoning = NULL;
         chat_msgs_push(msgs, msg);
     }
     buf_free(&pending_reasoning);
+    free(pending_encrypted_reasoning);
     return true;
 fail:
     buf_free(&pending_reasoning);
+    free(pending_encrypted_reasoning);
     return false;
 }
 
@@ -15188,6 +15260,90 @@ static void test_render_preserves_reasoning_with_tools(void) {
     chat_msgs_free(&msgs);
 }
 
+/* The Responses API carries prior-turn reasoning as separate `reasoning`
+ * items that must merge into the following assistant message so the chat
+ * renderer can preserve it exactly like the chat/completions path does with
+ * reasoning_content.  This test drives the real Responses parser + renderer
+ * and compares against the equivalent chat-completions message list. */
+static void test_responses_rendering_preserves_reasoning(void) {
+    const char *resp_input =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":"
+        "[{\"type\":\"input_text\",\"text\":\"first\"}]},"
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":"
+        "[{\"type\":\"summary_text\",\"text\":\"tool reasoning\"}]},"
+        "{\"type\":\"message\",\"role\":\"assistant\",\"content\":"
+        "[{\"type\":\"output_text\",\"text\":\"\"}]},"
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\","
+        "\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"/tmp\"},"
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":"
+        "[{\"type\":\"input_text\",\"text\":\"second\"}]}]";
+    const char *p = resp_input;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+
+    /* The reasoning summary must be attached to the assistant message. */
+    const chat_msg *assistant = NULL;
+    for (int i = 0; i < msgs.len; i++) {
+        if (!strcmp(msgs.v[i].role, "assistant")) { assistant = &msgs.v[i]; break; }
+    }
+    TEST_ASSERT(assistant != NULL);
+    TEST_ASSERT(assistant->reasoning &&
+                strstr(assistant->reasoning, "tool reasoning") != NULL);
+
+    /* With tools in the request the reasoning is preserved in the render. */
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    fprintf(stderr, "\n--- RESP PROMPT ---\n%s\n--- END ---\n", prompt);
+    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
+    free(prompt);
+
+    /* Even without tools in this request, the tool history keeps reasoning
+     * preserved -- identical to the chat-completions behaviour. */
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    free(prompt);
+
+    chat_msgs_free(&msgs);
+}
+
+/* Zed sends reasoning items with encrypted_content (opaque base64) instead of
+ * summary/content when replaying history in stateless mode. DS4 cannot decrypt
+ * it, but must preserve it verbatim in the rendered prompt so the token stream
+ * matches the original generation for KV cache reuse. */
+static void test_responses_encrypted_reasoning_preserved(void) {
+    const char *resp_input =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":"
+        "[{\"type\":\"input_text\",\"text\":\"first\"}]},"
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\","
+        "\"encrypted_content\":\"VGhpcyBpcyBvcGFxdWUgYmFzZTY0\"},"
+        "{\"type\":\"message\",\"role\":\"assistant\",\"content\":"
+        "[{\"type\":\"output_text\",\"text\":\"answer\"}]}]";
+    const char *p = resp_input;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+
+    /* The encrypted_content must be attached to the assistant message. */
+    const chat_msg *assistant = NULL;
+    for (int i = 0; i < msgs.len; i++) {
+        if (!strcmp(msgs.v[i].role, "assistant")) { assistant = &msgs.v[i]; break; }
+    }
+    TEST_ASSERT(assistant != NULL);
+    TEST_ASSERT(assistant->encrypted_content &&
+                !strcmp(assistant->encrypted_content, "VGhpcyBpcyBvcGFxdWUgYmFzZTY0"));
+
+    /* The rendered prompt must include the encrypted content in thinking tags
+     * so the token stream matches the original generation. */
+    char *prompt = render_chat_prompt_text(&msgs, "{}", NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<think>VGhpcyBpcyBvcGFxdWUgYmFzZTY0</think>") != NULL);
+    free(prompt);
+
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     /* The tool-schema block must sit at the head of the system region so the
      * client's system content stays at the tail, right before <｜User｜>.
@@ -18452,6 +18608,8 @@ static void ds4_server_unit_tests_run(void) {
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
+    test_responses_rendering_preserves_reasoning();
+    test_responses_encrypted_reasoning_preserved();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
