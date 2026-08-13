@@ -145,6 +145,10 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+void ds4_gpu_set_streaming_expert_cache_budget2(uint32_t experts);
+void ds4_gpu_set_streaming_expert_cache_expert_bytes2(uint64_t bytes);
+#endif
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);

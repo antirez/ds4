@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
@@ -18,6 +19,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -148,6 +150,108 @@ typedef struct {
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
+
+typedef struct ds4_gpu_stream_expert_table {
+    const void *model_map;
+    uint64_t    model_size;
+    uint32_t    layer;
+    uint32_t    n_total_expert;
+    uint64_t    gate_offset;
+    uint64_t    up_offset;
+    uint64_t    down_offset;
+    uint64_t    gate_expert_bytes;
+    uint64_t    down_expert_bytes;
+} ds4_gpu_stream_expert_table;
+
+struct cuda_stream_hot_key {
+    const void *model_map;
+    uint64_t model_size;
+    uint32_t layer;
+    uint32_t expert;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+
+    bool operator==(const cuda_stream_hot_key &other) const {
+        return model_map == other.model_map && model_size == other.model_size &&
+               layer == other.layer && expert == other.expert &&
+               gate_offset == other.gate_offset && up_offset == other.up_offset &&
+               down_offset == other.down_offset &&
+               gate_expert_bytes == other.gate_expert_bytes &&
+               down_expert_bytes == other.down_expert_bytes;
+    }
+};
+
+struct cuda_stream_hot_key_hash {
+    size_t operator()(const cuda_stream_hot_key &key) const {
+        size_t h = std::hash<const void *>{}(key.model_map);
+        const auto mix = [&h](uint64_t value) {
+            h ^= std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ull +
+                 (h << 6) + (h >> 2);
+        };
+        mix(key.model_size);
+        mix(((uint64_t)key.layer << 32) | key.expert);
+        mix(key.gate_offset);
+        mix(key.up_offset);
+        mix(key.down_offset);
+        mix(key.gate_expert_bytes);
+        mix(key.down_expert_bytes);
+        return h;
+    }
+};
+
+struct cuda_stream_hot_entry {
+    cuda_stream_hot_key key = {};
+    uint64_t hotness = 0;
+    uint64_t last_used = 0;
+    bool valid = false;
+};
+
+struct cuda_stream_hot_cache {
+    uint32_t requested_count = 0;
+    uint32_t effective_count = 0;
+    uint32_t resident_count = 0;
+    uint64_t expert_bytes = 0;
+    uint64_t clock = 0;
+    uint64_t route_count = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+    char *slab = NULL;
+    uint64_t slab_bytes = 0;
+    bool allocation_failed = false;
+    std::vector<cuda_stream_hot_entry> entries;
+    std::unordered_map<cuda_stream_hot_key, uint32_t,
+                       cuda_stream_hot_key_hash> index;
+    std::mutex mutex;
+};
+
+static cuda_stream_hot_cache g_stream_hot_cache;
+static cuda_stream_hot_cache g_stream_hot_cache2;
+
+/*
+ * Mixed-precision models (e.g. Q2 routed experts with a Q4K tail) have two
+ * per-expert size classes.  A single slab class used to evict every boosted
+ * layer from the cache, forcing per-token host reads on exactly the layers
+ * the model was upgraded on.  Keep a second, independent cache whose slab is
+ * sized for the secondary class; ds4.c splits the byte budget across them.
+ */
+static cuda_stream_hot_cache *cuda_stream_hot_cache_for(uint64_t expert_bytes) {
+    if (expert_bytes != 0 && expert_bytes == g_stream_hot_cache.expert_bytes)
+        return &g_stream_hot_cache;
+    if (expert_bytes != 0 && expert_bytes == g_stream_hot_cache2.expert_bytes)
+        return &g_stream_hot_cache2;
+    return NULL;
+}
+
+static int cuda_stream_selected_ranges_valid(
+        const ds4_gpu_stream_expert_table *table);
+static int cuda_stream_selected_cache_begin_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *selected_ids,
+        uint32_t slot_count);
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
@@ -1455,9 +1559,15 @@ static uint64_t cuda_model_copy_chunk_bytes(void) {
     return mb * 1048576ull;
 }
 
-static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
+static void cuda_model_discard_source_pages_impl(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        bool force) {
 #if defined(POSIX_MADV_DONTNEED)
-    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || !model_map || bytes == 0 || offset > model_size) return;
+    if ((!force && getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) ||
+        !model_map || bytes == 0 || offset > model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -1471,17 +1581,37 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
     (void)model_size;
     (void)offset;
     (void)bytes;
+    (void)force;
 #endif
 }
 
-static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+static void cuda_model_discard_source_pages(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes) {
+    cuda_model_discard_source_pages_impl(
+            model_map, model_size, offset, bytes, false);
+}
+
+static void cuda_model_drop_file_pages_impl(
+        uint64_t offset,
+        uint64_t bytes,
+        bool force) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_fd < 0 ||
+        (!force && getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) ||
+        bytes == 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
     (void)bytes;
+    (void)force;
 #endif
+}
+
+static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+    cuda_model_drop_file_pages_impl(offset, bytes, false);
 }
 
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
@@ -1740,6 +1870,339 @@ static int cuda_model_copy_to_device_streamed(
                 what ? what : "expert", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
+    }
+    return 1;
+}
+
+static int cuda_stream_hot_cache_enabled(void) {
+    return g_ssd_streaming_mode &&
+           (g_stream_hot_cache.requested_count != 0 ||
+            g_stream_hot_cache2.requested_count != 0);
+}
+
+static uint64_t cuda_stream_hot_expert_bytes(
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2u) return 0;
+    return 2u * gate_expert_bytes + down_expert_bytes;
+}
+
+static void cuda_stream_hot_cache_release_locked(
+        cuda_stream_hot_cache *c,
+        bool clear_config) {
+    if (c->slab &&
+        getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL) {
+        const uint64_t lookups = c->hits + c->misses;
+        fprintf(stderr,
+                "ds4: CUDA persistent expert cache: resident=%u/%u "
+                "hits=%llu misses=%llu hit_rate=%.2f%% evictions=%llu\n",
+                c->resident_count,
+                c->effective_count,
+                (unsigned long long)c->hits,
+                (unsigned long long)c->misses,
+                lookups ? 100.0 * (double)c->hits /
+                              (double)lookups : 0.0,
+                (unsigned long long)c->evictions);
+    }
+    if (c->slab) {
+        (void)cudaDeviceSynchronize();
+        (void)cudaFree(c->slab);
+    }
+    c->slab = NULL;
+    c->slab_bytes = 0;
+    c->effective_count = 0;
+    c->resident_count = 0;
+    c->clock = 0;
+    c->route_count = 0;
+    c->hits = 0;
+    c->misses = 0;
+    c->evictions = 0;
+    c->allocation_failed = false;
+    c->entries.clear();
+    c->index.clear();
+    if (clear_config) {
+        c->requested_count = 0;
+        c->expert_bytes = 0;
+    }
+}
+
+static void cuda_stream_hot_cache_release(
+        cuda_stream_hot_cache *c,
+        bool clear_config) {
+    std::lock_guard<std::mutex> lock(c->mutex);
+    cuda_stream_hot_cache_release_locked(c, clear_config);
+}
+
+static void cuda_stream_hot_cache_release_all(bool clear_config) {
+    cuda_stream_hot_cache_release(&g_stream_hot_cache, clear_config);
+    cuda_stream_hot_cache_release(&g_stream_hot_cache2, clear_config);
+}
+
+static cuda_stream_hot_key cuda_stream_hot_key_make(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t expert) {
+    cuda_stream_hot_key key = {};
+    key.model_map = table->model_map;
+    key.model_size = table->model_size;
+    key.layer = table->layer;
+    key.expert = expert;
+    key.gate_offset = table->gate_offset;
+    key.up_offset = table->up_offset;
+    key.down_offset = table->down_offset;
+    key.gate_expert_bytes = table->gate_expert_bytes;
+    key.down_expert_bytes = table->down_expert_bytes;
+    return key;
+}
+
+static int cuda_stream_hot_cache_ensure_locked(
+        cuda_stream_hot_cache *c,
+        const ds4_gpu_stream_expert_table *table) {
+    if (!cuda_stream_hot_cache_enabled() || !g_ssd_streaming_mode ||
+        c->requested_count == 0 ||
+        c->allocation_failed || !table) {
+        return 0;
+    }
+    const uint64_t expert_bytes = cuda_stream_hot_expert_bytes(
+            table->gate_expert_bytes, table->down_expert_bytes);
+    if (expert_bytes == 0 || c->expert_bytes == 0 ||
+        expert_bytes != c->expert_bytes) {
+        return 0;
+    }
+    if (c->slab) return 1;
+
+    const uint32_t count = c->requested_count;
+    char *slab = NULL;
+    if ((uint64_t)count > UINT64_MAX / expert_bytes) return 0;
+    const uint64_t slab_bytes = (uint64_t)count * expert_bytes;
+    const cudaError_t err = cudaMalloc((void **)&slab, (size_t)slab_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        c->allocation_failed = true;
+        fprintf(stderr,
+                "ds4: CUDA persistent expert cache allocation failed for "
+                "%u slots (%.2f GiB): %s; falling back to transient "
+                "selected loads\n",
+                count, (double)slab_bytes / 1073741824.0,
+                cudaGetErrorString(err));
+        return 0;
+    }
+    try {
+        c->entries.assign(count, cuda_stream_hot_entry{});
+        c->index.reserve((size_t)count * 2u);
+    } catch (...) {
+        (void)cudaFree(slab);
+        c->allocation_failed = true;
+        fprintf(stderr,
+                "ds4: CUDA persistent expert cache metadata allocation failed; "
+                "falling back to transient selected loads\n");
+        return 0;
+    }
+    c->slab = slab;
+    c->slab_bytes = slab_bytes;
+    c->effective_count = count;
+    fprintf(stderr,
+            "ds4: CUDA persistent expert cache enabled: %u slots, %.2f GiB "
+            "(%.2f MiB/expert)\n",
+            count,
+            (double)slab_bytes / 1073741824.0,
+            (double)expert_bytes / 1048576.0);
+    return 1;
+}
+
+static uint32_t cuda_stream_hot_cache_victim_locked(cuda_stream_hot_cache *c) {
+    for (uint32_t i = 0; i < c->effective_count; i++) {
+        if (!c->entries[i].valid) return i;
+    }
+    uint32_t victim = 0;
+    for (uint32_t i = 1; i < c->effective_count; i++) {
+        const cuda_stream_hot_entry &cur = c->entries[i];
+        const cuda_stream_hot_entry &best = c->entries[victim];
+        if (cur.hotness < best.hotness ||
+            (cur.hotness == best.hotness && cur.last_used < best.last_used)) {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+static void cuda_stream_hot_cache_touch_locked(
+        cuda_stream_hot_cache *c,
+        cuda_stream_hot_entry *entry,
+        uint32_t weight) {
+    if (!entry) return;
+    entry->last_used = ++c->clock;
+    const uint64_t add = weight ? weight : 1u;
+    entry->hotness = entry->hotness > UINT64_MAX - add ?
+        UINT64_MAX : entry->hotness + add;
+    c->route_count += add;
+    if ((c->route_count & 4095u) < add) {
+        for (cuda_stream_hot_entry &candidate : c->entries) {
+            candidate.hotness >>= 1u;
+        }
+    }
+}
+
+static int cuda_stream_hot_cache_load_locked(
+        cuda_stream_hot_cache *c,
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t expert,
+        uint32_t weight,
+        uint32_t *slot_out) {
+    const cuda_stream_hot_key key = cuda_stream_hot_key_make(table, expert);
+    auto found = c->index.find(key);
+    if (found != c->index.end()) {
+        cuda_stream_hot_entry &entry = c->entries[found->second];
+        cuda_stream_hot_cache_touch_locked(c, &entry, weight);
+        c->hits++;
+        *slot_out = found->second;
+        return 1;
+    }
+
+    const uint32_t slot = cuda_stream_hot_cache_victim_locked(c);
+    cuda_stream_hot_entry &entry = c->entries[slot];
+    if (entry.valid) {
+        c->index.erase(entry.key);
+        entry.valid = false;
+        c->resident_count--;
+        c->evictions++;
+    }
+
+    const uint64_t expert_bytes = c->expert_bytes;
+    char *base = c->slab + (uint64_t)slot * expert_bytes;
+    char *gate_dst = base;
+    char *up_dst = gate_dst + table->gate_expert_bytes;
+    char *down_dst = up_dst + table->gate_expert_bytes;
+    const uint64_t gate_src = table->gate_offset +
+                              (uint64_t)expert * table->gate_expert_bytes;
+    const uint64_t up_src = table->up_offset +
+                            (uint64_t)expert * table->gate_expert_bytes;
+    const uint64_t down_src = table->down_offset +
+                              (uint64_t)expert * table->down_expert_bytes;
+    if (!cuda_model_copy_to_device_streamed(
+                gate_dst, table->model_map, table->model_size,
+                gate_src, table->gate_expert_bytes,
+                "persistent gate expert copy") ||
+        !cuda_model_copy_to_device_streamed(
+                up_dst, table->model_map, table->model_size,
+                up_src, table->gate_expert_bytes,
+                "persistent up expert copy") ||
+        !cuda_model_copy_to_device_streamed(
+                down_dst, table->model_map, table->model_size,
+                down_src, table->down_expert_bytes,
+                "persistent down expert copy")) {
+        return 0;
+    }
+    if (getenv("DS4_CUDA_DROP_PERSISTENT_SOURCE_PAGES") != NULL) {
+        cuda_model_drop_file_pages_impl(
+                gate_src, table->gate_expert_bytes, true);
+        cuda_model_drop_file_pages_impl(
+                up_src, table->gate_expert_bytes, true);
+        cuda_model_drop_file_pages_impl(
+                down_src, table->down_expert_bytes, true);
+        cuda_model_discard_source_pages_impl(
+                table->model_map, table->model_size,
+                gate_src, table->gate_expert_bytes, true);
+        cuda_model_discard_source_pages_impl(
+                table->model_map, table->model_size,
+                up_src, table->gate_expert_bytes, true);
+        cuda_model_discard_source_pages_impl(
+                table->model_map, table->model_size,
+                down_src, table->down_expert_bytes, true);
+    }
+
+    entry.key = key;
+    entry.hotness = 0;
+    entry.last_used = 0;
+    entry.valid = true;
+    cuda_stream_hot_cache_touch_locked(c, &entry, weight);
+    try {
+        c->index.emplace(entry.key, slot);
+    } catch (...) {
+        entry.valid = false;
+        cuda_stream_hot_cache_release_locked(c, false);
+        c->allocation_failed = true;
+        fprintf(stderr,
+                "ds4: CUDA persistent expert cache index allocation failed; "
+                "falling back to transient selected loads\n");
+        return 0;
+    }
+    c->resident_count++;
+    c->misses++;
+    *slot_out = slot;
+    return 1;
+}
+
+static int cuda_stream_hot_cache_materialize(
+        const ds4_gpu_stream_expert_table *table,
+        const std::vector<int32_t> &experts,
+        const std::vector<uint32_t> &frequencies,
+        char *gate_out,
+        char *up_out,
+        char *down_out) {
+    const uint64_t expert_bytes = cuda_stream_hot_expert_bytes(
+            table->gate_expert_bytes, table->down_expert_bytes);
+    cuda_stream_hot_cache *c = cuda_stream_hot_cache_for(expert_bytes);
+    if (!c) return 0;
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (!cuda_stream_hot_cache_ensure_locked(c, table)) return 0;
+    for (uint32_t i = 0; i < experts.size(); i++) {
+        uint32_t slot = 0;
+        if (!cuda_stream_hot_cache_load_locked(
+                    c, table, (uint32_t)experts[i], frequencies[i], &slot)) {
+            return 0;
+        }
+        const char *base = c->slab +
+                           (uint64_t)slot * c->expert_bytes;
+        const char *gate_src = base;
+        const char *up_src = gate_src + table->gate_expert_bytes;
+        const char *down_src = up_src + table->gate_expert_bytes;
+        const uint64_t gate_off = (uint64_t)i * table->gate_expert_bytes;
+        const uint64_t down_off = (uint64_t)i * table->down_expert_bytes;
+        if (!cuda_ok(cudaMemcpy(gate_out + gate_off, gate_src,
+                                (size_t)table->gate_expert_bytes,
+                                cudaMemcpyDeviceToDevice),
+                     "persistent gate expert materialize") ||
+            !cuda_ok(cudaMemcpy(up_out + gate_off, up_src,
+                                (size_t)table->gate_expert_bytes,
+                                cudaMemcpyDeviceToDevice),
+                     "persistent up expert materialize") ||
+            !cuda_ok(cudaMemcpy(down_out + down_off, down_src,
+                                (size_t)table->down_expert_bytes,
+                                cudaMemcpyDeviceToDevice),
+                     "persistent down expert materialize")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int cuda_stream_hot_cache_seed(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *expert_ids,
+        const uint32_t *priorities,
+        uint32_t count) {
+    if (!cuda_stream_hot_cache_enabled()) return 1;
+    if (!cuda_stream_selected_ranges_valid(table)) return 0;
+    const uint64_t expert_bytes = cuda_stream_hot_expert_bytes(
+            table->gate_expert_bytes, table->down_expert_bytes);
+    cuda_stream_hot_cache *c = cuda_stream_hot_cache_for(expert_bytes);
+    if (!c) return 1;
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (!cuda_stream_hot_cache_ensure_locked(c, table)) return 1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (expert_ids[i] < 0 ||
+            (uint32_t)expert_ids[i] >= table->n_total_expert) {
+            return 0;
+        }
+        uint32_t slot = 0;
+        const uint32_t priority = priorities ? priorities[i] : 1u;
+        if (!cuda_stream_hot_cache_load_locked(
+                    c, table, (uint32_t)expert_ids[i], priority, &slot)) {
+            fprintf(stderr,
+                    "ds4: CUDA persistent expert preload failed; "
+                    "continuing with demand loads\n");
+            return 1;
+        }
     }
     return 1;
 }
@@ -2261,6 +2724,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     cuda_stream_selected_cache_release();
+    cuda_stream_hot_cache_release_all(true);
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_cublas_ready = 0;
@@ -2488,6 +2952,11 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
+
+    /* ThinkMax can fit the model and DSpark support in VRAM but needs the
+     * long-lived KV allocation to fault through host memory. Keep this local
+     * opt-in so ordinary CUDA sessions retain device-only KV performance. */
+    if (getenv("DS4_CUDA_FORCE_MANAGED_KV") != NULL) return 1;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
@@ -3125,6 +3594,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
+    cuda_stream_hot_cache_release_all(false);
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -3222,6 +3692,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
     cuda_stream_selected_cache_release();
+    cuda_stream_hot_cache_release_all(false);
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -20859,7 +21330,7 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int logical_tier = ds4_tensor_device_idx(out);
-    const int use_stream_selected_cache =
+    int use_stream_selected_cache =
         allow_streaming &&
         g_ssd_streaming_mode &&
         g_stream_selected_cache.valid &&
@@ -20879,6 +21350,49 @@ static int routed_moe_launch(
         g_stream_selected_cache.slot_selected_tensor.ptr &&
         g_stream_selected_cache.slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
+    if (g_ssd_streaming_mode && allow_streaming &&
+        !use_stream_selected_cache && cuda_stream_hot_cache_enabled() &&
+        selected && selected->ptr && required_slot_count <= UINT32_MAX) {
+        std::vector<int32_t> selected_ids;
+        try {
+            selected_ids.resize((size_t)required_slot_count);
+        } catch (...) {
+            selected_ids.clear();
+        }
+        if (!selected_ids.empty() &&
+            cuda_ok(cudaMemcpy(selected_ids.data(), selected->ptr,
+                               (size_t)required_slot_count * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost),
+                    "streaming selected-id repair read")) {
+            const ds4_gpu_stream_expert_table table = {
+                model_map,
+                model_size,
+                layer_index,
+                n_total_expert,
+                gate_offset,
+                up_offset,
+                down_offset,
+                gate_expert_bytes,
+                down_expert_bytes,
+            };
+            if (cuda_stream_selected_cache_begin_load(
+                        &table, selected_ids.data(),
+                        (uint32_t)required_slot_count)) {
+                use_stream_selected_cache =
+                    g_stream_selected_cache.valid &&
+                    g_stream_selected_cache.logical_tier == logical_tier &&
+                    g_stream_selected_cache.model_map == model_map &&
+                    g_stream_selected_cache.layer == layer_index &&
+                    g_stream_selected_cache.n_total_expert == n_total_expert &&
+                    g_stream_selected_cache.slot_count >= required_slot_count &&
+                    g_stream_selected_cache.gate_offset == gate_offset &&
+                    g_stream_selected_cache.up_offset == up_offset &&
+                    g_stream_selected_cache.down_offset == down_offset &&
+                    g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
+                    g_stream_selected_cache.down_expert_bytes == down_expert_bytes;
+            }
+        }
+    }
     if (g_ssd_streaming_mode && allow_streaming &&
         !use_stream_selected_cache) {
         fprintf(stderr,
@@ -22266,7 +22780,6 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              layer_index, 1, force_resident ? 0 : 1, 0);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
-    (void)force_resident;
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -22275,7 +22788,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens, 1, 0);
+                             layer_index, n_tokens, force_resident ? 0 : 1, 0);
 }
 
 extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
@@ -22883,18 +23396,6 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
     return 0;
 }
 
-typedef struct ds4_gpu_stream_expert_table {
-    const void *model_map;
-    uint64_t    model_size;
-    uint32_t    layer;
-    uint32_t    n_total_expert;
-    uint64_t    gate_offset;
-    uint64_t    up_offset;
-    uint64_t    down_offset;
-    uint64_t    gate_expert_bytes;
-    uint64_t    down_expert_bytes;
-} ds4_gpu_stream_expert_table;
-
 static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
     if (*ptr && *capacity >= bytes) return 1;
@@ -22968,11 +23469,14 @@ static int cuda_stream_selected_cache_begin_load(
 
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> compact_ids;
+    std::vector<uint32_t> compact_frequencies;
     std::vector<int32_t> slot_ids;
     try {
         expert_to_slot.assign(table->n_total_expert, -1);
         compact_ids.reserve(slot_count < table->n_total_expert ?
                             slot_count : table->n_total_expert);
+        compact_frequencies.reserve(slot_count < table->n_total_expert ?
+                                    slot_count : table->n_total_expert);
         slot_ids.resize(slot_count);
     } catch (...) {
         return 0;
@@ -22990,7 +23494,9 @@ static int cuda_stream_selected_cache_begin_load(
             compact = (int32_t)compact_ids.size();
             expert_to_slot[(uint32_t)expert] = compact;
             compact_ids.push_back(expert);
+            compact_frequencies.push_back(0);
         }
+        compact_frequencies[(uint32_t)compact]++;
         slot_ids[i] = compact;
     }
     if (compact_ids.empty() || compact_ids.size() > UINT32_MAX) return 0;
@@ -23027,33 +23533,39 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
-    for (uint32_t i = 0; i < compact_ids.size(); i++) {
-        const uint64_t expert = (uint32_t)compact_ids[i];
-        const uint64_t gate_src =
-            table->gate_offset + expert * table->gate_expert_bytes;
-        const uint64_t up_src =
-            table->up_offset + expert * table->gate_expert_bytes;
-        const uint64_t down_src =
-            table->down_offset + expert * table->down_expert_bytes;
-        const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
-        const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-        if (!cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.gate_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    gate_src, table->gate_expert_bytes,
-                    "stream gate expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.up_ptr + gate_dst,
-                    table->model_map, table->model_size,
-                    up_src, table->gate_expert_bytes,
-                    "stream up expert copy") ||
-            !cuda_model_copy_to_device_streamed(
-                    g_stream_selected_cache.down_ptr + down_dst,
-                    table->model_map, table->model_size,
-                    down_src, table->down_expert_bytes,
-                    "stream down expert copy")) {
-            cuda_stream_selected_cache_invalidate();
-            return 0;
+    if (!cuda_stream_hot_cache_materialize(
+                table, compact_ids, compact_frequencies,
+                g_stream_selected_cache.gate_ptr,
+                g_stream_selected_cache.up_ptr,
+                g_stream_selected_cache.down_ptr)) {
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            const uint64_t expert = (uint32_t)compact_ids[i];
+            const uint64_t gate_src =
+                table->gate_offset + expert * table->gate_expert_bytes;
+            const uint64_t up_src =
+                table->up_offset + expert * table->gate_expert_bytes;
+            const uint64_t down_src =
+                table->down_offset + expert * table->down_expert_bytes;
+            const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
+            const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
+            if (!cuda_model_copy_to_device_streamed(
+                        g_stream_selected_cache.gate_ptr + gate_dst,
+                        table->model_map, table->model_size,
+                        gate_src, table->gate_expert_bytes,
+                        "stream gate expert copy") ||
+                !cuda_model_copy_to_device_streamed(
+                        g_stream_selected_cache.up_ptr + gate_dst,
+                        table->model_map, table->model_size,
+                        up_src, table->gate_expert_bytes,
+                        "stream up expert copy") ||
+                !cuda_model_copy_to_device_streamed(
+                        g_stream_selected_cache.down_ptr + down_dst,
+                        table->model_map, table->model_size,
+                        down_src, table->down_expert_bytes,
+                        "stream down expert copy")) {
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
         }
     }
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
@@ -26922,13 +27434,13 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
-    /* GLM graph memory guard: on this backend the model weights are
-     * distributed across all devices by the multi-tier placement, so the
-     * relevant budget is the aggregate VRAM. */
+    /* SSD streaming is single-GPU, so its cache must fit the active device.
+     * Multi-tier non-streaming placement still uses the aggregate VRAM. */
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return 0;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    if (g_ssd_streaming_mode) return (uint64_t)total_b;
     return (uint64_t)total_b * (uint64_t)n;
 }
 
@@ -27260,9 +27772,11 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
+    if (!cuda_stream_hot_cache_enabled() || !g_ssd_streaming_mode) return 0;
+    const uint64_t expert_bytes = cuda_stream_hot_expert_bytes(
+            gate_expert_bytes, down_expert_bytes);
+    cuda_stream_hot_cache *c = cuda_stream_hot_cache_for(expert_bytes);
+    return c ? c->requested_count : 0;
 }
 
 extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -27374,30 +27888,66 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    if (!g_ssd_streaming_mode) {
+        cuda_stream_selected_cache_release();
+        cuda_stream_hot_cache_release_all(false);
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
+    std::lock_guard<std::mutex> lock(g_stream_hot_cache.mutex);
+    if (g_stream_hot_cache.requested_count == experts) return;
+    cuda_stream_hot_cache_release_locked(&g_stream_hot_cache, false);
+    g_stream_hot_cache.requested_count = experts;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
+    std::lock_guard<std::mutex> lock(g_stream_hot_cache.mutex);
+    if (g_stream_hot_cache.expert_bytes == bytes) return;
+    cuda_stream_hot_cache_release_locked(&g_stream_hot_cache, false);
+    g_stream_hot_cache.expert_bytes = bytes;
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_budget2(uint32_t experts) {
+    std::lock_guard<std::mutex> lock(g_stream_hot_cache2.mutex);
+    if (g_stream_hot_cache2.requested_count == experts) return;
+    cuda_stream_hot_cache_release_locked(&g_stream_hot_cache2, false);
+    g_stream_hot_cache2.requested_count = experts;
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes2(uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(g_stream_hot_cache2.mutex);
+    if (g_stream_hot_cache2.expert_bytes == bytes) return;
+    cuda_stream_hot_cache_release_locked(&g_stream_hot_cache2, false);
+    g_stream_hot_cache2.expert_bytes = bytes;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
+    if (!cuda_stream_hot_cache_enabled() || !g_ssd_streaming_mode) return 0;
+    return g_stream_hot_cache.requested_count +
+           g_stream_hot_cache2.requested_count;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
+    if (cuda_stream_hot_cache_enabled()) {
+        return g_stream_hot_cache.resident_count +
+               g_stream_hot_cache2.resident_count;
+    }
+    return g_stream_selected_cache.valid ? g_stream_selected_cache.compact_count : 0;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
+    for (cuda_stream_hot_cache *c : {&g_stream_hot_cache, &g_stream_hot_cache2}) {
+        std::lock_guard<std::mutex> lock(c->mutex);
+        for (cuda_stream_hot_entry &entry : c->entries) {
+            entry.hotness = 0;
+        }
+        c->route_count = 0;
+    }
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
+    cuda_stream_hot_cache_release_all(false);
     cuda_stream_selected_cache_release();
 }
 
@@ -27405,8 +27955,8 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t n_selected) {
-    (void)table; (void)selected_ids; (void)n_selected;
-    return 1;
+    if (!table || !selected_ids || n_selected == 0) return 0;
+    return cuda_stream_hot_cache_seed(table, selected_ids, NULL, n_selected);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -27427,8 +27977,9 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t *expert_ids,
         const uint32_t *expert_priorities,
         uint32_t n_experts) {
-    (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
-    return 1;
+    if (!table || !expert_ids || n_experts == 0) return 0;
+    return cuda_stream_hot_cache_seed(
+            table, expert_ids, expert_priorities, n_experts);
 }
 
 extern "C" int ds4_gpu_argmax_tensor(

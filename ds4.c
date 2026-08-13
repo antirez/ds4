@@ -33,6 +33,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
@@ -4535,6 +4536,49 @@ static bool ds4_streaming_cacheable_expert_count(
     return true;
 }
 
+/* Most common per-expert size class other than the primary slab class.
+ * Mixed-precision models (Q2 body with a Q4K tail) get a second cache slab
+ * sized for this class so boosted layers stop bypassing the expert cache. */
+static bool ds4_streaming_secondary_expert_class(
+        const ds4_weights *weights,
+        uint64_t          *bytes_out,
+        uint32_t          *layers_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (layers_out) *layers_out = 0;
+    if (!weights || !bytes_out) return false;
+
+    uint64_t primary = 0;
+    if (!ds4_streaming_routed_expert_bytes(weights, &primary)) return false;
+
+    uint64_t best_bytes = 0;
+    uint32_t best_count = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint64_t candidate = 0;
+        if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                 &candidate) ||
+            candidate == primary) {
+            continue;
+        }
+        uint32_t count = 0;
+        for (uint32_t jl = 0; jl < DS4_N_LAYER; jl++) {
+            uint64_t bytes = 0;
+            if (streaming_layer_routed_expert_bytes(&weights->layer[jl],
+                                                    &bytes) &&
+                bytes == candidate) {
+                count++;
+            }
+        }
+        if (count > best_count) {
+            best_bytes = candidate;
+            best_count = count;
+        }
+    }
+    if (best_count == 0) return false;
+    *bytes_out = best_bytes;
+    if (layers_out) *layers_out = best_count;
+    return true;
+}
+
 static bool ds4_streaming_prefill_headroom_bytes(
         const ds4_weights *weights,
         uint64_t          *bytes_out) {
@@ -4568,11 +4612,9 @@ static bool ds4_streaming_prefill_headroom_bytes(
 
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
- * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
- * single-size-class slab allocator sized from the dominant local routed-layer
- * size class, so other layers can never be served from it: they must read
- * expert weights through the mapped-model views instead. A layer is "uniform"
- * iff its per-expert bytes match the slab class.
+ * bigger quant (e.g. Q4_K among IQ2 layers). The primary streaming expert
+ * cache uses the dominant routed-layer size class; this predicate identifies
+ * layers that need a secondary class or mapped-model fallback.
  */
 static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
@@ -4584,6 +4626,18 @@ static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
     if (!streaming_layer_routed_expert_bytes(l, &bytes)) return true;
     if (!ds4_streaming_routed_expert_bytes(w, &base)) return true;
     return bytes == base;
+}
+
+static DS4_MAYBE_UNUSED bool weights_streaming_layer_expert_cache_class_supported(
+        const ds4_weights *w,
+        uint32_t           il) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    return weights_streaming_layer_experts_uniform(w, il);
+#else
+    (void)w;
+    (void)il;
+    return true;
+#endif
 }
 
 static uint32_t ds4_streaming_cache_experts_for_byte_budget(
@@ -6178,8 +6232,7 @@ static bool glm_stream_expert_cache_addr_layout_supported(
                               "DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE")) {
         return false;
     }
-    if (!weights_streaming_layer_experts_uniform(w, il)) return false;
-
+    if (!weights_streaming_layer_expert_cache_class_supported(w, il)) return false;
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) return false;
     const bool q2_addr =
         l->ffn_gate_exps->type == DS4_TENSOR_Q2_K &&
@@ -6263,9 +6316,9 @@ static bool glm_stream_decode_experts_are_streamed(
 /*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
- * Boosted layers, mixed GLM quant layouts such as Q4 gate/up plus Q5 down, or
- * undersized expert caches fall back to direct model-range reads. Include
- * those expert tensors so cache-hit prefill extension and decode are covered.
+ * Unsupported mixed GLM quant layouts or resident-decode layers need direct
+ * model-range reads. Cacheable Q2/Q4 layouts use their matching persistent
+ * slab (or the transient selected-expert fallback) and stay out of this span.
  */
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
@@ -6273,9 +6326,9 @@ static void model_map_span_vec_include_layer_decode(
         uint32_t                il) {
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
-    if (!weights_streaming_layer_experts_uniform(w, il) ||
+    if (!weights_streaming_layer_expert_cache_class_supported(w, il) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-         !glm_stream_decode_experts_are_streamed(w, l, il)) ||
+          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
@@ -11911,6 +11964,22 @@ static void layer_ffn_shared_batch(
                       comb,
                       n_tok);
     if (profile) t_hc_norm = now_sec() - t0;
+
+    const char *trace_ffn_dir = getenv("DS4_TRACE_FFN_NORM");
+    if (trace_ffn_dir && trace_ffn_dir[0]) {
+        char layer_dir[512];
+        snprintf(layer_dir, sizeof(layer_dir), "%s/layer-%03u", trace_ffn_dir, il);
+        mkdir(layer_dir, 0755);
+        char filename[768];
+        snprintf(filename, sizeof(filename), "%s/ffn_norm.f32", layer_dir);
+        FILE *trace_fp = fopen(filename, "ab");
+        if (trace_fp) {
+            int64_t header[2] = {(int64_t)n_tok, (int64_t)DS4_N_EMBD};
+            fwrite(header, sizeof(header[0]), 2, trace_fp);
+            fwrite(norm, sizeof(float), (size_t)n_tok * DS4_N_EMBD, trace_fp);
+            fclose(trace_fp);
+        }
+    }
 
     t0 = profile ? now_sec() : 0.0;
     if (routed_token_parallel) {
@@ -17745,7 +17814,7 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         !g->ssd_streaming ||
         g->quality ||
         !weights ||
-        n_tokens <= 1 ||
+        n_tokens == 0 ||
         glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR",
                               "DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") ||
         glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_EXPERT_ADDR_TABLE",
@@ -53824,15 +53893,38 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     }
     const uint32_t max_cache_experts = max_cache_experts_u64 > UINT32_MAX ?
         UINT32_MAX : (uint32_t)max_cache_experts_u64;
+    uint64_t max_dynamic_cache_bytes =
+        ds4_mul_sat_u64(max_cache_experts_u64, per_expert_bytes);
+    bool mixed_cuda_cache = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    uint64_t secondary_expert_bytes = 0;
+    uint32_t secondary_cache_layers = 0;
+    if (e->backend == DS4_BACKEND_CUDA &&
+        ds4_streaming_secondary_expert_class(&e->weights,
+                                             &secondary_expert_bytes,
+                                             &secondary_cache_layers)) {
+        const uint64_t secondary_count =
+            ds4_mul_sat_u64(secondary_cache_layers, DS4_N_EXPERT);
+        max_dynamic_cache_bytes = ds4_add_sat_u64(
+                max_dynamic_cache_bytes,
+                ds4_mul_sat_u64(secondary_count, secondary_expert_bytes));
+        mixed_cuda_cache = true;
+    }
+#endif
     if (e->ssd_streaming_cache_bytes == 0 &&
-        max_cache_experts != 0 &&
-        e->ssd_streaming_cache_experts > max_cache_experts) {
-        fprintf(stderr,
-                "ds4: SSD streaming expert cache capped from %u to %u "
-                "experts cacheable by this layer slice\n",
-                e->ssd_streaming_cache_experts,
-                max_cache_experts);
-        e->ssd_streaming_cache_experts = max_cache_experts;
+        max_dynamic_cache_bytes != 0 && per_expert_bytes != 0) {
+        const uint64_t max_equivalent_u64 =
+            max_dynamic_cache_bytes / per_expert_bytes;
+        const uint32_t max_equivalent = max_equivalent_u64 > UINT32_MAX ?
+            UINT32_MAX : (uint32_t)max_equivalent_u64;
+        if (e->ssd_streaming_cache_experts > max_equivalent) {
+            fprintf(stderr,
+                    "ds4: SSD streaming expert cache capped from %u to %u "
+                    "experts cacheable by this layer slice\n",
+                    e->ssd_streaming_cache_experts,
+                    max_equivalent);
+            e->ssd_streaming_cache_experts = max_equivalent;
+        }
     }
 
     uint32_t full_layers = 0;
@@ -53967,6 +54059,10 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             }
             dynamic_cache_bytes -= full_layers_bytes;
         }
+        if (max_dynamic_cache_bytes != 0 &&
+            dynamic_cache_bytes > max_dynamic_cache_bytes) {
+            dynamic_cache_bytes = max_dynamic_cache_bytes;
+        }
 
         uint64_t budget_expert_bytes = 0;
         uint32_t budget =
@@ -53974,7 +54070,8 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                     &e->weights,
                     dynamic_cache_bytes,
                     &budget_expert_bytes);
-        if (max_cache_experts != 0 && budget > max_cache_experts) {
+        if (!mixed_cuda_cache &&
+            max_cache_experts != 0 && budget > max_cache_experts) {
             budget = max_cache_experts;
         }
         if (budget == 0 || budget_expert_bytes == 0) {
@@ -53983,8 +54080,8 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             return false;
         }
         e->ssd_streaming_cache_experts = budget;
-        e->ssd_streaming_cache_bytes =
-            (uint64_t)budget * budget_expert_bytes;
+        e->ssd_streaming_cache_bytes = mixed_cuda_cache ?
+            dynamic_cache_bytes : (uint64_t)budget * budget_expert_bytes;
 
         if (full_layers != 0) {
             fprintf(stderr,
@@ -55855,10 +55952,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
         if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+            const bool allow_cuda_streaming_mtp =
+                e->backend == DS4_BACKEND_CUDA &&
+                (e->ssd_streaming_cache_experts != 0 ||
+                 e->ssd_streaming_cache_bytes != 0);
+            if (!allow_cuda_streaming_mtp) {
+                fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr,
+                    "ds4: CUDA persistent expert cache enables experimental "
+                    "--ssd-streaming + --mtp\n");
         }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
@@ -56036,7 +56142,70 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     routed++;
                     if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
                 }
-                if (boosted > 0) {
+                uint32_t primary_cache_experts = e->ssd_streaming_cache_experts;
+                bool secondary_cache_configured = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+                uint64_t secondary_bytes = 0;
+                uint32_t secondary_layers = 0;
+                if (boosted > 0 &&
+                    ds4_streaming_secondary_expert_class(&e->weights,
+                                                         &secondary_bytes,
+                                                         &secondary_layers) &&
+                    secondary_bytes != 0 && slab_expert_bytes != 0 &&
+                    e->ssd_streaming_cache_experts != 0) {
+                    /*
+                     * Split the byte budget across the two size classes in
+                     * proportion to each class's total routed bytes, so the
+                     * boosted (e.g. Q4K tail) layers get their own VRAM slab
+                     * instead of reading experts from mapped views per token.
+                     */
+                    const uint64_t budget_bytes =
+                        e->ssd_streaming_cache_bytes != 0 ?
+                        e->ssd_streaming_cache_bytes :
+                        (uint64_t)e->ssd_streaming_cache_experts * slab_expert_bytes;
+                    const uint64_t primary_total =
+                        (uint64_t)(routed - boosted) * (uint64_t)DS4_N_EXPERT *
+                        slab_expert_bytes;
+                    const uint64_t secondary_total =
+                        (uint64_t)secondary_layers * (uint64_t)DS4_N_EXPERT *
+                        secondary_bytes;
+                    const long double denom =
+                        (long double)(primary_total + secondary_total);
+                    uint64_t share2 = denom > 0.0L ?
+                        (uint64_t)((long double)budget_bytes *
+                                   (long double)secondary_total / denom) : 0;
+                    uint32_t count2 =
+                        secondary_bytes != 0 ?
+                        (uint32_t)(share2 / secondary_bytes) : 0;
+                    const uint64_t max2 =
+                        (uint64_t)secondary_layers * (uint64_t)DS4_N_EXPERT;
+                    if (count2 > max2) count2 = (uint32_t)max2;
+                    uint64_t share1 = budget_bytes > share2 ?
+                        budget_bytes - share2 : 0;
+                    uint32_t count1 =
+                        slab_expert_bytes != 0 ?
+                        (uint32_t)(share1 / slab_expert_bytes) : 0;
+                    const uint64_t max1 =
+                        (uint64_t)(routed - boosted) * (uint64_t)DS4_N_EXPERT;
+                    if (count1 > max1) count1 = (uint32_t)max1;
+                    primary_cache_experts = count1;
+                    ds4_gpu_set_streaming_expert_cache_budget(count1);
+                    ds4_gpu_set_streaming_expert_cache_expert_bytes2(secondary_bytes);
+                    ds4_gpu_set_streaming_expert_cache_budget2(count2);
+                    secondary_cache_configured = true;
+                    fprintf(stderr,
+                            "ds4: SSD streaming mixed-precision model: %u/%u boosted "
+                            "routed layers get a dedicated expert cache class "
+                            "(%u slots x %.2f MiB, %.2f GiB); primary class keeps "
+                            "%u slots (%.2f GiB)\n",
+                            boosted, routed,
+                            count2, (double)secondary_bytes / 1048576.0,
+                            (double)count2 * (double)secondary_bytes / 1073741824.0,
+                            count1,
+                            (double)count1 * (double)slab_expert_bytes / 1073741824.0);
+                }
+#endif
+                if (boosted > 0 && !secondary_cache_configured) {
                     fprintf(stderr,
                             "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
                             "off the slab size class will bypass the expert cache and read "
@@ -56061,14 +56230,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 const uint64_t min_experts =
                     (uint64_t)(routed - boosted) * DS4_N_EXPERT_USED;
                 if (min_experts != 0 &&
-                    e->ssd_streaming_cache_experts != 0 &&
-                    e->ssd_streaming_cache_experts < 2u * min_experts) {
+                    primary_cache_experts != 0 &&
+                    primary_cache_experts < 2u * min_experts) {
                     fprintf(stderr,
                             "ds4: WARNING: SSD streaming expert cache (%u experts) is "
                             "under twice the per-token routed working set (%u layers "
                             "x %u experts = %llu); expect heavy thrashing below "
                             "%.2f GiB\n",
-                            e->ssd_streaming_cache_experts,
+                            primary_cache_experts,
                             routed - boosted,
                             DS4_N_EXPERT_USED,
                             (unsigned long long)min_experts,
