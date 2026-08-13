@@ -4,6 +4,14 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 SAMPLING_TEST :=
+# Optional cross-TU optimization for Apple Silicon release builds:
+#   make DS4_LTO=thin
+DS4_LTO ?=
+ifneq ($(strip $(DS4_LTO)),)
+CFLAGS += -flto=$(DS4_LTO)
+OBJCFLAGS += -flto=$(DS4_LTO)
+LDFLAGS += -flto=$(DS4_LTO)
+endif
 else
 NATIVE_CPU_FLAG ?= -march=native
 SAMPLING_TEST := tests/test_sampling
@@ -23,7 +31,7 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else

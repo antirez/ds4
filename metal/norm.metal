@@ -351,15 +351,12 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
             scratch[tid] = abs(v);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float m64 = simd_max(scratch[tid]);
+        if (tid < 64u && (tid & 31u) == 0u) {
+            scratch[tid >> 5u] = m64;
         }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float amax = max(max(scratch[0], scratch[1]), 1.0e-4f);
         const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
         if (tid < 64u && off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;

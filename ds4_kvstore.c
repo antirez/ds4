@@ -467,6 +467,22 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
+    /* mtime gate: DS4_KVSTORE_MTIME_GATE=1 re-enables. Off by default because
+     * st_mtime has SECOND resolution on macOS; a store followed by a refresh
+     * within the same second silently misses fresh entries, which showed up as
+     * nondeterministic cache lineage drift in deep-context A/B runs. */
+    static int mtime_gate = -1;
+    if (mtime_gate < 0) {
+        const char *e = getenv("DS4_KVSTORE_MTIME_GATE");
+        mtime_gate = (e && e[0] == '1') ? 1 : 0;
+    }
+    struct stat dirst0;
+    const int have_stamp = stat(kc->dir, &dirst0) == 0;
+    if (mtime_gate && have_stamp &&
+        kc->scanned_dir_mtime == dirst0.st_mtime &&
+        kc->scanned_dir_ctime == dirst0.st_ctime) {
+        return;
+    }
     ds4_kvstore_clear(kc);
     DIR *d = opendir(kc->dir);
     if (!d) return;
@@ -480,6 +496,10 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         free(path);
     }
     closedir(d);
+    if (have_stamp) {
+        kc->scanned_dir_mtime = dirst0.st_mtime;
+        kc->scanned_dir_ctime = dirst0.st_ctime;
+    }
 }
 
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {

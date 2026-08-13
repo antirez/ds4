@@ -6314,6 +6314,169 @@ kernel void kernel_dsv4_indexer_scores_tiled(
     }
 }
 
+/* DS4 ratio-4 indexer score builder, lightning-indexer organization
+ * (ported from llama.cpp's Metal kernel_lightning_indexer):
+ *
+ * Each 256-thread threadgroup owns NK=64 compressed rows.  Those rows are
+ * staged to threadgroup memory once and transposed into per-simdgroup
+ * register matrices (mk) ONCE; the whole head loop then reuses
+ * register-resident K instead of re-reading threadgroup K per head (the
+ * structural tax in kernel_dsv4_indexer_scores_tiled* and
+ * kernel_dsv4_indexer_score_one_direct).  Heads are processed in
+ * NHPTG=8-head tiles (Q staged per tile, head weights pre-scaled), with
+ * one score register per key accumulated over all tiles and a single
+ * store per key.  Prefill iterates NBPTG=8 tokens inside the kernel
+ * against the same resident K; decode passes n_tokens=1.
+ *
+ * Per-cell math is preserved: f32 rows staged to half, 8x8 simdgroup
+ * matrix steps over depth 128 in ascending order, relu then w*scale per
+ * head in ascending head order, and ds4's causal (-inf) epilogue for
+ * multi-token (prefill) calls / all-rows pass-through for decode. */
+template <int NBPTG, int T_NSG>
+kernel void kernel_dsv4_indexer_scores_llt_impl(
+        constant ds4_metal_args_dsv4_indexer_scores_fused & args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device       char *scores,
+        threadgroup float *sharedf [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint DK     = 128;   // indexer key depth
+    constexpr uint NH     = 64;    // indexer heads
+    constexpr uint NHPTG  = 8;     // heads per tile
+    constexpr uint NKPSG  = 8;     // keys per simdgroup
+    constexpr uint NSG    = T_NSG; // simdgroups per threadgroup
+    constexpr uint NK     = NKPSG*NSG;   // keys per threadgroup
+    constexpr uint NTG    = 32*NSG;      // threads per threadgroup
+    constexpr uint DK8    = DK/8;
+
+    if (args.n_head != NH || args.head_dim != DK) return;
+    const bool causal = args.n_tokens > 1u;
+
+    threadgroup half  *sk  = (threadgroup half *)sharedf;        // [NK][DK]
+    threadgroup half  *sq  = sk + NK*DK;                         // 2 banks [NHPTG][DK]
+    threadgroup float *sw  = sharedf + (NK*DK + 2*NHPTG*DK)/2;   // 2 banks [NHPTG]
+    threadgroup float *sqk = sw + 2*NHPTG;                       // [NSG*NHPTG*NKPSG]
+
+    const uint i_kv_0 = tgpig.x * NK;
+
+    // Stage this threadgroup's K rows once (f32 device -> half, edges zeroed).
+    // Vectorized: float4 loads + half4 stores (DK is a multiple of 4).
+    for (uint i4 = tiitg*4u; i4 < NK*DK; i4 += NTG*4u) {
+        const uint ik = i4 / DK;
+        const uint d  = i4 - ik*DK;    // multiple of 4
+        const uint comp = i_kv_0 + ik;
+        half4 v = half4(0.0h);
+        if (comp < args.n_comp) {
+            device const float *row = (device const float *)(index_comp +
+                (uint64_t)comp * args.index_row_stride);
+            v = half4(((device const float4 *)row)[d >> 2]);
+        }
+        *(threadgroup half4 *)(sk + i4) = v;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // K tile of this simdgroup transposed into registers: [DK][NKPSG].
+    simdgroup_half8x8 mk[DK8];
+    for (uint i = 0; i < DK8; i++) {
+        simdgroup_load(mk[i], sk + (uint)sgitg*NKPSG*DK + 8*i, DK, 0, true);
+    }
+
+    const uint i_kv = i_kv_0 + (uint)sgitg*NKPSG;   // first key of this simdgroup
+    const uint i_batch_0 = tgpig.y * NBPTG;
+    const uint n_batch = min((uint)NBPTG, args.n_tokens - i_batch_0);
+    threadgroup float *pqk = sqk + (uint)sgitg*NHPTG*NKPSG;
+
+    for (uint ib = 0; ib < n_batch; ib++) {
+        const uint i_batch = i_batch_0 + ib;
+        device const char *pq = q + (uint64_t)i_batch * args.q_token_stride;
+        device const float *pw = (device const float *)(weights +
+            (uint64_t)i_batch * args.weights_token_stride);
+
+        float score = 0.0f;
+
+        // Double-buffered Q: stage tile t+1 into the alternate sq/sw bank
+        // while tile t's MMA consumes the current bank (device-latency hidden).
+        constexpr uint NTILE = NH / NHPTG;
+        // Pre-stage head tile 0 into bank 0.
+        for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
+            const uint ih = i4 / DK;
+            const uint d  = i4 - ih*DK;   // multiple of 4
+            device const float *qh = (device const float *)(pq +
+                (uint64_t)ih * args.q_head_stride);
+            *(threadgroup half4 *)(sq + i4) = half4(((device const float4 *)qh)[d >> 2]);
+        }
+        if (tiitg < NHPTG) {
+            sw[tiitg] = pw[tiitg] * args.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint tile = 0; tile < NTILE; tile++) {
+            const uint cur = tile & 1u;
+            threadgroup half  *sqc = sq + cur * NHPTG*DK;
+            threadgroup float *swc = sw + cur * NHPTG;
+            // Prefetch tile t+1 into the other bank (no barrier needed yet:
+            // the MMA below reads the other bank exclusively).
+            if (tile + 1 < NTILE) {
+                const uint nxt_head = (tile + 1) * NHPTG;
+                threadgroup half  *sqn = sq + (cur ^ 1u) * NHPTG*DK;
+                threadgroup float *swn = sw + (cur ^ 1u) * NHPTG;
+                for (uint i4 = tiitg*4u; i4 < NHPTG*DK; i4 += NTG*4u) {
+                    const uint ih = i4 / DK;
+                    const uint d  = i4 - ih*DK;
+                    device const float *qh = (device const float *)(pq +
+                        (uint64_t)(nxt_head + ih) * args.q_head_stride);
+                    *(threadgroup half4 *)(sqn + i4) = half4(((device const float4 *)qh)[d >> 2]);
+                }
+                if (tiitg < NHPTG) {
+                    swn[tiitg] = pw[nxt_head + tiitg] * args.scale;
+                }
+            }
+
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            for (uint i = 0; i < DK8; i++) {
+                simdgroup_half8x8 mq;
+                simdgroup_load(mq, sqc + 8*i, DK, 0, false);
+                simdgroup_multiply_accumulate(mqk, mq, mk[i], mqk);
+            }
+            simdgroup_store(mqk, pqk, NKPSG, 0, false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // One lane per key: ReLU, pre-scaled head weight, accumulate
+            // over this head tile (ascending head order across tiles).
+            if (tiisg < NKPSG) {
+                for (uint ih = 0; ih < NHPTG; ih++) {
+                    score += max(pqk[ih*NKPSG + tiisg], 0.0f) * swc[ih];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tiisg < NKPSG) {
+            const uint comp = i_kv + tiisg;
+            if (comp < args.n_comp) {
+                const uint visible = causal ?
+                    min((args.pos0 + i_batch + 1u) / args.ratio, args.n_comp)
+                    : args.n_comp;
+                device float *dst = (device float *)(scores +
+                    (uint64_t)i_batch * args.score_token_stride) + comp;
+                *dst = comp < visible ? score : -INFINITY;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_dsv4_indexer_scores_llt_impl<1,1>) kernel_dsv4_llt_t;
+/* Default NBPTG=8; 16 and 32 trade grid occupancy for amortized K staging. */
+template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4>;
+
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse
 // compressed attention that maps cleanly to TensorOps: a regular token by

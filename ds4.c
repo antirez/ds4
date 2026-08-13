@@ -15,6 +15,9 @@
  */
 
 #include <errno.h>
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
 #include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
@@ -55,6 +58,7 @@
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
 
 static uint32_t metal_graph_cuda_tp_output_requested_ways(void) {
+    /* read directly: defined before ds4_env_cached (literal-pool cache below) */
     const char *env = getenv("DS4_CUDA_TP_OUTPUT_WAYS");
     if (!env || !env[0]) return 8;
     char *end = NULL;
@@ -106,6 +110,27 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+
+/* getenv() cache: the decode/prefill dispatch reads process env per token per
+ * layer (~200-400 linear environ scans per tokenizer-second). Env is read-only
+ * in this codebase (no setenv/putenv), so values are frozen at first read.
+ * Keyed by literal pointer — getenv call sites use string literals, and C
+ * literal pooling within this TU gives each literal a single address. */
+static const char *ds4_env_cached(const char *name) {
+    struct entry { const char *name; const char *value; };
+    static struct entry cache[256];
+    static int n_cache = 0;
+    for (int i = 0; i < n_cache; i++)
+        if (cache[i].name == name) return cache[i].value;
+    const char *v = getenv(name);
+    if (n_cache < 256) {
+        cache[n_cache].name = name;
+        cache[n_cache].value = v;
+        n_cache++;
+    }
+    return v;
+}
+
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -430,22 +455,22 @@ static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) 
 
 static bool glm_graph_env_present(const char *rocm_name, const char *metal_name) {
 #ifdef DS4_ROCM_BUILD
-    if (rocm_name && getenv(rocm_name) != NULL) return true;
+    if (rocm_name && ds4_env_cached(rocm_name) != NULL) return true;
 #else
     (void)rocm_name;
 #endif
-    return metal_name && getenv(metal_name) != NULL;
+    return metal_name && ds4_env_cached(metal_name) != NULL;
 }
 
 static const char *glm_graph_env_value(const char *rocm_name,
                                        const char *metal_name) {
 #ifdef DS4_ROCM_BUILD
-    const char *rocm_env = rocm_name ? getenv(rocm_name) : NULL;
+    const char *rocm_env = rocm_name ? ds4_env_cached(rocm_name) : NULL;
     if (rocm_env && rocm_env[0]) return rocm_env;
 #else
     (void)rocm_name;
 #endif
-    const char *metal_env = metal_name ? getenv(metal_name) : NULL;
+    const char *metal_env = metal_name ? ds4_env_cached(metal_name) : NULL;
     return (metal_env && metal_env[0]) ? metal_env : NULL;
 }
 
@@ -1852,7 +1877,7 @@ static void ds4_threads_init(void) {
         n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
     }
 
-    const char *env = getenv("DS4_THREADS");
+    const char *env = ds4_env_cached("DS4_THREADS");
     if (env && env[0]) {
         long v = strtol(env, NULL, 10);
         if (v > 0) n_threads = (uint32_t)v;
@@ -2858,7 +2883,7 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
     uint64_t mb = 1024;
 #ifndef DS4_ROCM_BUILD
-    const char *env = getenv("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
+    const char *env = ds4_env_cached("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
@@ -3036,7 +3061,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 #ifndef DS4_ROCM_BUILD
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+    if (ds4_env_cached("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
     }
 #endif
@@ -6035,7 +6060,7 @@ static void model_map_span_vec_append(ds4_model_map_span_vec *spans, uint64_t lo
 
 static uint32_t model_map_q4_pro_group_views(void) {
     uint32_t views = 1;
-    const char *env = getenv("DS4_METAL_Q4_PRO_MAP_GROUPS");
+    const char *env = ds4_env_cached("DS4_METAL_Q4_PRO_MAP_GROUPS");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -11571,7 +11596,7 @@ static void layer_ffn_one(
         float               steering_scale,
         bool                trace) {
     const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
+    const bool profile = ds4_env_cached("DS4_DECODE_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc = 0.0;
     double t_norm = 0.0;
@@ -11676,7 +11701,7 @@ static void layer_ffn_one_decode_scratch(
         float                    steering_scale,
         ds4_cpu_decode_scratch * scratch) {
     const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
+    const bool profile = ds4_env_cached("DS4_DECODE_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc = 0.0;
     double t_norm = 0.0;
@@ -11917,7 +11942,7 @@ static void layer_ffn_shared_batch(
         uint32_t            il,
         const float       * steering_dirs,
         float               steering_scale) {
-    const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
+    const bool profile = ds4_env_cached("DS4_PREFILL_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc_norm = 0.0;
     double t_routed = 0.0;
@@ -11949,8 +11974,8 @@ static void layer_ffn_shared_batch(
     const uint64_t routed_q8_x_blocks = expert_in_dim / 32u;
     const uint64_t routed_q8_mid_blocks = down_in_dim / 32u;
     const bool routed_token_parallel =
-        getenv("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
-        (getenv("DS4_NO_ROUTED_TOKEN_PARALLEL") == NULL && n_tok >= 64);
+        ds4_env_cached("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
+        (ds4_env_cached("DS4_NO_ROUTED_TOKEN_PARALLEL") == NULL && n_tok >= 64);
     float *routed_mid = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
     block_q8_K *routed_xq = (routed_token_parallel || routed_q8_0) ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
     block_q8_K *routed_midq = (routed_token_parallel || routed_q8_0) ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
@@ -12164,7 +12189,7 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     if (requested_chunk != 0) {
         cap = requested_chunk;
     } else {
-        const char *env = getenv("DS4_METAL_PREFILL_CHUNK");
+        const char *env = ds4_env_cached("DS4_METAL_PREFILL_CHUNK");
         if (env && env[0]) {
             char *endp = NULL;
             const long v = strtol(env, &endp, 10);
@@ -13182,7 +13207,7 @@ static void layer_attention_raw_swa_batch(
         uint32_t                  pos0,
         const float             * steering_dirs,
         float                     steering_scale) {
-    const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
+    const bool profile = ds4_env_cached("DS4_PREFILL_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc_norm = 0.0;
     double t_q = 0.0;
@@ -13261,24 +13286,24 @@ static void layer_attention_raw_swa_batch(
 
     t0 = profile ? now_sec() : 0.0;
     const uint32_t ratio = cache->compress_ratio;
-    const bool prefer_parallel_attn = getenv("DS4_PARALLEL_ATTN_ROWS") != NULL;
+    const bool prefer_parallel_attn = ds4_env_cached("DS4_PARALLEL_ATTN_ROWS") != NULL;
     const bool prefix_batch_attn =
         prefer_parallel_attn &&
-        getenv("DS4_NO_PARALLEL_ATTN_ROWS") == NULL &&
+        ds4_env_cached("DS4_NO_PARALLEL_ATTN_ROWS") == NULL &&
         cache->n_raw == 0 &&
         pos0 == 0;
     if (!prefix_batch_attn) {
         heads = xmalloc((size_t)n_tok * q_dim * sizeof(heads[0]));
     }
     uint32_t batch_rope_max = 4096;
-    const char *batch_rope_max_env = getenv("DS4_BATCHED_ROPE_MAX");
+    const char *batch_rope_max_env = ds4_env_cached("DS4_BATCHED_ROPE_MAX");
     if (batch_rope_max_env && batch_rope_max_env[0]) {
         long v = strtol(batch_rope_max_env, NULL, 10);
         if (v >= 0 && v <= 65536) batch_rope_max = (uint32_t)v;
     }
     const bool batch_prefix_rope =
         prefix_batch_attn &&
-        getenv("DS4_NO_BATCHED_ROPE") == NULL &&
+        ds4_env_cached("DS4_NO_BATCHED_ROPE") == NULL &&
         n_tok <= batch_rope_max;
     uint32_t *comp_counts = prefix_batch_attn ?
         xcalloc((size_t)n_tok, sizeof(comp_counts[0])) : NULL;
@@ -13490,7 +13515,7 @@ static void layer_attention_raw_swa_batch(
         fprintf(stderr,
                 "ds4: prefill detail layer %u attn hc_norm=%.3f q=%.3f kv=%.3f token_loop=%.3f out=%.3f total=%.3f\n",
                 il, t_hc_norm, t_q, t_kv, t_token_loop, t_out, now_sec() - t_start);
-        if (getenv("DS4_PREFILL_PROFILE_TOKEN") != NULL) {
+        if (ds4_env_cached("DS4_PREFILL_PROFILE_TOKEN") != NULL) {
             fprintf(stderr,
                     "ds4: prefill token detail layer %u rope_cache=%.3f compress=%.3f indexer=%.3f attn_rows=%.3f inv_rope=%.3f\n",
                     il, t_tl_rope_cache, t_tl_compress, t_tl_indexer, t_tl_attn_rows, t_tl_inv_rope);
@@ -13532,7 +13557,7 @@ static void layer_forward_raw_swa_one(
         float                     steering_ffn_scale,
         ds4_cpu_decode_scratch  * scratch) {
     const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
+    const bool profile = ds4_env_cached("DS4_DECODE_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc = 0.0;
     double t_q = 0.0;
@@ -13770,11 +13795,11 @@ static void prefill_layer_major_cpu(
     float *attn = xmalloc((size_t)n_tok * hc_dim * sizeof(attn[0]));
     float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
     uint32_t ffn_batch = 128;
-    const bool batched_attn = getenv("DS4_NO_BATCHED_ATTN") == NULL;
-    const bool batched_ffn = getenv("DS4_BATCHED_FFN") != NULL;
-    const bool parallel_ffn = getenv("DS4_PARALLEL_FFN") != NULL;
-    const bool shared_batch_ffn = getenv("DS4_NO_SHARED_BATCH_FFN") == NULL;
-    const char *batch_env = getenv("DS4_PREFILL_BATCH");
+    const bool batched_attn = ds4_env_cached("DS4_NO_BATCHED_ATTN") == NULL;
+    const bool batched_ffn = ds4_env_cached("DS4_BATCHED_FFN") != NULL;
+    const bool parallel_ffn = ds4_env_cached("DS4_PARALLEL_FFN") != NULL;
+    const bool shared_batch_ffn = ds4_env_cached("DS4_NO_SHARED_BATCH_FFN") == NULL;
+    const char *batch_env = ds4_env_cached("DS4_PREFILL_BATCH");
     ds4_cpu_decode_scratch decode_scratch;
     bool decode_scratch_ready = false;
     if (batch_env && batch_env[0]) {
@@ -16361,7 +16386,7 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 }
 
 static bool metal_graph_tp_env_flag(const char *name, bool dflt) {
-    const char *env = getenv(name);
+    const char *env = ds4_env_cached(name);
     if (!env || !env[0]) return dflt;
     return strcmp(env, "0") != 0;
 }
@@ -16540,7 +16565,7 @@ static bool metal_graph_cuda_greedy_split_top1_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLIT_TOP1");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_SPLIT_TOP1");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLIT_TOP1", false);
 #endif
@@ -16558,7 +16583,7 @@ static bool metal_graph_cuda_verify_decode2_split_top1_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_VERIFY_DECODE2_SPLIT_TOP1");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_VERIFY_DECODE2_SPLIT_TOP1");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_VERIFY_DECODE2_SPLIT_TOP1", false);
 #endif
@@ -16568,7 +16593,7 @@ static bool metal_graph_cuda_greedy_splitkv_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_SPLITKV");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV", false);
 #endif
@@ -16578,7 +16603,7 @@ static bool metal_graph_cuda_greedy_vec4_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_VEC4");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_VEC4");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_VEC4", false);
 #endif
@@ -16588,7 +16613,7 @@ static bool metal_graph_cuda_splitkv_spec_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_SPLITKV_SPEC");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_SPLITKV_SPEC");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_SPEC", false);
 #endif
@@ -16598,7 +16623,7 @@ static bool metal_graph_cuda_splitkv_spec_toponly_row0_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_SPLITKV_SPEC_TOPONLY_ROW0");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_SPLITKV_SPEC_TOPONLY_ROW0");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_SPEC_TOPONLY_ROW0", false);
 #endif
@@ -16608,7 +16633,7 @@ static bool metal_graph_cuda_splitkv_spec_batch_verify_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_SPLITKV_SPEC_BATCH_VERIFY");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_SPLITKV_SPEC_BATCH_VERIFY");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_SPLITKV_SPEC_BATCH_VERIFY", false);
 #endif
@@ -16618,7 +16643,7 @@ static float metal_graph_cuda_greedy_vec4_margin_threshold(void) {
 #if defined(__APPLE__)
     return 0.0f;
 #else
-    const char *env = getenv("DS4_CUDA_GREEDY_VEC4_MARGIN");
+    const char *env = ds4_env_cached("DS4_CUDA_GREEDY_VEC4_MARGIN");
     if (env && env[0]) {
         char *end = NULL;
         double v = strtod(env, &end);
@@ -16638,7 +16663,7 @@ static bool metal_graph_cuda_greedy_vec4_fallback_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_VEC4_FALLBACK");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_VEC4_FALLBACK");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_cuda_greedy_vec4_margin_threshold() > 0.0f;
 #endif
@@ -16648,7 +16673,7 @@ static float metal_graph_cuda_greedy_splitkv_margin_threshold(void) {
 #if defined(__APPLE__)
     return 0.0f;
 #else
-    const char *env = getenv("DS4_CUDA_GREEDY_SPLITKV_MARGIN");
+    const char *env = ds4_env_cached("DS4_CUDA_GREEDY_SPLITKV_MARGIN");
     if (env && env[0]) {
         char *end = NULL;
         double v = strtod(env, &end);
@@ -16668,7 +16693,7 @@ static bool metal_graph_cuda_greedy_splitkv_fallback_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV_FALLBACK");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_SPLITKV_FALLBACK");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_cuda_greedy_splitkv_margin_threshold() > 0.0f;
 #endif
@@ -16678,7 +16703,7 @@ static bool metal_graph_cuda_greedy_splitkv_top2_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV_TOP2");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_SPLITKV_TOP2");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV_TOP2", true);
 #endif
@@ -16696,14 +16721,14 @@ static bool metal_graph_cuda_greedy_splitkv_pair_replay_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_GREEDY_SPLITKV_PAIR_REPLAY");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_GREEDY_SPLITKV_PAIR_REPLAY");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_GREEDY_SPLITKV_PAIR_REPLAY", false);
 #endif
 }
 
 static DS4_MAYBE_UNUSED uint32_t metal_graph_cuda_greedy_max_segment(const char *name) {
-    const char *env = getenv(name);
+    const char *env = ds4_env_cached(name);
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -16737,7 +16762,7 @@ static uint32_t metal_graph_cuda_greedy_vec4_max_segment(void) {
 }
 
 static uint32_t metal_graph_cuda_greedy_splitkv_min_score(void) {
-    const char *env = getenv("DS4_CUDA_SPLITKV_MIN_SCORE");
+    const char *env = ds4_env_cached("DS4_CUDA_SPLITKV_MIN_SCORE");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -16761,9 +16786,9 @@ static bool metal_graph_cuda_qkv_kv_rope_fuse_requested(void) {
 #if defined(__APPLE__)
     return false;
 #else
-    const char *no = getenv("DS4_CUDA_NO_QKV_KV_ROPE_FUSE");
+    const char *no = ds4_env_cached("DS4_CUDA_NO_QKV_KV_ROPE_FUSE");
     if (no && no[0] && strcmp(no, "0") != 0) return false;
-    if (getenv("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL) return false;
+    if (ds4_env_cached("DS4_CUDA_DISABLE_QKV_RMS_FUSED") != NULL) return false;
     return metal_graph_tp_env_flag("DS4_CUDA_QKV_KV_ROPE_FUSE", true);
 #endif
 }
@@ -16789,7 +16814,7 @@ static bool metal_graph_cuda_prefill_pipeline_requested(const ds4_gpu_graph *g) 
     (void)g;
     return false;
 #else
-    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE");
+    const char *env = ds4_env_cached("DS4_CUDA_PREFILL_PIPELINE");
     if (env && env[0]) return strcmp(env, "0") != 0;
     return g && g->cuda_tp_decode;
 #endif
@@ -16804,7 +16829,7 @@ static bool metal_graph_cuda_prefill_pipeline_q8_cache_requested(void) {
 }
 
 static uint32_t metal_graph_cuda_prefill_pipeline_microbatch(void) {
-    const char *env = getenv("DS4_CUDA_PREFILL_PIPELINE_MB");
+    const char *env = ds4_env_cached("DS4_CUDA_PREFILL_PIPELINE_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
@@ -16897,15 +16922,15 @@ static bool metal_graph_alloc_raw_cap(
         g->cuda_tp_decode && metal_graph_cuda_tp_prefill_attn_output_requested();
     g->cuda_q_norm_rope_fuse = metal_graph_cuda_q_norm_rope_fuse_requested();
     g->cuda_qkv_kv_rope_fuse = metal_graph_cuda_qkv_kv_rope_fuse_requested();
-    g->cuda_qkv_pair = getenv("DS4_CUDA_NO_QKV_PAIR") == NULL;
+    g->cuda_qkv_pair = ds4_env_cached("DS4_CUDA_NO_QKV_PAIR") == NULL;
     g->cuda_tp_attn_out_hc_fuse =
-        getenv("DS4_CUDA_TP_ATTN_OUT_HC_FUSE") != NULL &&
-        getenv("DS4_CUDA_NO_TP_ATTN_OUT_HC_FUSE") == NULL;
+        ds4_env_cached("DS4_CUDA_TP_ATTN_OUT_HC_FUSE") != NULL &&
+        ds4_env_cached("DS4_CUDA_NO_TP_ATTN_OUT_HC_FUSE") == NULL;
     g->shared_gate_up_swiglu_fuse =
-        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
-    g->decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
-    g->decode_index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
-    g->output_stage_profile = getenv("DS4_METAL_OUTPUT_STAGE_PROFILE") != NULL;
+        ds4_env_cached("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+    g->decode_stage_profile = ds4_env_cached("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
+    g->decode_index_stage_profile = ds4_env_cached("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
+    g->output_stage_profile = ds4_env_cached("DS4_METAL_OUTPUT_STAGE_PROFILE") != NULL;
     const bool enable_splitkv_spec = metal_graph_cuda_splitkv_spec_requested();
     const bool enable_splitkv_batch_verify =
         enable_splitkv_spec && metal_graph_cuda_splitkv_spec_batch_verify_requested();
@@ -17926,11 +17951,11 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         g->quality ||
         !weights ||
         n_tokens <= 1 ||
-        getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
-        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
-        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
+        ds4_env_cached("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
+        ds4_env_cached("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
+        ds4_env_cached("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+        ds4_env_cached("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        ds4_env_cached("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
         DS4_N_LAYER == 0 ||
         DS4_N_EXPERT < 128 ||
         DS4_N_EXPERT_USED != 6) {
@@ -19687,7 +19712,7 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
     if (parsed < 0) {
         parsed = 0;
 #ifndef DS4_ROCM_BUILD
-        const char *env = getenv("DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD");
+        const char *env = ds4_env_cached("DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD");
         if (env && env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(env, &end, 10);
@@ -19732,7 +19757,7 @@ static bool metal_graph_env_flag(const char *name, int *cache) {
         (void)name;
         *cache = 0;
 #else
-        const char *env = getenv(name);
+        const char *env = ds4_env_cached(name);
         *cache = env && env[0] && strcmp(env, "0") != 0;
 #endif
     }
@@ -19773,12 +19798,12 @@ static bool metal_graph_enable_batch_hc_norm_fusion(void) {
     static int cache = -1;
     if (metal_graph_use_reference_hc_norm_decode()) return false;
     if (cache == -1) {
-        const char *disable = getenv("DS4_METAL_DISABLE_BATCH_HC_NORM_FUSION");
+        const char *disable = ds4_env_cached("DS4_METAL_DISABLE_BATCH_HC_NORM_FUSION");
         if (disable && disable[0] && strcmp(disable, "0") != 0) {
             cache = 0;
         } else {
             const char *legacy_enable =
-                getenv("DS4_METAL_ENABLE_BATCH_HC_NORM_FUSION");
+                ds4_env_cached("DS4_METAL_ENABLE_BATCH_HC_NORM_FUSION");
             cache = (!legacy_enable || !legacy_enable[0] ||
                      strcmp(legacy_enable, "0") != 0) ? 1 : 0;
         }
@@ -19846,7 +19871,7 @@ static float metal_graph_hc_norm_fusion_check_tolerance(void) {
     if (initialized) return tolerance;
     tolerance = 2.0e-4f;
 #ifndef DS4_ROCM_BUILD
-    const char *env = getenv("DS4_METAL_HC_NORM_FUSION_CHECK_TOL");
+    const char *env = ds4_env_cached("DS4_METAL_HC_NORM_FUSION_CHECK_TOL");
     if (env && env[0]) {
         char *end = NULL;
         const float v = strtof(env, &end);
@@ -20254,8 +20279,8 @@ static bool metal_graph_use_pro_q4_cpu_router(void) {
 }
 
 static bool metal_graph_use_streaming_iq2_cpu_router(void) {
-    return getenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
+    return ds4_env_cached("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER") != NULL &&
+           ds4_env_cached("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
 }
 
 static bool metal_graph_use_q4_selected_shared_overlap(
@@ -20285,7 +20310,7 @@ static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g)
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
+           ds4_env_cached("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
 #else
     (void)g;
     return false;
@@ -20293,12 +20318,12 @@ static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g)
 }
 
 static bool metal_graph_q4_non_streaming_opt_in_enabled(void) {
-    return getenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("DS4_METAL_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
-           getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL ||
-           getenv("DS4_METAL_ENABLE_Q4_EXPERT_ADDRESS_TABLE") != NULL ||
-           getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
-           getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO") != NULL;
+    return ds4_env_cached("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
+           ds4_env_cached("DS4_METAL_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
+           ds4_env_cached("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL ||
+           ds4_env_cached("DS4_METAL_ENABLE_Q4_EXPERT_ADDRESS_TABLE") != NULL ||
+           ds4_env_cached("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
+           ds4_env_cached("DS4_METAL_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO") != NULL;
 }
 
 static bool metal_graph_q4_selected_paths_allowed(const ds4_gpu_graph *g) {
@@ -20311,15 +20336,15 @@ static bool metal_graph_q4_selected_paths_allowed(const ds4_gpu_graph *g) {
 static bool metal_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL &&
-           getenv("DS4_METAL_DISABLE_IQ2_SELECTED_SHARED_OVERLAP") == NULL;
+           ds4_env_cached("DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL &&
+           ds4_env_cached("DS4_METAL_DISABLE_IQ2_SELECTED_SHARED_OVERLAP") == NULL;
 }
 
 static bool metal_graph_use_iq2_selected_async_load(const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
 #ifndef DS4_ROCM_BUILD
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
+           ds4_env_cached("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_LOAD") == NULL;
 #else
            true;
 #endif
@@ -20330,19 +20355,19 @@ static bool metal_graph_use_iq2_selected_async_early_commit(
     return g &&
            g->ssd_streaming &&
 #ifndef DS4_ROCM_BUILD
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
+           ds4_env_cached("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
 #else
            false;
 #endif
 }
 
 static bool metal_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
-    if (getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
-        getenv("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") != NULL) {
+    if (ds4_env_cached("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
+        ds4_env_cached("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") != NULL) {
         return false;
     }
     if (!g || (!g->ssd_streaming &&
-               getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL)) {
+               ds4_env_cached("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL)) {
         return false;
     }
 #ifndef DS4_NO_GPU
@@ -20402,9 +20427,9 @@ static bool metal_graph_decode_pro_q4_expert_table_expected(
            !glm_graph_env_present("DS4_ROCM_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
                                   "DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
            (metal_graph_use_pro_q4_expert_table_auto(g) ||
-            getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL) &&
-           getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL &&
-           getenv("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") == NULL;
+            ds4_env_cached("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") != NULL) &&
+           ds4_env_cached("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL &&
+           ds4_env_cached("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") == NULL;
 }
 
 static bool metal_graph_decode_q4_selected_slots_expected(
@@ -20470,7 +20495,7 @@ static bool metal_graph_decode_mxfp4_selected_slots_expected(
                                   "DS4_METAL_MOE_WRITE_CLAMPED_ACT") &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
                                   "DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
-           getenv("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
+           ds4_env_cached("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
 }
 
 static bool metal_graph_streaming_expert_cache_seed_layer_expected(
@@ -20526,25 +20551,25 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
         !layer->ffn_down_exps ||
         DS4_N_EXPERT_USED != 6 ||
         DS4_N_EXPERT < 128 ||
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
+        ds4_env_cached("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        ds4_env_cached("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
         return false;
     }
     const bool q4 =
         layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-        getenv("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL;
+        ds4_env_cached("DS4_METAL_DISABLE_Q4_SELECTED_EXPERT_VIEWS") == NULL;
     const bool iq2 =
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
+        ds4_env_cached("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
     const bool mxfp4 =
         layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
-        getenv("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
+        ds4_env_cached("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
     return q4 || iq2 || mxfp4;
 #else
     (void)g;
@@ -20934,8 +20959,8 @@ static bool metal_graph_decode_cpu_router(
         uint32_t                il,
         uint32_t                token) {
     const bool profile =
-        getenv("DS4_METAL_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
-        getenv("DS4_METAL_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
+        ds4_env_cached("DS4_METAL_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
+        ds4_env_cached("DS4_METAL_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
@@ -21009,8 +21034,8 @@ static bool metal_graph_use_iq2_selected_readahead_shared_delay(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") == NULL;
+           ds4_env_cached("DS4_METAL_ENABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") != NULL &&
+           ds4_env_cached("DS4_METAL_DISABLE_STREAMING_SELECTED_READAHEAD_SHARED_DELAY") == NULL;
 }
 
 static bool metal_graph_decode_selected_readahead_override(
@@ -21027,7 +21052,7 @@ static bool metal_graph_decode_selected_readahead_override(
     }
 
     const bool profile =
-        getenv("DS4_METAL_STREAMING_SELECTED_READAHEAD_PROFILE") != NULL;
+        ds4_env_cached("DS4_METAL_STREAMING_SELECTED_READAHEAD_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     if (ds4_gpu_end_commands() == 0) return false;
     const double t_sync = profile ? now_sec() : 0.0;
@@ -21139,7 +21164,7 @@ static bool metal_graph_decode_cuda_selected_load(
     }
 
     const bool profile =
-        getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL;
+        ds4_env_cached("DS4_CUDA_STREAMING_EXPERT_CACHE_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
     if (ds4_gpu_end_commands() == 0) return false;
@@ -21207,7 +21232,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         n_tokens <= 1 ||
         DS4_N_EXPERT == 0 ||
         DS4_N_EXPERT_USED == 0 ||
-        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") != NULL) {
+        ds4_env_cached("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") != NULL) {
         return true;
     }
 
@@ -21222,7 +21247,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
     }
 
     const bool profile =
-        getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE") != NULL;
+        ds4_env_cached("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
     if (ds4_gpu_end_commands() == 0) return false;
@@ -21735,7 +21760,7 @@ static bool metal_graph_tp_ablate(const char *chain) {
     static const char *env = NULL;
     static int init = 0;
     if (!init) {
-        env = getenv("DS4_TP_ABLATE");
+        env = ds4_env_cached("DS4_TP_ABLATE");
         init = 1;
     }
     return env && strstr(env, chain) != NULL;
@@ -21817,11 +21842,11 @@ static bool metal_graph_ported_m5_decode_feature_enabled(
         const char *pre_m5_disable_env,
         const char *m5_disable_env) {
 #if defined(__APPLE__)
-    if (m5_disable_env && getenv(m5_disable_env) != NULL) return false;
+    if (m5_disable_env && ds4_env_cached(m5_disable_env) != NULL) return false;
     const bool pre_m5 = ds4_gpu_device_is_pre_m5_apple_silicon();
     if (pre_m5 &&
-        (getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") != NULL ||
-         (pre_m5_disable_env && getenv(pre_m5_disable_env) != NULL))) {
+        (ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") != NULL ||
+         (pre_m5_disable_env && ds4_env_cached(pre_m5_disable_env) != NULL))) {
         return false;
     }
     return pre_m5 || ds4_gpu_device_is_m5_apple_silicon();
@@ -21848,7 +21873,7 @@ static bool metal_graph_encode_decode_layer_phase(
      * kernel, which already owns each head's whole row. Removes one
      * 64-threadgroup dispatch per layer. */
     const bool fuse_attn_inv_rope =
-        getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE") == NULL &&
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE") == NULL &&
         (ds4_gpu_device_is_pre_m5_apple_silicon() ||
          ds4_gpu_device_is_m5_apple_silicon()) &&
         ds4_gpu_decode_attn_rope_fuse_available() != 0;
@@ -21924,9 +21949,9 @@ static bool metal_graph_encode_decode_layer_phase(
         !decode_stage_profile &&
         !metal_graph_directional_steering_ffn_enabled(g) &&
         metal_graph_debug_get_config()->prefix == NULL &&
-        getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
-        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
-        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+        ds4_env_cached("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
+        ds4_env_cached("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+        ds4_env_cached("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
@@ -21940,7 +21965,7 @@ static bool metal_graph_encode_decode_layer_phase(
 #endif
     const bool parallel_full_ffn_eligible =
         parallel_ffn_route_eligible &&
-        getenv("DS4_METAL_Q8_MV_NSG") == NULL &&
+        ds4_env_cached("DS4_METAL_Q8_MV_NSG") == NULL &&
         fuse_shared_gate_up &&
         layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc() &&
@@ -22059,7 +22084,7 @@ static bool metal_graph_encode_decode_layer_phase(
             hc_dim == 16384u && mix_hc == 24u &&
             layer->hc_attn_fn->type == DS4_TENSOR_F16 &&
             !metal_graph_use_reference_hc_decode() &&
-            getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
+            ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              ds4_gpu_device_is_m5_apple_silicon()) &&
             ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
@@ -22401,7 +22426,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 raw_cache != NULL &&
                 raw_row < raw_cap &&
                 phase == METAL_DECODE_LAYER_FULL &&
-                getenv("DS4_METAL_DISABLE_PRE_M5_QKV_NORM_KV_STORE_FUSE") == NULL &&
+                ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_QKV_NORM_KV_STORE_FUSE") == NULL &&
                 (ds4_gpu_device_is_pre_m5_apple_silicon() ||
                  ds4_gpu_device_is_m5_apple_silicon()) &&
                 ds4_gpu_kv_rope_fp8_fuse_available() != 0) {
@@ -22542,7 +22567,7 @@ static bool metal_graph_encode_decode_layer_phase(
         !tp_ablate_kv && !kv_rope_fused &&
         !metal_graph_use_reference_kv_decode() &&
         !resume_after_kv_store &&
-        getenv("DS4_METAL_DISABLE_PRE_M5_KV_ROPE_FP8_FUSE") == NULL &&
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_KV_ROPE_FP8_FUSE") == NULL &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         ds4_gpu_kv_rope_fp8_fuse_available() != 0;
     if (ok && !tp_ablate_kv && !kv_rope_fused && !fuse_kv_rope_store) {
@@ -22614,7 +22639,7 @@ static bool metal_graph_encode_decode_layer_phase(
         int quad_store = comp_state_already_stored ? 1 : 0;
         if (ok && quad_store == 0 && ratio == 4u &&
             !metal_graph_use_reference_compressor_pair_proj() &&
-            getenv("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_QUAD_STORE") == NULL &&
+            ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_QUAD_STORE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              ds4_gpu_device_is_m5_apple_silicon()) &&
             layer->indexer_compressor_kv && layer->indexer_compressor_gate &&
@@ -23629,7 +23654,7 @@ static bool metal_graph_encode_decode_layer_phase(
             hc_dim == 16384u && mix_hc == 24u &&
             layer->hc_ffn_fn->type == DS4_TENSOR_F16 &&
             !metal_graph_use_reference_hc_decode() &&
-            getenv("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
+            ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE") == NULL &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              ds4_gpu_device_is_m5_apple_silicon()) &&
             ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
@@ -23769,14 +23794,14 @@ static bool metal_graph_encode_decode_layer_phase(
             layer->ffn_gate_inp->dim[0] == DS4_N_EMBD &&
             layer->ffn_gate_inp->dim[1] == DS4_N_EXPERT &&
             (!ds4_gpu_device_is_pre_m5_apple_silicon() ||
-             getenv("DS4_METAL_DISABLE_PRE_M5_ROUTER_SHARED_FUSE") == NULL) &&
+             ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_ROUTER_SHARED_FUSE") == NULL) &&
             (ds4_gpu_device_is_pre_m5_apple_silicon() ||
              ds4_gpu_device_is_m5_apple_silicon())) {
 #if defined(__APPLE__)
             const bool fuse_router_project_select =
                 parallel_full_ffn_eligible &&
                 layer->ffn_gate_tid2eid == NULL &&
-                getenv("DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE") == NULL &&
+                ds4_env_cached("DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE") == NULL &&
                 ds4_gpu_device_is_m5_apple_silicon();
             if (fuse_router_project_select) {
                 const int fused =
@@ -24321,7 +24346,7 @@ static bool metal_graph_encode_decode_layer_phase(
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
+        ds4_env_cached("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
         (q4_selected_shared_overlap ||
          iq2_selected_shared_overlap ||
          mxfp4_selected_shared_overlap ||
@@ -24342,7 +24367,7 @@ static bool metal_graph_encode_decode_layer_phase(
         metal_graph_decode_iq2_selected_slots_expected(g, layer) &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+        ds4_env_cached("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
     const bool cuda_stream_selected_load =
         ok &&
         !overlap_selected_shared &&
@@ -24350,7 +24375,7 @@ static bool metal_graph_encode_decode_layer_phase(
         g->ssd_streaming &&
         metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+        ds4_env_cached("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
     if (cuda_stream_selected_load) {
         ok = metal_graph_decode_cuda_selected_load(g,
                                                    model,
@@ -25546,7 +25571,7 @@ static bool metal_graph_output_logits_head_matmul(
                  weights->output->dim[0] == DS4_N_EMBD &&
                  weights->output->dim[1] == vocab_dim &&
                  head_rows <= DS4_DSPARK_MAX_BLOCK_SIZE &&
-                 getenv("DS4_DSPARK_VERIFY_HEAD_NO_TP") == NULL;
+                 ds4_env_cached("DS4_DSPARK_VERIFY_HEAD_NO_TP") == NULL;
     for (uint32_t i = 0; tp_ok && i < tp_ways; i++) {
         const int t = tp_tiers[i];
         tp_ok = t >= 0 && t < DS4_MAX_GPUS &&
@@ -26637,11 +26662,11 @@ static int metal_graph_first_token_full_test(
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc(&g, weights, &weights->layer[0]);
     g.quality = quality;
-    const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
+    const bool trace_layers = ds4_env_cached("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
     if (trace_layers && ok) {
         g.materialize_ffn_out = true;
-        const bool teacher_force = getenv("DS4_METAL_GRAPH_TEACHER_FORCE") != NULL;
-        const char *stage_layer_env = getenv("DS4_METAL_GRAPH_TRACE_STAGE_LAYER");
+        const bool teacher_force = ds4_env_cached("DS4_METAL_GRAPH_TEACHER_FORCE") != NULL;
+        const char *stage_layer_env = ds4_env_cached("DS4_METAL_GRAPH_TRACE_STAGE_LAYER");
         const long stage_layer = stage_layer_env ? strtol(stage_layer_env, NULL, 10) : -1;
         float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
         float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
@@ -26774,8 +26799,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_pre_m5_q2_decode_schedule_eligible(
         pos < 128u || pos >= 2816u ||
         g->quality || g->ssd_streaming || g->ssd_streaming_cold ||
         g->placement != NULL || g->tp_world > 1u ||
-        getenv("DS4_METAL_DISABLE_PRE_M5_Q2_DECODE_SPLIT2_32") != NULL ||
-        getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") != NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_Q2_DECODE_SPLIT2_32") != NULL ||
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") != NULL) {
         return false;
     }
     const ds4_layer_weights *layer = &weights->layer[4];
@@ -26806,7 +26831,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_pre_m5_q2_decode_schedule_eligible(
 static uint32_t metal_graph_token_split_after_layers(void) {
     uint32_t split_after_layers = 4;
 #ifndef DS4_ROCM_BUILD
-    const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
+    const char *split_env = ds4_env_cached("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(split_env, &end, 10);
@@ -26827,7 +26852,7 @@ static uint32_t metal_graph_token_adaptive_split_after_layers(
 #if defined(__APPLE__)
     /* In the validated 128..2815 Q2 window, routed decode exposes enough GPU
      * work after layer two to overlap encoding before the layer-32 flush. */
-    const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
+    const char *split_env = ds4_env_cached("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if ((!split_env || !split_env[0]) &&
         metal_graph_pre_m5_q2_decode_schedule_eligible(
             g, weights, pos, allow_split_flush)) {
@@ -26853,7 +26878,7 @@ static uint32_t metal_graph_token_adaptive_split_after_layers(
         g && !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
         g->tp_world != 2u && mxfp4_routed &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
-        getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SPLIT3") == NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SPLIT3") == NULL) {
         return 3u;
     }
     /* At the 2K frontier the fifth layer adds enough work to overlap command
@@ -26865,7 +26890,7 @@ static uint32_t metal_graph_token_adaptive_split_after_layers(
         g && !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
         g->tp_world != 2u && mxfp4_routed &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
-        getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SPLIT5") == NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SPLIT5") == NULL) {
         return 5u;
     }
 #else
@@ -26895,7 +26920,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_decode_pipeline_fast_lookup_eligible(
      * of position, so the same lookup is valid there; keep an early-only
      * rollback for attribution without disabling the established 2K path. */
     if (pos < 2048u &&
-        getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_PIPELINE_FAST_LOOKUP") != NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_PIPELINE_FAST_LOOKUP") != NULL) {
         return false;
     }
 
@@ -26907,7 +26932,7 @@ static DS4_MAYBE_UNUSED bool metal_graph_decode_pipeline_fast_lookup_eligible(
         layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_down_exps->type == DS4_TENSOR_MXFP4;
     return mxfp4_routed && ds4_gpu_device_is_pre_m5_apple_silicon() &&
-           getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PIPELINE_FAST_LOOKUP") == NULL;
+           ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_PIPELINE_FAST_LOOKUP") == NULL;
 #else
     (void)g;
     (void)weights;
@@ -26921,7 +26946,7 @@ static uint32_t metal_graph_token_second_split_after_layers(void) {
     uint32_t split_after_layers = 0;
 #if defined(__APPLE__)
     const char *split_env =
-        getenv("DS4_METAL_GRAPH_TOKEN_SECOND_SPLIT_LAYERS");
+        ds4_env_cached("DS4_METAL_GRAPH_TOKEN_SECOND_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(split_env, &end, 10);
@@ -26946,7 +26971,7 @@ static uint32_t metal_graph_token_adaptive_second_split_after_layers(
         bool                 allow_split_flush) {
 #if defined(__APPLE__)
     const char *second_split_env =
-        getenv("DS4_METAL_GRAPH_TOKEN_SECOND_SPLIT_LAYERS");
+        ds4_env_cached("DS4_METAL_GRAPH_TOKEN_SECOND_SPLIT_LAYERS");
     if (second_split_env && second_split_env[0]) {
         return env_second_split_after_layers;
     }
@@ -26979,7 +27004,7 @@ static uint32_t metal_graph_token_adaptive_second_split_after_layers(
      * Keep a separate rollback so the established 2K schedule remains
      * independently attributable. */
     if (eligible && pos >= 128u && pos < 2048u && DS4_N_LAYER > 12u &&
-        getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SECOND_SPLIT12") == NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_EARLY_SECOND_SPLIT12") == NULL) {
         return 12u;
     }
     /* The encode/GPU overlap bubble the second split closes persists past
@@ -26987,7 +27012,7 @@ static uint32_t metal_graph_token_adaptive_second_split_after_layers(
      * window (raw SWA saturates at 128 rows) while encode cost per layer is
      * constant, so the same 4/16 schedule stays profitable through 3327. */
     if (eligible && pos >= 2048u && DS4_N_LAYER > 16u &&
-        getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_SECOND_SPLIT16") == NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRE_M5_DECODE_SECOND_SPLIT16") == NULL) {
         return 16u;
     }
 #else
@@ -27737,7 +27762,7 @@ static bool metal_graph_upload_prompt_embeddings_hc(
 
     uint32_t gpu_min = 512;
 #ifndef DS4_ROCM_BUILD
-    const char *gpu_min_env = getenv("DS4_METAL_GPU_BATCH_EMBED_MIN");
+    const char *gpu_min_env = ds4_env_cached("DS4_METAL_GPU_BATCH_EMBED_MIN");
     if (gpu_min_env && gpu_min_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(gpu_min_env, &end, 10);
@@ -27835,7 +27860,7 @@ static bool metal_graph_warmup_prefill_kernels(
     if (g && g->ssd_streaming) return true;
     if (warmed) return true;
 #ifndef DS4_ROCM_BUILD
-    if (getenv("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+    if (ds4_env_cached("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
 #endif
 
     /*
@@ -27946,10 +27971,10 @@ static bool metal_graph_stage_profile_enabled_for_layer(
         const char *layer_env_name,
         uint32_t    il) {
     size_t flag_len = 0;
-    const char *flag = metal_graph_env_trim(getenv(flag_env_name), &flag_len);
+    const char *flag = metal_graph_env_trim(ds4_env_cached(flag_env_name), &flag_len);
     if (!flag) return false;
 
-    const char *layer_env = getenv(layer_env_name);
+    const char *layer_env = ds4_env_cached(layer_env_name);
     const bool has_layer_filter = layer_env && layer_env[0];
 
     if (flag_len != 0) {
@@ -28062,7 +28087,7 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
     static int cached = -1;
     if (cached < 0) {
         cached = 32;
-        const char *env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
+        const char *env = ds4_env_cached("DS4_TP_PREFILL_SPLIT_MIN");
         if (env && env[0]) cached = atoi(env);
         if (cached < 2) cached = 2;
     }
@@ -28076,7 +28101,7 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
 static bool metal_graph_tp_subgate_pipeline(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_TP_SUBGATE_PIPELINE");
+        const char *env = ds4_env_cached("DS4_TP_SUBGATE_PIPELINE");
         cached = env && env[0] && atoi(env) != 0;
     }
     return cached != 0;
@@ -28744,7 +28769,7 @@ static bool metal_graph_encode_layer_attention_batch(
             metal_graph_attn_comp_prefill_target_free(attn_comp_target);
         } else {
             const bool aligned_chunk =
-                getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
+                ds4_env_cached("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
                 !g->spec_capture_prefixes &&
                 (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
             if (aligned_chunk) {
@@ -29069,7 +29094,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
             } else {
                 const bool aligned_chunk =
-                    getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
+                    ds4_env_cached("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
                     !g->spec_capture_prefixes &&
                     (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
                 if (aligned_chunk) {
@@ -31217,7 +31242,7 @@ static bool metal_graph_eval_token_raw_swa_top(
     if (top2) top2->fast_attention = fast_attention;
     const int old_fast_attention =
         ds4_gpu_set_decode_fast_attention(fast_attention ? 1 : 0);
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool profile = ds4_env_cached("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     const bool split_top1 =
         allow_split_top1 &&
@@ -31746,7 +31771,7 @@ static bool metal_graph_prepare_dspark_stage0_setup_block(
 
     /* DS4_DSPARK_PROP_PROFILE=1: break the setup block into phases to
      * localize the TP-only prop_setup inflation (26ms vs 1.3ms single). */
-    const bool prop_profile = getenv("DS4_DSPARK_PROP_PROFILE") != NULL;
+    const bool prop_profile = ds4_env_cached("DS4_DSPARK_PROP_PROFILE") != NULL;
     const double pp_t0 = prop_profile ? now_sec() : 0.0;
     bool ok = ds4_gpu_tensor_write(g->dspark_draft_tokens,
                                    0,
@@ -32200,7 +32225,7 @@ static bool metal_graph_encode_dspark_next_stage_draft_input_from(
 }
 
 static bool metal_graph_profile_layer_env_match(const char *env_name, uint32_t il) {
-    const char *layer_env = getenv(env_name);
+    const char *layer_env = ds4_env_cached(env_name);
     if (!layer_env || !layer_env[0]) return true;
 
     char *end = NULL;
@@ -32212,7 +32237,7 @@ static bool metal_graph_profile_layer_env_match(const char *env_name, uint32_t i
 }
 
 static bool metal_graph_dspark_stage_profile_enabled(uint32_t stage) {
-    return getenv("DS4_DSPARK_STAGE_PROFILE") != NULL &&
+    return ds4_env_cached("DS4_DSPARK_STAGE_PROFILE") != NULL &&
            metal_graph_profile_layer_env_match("DS4_DSPARK_STAGE_PROFILE_STAGE",
                                                stage);
 }
@@ -32550,7 +32575,7 @@ static bool metal_graph_eval_dspark_stage_block(
     DS4_DSPARK_PROFILE_STAGE("ffn");
     if (ok &&
         !prepare_next_stage_input &&
-        getenv("DS4_DSPARK_DISABLE_FINAL_OUTPUT_ALIAS") != NULL) {
+        ds4_env_cached("DS4_DSPARK_DISABLE_FINAL_OUTPUT_ALIAS") != NULL) {
         ok = ds4_gpu_tensor_copy(g->dspark_stage_output_hc,
                                   0,
                                   metal_graph_batch_next_hc(g),
@@ -32785,7 +32810,7 @@ static bool metal_graph_dspark_ring_maintain(
 
 static ds4_gpu_tensor *metal_graph_dspark_final_output_hc(const ds4_gpu_graph *g) {
     if (!g) return NULL;
-    if (getenv("DS4_DSPARK_DISABLE_FINAL_OUTPUT_ALIAS") == NULL &&
+    if (ds4_env_cached("DS4_DSPARK_DISABLE_FINAL_OUTPUT_ALIAS") == NULL &&
         metal_graph_batch_next_hc(g)) {
         return metal_graph_batch_next_hc(g);
     }
@@ -33321,7 +33346,7 @@ static bool dspark_markov_q8_0_argmax(
 static bool dspark_markov_bias_disabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *env = getenv("DS4_DSPARK_NO_MARKOV");
+        const char *env = ds4_env_cached("DS4_DSPARK_NO_MARKOV");
         cached = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return cached == 1;
@@ -33330,7 +33355,7 @@ static bool dspark_markov_bias_disabled(void) {
 static bool dspark_disable_fused_cpu_markov_argmax(void) {
     static int cache = -1;
     if (cache < 0) {
-        const char *env = getenv("DS4_DSPARK_DISABLE_FUSED_CPU_MARKOV_ARGMAX");
+        const char *env = ds4_env_cached("DS4_DSPARK_DISABLE_FUSED_CPU_MARKOV_ARGMAX");
         cache = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return cache != 0;
@@ -33339,7 +33364,7 @@ static bool dspark_disable_fused_cpu_markov_argmax(void) {
 static bool dspark_disable_reuse_confidence0_markov(void) {
     static int cache = -1;
     if (cache < 0) {
-        const char *env = getenv("DS4_DSPARK_DISABLE_REUSE_CONFIDENCE0_MARKOV");
+        const char *env = ds4_env_cached("DS4_DSPARK_DISABLE_REUSE_CONFIDENCE0_MARKOV");
         cache = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
     }
     return cache != 0;
@@ -33554,7 +33579,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         /* CUDA can apply the Markov bias and argmax without reading back the
          * full logits row. Metal currently falls through to the CPU path. */
         if (ok && !dspark_markov_bias_disabled() &&
-            getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
+            ds4_env_cached("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
             g->dspark_draft_tokens &&
             dw->markov_rank != 0 && (dw->markov_rank & 31u) == 0 &&
             final->markov_w1->type == DS4_TENSOR_Q8_0 &&
@@ -34206,9 +34231,9 @@ static bool metal_graph_prefill_pipeline_stage_major(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = true;
-    const double t0 = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") ? now_sec() : 0.0;
+    const double t0 = ds4_env_cached("DS4_METAL_GRAPH_PREFILL_PROFILE") ? now_sec() : 0.0;
 
-    const bool sequential = getenv("DS4_CUDA_PREFILL_PIPELINE_SEQUENTIAL") != NULL;
+    const bool sequential = ds4_env_cached("DS4_CUDA_PREFILL_PIPELINE_SEQUENTIAL") != NULL;
     const bool suppress_q8_cache =
         !metal_graph_cuda_prefill_pipeline_q8_cache_requested();
     const int saved_q8_cache_suppressed = ds4_gpu_q8_cache_suppressed();
@@ -34255,7 +34280,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
                 if (ok && stage_i + 1u < n_stages) {
                     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[stages[stage_i].tier];
                     ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[stages[stage_i + 1u].tier];
-                    if (ok && getenv("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
+                    if (ok && ds4_env_cached("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
                         ok = metal_graph_set_active_tier_no_copy(g, stages[stage_i].tier) &&
                              ds4_gpu_synchronize() != 0;
                     }
@@ -34329,7 +34354,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
                 if (ok && stage_i + 1u < n_stages) {
                     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[stages[stage_i].tier];
                     ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[stages[stage_i + 1u].tier];
-                    if (ok && getenv("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
+                    if (ok && ds4_env_cached("DS4_CUDA_PREFILL_PIPELINE_SYNC_BOUNDARY") != NULL) {
                         ok = metal_graph_set_active_tier_no_copy(g, stages[stage_i].tier) &&
                              ds4_gpu_synchronize() != 0;
                     }
@@ -35342,8 +35367,8 @@ typedef struct ds4_verify_suffix_timing {
 } ds4_verify_suffix_timing;
 
 static bool metal_graph_dspark_verify_selected_profile_enabled(void) {
-    return getenv("DS4_DSPARK_VERIFY_SELECTED_PROFILE") != NULL &&
-           getenv("DS4_DSPARK_DISABLE_VERIFY_SELECTED_PROFILE") == NULL;
+    return ds4_env_cached("DS4_DSPARK_VERIFY_SELECTED_PROFILE") != NULL &&
+           ds4_env_cached("DS4_DSPARK_DISABLE_VERIFY_SELECTED_PROFILE") == NULL;
 }
 
 /* Layer-major speculative target verifier for tiny MTP suffixes.
@@ -35389,7 +35414,7 @@ static bool metal_graph_verify_suffix_tops_impl(
     g->spec_capture_prefixes =
         capture_prefix1 && n_tokens > 1u &&
         n_tokens <= DS4_SPEC_PREFIX_SLOTS + 1u;
-    const char *split_head_env = getenv("DS4_DSPARK_VERIFY_SPLIT_HEAD");
+    const char *split_head_env = ds4_env_cached("DS4_DSPARK_VERIFY_SPLIT_HEAD");
     const bool fuse_head =
         !split_head_env || !split_head_env[0] ||
         strcmp(split_head_env, "0") == 0;
@@ -35421,7 +35446,7 @@ static bool metal_graph_verify_suffix_tops_impl(
     static int verify_profile_left = -1;
     if (verify_profile_left < 0) {
         verify_profile_left =
-            getenv("DS4_DSPARK_VERIFY_PROFILE") != NULL ? 1 : 0;
+            ds4_env_cached("DS4_DSPARK_VERIFY_PROFILE") != NULL ? 1 : 0;
     }
     const bool verify_profile = verify_profile_left > 0 && ok;
     if (verify_profile) verify_profile_left--;
@@ -35537,7 +35562,7 @@ static bool metal_graph_verify_suffix_tops_impl(
                                    0,
                                    row_tops,
                                    (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
-        if (ok && getenv("DS4_DSPARK_VERIFY_TOPS_CHECK") != NULL) {
+        if (ok && ds4_env_cached("DS4_DSPARK_VERIFY_TOPS_CHECK") != NULL) {
             float *chk = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
             for (uint32_t r = 0; r < top_rows; r++) {
                 if (ds4_gpu_tensor_read(g->spec_logits,
@@ -35863,7 +35888,7 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
     if (raw_cap < raw_window) raw_cap = raw_window;
 
 #ifndef DS4_ROCM_BUILD
-    const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+    const char *env = ds4_env_cached("DS4_METAL_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -35892,7 +35917,7 @@ static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len,
  * as a conservative crossover.  The env knob remains useful for retuning. */
 static uint32_t metal_graph_resume_prefill_min_tokens(void) {
 #ifndef DS4_ROCM_BUILD
-    const char *env = getenv("DS4_METAL_RESUME_PREFILL_MIN");
+    const char *env = ds4_env_cached("DS4_METAL_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -35907,7 +35932,7 @@ static uint32_t metal_graph_resume_prefill_min_tokens(void) {
 
 static uint32_t glm_graph_resume_prefill_min_tokens(void) {
 #ifndef DS4_ROCM_BUILD
-    const char *env = getenv("DS4_GLM_RESUME_PREFILL_MIN");
+    const char *env = ds4_env_cached("DS4_GLM_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -35986,7 +36011,7 @@ static uint32_t glm_tp_head_split_min(void) {
     static int cached = -1;
     if (cached < 0) {
         cached = 64;
-        const char *env = getenv("DS4_GLM_TP_HEAD_SPLIT_MIN");
+        const char *env = ds4_env_cached("DS4_GLM_TP_HEAD_SPLIT_MIN");
         if (env && env[0]) cached = atoi(env);
         if (cached < 0) cached = 0;
     }
@@ -35996,7 +36021,7 @@ static uint32_t glm_tp_head_split_min(void) {
 /* Correctness isolation: dump a hidden row (pre-output-norm), overwriting
  * on each call — run with -n 0 so the file ends as the final prompt row. */
 static void glm_debug_dump_hidden_row(const ds4_gpu_tensor *t, uint32_t row) {
-    const char *path = getenv("DS4_GLM_HIDDEN_DUMP");
+    const char *path = ds4_env_cached("DS4_GLM_HIDDEN_DUMP");
     if (!path || !path[0] || !t) return;
     float *buf = malloc((size_t)DS4_N_EMBD * sizeof(float));
     if (!buf) return;
@@ -36016,7 +36041,7 @@ static void glm_debug_dump_hidden_row(const ds4_gpu_tensor *t, uint32_t row) {
 /* Layer bisect: which layer's output hidden to dump (-1 = final/off,
  * -2 = every layer, one file per layer). */
 static int glm_debug_hidden_dump_layer(void) {
-    const char *v = getenv("DS4_GLM_HIDDEN_DUMP_LAYER");
+    const char *v = ds4_env_cached("DS4_GLM_HIDDEN_DUMP_LAYER");
     if (!v || !v[0]) return -1;
     if (strcmp(v, "all") == 0) return -2;
     return atoi(v);
@@ -36032,7 +36057,7 @@ static void glm_debug_dump_raw_layer(const ds4_gpu_tensor *t,
                                      uint64_t bytes,
                                      uint32_t il,
                                      int pos) {
-    const char *path = getenv("DS4_GLM_HIDDEN_DUMP");
+    const char *path = ds4_env_cached("DS4_GLM_HIDDEN_DUMP");
     if (!path || !path[0] || !t) return;
     char full[1024];
     if (pos >= 0)
@@ -36052,7 +36077,7 @@ static void glm_debug_dump_hidden_layer(const ds4_gpu_tensor *t,
                                         uint32_t row,
                                         uint32_t il,
                                         uint32_t pos) {
-    const char *path = getenv("DS4_GLM_HIDDEN_DUMP");
+    const char *path = ds4_env_cached("DS4_GLM_HIDDEN_DUMP");
     if (!path || !path[0] || !t) return;
     char full[1024];
     snprintf(full, sizeof(full), "%s.L%02u.T%02u", path, il, pos);
@@ -36074,7 +36099,7 @@ static void glm_debug_dump_hidden_layer(const ds4_gpu_tensor *t,
 /* Correctness isolation: dump the post-prefill logits vector once. */
 static void glm_debug_dump_prefill_logits(const float *logits) {
     static int dumped;
-    const char *path = getenv("DS4_GLM_LOGIT_DUMP");
+    const char *path = ds4_env_cached("DS4_GLM_LOGIT_DUMP");
     if (!path || !path[0] || dumped || !logits) return;
     FILE *f = fopen(path, "wb");
     if (!f) return;
@@ -36496,7 +36521,7 @@ static int metal_graph_prompt_logits_test(
         const token_vec   *prompt,
         int                ctx_size) {
     int n_test = prompt->len;
-    const char *n_test_env = getenv("DS4_METAL_GRAPH_PROMPT_TOKENS");
+    const char *n_test_env = ds4_env_cached("DS4_METAL_GRAPH_PROMPT_TOKENS");
     if (n_test_env && n_test_env[0]) {
         char *endp = NULL;
         const long v = strtol(n_test_env, &endp, 10);
@@ -36520,7 +36545,7 @@ static int metal_graph_prompt_logits_test(
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = ds4_env_cached("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     ds4_kv_cache cpu_cache;
@@ -36529,7 +36554,7 @@ static int metal_graph_prompt_logits_test(
     float *gpu_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *oracle_logits = NULL;
 
-    const char *oracle_path = getenv("DS4_ORACLE_LOGITS");
+    const char *oracle_path = ds4_env_cached("DS4_ORACLE_LOGITS");
     if (oracle_path && oracle_path[0]) {
         oracle_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         if (!read_f32_binary_file(oracle_path, oracle_logits, DS4_N_VOCAB)) {
@@ -36553,20 +36578,20 @@ static int metal_graph_prompt_logits_test(
     if (memory_report) ds4_gpu_print_memory_report("after prompt graph");
 
     if (ok) {
-        const char *dump_gpu = getenv("DS4_METAL_GRAPH_DUMP_LOGITS");
+        const char *dump_gpu = ds4_env_cached("DS4_METAL_GRAPH_DUMP_LOGITS");
         if (dump_gpu && dump_gpu[0]) {
             if (write_f32_binary_file(dump_gpu, gpu_logits, DS4_N_VOCAB)) {
                 fprintf(stderr, "ds4: wrote Metal graph logits to %s\n", dump_gpu);
             }
         }
-        const char *dump_cpu = getenv("DS4_CPU_DUMP_LOGITS");
+        const char *dump_cpu = ds4_env_cached("DS4_CPU_DUMP_LOGITS");
         if (dump_cpu && dump_cpu[0]) {
             if (write_f32_binary_file(dump_cpu, cpu_logits, DS4_N_VOCAB)) {
                 fprintf(stderr, "ds4: wrote CPU logits to %s\n", dump_cpu);
             }
         }
-        if (getenv("DS4_METAL_GRAPH_TRACE_CACHE") != NULL ||
-            getenv("DS4_METAL_GRAPH_TRACE_COMP") != NULL) {
+        if (ds4_env_cached("DS4_METAL_GRAPH_TRACE_CACHE") != NULL ||
+            ds4_env_cached("DS4_METAL_GRAPH_TRACE_COMP") != NULL) {
             for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                 const uint32_t n_raw = cpu_cache.layer[il].n_raw;
                 if (n_raw != 0) {
@@ -37837,34 +37862,35 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
     struct special {
         const char *text;
+        size_t len;   /* sizeof literal - 1: avoids strlen() per scanned byte */
         int token;
     } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"[gMASK]",                vocab->bos_id},
-        {"<sop>",                  vocab->sop_id},
-        {"<|system|>",             vocab->system_id},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<|user|>",               vocab->user_id},
-        {"<|assistant|>",          vocab->assistant_id},
-        {"<|observation|>",        vocab->observation_id},
-        {"<think>",                vocab->think_start_id},
-        {"</think>",               vocab->think_end_id},
-        {"<tool_call>",            vocab->tool_call_start_id},
-        {"</tool_call>",           vocab->tool_call_end_id},
-        {"<tool_response>",        vocab->tool_response_start_id},
-        {"</tool_response>",       vocab->tool_response_end_id},
-        {"<arg_key>",              vocab->arg_key_start_id},
-        {"</arg_key>",             vocab->arg_key_end_id},
-        {"<arg_value>",            vocab->arg_value_start_id},
-        {"</arg_value>",           vocab->arg_value_end_id},
-        {"｜DSML｜",                vocab->dsml_id},
+        {"<｜begin▁of▁sentence｜>", sizeof("<｜begin▁of▁sentence｜>") - 1, vocab->bos_id},
+        {"<｜end▁of▁sentence｜>",   sizeof("<｜end▁of▁sentence｜>")   - 1, vocab->eos_id},
+        {"[gMASK]",                sizeof("[gMASK]")                - 1, vocab->bos_id},
+        {"<sop>",                  sizeof("<sop>")                  - 1, vocab->sop_id},
+        {"<|system|>",             sizeof("<|system|>")             - 1, vocab->system_id},
+        {"<｜User｜>",              sizeof("<｜User｜>")              - 1, vocab->user_id},
+        {"<｜Assistant｜>",         sizeof("<｜Assistant｜>")         - 1, vocab->assistant_id},
+        {"<|user|>",               sizeof("<|user|>")               - 1, vocab->user_id},
+        {"<|assistant|>",          sizeof("<|assistant|>")          - 1, vocab->assistant_id},
+        {"<|observation|>",        sizeof("<|observation|>")        - 1, vocab->observation_id},
+        {"<think>",                sizeof("<think>")                - 1, vocab->think_start_id},
+        {"</think>",               sizeof("</think>")               - 1, vocab->think_end_id},
+        {"<tool_call>",            sizeof("<tool_call>")            - 1, vocab->tool_call_start_id},
+        {"</tool_call>",           sizeof("</tool_call>")           - 1, vocab->tool_call_end_id},
+        {"<tool_response>",        sizeof("<tool_response>")        - 1, vocab->tool_response_start_id},
+        {"</tool_response>",       sizeof("</tool_response>")       - 1, vocab->tool_response_end_id},
+        {"<arg_key>",              sizeof("<arg_key>")              - 1, vocab->arg_key_start_id},
+        {"</arg_key>",             sizeof("</arg_key>")             - 1, vocab->arg_key_end_id},
+        {"<arg_value>",            sizeof("<arg_value>")            - 1, vocab->arg_value_start_id},
+        {"</arg_value>",           sizeof("</arg_value>")           - 1, vocab->arg_value_end_id},
+        {"｜DSML｜",                sizeof("｜DSML｜")                - 1, vocab->dsml_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
         if (specials[i].token < 0) continue;
-        size_t n = strlen(specials[i].text);
+        size_t n = specials[i].len;
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;
             *len = n;
@@ -38263,7 +38289,7 @@ static int argmax_f32_excluding_unrolled8(
 }
 
 static int sample_argmax(const float *logits, uint32_t n_vocab) {
-    if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
+    if (ds4_env_cached("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return sample_argmax_unrolled8(logits, n_vocab);
     }
     int best = 0;
@@ -38363,6 +38389,23 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
     }
 }
 
+#if defined(__APPLE__)
+/* Opt-in Accelerate vForce vvexpf: 2.6-4x faster than scalar expf (measured on
+ * M3 Ultra: 0.35 ns/op vs 1.3 ns/op) but NOT bit-identical (about 15% of
+ * values differ in the last ULP). Calling this changes the sampling stream for
+ * expf-dominated paths, so it is reserved for expf-heavy loops and gated by
+ * DS4_SAMPLE_ACCELERATE_EXP=1. Default is the bit-exact scalar path. */
+static int sample_accelerate_exp = -1;
+static bool sample_use_accelerate_exp(void) {
+    if (sample_accelerate_exp < 0) {
+        const char *e = ds4_env_cached("DS4_SAMPLE_ACCELERATE_EXP");
+        sample_accelerate_exp = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return sample_accelerate_exp != 0;
+}
+#define SAMPLE_BULK_EXP_BLOCK 2048
+#endif
+
 static bool sample_fast_top_p(
         const float *logits,
         uint32_t     n_vocab,
@@ -38385,6 +38428,45 @@ static bool sample_fast_top_p(
     float sum = 0.0f;
     float heap_sum = 0.0f;
 
+#if defined(__APPLE__)
+    if (sample_use_accelerate_exp()) {
+        /* Bulk expf in vocab-scan order: identical acceptance sequence as the
+         * scalar loop below (heap candidates and sums consume p in the same
+         * order; p values themselves are vForce-computed, so the sampled token
+         * stream may differ from the scalar path). */
+        float xs[SAMPLE_BULK_EXP_BLOCK], ps[SAMPLE_BULK_EXP_BLOCK];
+        int idx[SAMPLE_BULK_EXP_BLOCK];
+        uint32_t nb = 0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            xs[nb] = (v - max_logit) / temperature;
+            idx[nb] = (int)i;
+            nb++;
+            if (nb == SAMPLE_BULK_EXP_BLOCK || i + 1 == n_vocab) {
+                int cnt = (int)nb;
+                vvexpf(ps, xs, &cnt);
+                for (uint32_t j = 0; j < nb; j++) {
+                    const float p = ps[j];
+                    sum += p;
+                    sample_candidate cand = {.id = idx[j], .logit = logits[idx[j]], .prob = p};
+                    if (n < cap) {
+                        heap[n] = cand;
+                        heap_sum += p;
+                        sample_heap_sift_up(heap, n);
+                        n++;
+                    } else if (sample_candidate_gt(cand, heap[0])) {
+                        heap_sum -= heap[0].prob;
+                        heap[0] = cand;
+                        heap_sum += p;
+                        sample_heap_sift_down(heap, n, 0);
+                    }
+                }
+                nb = 0;
+            }
+        }
+    } else
+#endif
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
@@ -38699,7 +38781,7 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id) {
     if (!logits) return -1;
-    if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
+    if (ds4_env_cached("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(logits, n_vocab, excluded_id);
     }
     int best = -1;
@@ -38776,7 +38858,7 @@ static int generate_raw_swa_cpu(
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     int pos = prompt->len;
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
+    const bool trace_top = ds4_env_cached("DS4_TRACE_TOP") != NULL;
     const double t_prefill0 = now_sec();
 
     if (prompt->len <= 0 || prompt->len > ctx_size) {
@@ -38794,7 +38876,7 @@ static int generate_raw_swa_cpu(
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
-    const char *dump_prefill_logits = getenv("DS4_CPU_DUMP_PREFILL_LOGITS");
+    const char *dump_prefill_logits = ds4_env_cached("DS4_CPU_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
         if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
             free(logits);
@@ -38807,7 +38889,7 @@ static int generate_raw_swa_cpu(
 
     int n_generated = 0;
     int n_decode_eval = 0;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    const bool token_timing = ds4_env_cached("DS4_TOKEN_TIMING") != NULL;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
@@ -39020,7 +39102,7 @@ static uint64_t glm_graph_saturating_add_u64(uint64_t a, uint64_t b) {
 }
 
 static bool glm_graph_env_disabled(const char *name) {
-    const char *env = getenv(name);
+    const char *env = ds4_env_cached(name);
     if (!env || !env[0]) return false;
     return strcmp(env, "0") == 0 ||
            strcasecmp(env, "false") == 0 ||
@@ -39033,7 +39115,7 @@ static double glm_graph_env_double(
         double      fallback,
         double      min_value,
         double      max_value) {
-    const char *env = getenv(name);
+    const char *env = ds4_env_cached(name);
     if (!env || !env[0]) return fallback;
     char *end = NULL;
     errno = 0;
@@ -39256,7 +39338,7 @@ static bool glm_graph_memory_guard_for_compact_cap(
     }
 
     if (required <= budget) {
-        const char *report = getenv("DS4_GLM_MEMORY_GUARD_REPORT");
+        const char *report = ds4_env_cached("DS4_GLM_MEMORY_GUARD_REPORT");
         if (report && report[0]) {
             fprintf(stderr,
                     "ds4: GLM memory guard ctx=%u compact_cap=%u required=%.2f GiB "
@@ -39585,7 +39667,7 @@ static bool glm_graph_streaming_prefill_sync_each_layer(
     const char *env = glm_graph_env_value(
             "DS4_ROCM_GLM_STREAMING_PREFILL_SYNC_EACH_LAYER",
             "DS4_METAL_GLM_STREAMING_PREFILL_SYNC_EACH_LAYER");
-    if (!env) env = getenv("DS4_GLM_STREAMING_PREFILL_SYNC_EACH_LAYER");
+    if (!env) env = ds4_env_cached("DS4_GLM_STREAMING_PREFILL_SYNC_EACH_LAYER");
     return glm_graph_env_truthy(env);
 #else
     (void)full_layer_prefill;
@@ -39805,7 +39887,7 @@ static bool glm_graph_stream_map_decode_layer(
     g->streaming_static_decode_map_current = false;
     if (glm_graph_env_present("DS4_ROCM_GLM_STREAMING_DECODE_FULL_LAYER_MAP",
                               "DS4_METAL_GLM_STREAMING_DECODE_FULL_LAYER_MAP") ||
-        getenv("DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP") != NULL) {
+        ds4_env_cached("DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP") != NULL) {
         return metal_graph_stream_map_layer(model, weights, il);
     }
     if (weights && il < DS4_N_LAYER &&
@@ -40761,7 +40843,7 @@ static bool glm_graph_alloc_slice(
     }
 #ifdef DS4_ROCM_BUILD
     if (glm_graph_env_truthy(
-            getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"))) {
+            ds4_env_cached("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"))) {
         fprintf(stderr,
                 "ds4: ROCm GLM one-token layer slices use the optimized token graph\n");
     }
@@ -41271,7 +41353,7 @@ static int glm_graph_routed_moe_one_dispatch(
     if (glm_graph_layer_uses_generic_routed_moe(l)) {
         if (!g->routed_gate || !g->routed_up || !g->routed_down ||
             l->ffn_gate_exps->type != l->ffn_up_exps->type) {
-            if (getenv("DS4_GLM_TP_DEBUG")) {
+            if (ds4_env_cached("DS4_GLM_TP_DEBUG")) {
                 fprintf(stderr,
                         "ds4: glm dispatch guard: gate=%p up=%p down=%p types=%u/%u\n",
                         (void *)g->routed_gate, (void *)g->routed_up,
@@ -41369,7 +41451,7 @@ static bool glm_graph_tp_batch_ffn_combine(
         uint32_t           n_tokens) {
     const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
     if (!g->tp_bounce_out || !g->tp_bounce_in) return false;
-    if (getenv("DS4_GLM_ABLATE_COMBINE")) {
+    if (ds4_env_cached("DS4_GLM_ABLATE_COMBINE")) {
         /* Timing probe: local half only, no exchange (garbage output;
          * both ranks must set the env or the gates desync). */
         return ds4_gpu_add_tensor(ffn_out,
@@ -41523,7 +41605,7 @@ static bool glm_graph_use_streaming_selected_async_load(
 #ifdef DS4_ROCM_BUILD
     return true;
 #else
-    return getenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD") != NULL;
+    return ds4_env_cached("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD") != NULL;
 #endif
 }
 
@@ -41616,7 +41698,7 @@ static uint32_t glm_decode_ablate_mask(void) {
     static int cached = -1;
     if (cached < 0) {
         uint32_t mask = 0;
-        const char *env = getenv("DS4_GLM_DECODE_ABLATE");
+        const char *env = ds4_env_cached("DS4_GLM_DECODE_ABLATE");
         if (env) {
             if (strstr(env, "attn_out")) mask |= DS4_GLM_ABLATE_ATTN_OUT;
             if (strstr(env, "attn_core")) mask |= DS4_GLM_ABLATE_ATTN_CORE;
@@ -41938,7 +42020,7 @@ static bool glm_graph_encode_sparse_ffn_one(
         fprintf(stderr, "ds4: GLM tensor parallelism requires resident weights\n");
         ok = false;
     }
-    if (!ok && tp_split_ffn && getenv("DS4_GLM_TP_DEBUG")) {
+    if (!ok && tp_split_ffn && ds4_env_cached("DS4_GLM_TP_DEBUG")) {
         fprintf(stderr, "ds4: glm sparse ffn: failed before routed dispatch (layer %u)\n", il);
     }
     if (ok && !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
@@ -42273,7 +42355,7 @@ static uint32_t glm_graph_q8_stripe_tokens(void) {
 }
 
 static bool glm_graph_flash_attention_prefill_enabled(void) {
-    return getenv("DS4_GLM_DISABLE_FLASH_PREFILL") == NULL;
+    return ds4_env_cached("DS4_GLM_DISABLE_FLASH_PREFILL") == NULL;
 }
 
 static uint32_t glm_graph_flash_attention_prefill_min_tokens(void) {
@@ -46870,7 +46952,7 @@ static uint32_t glm_graph_streaming_token_prefill_max_tokens(void) {
     const char *env = glm_graph_env_value(
             "DS4_ROCM_GLM_STREAMING_TOKEN_PREFILL_MAX",
             "DS4_METAL_GLM_STREAMING_TOKEN_PREFILL_MAX");
-    if (!env || !env[0]) env = getenv("DS4_GLM_STREAMING_TOKEN_PREFILL_MAX");
+    if (!env || !env[0]) env = ds4_env_cached("DS4_GLM_STREAMING_TOKEN_PREFILL_MAX");
     const uint32_t default_max =
         glm_graph_streaming_token_prefill_default_max_tokens();
     if (!env || !env[0]) return default_max;
@@ -46888,7 +46970,7 @@ static bool glm_graph_use_streaming_token_prefill(
         uint32_t                 pos0,
         uint32_t                 n_tokens) {
     if (!g || !g->ssd_streaming || g->quality || n_tokens == 0) return false;
-    if (getenv("DS4_GLM_DISABLE_STREAMING_TOKEN_PREFILL") != NULL ||
+    if (ds4_env_cached("DS4_GLM_DISABLE_STREAMING_TOKEN_PREFILL") != NULL ||
         glm_graph_env_present("DS4_ROCM_GLM_DISABLE_STREAMING_TOKEN_PREFILL",
                               "DS4_METAL_GLM_DISABLE_STREAMING_TOKEN_PREFILL")) {
         return false;
@@ -46967,7 +47049,7 @@ static bool glm_graph_streaming_decode_sync_each_layer(void) {
     const char *env = glm_graph_env_value(
             "DS4_ROCM_GLM_STREAMING_DECODE_SYNC_EACH_LAYER",
             "DS4_METAL_GLM_STREAMING_DECODE_SYNC_EACH_LAYER");
-    if (!env) env = getenv("DS4_GLM_STREAMING_DECODE_SYNC_EACH_LAYER");
+    if (!env) env = ds4_env_cached("DS4_GLM_STREAMING_DECODE_SYNC_EACH_LAYER");
     return glm_graph_env_truthy(env);
 #else
     return true;
@@ -46985,7 +47067,7 @@ static bool glm_graph_forward_token(
         float             *logits_out,
         bool               defer_completion) {
 #define DS4_GLM_FT_FAIL(why) do { \
-        if (getenv("DS4_GLM_TP_DEBUG")) \
+        if (ds4_env_cached("DS4_GLM_TP_DEBUG")) \
             fprintf(stderr, "ds4: glm forward_token fail pos=%u: %s\n", pos, why); \
     } while (0)
     if (!g || !model || !weights ||
@@ -47004,7 +47086,7 @@ static bool glm_graph_forward_token(
     uint32_t decode_layer_flush_interval = 0;
     if (logits_out != NULL) {
         decode_layer_flush_interval = use_indexed_attention ? 4u : 32u;
-        const char *dfi = getenv("DS4_GLM_DECODE_FLUSH_INTERVAL");
+        const char *dfi = ds4_env_cached("DS4_GLM_DECODE_FLUSH_INTERVAL");
         if (dfi && dfi[0]) {
             int v = atoi(dfi);
             decode_layer_flush_interval = v <= 0 ? 0u : (uint32_t)v;
@@ -47719,7 +47801,7 @@ static bool glm_graph_forward_token(
     } else if (!ok) {
         (void)ds4_gpu_synchronize();
     }
-    if (!ok && getenv("DS4_GLM_TP_DEBUG")) {
+    if (!ok && ds4_env_cached("DS4_GLM_TP_DEBUG")) {
         fprintf(stderr,
                 "ds4: glm forward_token fail pos=%u around layer %u\n",
                 pos, glm_ft_fail_il);
@@ -48187,7 +48269,7 @@ static DS4_MAYBE_UNUSED int generate_glm_metal_first_token(
         return 1;
     }
 
-    if (getenv("DS4_TRACE_TOP") != NULL) {
+    if (ds4_env_cached("DS4_TRACE_TOP") != NULL) {
         print_top_logits(stderr, "GLM first-token", vocab, logits, DS4_N_VOCAB, 10);
     }
     const int token = sample_argmax(logits, DS4_N_VOCAB);
@@ -48252,7 +48334,7 @@ static int generate_glm_metal_argmax(
         glm_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = ds4_env_cached("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after GLM graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
@@ -48300,7 +48382,7 @@ static int generate_glm_metal_argmax(
      * DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL=0.
      */
     const char *grow_cache_env =
-        getenv("DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
+        ds4_env_cached("DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
     if (ssd_streaming &&
         ssd_streaming_cache_bytes != 0 &&
         ssd_streaming_prefill_headroom_bytes != 0 &&
@@ -48337,10 +48419,10 @@ static int generate_glm_metal_argmax(
     int n_generated = 0;
     int n_decode_eval = 0;
     uint32_t pos = (uint32_t)prompt->len;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    const bool token_timing = ds4_env_cached("DS4_TOKEN_TIMING") != NULL;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < g.ctx_size; i++) {
-        if (getenv("DS4_TRACE_TOP") != NULL) {
+        if (ds4_env_cached("DS4_TRACE_TOP") != NULL) {
             char label[64];
             snprintf(label, sizeof(label), "GLM step %d", i);
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
@@ -48490,12 +48572,12 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = ds4_env_cached("DS4_METAL_MEMORY_REPORT") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    const bool trace_top = ds4_env_cached("DS4_TRACE_TOP") != NULL;
+    const bool token_timing = ds4_env_cached("DS4_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
@@ -48518,7 +48600,7 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-    const char *dump_prefill_logits = getenv("DS4_METAL_DUMP_PREFILL_LOGITS");
+    const char *dump_prefill_logits = ds4_env_cached("DS4_METAL_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
         if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
             free(logits);
@@ -48717,7 +48799,7 @@ static uint32_t engine_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     if (raw_cap < raw_window) raw_cap = raw_window;
 
     /* Env override (matches metal_graph_raw_cap_for_context behavior). */
-    const char *env = getenv("DS4_METAL_GRAPH_RAW_CAP");
+    const char *env = ds4_env_cached("DS4_METAL_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -48884,14 +48966,14 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     uint64_t output_logits_elems  = vocab_dim;
     const int planner_n_gpus = e ? e->gpu_cfg.n_gpus : 0;
 #if !defined(__APPLE__)
-    const char *tp_output_env = getenv("DS4_CUDA_TP_OUTPUT");
+    const char *tp_output_env = ds4_env_cached("DS4_CUDA_TP_OUTPUT");
     const bool tp_decode_requested = e && e->cuda_tensor_parallel;
     const bool tp_output_requested =
         !tp_output_env || !tp_output_env[0] || strcmp(tp_output_env, "0") != 0;
     if (planner_n_gpus >= 2 && (planner_n_gpus & 1) == 0 &&
         tp_decode_requested && tp_output_requested) {
         uint32_t output_ways = 8u;
-        const char *ways_env = getenv("DS4_CUDA_TP_OUTPUT_WAYS");
+        const char *ways_env = ds4_env_cached("DS4_CUDA_TP_OUTPUT_WAYS");
         if (ways_env && ways_env[0]) {
             char *end = NULL;
             const unsigned long parsed = strtoul(ways_env, &end, 10);
@@ -49170,7 +49252,7 @@ static void ds4_release_instance_lock(void) {
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
-    const char *path = getenv("DS4_LOCK_FILE");
+    const char *path = ds4_env_cached("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
@@ -49349,7 +49431,7 @@ static void ds4_dspark_stats_note_len(
 }
 
 static uint32_t ds4_dspark_env_u32(const char *name, uint32_t fallback) {
-    const char *env = getenv(name);
+    const char *env = ds4_env_cached(name);
     if (!env || !env[0]) return fallback;
     char *end = NULL;
     errno = 0;
@@ -49359,7 +49441,7 @@ static uint32_t ds4_dspark_env_u32(const char *name, uint32_t fallback) {
 }
 
 static bool ds4_dspark_scheduler_enabled(void) {
-    const char *env = getenv("DS4_DSPARK_SCHEDULER");
+    const char *env = ds4_env_cached("DS4_DSPARK_SCHEDULER");
     return !env || !env[0] || strcmp(env, "0") != 0;
 }
 
@@ -49437,7 +49519,7 @@ static bool ds4_session_dspark_scheduler_should_skip(ds4_session *s) {
     s->dspark_sched_skip--;
     s->dspark_sched_skipped_cycle = true;
     s->dspark_stats.scheduler_skips++;
-    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+    if (ds4_env_cached("DS4_DSPARK_SPEC_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: DSpark scheduler skip remaining=%u\n",
                 s->dspark_sched_skip);
@@ -49504,7 +49586,7 @@ static void ds4_session_dspark_scheduler_note(
         if (s->dspark_sched_skip < skip) {
             s->dspark_sched_skip = skip;
         }
-        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+        if (ds4_env_cached("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
                     "ds4: DSpark scheduler no-draft pause skip=%u "
                     "accepted_total=%u long_accept=%d confidence0=%s%.3f\n",
@@ -49534,7 +49616,7 @@ static void ds4_session_dspark_scheduler_note(
         s->dspark_sched_cycles >= break_even_window &&
         measured_unprofitable) {
         s->dspark_sched_skip = ds4_dspark_scheduler_slow_skip_cycles();
-        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+        if (ds4_env_cached("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
                     "ds4: DSpark scheduler break-even pause cycles=%u "
                     "accepted=%u saved=%.3fms extra=%.3fms skip=%u\n",
@@ -49575,7 +49657,7 @@ static void ds4_session_dspark_scheduler_note(
                 s->dspark_sched_skip = slow_skip;
             }
         }
-        if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+        if (ds4_env_cached("DS4_DSPARK_SPEC_LOG") != NULL) {
             fprintf(stderr,
                     "ds4: DSpark scheduler pause cycles=%u accepted=%u "
                     "avg=%.3f no_draft=%u extra_per_accept=%.3fms "
@@ -49887,6 +49969,24 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
         payload_set_err(err, errlen, "session tensor is smaller than the payload");
         return 1;
     }
+    /* Zero-copy path on Apple unified memory: write() straight from the shared
+     * Metal buffer (no 8MB staging loop, no second memcpy). */
+    const void *host = ds4_env_cached("DS4_DISABLE_ZEROCOPY_PAYLOAD_SPANS") != NULL
+        ? NULL : ds4_gpu_tensor_const_host_ptr(tensor, offset);
+    if (host) {
+        if (bytes == 0) return 0;
+        /* fence: any GPU commands producing this tensor's bytes must complete
+         * before the host reads them for the session file. */
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to sync accelerator before payload write");
+            return 1;
+        }
+        if (fwrite(host, 1, (size_t)bytes, fp) != (size_t)bytes) {
+            payload_set_err(err, errlen, "failed to write session payload");
+            return 1;
+        }
+        return 0;
+    }
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
@@ -49909,6 +50009,28 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
     {
         payload_set_err(err, errlen, "session tensor is smaller than the payload");
         return 1;
+    }
+    if (remaining && *remaining < bytes) {
+        payload_set_err(err, errlen, "truncated session payload");
+        return 1;
+    }
+    /* Zero-copy path on Apple unified memory: read() straight into the shared
+     * Metal buffer (no 8MB staging loop, no second memcpy). */
+    void *host = ds4_env_cached("DS4_DISABLE_ZEROCOPY_PAYLOAD_SPANS") != NULL
+        ? NULL : ds4_gpu_tensor_host_ptr((ds4_gpu_tensor *)tensor, offset);
+    if (host) {
+        if (remaining) *remaining -= bytes;
+        if (fread(host, 1, (size_t)bytes, fp) != (size_t)bytes) {
+            payload_set_err(err, errlen, "failed to read session payload");
+            return 1;
+        }
+        /* The GPU may have in-flight commands against this tensor (restore
+         * lands mid-enqueue): fence host writes ahead of device reads. */
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to sync accelerator after payload read");
+            return 1;
+        }
+        return 0;
     }
     uint64_t done = 0;
     while (done < bytes) {
@@ -52652,8 +52774,8 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
         }
         anchor_ready = s->greedy_splitkv_anchor_valid;
         if (!anchor_ready &&
-            ((splitkv_fallback && getenv("DS4_CUDA_GREEDY_SPLITKV_FALLBACK_LOG")) ||
-             (vec4_fallback && getenv("DS4_CUDA_GREEDY_VEC4_FALLBACK_LOG"))))
+            ((splitkv_fallback && ds4_env_cached("DS4_CUDA_GREEDY_SPLITKV_FALLBACK_LOG")) ||
+             (vec4_fallback && ds4_env_cached("DS4_CUDA_GREEDY_VEC4_FALLBACK_LOG"))))
         {
             fprintf(stderr,
                     "ds4: greedy %s frontier snapshot failed at pos=%u; using exact attention\n",
@@ -52687,7 +52809,7 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
     if (ok && anchor_ready && top2.fast_attention) {
         const float margin = top2.value0 - top2.value1;
         const float threshold = metal_graph_cuda_greedy_splitkv_margin_threshold();
-        if (getenv("DS4_CUDA_GREEDY_SPLITKV_TRACE")) {
+        if (ds4_env_cached("DS4_CUDA_GREEDY_SPLITKV_TRACE")) {
             fprintf(stderr,
                     "ds4: greedy split-kv margin pos=%u top=%d second=%d margin=%.6f threshold=%.6f\n",
                     pos,
@@ -52700,7 +52822,7 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
             const int replay_segment_len = s->greedy_splitkv_segment.len;
             ok = ds4_session_greedy_splitkv_replay_exact(s, token, &top, err, errlen);
             replayed_exact = ok;
-            if (ok && getenv("DS4_CUDA_GREEDY_SPLITKV_FALLBACK_LOG")) {
+            if (ok && ds4_env_cached("DS4_CUDA_GREEDY_SPLITKV_FALLBACK_LOG")) {
                 fprintf(stderr,
                         "ds4: greedy split-kv exact replay pos=%u segment=%d margin=%.6f threshold=%.6f approx_top=%d second=%d exact_top=%d\n",
                         pos,
@@ -52716,7 +52838,7 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
     if (ok && vec4_fallback && anchor_ready && use_vec4_attention) {
         const float margin = top2.value0 - top2.value1;
         const float threshold = metal_graph_cuda_greedy_vec4_margin_threshold();
-        if (getenv("DS4_CUDA_GREEDY_VEC4_TRACE")) {
+        if (ds4_env_cached("DS4_CUDA_GREEDY_VEC4_TRACE")) {
             fprintf(stderr,
                     "ds4: greedy vec4 margin pos=%u top=%d second=%d margin=%.6f threshold=%.6f\n",
                     pos,
@@ -52729,7 +52851,7 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
             const int replay_segment_len = s->greedy_splitkv_segment.len;
             ok = ds4_session_greedy_splitkv_replay_exact(s, token, &top, err, errlen);
             replayed_exact = ok;
-            if (ok && getenv("DS4_CUDA_GREEDY_VEC4_FALLBACK_LOG")) {
+            if (ok && ds4_env_cached("DS4_CUDA_GREEDY_VEC4_FALLBACK_LOG")) {
                 fprintf(stderr,
                         "ds4: greedy vec4 exact replay pos=%u segment=%d margin=%.6f threshold=%.6f approx_top=%d second=%d exact_top=%d\n",
                         pos,
@@ -52752,8 +52874,8 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
             ok = ds4_session_greedy_splitkv_replay_exact(s, token, &top, err, errlen);
             replayed_exact = ok;
             if (ok &&
-                ((vec4_fallback && getenv("DS4_CUDA_GREEDY_VEC4_FALLBACK_LOG")) ||
-                 (splitkv_fallback && getenv("DS4_CUDA_GREEDY_SPLITKV_FALLBACK_LOG"))))
+                ((vec4_fallback && ds4_env_cached("DS4_CUDA_GREEDY_VEC4_FALLBACK_LOG")) ||
+                 (splitkv_fallback && ds4_env_cached("DS4_CUDA_GREEDY_SPLITKV_FALLBACK_LOG"))))
             {
                 fprintf(stderr,
                         "ds4: greedy %s exact replay pos=%u segment=%d reason=max_segment max=%u approx_top=%d second=%d exact_top=%d\n",
@@ -52801,7 +52923,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
     ds4_engine *e = s->engine;
     const uint32_t start = (uint32_t)s->checkpoint.len;
     if ((uint64_t)start + 2u > (uint64_t)s->ctx_size) {
-        if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: split-kv spec skip pos=%u reason=context-room\n",
                     start);
@@ -52809,7 +52931,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
         return 0;
     }
     if (!metal_graph_cuda_splitkv_score_may_engage(&s->graph, start)) {
-        if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: split-kv spec skip pos=%u reason=score-gate\n",
                     start);
@@ -52819,7 +52941,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
 
     const int draft0 = sample_argmax(s->logits, DS4_N_VOCAB);
     if (draft0 < 0 || draft0 == eos_token) {
-        if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: split-kv spec skip pos=%u reason=%s draft0=%d\n",
                     start,
@@ -52832,7 +52954,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     if (!spec_frontier_snapshot(&frontier, s)) {
-        if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: split-kv spec frontier snapshot failed at pos=%u; using exact decode\n",
                     start);
@@ -52840,7 +52962,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
         return 0;
     }
 
-    const bool timing = getenv("DS4_CUDA_SPLITKV_SPEC_TIMING") != NULL;
+    const bool timing = ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_TIMING") != NULL;
     const double t0 = timing ? now_sec() : 0.0;
     int draft1 = -1;
     bool draft_ok = metal_graph_eval_token_raw_swa_top(&s->graph,
@@ -52864,7 +52986,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
         return -1;
     }
     if (!draft_ok || draft1 < 0) {
-        if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: split-kv spec draft failed at pos=%u; using exact decode\n",
                     start);
@@ -52874,8 +52996,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
     }
 
     if (metal_graph_cuda_splitkv_spec_batch_verify_requested()) {
-        float *row_logits = xmalloc(
-                (size_t)2 * DS4_N_VOCAB * sizeof(row_logits[0]));
+        float *row_logits = s->spec_row_logits;  /* session scratch: 2*VOCAB */
         int row0_top = -1;
         s->checkpoint.len = (int)start;
         token_vec_push(&s->checkpoint, draft0);
@@ -52898,7 +53019,6 @@ static int ds4_session_eval_splitkv_spec_after_first(
             snprintf(err, errlen, "%s split-kv spec batch verifier failed",
                      ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
-            free(row_logits);
             spec_frontier_free(&frontier);
             return -1;
         }
@@ -52920,7 +53040,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
                          "%s split-kv spec batch prefix commit failed",
                          ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
-                free(row_logits);
+                
                 spec_frontier_free(&frontier);
                 return -1;
             }
@@ -52933,7 +53053,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
             s->mtp_draft_valid = false;
         }
 
-        if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
             fprintf(stderr,
                     "ds4: split-kv spec batch pos=%u draft0=%d draft1=%d verify_next=%d accepted=%d\n",
                     start,
@@ -52953,18 +53073,15 @@ static int ds4_session_eval_splitkv_spec_after_first(
                     (done - t0) * 1000.0);
         }
 
-        free(row_logits);
+        
         spec_frontier_free(&frontier);
         return n_accept;
     }
 
     const bool toponly_row0 =
         metal_graph_cuda_splitkv_spec_toponly_row0_requested();
-    float *row0_logits = toponly_row0
-        ? NULL
-        : xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
-    float *row1_logits =
-        xmalloc((size_t)DS4_N_VOCAB * sizeof(row1_logits[0]));
+    float *row0_logits = toponly_row0 ? NULL : s->spec_row_logits;
+    float *row1_logits = s->spec_row_logits + DS4_N_VOCAB;
     int row0_top = -1;
     bool ok = metal_graph_verify_decode2_exact(&s->graph,
                                                &e->model,
@@ -52982,8 +53099,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
         snprintf(err, errlen, "%s split-kv spec exact verifier failed",
                  ds4_backend_name(e->backend));
         s->checkpoint_valid = false;
-        free(row1_logits);
-        free(row0_logits);
+        
+        
         spec_frontier_free(&frontier);
         return -1;
     }
@@ -53013,7 +53130,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
                          "%s split-kv spec row0 exact replay failed",
                          ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
-                free(row1_logits);
+                
                 spec_frontier_free(&frontier);
                 return -1;
             }
@@ -53023,8 +53140,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
                 snprintf(err, errlen, "%s split-kv spec prefix commit failed",
                          ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
-                free(row1_logits);
-                free(row0_logits);
+                
+                
                 spec_frontier_free(&frontier);
                 return -1;
             }
@@ -53038,7 +53155,7 @@ static int ds4_session_eval_splitkv_spec_after_first(
         s->mtp_draft_valid = false;
     }
 
-    if (getenv("DS4_CUDA_SPLITKV_SPEC_LOG")) {
+    if (ds4_env_cached("DS4_CUDA_SPLITKV_SPEC_LOG")) {
         fprintf(stderr,
                 "ds4: split-kv spec pos=%u draft0=%d draft1=%d exact_next=%d accepted=%d\n",
                 start,
@@ -53058,8 +53175,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
                 (done - t0) * 1000.0);
     }
 
-    free(row1_logits);
-    free(row0_logits);
+    
+    
     spec_frontier_free(&frontier);
     return n_accept;
 }
@@ -55760,17 +55877,17 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
         e->backend != DS4_BACKEND_METAL ||
         e->ssd_streaming ||
         DS4_MODEL_VARIANT != DS4_VARIANT_PRO ||
-        getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_PRELOAD") != NULL) {
+        ds4_env_cached("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_PRELOAD") != NULL) {
         return true;
     }
     if (!metal_graph_q4_non_streaming_opt_in_enabled()) {
         return true;
     }
     if (ds4_gpu_pro_q4_expert_table_auto_available() == 0 &&
-        getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL &&
-        getenv("DS4_METAL_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO") == NULL &&
-        getenv("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") == NULL &&
-        getenv("DS4_METAL_ENABLE_Q4_EXPERT_ADDRESS_TABLE") == NULL) {
+        ds4_env_cached("DS4_METAL_ENABLE_PRO_Q4_EXPERT_TABLE_AUTO") == NULL &&
+        ds4_env_cached("DS4_METAL_ENABLE_PRO_Q4_EXPERT_ADDRESS_AUTO") == NULL &&
+        ds4_env_cached("DS4_METAL_ENABLE_Q4_EXPERT_TABLE") == NULL &&
+        ds4_env_cached("DS4_METAL_ENABLE_Q4_EXPERT_ADDRESS_TABLE") == NULL) {
         return true;
     }
 
@@ -56099,7 +56216,7 @@ static bool engine_cuda_tp_output_env_requested(void) {
 #if defined(__APPLE__) && !defined(DS4_TEST_HOOKS)
     return false;
 #else
-    const char *env = getenv("DS4_CUDA_TP_OUTPUT");
+    const char *env = ds4_env_cached("DS4_CUDA_TP_OUTPUT");
     return !env || !env[0] || strcmp(env, "0") != 0;
 #endif
 }
@@ -56723,7 +56840,7 @@ static int engine_install_dspark_support_cache(ds4_engine *e) {
             if (f > best_free) { best_free = f; exec_tier = t; }
         }
     }
-    const char *tier_env = getenv("DS4_DSPARK_EXEC_TIER");
+    const char *tier_env = ds4_env_cached("DS4_DSPARK_EXEC_TIER");
     if (tier_env && tier_env[0]) {
         const int v = atoi(tier_env);
         if (v >= 0 && v < e->gpu_cfg.n_gpus) exec_tier = v;
@@ -56750,7 +56867,7 @@ static int engine_install_dspark_support_cache(ds4_engine *e) {
     }
     uint64_t reserve = 4ull * 1024ull * 1024ull * 1024ull + (1ull << 29);
     {
-        const char *renv = getenv("DS4_DSPARK_CACHE_RESERVE_GB");
+        const char *renv = ds4_env_cached("DS4_DSPARK_CACHE_RESERVE_GB");
         if (renv && renv[0]) {
             const int gv = atoi(renv);
             if (gv >= 1 && gv <= 32) reserve = (uint64_t)gv << 30;
@@ -57270,9 +57387,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
-        expert_profile_path = getenv("DS4_EXPERT_PROFILE");
+        expert_profile_path = ds4_env_cached("DS4_EXPERT_PROFILE");
     }
-    const char *expert_hotlist_path = getenv("DS4_EXPERT_HOTLIST");
+    const char *expert_hotlist_path = ds4_env_cached("DS4_EXPERT_HOTLIST");
     if ((expert_profile_path && expert_profile_path[0]) ||
         (expert_hotlist_path && expert_hotlist_path[0])) {
         if (e->backend == DS4_BACKEND_METAL) {
@@ -58215,7 +58332,7 @@ static int ds4_engine_tp_batch_exchange(void *ud, uint32_t layer,
 static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
                                       const void *out, void *in,
                                       uint64_t bytes) {
-    if (g_glm_tp_debug_ids && getenv("DS4_GLM_TP_DEBUG")) {
+    if (g_glm_tp_debug_ids && ds4_env_cached("DS4_GLM_TP_DEBUG")) {
         fprintf(stderr,
                 "ds4-tp: big gate l=%u ids[0..7]=%d %d %d %d %d %d %d %d\n",
                 layer,
@@ -58362,7 +58479,7 @@ void ds4_engine_close(ds4_engine *e) {
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void) {
-    const char *env = getenv("DS4_DSPARK_STATS");
+    const char *env = ds4_env_cached("DS4_DSPARK_STATS");
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
@@ -58736,8 +58853,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->sample_probs =
         xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
     if (need_spec_verifier) {
+        /* 2x vocab: scratch for all speculative-verify paths (row_logits up to
+         * 2*VOCAB, or row/row0 halves of VOCAB each). Previously xmalloc/freed
+         * per verify cycle (1.3-2.6 MB churn per 1-2 committed tokens). */
         s->spec_row_logits =
-            xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_logits[0]));
+            xmalloc((size_t)2 * DS4_N_VOCAB * sizeof(s->spec_row_logits[0]));
     }
     if (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) {
         const uint64_t dspark_feature_count =
@@ -59311,7 +59431,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 #ifdef DS4_ROCM_BUILD
         const bool rocm_layer_slice_token_decode =
             glm_graph_env_truthy(
-                    getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"));
+                    ds4_env_cached("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"));
 #else
         const bool rocm_layer_slice_token_decode = false;
 #endif
@@ -59772,7 +59892,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
-        const char *kvp = getenv("DS4_GLM_KV_DUMP");
+        const char *kvp = ds4_env_cached("DS4_GLM_KV_DUMP");
         if (kvp && kvp[0] && s->glm_graph.layer_kv_lora_cache[0]) {
             const ds4_glm_gpu_graph *g = &s->glm_graph;
             const uint32_t rows = prompt ? (uint32_t)prompt->len : 0;
@@ -59911,7 +60031,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
         ds4_tokens glm_trunc_prompt;
         {
-            const char *tr = getenv("DS4_GLM_PREFILL_TRUNC");
+            const char *tr = ds4_env_cached("DS4_GLM_PREFILL_TRUNC");
             if (tr && tr[0]) {
                 const int tn = atoi(tr);
                 if (tn > 0 && tn < prompt->len) {
@@ -59951,7 +60071,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 
         uint32_t glm_exact_prefill_max = 64;
         {
-            const char *em = getenv("DS4_GLM_TP_EXACT_PREFILL_MAX");
+            const char *em = ds4_env_cached("DS4_GLM_TP_EXACT_PREFILL_MAX");
             if (em && em[0]) glm_exact_prefill_max = (uint32_t)atoi(em);
         }
         if (s->engine->glm_tp_token_prefill ||
@@ -60009,7 +60129,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         const bool prompt_fits_dense_attention =
             s->glm_graph.full_kv_cache &&
             (uint32_t)prompt->len <= s->glm_graph.ctx_cap;
-        const bool sync_trace = getenv("DS4_GLM_SYNC_TRACE") != NULL;
+        const bool sync_trace = ds4_env_cached("DS4_GLM_SYNC_TRACE") != NULL;
         const bool indexed_batch_available =
             glm_graph_indexed_prefill_batch_available(&s->glm_graph);
         const bool indexed_resume_keeps_sparse_state =
@@ -60714,7 +60834,7 @@ int ds4_session_argmax(ds4_session *s) {
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
-    if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
+    if (ds4_env_cached("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
     }
@@ -60734,11 +60854,17 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
-    float *scratch = xmalloc((size_t)n_vocab * sizeof(scratch[0]));
+    /* grow-once thread-local scratch: was xmalloc(n_vocab*4) + free per call */
+    static __thread float *scratch = NULL;
+    static __thread size_t scratch_cap = 0;
+    if (scratch_cap < (size_t)n_vocab) {
+        free(scratch);
+        scratch = xmalloc((size_t)n_vocab * sizeof(scratch[0]));
+        scratch_cap = (size_t)n_vocab;
+    }
     const int token = sample_top_p_min_p(logits, (uint32_t)n_vocab,
                                          temperature, top_k, top_p, min_p,
                                          rng, scratch);
-    free(scratch);
     return token;
 }
 
@@ -60901,7 +61027,7 @@ static bool ds4_session_prepare_legacy_mtp_draft(ds4_session *s,
                                    &e->mtp_weights,
                                    token,
                                    pos,
-                                   getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
+                                   ds4_env_cached("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
                                    &mtp_top)) {
         s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
         s->mtp_draft_valid = true;
@@ -60916,10 +61042,10 @@ static bool ds4_session_prepare_legacy_mtp_draft(ds4_session *s,
 static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                   int token,
                                                   uint32_t pos) {
-    const char *probe = getenv("DS4_DSPARK_PROBE");
+    const char *probe = ds4_env_cached("DS4_DSPARK_PROBE");
     const bool probe_log = probe && probe[0];
     const bool enabled = s->engine->dspark;
-    const char *fake_argmax = getenv("DS4_DSPARK_FAKE_ARGMAX_PROPOSAL");
+    const char *fake_argmax = ds4_env_cached("DS4_DSPARK_FAKE_ARGMAX_PROPOSAL");
     const bool fake_argmax_enabled =
         enabled &&
         fake_argmax && fake_argmax[0] && strcmp(fake_argmax, "0") != 0;
@@ -61554,7 +61680,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
          * from the nextn block and score it against the next greedy pick.
          * Both TP ranks must set the env (the draft's routed experts ride
          * a big-gate exchange). */
-        if (getenv("DS4_GLM_MTP_PROBE") && DS4_N_NEXTN_PREDICT != 0) {
+        if (ds4_env_cached("DS4_GLM_MTP_PROBE") && DS4_N_NEXTN_PREDICT != 0) {
             static int probe_hits, probe_total, probe_have, probe_draft;
             static uint32_t probe_min_pos = UINT32_MAX;
             int nmax = 0;
@@ -61585,7 +61711,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         (void)probe_mtp;
         return 0;
     }
-    const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+    const bool mtp_probe_log = ds4_env_cached("DS4_MTP_PROBE") != NULL;
     if (probe_mtp && e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
         ds4_session_note_legacy_mtp_probe(s, token, mtp_probe_log);
     }
@@ -61683,12 +61809,12 @@ static bool ds4_sessions_eval_batch_metal_supported(
         ds4_decode_item *items,
         int count,
         ds4_engine *e) {
-    const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
+    const char *tp_batch = ds4_env_cached("DS4_METAL_TP_SESSION_BATCH");
     if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
-        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
-        getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) {
+        ds4_env_cached("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+        ds4_env_cached("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) {
         return false;
     }
     for (int i = 0; i < count; i++) {
@@ -61701,7 +61827,7 @@ static bool ds4_sessions_eval_batch_metal_supported(
             if (!s->glm_graph_ready || s->glm_graph.ssd_streaming ||
                 glm_debug_hidden_dump_layer() >= 0 ||
                 e->glm_mtp ||
-                getenv("DS4_GLM_MTP_PROBE") != NULL) {
+                ds4_env_cached("DS4_GLM_MTP_PROBE") != NULL) {
                 return false;
             }
         } else if (s->graph.ssd_streaming) {
@@ -61715,7 +61841,7 @@ static bool metal_graph_native_session_batch_shared_supported(
         ds4_decode_item *items,
         int count,
         const ds4_engine *e) {
-    const char *enabled = getenv("DS4_METAL_SESSION_BATCH_SHARED");
+    const char *enabled = ds4_env_cached("DS4_METAL_SESSION_BATCH_SHARED");
     if ((enabled && enabled[0] && strcmp(enabled, "0") == 0) ||
         !items || count < 2 || !e || e->tp.active ||
         e->support_kind != DS4_SUPPORT_NONE ||
@@ -61765,7 +61891,7 @@ static bool metal_graph_native_session_batch_qkv_supported(
         ds4_decode_item *items,
         int count,
         const ds4_engine *e) {
-    const char *enabled = getenv("DS4_METAL_SESSION_BATCH_QKV");
+    const char *enabled = ds4_env_cached("DS4_METAL_SESSION_BATCH_QKV");
     if ((enabled && enabled[0] && strcmp(enabled, "0") == 0) ||
         !items || count < 2 || !e || e->tp.active ||
         metal_graph_use_reference_qkv_norm()) {
@@ -62178,7 +62304,7 @@ static int ds4_sessions_eval_batch_metal(
             ds4_session_dspark_capture_note_checkpoint(s);
         }
     }
-    if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
+    if (ds4_env_cached("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: Metal session batch rows=%d family=%s "
                 "native_shared=%d native_qkv=%d\n",
@@ -62200,7 +62326,7 @@ static bool ds4_sessions_eval_batch_with_prefill_metal_supported(
         return false;
     }
     ds4_engine *e = prefill_session->engine;
-    const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
+    const char *tp_batch = ds4_env_cached("DS4_METAL_TP_SESSION_BATCH");
     if (e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
@@ -62209,9 +62335,9 @@ static bool ds4_sessions_eval_batch_with_prefill_metal_supported(
         prefill_session->distributed ||
         prefill_session->graph.ssd_streaming ||
         ds4_session_cancelled(prefill_session) ||
-        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
-        getenv("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL ||
-        getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL) {
+        ds4_env_cached("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+        ds4_env_cached("DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE") != NULL ||
+        ds4_env_cached("DS4_METAL_LAYER_STAGE_PROFILE") != NULL) {
         return false;
     }
 
@@ -62419,7 +62545,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
         s->mtp_draft_valid = false;
         ds4_session_dspark_capture_note_checkpoint(s);
     }
-    if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
+    if (ds4_env_cached("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: Metal mixed batch prefill_rows=%u decode_rows=%d\n",
                 rows, count);
@@ -62586,7 +62712,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         int          accepted_cap,
         char        *err,
         size_t       errlen) {
-    const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
+    const bool spec_log = ds4_env_cached("DS4_DSPARK_SPEC_LOG") != NULL;
     const bool stats_enabled = s && ds4_dspark_stats_enabled();
     const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled();
     const double stats_t0 =
@@ -63137,7 +63263,7 @@ static bool metal_graph_session_batch_moe_supported(
         int count,
         const ds4_weights *weights) {
     if (!items || count < 3 || !weights || DS4_N_EXPERT_USED != 6u ||
-        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) {
+        ds4_env_cached("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) {
         return false;
     }
 
@@ -63288,25 +63414,25 @@ static bool metal_graph_session_batch_attn_core_supported(
     if (!items || count < 3 || !weights ||
         count > (int)DS4_GPU_ATTENTION_DECODE_BATCH_MAX ||
         DS4_N_HEAD_DIM != 512u || metal_graph_attn_comp_cache_is_f16() ||
-        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
-        getenv("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DECODE") != NULL ||
-        getenv("DS4_CUDA_SPLITKV_DECODE") != NULL ||
-        getenv("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL ||
-        getenv("DS4_CUDA_DECODE_SCORE4") != NULL ||
-        getenv("DS4_CUDA_DECODE_SCORE8") != NULL ||
-        getenv("DS4_CUDA_NO_DECODE_VALUE512") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_LDG") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4_PLAIN") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_DIM2") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL ||
-        getenv("DS4_CUDA_NO_SCORE_TILE") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_MIN_SCORE") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_CHUNK") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_FLOOR") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S_MAX") != NULL ||
-        getenv("DS4_CUDA_EXACT_SCORE_SPLIT_S") != NULL) {
+        ds4_env_cached("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+        ds4_env_cached("DS4_CUDA_NO_EXACT_SCORE_SPLIT_DECODE") != NULL ||
+        ds4_env_cached("DS4_CUDA_SPLITKV_DECODE") != NULL ||
+        ds4_env_cached("DS4_CUDA_DECODE_HEADS8_ONLINE") != NULL ||
+        ds4_env_cached("DS4_CUDA_DECODE_SCORE4") != NULL ||
+        ds4_env_cached("DS4_CUDA_DECODE_SCORE8") != NULL ||
+        ds4_env_cached("DS4_CUDA_NO_DECODE_VALUE512") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_GRAPH") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_LDG") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_VEC4_PLAIN") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_DIM2") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_FUSE_INV_ROPE") != NULL ||
+        ds4_env_cached("DS4_CUDA_NO_SCORE_TILE") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_MIN_SCORE") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_CHUNK") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_S_FLOOR") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_S_MAX") != NULL ||
+        ds4_env_cached("DS4_CUDA_EXACT_SCORE_SPLIT_S") != NULL) {
         return false;
     }
 
@@ -63436,7 +63562,7 @@ static bool metal_graph_session_batch_qkv_supported(
     if (!items || count < 3 || !weights ||
         count > (int)DS4_GPU_ATTENTION_DECODE_BATCH_MAX ||
         DS4_N_HEAD_KV != 1u || metal_graph_use_reference_qkv_norm() ||
-        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) {
+        ds4_env_cached("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL) {
         return false;
     }
     ds4_gpu_graph *first = &items[0].session->graph;
@@ -65369,7 +65495,7 @@ static void metal_graph_align_mixed_workspace(
  * layer-interleaved path. Larger waves currently change prefill logits and
  * must use the serialized public-API fallback. */
 static DS4_MAYBE_UNUSED uint32_t metal_graph_mixed_routed_max_prefill_rows(void) {
-    const char *value = getenv("DS4_CUDA_MIXED_ROUTED_MAX_PREFILL");
+    const char *value = ds4_env_cached("DS4_CUDA_MIXED_ROUTED_MAX_PREFILL");
     if (!value || !value[0]) return 512u;
     char *end = NULL;
     unsigned long parsed = strtoul(value, &end, 10);
@@ -65410,8 +65536,8 @@ static bool metal_graph_mixed_prefill_decode_supported(
         prefill_rows > g->raw_cap ||
         (start % g->prefill_cap) + prefill_rows > g->prefill_cap ||
         metal_graph_directional_steering_ffn_enabled(g) ||
-        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
-        getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL) {
+        ds4_env_cached("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
+        ds4_env_cached("DS4_METAL_LAYER_STAGE_PROFILE") != NULL) {
         return false;
     }
     if (!metal_graph_mixed_workspace_compatible(g, batch_graph)) return false;
@@ -65757,7 +65883,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                 ok = false;
             }
         }
-        const char *interleave = getenv("DS4_CUDA_SESSION_BATCH_INTERLEAVE");
+        const char *interleave = ds4_env_cached("DS4_CUDA_SESSION_BATCH_INTERLEAVE");
         const bool use_pipeline = !interleave || !interleave[0] ||
                                   strcmp(interleave, "0") != 0;
         if (ok && use_pipeline && first->graph.placement) {
@@ -66027,7 +66153,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             can_prepare_support_draft = false;
             dspark_tail_skip = true;
             if (ds4_dspark_stats_enabled()) s->dspark_stats.tail_skips++;
-            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+            if (ds4_env_cached("DS4_DSPARK_SPEC_LOG") != NULL) {
                 fprintf(stderr,
                         "ds4: DSpark scheduler tail skip max=%d min=%u\n",
                         max_tokens,
@@ -66087,18 +66213,18 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    const bool strict_mtp = e->quality || ds4_env_cached("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
-    const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
+    const char *mtp_margin_env = ds4_env_cached("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
         char *end = NULL;
         float v = strtof(mtp_margin_env, &end);
         if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
     }
-    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
-    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
+    const bool mtp_timing = ds4_env_cached("DS4_MTP_TIMING") != NULL;
+    const bool mtp_conf_log = ds4_env_cached("DS4_MTP_CONF_LOG") != NULL;
     const bool mtp_need_logits = mtp_conf_log ||
-        getenv("DS4_MTP_FULL_LOGITS") != NULL ||
+        ds4_env_cached("DS4_MTP_FULL_LOGITS") != NULL ||
         (!strict_mtp && mtp_margin_threshold > 0.0f);
     const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
     double mtp_t_after_draft = mtp_t0;
@@ -66112,7 +66238,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * only first_token and skip all speculative work.
      */
     if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
         }
         return n_accept;
@@ -66169,7 +66295,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             mtp_last_margin = v0 - v1;
         }
         if (mtp_last_margin < mtp_margin_threshold) {
-            float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+            float *row_logits = s->spec_row_logits;  /* session scratch */
             const int start = s->checkpoint.len;
             const double verify_t0 = mtp_timing ? now_sec() : 0.0;
             bool ok = metal_graph_eval_token_raw_swa(&s->graph,
@@ -66179,13 +66305,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                      (uint32_t)start,
                                                      row_logits);
             if (!ok) {
-                free(row_logits);
+                
                 snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
                 return -1;
             }
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-            free(row_logits);
+            
             token_vec_push(&s->checkpoint, drafts[0]);
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
@@ -66228,12 +66354,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     const bool use_decode2_exact =
         draft_n == 2 &&
         (strict_mtp || prefer_decode2_exact) &&
-        getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+        ds4_env_cached("DS4_MTP_BATCH_VERIFY") == NULL;
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-        float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
+        float *row_logits  = s->spec_row_logits;                  /* session scratch */
+        float *row0_logits = s->spec_row_logits + DS4_N_VOCAB;    /* second half */
         const int start = s->checkpoint.len;
         int row0_top = -1;
         const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
@@ -66272,8 +66398,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         (now_sec() - mtp_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
-            free(row0_logits);
-            free(row_logits);
+            
+            
             return n_accept;
         }
 
@@ -66301,8 +66427,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         (replay_done - mtp_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
-            free(row0_logits);
-            free(row_logits);
+            
+            
             return n_accept;
         }
         if (have_frontier) {
@@ -66311,9 +66437,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             (void)spec_frontier_restore(&frontier, s);
         }
         spec_frontier_free(&frontier);
-        free(row0_logits);
-        free(row_logits);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        
+        
+        if (ds4_env_cached("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp decode2 verifier failed, falling back to sequential\n");
         }
     }
@@ -66323,7 +66449,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
         int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        float *row_logits = s->spec_row_logits;  /* session scratch */
         const int start = s->checkpoint.len;
         /*
          * The production MTP depth is two.  Prefix-1 capture makes partial
@@ -66334,12 +66460,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
          * the older no-replay partial path for measurement.
          */
         const bool capture_prefix1 =
-            draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
-        const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
+            draft_n == 2 && (!strict_mtp || ds4_env_cached("DS4_MTP_CAPTURE_PREFIX1") != NULL);
+        const bool exact_replay_debug = ds4_env_cached("DS4_MTP_EXACT_REPLAY") != NULL;
         const bool snapshot_required =
             draft_n > 2 ||
             (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
-            getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
+            ds4_env_cached("DS4_MTP_FORCE_SNAPSHOT") != NULL;
         bool have_frontier = false;
         bool ok = true;
         bool verifier_may_have_mutated = false;
@@ -66408,7 +66534,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         DS4_MTP_KEEP_ACCEPTED(replayed);
                         ds4_session_dspark_capture_note_checkpoint(s);
                         spec_frontier_free(&frontier);
-                        free(row_logits);
+                        
                         free(row_tops);
                         return n_accept;
                     }
@@ -66440,7 +66566,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
+                    
                     free(row_tops);
                     return n_accept;
                 }
@@ -66473,7 +66599,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
+                    
                     free(row_tops);
                     return n_accept;
                 }
@@ -66510,7 +66636,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
+                    
                     free(row_tops);
                     return n_accept;
                 }
@@ -66554,7 +66680,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
+                    
                     free(row_tops);
                     return n_accept;
                 }
@@ -66572,14 +66698,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             s->checkpoint_valid = false;
             DS4_MTP_KEEP_ACCEPTED(0);
             spec_frontier_free(&frontier);
-            free(row_logits);
+            
             free(row_tops);
             return -1;
         }
         spec_frontier_free(&frontier);
-        free(row_logits);
+        
         free(row_tops);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
+        if (ds4_env_cached("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
         }
     }
@@ -66596,7 +66722,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     const double seq_t0 = mtp_timing ? now_sec() : 0.0;
     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
         if (target_top != drafts[i]) {
-            if (getenv("DS4_MTP_SPEC_LOG")) {
+            if (ds4_env_cached("DS4_MTP_SPEC_LOG")) {
                 fprintf(stderr,
                         "ds4: mtp spec seq miss at=%d draft=%d base=%d drafted=%d accepted=%d\n",
                         i,
@@ -66653,7 +66779,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 (now_sec() - seq_t0) * 1000.0,
                 (now_sec() - mtp_t0) * 1000.0);
     }
-    if (getenv("DS4_MTP_SPEC_LOG")) {
+    if (ds4_env_cached("DS4_MTP_SPEC_LOG")) {
         if (verified == draft_n) {
             fprintf(stderr,
                     "ds4: mtp spec seq accept drafted=%d accepted=%d\n",
