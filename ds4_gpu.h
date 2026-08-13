@@ -146,6 +146,11 @@ typedef struct {
 int ds4_gpu_device_cache_tensors(int device_id,
                                  const ds4_tensor_range *ranges,
                                  int n_ranges);
+/* SSD+DSpark uses a persistent no-copy support view on Metal. This is a
+ * deliberately distinct API from the CUDA multi-tier support-map registry,
+ * whose non-zero offset bias is part of its cache-key contract. */
+int ds4_gpu_register_persistent_support_map(const void *map, uint64_t size);
+void ds4_gpu_release_persistent_support_map(void);
 int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
 int ds4_gpu_device_cache_support_tensors(int device_id,
                                          int entry_device_id,

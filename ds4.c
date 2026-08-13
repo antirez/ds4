@@ -154,9 +154,6 @@ int ds4_gpu_tensor_copy_xdev3_default_dst(
 int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     (void)model_map; (void)model_size; return 0;
 }
-int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
-    (void)map; (void)size; (void)bias; return 1;
-}
 int ds4_gpu_device_cache_support_tensors(int device_id,
                                           int exec_device_id,
                                           const ds4_tensor_range *ranges,
@@ -362,6 +359,14 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+/* Keep the persistent-support lifecycle API link-complete for CPU-only
+ * diagnostics. CPU has no no-copy accelerator view to retain. */
+int ds4_gpu_register_persistent_support_map(const void *map, uint64_t size) {
+    (void)map;
+    (void)size;
+    return 0;
+}
+void ds4_gpu_release_persistent_support_map(void) {}
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -2945,6 +2950,20 @@ static bool support_model_checkpoint_compatible(const ds4_model *m) {
     return true;
 }
 
+/* Filename discovery is only a candidate selection step. Startup policy is
+ * decided from the tensors actually detected in the support GGUF: explicit
+ * DSpark must never fall through to the otherwise-valid legacy MTP path, and
+ * SSD support remains restricted to an explicitly enabled DSpark bundle. */
+static bool support_kind_allowed_for_startup(
+        bool dspark_requested,
+        bool ssd_streaming,
+        ds4_support_kind kind) {
+    if (dspark_requested && kind != DS4_SUPPORT_DSPARK) return false;
+    if (ssd_streaming &&
+        (kind != DS4_SUPPORT_DSPARK || !dspark_requested)) return false;
+    return true;
+}
+
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
 typedef struct {
@@ -4812,12 +4831,14 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
         ds4_backend backend,
         int         ctx_size,
         uint32_t    prefill_chunk,
-        bool        ssd_streaming) {
+        bool        ssd_streaming,
+        uint64_t    fixed_mapping_bytes) {
 #ifdef DS4_NO_GPU
     (void)backend;
     (void)ctx_size;
     (void)prefill_chunk;
     (void)ssd_streaming;
+    (void)fixed_mapping_bytes;
     return 0;
 #else
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
@@ -4838,8 +4859,11 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
                                                       ctx_size,
                                                       prefill_chunk,
                                                       ssd_streaming);
+    uint64_t fixed_bytes = ctx_mem.total_bytes;
+    if (fixed_bytes > UINT64_MAX - fixed_mapping_bytes) return 0;
+    fixed_bytes += fixed_mapping_bytes;
     uint64_t safe = 0;
-    if (target > ctx_mem.total_bytes) safe = target - ctx_mem.total_bytes;
+    if (target > fixed_bytes) safe = target - fixed_bytes;
     safe = (safe / gib) * gib;
     if (safe == 0) safe = gib;
     return safe;
@@ -5630,6 +5654,62 @@ static void dspark_weights_validate_layout(ds4_dspark_weights *dw) {
                                   (uint64_t)DS4_N_EMBD + dw->markov_rank,
                                   1, 0);
 }
+
+/* `--dspark` is an explicit opt-in to execute this complete support model.
+ * Detection is deliberately permissive enough to identify a candidate and
+ * print useful diagnostics; activation is not. Do not register a persistent
+ * model mapping, or attempt a decode, until every bound tensor and metadata
+ * invariant is complete. */
+static bool dspark_weights_ready_for_enabled_runtime(
+        const ds4_dspark_weights *dw) {
+    if (!dw ||
+        dw->n_stages < 3 || dw->n_stages > DS4_DSPARK_MAX_STAGES ||
+        !dw->has_block_size || dw->block_size == 0 ||
+        dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE ||
+        !dw->has_markov_rank || dw->markov_rank == 0 ||
+        !dw->has_noise_token_id ||
+        !dw->has_target_layers || dw->target_layer_count == 0 ||
+        dw->target_layer_count > DS4_DSPARK_MAX_TARGET_LAYERS) {
+        return false;
+    }
+    return dw->missing_tensors == 0 &&
+           dw->invalid_tensors == 0 &&
+           dw->metadata_errors == 0;
+}
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_dspark_support_ready(
+        const ds4_test_dspark_readiness *fixture) {
+    if (!fixture) return 0;
+    const ds4_dspark_weights dw = {
+        .n_stages = fixture->n_stages,
+        .block_size = fixture->block_size,
+        .markov_rank = fixture->markov_rank,
+        .target_layer_count = fixture->target_layer_count,
+        .missing_tensors = fixture->missing_tensors,
+        .invalid_tensors = fixture->invalid_tensors,
+        .metadata_errors = fixture->metadata_errors,
+        .has_block_size = fixture->has_block_size,
+        .has_markov_rank = fixture->has_markov_rank,
+        .has_noise_token_id = fixture->has_noise_token_id,
+        .has_target_layers = fixture->has_target_layers,
+    };
+    return dspark_weights_ready_for_enabled_runtime(&dw) ? 1 : 0;
+}
+
+int ds4_test_support_kind_allowed_for_startup(
+        bool dspark_requested,
+        bool ssd_streaming,
+        int support_kind) {
+    if (support_kind < DS4_SUPPORT_NONE || support_kind > DS4_SUPPORT_DSPARK) {
+        return 0;
+    }
+    return support_kind_allowed_for_startup(
+            dspark_requested,
+            ssd_streaming,
+            (ds4_support_kind)support_kind) ? 1 : 0;
+}
+#endif
 
 static bool ds4_shape_matches_metadata(
         const ds4_shape *s,
@@ -31654,8 +31734,12 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
 
+    /* --quality disables the selected-expert kernels that make the compact
+     * static map sufficient.  Keep quality decode layer-scoped so the full
+     * routed tensors needed by the exact kernels are mapped without making
+     * the entire model resident at once. */
     const bool static_decode_map =
-        metal_graph_stream_decode_static_map_enabled() &&
+        !g->quality && metal_graph_stream_decode_static_map_enabled() &&
         weights_model_map_decode_static_supported(weights);
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
@@ -31740,7 +31824,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     double execute_s = 0.0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double tl0 = profile ? now_sec() : 0.0;
-        if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
+        if (!static_decode_map &&
+            !(g->quality ? metal_graph_stream_map_layer(model, weights, il) :
+                           metal_graph_stream_map_layer_decode(model, weights, il))) {
             ok = false;
             break;
         }
@@ -36375,7 +36461,7 @@ static bool metal_graph_prefill_layer_major(
     }
     if (ok && logits && g->ssd_streaming) {
         const bool static_decode_map =
-            metal_graph_stream_decode_static_map_enabled() &&
+            !g->quality && metal_graph_stream_decode_static_map_enabled() &&
             weights_model_map_decode_static_supported(weights);
         const bool static_map_state_cache =
             static_decode_map &&
@@ -38441,6 +38527,19 @@ static uint64_t ds4_engine_dynamic_expert_cache_bytes(
 static uint64_t glm_graph_streaming_active_model_bytes(
         const ds4_weights *weights);
 
+/* Persistent DSpark support is wrapped as one Metal no-copy buffer over the
+ * complete support mapping, including its GGUF metadata. Account that exact
+ * byte span everywhere a streaming cache is budgeted or admitted. */
+static uint64_t ds4_engine_persistent_dspark_support_bytes(
+        const ds4_engine *e) {
+    if (!e || !e->ssd_streaming ||
+        e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark ||
+        !e->mtp_model.map) {
+        return 0;
+    }
+    return e->mtp_model.size;
+}
+
 static uint64_t ds4_engine_streaming_transient_guard_bytes(
         const ds4_engine *e) {
     if (!e || !e->ssd_streaming) return 0;
@@ -38448,6 +38547,8 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     total = ds4_add_sat_u64(total, e->ssd_streaming_prefill_headroom_bytes);
     total = ds4_add_sat_u64(total,
                             e->ssd_streaming_decode_map_extra_bytes);
+    total = ds4_add_sat_u64(total,
+                            ds4_engine_persistent_dspark_support_bytes(e));
     return total;
 }
 
@@ -38492,6 +38593,8 @@ static void ds4_engine_print_startup_memory(
         ds4_engine_dynamic_expert_cache_bytes(e);
     const uint64_t expert_reserved_bytes =
         e->ssd_streaming_prefill_headroom_bytes;
+    const uint64_t support_model_bytes =
+        ds4_engine_persistent_dspark_support_bytes(e);
     uint64_t resident_model_bytes = e->startup_model_span_bytes;
 #ifndef DS4_NO_GPU
     if (e->ssd_streaming_static_decode_map &&
@@ -38510,6 +38613,7 @@ static void ds4_engine_print_startup_memory(
     total = ds4_add_sat_u64(total, resident_model_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
+    total = ds4_add_sat_u64(total, support_model_bytes);
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
@@ -38535,6 +38639,11 @@ static void ds4_engine_print_startup_memory(
                 " + prefill expert reserve %.2f GiB",
                 ds4_bytes_to_gib(expert_reserved_bytes));
     }
+    if (support_model_bytes != 0) {
+        fprintf(stderr,
+                " + DSpark support %.2f GiB",
+                ds4_bytes_to_gib(support_model_bytes));
+    }
     fprintf(stderr,
             " = %s%.2f GiB planned%s\n",
             bright_green,
@@ -38551,6 +38660,91 @@ static void ds4_engine_print_startup_memory(
             mem.comp_cap,
             ds4_backend_name(e->backend),
             reset);
+}
+
+static uint64_t ds4_engine_host_memory_bytes(void) {
+#if defined(__APPLE__)
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0) return 0;
+    return len == sizeof(bytes) ? bytes : 0;
+#else
+    return 0;
+#endif
+}
+
+/* This is a startup admission check for the one process being opened. It uses
+ * physical host capacity plus an explicit reserve; it deliberately makes no
+ * claim about unrelated processes, their allocations, or future VM pressure.
+ */
+static bool ds4_engine_dspark_ssd_admission_guard(
+        const ds4_engine *e,
+        int               requested_ctx_size) {
+    if (!e || !e->ssd_streaming ||
+        e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark) {
+        return true;
+    }
+    if (e->backend != DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4: SSD streaming + DSpark admission is Metal-only; refusing %s backend\n",
+                ds4_backend_name(e->backend));
+        return false;
+    }
+
+    const uint64_t capacity_bytes = ds4_engine_host_memory_bytes();
+    if (capacity_bytes == 0) {
+        fprintf(stderr,
+                "ds4: SSD streaming + DSpark cannot determine host capacity; "
+                "refusing persistent support registration\n");
+        return false;
+    }
+    const int ctx_size = requested_ctx_size > 0 ? requested_ctx_size :
+        (e->placement_ctx_hint > 0 ? e->placement_ctx_hint : 4096);
+    const ds4_context_memory context =
+        ds4_context_memory_estimate_with_prefill_mode(e->backend,
+                                                      ctx_size,
+                                                      e->prefill_chunk,
+                                                      true);
+    const uint64_t expert_cache_bytes = ds4_add_sat_u64(
+            ds4_engine_dynamic_expert_cache_bytes(e),
+            e->ssd_streaming_full_layer_bytes);
+    const ds4_ssd_admission_request request = {
+        .capacity_bytes = capacity_bytes,
+        .target_mapped_bytes = e->startup_model_span_bytes,
+        .support_bytes = ds4_engine_persistent_dspark_support_bytes(e),
+        .expert_cache_bytes = expert_cache_bytes,
+        .prefill_reserve_bytes = e->ssd_streaming_prefill_headroom_bytes,
+        .kv_bytes = ds4_add_sat_u64(context.raw_bytes, context.compressed_bytes),
+        .scratch_bytes = context.scratch_bytes,
+        .safety_headroom_bytes = 8ull * 1024ull * 1024ull * 1024ull,
+    };
+    ds4_ssd_admission_result plan;
+    if (!ds4_ssd_admission_plan(&request, &plan)) {
+        fprintf(stderr,
+                "ds4: SSD streaming + DSpark admission refused: required %.2f GiB "
+                "(target %.2f + support %.2f + expert cache %.2f + prefill reserve %.2f "
+                "+ KV %.2f + scratch %.2f + safety %.2f), host capacity %.2f GiB\n",
+                ds4_bytes_to_gib(plan.required_bytes),
+                ds4_bytes_to_gib(request.target_mapped_bytes),
+                ds4_bytes_to_gib(request.support_bytes),
+                ds4_bytes_to_gib(request.expert_cache_bytes),
+                ds4_bytes_to_gib(request.prefill_reserve_bytes),
+                ds4_bytes_to_gib(request.kv_bytes),
+                ds4_bytes_to_gib(request.scratch_bytes),
+                ds4_bytes_to_gib(request.safety_headroom_bytes),
+                ds4_bytes_to_gib(capacity_bytes));
+        if (plan.required_bytes == 0) {
+            fprintf(stderr,
+                    "ds4: SSD streaming + DSpark admission ledger overflowed; refusing startup\n");
+        }
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: SSD streaming + DSpark admission: %.2f / %.2f GiB "
+            "(host-capacity check only; not a cross-process safety guarantee)\n",
+            ds4_bytes_to_gib(plan.required_bytes),
+            ds4_bytes_to_gib(plan.budget_bytes));
+    return true;
 }
 
 static bool cpu_directional_steering_enabled(
@@ -41944,6 +42138,12 @@ static bool glm_graph_stream_map_decode_layer(
         uint32_t           il) {
     if (!g || !g->ssd_streaming) return true;
     g->streaming_static_decode_map_current = false;
+    /* The exact --quality kernels consume whole routed tensors.  The normal
+     * selected-expert cache deliberately omits those tensors from the decode
+     * map, so quality must use the bounded full-layer map instead. */
+    if (g->quality) {
+        return metal_graph_stream_map_layer(model, weights, il);
+    }
     if (glm_graph_env_present("DS4_ROCM_GLM_STREAMING_DECODE_FULL_LAYER_MAP",
                               "DS4_METAL_GLM_STREAMING_DECODE_FULL_LAYER_MAP") ||
         getenv("DS4_GLM_STREAMING_DECODE_FULL_LAYER_MAP") != NULL) {
@@ -51227,6 +51427,7 @@ static bool glm_graph_forward_token(
     double decode_flush_stage_t0 = decode_flush_profile ? now_sec() : 0.0;
 
     const bool static_decode_map =
+        !g->quality &&
         !input_hc &&
         g->has_token_embd &&
         g->ssd_streaming &&
@@ -60120,6 +60321,14 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 "ds4: SSD streaming auto cache could not measure non-routed model weights\n");
         return false;
     }
+    const uint64_t support_bytes =
+        ds4_engine_persistent_dspark_support_bytes(e);
+    if (non_routed_bytes > UINT64_MAX - support_bytes) {
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache overflow while reserving DSpark support\n");
+        return false;
+    }
+    const uint64_t fixed_model_bytes = non_routed_bytes + support_bytes;
 
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
@@ -60150,7 +60359,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     }
     ds4_ssd_cache_plan plan;
     if (!ds4_ssd_auto_cache_plan(recommended,
-                                 non_routed_bytes,
+                                 fixed_model_bytes,
                                  per_expert_bytes,
                                  max_model_experts,
                                  &plan)) {
@@ -60276,8 +60485,13 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 0.0,
             (double)plan.model_target_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   non-routed weights: %.2f GiB\n",
+            "ds4:   non-routed target weights: %.2f GiB\n",
             (double)non_routed_bytes / 1073741824.0);
+    if (support_bytes != 0) {
+        fprintf(stderr,
+                "ds4:   persistent DSpark support: %.2f GiB\n",
+                (double)support_bytes / 1073741824.0);
+    }
     fprintf(stderr,
             "ds4:   routed expert size: %.2f MiB\n",
             (double)per_expert_bytes / 1048576.0);
@@ -60309,9 +60523,9 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 e->placement_ctx_hint > 0 ? e->placement_ctx_hint : 4096);
     }
 #endif
-    if (plan.model_target_bytes <= non_routed_bytes) {
+    if (plan.model_target_bytes <= fixed_model_bytes) {
         fprintf(stderr,
-                "ds4:   note: non-routed weights already fill the 80%% target; keeping a one-expert cache\n");
+                "ds4:   note: target and persistent support already fill the 80%% target; keeping a one-expert cache\n");
     }
     return true;
 #endif
@@ -62466,6 +62680,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+    if (opt->ssd_streaming && opt->dspark &&
+        opt->backend != DS4_BACKEND_METAL) {
+        fprintf(stderr,
+                "ds4: SSD streaming + DSpark persistent support is Metal-only; "
+                "%s is unsupported\n",
+                ds4_backend_name(opt->backend));
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -62765,24 +62989,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
-        const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ds4_streaming_manual_cache_safe_bytes(e->backend,
-                                                  opt->context_size,
-                                                  e->prefill_chunk,
-                                                  e->ssd_streaming);
-        if (safe_cache_bytes != 0 &&
-            e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
-            fprintf(stderr,
-                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
-                    "to stay below the graph working-set pressure budget\n",
-                    ds4_backend_name(e->backend),
-                    (double)requested_cache_bytes / 1073741824.0,
-                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
-        }
-    }
     if (opt->inspect_only) {
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
@@ -62887,17 +63093,40 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
             support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
         if (!support_model_checkpoint_compatible(&e->mtp_model)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (!support_kind_allowed_for_startup(
+                    e->dspark, e->ssd_streaming, e->support_kind)) {
+        if (!support_kind_allowed_for_startup(
+                    e->dspark, e->ssd_streaming, e->support_kind)) {
+            if (e->dspark && e->support_kind != DS4_SUPPORT_DSPARK) {
+                fprintf(stderr,
+                        "ds4: explicit --dspark requires DSpark support content; "
+                        "detected %s and refusing legacy MTP substitution\n",
+                        support_kind_name(e->support_kind));
+            } else {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming support models require an enabled "
+                        "DSpark bundle; legacy or inactive --mtp is unsupported\n");
+            }
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming &&
+            e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+            e->backend != DS4_BACKEND_METAL) {
+            fprintf(stderr,
+                    "ds4: SSD streaming + DSpark persistent support is Metal-only; "
+                    "%s is unsupported\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -62934,6 +63163,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->dspark_weights.missing_tensors,
                     e->dspark_weights.invalid_tensors,
                     e->dspark_weights.metadata_errors);
+            if (e->dspark &&
+                !dspark_weights_ready_for_enabled_runtime(
+                        &e->dspark_weights)) {
+                fprintf(stderr,
+                        "ds4: explicit --dspark support is incomplete or invalid; "
+                        "refusing startup before support mapping "
+                        "(stages=%u block=%u tensors=%u missing=%u "
+                        "invalid=%u metadata_errors=%u)\n",
+                        e->dspark_weights.n_stages,
+                        e->dspark_weights.block_size,
+                        e->dspark_weights.present_tensors,
+                        e->dspark_weights.missing_tensors,
+                        e->dspark_weights.invalid_tensors,
+                        e->dspark_weights.metadata_errors);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
@@ -62949,6 +63196,26 @@ static int ds4_engine_open_internal(ds4_engine **out,
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+    }
+    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
+        const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
+        const uint64_t safe_cache_bytes =
+            ds4_streaming_manual_cache_safe_bytes(
+                    e->backend,
+                    opt->context_size,
+                    e->prefill_chunk,
+                    e->ssd_streaming,
+                    ds4_engine_persistent_dspark_support_bytes(e));
+        if (safe_cache_bytes != 0 &&
+            e->ssd_streaming_cache_bytes > safe_cache_bytes) {
+            e->ssd_streaming_cache_bytes = safe_cache_bytes;
+            fprintf(stderr,
+                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
+                    "after context and persistent-support reservations\n",
+                    ds4_backend_name(e->backend),
+                    (double)requested_cache_bytes / 1073741824.0,
+                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
         }
     }
 
@@ -63352,14 +63619,31 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->support_kind == DS4_SUPPORT_DSPARK &&
             ds4_gpu_dspark_gfx1151_fast_path() != 0;
 #endif
-        if (support_model_runtime_ready &&
-            !support_uses_secondary_rocm_cache &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
-        {
+        const bool persistent_streaming_dspark =
+            e->ssd_streaming &&
+            e->support_kind == DS4_SUPPORT_DSPARK &&
+            e->dspark;
+        if (persistent_streaming_dspark &&
+            !ds4_engine_dspark_ssd_admission_guard(e, opt->context_size)) {
+            free(load_offsets);
+            free(load_sizes);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        const bool support_map_ok =
+            !support_model_runtime_ready || support_uses_secondary_rocm_cache ? true :
+            persistent_streaming_dspark ?
+                ds4_gpu_register_persistent_support_map(
+                        e->mtp_model.map,
+                        e->mtp_model.size) != 0 :
+                ds4_gpu_set_model_map_range(
+                        e->mtp_model.map,
+                        e->mtp_model.size,
+                        e->mtp_model.tensor_data_pos,
+                        e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                        e->mtp_model.max_tensor_bytes) != 0;
+        if (!support_map_ok) {
             fprintf(stderr,
                     "ds4: %s failed to map support model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
@@ -64159,14 +64443,21 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
-    if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
-    model_close(&e->model);
 #ifndef DS4_NO_GPU
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+    /* The Metal DSpark support buffer wraps the support mmap with
+     * newBufferWithBytesNoCopy. Synchronize and release it before model_close
+     * can unmap those pages; releasing it from generic GPU cleanup afterwards
+     * is too late and risks a use-after-unmap in Metal. */
+    ds4_gpu_release_persistent_support_map();
+#endif
+    if (e->mtp_model.map) model_close(&e->mtp_model);
+    model_close(&e->model);
+#ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -65683,7 +65974,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
                 g->streaming_static_decode_map_current = false;
-                ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+                ok = g->quality ?
+                     metal_graph_stream_map_layer(&e->model, &e->weights, il) :
+                     metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
                 if (ok) {
                     ok = metal_graph_encode_decode_layer(g,

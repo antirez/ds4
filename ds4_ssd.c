@@ -134,6 +134,35 @@ bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
     return out->cache_experts != 0;
 }
 
+static bool ds4_ssd_add_checked(uint64_t *total, uint64_t add) {
+    if (!total || *total > UINT64_MAX - add) return false;
+    *total += add;
+    return true;
+}
+
+bool ds4_ssd_admission_plan(const ds4_ssd_admission_request *request,
+                            ds4_ssd_admission_result        *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!request || request->capacity_bytes == 0) return false;
+
+    uint64_t required = 0;
+    if (!ds4_ssd_add_checked(&required, request->target_mapped_bytes) ||
+        !ds4_ssd_add_checked(&required, request->support_bytes) ||
+        !ds4_ssd_add_checked(&required, request->expert_cache_bytes) ||
+        !ds4_ssd_add_checked(&required, request->prefill_reserve_bytes) ||
+        !ds4_ssd_add_checked(&required, request->kv_bytes) ||
+        !ds4_ssd_add_checked(&required, request->scratch_bytes) ||
+        !ds4_ssd_add_checked(&required, request->safety_headroom_bytes)) {
+        return false;
+    }
+
+    if (out) {
+        out->required_bytes = required;
+        out->budget_bytes = request->capacity_bytes;
+    }
+    return required <= request->capacity_bytes;
+}
+
 bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
                                  uint64_t             bytes) {
     if (!lock) return false;
