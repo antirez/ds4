@@ -2582,6 +2582,7 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
 #define DS4_SPEC_PREFIX_SLOTS 4
+#define DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS 64
 
 static bool ds4_dspark_rocm_gfx1151_fast_path(void) {
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
@@ -2610,6 +2611,7 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    bool target_layers_overflow;
 } ds4_dspark_summary;
 
 typedef enum {
@@ -2628,13 +2630,16 @@ static bool model_get_u32_any(const ds4_model *m, const char *const *keys,
 
 static bool model_get_u32_array_any(const ds4_model *m, const char *const *keys,
                                     size_t nkeys, uint32_t *out,
-                                    uint32_t cap, uint32_t *n_out) {
+                                    uint32_t cap, uint32_t *n_out,
+                                    bool *overflow_out) {
+    if (overflow_out) *overflow_out = false;
     for (size_t ik = 0; ik < nkeys; ik++) {
         ds4_array_ref arr = {0};
         if (!model_get_array(m, keys[ik], &arr)) continue;
         if (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32) continue;
 
         ds4_cursor c = cursor_at(m, arr.data_pos);
+        if (overflow_out && arr.len > cap) *overflow_out = true;
         uint32_t n = arr.len < cap ? (uint32_t)arr.len : cap;
         for (uint32_t i = 0; i < n; i++) {
             if (arr.type == GGUF_VALUE_UINT32) {
@@ -2712,7 +2717,8 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
                                 sizeof(target_keys) / sizeof(target_keys[0]),
                                 s.target_layers,
                                 DS4_DSPARK_MAX_TARGET_LAYERS,
-                                &s.target_layer_count)) {
+                                &s.target_layer_count,
+                                &s.target_layers_overflow)) {
         s.has_metadata = true;
         s.has_target_layers = true;
     }
@@ -2962,6 +2968,304 @@ static bool support_kind_allowed_for_startup(
     if (ssd_streaming &&
         (kind != DS4_SUPPORT_DSPARK || !dspark_requested)) return false;
     return true;
+}
+
+static bool dspark_distributed_role_allowed(
+        bool                 dspark_requested,
+        ds4_distributed_role role) {
+    return !dspark_requested || role == DS4_DISTRIBUTED_NONE;
+}
+
+static bool dspark_session_request_within_admitted_ceilings(
+        uint32_t active_sessions,
+        uint32_t session_limit,
+        int      requested_ctx_size,
+        int      admitted_ctx_size,
+        uint64_t context_scratch_bytes,
+        uint64_t admitted_context_scratch_bytes,
+        uint64_t graph_bytes,
+        uint64_t admitted_graph_bytes,
+        uint64_t speculative_bytes,
+        uint64_t admitted_speculative_bytes,
+        uint64_t workspace_bytes,
+        uint64_t admitted_workspace_bytes) {
+    return session_limit != 0 &&
+           active_sessions < session_limit &&
+           requested_ctx_size > 0 &&
+           admitted_ctx_size > 0 &&
+           requested_ctx_size <= admitted_ctx_size &&
+           context_scratch_bytes <= admitted_context_scratch_bytes &&
+           graph_bytes <= admitted_graph_bytes &&
+           speculative_bytes <= admitted_speculative_bytes &&
+           workspace_bytes <= admitted_workspace_bytes;
+}
+
+/* Engine teardown and session creation share this gate.  A creator takes the
+ * reservation before reading any engine-owned state; close first marks the
+ * engine closed to new reservations, then waits for every admitted creator to
+ * leave before it releases model, thread, or GPU state.  This is separate from
+ * the shared-prefill-workspace lifecycle: a session can otherwise reach engine
+ * state before it registers as that workspace's creator or borrower. */
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t  changed;
+    bool initialized;
+    bool closing;
+    uint32_t in_flight;
+} ds4_session_creation_state;
+
+static bool ds4_session_creation_state_init(
+        ds4_session_creation_state *state) {
+    if (!state) return false;
+    if (pthread_mutex_init(&state->mutex, NULL) != 0) return false;
+    if (pthread_cond_init(&state->changed, NULL) != 0) {
+        pthread_mutex_destroy(&state->mutex);
+        return false;
+    }
+    state->initialized = true;
+    return true;
+}
+
+static void ds4_session_creation_state_destroy(
+        ds4_session_creation_state *state) {
+    if (!state || !state->initialized) return;
+    pthread_cond_destroy(&state->changed);
+    pthread_mutex_destroy(&state->mutex);
+    memset(state, 0, sizeof(*state));
+}
+
+/* Reserve an in-flight create before the caller inspects e->backend, weights,
+ * transport, or any other engine-owned field. */
+static bool ds4_session_creation_begin(
+        ds4_session_creation_state *state) {
+    if (!state || !state->initialized ||
+        pthread_mutex_lock(&state->mutex) != 0) {
+        return false;
+    }
+    if (state->closing || state->in_flight == UINT32_MAX) {
+        pthread_mutex_unlock(&state->mutex);
+        return false;
+    }
+    state->in_flight++;
+    pthread_mutex_unlock(&state->mutex);
+    return true;
+}
+
+static void ds4_session_creation_end(
+        ds4_session_creation_state *state) {
+    if (!state || !state->initialized) return;
+    pthread_mutex_lock(&state->mutex);
+    if (state->in_flight != 0) state->in_flight--;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+/* Once this returns, no creation which acquired the gate can still touch
+ * engine state.  Keep closing set through destruction so later creation
+ * attempts fail closed rather than racing resource teardown. */
+static bool ds4_session_creation_begin_close(
+        ds4_session_creation_state *state) {
+    if (!state || !state->initialized ||
+        pthread_mutex_lock(&state->mutex) != 0) {
+        return false;
+    }
+    state->closing = true;
+    pthread_cond_broadcast(&state->changed);
+    while (state->in_flight != 0) {
+        if (pthread_cond_wait(&state->changed, &state->mutex) != 0) {
+            pthread_mutex_unlock(&state->mutex);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return true;
+}
+
+/* Admission helpers are defined with the Metal graph accounting later in this
+ * translation unit.  The CPU-only test hooks below deliberately use the same
+ * arithmetic rather than reimplementing a second oracle. */
+static bool ds4_admission_add_product(
+        uint64_t *total,
+        uint64_t  a,
+        uint64_t  b,
+        uint64_t  c,
+        uint64_t  d);
+static bool ds4_context_scratch_bytes_for_workspace(
+        const ds4_context_memory *context,
+        uint32_t                 workspace_prefill_cap,
+        uint64_t                 tiers,
+        uint64_t                *out);
+
+/* A shared prefill workspace is published only after its owner has completed
+ * allocation and transferred every tensor pointer. Creator state and lifetime
+ * borrows make concurrent session creation and engine teardown explicit. */
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t  changed;
+    bool initialized;
+    bool creating;
+    bool ready;
+    bool closing;
+    uint32_t prefill_cap;
+    uint32_t borrowers;
+} ds4_shared_prefill_workspace_state;
+
+static bool ds4_shared_prefill_workspace_state_init(
+        ds4_shared_prefill_workspace_state *state) {
+    if (!state) return false;
+    if (pthread_mutex_init(&state->mutex, NULL) != 0) return false;
+    if (pthread_cond_init(&state->changed, NULL) != 0) {
+        pthread_mutex_destroy(&state->mutex);
+        return false;
+    }
+    state->initialized = true;
+    return true;
+}
+
+static void ds4_shared_prefill_workspace_state_destroy(
+        ds4_shared_prefill_workspace_state *state) {
+    if (!state || !state->initialized) return;
+    pthread_cond_destroy(&state->changed);
+    pthread_mutex_destroy(&state->mutex);
+    memset(state, 0, sizeof(*state));
+}
+
+/* A session either becomes the one creator, or obtains a lifetime borrow of
+ * an already-published workspace. Creation intentionally runs outside the
+ * mutex: close() marks closing and waits for the creator rather than racing a
+ * large allocation or holding the lock across GPU work. */
+static bool ds4_shared_prefill_workspace_acquire(
+        ds4_shared_prefill_workspace_state *state,
+        bool                              *creator,
+        bool                              *ready,
+        uint32_t                          *prefill_cap) {
+    if (creator) *creator = false;
+    if (ready) *ready = false;
+    if (prefill_cap) *prefill_cap = 0;
+    if (!state || !state->initialized || !creator || !ready || !prefill_cap ||
+        pthread_mutex_lock(&state->mutex) != 0) {
+        return false;
+    }
+    while (state->creating && !state->closing) {
+        if (pthread_cond_wait(&state->changed, &state->mutex) != 0) {
+            pthread_mutex_unlock(&state->mutex);
+            return false;
+        }
+    }
+    if (state->closing) {
+        pthread_mutex_unlock(&state->mutex);
+        return false;
+    }
+    if (state->ready) {
+        state->borrowers++;
+        *ready = true;
+        *prefill_cap = state->prefill_cap;
+        pthread_mutex_unlock(&state->mutex);
+        return true;
+    }
+    state->creating = true;
+    *creator = true;
+    pthread_mutex_unlock(&state->mutex);
+    return true;
+}
+
+/* The creator must call this exactly once if allocation failed before it
+ * could publish. It wakes a waiter to retry ownership and makes close()
+ * observe that no provisional workspace exists. */
+static void ds4_shared_prefill_workspace_abort_create(
+        ds4_shared_prefill_workspace_state *state) {
+    if (!state || !state->initialized) return;
+    pthread_mutex_lock(&state->mutex);
+    state->creating = false;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+/* Locks the transition from a private creator graph to the engine-owned
+ * graph. The caller transfers pointers while this lock is held, then calls
+ * publish_locked(). That makes the pointers visible only after ownership and
+ * the first session's lifetime borrow are both established. */
+static bool ds4_shared_prefill_workspace_begin_publish(
+        ds4_shared_prefill_workspace_state *state) {
+    if (!state || !state->initialized ||
+        pthread_mutex_lock(&state->mutex) != 0) {
+        return false;
+    }
+    if (!state->creating || state->closing) {
+        state->creating = false;
+        pthread_cond_broadcast(&state->changed);
+        pthread_mutex_unlock(&state->mutex);
+        return false;
+    }
+    return true;
+}
+
+/* Requires the mutex retained by begin_publish(). */
+static void ds4_shared_prefill_workspace_publish_locked(
+        ds4_shared_prefill_workspace_state *state,
+        uint32_t                            prefill_cap) {
+    if (!state || !state->initialized) return;
+    state->prefill_cap = prefill_cap;
+    state->ready = true;
+    state->creating = false;
+    /* The publishing session aliases the transferred workspace too. */
+    state->borrowers++;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void ds4_shared_prefill_workspace_release_borrow(
+        ds4_shared_prefill_workspace_state *state) {
+    if (!state || !state->initialized) return;
+    pthread_mutex_lock(&state->mutex);
+    if (state->borrowers != 0) state->borrowers--;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+/* Sets closing and waits until the workspace has no creator and no session
+ * aliases. On success the caller owns the mutex and may safely free the
+ * engine-owned tensors before close_unlock(). */
+static bool ds4_shared_prefill_workspace_begin_close(
+        ds4_shared_prefill_workspace_state *state,
+        bool                              *ready) {
+    if (ready) *ready = false;
+    if (!state || !state->initialized || !ready ||
+        pthread_mutex_lock(&state->mutex) != 0) {
+        return false;
+    }
+    state->closing = true;
+    while (state->creating || state->borrowers != 0) {
+        if (pthread_cond_wait(&state->changed, &state->mutex) != 0) {
+            pthread_mutex_unlock(&state->mutex);
+            return false;
+        }
+    }
+    *ready = state->ready;
+    return true;
+}
+
+/* Requires the mutex retained by begin_close(). */
+static void ds4_shared_prefill_workspace_close_unlock(
+        ds4_shared_prefill_workspace_state *state) {
+    if (!state || !state->initialized) return;
+    state->ready = false;
+    state->prefill_cap = 0;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+/* Admission fixes the maximum context before sessions exist. Shared
+ * allocation uses that ceiling, while sessions retain their own context and
+ * KV capacities. */
+static int ds4_shared_prefill_workspace_context_size(
+        bool share_workspace,
+        int  requested_ctx_size,
+        int  configured_max_ctx_size) {
+    if (!share_workspace || configured_max_ctx_size <= requested_ctx_size) {
+        return requested_ctx_size;
+    }
+    return configured_max_ctx_size;
 }
 
 #ifndef DS4_NO_GPU
@@ -4343,6 +4647,7 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    bool target_layers_overflow;
     ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
 } ds4_dspark_weights;
 
@@ -5506,6 +5811,11 @@ static void dspark_weights_validate_metadata(ds4_dspark_weights *dw) {
         dspark_weights_note_metadata_error(dw, "missing target layer list");
         return;
     }
+    if (dw->target_layers_overflow) {
+        dspark_weights_note_metadata_error(
+                dw, "target layer list exceeds runtime limit");
+        return;
+    }
 
     uint32_t prev = UINT32_MAX;
     for (uint32_t i = 0; i < dw->target_layer_count; i++) {
@@ -5669,6 +5979,7 @@ static bool dspark_weights_ready_for_enabled_runtime(
         !dw->has_markov_rank || dw->markov_rank == 0 ||
         !dw->has_noise_token_id ||
         !dw->has_target_layers || dw->target_layer_count == 0 ||
+        dw->target_layers_overflow ||
         dw->target_layer_count > DS4_DSPARK_MAX_TARGET_LAYERS) {
         return false;
     }
@@ -5693,6 +6004,7 @@ int ds4_test_dspark_support_ready(
         .has_markov_rank = fixture->has_markov_rank,
         .has_noise_token_id = fixture->has_noise_token_id,
         .has_target_layers = fixture->has_target_layers,
+        .target_layers_overflow = fixture->target_layers_overflow,
     };
     return dspark_weights_ready_for_enabled_runtime(&dw) ? 1 : 0;
 }
@@ -5708,6 +6020,397 @@ int ds4_test_support_kind_allowed_for_startup(
             dspark_requested,
             ssd_streaming,
             (ds4_support_kind)support_kind) ? 1 : 0;
+}
+
+int ds4_test_dspark_distributed_role_allowed(
+        bool dspark_requested,
+        int  distributed_role) {
+    if (distributed_role < DS4_DISTRIBUTED_NONE ||
+        distributed_role > DS4_DISTRIBUTED_WORKER) {
+        return 0;
+    }
+    return dspark_distributed_role_allowed(
+            dspark_requested,
+            (ds4_distributed_role)distributed_role) ? 1 : 0;
+}
+
+int ds4_test_dspark_session_request_within_admitted_ceilings(
+        uint32_t active_sessions,
+        uint32_t session_limit,
+        int      requested_ctx_size,
+        int      admitted_ctx_size,
+        uint64_t context_scratch_bytes,
+        uint64_t admitted_context_scratch_bytes,
+        uint64_t graph_bytes,
+        uint64_t admitted_graph_bytes,
+        uint64_t speculative_bytes,
+        uint64_t admitted_speculative_bytes,
+        uint64_t workspace_bytes,
+        uint64_t admitted_workspace_bytes) {
+    return dspark_session_request_within_admitted_ceilings(
+            active_sessions,
+            session_limit,
+            requested_ctx_size,
+            admitted_ctx_size,
+            context_scratch_bytes,
+            admitted_context_scratch_bytes,
+            graph_bytes,
+            admitted_graph_bytes,
+            speculative_bytes,
+            admitted_speculative_bytes,
+            workspace_bytes,
+            admitted_workspace_bytes) ? 1 : 0;
+}
+
+typedef struct {
+    ds4_shared_prefill_workspace_state *state;
+    uint32_t prefill_cap;
+    unsigned int *owner_count;
+    unsigned int *ready_count;
+} ds4_test_shared_prefill_workspace_claim_args;
+
+static void *ds4_test_shared_prefill_workspace_claim_thread(void *arg) {
+    ds4_test_shared_prefill_workspace_claim_args *args = arg;
+    bool creator = false;
+    bool ready = false;
+    uint32_t prefill_cap = 0;
+    if (!ds4_shared_prefill_workspace_acquire(
+                args->state, &creator, &ready, &prefill_cap)) {
+        return (void *)1;
+    }
+    if (creator) {
+        __atomic_add_fetch(args->owner_count, 1u, __ATOMIC_RELAXED);
+        if (!ds4_shared_prefill_workspace_begin_publish(args->state)) {
+            ds4_shared_prefill_workspace_abort_create(args->state);
+            return (void *)1;
+        }
+        ds4_shared_prefill_workspace_publish_locked(
+                args->state, args->prefill_cap);
+        ds4_shared_prefill_workspace_release_borrow(args->state);
+    } else if (ready) {
+        __atomic_add_fetch(args->ready_count, 1u, __ATOMIC_RELAXED);
+        ds4_shared_prefill_workspace_release_borrow(args->state);
+    } else {
+        return (void *)1;
+    }
+    return NULL;
+}
+
+int ds4_test_shared_prefill_workspace_claims(
+        unsigned int contenders,
+        int          requested_ctx_size,
+        int          admitted_ctx_size,
+        unsigned int *owner_count_out,
+        unsigned int *ready_count_out,
+        unsigned int *published_prefill_cap_out) {
+    if (!owner_count_out || !ready_count_out || !published_prefill_cap_out ||
+        contenders == 0 || requested_ctx_size <= 0 || admitted_ctx_size <= 0) {
+        return 0;
+    }
+    *owner_count_out = 0;
+    *ready_count_out = 0;
+    *published_prefill_cap_out = 0;
+    ds4_shared_prefill_workspace_state state = {0};
+    if (!ds4_shared_prefill_workspace_state_init(&state)) return 0;
+    const int workspace_ctx_size = ds4_shared_prefill_workspace_context_size(
+            true, requested_ctx_size, admitted_ctx_size);
+    const uint32_t prefill_cap = (uint32_t)workspace_ctx_size;
+    pthread_t *threads = calloc(contenders, sizeof(*threads));
+    ds4_test_shared_prefill_workspace_claim_args *args = calloc(
+            contenders, sizeof(*args));
+    if (!threads || !args) {
+        free(threads);
+        free(args);
+        ds4_shared_prefill_workspace_state_destroy(&state);
+        return 0;
+    }
+    unsigned int started = 0;
+    for (; started < contenders; started++) {
+        args[started] = (ds4_test_shared_prefill_workspace_claim_args){
+            .state = &state,
+            .prefill_cap = prefill_cap,
+            .owner_count = owner_count_out,
+            .ready_count = ready_count_out,
+        };
+        if (pthread_create(&threads[started], NULL,
+                           ds4_test_shared_prefill_workspace_claim_thread,
+                           &args[started]) != 0) {
+            break;
+        }
+    }
+    int ok = started == contenders;
+    for (unsigned int i = 0; i < started; i++) {
+        void *result = NULL;
+        if (pthread_join(threads[i], &result) != 0 || result != NULL) ok = 0;
+    }
+    if (ok && state.ready) *published_prefill_cap_out = state.prefill_cap;
+    free(threads);
+    free(args);
+    ds4_shared_prefill_workspace_state_destroy(&state);
+    return ok ? 1 : 0;
+}
+
+int ds4_test_shared_prefill_workspace_abort_reopens(void) {
+    ds4_shared_prefill_workspace_state state = {0};
+    if (!ds4_shared_prefill_workspace_state_init(&state)) return 0;
+    bool creator = false;
+    bool ready = false;
+    uint32_t cap = 0;
+    int ok = ds4_shared_prefill_workspace_acquire(
+            &state, &creator, &ready, &cap) && creator && !ready;
+    if (ok) ds4_shared_prefill_workspace_abort_create(&state);
+    creator = false;
+    ready = false;
+    cap = 0;
+    if (ok) {
+        ok = ds4_shared_prefill_workspace_acquire(
+                &state, &creator, &ready, &cap) && creator && !ready;
+    }
+    if (ok) {
+        ok = ds4_shared_prefill_workspace_begin_publish(&state);
+        if (ok) {
+            ds4_shared_prefill_workspace_publish_locked(&state, 4096);
+            ds4_shared_prefill_workspace_release_borrow(&state);
+        }
+    }
+    bool close_ready = false;
+    if (ok) {
+        ok = ds4_shared_prefill_workspace_begin_close(&state, &close_ready) &&
+             close_ready;
+        if (ok) ds4_shared_prefill_workspace_close_unlock(&state);
+    }
+    ds4_shared_prefill_workspace_state_destroy(&state);
+    return ok ? 1 : 0;
+}
+
+int ds4_test_shared_prefill_workspace_context_size(
+        int requested_ctx_size,
+        int admitted_ctx_size) {
+    return ds4_shared_prefill_workspace_context_size(
+            true, requested_ctx_size, admitted_ctx_size);
+}
+
+typedef struct {
+    ds4_session_creation_state *state;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    bool creator_entered;
+    bool release_creator;
+    bool creator_finished;
+    bool close_finished;
+} ds4_test_session_creation_close_race_state;
+
+static void *ds4_test_session_creation_creator_thread(void *arg) {
+    ds4_test_session_creation_close_race_state *test = arg;
+    if (!ds4_session_creation_begin(test->state)) return (void *)1;
+    pthread_mutex_lock(&test->mutex);
+    test->creator_entered = true;
+    pthread_cond_broadcast(&test->changed);
+    while (!test->release_creator) {
+        if (pthread_cond_wait(&test->changed, &test->mutex) != 0) {
+            pthread_mutex_unlock(&test->mutex);
+            ds4_session_creation_end(test->state);
+            return (void *)1;
+        }
+    }
+    pthread_mutex_unlock(&test->mutex);
+    ds4_session_creation_end(test->state);
+    pthread_mutex_lock(&test->mutex);
+    test->creator_finished = true;
+    pthread_cond_broadcast(&test->changed);
+    pthread_mutex_unlock(&test->mutex);
+    return NULL;
+}
+
+static void *ds4_test_session_creation_close_thread(void *arg) {
+    ds4_test_session_creation_close_race_state *test = arg;
+    if (!ds4_session_creation_begin_close(test->state)) return (void *)1;
+    pthread_mutex_lock(&test->mutex);
+    test->close_finished = true;
+    pthread_cond_broadcast(&test->changed);
+    pthread_mutex_unlock(&test->mutex);
+    return NULL;
+}
+
+/* A scheduler-controlled race proof: a creation is parked after its
+ * reservation, close observes that reservation and rejects a later create,
+ * then can finish only after the original creator leaves.  No sleeps, model,
+ * GPU, or timing threshold participate in the assertion. */
+int ds4_test_session_creation_close_race(void) {
+    ds4_session_creation_state lifecycle = {0};
+    ds4_test_session_creation_close_race_state test = {
+        .state = &lifecycle,
+    };
+    if (!ds4_session_creation_state_init(&lifecycle) ||
+        pthread_mutex_init(&test.mutex, NULL) != 0) {
+        ds4_session_creation_state_destroy(&lifecycle);
+        return 0;
+    }
+    if (pthread_cond_init(&test.changed, NULL) != 0) {
+        pthread_mutex_destroy(&test.mutex);
+        ds4_session_creation_state_destroy(&lifecycle);
+        return 0;
+    }
+
+    pthread_t creator;
+    pthread_t closer;
+    bool creator_started = pthread_create(
+            &creator, NULL, ds4_test_session_creation_creator_thread, &test) == 0;
+    bool closer_started = false;
+    int ok = creator_started ? 1 : 0;
+    if (ok) {
+        pthread_mutex_lock(&test.mutex);
+        while (!test.creator_entered) {
+            if (pthread_cond_wait(&test.changed, &test.mutex) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&test.mutex);
+    }
+    if (ok) {
+        closer_started = pthread_create(
+                &closer, NULL, ds4_test_session_creation_close_thread, &test) == 0;
+        ok = closer_started ? 1 : 0;
+    }
+    if (ok) {
+        pthread_mutex_lock(&lifecycle.mutex);
+        while (!lifecycle.closing) {
+            if (pthread_cond_wait(&lifecycle.changed, &lifecycle.mutex) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&lifecycle.mutex);
+    }
+    if (ok) {
+        /* close has published its fence but the parked creator still owns the
+         * only reservation, so a later create must fail synchronously. */
+        ok = !ds4_session_creation_begin(&lifecycle);
+    }
+    if (ok) {
+        pthread_mutex_lock(&test.mutex);
+        ok = !test.close_finished;
+        test.release_creator = true;
+        pthread_cond_broadcast(&test.changed);
+        pthread_mutex_unlock(&test.mutex);
+    } else if (creator_started) {
+        pthread_mutex_lock(&test.mutex);
+        test.release_creator = true;
+        pthread_cond_broadcast(&test.changed);
+        pthread_mutex_unlock(&test.mutex);
+    }
+
+    void *creator_result = NULL;
+    void *closer_result = NULL;
+    if (creator_started && pthread_join(creator, &creator_result) != 0) ok = 0;
+    if (closer_started && pthread_join(closer, &closer_result) != 0) ok = 0;
+    pthread_mutex_lock(&test.mutex);
+    ok = ok && creator_result == NULL && closer_result == NULL &&
+         test.creator_finished && test.close_finished;
+    pthread_mutex_unlock(&test.mutex);
+
+    pthread_cond_destroy(&test.changed);
+    pthread_mutex_destroy(&test.mutex);
+    ds4_session_creation_state_destroy(&lifecycle);
+    return ok ? 1 : 0;
+}
+
+/* Synthetic dimensions exercise the same scratch helper used by admission.
+ * The allocated score/mask rows and selection rows use workspace_cap, whereas
+ * the F16 stage stays at requested_prefill_cap.  This is the smaller-context
+ * case which previously underpriced a max-context graph. */
+int ds4_test_dspark_small_context_admission_exact(void) {
+    const uint32_t comp_cap = 17;
+    const uint32_t requested_prefill_cap = 64;
+    const uint32_t workspace_prefill_cap = 256;
+    const uint64_t tiers = 3;
+    const uint64_t one_tier_stage_bytes = 96;
+    uint64_t one_tier_scores = 0;
+    if (!ds4_admission_add_product(&one_tier_scores,
+                                   2u,
+                                   comp_cap,
+                                   requested_prefill_cap,
+                                   sizeof(float))) {
+        return 0;
+    }
+    ds4_context_memory context = {
+        .prefill_cap = requested_prefill_cap,
+        .comp_cap = comp_cap,
+        .scratch_bytes = one_tier_scores + one_tier_stage_bytes,
+    };
+    uint64_t planned_scratch = 0;
+    if (!ds4_context_scratch_bytes_for_workspace(
+                &context,
+                workspace_prefill_cap,
+                tiers,
+                &planned_scratch)) {
+        return 0;
+    }
+    const uint64_t selected_dim =
+        DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u;
+    uint64_t planned_selection = 0;
+    uint64_t allocated_scratch = 0;
+    uint64_t allocated_selection = 0;
+    uint64_t legacy_scratch = 0;
+    uint64_t legacy_selection = 0;
+    if (!ds4_admission_add_product(&planned_selection,
+                                   selected_dim,
+                                   workspace_prefill_cap,
+                                   1u,
+                                   sizeof(uint32_t)) ||
+        !ds4_admission_add_product(&allocated_scratch,
+                                   tiers,
+                                   2ull * comp_cap,
+                                   workspace_prefill_cap,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&allocated_scratch,
+                                   tiers,
+                                   one_tier_stage_bytes,
+                                   1u,
+                                   1u) ||
+        !ds4_admission_add_product(&allocated_selection,
+                                   selected_dim,
+                                   workspace_prefill_cap,
+                                   1u,
+                                   sizeof(uint32_t)) ||
+        !ds4_admission_add_product(&legacy_scratch,
+                                   tiers,
+                                   2ull * comp_cap,
+                                   requested_prefill_cap,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&legacy_scratch,
+                                   tiers,
+                                   one_tier_stage_bytes,
+                                   1u,
+                                   1u) ||
+        !ds4_admission_add_product(&legacy_selection,
+                                   selected_dim,
+                                   requested_prefill_cap,
+                                   1u,
+                                   sizeof(uint32_t))) {
+        return 0;
+    }
+    const bool exact = planned_scratch == allocated_scratch &&
+                       planned_selection == allocated_selection;
+    const bool catches_old_undercount =
+        planned_scratch + planned_selection >
+            legacy_scratch + legacy_selection;
+    const bool admitted_exactly = dspark_session_request_within_admitted_ceilings(
+            0, 1, 1024, 4096,
+            planned_scratch, planned_scratch,
+            planned_selection, planned_selection,
+            0, 0,
+            0, 0);
+    const bool rejects_legacy_ceiling =
+        !dspark_session_request_within_admitted_ceilings(
+            0, 1, 1024, 4096,
+            planned_scratch, legacy_scratch,
+            planned_selection, legacy_selection,
+            0, 0,
+            0, 0);
+    return exact && catches_old_undercount && admitted_exactly &&
+           rejects_legacy_ceiling ? 1 : 0;
 }
 #endif
 
@@ -7540,6 +8243,7 @@ static void dspark_weights_bind_optional(
     dw->has_markov_rank = summary->has_markov_rank;
     dw->has_noise_token_id = summary->has_noise_token_id;
     dw->has_target_layers = summary->has_target_layers;
+    dw->target_layers_overflow = summary->target_layers_overflow;
     memcpy(dw->target_layers,
            summary->target_layers,
            (size_t)dw->target_layer_count * sizeof(dw->target_layers[0]));
@@ -15866,6 +16570,8 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * retain F32 staging, and the kernels receive the storage format explicitly. */
 #define DS4_GPU_GLM_COMPACT_CACHE_F16 1
 
+static bool ds4_admission_add_u64(uint64_t *total, uint64_t bytes);
+
 /* =========================================================================
  * Metal Release Graph State.
  * =========================================================================
@@ -15874,8 +16580,6 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * decode and another for batched prefill.  The structure is DS4-specific:
  * tensor names follow the model stages rather than generic graph nodes.
  */
-
-enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
 typedef struct {
     /* Class P — per-tier replicated kernel scratch buffers.
@@ -16052,6 +16756,7 @@ typedef struct {
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
+    uint32_t prefill_workspace_cap;
     uint32_t raw_window;
     uint32_t batch_token_offset;
 
@@ -16611,6 +17316,7 @@ static void metal_graph_transfer_prefill_workspace(
         ds4_gpu_graph *src) {
     memset(dst, 0, sizeof(*dst));
     dst->prefill_cap = src->prefill_cap;
+    dst->prefill_workspace_cap = src->prefill_workspace_cap;
     dst->emb_tier = src->emb_tier;
     dst->owns_prefill_workspace = true;
     metal_graph_copy_prefill_workspace_pointers(dst, src);
@@ -16628,6 +17334,177 @@ static uint64_t metal_graph_prefill_workspace_bytes(const ds4_gpu_graph *g) {
     total += ds4_gpu_tensor_bytes(g->batch_q_half);
     total += ds4_gpu_tensor_bytes(g->prefill_seed_router_selected);
     return total;
+}
+
+/* Sum the exact tensors whose size is predicted by
+ * ds4_engine_dspark_session_speculative_bytes. This runs after allocation so
+ * a future allocator change cannot silently escape startup admission. */
+static bool metal_graph_dspark_speculative_bytes(
+        const ds4_gpu_graph *g,
+        uint64_t            *out) {
+    if (out) *out = 0;
+    if (!g || !out) return false;
+
+    uint64_t bytes = 0;
+#define DS4_ADD_SPEC_TENSOR(tensor)                                      \
+    do {                                                                 \
+        if (!ds4_admission_add_u64(&bytes,                               \
+                                   ds4_gpu_tensor_bytes((tensor)))) {    \
+            return false;                                                \
+        }                                                                \
+    } while (0)
+
+    DS4_ADD_SPEC_TENSOR(g->mtp_embed);
+    DS4_ADD_SPEC_TENSOR(g->mtp_enorm);
+    DS4_ADD_SPEC_TENSOR(g->mtp_eproj);
+    DS4_ADD_SPEC_TENSOR(g->mtp_eproj_hc);
+    DS4_ADD_SPEC_TENSOR(g->mtp_hnorm_hc);
+    DS4_ADD_SPEC_TENSOR(g->mtp_hproj_hc);
+    DS4_ADD_SPEC_TENSOR(g->mtp_input_hc);
+    DS4_ADD_SPEC_TENSOR(g->mtp_state_hc);
+    DS4_ADD_SPEC_TENSOR(g->mtp_next_hc);
+    DS4_ADD_SPEC_TENSOR(g->mtp_raw_cache);
+    DS4_ADD_SPEC_TENSOR(g->spec_logits);
+    for (uint32_t layer = 0; layer < DS4_N_LAYER; layer++) {
+        DS4_ADD_SPEC_TENSOR(g->spec_attn_state_kv[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_attn_state_score[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_index_state_kv[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_index_state_score[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_prefix1_attn_state_kv[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_prefix1_attn_state_score[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_prefix1_index_state_kv[layer]);
+        DS4_ADD_SPEC_TENSOR(g->spec_prefix1_index_state_score[layer]);
+    }
+    DS4_ADD_SPEC_TENSOR(g->dspark_hc_mean_weights);
+    DS4_ADD_SPEC_TENSOR(g->dspark_hc_mean_rows);
+    DS4_ADD_SPEC_TENSOR(g->dspark_target_hidden);
+    DS4_ADD_SPEC_TENSOR(g->dspark_target_hidden_batch);
+    DS4_ADD_SPEC_TENSOR(g->dspark_stage0_packed);
+    DS4_ADD_SPEC_TENSOR(g->dspark_stage0_proj);
+    DS4_ADD_SPEC_TENSOR(g->dspark_main_x);
+    DS4_ADD_SPEC_TENSOR(g->dspark_draft_tokens);
+    DS4_ADD_SPEC_TENSOR(g->dspark_draft_hc);
+    DS4_ADD_SPEC_TENSOR(g->dspark_target_hc);
+    DS4_ADD_SPEC_TENSOR(g->dspark_stage_input_hc);
+    DS4_ADD_SPEC_TENSOR(g->dspark_stage_output_hc);
+    DS4_ADD_SPEC_TENSOR(g->dspark_position_ids);
+    for (uint32_t stage = 0; stage < DS4_DSPARK_MAX_STAGES; stage++) {
+        DS4_ADD_SPEC_TENSOR(g->dspark_raw_cache[stage]);
+    }
+
+#undef DS4_ADD_SPEC_TENSOR
+    *out = bytes;
+    return true;
+}
+
+/* Sum the ordinary persistent graph tensors which are not represented by the
+ * KV, speculative, host, or prefill-workspace admission categories. The
+ * predictor reserves a possible lazy ffn_out buffer; therefore the runtime
+ * check below is a coverage check (allocated <= planned), not byte equality. */
+/* These persistent tensors are accounted under session_context_scratch_bytes.
+ * They are intentionally separate from the shared prefill workspace because
+ * each session owns its score/mask rows even when it aliases batch buffers. */
+static bool metal_graph_context_scratch_bytes(
+        const ds4_gpu_graph *g,
+        uint64_t            *out) {
+    if (out) *out = 0;
+    if (!g || !out) return false;
+
+    uint64_t bytes = 0;
+#define DS4_ADD_CONTEXT_SCRATCH(tensor)                                 \
+    do {                                                                 \
+        if (!ds4_admission_add_u64(&bytes,                               \
+                                   ds4_gpu_tensor_bytes((tensor)))) {    \
+            return false;                                                \
+        }                                                                \
+    } while (0)
+
+    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+        DS4_ADD_CONTEXT_SCRATCH(g->indexer_scores_by_tier[tier]);
+        DS4_ADD_CONTEXT_SCRATCH(g->comp_mask_by_tier[tier]);
+        DS4_ADD_CONTEXT_SCRATCH(g->attn_comp_stage_by_tier[tier]);
+    }
+
+#undef DS4_ADD_CONTEXT_SCRATCH
+    *out = bytes;
+    return true;
+}
+
+static bool metal_graph_ordinary_session_bytes(
+        const ds4_gpu_graph *g,
+        uint64_t            *out) {
+    if (out) *out = 0;
+    if (!g || !out) return false;
+
+    uint64_t bytes = 0;
+#define DS4_ADD_ORDINARY_TENSOR(tensor)                                  \
+    do {                                                                  \
+        if (!ds4_admission_add_u64(&bytes,                                \
+                                   ds4_gpu_tensor_bytes((tensor)))) {     \
+            return false;                                                 \
+        }                                                                 \
+    } while (0)
+
+    for (uint32_t layer = 0; layer < DS4_N_LAYER; layer++) {
+        DS4_ADD_ORDINARY_TENSOR(g->layer_attn_state_kv[layer]);
+        DS4_ADD_ORDINARY_TENSOR(g->layer_attn_state_score[layer]);
+        DS4_ADD_ORDINARY_TENSOR(g->layer_index_state_kv[layer]);
+        DS4_ADD_ORDINARY_TENSOR(g->layer_index_state_score[layer]);
+    }
+    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+        DS4_ADD_ORDINARY_TENSOR(g->cur_hc_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->flat_hc_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->hc_mix_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->hc_split_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->attn_cur_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->attn_norm_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->qr_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->qr_norm_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->q_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->kv_raw_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->kv_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->comp_kv_cur_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->comp_sc_cur_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->index_comp_kv_cur_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->index_comp_sc_cur_by_tier[tier]);
+        /* indexer_scores, comp_mask, and attn_comp_stage already live in
+         * session_context_scratch_bytes, so intentionally exclude them. */
+        DS4_ADD_ORDINARY_TENSOR(g->indexer_q_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->indexer_weights_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->comp_selected_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->heads_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->attn_low_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->attn_out_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->after_attn_hc_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->ffn_cur_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->ffn_norm_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->shared_gate_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->shared_up_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->shared_mid_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->shared_out_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->router_logits_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->router_probs_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->router_selected_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->router_weights_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->routed_gate_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->routed_up_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->routed_mid_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->routed_down_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->routed_out_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->ffn_out_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->after_ffn_hc_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->tp_peer_tmp_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->directional_steering_dirs_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->output_pre_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->output_weights_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->output_embd_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->output_norm_by_tier[tier]);
+        DS4_ADD_ORDINARY_TENSOR(g->logits_by_tier[tier]);
+    }
+
+#undef DS4_ADD_ORDINARY_TENSOR
+    *out = bytes;
+    return true;
 }
 
 static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
@@ -17274,8 +18151,10 @@ static bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
 static bool metal_graph_ensure_batch_ffn_out_on(ds4_gpu_graph *g, int t) {
     if (t < 0 || t >= DS4_MAX_GPUS) return false;
     if (!g->batch_ffn_out_by_tier[t]) {
+        const uint32_t cap = g->prefill_workspace_cap != 0 ?
+            g->prefill_workspace_cap : g->prefill_cap;
         g->batch_ffn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                t, (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+                t, (uint64_t)cap * DS4_N_EMBD * sizeof(float));
     }
     return g->batch_ffn_out_by_tier[t] != NULL;
 }
@@ -17782,6 +18661,7 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
+        uint32_t                prefill_workspace_cap,
         bool                    enable_mtp,
         const int              *placement,
         bool                    cuda_tensor_parallel,
@@ -17867,6 +18747,8 @@ static bool metal_graph_alloc_raw_cap(
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
+    if (prefill_workspace_cap == 0) prefill_workspace_cap = prefill_cap;
+    if (prefill_workspace_cap < prefill_cap) return false;
     uint32_t raw_window = DS4_N_SWA;
     if (raw_window > ctx_size) raw_window = ctx_size;
     if (raw_window == 0) raw_window = 1;
@@ -17876,6 +18758,7 @@ static bool metal_graph_alloc_raw_cap(
     g->raw_cap = raw_cap;
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
+    g->prefill_workspace_cap = prefill_workspace_cap;
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!weights_layer_has_required(&weights->layer[il], il)) continue;
@@ -17920,7 +18803,7 @@ static bool metal_graph_alloc_raw_cap(
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
     const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
-    const uint64_t pc = prefill_cap;
+    const uint64_t pc = prefill_workspace_cap;
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
@@ -18252,13 +19135,14 @@ static bool metal_graph_alloc_raw_cap(
      * and included in the CUDA scratch estimate because TP prefill can use it
      * as the combined routed+shared FFN buffer. */
     if (shared_prefill_workspace) {
-        if (shared_prefill_workspace->prefill_cap < prefill_cap ||
+        if (shared_prefill_workspace->prefill_workspace_cap <
+                prefill_workspace_cap ||
             shared_prefill_workspace->emb_tier != g->emb_tier) {
             fprintf(stderr,
                     "ds4: shared prefill workspace is incompatible "
                     "(capacity %u/%u, embedding tier %d/%d)\n",
-                    shared_prefill_workspace->prefill_cap,
-                    prefill_cap,
+                    shared_prefill_workspace->prefill_workspace_cap,
+                    prefill_workspace_cap,
                     shared_prefill_workspace->emb_tier,
                     g->emb_tier);
         } else {
@@ -18428,7 +19312,7 @@ static bool metal_graph_alloc(
     /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
     return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
-                                     1, false, NULL, false, NULL);
+                                     1, 1, false, NULL, false, NULL);
 }
 
 static bool metal_graph_install_model_spans(
@@ -38091,7 +38975,8 @@ static int metal_graph_prompt_logits_test(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        (uint32_t)n_test, false, NULL, false, NULL);
+                                        (uint32_t)n_test, (uint32_t)n_test,
+                                        false, NULL, false, NULL);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -38460,6 +39345,16 @@ struct ds4_engine {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
+    uint64_t admitted_session_context_scratch_bytes;
+    uint64_t admitted_session_graph_bytes;
+    uint64_t admitted_session_speculative_bytes;
+    uint64_t admitted_prefill_workspace_bytes;
+    ds4_ssd_admission_request admitted_request;
+    ds4_ssd_admission_result admitted_plan;
+    uint32_t admitted_session_limit;
+    uint32_t active_admitted_sessions;
+    int admitted_context_size;
+    bool dspark_ssd_admission_active;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
     bool glm_mtp;
@@ -38480,9 +39375,10 @@ struct ds4_engine {
     bool mtp_ready;
     bool vision_ready;
     bool vision_map_ready;
+    ds4_session_creation_state session_creation_state;
     bool share_session_prefill_workspace;
+    ds4_shared_prefill_workspace_state shared_prefill_workspace_state;
 #ifndef DS4_NO_GPU
-    bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
 #endif
 
@@ -38555,7 +39451,42 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
 static void ds4_engine_print_startup_memory(
         const ds4_engine *e,
         int               ctx_size) {
-    if (!e || ctx_size <= 0) return;
+    if (!e) return;
+
+    if (e->dspark_ssd_admission_active) {
+        const ds4_ssd_admission_request *request = &e->admitted_request;
+        const ds4_ssd_admission_result *plan = &e->admitted_plan;
+        fprintf(stderr,
+                "ds4: memory: complete admitted SSD+DSpark ledger %.2f / %.2f GiB "
+                "(prelocked %.2f + target %.2f + support %.2f + expert cache %.2f "
+                "+ prefill reserve %.2f + %u-session KV %.2f "
+                "+ context scratch %.2f + ordinary graph %.2f "
+                "+ speculative state %.2f "
+                "+ host buffers %.2f + session prefill workspace %.2f "
+                "+ shared prefill workspace %.2f + safety %.2f; "
+                "max context %d)\n",
+                ds4_bytes_to_gib(plan->required_bytes),
+                ds4_bytes_to_gib(plan->budget_bytes),
+                ds4_bytes_to_gib(request->prelocked_bytes),
+                ds4_bytes_to_gib(request->target_mapped_bytes),
+                ds4_bytes_to_gib(request->support_bytes),
+                ds4_bytes_to_gib(request->expert_cache_bytes),
+                ds4_bytes_to_gib(request->prefill_reserve_bytes),
+                request->session_count,
+                ds4_bytes_to_gib(plan->total_session_kv_bytes),
+                ds4_bytes_to_gib(
+                    plan->total_session_context_scratch_bytes),
+                ds4_bytes_to_gib(plan->total_session_graph_bytes),
+                ds4_bytes_to_gib(plan->total_session_speculative_bytes),
+                ds4_bytes_to_gib(plan->total_session_host_bytes),
+                ds4_bytes_to_gib(
+                    plan->total_session_prefill_workspace_bytes),
+                ds4_bytes_to_gib(plan->shared_prefill_workspace_bytes),
+                ds4_bytes_to_gib(request->safety_headroom_bytes),
+                e->admitted_context_size);
+        return;
+    }
+    if (ctx_size <= 0) return;
 
     ds4_context_memory mem;
 #ifndef DS4_NO_GPU
@@ -38673,13 +39604,588 @@ static uint64_t ds4_engine_host_memory_bytes(void) {
 #endif
 }
 
+static bool ds4_admission_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || (a != 0 && b > UINT64_MAX / a)) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool ds4_admission_add_u64(uint64_t *total, uint64_t bytes) {
+    if (!total || *total > UINT64_MAX - bytes) return false;
+    *total += bytes;
+    return true;
+}
+
+static bool ds4_admission_add_product(
+        uint64_t *total,
+        uint64_t  a,
+        uint64_t  b,
+        uint64_t  c,
+        uint64_t  d) {
+    uint64_t ab = 0;
+    uint64_t abc = 0;
+    uint64_t bytes = 0;
+    return ds4_admission_mul_u64(a, b, &ab) &&
+           ds4_admission_mul_u64(ab, c, &abc) &&
+           ds4_admission_mul_u64(abc, d, &bytes) &&
+           ds4_admission_add_u64(total, bytes);
+}
+
+static uint32_t ds4_engine_metal_used_tier_count(const ds4_engine *e) {
+    bool used[DS4_MAX_GPUS] = {0};
+    used[0] = true;
+    if (e && e->multi_tier) {
+        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER + 2u; i++) {
+            const int tier = e->placement[i];
+            if (tier >= 0 && tier < DS4_MAX_GPUS) used[tier] = true;
+        }
+    }
+    uint32_t count = 0;
+    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+        if (used[tier]) count++;
+    }
+    return count;
+}
+
+/* indexer_scores and comp_mask are persistent per-session tensors, but their
+ * row dimension follows the graph's prefill-workspace capacity.  A smaller
+ * requested context therefore cannot price them at its own prefill cap when a
+ * session allocates a larger shared/max-context workspace.  The context
+ * estimator supplies one-tier score/mask plus F16 staging; expand that exact
+ * base to every real allocation tier without recharging it elsewhere. */
+static bool ds4_context_scratch_bytes_for_workspace(
+        const ds4_context_memory *context,
+        uint32_t                 workspace_prefill_cap,
+        uint64_t                 tiers,
+        uint64_t                *out) {
+    if (out) *out = 0;
+    if (!context || !out || tiers == 0 || context->prefill_cap == 0 ||
+        workspace_prefill_cap < context->prefill_cap) {
+        return false;
+    }
+    uint64_t one_tier_scores = 0;
+    if (!ds4_admission_add_product(&one_tier_scores,
+                                   2u,
+                                   context->comp_cap,
+                                   context->prefill_cap,
+                                   sizeof(float)) ||
+        context->scratch_bytes < one_tier_scores) {
+        return false;
+    }
+    const uint64_t one_tier_stage =
+        context->scratch_bytes - one_tier_scores;
+    uint64_t bytes = 0;
+    if (!ds4_admission_add_product(&bytes,
+                                   tiers,
+                                   2ull * context->comp_cap,
+                                   workspace_prefill_cap,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes,
+                                   tiers,
+                                   one_tier_stage,
+                                   1u,
+                                   1u)) {
+        return false;
+    }
+    *out = bytes;
+    return true;
+}
+
+static bool ds4_engine_dspark_session_context_scratch_bytes(
+        const ds4_engine         *e,
+        const ds4_context_memory *context,
+        uint32_t                 workspace_prefill_cap,
+        uint64_t                *out) {
+    return e && ds4_context_scratch_bytes_for_workspace(
+            context,
+            workspace_prefill_cap,
+            ds4_engine_metal_used_tier_count(e),
+            out);
+}
+
+/* Mirrors the DS4_GPU_PREFILL_WORKSPACE_FIELDS allocation in
+ * metal_graph_alloc_raw_cap. These are the only graph tensors transferred to
+ * e->shared_prefill_workspace; batch_q_half and the prefill routing seed move
+ * with them and are counted explicitly. */
+static bool ds4_engine_prefill_workspace_bytes(
+        const ds4_engine        *e,
+        const ds4_context_memory *context,
+        uint64_t                *out) {
+    if (out) *out = 0;
+    if (!e || !context || !out || context->prefill_cap == 0) return false;
+
+    const uint64_t tiers = ds4_engine_metal_used_tier_count(e);
+    const uint64_t rows = context->prefill_cap;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t low_dim =
+        (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t group_dim =
+        (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
+    const uint64_t comp_width =
+        2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+            ? DS4_N_HEAD_DIM : DS4_N_INDEXER_HEAD_DIM);
+    const uint64_t indexer_q_dim =
+        (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+
+    uint64_t bytes = 0;
+    /* prefill_tokens_by_tier is allocated once on the embedding tier. */
+    if (!ds4_admission_add_product(&bytes, 1, rows, 1, sizeof(int32_t)) ||
+        /* batch_cur/next/flat_hc and batch_after_attn_hc */
+        !ds4_admission_add_product(&bytes, tiers, rows, 4u * hc_dim,
+                                   sizeof(float)) ||
+        /* batch_hc_mix and batch_hc_split */
+        !ds4_admission_add_product(&bytes, tiers, rows, 2u * mix_hc,
+                                   sizeof(float)) ||
+        /* Eight batch hidden-width buffers, including batch_ffn_out. */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   8u * DS4_N_EMBD, sizeof(float)) ||
+        /* batch_qr and batch_qr_norm */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   2u * DS4_N_LORA_Q, sizeof(float)) ||
+        /* batch_q and batch_heads */
+        !ds4_admission_add_product(&bytes, tiers, rows, 2u * q_dim,
+                                   sizeof(float)) ||
+        /* batch_kv_raw and batch_kv */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   2u * DS4_N_HEAD_DIM, sizeof(float)) ||
+        /* batch_comp_kv and batch_comp_sc */
+        !ds4_admission_add_product(&bytes, tiers, rows, 2u * comp_width,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows, indexer_q_dim,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   DS4_N_INDEXER_HEAD, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows, low_dim,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows, group_dim,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows, DS4_N_LORA_O,
+                                   sizeof(float)) ||
+        /* batch_shared_gate/up/mid */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   3u * DS4_N_FF_EXP, sizeof(float)) ||
+        /* batch_router_logits and batch_router_probs */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   2u * DS4_N_EXPERT, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   DS4_N_EXPERT_USED, sizeof(int)) ||
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   DS4_N_EXPERT_USED, sizeof(float)) ||
+        /* batch_routed_gate/up/mid */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   3ull * DS4_N_EXPERT_USED * DS4_N_FF_EXP,
+                                   sizeof(float)) ||
+        /* batch_routed_down */
+        !ds4_admission_add_product(&bytes, tiers, rows,
+                                   (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD,
+                                   sizeof(float))) {
+        return false;
+    }
+#if defined(__APPLE__)
+    if (!ds4_admission_add_product(&bytes, 1, rows, q_dim,
+                                   sizeof(uint16_t))) {
+        return false;
+    }
+#endif
+    if (!ds4_admission_add_product(
+                &bytes,
+                DS4_N_LAYER,
+                DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS,
+                DS4_N_EXPERT_USED,
+                sizeof(int32_t))) {
+        return false;
+    }
+    *out = bytes;
+    return true;
+}
+
+/* Account for the ordinary per-session graph tensors allocated by
+ * metal_graph_alloc_raw_cap. KV caches, compressor score/mask and F16
+ * staging scratch, DSpark speculation, host buffers, and the batched
+ * prefill workspace are deliberately excluded because the admission ledger
+ * already reserves each in a separate category. Reserve ffn_out even when it
+ * is still lazy so a later debug or steering path cannot exceed admission. */
+static bool ds4_engine_dspark_session_ordinary_graph_bytes(
+        const ds4_engine         *e,
+        const ds4_context_memory *context,
+        uint32_t                 workspace_prefill_cap,
+        uint64_t                 *out) {
+    if (out) *out = 0;
+    if (!e || !context || !out || e->cuda_tensor_parallel ||
+        workspace_prefill_cap < context->prefill_cap) {
+        return false;
+    }
+
+    const ds4_layer_weights *shape_layer =
+        weights_first_bound_layer(&e->weights);
+    if (!shape_layer || !shape_layer->attn_q_a ||
+        !shape_layer->ffn_gate_shexp || !shape_layer->ffn_gate_exps) {
+        return false;
+    }
+
+    const uint64_t tiers = ds4_engine_metal_used_tier_count(e);
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t mix_hc =
+        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    const uint64_t q_rank = shape_layer->attn_q_a->dim[1];
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t low_dim =
+        (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t shared_dim = shape_layer->ffn_gate_shexp->dim[1];
+    const uint64_t routed_mid_dim = shape_layer->ffn_gate_exps->dim[1];
+    const uint64_t vocab_dim =
+        e->weights.output ? e->weights.output->dim[1] : DS4_N_VOCAB;
+    const uint64_t comp_width =
+        2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
+            ? DS4_N_HEAD_DIM : DS4_N_INDEXER_HEAD_DIM);
+    const uint64_t indexer_q_dim =
+        (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t selected_dim =
+        DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u;
+    uint64_t bytes = 0;
+
+    /* Fixed decode Class P scratch, including a conservative ffn_out slot. */
+    if (!ds4_admission_add_product(&bytes, tiers, 2u * hc_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 2u * mix_hc, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 4u * DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 2u * q_rank, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, q_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 2u * DS4_N_HEAD_DIM, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 2u * comp_width, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers,
+                                   4u * DS4_N_INDEXER_HEAD_DIM, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, indexer_q_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, DS4_N_INDEXER_HEAD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, selected_dim,
+                                   workspace_prefill_cap, sizeof(uint32_t)) ||
+        !ds4_admission_add_product(&bytes, tiers, q_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, low_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, hc_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 2u * DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 3u * shared_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, 2u * DS4_N_EXPERT, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, DS4_N_EXPERT_USED, 1,
+                                   sizeof(int)) ||
+        !ds4_admission_add_product(&bytes, tiers, DS4_N_EXPERT_USED, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers,
+                                   3ull * DS4_N_EXPERT_USED * routed_mid_dim,
+                                   1, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers,
+                                   (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD,
+                                   1, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, tiers, hc_dim, 1,
+                                   sizeof(float))) {
+        return false;
+    }
+
+    /* Class H output scratch is allocated once on the head tier. */
+    if (!ds4_admission_add_product(&bytes, 2u * hc_dim, 1, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, 2u * DS4_N_EMBD, 1, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, vocab_dim, 1, 1,
+                                   sizeof(float))) {
+        return false;
+    }
+
+    /* Live compressor frontier state is independent of KV-cache storage. */
+    for (uint32_t layer = 0; layer < DS4_N_LAYER; layer++) {
+        if (!weights_layer_has_required(&e->weights.layer[layer], layer)) {
+            continue;
+        }
+        const uint32_t ratio = ds4_layer_compress_ratio(layer);
+        if (ratio == 0) continue;
+        const uint64_t coff = ratio == 4 ? 2u : 1u;
+        if (!ds4_admission_add_product(&bytes, 2u,
+                                       coff * DS4_N_HEAD_DIM,
+                                       coff * ratio, sizeof(float))) {
+            return false;
+        }
+        if (ratio == 4 &&
+            !ds4_admission_add_product(&bytes, 2u,
+                                        coff * DS4_N_INDEXER_HEAD_DIM,
+                                        coff * ratio, sizeof(float))) {
+            return false;
+        }
+    }
+
+    if (e->directional_steering_attn_scale != 0.0f ||
+        e->directional_steering_ffn_scale != 0.0f) {
+        if (!ds4_admission_add_product(&bytes, tiers, DS4_N_LAYER,
+                                       DS4_N_EMBD, sizeof(float))) {
+            return false;
+        }
+    }
+
+    *out = bytes;
+    return true;
+}
+
+/* The verifier and DSpark target-capture graph are instantiated separately in
+ * every session. Keep this formula aligned with metal_graph_alloc_raw_cap and
+ * metal_graph_configure_dspark_capture. */
+static bool ds4_engine_dspark_session_speculative_bytes(
+        const ds4_engine         *e,
+        const ds4_context_memory *context,
+        uint64_t                 *out) {
+    if (out) *out = 0;
+    if (!e || !context || !out) return false;
+
+    const ds4_dspark_weights *dw = &e->dspark_weights;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    uint64_t bytes = 0;
+
+    /* Speculative verifier: mtp_embed/enorm/eproj, six HC buffers,
+     * mtp_raw_cache, spec_logits, and all rollback/prefix frontiers. */
+    if (!ds4_admission_add_product(&bytes, 3, DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, 6, hc_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, context->raw_cap,
+                                   DS4_N_HEAD_DIM, 1, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, DS4_DSPARK_MAX_BLOCK_SIZE,
+                                   DS4_N_VOCAB, 1, sizeof(float))) {
+        return false;
+    }
+    for (uint32_t layer = 0; layer < DS4_N_LAYER; layer++) {
+        if (!weights_layer_has_required(&e->weights.layer[layer], layer)) {
+            continue;
+        }
+        const uint32_t ratio = ds4_layer_compress_ratio(layer);
+        if (ratio == 0) continue;
+        const uint64_t coff = ratio == 4 ? 2u : 1u;
+        /* spec_attn_state_{kv,score} plus four prefix slots for each. */
+        if (!ds4_admission_add_product(
+                    &bytes,
+                    2u + 2u * DS4_SPEC_PREFIX_SLOTS,
+                    coff * DS4_N_HEAD_DIM,
+                    coff * ratio,
+                    sizeof(float))) {
+            return false;
+        }
+        if (ratio == 4 &&
+            !ds4_admission_add_product(
+                    &bytes,
+                    2u + 2u * DS4_SPEC_PREFIX_SLOTS,
+                    coff * DS4_N_INDEXER_HEAD_DIM,
+                    coff * ratio,
+                    sizeof(float))) {
+            return false;
+        }
+    }
+
+    /* DSpark capture/proposal tensors: hc_mean_weights/rows,
+     * target_hidden[/batch], stage0_packed/proj, main_x, draft tokens/HC,
+     * target/stage HC, positions, and one support raw cache per stage. */
+    if (!ds4_admission_add_product(&bytes, DS4_N_HC, 1, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, context->prefill_cap,
+                                   DS4_N_HC, 1, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, dw->target_layer_count,
+                                   DS4_N_EMBD, 1, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, dw->target_layer_count,
+                                   context->prefill_cap, DS4_N_EMBD,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, (uint64_t)dw->block_size + 1u,
+                                   dw->target_layer_count, DS4_N_EMBD,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, 2, DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, dw->block_size, 1, 1,
+                                   sizeof(int32_t)) ||
+        !ds4_admission_add_product(&bytes, dw->block_size, hc_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, 1, hc_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, (uint64_t)dw->block_size + 1u,
+                                   hc_dim, 1, sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, dw->block_size, hc_dim, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, (uint64_t)dw->block_size + 1u,
+                                   1, 1, sizeof(int32_t)) ||
+        !ds4_admission_add_product(&bytes, dw->n_stages,
+                                   context->raw_cap, DS4_N_HEAD_DIM,
+                                   sizeof(float))) {
+        return false;
+    }
+
+    *out = bytes;
+    return true;
+}
+
+static bool ds4_engine_dspark_session_admission_claim(
+        ds4_engine *e,
+        int         ctx_size,
+        bool       *claimed,
+        uint64_t   *expected_context_scratch_bytes,
+        uint64_t   *expected_graph_bytes,
+        uint64_t   *expected_speculative_bytes,
+        uint64_t   *expected_workspace_bytes) {
+    if (claimed) *claimed = false;
+    if (expected_context_scratch_bytes) *expected_context_scratch_bytes = 0;
+    if (expected_graph_bytes) *expected_graph_bytes = 0;
+    if (expected_speculative_bytes) *expected_speculative_bytes = 0;
+    if (expected_workspace_bytes) *expected_workspace_bytes = 0;
+    if (!e || !claimed || !expected_context_scratch_bytes ||
+        !expected_graph_bytes || !expected_speculative_bytes ||
+        !expected_workspace_bytes) {
+        return false;
+    }
+    if (!e->dspark_ssd_admission_active) return true;
+
+    if (ctx_size <= 0 || ctx_size > e->admitted_context_size) {
+        fprintf(stderr,
+                "ds4: session context %d exceeds admitted SSD+DSpark maximum %d; refusing session\n",
+                ctx_size,
+                e->admitted_context_size);
+        return false;
+    }
+
+    const ds4_context_memory context =
+        ds4_context_memory_estimate_with_prefill_mode(e->backend,
+                                                      ctx_size,
+                                                      e->prefill_chunk,
+                                                      true);
+    const int workspace_ctx_size =
+        ds4_shared_prefill_workspace_context_size(
+                e->share_session_prefill_workspace,
+                ctx_size,
+                e->admitted_context_size);
+    const ds4_context_memory workspace_context =
+        ds4_context_memory_estimate_with_prefill_mode(e->backend,
+                                                      workspace_ctx_size,
+                                                      e->prefill_chunk,
+                                                      true);
+    uint64_t context_scratch_bytes = 0;
+    uint64_t graph_bytes = 0;
+    uint64_t speculative_bytes = 0;
+    uint64_t workspace_bytes = 0;
+    if (!ds4_engine_dspark_session_context_scratch_bytes(
+                e,
+                &context,
+                workspace_context.prefill_cap,
+                &context_scratch_bytes) ||
+        !ds4_engine_dspark_session_ordinary_graph_bytes(
+                e,
+                &context,
+                workspace_context.prefill_cap,
+                &graph_bytes) ||
+        !ds4_engine_dspark_session_speculative_bytes(
+                e, &context, &speculative_bytes) ||
+        !ds4_engine_prefill_workspace_bytes(
+                e, &workspace_context, &workspace_bytes)) {
+        fprintf(stderr,
+                "ds4: session SSD+DSpark ceiling calculation overflowed; refusing session\n");
+        return false;
+    }
+
+    uint32_t active = __atomic_load_n(&e->active_admitted_sessions,
+                                      __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (!dspark_session_request_within_admitted_ceilings(
+                    active,
+                    e->admitted_session_limit,
+                    ctx_size,
+                    e->admitted_context_size,
+                    context_scratch_bytes,
+                    e->admitted_session_context_scratch_bytes,
+                    graph_bytes,
+                    e->admitted_session_graph_bytes,
+                    speculative_bytes,
+                    e->admitted_session_speculative_bytes,
+                    workspace_bytes,
+                    e->admitted_prefill_workspace_bytes)) {
+            fprintf(stderr,
+                    "ds4: session exceeds admitted SSD+DSpark ceilings "
+                    "(active %u/%u, context %d/%d, scratch %.2f/%.2f GiB, "
+                    "graph %.2f/%.2f GiB, "
+                    "speculative %.2f/%.2f GiB, "
+                    "prefill workspace %.2f/%.2f GiB); refusing session\n",
+                    active,
+                    e->admitted_session_limit,
+                    ctx_size,
+                    e->admitted_context_size,
+                    ds4_bytes_to_gib(context_scratch_bytes),
+                    ds4_bytes_to_gib(
+                        e->admitted_session_context_scratch_bytes),
+                    ds4_bytes_to_gib(graph_bytes),
+                    ds4_bytes_to_gib(e->admitted_session_graph_bytes),
+                    ds4_bytes_to_gib(speculative_bytes),
+                    ds4_bytes_to_gib(
+                        e->admitted_session_speculative_bytes),
+                    ds4_bytes_to_gib(workspace_bytes),
+                    ds4_bytes_to_gib(e->admitted_prefill_workspace_bytes));
+            return false;
+        }
+        const uint32_t next = active + 1u;
+        if (__atomic_compare_exchange_n(&e->active_admitted_sessions,
+                                        &active,
+                                        next,
+                                        false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            *claimed = true;
+            *expected_context_scratch_bytes = context_scratch_bytes;
+            *expected_graph_bytes = graph_bytes;
+            *expected_speculative_bytes = speculative_bytes;
+            *expected_workspace_bytes = workspace_bytes;
+            return true;
+        }
+    }
+}
+
+static void ds4_engine_dspark_session_admission_release(ds4_engine *e) {
+    if (!e || !e->dspark_ssd_admission_active) return;
+    uint32_t active = __atomic_load_n(&e->active_admitted_sessions,
+                                      __ATOMIC_ACQUIRE);
+    while (active != 0) {
+        const uint32_t next = active - 1u;
+        if (__atomic_compare_exchange_n(&e->active_admitted_sessions,
+                                        &active,
+                                        next,
+                                        false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            return;
+        }
+    }
+}
+
+static bool ds4_engine_dspark_session_host_bytes(
+        const ds4_engine *e,
+        uint64_t         *out);
+
 /* This is a startup admission check for the one process being opened. It uses
  * physical host capacity plus an explicit reserve; it deliberately makes no
  * claim about unrelated processes, their allocations, or future VM pressure.
  */
 static bool ds4_engine_dspark_ssd_admission_guard(
-        const ds4_engine *e,
-        int               requested_ctx_size) {
+        ds4_engine *e,
+        int         requested_ctx_size) {
     if (!e || !e->ssd_streaming ||
         e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark) {
         return true;
@@ -38705,32 +40211,90 @@ static bool ds4_engine_dspark_ssd_admission_guard(
                                                       ctx_size,
                                                       e->prefill_chunk,
                                                       true);
-    const uint64_t expert_cache_bytes = ds4_add_sat_u64(
-            ds4_engine_dynamic_expert_cache_bytes(e),
-            e->ssd_streaming_full_layer_bytes);
+    const uint32_t session_count = e->placement_session_count_hint > 1
+        ? (uint32_t)e->placement_session_count_hint : 1u;
+    uint64_t expert_cache_bytes =
+        ds4_engine_dynamic_expert_cache_bytes(e);
+    uint64_t session_kv_bytes = context.raw_bytes;
+    uint64_t session_context_scratch_bytes = 0;
+    uint64_t session_graph_bytes = 0;
+    uint64_t session_speculative_bytes = 0;
+    uint64_t session_host_bytes = 0;
+    uint64_t prefill_workspace_bytes = 0;
+    if (!ds4_admission_add_u64(&expert_cache_bytes,
+                               e->ssd_streaming_full_layer_bytes) ||
+        !ds4_admission_add_u64(&session_kv_bytes,
+                               context.compressed_bytes) ||
+        !ds4_engine_dspark_session_context_scratch_bytes(
+                e,
+                &context,
+                context.prefill_cap,
+                &session_context_scratch_bytes) ||
+        !ds4_engine_dspark_session_ordinary_graph_bytes(
+                e,
+                &context,
+                context.prefill_cap,
+                &session_graph_bytes) ||
+        !ds4_engine_dspark_session_speculative_bytes(
+                e, &context, &session_speculative_bytes) ||
+        !ds4_engine_dspark_session_host_bytes(e, &session_host_bytes) ||
+        !ds4_engine_prefill_workspace_bytes(
+                e, &context, &prefill_workspace_bytes)) {
+        fprintf(stderr,
+                "ds4: SSD streaming + DSpark admission category "
+                "calculation overflowed; refusing startup\n");
+        return false;
+    }
+    const uint64_t session_prefill_workspace_bytes =
+        e->share_session_prefill_workspace ? 0 : prefill_workspace_bytes;
+    const uint64_t shared_prefill_workspace_bytes =
+        e->share_session_prefill_workspace ? prefill_workspace_bytes : 0;
     const ds4_ssd_admission_request request = {
         .capacity_bytes = capacity_bytes,
+        .prelocked_bytes = e->simulated_memory.bytes,
         .target_mapped_bytes = e->startup_model_span_bytes,
         .support_bytes = ds4_engine_persistent_dspark_support_bytes(e),
         .expert_cache_bytes = expert_cache_bytes,
         .prefill_reserve_bytes = e->ssd_streaming_prefill_headroom_bytes,
-        .kv_bytes = ds4_add_sat_u64(context.raw_bytes, context.compressed_bytes),
-        .scratch_bytes = context.scratch_bytes,
+        .session_kv_bytes = session_kv_bytes,
+        .session_context_scratch_bytes = session_context_scratch_bytes,
+        .session_graph_bytes = session_graph_bytes,
+        .session_speculative_bytes = session_speculative_bytes,
+        .session_host_bytes = session_host_bytes,
+        .session_prefill_workspace_bytes =
+            session_prefill_workspace_bytes,
+        .shared_prefill_workspace_bytes = shared_prefill_workspace_bytes,
         .safety_headroom_bytes = 8ull * 1024ull * 1024ull * 1024ull,
+        .session_count = session_count,
     };
     ds4_ssd_admission_result plan;
     if (!ds4_ssd_admission_plan(&request, &plan)) {
         fprintf(stderr,
                 "ds4: SSD streaming + DSpark admission refused: required %.2f GiB "
-                "(target %.2f + support %.2f + expert cache %.2f + prefill reserve %.2f "
-                "+ KV %.2f + scratch %.2f + safety %.2f), host capacity %.2f GiB\n",
+                "(prelocked %.2f + target %.2f + support %.2f + expert cache %.2f "
+                "+ prefill reserve %.2f + %u-session KV %.2f "
+                "+ context scratch %.2f + ordinary graph %.2f "
+                "+ speculative state %.2f "
+                "+ host buffers %.2f + session prefill workspace %.2f "
+                "+ shared prefill workspace %.2f + safety %.2f), "
+                "host capacity %.2f GiB\n",
                 ds4_bytes_to_gib(plan.required_bytes),
+                ds4_bytes_to_gib(request.prelocked_bytes),
                 ds4_bytes_to_gib(request.target_mapped_bytes),
                 ds4_bytes_to_gib(request.support_bytes),
                 ds4_bytes_to_gib(request.expert_cache_bytes),
                 ds4_bytes_to_gib(request.prefill_reserve_bytes),
-                ds4_bytes_to_gib(request.kv_bytes),
-                ds4_bytes_to_gib(request.scratch_bytes),
+                session_count,
+                ds4_bytes_to_gib(plan.total_session_kv_bytes),
+                ds4_bytes_to_gib(
+                    plan.total_session_context_scratch_bytes),
+                ds4_bytes_to_gib(plan.total_session_graph_bytes),
+                ds4_bytes_to_gib(plan.total_session_speculative_bytes),
+                ds4_bytes_to_gib(plan.total_session_host_bytes),
+                ds4_bytes_to_gib(
+                    plan.total_session_prefill_workspace_bytes),
+                ds4_bytes_to_gib(
+                    request.shared_prefill_workspace_bytes),
                 ds4_bytes_to_gib(request.safety_headroom_bytes),
                 ds4_bytes_to_gib(capacity_bytes));
         if (plan.required_bytes == 0) {
@@ -38739,11 +40303,31 @@ static bool ds4_engine_dspark_ssd_admission_guard(
         }
         return false;
     }
+    e->admitted_session_context_scratch_bytes = session_context_scratch_bytes;
+    e->admitted_session_graph_bytes = session_graph_bytes;
+    e->admitted_session_speculative_bytes = session_speculative_bytes;
+    e->admitted_prefill_workspace_bytes = prefill_workspace_bytes;
+    e->admitted_request = request;
+    e->admitted_plan = plan;
+    e->admitted_session_limit = session_count;
+    e->admitted_context_size = ctx_size;
+    e->dspark_ssd_admission_active = true;
     fprintf(stderr,
             "ds4: SSD streaming + DSpark admission: %.2f / %.2f GiB "
-            "(host-capacity check only; not a cross-process safety guarantee)\n",
+            "(%u sessions: KV %.2f, context scratch %.2f, ordinary graph %.2f, "
+            "speculative state %.2f, "
+            "host buffers %.2f, session prefill workspace %.2f; "
+            "shared prefill workspace %.2f; host-capacity check only)\n",
             ds4_bytes_to_gib(plan.required_bytes),
-            ds4_bytes_to_gib(plan.budget_bytes));
+            ds4_bytes_to_gib(plan.budget_bytes),
+            session_count,
+            ds4_bytes_to_gib(plan.total_session_kv_bytes),
+            ds4_bytes_to_gib(plan.total_session_context_scratch_bytes),
+            ds4_bytes_to_gib(plan.total_session_graph_bytes),
+            ds4_bytes_to_gib(plan.total_session_speculative_bytes),
+            ds4_bytes_to_gib(plan.total_session_host_bytes),
+            ds4_bytes_to_gib(plan.total_session_prefill_workspace_bytes),
+            ds4_bytes_to_gib(request.shared_prefill_workspace_bytes));
     return true;
 }
 
@@ -53233,7 +54817,8 @@ static int generate_metal_graph_raw_swa(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, prefill_cap,
+                                        false, NULL, false, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -54117,7 +55702,42 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    bool admission_slot_held;
+    /* Keeps the engine-owned shared prefill tensors alive until this session
+     * has released every aliased graph pointer. */
+    bool shared_prefill_workspace_borrowed;
+    uint64_t admission_expected_context_scratch_bytes;
+    uint64_t admission_expected_graph_bytes;
+    uint64_t admission_expected_speculative_bytes;
+    uint64_t admission_expected_workspace_bytes;
 };
+
+/* Fixed host allocations made by ds4_session_create for the DSpark path:
+ * the session object (including inline draft/frontier metadata), target
+ * logits, sampling probabilities, one verifier row, Markov bias, confidence
+ * features, and the graph's CPU router-normalization row. */
+static bool ds4_engine_dspark_session_host_bytes(
+        const ds4_engine *e,
+        uint64_t         *out) {
+    if (out) *out = 0;
+    if (!e || !out) return false;
+
+    uint64_t bytes = sizeof(ds4_session);
+    if (!ds4_admission_add_product(&bytes, 4, DS4_N_VOCAB, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(&bytes, 1, DS4_N_EMBD, 1,
+                                   sizeof(float)) ||
+        !ds4_admission_add_product(
+                &bytes,
+                (uint64_t)DS4_N_EMBD + e->dspark_weights.markov_rank,
+                1,
+                1,
+                sizeof(float))) {
+        return false;
+    }
+    *out = bytes;
+    return true;
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -57491,7 +59111,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, prefill_cap,
+                                        false, NULL, false, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -62680,6 +64301,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+    if (!dspark_distributed_role_allowed(opt->dspark,
+                                         opt->distributed.role)) {
+        fprintf(stderr,
+                "ds4: explicit --dspark is not supported with distributed execution\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if (opt->ssd_streaming && opt->dspark &&
         opt->backend != DS4_BACKEND_METAL) {
         fprintf(stderr,
@@ -62707,6 +64336,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    if (e->share_session_prefill_workspace &&
+        !ds4_shared_prefill_workspace_state_init(
+                &e->shared_prefill_workspace_state)) {
+        fprintf(stderr, "ds4: failed to initialize shared prefill workspace lock\n");
+        free(e->directional_steering_file);
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+    if (!ds4_session_creation_state_init(&e->session_creation_state)) {
+        fprintf(stderr, "ds4: failed to initialize session creation lifecycle gate\n");
+        ds4_shared_prefill_workspace_state_destroy(
+                &e->shared_prefill_workspace_state);
+        free(e->directional_steering_file);
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -64418,6 +66065,33 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->session_creation_state.initialized &&
+        !ds4_session_creation_begin_close(&e->session_creation_state)) {
+        fprintf(stderr,
+                "ds4: failed to synchronize in-flight session creation during teardown\n");
+        return;
+    }
+#ifndef DS4_NO_GPU
+    /* The engine-wide creation gate covers work before a creator/borrower
+     * registers with this state.  Drain the workspace state next, before any
+     * engine-owned teardown can invalidate the resources a registered session
+     * still aliases. */
+    if (e->shared_prefill_workspace_state.initialized) {
+        bool shared_workspace_ready = false;
+        if (!ds4_shared_prefill_workspace_begin_close(
+                    &e->shared_prefill_workspace_state,
+                    &shared_workspace_ready)) {
+            fprintf(stderr,
+                    "ds4: failed to synchronize shared prefill workspace teardown\n");
+            return;
+        }
+        if (shared_workspace_ready) {
+            metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
+        }
+        ds4_shared_prefill_workspace_close_unlock(
+                &e->shared_prefill_workspace_state);
+    }
+#endif
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
@@ -64445,10 +66119,6 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->vision_model.map) model_close(&e->vision_model);
 #ifndef DS4_NO_GPU
-    if (e->shared_prefill_workspace_ready) {
-        metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
-        e->shared_prefill_workspace_ready = false;
-    }
     /* The Metal DSpark support buffer wraps the support mmap with
      * newBufferWithBytesNoCopy. Synchronize and release it before model_close
      * can unmap those pages; releasing it from generic GPU cleanup afterwards
@@ -64464,6 +66134,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
+    ds4_shared_prefill_workspace_state_destroy(
+            &e->shared_prefill_workspace_state);
+    ds4_session_creation_state_destroy(&e->session_creation_state);
     free(e);
 }
 
@@ -64599,7 +66272,28 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
-int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+static void ds4_session_release_admission_slot(ds4_session *s) {
+    if (!s || !s->admission_slot_held) return;
+#ifndef DS4_NO_GPU
+    ds4_engine_dspark_session_admission_release(s->engine);
+#endif
+    s->admission_slot_held = false;
+}
+
+static void ds4_session_release_shared_prefill_workspace(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (!s || !s->shared_prefill_workspace_borrowed || !s->engine) return;
+    ds4_shared_prefill_workspace_release_borrow(
+            &s->engine->shared_prefill_workspace_state);
+    s->shared_prefill_workspace_borrowed = false;
+#else
+    (void)s;
+#endif
+}
+
+static int ds4_session_create_impl(ds4_session **out,
+                                   ds4_engine  *e,
+                                   int          ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -64752,8 +66446,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
+    const int configured_shared_workspace_ctx_size =
+        e->dspark_ssd_admission_active ? e->admitted_context_size :
+                                         e->placement_ctx_hint;
+    const int shared_workspace_ctx_size =
+        ds4_shared_prefill_workspace_context_size(
+                e->share_session_prefill_workspace,
+                ctx_size,
+                configured_shared_workspace_ctx_size);
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
+    const uint32_t workspace_prefill_cap =
+        metal_graph_prefill_cap_for_prompt(shared_workspace_ctx_size,
+                                           e->prefill_chunk);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
@@ -64766,24 +66471,74 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) ||
         e->tp.active; /* TP worker mirrors the leader's verify blocks */
     const int *placement = e->multi_tier ? e->placement : NULL;
+    if (!ds4_engine_dspark_session_admission_claim(
+                e,
+                ctx_size,
+                &s->admission_slot_held,
+                &s->admission_expected_context_scratch_bytes,
+                &s->admission_expected_graph_bytes,
+                &s->admission_expected_speculative_bytes,
+                &s->admission_expected_workspace_bytes)) {
+        free(s);
+        return 1;
+    }
+    bool shared_workspace_creator = false;
+    bool shared_workspace_ready = false;
+    uint32_t shared_workspace_cap = 0;
+    if (e->share_session_prefill_workspace) {
+        if (!ds4_shared_prefill_workspace_acquire(
+                    &e->shared_prefill_workspace_state,
+                    &shared_workspace_creator,
+                    &shared_workspace_ready,
+                    &shared_workspace_cap)) {
+            fprintf(stderr, "ds4: failed to acquire shared prefill workspace\n");
+            ds4_session_release_admission_slot(s);
+            free(s);
+            return 1;
+        }
+        if (shared_workspace_ready) {
+            s->shared_prefill_workspace_borrowed = true;
+        }
+        if (shared_workspace_ready &&
+            shared_workspace_cap < workspace_prefill_cap) {
+            fprintf(stderr,
+                    "ds4: shared prefill workspace capacity %u is below "
+                    "the configured session requirement %u; refusing session\n",
+                    shared_workspace_cap,
+                    workspace_prefill_cap);
+            ds4_session_release_shared_prefill_workspace(s);
+            ds4_session_release_admission_slot(s);
+            free(s);
+            return 1;
+        }
+    }
     const ds4_gpu_graph *shared_prefill_workspace =
-        e->share_session_prefill_workspace &&
-        e->shared_prefill_workspace_ready
+        e->share_session_prefill_workspace && shared_workspace_ready
             ? &e->shared_prefill_workspace
             : NULL;
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
+                                   workspace_prefill_cap,
                                    need_spec_verifier,
                                    placement,
                                    e->cuda_tensor_parallel,
                                    shared_prefill_workspace))
     {
+        if (shared_workspace_creator) {
+            ds4_shared_prefill_workspace_abort_create(
+                    &e->shared_prefill_workspace_state);
+        }
+        ds4_session_release_shared_prefill_workspace(s);
+        ds4_session_release_admission_slot(s);
         free(s);
         return 1;
     }
-    if (e->share_session_prefill_workspace &&
-        !e->shared_prefill_workspace_ready) {
+    const bool prepare_owned_prefill_workspace =
+        (e->share_session_prefill_workspace && shared_workspace_creator) ||
+        (e->dspark_ssd_admission_active &&
+         !e->share_session_prefill_workspace);
+    if (prepare_owned_prefill_workspace) {
         bool workspace_ok = true;
         for (int t = 0; workspace_ok && t < DS4_MAX_GPUS; t++) {
             if (!s->graph.batch_cur_hc_by_tier[t]) continue;
@@ -64791,22 +66546,61 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         if (!workspace_ok) {
             fprintf(stderr,
-                    "ds4: failed to complete shared prefill workspace allocation\n");
+                    "ds4: failed to complete prefill workspace allocation\n");
             metal_graph_free(&s->graph);
+            if (shared_workspace_creator) {
+                ds4_shared_prefill_workspace_abort_create(
+                        &e->shared_prefill_workspace_state);
+            }
+            ds4_session_release_shared_prefill_workspace(s);
+            ds4_session_release_admission_slot(s);
             free(s);
             return 1;
         }
         const uint64_t workspace_bytes =
             metal_graph_prefill_workspace_bytes(&s->graph);
-        metal_graph_transfer_prefill_workspace(
-                &e->shared_prefill_workspace, &s->graph);
-        e->shared_prefill_workspace_ready = true;
-        fprintf(stderr,
-                "ds4: shared session prefill workspace enabled: "
-                "cap=%u, %.2f GiB total GPU memory; each additional "
-                "session aliases this allocation\n",
-                e->shared_prefill_workspace.prefill_cap,
-                (double)workspace_bytes / 1073741824.0);
+        if (e->dspark_ssd_admission_active &&
+            workspace_bytes != s->admission_expected_workspace_bytes) {
+            fprintf(stderr,
+                    "ds4: %s prefill workspace admission drift: "
+                    "planned %.2f GiB, allocated %.2f GiB; refusing session\n",
+                    e->share_session_prefill_workspace ? "shared" :
+                                                         "per-session",
+                    ds4_bytes_to_gib(
+                        s->admission_expected_workspace_bytes),
+                    ds4_bytes_to_gib(workspace_bytes));
+            metal_graph_free(&s->graph);
+            if (shared_workspace_creator) {
+                ds4_shared_prefill_workspace_abort_create(
+                        &e->shared_prefill_workspace_state);
+            }
+            ds4_session_release_shared_prefill_workspace(s);
+            ds4_session_release_admission_slot(s);
+            free(s);
+            return 1;
+        }
+        if (e->share_session_prefill_workspace) {
+            if (!ds4_shared_prefill_workspace_begin_publish(
+                        &e->shared_prefill_workspace_state)) {
+                fprintf(stderr,
+                        "ds4: shared prefill workspace closed during creation\n");
+                metal_graph_free(&s->graph);
+                ds4_session_release_admission_slot(s);
+                free(s);
+                return 1;
+            }
+            metal_graph_transfer_prefill_workspace(
+                    &e->shared_prefill_workspace, &s->graph);
+            fprintf(stderr,
+                    "ds4: shared session prefill workspace enabled: "
+                    "cap=%u, %.2f GiB total GPU memory; each additional "
+                    "session aliases this allocation\n",
+                    e->shared_prefill_workspace.prefill_workspace_cap,
+                    (double)workspace_bytes / 1073741824.0);
+            ds4_shared_prefill_workspace_publish_locked(
+                    &e->shared_prefill_workspace_state, workspace_prefill_cap);
+            s->shared_prefill_workspace_borrowed = true;
+        }
     }
     s->graph.quality = e->quality;
     s->graph.ssd_streaming = e->ssd_streaming;
@@ -64832,6 +66626,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 half * sizeof(float));
         if (!s->graph.tp_logits_half) {
             metal_graph_free(&s->graph);
+            ds4_session_release_shared_prefill_workspace(s);
+            ds4_session_release_admission_slot(s);
             free(s);
             return 1;
         }
@@ -64842,6 +66638,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
         metal_graph_free(&s->graph);
+        ds4_session_release_shared_prefill_workspace(s);
+        ds4_session_release_admission_slot(s);
         free(s);
         return 1;
     }
@@ -64850,6 +66648,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                   &e->dspark_weights)) {
             fprintf(stderr, "ds4: failed to configure DSpark target-hidden capture\n");
             metal_graph_free(&s->graph);
+            ds4_session_release_shared_prefill_workspace(s);
+            ds4_session_release_admission_slot(s);
             free(s);
             return 1;
         }
@@ -64862,6 +66662,60 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         s->graph.dspark_target_layers[i]);
             }
             fprintf(stderr, "\n");
+        }
+        if (e->ssd_streaming && e->dspark) {
+            uint64_t allocated_context_scratch_bytes = 0;
+            uint64_t allocated_graph_bytes = 0;
+            uint64_t allocated_speculative_bytes = 0;
+            if (!metal_graph_context_scratch_bytes(
+                        &s->graph, &allocated_context_scratch_bytes) ||
+                allocated_context_scratch_bytes !=
+                    s->admission_expected_context_scratch_bytes) {
+                fprintf(stderr,
+                        "ds4: per-session context scratch admission drift: "
+                        "planned %.2f GiB, allocated %.2f GiB; "
+                        "refusing session\n",
+                        ds4_bytes_to_gib(
+                            s->admission_expected_context_scratch_bytes),
+                        ds4_bytes_to_gib(allocated_context_scratch_bytes));
+                metal_graph_free(&s->graph);
+                ds4_session_release_shared_prefill_workspace(s);
+                ds4_session_release_admission_slot(s);
+                free(s);
+                return 1;
+            }
+            if (!metal_graph_ordinary_session_bytes(
+                        &s->graph, &allocated_graph_bytes) ||
+                allocated_graph_bytes > s->admission_expected_graph_bytes) {
+                fprintf(stderr,
+                        "ds4: per-session ordinary graph admission drift: "
+                        "planned %.2f GiB, allocated %.2f GiB; "
+                        "refusing session\n",
+                        ds4_bytes_to_gib(s->admission_expected_graph_bytes),
+                        ds4_bytes_to_gib(allocated_graph_bytes));
+                metal_graph_free(&s->graph);
+                ds4_session_release_shared_prefill_workspace(s);
+                ds4_session_release_admission_slot(s);
+                free(s);
+                return 1;
+            }
+            if (!metal_graph_dspark_speculative_bytes(
+                        &s->graph, &allocated_speculative_bytes) ||
+                allocated_speculative_bytes !=
+                    s->admission_expected_speculative_bytes) {
+                fprintf(stderr,
+                        "ds4: per-session speculative admission drift: "
+                        "planned %.2f GiB, allocated %.2f GiB; "
+                        "refusing session\n",
+                        ds4_bytes_to_gib(
+                            s->admission_expected_speculative_bytes),
+                        ds4_bytes_to_gib(allocated_speculative_bytes));
+                metal_graph_free(&s->graph);
+                ds4_session_release_shared_prefill_workspace(s);
+                ds4_session_release_admission_slot(s);
+                free(s);
+                return 1;
+            }
         }
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -64898,15 +66752,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                     err,
                                     sizeof(err)) != 0) {
             fprintf(stderr,
-                    "ds4: failed to create distributed coordinator session: %s\n",
-                    err[0] ? err : "unknown error");
+                        "ds4: failed to create distributed coordinator session: %s\n",
+                        err[0] ? err : "unknown error");
             metal_graph_free(&s->graph);
+            ds4_session_release_shared_prefill_workspace(s);
             free(s->logits);
             free(s->sample_probs);
             free(s->mtp_logits);
             free(s->spec_row_logits);
             free(s->dspark_markov_bias);
             free(s->dspark_conf_features);
+            ds4_session_release_admission_slot(s);
             free(s);
             return 1;
         }
@@ -64918,6 +66774,22 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     *out = s;
     return 0;
 #endif
+}
+
+int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+    if (!out || !e || ctx_size <= 0) return 1;
+    *out = NULL;
+
+    /* This reservation deliberately precedes every engine-field read in the
+     * implementation.  ds4_engine_close() sets the gate closed and waits for
+     * this exact scope before it tears down engine-owned resources. */
+    if (!ds4_session_creation_begin(&e->session_creation_state)) {
+        fprintf(stderr, "ds4: engine is closing; refusing new session\n");
+        return 1;
+    }
+    const int rc = ds4_session_create_impl(out, e, ctx_size);
+    ds4_session_creation_end(&e->session_creation_state);
+    return rc;
 }
 
 void ds4_session_free(ds4_session *s) {
@@ -64951,6 +66823,7 @@ void ds4_session_free(ds4_session *s) {
         }
     }
 #endif
+    ds4_session_release_shared_prefill_workspace(s);
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
@@ -64966,6 +66839,7 @@ void ds4_session_free(ds4_session *s) {
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
 #endif
+    ds4_session_release_admission_slot(s);
     free(s);
 }
 

@@ -23,18 +23,39 @@ typedef struct {
  * from their cache arithmetic. */
 typedef struct {
     uint64_t capacity_bytes;
+    uint64_t prelocked_bytes;
     uint64_t target_mapped_bytes;
     uint64_t support_bytes;
     uint64_t expert_cache_bytes;
     uint64_t prefill_reserve_bytes;
-    uint64_t kv_bytes;
-    uint64_t scratch_bytes;
+    /* Every session owns each of these allocations independently.
+     * session_count defaults to one when zero. */
+    uint64_t session_kv_bytes;
+    uint64_t session_context_scratch_bytes;
+    /* Persistent, non-KV GPU graph state: live compressor frontiers plus
+     * fixed decode/output scratch. This deliberately excludes speculative
+     * tensors and prefill workspace, which have their own categories. */
+    uint64_t session_graph_bytes;
+    uint64_t session_speculative_bytes;
+    uint64_t session_host_bytes;
+    uint64_t session_prefill_workspace_bytes;
+    /* The serialized batched server may instead transfer one prefill
+     * workspace to engine ownership and alias it from every session. */
+    uint64_t shared_prefill_workspace_bytes;
     uint64_t safety_headroom_bytes;
+    uint32_t session_count;
 } ds4_ssd_admission_request;
 
 typedef struct {
     uint64_t required_bytes;
     uint64_t budget_bytes;
+    uint64_t total_session_kv_bytes;
+    uint64_t total_session_context_scratch_bytes;
+    uint64_t total_session_graph_bytes;
+    uint64_t total_session_speculative_bytes;
+    uint64_t total_session_host_bytes;
+    uint64_t total_session_prefill_workspace_bytes;
+    uint64_t shared_prefill_workspace_bytes;
 } ds4_ssd_admission_result;
 
 bool ds4_parse_gib_arg(const char *s, uint64_t *bytes);

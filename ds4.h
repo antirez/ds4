@@ -461,6 +461,7 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    bool target_layers_overflow;
 } ds4_test_dspark_readiness;
 
 int ds4_test_dspark_support_ready(
@@ -474,6 +475,35 @@ int ds4_test_support_kind_allowed_for_startup(
         bool dspark_requested,
         bool ssd_streaming,
         int support_kind);
+int ds4_test_dspark_distributed_role_allowed(
+        bool dspark_requested,
+        int distributed_role);
+int ds4_test_dspark_session_request_within_admitted_ceilings(
+        uint32_t active_sessions,
+        uint32_t session_limit,
+        int requested_ctx_size,
+        int admitted_ctx_size,
+        uint64_t context_scratch_bytes,
+        uint64_t admitted_context_scratch_bytes,
+        uint64_t graph_bytes,
+        uint64_t admitted_graph_bytes,
+        uint64_t speculative_bytes,
+        uint64_t admitted_speculative_bytes,
+        uint64_t workspace_bytes,
+        uint64_t admitted_workspace_bytes);
+int ds4_test_shared_prefill_workspace_claims(
+        unsigned int contenders,
+        int          requested_ctx_size,
+        int          admitted_ctx_size,
+        unsigned int *owner_count_out,
+        unsigned int *ready_count_out,
+        unsigned int *published_prefill_cap_out);
+int ds4_test_shared_prefill_workspace_abort_reopens(void);
+int ds4_test_shared_prefill_workspace_context_size(
+        int requested_ctx_size,
+        int admitted_ctx_size);
+int ds4_test_session_creation_close_race(void);
+int ds4_test_dspark_small_context_admission_exact(void);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,

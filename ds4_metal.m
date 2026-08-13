@@ -11546,15 +11546,26 @@ int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) 
 }
 
 void ds4_gpu_release_persistent_support_map(void) {
-    if (!g_support_model_buffer) return;
     /* newBufferWithBytesNoCopy does not extend the mmap lifetime. Drain all
-     * queued work, then release the Objective-C owner before model_close()
-     * unmaps the support GGUF. */
+     * queued work, then evict every cache class that can retain a support-map
+     * view. Residency sets must leave the queue before their tables release
+     * owned exact views; the persistent whole-map owner is released last,
+     * before model_close() unmaps the support GGUF. */
+    if (!g_initialized) {
+        g_support_model_buffer = nil;
+        g_support_model_map_ptr = NULL;
+        g_support_model_map_size = 0;
+        return;
+    }
     if (!ds4_gpu_synchronize()) {
         fprintf(stderr,
                 "ds4: Metal support-view synchronization failed during teardown\n");
     }
     @autoreleasepool {
+        [g_q4_expert_layer_residency_cache removeAllObjects];
+        [g_q4_expert_table_cache removeAllObjects];
+        ds4_gpu_model_buffer_cache_clear("support-unmap");
+        [g_transient_buffers removeAllObjects];
         g_support_model_buffer = nil;
         g_support_model_map_ptr = NULL;
         g_support_model_map_size = 0;
