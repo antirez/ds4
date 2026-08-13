@@ -565,6 +565,11 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 }
 
 typedef struct server server;
+typedef struct response_state_entry response_state_entry;
+
+/* A parsed request holds a pinned response-state record while it waits in the
+ * server queue.  The record itself lives in the bounded server-local index. */
+static void response_state_release(server *s, response_state_entry *entry);
 
 typedef struct {
     char *id;
@@ -693,11 +698,49 @@ typedef struct {
     bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
+    /* previous_response_id continuation.  On a state hit prompt contains only
+     * the rendered tail; generate_job() joins it to the saved exact frontier. */
+    char *responses_previous_id;
+    char *responses_state_tail_text;
+    char *responses_state_instructions;
+    char *responses_state_request_tools;
+    char *responses_state_active_tools;
+    bool responses_state_tool_choice_none;
+    bool responses_state_instructions_set;
+    bool responses_state_request_tools_set;
+    bool responses_state_tool_choice_set;
+    bool responses_state_thinking_set;
+    uint64_t responses_state_fingerprint;
+    response_state_entry *responses_state;
+    server *responses_state_server;
+    bool responses_stateful;
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
+
+static uint64_t response_state_fingerprint_values(server_model_syntax syntax,
+                                                  ds4_think_mode think_mode,
+                                                  bool has_tools,
+                                                  bool tool_choice_none,
+                                                  const char *model,
+                                                  const char *instructions,
+                                                  const char *request_tools,
+                                                  const char *active_tools);
+static response_state_entry *response_state_acquire(server *s, const char *id);
+/* If an optional KV checkpoint survived a process restart, rebuild its bounded
+ * response-id record before treating the request as a replay fallback. */
+static response_state_entry *response_state_acquire_or_restore(server *s, const char *id);
+static bool response_state_config_matches(const response_state_entry *entry,
+                                          const request *r);
+static const stop_list *response_state_call_ids(const response_state_entry *entry);
+static bool responses_input_is_append_only(const chat_msgs *msgs);
+static bool responses_validate_state_tool_outputs(const chat_msgs *msgs,
+                                                  const stop_list *known_ids,
+                                                  char *err, size_t errlen);
+static void response_state_apply(request *r, response_state_entry *entry,
+                                 const char *delta_tools);
 
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
@@ -810,6 +853,30 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+/* Response-state records outlive the request that introduced a tool schema.
+ * Keep an owned copy of the ordered schema metadata so a later function-call
+ * continuation renders its arguments in the same wire order. */
+static tool_schema_order tool_schema_order_clone(const tool_schema_order *src) {
+    tool_schema_order dst = {0};
+    if (!src) return dst;
+    dst.name = src->name ? xstrdup(src->name) : NULL;
+    dst.wire_name = src->wire_name ? xstrdup(src->wire_name) : NULL;
+    dst.namespace = src->namespace ? xstrdup(src->namespace) : NULL;
+    dst.responses_tool_search = src->responses_tool_search;
+    for (int i = 0; i < src->len; i++) {
+        tool_schema_order_prop_push(&dst, xstrdup(src->prop[i] ? src->prop[i] : ""));
+    }
+    return dst;
+}
+
+static void tool_schema_orders_clone_append(tool_schema_orders *dst,
+                                            const tool_schema_orders *src) {
+    if (!dst || !src) return;
+    for (int i = 0; i < src->len; i++) {
+        tool_schema_orders_push(dst, tool_schema_order_clone(&src->v[i]));
+    }
+}
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -834,11 +901,32 @@ static void request_free(request *r) {
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
+    free(r->responses_previous_id);
+    free(r->responses_state_tail_text);
+    free(r->responses_state_instructions);
+    free(r->responses_state_request_tools);
+    free(r->responses_state_active_tools);
+    if (r->responses_state) response_state_release(r->responses_state_server, r->responses_state);
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
+}
+
+static void responses_request_set_state_config(request *r,
+                                               const char *instructions,
+                                               const char *request_tools,
+                                               const char *active_tools,
+                                               bool tool_choice_none) {
+    if (!r) return;
+    free(r->responses_state_instructions);
+    free(r->responses_state_request_tools);
+    free(r->responses_state_active_tools);
+    r->responses_state_instructions = xstrdup(instructions ? instructions : "");
+    r->responses_state_request_tools = xstrdup(request_tools ? request_tools : "");
+    r->responses_state_active_tools = xstrdup(active_tools ? active_tools : "");
+    r->responses_state_tool_choice_none = tool_choice_none;
 }
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
@@ -4047,8 +4135,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
+    buf combined_tool_schemas = {0};
     char *instructions = NULL;
     char *tool_schemas = NULL;
+    char *previous_response_id = NULL;
+    response_state_entry *state = NULL;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -4085,6 +4176,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             got_input = true;
         } else if (!strcmp(key, "instructions")) {
+            r->responses_state_instructions_set = true;
             free(instructions);
             instructions = NULL;
             json_ws(&p);
@@ -4095,6 +4187,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "tools")) {
+            r->responses_state_request_tools_set = true;
             free(tool_schemas);
             tool_schemas = NULL;
             if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders)) {
@@ -4102,6 +4195,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
         } else if (!strcmp(key, "tool_choice")) {
+            r->responses_state_tool_choice_set = true;
             json_ws(&p);
             if (*p == '"') {
                 char *choice = NULL;
@@ -4123,6 +4217,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                     buf_free(&loaded_tool_schemas);
                     free(instructions);
                     free(tool_schemas);
+                    free(previous_response_id);
                     request_free(r);
                     return false;
                 }
@@ -4134,6 +4229,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 buf_free(&loaded_tool_schemas);
                 free(instructions);
                 free(tool_schemas);
+                free(previous_response_id);
                 request_free(r);
                 return false;
             } else if (!json_skip_value(&p)) {
@@ -4185,33 +4281,32 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
              * default behaviour (and the model_alias_* fallbacks below) intact. */
             if (effort_seen) {
                 got_thinking = true;
+                r->responses_state_thinking_set = true;
                 /* Responses-API effort of "minimal" / "none" maps to disabled
                  * thinking. Other effort values choose between HIGH and MAX. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
             }
-        } else if (!strcmp(key, "previous_response_id") ||
-                   !strcmp(key, "conversation"))
-        {
-            /* Official Responses state can be durable:
-             *   previous_response_id chains to a stored prior response, and
-             *   conversation points at a persistent Conversations object.
-             *
-             * DS4 does not yet implement that durable store.  The supported
-             * modes are either (a) a live in-memory continuation checked by
-             * visible transcript / tool call ids, or (b) stateless replay of
-             * the full input items.  Accepting a non-null durable reference
-             * without loading the referenced items would silently truncate the
-             * prompt, so reject it explicitly. */
+        } else if (!strcmp(key, "previous_response_id")) {
+            free(previous_response_id);
+            previous_response_id = NULL;
+            json_ws(&p);
+            if (!json_lit(&p, "null") && !json_string(&p, &previous_response_id)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "conversation")) {
+            /* Conversations objects need their own persistent object store;
+             * previous_response_id is the bounded local continuation handle. */
             json_ws(&p);
             if (!json_lit(&p, "null")) {
                 snprintf(err, errlen,
-                         "%s is not supported; replay full input instead",
-                         key);
+                         "conversation is not supported; use previous_response_id or replay full input instead");
                 free(key);
                 chat_msgs_free(&msgs);
                 buf_free(&loaded_tool_schemas);
                 free(instructions);
                 free(tool_schemas);
+                free(previous_response_id);
                 request_free(r);
                 return false;
             }
@@ -4227,13 +4322,83 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (*p != '}') goto bad;
     if (!got_input) {
         snprintf(err, errlen, "missing input");
-        chat_msgs_free(&msgs);
-        buf_free(&loaded_tool_schemas);
-        free(instructions);
-        free(tool_schemas);
-        request_free(r);
-        return false;
+        goto rejected;
     }
+
+    /* Keep the request's prompt-affecting configuration separately from its
+     * rendered history.  A previous_response_id may inherit omitted fields
+     * from the saved response, but an explicit edit must not silently reuse a
+     * different model prefix. */
+    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
+    if (loaded_tool_schemas.len) {
+        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
+        buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
+                   loaded_tool_schemas.len);
+    }
+    const char *active_tool_schemas =
+        (!tool_choice_none && combined_tool_schemas.len) ?
+        combined_tool_schemas.ptr : NULL;
+    r->has_tools = active_tool_schemas && active_tool_schemas[0];
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    r->think_mode = ds4_think_mode_for_context(
+        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    responses_request_set_state_config(r, instructions ? instructions : "",
+                                       tool_schemas ? tool_schemas : "",
+                                       active_tool_schemas ? active_tool_schemas : "",
+                                       tool_choice_none);
+    r->responses_state_fingerprint = response_state_fingerprint_values(
+        r->model_syntax, r->think_mode, r->has_tools,
+        r->responses_state_tool_choice_none, r->model,
+        r->responses_state_instructions, r->responses_state_request_tools,
+        r->responses_state_active_tools);
+
+    if (previous_response_id && previous_response_id[0]) {
+        state = response_state_acquire_or_restore(s, previous_response_id);
+        /* Dynamic tool-search schemas are rendered at the beginning of a full
+         * chat prompt, so they cannot safely be inserted into a generic tail.
+         * Treat that rare shape as an explicit replay branch instead. */
+        bool append_only = responses_input_is_append_only(&msgs) &&
+                           loaded_tool_schemas.len == 0;
+        if (state && append_only && response_state_config_matches(state, r)) {
+            if (!responses_validate_state_tool_outputs(&msgs, response_state_call_ids(state),
+                                                       err, errlen)) {
+                goto rejected;
+            }
+            response_state_apply(r, state, NULL);
+            r->responses_state = state;
+            r->responses_state_server = s;
+            r->responses_stateful = true;
+            state = NULL; /* request now owns the acquired reference */
+            r->responses_previous_id = previous_response_id;
+            previous_response_id = NULL;
+            r->responses_state_tail_text = render_live_tool_tail_for_syntax(
+                r->model_syntax, &msgs, 0, &r->tool_orders, r->think_mode);
+            r->prompt_text = xstrdup(r->responses_state_tail_text ?
+                                     r->responses_state_tail_text : "");
+            ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+            r->prompt_preserves_reasoning = true;
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            return true;
+        }
+        if (state) {
+            response_state_release(s, state);
+            state = NULL;
+        }
+        if (append_only) {
+            snprintf(err, errlen,
+                     "previous_response_id is unavailable or its prompt configuration changed; replay the full input history");
+            goto rejected;
+        }
+        /* An assistant/system item (or dynamic hosted-tool schema) means this
+         * is a deliberate full replay/edit.  Preserve the existing stateless
+         * parser/render/tokenize path below. */
+    }
+
     /* instructions in the Responses API replaces any system message — for Codex
      * it carries the full agent system prompt. Prepend it so render produces a
      * standard system+chat layout. */
@@ -4250,32 +4415,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             msgs.v[0] = tmp;
         }
     }
-    buf combined_tool_schemas = {0};
-    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
-    if (loaded_tool_schemas.len) {
-        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
-        buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
-                   loaded_tool_schemas.len);
-    }
-    const char *active_tool_schemas =
-        (!tool_choice_none && combined_tool_schemas.len) ?
-        combined_tool_schemas.ptr : NULL;
-    r->has_tools = active_tool_schemas && active_tool_schemas[0];
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = ds4_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
                                          err, errlen)) {
-        chat_msgs_free(&msgs);
-        buf_free(&combined_tool_schemas);
-        buf_free(&loaded_tool_schemas);
-        free(instructions);
-        free(tool_schemas);
-        request_free(r);
-        return false;
+        goto rejected;
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
@@ -4291,12 +4435,26 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    free(previous_response_id);
     return true;
-bad:
+rejected:
+    if (state) response_state_release(s, state);
     chat_msgs_free(&msgs);
+    buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    free(previous_response_id);
+    request_free(r);
+    return false;
+bad:
+    if (state) response_state_release(s, state);
+    chat_msgs_free(&msgs);
+    buf_free(&combined_tool_schemas);
+    buf_free(&loaded_tool_schemas);
+    free(instructions);
+    free(tool_schemas);
+    free(previous_response_id);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
@@ -6679,10 +6837,15 @@ typedef struct {
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
 } responses_stream;
 
-static void responses_stream_init(const request *r, responses_stream *st) {
+static void responses_stream_init(const request *r, responses_stream *st,
+                                  const char *response_id) {
     memset(st, 0, sizeof(*st));
     st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
-    responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
+    if (response_id && response_id[0]) {
+        snprintf(st->response_id, sizeof(st->response_id), "%s", response_id);
+    } else {
+        responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
+    }
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
     st->reasoning_index = -1;
@@ -7378,13 +7541,15 @@ static bool responses_sse_finish_live(int fd, const request *r,
 }
 
 static bool responses_final_response(int fd, bool enable_cors,
-                                     const request *r, const char *id,
+                                     const request *r, const char *response_id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
-    (void)id;
-    char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
+    char generated_response_id[40], reasoning_id[40], message_id[40];
+    if (!response_id || !response_id[0]) {
+        responses_random_id(generated_response_id, sizeof(generated_response_id), "resp_");
+        response_id = generated_response_id;
+    }
     responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
@@ -8417,6 +8582,48 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+/* Response state is a bounded local index over opaque response ids. When the
+ * optional KV cache is enabled, each record is serialized with its exact
+ * checkpoint and can be rebuilt after a restart; without that checkpoint it
+ * remains a live-process continuation only. It never copies visible history,
+ * so a continuation hit stays proportional to the supplied tail. */
+struct response_state_entry {
+    char *id;
+    char *checkpoint_key;
+    int slot_id;
+    int live_tokens;
+    /* Prompt frontier before this response generated its model output. */
+    int prompt_prefix_tokens;
+    uint64_t frontier_epoch;
+    server_model_syntax model_syntax;
+    ds4_think_mode think_mode;
+    bool has_tools;
+    bool tool_choice_none;
+    bool checkpoint_saved;
+    char *model;
+    char *instructions;
+    char *request_tools;
+    char *active_tools;
+    tool_schema_orders tool_orders;
+    stop_list call_ids;
+    uint64_t fingerprint;
+    size_t bytes;
+    int refs;
+    bool indexed;
+    response_state_entry *prev;
+    response_state_entry *next;
+};
+
+typedef struct {
+    rax *by_id;
+    response_state_entry *head;
+    response_state_entry *tail;
+    int entries;
+    int max_entries;
+    size_t bytes;
+    size_t max_bytes;
+} response_state_index;
+
 struct server_slot {
     server *srv;
     int id;
@@ -8425,6 +8632,14 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Responses checkpoints retain the exact post-turn frontier, so their
+     * schedule tracks the continued-cache boundary they crossed rather than
+     * the final response token count. */
+    int response_state_last_checkpoint_tokens;
+    /* Bumped when a request synchronizes a new prompt.  A response-state
+     * record may use a resident session only when both frontier and epoch
+     * still identify the exact sampled prefix. */
+    uint64_t frontier_epoch;
 
     job *assigned;
     job *running;
@@ -8453,6 +8668,7 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
+    response_state_index response_states;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -8714,6 +8930,452 @@ static void tool_memory_free(tool_memory *m) {
  * KV frontier.  If it does not match, DS4 falls back to the same prefix and
  * disk-cache machinery used by chat/completions, or returns a clear error for
  * tool-result-only requests that have no replayable prefix. */
+/* =========================================================================
+ * Responses previous_response_id state.
+ * =========================================================================
+ *
+ * This index is intentionally append-only/FIFO rather than an unbounded
+ * conversation store.  A record owns only continuation metadata and an exact
+ * KV frontier reference; it never retains a second copy of the visible chat
+ * history.  Requests pin a record while queued so eviction cannot turn a
+ * validated continuation into a dangling pointer. */
+
+#define DS4_RESPONSE_STATE_DEFAULT_MAX_IDS 4096
+#define DS4_RESPONSE_STATE_MAX_BYTES (64u * 1024u * 1024u)
+
+static int response_state_max_entries(const response_state_index *idx) {
+    return idx && idx->max_entries > 0 ? idx->max_entries :
+           DS4_RESPONSE_STATE_DEFAULT_MAX_IDS;
+}
+
+static size_t response_state_max_bytes(const response_state_index *idx) {
+    return idx && idx->max_bytes > 0 ? idx->max_bytes :
+           DS4_RESPONSE_STATE_MAX_BYTES;
+}
+
+static bool response_state_string_eq(const char *a, const char *b) {
+    return !strcmp(a ? a : "", b ? b : "");
+}
+
+static uint64_t response_state_hash_bytes(uint64_t h, const void *data, size_t len) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t response_state_hash_string(uint64_t h, const char *s) {
+    const char *text = s ? s : "";
+    h = response_state_hash_bytes(h, text, strlen(text));
+    const unsigned char zero = 0;
+    return response_state_hash_bytes(h, &zero, 1);
+}
+
+static uint64_t response_state_fingerprint_values(server_model_syntax syntax,
+                                                  ds4_think_mode think_mode,
+                                                  bool has_tools,
+                                                  bool tool_choice_none,
+                                                  const char *model,
+                                                  const char *instructions,
+                                                  const char *request_tools,
+                                                  const char *active_tools) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    h = response_state_hash_bytes(h, &syntax, sizeof(syntax));
+    h = response_state_hash_bytes(h, &think_mode, sizeof(think_mode));
+    h = response_state_hash_bytes(h, &has_tools, sizeof(has_tools));
+    h = response_state_hash_bytes(h, &tool_choice_none, sizeof(tool_choice_none));
+    h = response_state_hash_string(h, model);
+    h = response_state_hash_string(h, instructions);
+    h = response_state_hash_string(h, request_tools);
+    return response_state_hash_string(h, active_tools);
+}
+
+static size_t response_state_size_add(size_t total, size_t add) {
+    return add > SIZE_MAX - total ? SIZE_MAX : total + add;
+}
+
+static size_t response_state_tool_orders_bytes(const tool_schema_orders *orders) {
+    size_t bytes = 0;
+    if (!orders) return 0;
+    if (orders->cap > 0) {
+        bytes = response_state_size_add(bytes,
+                                        (size_t)orders->cap * sizeof(orders->v[0]));
+    }
+    for (int i = 0; i < orders->len; i++) {
+        const tool_schema_order *o = &orders->v[i];
+        if (o->cap > 0) {
+            bytes = response_state_size_add(bytes,
+                                            (size_t)o->cap * sizeof(o->prop[0]));
+        }
+        bytes = response_state_size_add(bytes, strlen(o->name ? o->name : "") + 1);
+        bytes = response_state_size_add(bytes, strlen(o->wire_name ? o->wire_name : "") + 1);
+        bytes = response_state_size_add(bytes, strlen(o->namespace ? o->namespace : "") + 1);
+        for (int j = 0; j < o->len; j++) {
+            bytes = response_state_size_add(bytes, strlen(o->prop[j] ? o->prop[j] : "") + 1);
+        }
+    }
+    return bytes;
+}
+
+static size_t response_state_entry_bytes(const response_state_entry *entry) {
+    if (!entry) return 0;
+    size_t bytes = sizeof(*entry);
+    bytes = response_state_size_add(bytes, strlen(entry->id ? entry->id : "") + 1);
+    bytes = response_state_size_add(bytes, strlen(entry->checkpoint_key ? entry->checkpoint_key : "") + 1);
+    bytes = response_state_size_add(bytes, strlen(entry->model ? entry->model : "") + 1);
+    bytes = response_state_size_add(bytes, strlen(entry->instructions ? entry->instructions : "") + 1);
+    bytes = response_state_size_add(bytes, strlen(entry->request_tools ? entry->request_tools : "") + 1);
+    bytes = response_state_size_add(bytes, strlen(entry->active_tools ? entry->active_tools : "") + 1);
+    bytes = response_state_size_add(bytes, response_state_tool_orders_bytes(&entry->tool_orders));
+    if (entry->call_ids.cap > 0) {
+        bytes = response_state_size_add(bytes,
+                                        (size_t)entry->call_ids.cap * sizeof(entry->call_ids.v[0]));
+    }
+    for (int i = 0; i < entry->call_ids.len; i++) {
+        bytes = response_state_size_add(bytes,
+                                        strlen(entry->call_ids.v[i] ? entry->call_ids.v[i] : "") + 1);
+    }
+    return bytes;
+}
+
+static void response_state_entry_free(response_state_entry *entry) {
+    if (!entry) return;
+    free(entry->id);
+    free(entry->checkpoint_key);
+    free(entry->model);
+    free(entry->instructions);
+    free(entry->request_tools);
+    free(entry->active_tools);
+    tool_schema_orders_free(&entry->tool_orders);
+    id_list_free(&entry->call_ids);
+    free(entry);
+}
+
+static void response_state_index_init_locked(response_state_index *idx) {
+    if (!idx || idx->by_id) return;
+    idx->by_id = raxNew();
+    if (!idx->by_id) die("out of memory");
+}
+
+static void response_state_link_head(response_state_index *idx,
+                                     response_state_entry *entry) {
+    entry->prev = NULL;
+    entry->next = idx->head;
+    if (idx->head) idx->head->prev = entry;
+    else idx->tail = entry;
+    idx->head = entry;
+}
+
+static void response_state_unlink(response_state_index *idx,
+                                  response_state_entry *entry) {
+    if (entry->prev) entry->prev->next = entry->next;
+    else idx->head = entry->next;
+    if (entry->next) entry->next->prev = entry->prev;
+    else idx->tail = entry->prev;
+    entry->prev = entry->next = NULL;
+}
+
+static void response_state_detach_locked(response_state_index *idx,
+                                         response_state_entry *entry) {
+    if (!idx || !entry || !entry->indexed) return;
+    void *old = NULL;
+    (void)raxRemove(idx->by_id, (unsigned char *)entry->id,
+                    strlen(entry->id), &old);
+    response_state_unlink(idx, entry);
+    entry->indexed = false;
+    if (idx->entries > 0) idx->entries--;
+    if (idx->bytes >= entry->bytes) idx->bytes -= entry->bytes;
+    else idx->bytes = 0;
+    if (entry->refs == 0) response_state_entry_free(entry);
+}
+
+static void response_state_prune_locked(response_state_index *idx) {
+    while (idx && idx->tail &&
+           (idx->entries > response_state_max_entries(idx) ||
+            idx->bytes > response_state_max_bytes(idx)))
+    {
+        response_state_detach_locked(idx, idx->tail);
+    }
+}
+
+static bool response_state_insert(server *s, response_state_entry *entry) {
+    if (!s || !entry || !entry->id || !entry->id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    response_state_index *idx = &s->response_states;
+    response_state_index_init_locked(idx);
+    void *existing = raxFind(idx->by_id, (unsigned char *)entry->id, strlen(entry->id));
+    if (existing != raxNotFound) {
+        pthread_mutex_unlock(&s->tool_mu);
+        return false;
+    }
+    entry->bytes = response_state_entry_bytes(entry);
+    if (response_state_max_entries(idx) < 1 || entry->bytes > response_state_max_bytes(idx)) {
+        pthread_mutex_unlock(&s->tool_mu);
+        return false;
+    }
+    if (!raxInsert(idx->by_id, (unsigned char *)entry->id, strlen(entry->id), entry, NULL)) {
+        pthread_mutex_unlock(&s->tool_mu);
+        die("out of memory");
+    }
+    entry->indexed = true;
+    response_state_link_head(idx, entry);
+    idx->entries++;
+    idx->bytes += entry->bytes;
+    response_state_prune_locked(idx);
+    bool kept = entry->indexed;
+    pthread_mutex_unlock(&s->tool_mu);
+    return kept;
+}
+
+static response_state_entry *response_state_acquire(server *s, const char *id) {
+    if (!s || !id || !id[0]) return NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    response_state_entry *entry = NULL;
+    if (s->response_states.by_id) {
+        void *found = raxFind(s->response_states.by_id, (unsigned char *)id, strlen(id));
+        if (found != raxNotFound) {
+            entry = found;
+            entry->refs++;
+        }
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return entry;
+}
+
+static bool response_state_is_current(server *s, const response_state_entry *entry,
+                                      const server_slot *slot, int live_tokens) {
+    if (!s || !entry || !slot) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = entry->indexed && entry->slot_id == slot->id &&
+              entry->live_tokens == live_tokens &&
+              entry->frontier_epoch == slot->frontier_epoch;
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static uint64_t response_state_slot_epoch(server *s, const server_slot *slot) {
+    if (!s || !slot) return 0;
+    pthread_mutex_lock(&s->tool_mu);
+    uint64_t epoch = slot->frontier_epoch;
+    pthread_mutex_unlock(&s->tool_mu);
+    return epoch;
+}
+
+static void response_state_advance_slot_epoch(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    if (++slot->frontier_epoch == 0) slot->frontier_epoch = 1;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool response_state_checkpoint_saved(server *s,
+                                            const response_state_entry *entry) {
+    if (!s || !entry) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool saved = entry->checkpoint_saved;
+    pthread_mutex_unlock(&s->tool_mu);
+    return saved;
+}
+
+static void response_state_release(server *s, response_state_entry *entry) {
+    if (!entry) return;
+    if (!s) {
+        /* A request can only own an entry from a live server, but keep failure
+         * cleanup safe for parser/unit-test construction paths. */
+        return;
+    }
+    pthread_mutex_lock(&s->tool_mu);
+    if (entry->refs > 0) entry->refs--;
+    response_state_prune_locked(&s->response_states);
+    if (!entry->indexed && entry->refs == 0) response_state_entry_free(entry);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void response_state_forget(server *s, response_state_entry *entry) {
+    if (!s || !entry) return;
+    pthread_mutex_lock(&s->tool_mu);
+    response_state_detach_locked(&s->response_states, entry);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void response_state_index_free(response_state_index *idx) {
+    if (!idx) return;
+    while (idx->tail) response_state_detach_locked(idx, idx->tail);
+    if (idx->by_id) raxFree(idx->by_id);
+    memset(idx, 0, sizeof(*idx));
+}
+
+static response_state_entry *response_state_make(const char *id, int slot_id,
+                                                  int live_tokens, uint64_t frontier_epoch,
+                                                  const request *r,
+                                                  const tool_calls *calls) {
+    if (!id || !id[0] || !r) return NULL;
+    response_state_entry *entry = xmalloc(sizeof(*entry));
+    memset(entry, 0, sizeof(*entry));
+    entry->id = xstrdup(id);
+    size_t key_len = strlen("responses-id:") + strlen(id) + 1;
+    entry->checkpoint_key = xmalloc(key_len);
+    snprintf(entry->checkpoint_key, key_len, "responses-id:%s", id);
+    entry->slot_id = slot_id;
+    entry->live_tokens = live_tokens;
+    entry->prompt_prefix_tokens = r->cache_read_tokens + r->cache_write_tokens;
+    if (entry->prompt_prefix_tokens < 0 || entry->prompt_prefix_tokens > live_tokens) {
+        entry->prompt_prefix_tokens = live_tokens;
+    }
+    entry->frontier_epoch = frontier_epoch;
+    entry->model_syntax = r->model_syntax;
+    entry->think_mode = r->think_mode;
+    entry->has_tools = r->has_tools;
+    entry->tool_choice_none = r->responses_state_tool_choice_none;
+    entry->model = xstrdup(r->model ? r->model : "");
+    entry->instructions = xstrdup(r->responses_state_instructions ?
+                                  r->responses_state_instructions : "");
+    entry->request_tools = xstrdup(r->responses_state_request_tools ?
+                                   r->responses_state_request_tools : "");
+    entry->active_tools = xstrdup(r->responses_state_active_tools ?
+                                  r->responses_state_active_tools : "");
+    tool_schema_orders_clone_append(&entry->tool_orders, &r->tool_orders);
+    if (calls) {
+        for (int i = 0; i < calls->len; i++) id_list_push_unique(&entry->call_ids, calls->v[i].id);
+    }
+    entry->fingerprint = response_state_fingerprint_values(
+        entry->model_syntax, entry->think_mode, entry->has_tools,
+        entry->tool_choice_none, entry->model, entry->instructions,
+        entry->request_tools, entry->active_tools);
+    return entry;
+}
+
+static response_state_entry *response_state_remember(server *s, int slot_id,
+                                                     int live_tokens, uint64_t frontier_epoch,
+                                                     const char *id, const request *r,
+                                                     const tool_calls *calls) {
+    response_state_entry *entry = response_state_make(id, slot_id, live_tokens,
+                                                       frontier_epoch, r, calls);
+    if (!entry) return NULL;
+    /* Keep a private reference while the producer optionally writes its disk
+     * checkpoint; index eviction may otherwise reclaim a just-created record. */
+    entry->refs = 1;
+    if (response_state_insert(s, entry)) return entry;
+    entry->refs = 0;
+    response_state_entry_free(entry);
+    return NULL;
+}
+
+static void response_state_set_checkpoint_saved(server *s, response_state_entry *entry,
+                                                bool checkpoint_saved) {
+    if (!s || !entry) return;
+    pthread_mutex_lock(&s->tool_mu);
+    if (entry->indexed) entry->checkpoint_saved = checkpoint_saved;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void responses_new_response_id(server *s, char *dst, size_t dstlen) {
+    if (!dst || dstlen == 0) return;
+    for (int attempt = 0; attempt < 16; attempt++) {
+        responses_random_id(dst, dstlen, "resp_");
+        response_state_entry *existing = response_state_acquire(s, dst);
+        if (!existing) return;
+        response_state_release(s, existing);
+    }
+    /* A 96-bit random collision is already astronomically unlikely; the final
+     * draw remains a usable opaque id if an adversarial test exhausts retries. */
+    responses_random_id(dst, dstlen, "resp_");
+}
+
+static const stop_list *response_state_call_ids(const response_state_entry *entry) {
+    return entry ? &entry->call_ids : NULL;
+}
+
+static bool response_state_config_matches(const response_state_entry *entry,
+                                          const request *r) {
+    if (!entry || !r) return false;
+    if (entry->model_syntax != r->model_syntax) return false;
+    if (r->model_from_request && !response_state_string_eq(entry->model, r->model)) return false;
+    if (r->responses_state_instructions_set &&
+        !response_state_string_eq(entry->instructions, r->responses_state_instructions)) return false;
+    if (r->responses_state_request_tools_set &&
+        !response_state_string_eq(entry->request_tools, r->responses_state_request_tools)) return false;
+    if (r->responses_state_tool_choice_set &&
+        entry->tool_choice_none != r->responses_state_tool_choice_none) return false;
+    if (r->responses_state_thinking_set && entry->think_mode != r->think_mode) return false;
+    return true;
+}
+
+static bool responses_input_is_append_only(const chat_msgs *msgs) {
+    if (!msgs) return false;
+    for (int i = 0; i < msgs->len; i++) {
+        const char *role = msgs->v[i].role ? msgs->v[i].role : "";
+        if (strcmp(role, "user") && strcmp(role, "tool") && strcmp(role, "function")) return false;
+    }
+    return true;
+}
+
+static bool responses_validate_state_tool_outputs(const chat_msgs *msgs,
+                                                  const stop_list *known_ids,
+                                                  char *err, size_t errlen) {
+    if (!msgs) return true;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (strcmp(m->role ? m->role : "", "tool") &&
+            strcmp(m->role ? m->role : "", "function")) continue;
+        stop_list ids = {0};
+        chat_msg_collect_tool_call_ids(m, &ids);
+        if (ids.len == 0) {
+            snprintf(err, errlen,
+                     "previous_response_id tool output requires a call_id; replay the full input history for an edited branch");
+            id_list_free(&ids);
+            return false;
+        }
+        for (int j = 0; j < ids.len; j++) {
+            if (!id_list_contains(known_ids, ids.v[j])) {
+                snprintf(err, errlen,
+                         "previous_response_id does not contain call_id %s; replay the full input history for an edited branch",
+                         ids.v[j] ? ids.v[j] : "");
+                id_list_free(&ids);
+                return false;
+            }
+        }
+        id_list_free(&ids);
+    }
+    return true;
+}
+
+static void response_state_apply(request *r, response_state_entry *entry,
+                                 const char *delta_tools) {
+    if (!r || !entry) return;
+    tool_schema_orders merged = {0};
+    tool_schema_orders_clone_append(&merged, &entry->tool_orders);
+    tool_schema_orders_clone_append(&merged, &r->tool_orders);
+    tool_schema_orders_free(&r->tool_orders);
+    r->tool_orders = merged;
+
+    free(r->model);
+    r->model = xstrdup(entry->model);
+    /* The inherited model is now explicit for the rest of the server pipeline;
+     * client_main must not replace it with today's default alias. */
+    r->model_from_request = true;
+    r->model_syntax = entry->model_syntax;
+    r->think_mode = entry->think_mode;
+
+    buf active = {0};
+    if (entry->active_tools && entry->active_tools[0]) buf_puts(&active, entry->active_tools);
+    if (!entry->tool_choice_none && delta_tools && delta_tools[0]) {
+        if (active.len) buf_putc(&active, '\n');
+        buf_puts(&active, delta_tools);
+    }
+    r->has_tools = !entry->tool_choice_none && active.len > 0;
+    responses_request_set_state_config(r, entry->instructions, entry->request_tools,
+                                       active.ptr ? active.ptr : "", entry->tool_choice_none);
+    r->responses_state_fingerprint = response_state_fingerprint_values(
+        r->model_syntax, r->think_mode, r->has_tools,
+        r->responses_state_tool_choice_none, r->model,
+        r->responses_state_instructions, r->responses_state_request_tools,
+        r->responses_state_active_tools);
+    buf_free(&active);
+}
+
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
@@ -9062,11 +9724,23 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
+#define KV_EXT_RESPONSES_ID DS4_KVSTORE_EXT_RESPONSES_ID
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
 #define KV_TOOL_MAP_VERSION 1u
 #define KV_TOOL_MAP_HEADER 8u
+/* Response-id records live in the checkpoint trailer, before the optional
+ * tool map.  The metadata is intentionally separate from the cache key: the
+ * key stays the opaque response id while the trailer carries the configuration
+ * and bindings needed to validate a continuation after a server restart. */
+#define KV_RESPONSE_STATE_MAGIC0 'K'
+#define KV_RESPONSE_STATE_MAGIC1 'R'
+#define KV_RESPONSE_STATE_MAGIC2 'S'
+#define KV_RESPONSE_STATE_VERSION 1u
+#define KV_RESPONSE_STATE_HEADER 8u
+#define KV_RESPONSE_STATE_MAX_ITEMS (DS4_RESPONSE_STATE_DEFAULT_MAX_IDS * 4u)
+#define KV_RESPONSE_STATE_MAX_ID_BYTES 256u
 
 typedef enum {
     KV_REASON_UNKNOWN   = DS4_KVSTORE_REASON_UNKNOWN,
@@ -9310,6 +9984,354 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     return loaded;
 }
 
+/* The response-id cache key identifies the checkpoint; this bounded trailer
+ * identifies how that checkpoint may be resumed.  Keep it binary rather than
+ * reparsing a JSON response on restart, and reject malformed or oversized
+ * records before they can enter the in-memory index. */
+static bool kv_response_state_size_add(uint64_t *total, uint64_t add) {
+    if (!total || add > UINT64_MAX - *total) return false;
+    *total += add;
+    return true;
+}
+
+static bool kv_response_state_size_string(uint64_t *total, const char *text) {
+    size_t len = strlen(text ? text : "");
+    if (len > UINT32_MAX) return false;
+    return kv_response_state_size_add(total, 4u) &&
+           kv_response_state_size_add(total, (uint64_t)len);
+}
+
+static bool kv_response_state_section_size(const response_state_entry *entry,
+                                           uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!entry || !entry->id || !entry->id[0] || !entry->checkpoint_key ||
+        !entry->checkpoint_key[0] || entry->live_tokens <= 0 ||
+        entry->prompt_prefix_tokens < 0 ||
+        entry->prompt_prefix_tokens > entry->live_tokens ||
+        entry->tool_orders.len < 0 || entry->call_ids.len < 0 ||
+        (uint64_t)entry->tool_orders.len > KV_RESPONSE_STATE_MAX_ITEMS ||
+        (uint64_t)entry->call_ids.len > KV_RESPONSE_STATE_MAX_ITEMS)
+    {
+        return false;
+    }
+
+    /* Five u32 fields, a u64 fingerprint, six strings, then the two lists. */
+    uint64_t bytes = KV_RESPONSE_STATE_HEADER + 28u;
+    const char *strings[] = {
+        entry->id, entry->checkpoint_key, entry->model, entry->instructions,
+        entry->request_tools, entry->active_tools,
+    };
+    for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
+        if (!kv_response_state_size_string(&bytes, strings[i])) return false;
+    }
+    if (!kv_response_state_size_add(&bytes, 4u)) return false;
+    for (int i = 0; i < entry->tool_orders.len; i++) {
+        const tool_schema_order *order = &entry->tool_orders.v[i];
+        if (order->len < 0 || (uint64_t)order->len > KV_RESPONSE_STATE_MAX_ITEMS ||
+            !kv_response_state_size_add(&bytes, 8u) ||
+            !kv_response_state_size_string(&bytes, order->name) ||
+            !kv_response_state_size_string(&bytes, order->wire_name) ||
+            !kv_response_state_size_string(&bytes, order->namespace))
+        {
+            return false;
+        }
+        for (int j = 0; j < order->len; j++) {
+            if (!kv_response_state_size_string(&bytes, order->prop[j])) return false;
+        }
+    }
+    if (!kv_response_state_size_add(&bytes, 4u)) return false;
+    for (int i = 0; i < entry->call_ids.len; i++) {
+        if (!entry->call_ids.v[i] || !entry->call_ids.v[i][0] ||
+            !kv_response_state_size_string(&bytes, entry->call_ids.v[i]))
+        {
+            return false;
+        }
+    }
+    if (bytes < KV_RESPONSE_STATE_HEADER ||
+        bytes - KV_RESPONSE_STATE_HEADER > UINT32_MAX ||
+        bytes > DS4_RESPONSE_STATE_MAX_BYTES)
+    {
+        return false;
+    }
+    if (bytes_out) *bytes_out = bytes;
+    return true;
+}
+
+static void kv_response_state_put_u32(buf *out, uint32_t value) {
+    uint8_t bytes[4];
+    le_put32(bytes, value);
+    buf_append(out, bytes, sizeof(bytes));
+}
+
+static void kv_response_state_put_u64(buf *out, uint64_t value) {
+    kv_response_state_put_u32(out, (uint32_t)value);
+    kv_response_state_put_u32(out, (uint32_t)(value >> 32));
+}
+
+static void kv_response_state_put_string(buf *out, const char *text) {
+    const char *value = text ? text : "";
+    size_t len = strlen(value);
+    kv_response_state_put_u32(out, (uint32_t)len);
+    buf_append(out, value, len);
+}
+
+static bool kv_response_state_build_section(const response_state_entry *entry,
+                                            buf *out) {
+    uint64_t expected = 0;
+    if (!out || !kv_response_state_section_size(entry, &expected)) return false;
+
+    const uint8_t header[KV_RESPONSE_STATE_HEADER] = {
+        KV_RESPONSE_STATE_MAGIC0, KV_RESPONSE_STATE_MAGIC1,
+        KV_RESPONSE_STATE_MAGIC2, KV_RESPONSE_STATE_VERSION,
+        0, 0, 0, 0,
+    };
+    buf_append(out, header, sizeof(header));
+    kv_response_state_put_u32(out, (uint32_t)entry->live_tokens);
+    kv_response_state_put_u32(out, (uint32_t)entry->prompt_prefix_tokens);
+    kv_response_state_put_u32(out, (uint32_t)entry->model_syntax);
+    kv_response_state_put_u32(out, (uint32_t)entry->think_mode);
+    uint32_t flags = (entry->has_tools ? 1u : 0u) |
+                     (entry->tool_choice_none ? 2u : 0u);
+    kv_response_state_put_u32(out, flags);
+    kv_response_state_put_u64(out, entry->fingerprint);
+    kv_response_state_put_string(out, entry->id);
+    kv_response_state_put_string(out, entry->checkpoint_key);
+    kv_response_state_put_string(out, entry->model);
+    kv_response_state_put_string(out, entry->instructions);
+    kv_response_state_put_string(out, entry->request_tools);
+    kv_response_state_put_string(out, entry->active_tools);
+    kv_response_state_put_u32(out, (uint32_t)entry->tool_orders.len);
+    for (int i = 0; i < entry->tool_orders.len; i++) {
+        const tool_schema_order *order = &entry->tool_orders.v[i];
+        kv_response_state_put_u32(out, order->responses_tool_search ? 1u : 0u);
+        kv_response_state_put_string(out, order->name);
+        kv_response_state_put_string(out, order->wire_name);
+        kv_response_state_put_string(out, order->namespace);
+        kv_response_state_put_u32(out, (uint32_t)order->len);
+        for (int j = 0; j < order->len; j++) {
+            kv_response_state_put_string(out, order->prop[j]);
+        }
+    }
+    kv_response_state_put_u32(out, (uint32_t)entry->call_ids.len);
+    for (int i = 0; i < entry->call_ids.len; i++) {
+        kv_response_state_put_string(out, entry->call_ids.v[i]);
+    }
+
+    if (out->len != expected || out->len < KV_RESPONSE_STATE_HEADER) {
+        buf_free(out);
+        return false;
+    }
+    le_put32((uint8_t *)out->ptr + 4,
+             (uint32_t)(out->len - KV_RESPONSE_STATE_HEADER));
+    return true;
+}
+
+typedef struct {
+    const uint8_t *ptr;
+    size_t len;
+    size_t pos;
+} kv_response_state_reader;
+
+static bool kv_response_state_read_u32(kv_response_state_reader *reader,
+                                       uint32_t *out) {
+    if (!reader || !out || reader->pos > reader->len ||
+        reader->len - reader->pos < 4u) return false;
+    *out = le_get32(reader->ptr + reader->pos);
+    reader->pos += 4u;
+    return true;
+}
+
+static bool kv_response_state_read_u64(kv_response_state_reader *reader,
+                                       uint64_t *out) {
+    uint32_t lo = 0, hi = 0;
+    if (!kv_response_state_read_u32(reader, &lo) ||
+        !kv_response_state_read_u32(reader, &hi)) return false;
+    *out = (uint64_t)lo | ((uint64_t)hi << 32);
+    return true;
+}
+
+static bool kv_response_state_read_string(kv_response_state_reader *reader,
+                                          char **out) {
+    if (out) *out = NULL;
+    uint32_t len = 0;
+    if (!reader || !out || !kv_response_state_read_u32(reader, &len) ||
+        len > DS4_RESPONSE_STATE_MAX_BYTES || reader->pos > reader->len ||
+        (size_t)len > reader->len - reader->pos ||
+        memchr(reader->ptr + reader->pos, '\0', len) != NULL)
+    {
+        return false;
+    }
+    *out = xstrndup((const char *)reader->ptr + reader->pos, len);
+    reader->pos += len;
+    return true;
+}
+
+static bool kv_response_state_read_header(FILE *fp, uint32_t *payload_bytes) {
+    uint8_t header[KV_RESPONSE_STATE_HEADER];
+    if (!fp || !payload_bytes || fread(header, 1, sizeof(header), fp) != sizeof(header)) {
+        return false;
+    }
+    if (header[0] != KV_RESPONSE_STATE_MAGIC0 ||
+        header[1] != KV_RESPONSE_STATE_MAGIC1 ||
+        header[2] != KV_RESPONSE_STATE_MAGIC2 ||
+        header[3] != KV_RESPONSE_STATE_VERSION)
+    {
+        return false;
+    }
+    *payload_bytes = le_get32(header + 4);
+    return *payload_bytes <= DS4_RESPONSE_STATE_MAX_BYTES;
+}
+
+static bool kv_response_state_skip_from_pos(FILE *fp) {
+    uint32_t payload_bytes = 0;
+    return kv_response_state_read_header(fp, &payload_bytes) &&
+           fseeko(fp, (off_t)payload_bytes, SEEK_CUR) == 0;
+}
+
+/* A generic cache load normally starts at a tool-map trailer. Response-id
+ * files add their state section first, so detect and skip it without making
+ * ordinary checkpoints depend on Responses state. */
+static bool kv_response_state_maybe_skip_from_pos(FILE *fp) {
+    if (!fp) return false;
+    off_t pos = ftello(fp);
+    if (pos < 0) return false;
+    uint8_t magic[4];
+    size_t got = fread(magic, 1, sizeof(magic), fp);
+    bool at_eof = got == 0 && feof(fp);
+    if (fseeko(fp, pos, SEEK_SET) != 0) return false;
+    if (at_eof) {
+        clearerr(fp);
+        return true;
+    }
+    if (got != sizeof(magic)) return false;
+    if (magic[0] != KV_RESPONSE_STATE_MAGIC0 ||
+        magic[1] != KV_RESPONSE_STATE_MAGIC1 ||
+        magic[2] != KV_RESPONSE_STATE_MAGIC2 ||
+        magic[3] != KV_RESPONSE_STATE_VERSION)
+    {
+        return true;
+    }
+    return kv_response_state_skip_from_pos(fp);
+}
+
+static response_state_entry *kv_response_state_read_from_pos(FILE *fp,
+                                                              const char *wanted_id,
+                                                              uint32_t expected_tokens) {
+    uint32_t payload_bytes = 0;
+    if (!fp || !wanted_id || !wanted_id[0] ||
+        !kv_response_state_read_header(fp, &payload_bytes) || payload_bytes == 0)
+    {
+        return NULL;
+    }
+    uint8_t *payload = xmalloc(payload_bytes);
+    if (fread(payload, 1, payload_bytes, fp) != payload_bytes) {
+        free(payload);
+        return NULL;
+    }
+
+    response_state_entry *entry = xmalloc(sizeof(*entry));
+    memset(entry, 0, sizeof(*entry));
+    kv_response_state_reader reader = {.ptr = payload, .len = payload_bytes};
+    uint32_t live_tokens = 0, prompt_prefix_tokens = 0;
+    uint32_t syntax = 0, think_mode = 0, flags = 0, order_count = 0, call_count = 0;
+    bool ok = kv_response_state_read_u32(&reader, &live_tokens) &&
+              kv_response_state_read_u32(&reader, &prompt_prefix_tokens) &&
+              kv_response_state_read_u32(&reader, &syntax) &&
+              kv_response_state_read_u32(&reader, &think_mode) &&
+              kv_response_state_read_u32(&reader, &flags) &&
+              kv_response_state_read_u64(&reader, &entry->fingerprint) &&
+              kv_response_state_read_string(&reader, &entry->id) &&
+              kv_response_state_read_string(&reader, &entry->checkpoint_key) &&
+              kv_response_state_read_string(&reader, &entry->model) &&
+              kv_response_state_read_string(&reader, &entry->instructions) &&
+              kv_response_state_read_string(&reader, &entry->request_tools) &&
+              kv_response_state_read_string(&reader, &entry->active_tools) &&
+              kv_response_state_read_u32(&reader, &order_count);
+    if (!ok || live_tokens == 0 || live_tokens > INT_MAX ||
+        prompt_prefix_tokens > live_tokens || syntax > SERVER_MODEL_SYNTAX_GLM ||
+        think_mode > DS4_THINK_MAX || flags > 3u ||
+        order_count > KV_RESPONSE_STATE_MAX_ITEMS)
+    {
+        goto bad;
+    }
+    entry->live_tokens = (int)live_tokens;
+    entry->prompt_prefix_tokens = (int)prompt_prefix_tokens;
+    entry->model_syntax = (server_model_syntax)syntax;
+    entry->think_mode = (ds4_think_mode)think_mode;
+    entry->has_tools = (flags & 1u) != 0;
+    entry->tool_choice_none = (flags & 2u) != 0;
+
+    for (uint32_t i = 0; i < order_count; i++) {
+        tool_schema_order order = {0};
+        uint32_t order_flags = 0, prop_count = 0;
+        ok = kv_response_state_read_u32(&reader, &order_flags) &&
+             kv_response_state_read_string(&reader, &order.name) &&
+             kv_response_state_read_string(&reader, &order.wire_name) &&
+             kv_response_state_read_string(&reader, &order.namespace) &&
+             kv_response_state_read_u32(&reader, &prop_count);
+        if (!ok || order_flags > 1u || prop_count > KV_RESPONSE_STATE_MAX_ITEMS ||
+            !order.name || !order.name[0] ||
+            tool_schema_orders_find(&entry->tool_orders, order.name))
+        {
+            tool_schema_order_free(&order);
+            goto bad;
+        }
+        order.responses_tool_search = order_flags != 0;
+        for (uint32_t j = 0; j < prop_count; j++) {
+            char *prop = NULL;
+            if (!kv_response_state_read_string(&reader, &prop)) {
+                tool_schema_order_free(&order);
+                goto bad;
+            }
+            tool_schema_order_prop_push(&order, prop);
+        }
+        tool_schema_orders_push(&entry->tool_orders, order);
+    }
+
+    if (!kv_response_state_read_u32(&reader, &call_count) ||
+        call_count > KV_RESPONSE_STATE_MAX_ITEMS)
+    {
+        goto bad;
+    }
+    for (uint32_t i = 0; i < call_count; i++) {
+        char *call_id = NULL;
+        if (!kv_response_state_read_string(&reader, &call_id) || !call_id[0] ||
+            id_list_contains(&entry->call_ids, call_id))
+        {
+            free(call_id);
+            goto bad;
+        }
+        stop_list_push(&entry->call_ids, call_id);
+    }
+
+    size_t wanted_len = strlen(wanted_id);
+    size_t key_len = strlen("responses-id:") + wanted_len + 1;
+    char *wanted_key = xmalloc(key_len);
+    snprintf(wanted_key, key_len, "responses-id:%s", wanted_id);
+    uint64_t fingerprint = response_state_fingerprint_values(
+        entry->model_syntax, entry->think_mode, entry->has_tools,
+        entry->tool_choice_none, entry->model, entry->instructions,
+        entry->request_tools, entry->active_tools);
+    ok = reader.pos == reader.len && !strcmp(entry->id, wanted_id) &&
+         !strcmp(entry->checkpoint_key, wanted_key) &&
+         entry->live_tokens == (int)expected_tokens &&
+         entry->fingerprint == fingerprint;
+    free(wanted_key);
+    if (!ok) goto bad;
+
+    entry->slot_id = -1;
+    entry->checkpoint_saved = true;
+    entry->bytes = response_state_entry_bytes(entry);
+    if (entry->bytes > response_state_max_bytes(NULL)) goto bad;
+    free(payload);
+    return entry;
+
+bad:
+    free(payload);
+    response_state_entry_free(entry);
+    return NULL;
+}
+
 #ifdef DS4_SERVER_TEST
 static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint8_t reason, uint8_t ext_flags,
@@ -9361,7 +10383,11 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
         {
-            kv_tool_map_load_from_pos(s, fp, &wanted);
+            bool trailer_ok = true;
+            if (hdr.ext_flags & KV_EXT_RESPONSES_ID) {
+                trailer_ok = kv_response_state_skip_from_pos(fp);
+            }
+            if (trailer_ok) kv_tool_map_load_from_pos(s, fp, &wanted);
         }
         fclose(fp);
     }
@@ -9428,6 +10454,15 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         engine, exact_prefix, suffix_text, out);
 }
 
+static void build_prompt_from_exact_prefix_and_token_suffix(
+        const ds4_tokens *exact_prefix,
+        const ds4_tokens *suffix,
+        ds4_tokens *out)
+{
+    ds4_tokens_copy(out, exact_prefix);
+    for (int i = 0; suffix && i < suffix->len; i++) ds4_tokens_push(out, suffix->v[i]);
+}
+
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
 }
@@ -9451,7 +10486,6 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
 
 
 
-#ifdef DS4_SERVER_TEST
 static bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                     uint64_t text_bytes,
                                     uint64_t payload_bytes,
@@ -9462,7 +10496,6 @@ static bool kv_cache_file_size_fits(const kv_disk_cache *kc,
                                       tool_map_bytes, file_bytes_out,
                                       required_bytes_out);
 }
-#endif
 
 
 
@@ -9476,8 +10509,78 @@ static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
     return kv_tool_map_write((server *)ud, fp, text, written_bytes);
 }
 
+typedef struct {
+    server *server;
+    const response_state_entry *entry;
+} kv_response_state_trailer;
+
+static bool kv_response_state_trailer_size_cb(void *ud, const char *text,
+                                              uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    kv_response_state_trailer *trailer = ud;
+    uint64_t state_bytes = 0, tool_map_bytes = 0, total = 0;
+    if (!trailer || !trailer->server || !trailer->entry ||
+        !kv_response_state_section_size(trailer->entry, &state_bytes) ||
+        !kv_tool_map_serialized_size(trailer->server, text, &tool_map_bytes))
+    {
+        return false;
+    }
+    /* A zero-count map makes the trailer order unambiguous and lets normal KV
+     * loaders continue to restore any exact DSML mappings after the state part. */
+    if (tool_map_bytes == 0) tool_map_bytes = KV_TOOL_MAP_HEADER;
+    if (!kv_response_state_size_add(&total, state_bytes) ||
+        !kv_response_state_size_add(&total, tool_map_bytes))
+    {
+        return false;
+    }
+    if (bytes_out) *bytes_out = total;
+    return true;
+}
+
+static bool kv_response_state_write_empty_tool_map(FILE *fp) {
+    uint8_t header[KV_TOOL_MAP_HEADER] = {
+        KV_TOOL_MAP_MAGIC0, KV_TOOL_MAP_MAGIC1, KV_TOOL_MAP_MAGIC2,
+        KV_TOOL_MAP_VERSION, 0, 0, 0, 0,
+    };
+    return fwrite(header, 1, sizeof(header), fp) == sizeof(header);
+}
+
+static bool kv_response_state_trailer_write_cb(void *ud, FILE *fp,
+                                                const char *text,
+                                                uint64_t *written_bytes) {
+    if (written_bytes) *written_bytes = 0;
+    kv_response_state_trailer *trailer = ud;
+    if (!trailer || !trailer->server || !trailer->entry || !fp) return false;
+
+    buf section = {0};
+    if (!kv_response_state_build_section(trailer->entry, &section)) return false;
+    bool ok = fwrite(section.ptr, 1, section.len, fp) == section.len;
+    uint64_t tool_map_bytes = 0;
+    if (ok) ok = kv_tool_map_write(trailer->server, fp, text, &tool_map_bytes);
+    if (ok && tool_map_bytes == 0) {
+        ok = kv_response_state_write_empty_tool_map(fp);
+        tool_map_bytes = ok ? KV_TOOL_MAP_HEADER : 0;
+    }
+    if (ok && written_bytes) *written_bytes = section.len + tool_map_bytes;
+    buf_free(&section);
+    return ok;
+}
+
 static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
+    if (!kv_response_state_maybe_skip_from_pos(fp)) return 0;
     return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
+}
+
+static ds4_kvstore_trailer_hooks kv_cache_response_state_hooks(
+        kv_response_state_trailer *trailer, const stop_list *wanted) {
+    return (ds4_kvstore_trailer_hooks){
+        .ud = trailer,
+        .ext_flag = (uint8_t)(KV_EXT_RESPONSES_ID | KV_EXT_TOOL_MAP),
+        .serialized_size = kv_response_state_trailer_size_cb,
+        .write = kv_response_state_trailer_write_cb,
+        .load = kv_cache_tool_map_load_cb,
+        .load_wanted = wanted,
+    };
 }
 
 static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
@@ -9505,7 +10608,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
-                                                  tokens, store_len, reason,
+                                                  tokens, store_len, false, reason,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
@@ -9513,6 +10616,86 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
+}
+
+/* Response-id checkpoints must carry their validation metadata in the same
+ * atomic KV file as the saved model frontier. A restart can therefore rebuild
+ * the small index without replaying visible history or trusting a sidecar. */
+static bool kv_cache_store_response_state_prefix(server *s, server_slot *slot,
+                                                 const ds4_tokens *tokens,
+                                                 const response_state_entry *entry) {
+    if (!s || !slot || !tokens || !entry || !entry->checkpoint_key) return false;
+    char err[160] = {0};
+    kv_response_state_trailer trailer = {.server = s, .entry = entry};
+    ds4_kvstore_trailer_hooks hooks = kv_cache_response_state_hooks(&trailer, NULL);
+
+    /* Most session implementations can report the exact payload size without
+     * staging it. Reject a known-overbudget response checkpoint before copying
+     * a full KV image to the temporary staging file. Distributed sessions that
+     * cannot know the size yet still use the regular staged budget check. */
+    uint64_t trailer_bytes = 0;
+    if (!kv_response_state_trailer_size_cb(&trailer, entry->checkpoint_key,
+                                           &trailer_bytes)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: response-id checkpoint skipped tokens=%d because its trailer size is invalid",
+                   tokens->len);
+        return false;
+    }
+
+    pthread_mutex_lock(&s->inference_mu);
+    pthread_mutex_lock(&s->kv_mu);
+    const uint64_t payload_bytes = ds4_session_payload_bytes(slot->session);
+    bool fits = true;
+    if (payload_bytes != 0) {
+        uint64_t file_bytes = 0, required_bytes = 0;
+        fits = kv_cache_file_size_fits(&s->kv,
+                                       (uint64_t)strlen(entry->checkpoint_key),
+                                       payload_bytes, trailer_bytes,
+                                       &file_bytes, &required_bytes);
+        if (!fits) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: response-id checkpoint skipped tokens=%d because estimated file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB before staging",
+                       tokens->len,
+                       (double)file_bytes / (1024.0 * 1024.0),
+                       (double)required_bytes / (1024.0 * 1024.0),
+                       (double)s->kv.budget_bytes / (1024.0 * 1024.0));
+        }
+    }
+    bool ok = fits && ds4_kvstore_store_live_prefix_text(
+        &s->kv, s->engine, slot->session, tokens, tokens->len, false, "continued",
+        entry->checkpoint_key, KV_EXT_RESPONSES_ID, "responses-id",
+        &hooks, err, sizeof(err));
+    pthread_mutex_unlock(&s->kv_mu);
+    pthread_mutex_unlock(&s->inference_mu);
+    return ok;
+}
+
+/* A response id is published only after its final wire write succeeds. If the
+ * peer disconnects, discard a checkpoint staged for that unpublished id too. */
+static void kv_cache_discard_response_state_checkpoint(
+        server *s, const response_state_entry *entry) {
+    if (!s || !s->kv.enabled || !s->kv.dir || !entry ||
+        !entry->checkpoint_key || !entry->checkpoint_key[0] ||
+        !response_state_checkpoint_saved(s, entry))
+    {
+        return;
+    }
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(entry->checkpoint_key,
+                               strlen(entry->checkpoint_key), sha);
+    char *path = ds4_kvstore_path_for_sha(&s->kv, sha);
+    if (!path) return;
+    pthread_mutex_lock(&s->kv_mu);
+    if (unlink(path) == 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: response-id checkpoint discarded after client disconnect");
+    } else if (errno != ENOENT) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: response-id checkpoint cleanup failed: %s",
+                   strerror(errno));
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    free(path);
 }
 
 static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
@@ -9608,6 +10791,36 @@ static void kv_cache_slot_restore_suppressed(server_slot *slot,
     }
 }
 
+/* Response ids need their exact post-turn frontier, not merely the aligned
+ * prefix used by ordinary continued entries. Trigger that more expensive save
+ * only after crossing the same continued-cache boundary, and remember the
+ * attempted boundary before I/O so an oversized/failed checkpoint cannot be
+ * retried on every short response. */
+static int response_state_checkpoint_boundary(const server *s,
+                                              const server_slot *slot,
+                                              int live_tokens) {
+    if (!s || !slot) return 0;
+    return ds4_kvstore_continued_store_crossed_target(
+        &s->kv, slot->response_state_last_checkpoint_tokens, live_tokens);
+}
+
+static void response_state_note_checkpoint_attempt(server_slot *slot,
+                                                   int boundary) {
+    if (slot && boundary > slot->response_state_last_checkpoint_tokens)
+        slot->response_state_last_checkpoint_tokens = boundary;
+}
+
+static void response_state_reset_checkpoint_cadence(server_slot *slot) {
+    if (slot) slot->response_state_last_checkpoint_tokens = 0;
+}
+
+static void response_state_seed_checkpoint_cadence(server *s,
+                                                   server_slot *slot,
+                                                   int live_tokens) {
+    const int boundary = response_state_checkpoint_boundary(s, slot, live_tokens);
+    if (boundary > 0) response_state_note_checkpoint_attempt(slot, boundary);
+}
+
 static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
                                                 const char *path) {
     if (!s || !slot || !path) return;
@@ -9623,6 +10836,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
+    response_state_reset_checkpoint_cadence(slot);
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
@@ -9653,7 +10867,8 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
-                                  bool responses_protocol) {
+                                  bool responses_protocol,
+                                  uint8_t required_ext_flags) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
@@ -9663,7 +10878,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
-                                           &hooks, responses_protocol);
+                                           &hooks, responses_protocol, required_ext_flags);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
@@ -9682,7 +10897,66 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+                                  req && req->api == API_RESPONSES, 0);
+}
+
+/* Recreate one bounded state record directly from its opaque checkpoint key.
+ * This is deliberately lazy: a restarted server does O(1) work for the id a
+ * client actually resumes instead of scanning every retained KV payload. */
+static response_state_entry *response_state_read_checkpoint(server *s,
+                                                             const char *id) {
+    if (!s || !s->kv.enabled || !s->kv.dir || !id || !id[0] ||
+        strlen(id) > KV_RESPONSE_STATE_MAX_ID_BYTES)
+    {
+        return NULL;
+    }
+    size_t key_len = strlen("responses-id:") + strlen(id) + 1;
+    char *key = xmalloc(key_len);
+    snprintf(key, key_len, "responses-id:%s", id);
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(key, strlen(key), sha);
+    char *path = ds4_kvstore_path_for_sha(&s->kv, sha);
+
+    response_state_entry *entry = NULL;
+    pthread_mutex_lock(&s->kv_mu);
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        kv_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        bool valid = kv_read_header(fp, &hdr, &text_bytes) &&
+                     (hdr.ext_flags & KV_EXT_RESPONSES_ID) &&
+                     text_bytes == strlen(key) &&
+                     hdr.tokens > 0 && hdr.ctx_size <= (uint32_t)s->ctx_size &&
+                     (!s->engine || hdr.model_id == (uint8_t)ds4_engine_model_id(s->engine));
+        if (valid) {
+            char *text = xmalloc((size_t)text_bytes + 1);
+            valid = fread(text, 1, text_bytes, fp) == text_bytes;
+            text[text_bytes] = '\0';
+            valid = valid && !memcmp(text, key, text_bytes);
+            free(text);
+        }
+        if (valid && hdr.payload_bytes <= INT64_MAX &&
+            fseeko(fp, (off_t)hdr.payload_bytes, SEEK_CUR) == 0)
+        {
+            entry = kv_response_state_read_from_pos(fp, id, hdr.tokens);
+        }
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    free(path);
+    free(key);
+    return entry;
+}
+
+static response_state_entry *response_state_acquire_or_restore(server *s,
+                                                                const char *id) {
+    response_state_entry *entry = response_state_acquire(s, id);
+    if (entry || !s || !id || !id[0]) return entry;
+
+    response_state_entry *restored = response_state_read_checkpoint(s, id);
+    if (!restored) return NULL;
+    if (!response_state_insert(s, restored)) response_state_entry_free(restored);
+    return response_state_acquire(s, id);
 }
 
 static int live_text_prefix_prompt(server *s, server_slot *slot,
@@ -9738,6 +11012,69 @@ static int responses_live_continuation_prompt(server *s, server_slot *slot,
         s->engine, live_tokens, req->responses_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
+    return live_tokens->len;
+}
+
+/* previous_response_id continuation.
+ *
+ * A successful parser hit carries only the new Responses input as
+ * responses_state_tail_text.  Prefer the producer slot when its epoch still
+ * names exactly the saved frontier; otherwise restore the record's private
+ * disk checkpoint when the optional KV cache retained it. */
+static int responses_state_continuation_prompt(server *s, server_slot *slot,
+                                               const request *req, int live_pos,
+                                               ds4_tokens *effective_prompt,
+                                               int *disk_cached_out,
+                                               char **disk_path_out,
+                                               uint8_t *disk_ext_out) {
+    if (!s || !slot || !req || !effective_prompt || !req->responses_stateful ||
+        !req->responses_state || !req->responses_state_tail_text) return 0;
+    response_state_entry *entry = req->responses_state;
+    if (response_state_is_current(s, entry, slot, live_pos)) {
+        const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+        if (live_tokens && live_tokens->len == entry->live_tokens) {
+            build_prompt_from_exact_prefix_and_token_suffix(
+                live_tokens, &req->prompt, effective_prompt);
+            return live_tokens->len;
+        }
+    }
+
+    if (!response_state_checkpoint_saved(s, entry) ||
+        !entry->checkpoint_key || !entry->checkpoint_key[0] || !s->kv.enabled) return 0;
+
+    char *loaded_path = NULL;
+    uint8_t loaded_ext = 0;
+    int loaded = kv_cache_try_load_text(s, slot, entry->checkpoint_key, NULL,
+                                        &loaded_path, &loaded_ext, true,
+                                        KV_EXT_RESPONSES_ID);
+    bool exact = loaded == entry->live_tokens &&
+                 (loaded_ext & KV_EXT_RESPONSES_ID) != 0;
+    if (!exact) {
+        free(loaded_path);
+        if (loaded > 0) {
+            pthread_mutex_lock(&s->inference_mu);
+            ds4_session_invalidate(slot->session);
+            pthread_mutex_unlock(&s->inference_mu);
+        }
+        response_state_reset_checkpoint_cadence(slot);
+        return 0;
+    }
+    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    if (!live_tokens || live_tokens->len != entry->live_tokens) {
+        free(loaded_path);
+        response_state_reset_checkpoint_cadence(slot);
+        return 0;
+    }
+    build_prompt_from_exact_prefix_and_token_suffix(
+        live_tokens, &req->prompt, effective_prompt);
+    /* A restarted slot has no in-memory response cadence. Seed it from the
+     * checkpoint's crossed boundary so the next short response does not stage
+     * the same full payload again. */
+    response_state_seed_checkpoint_cadence(s, slot, entry->live_tokens);
+    if (disk_cached_out) *disk_cached_out = loaded;
+    if (disk_path_out) *disk_path_out = loaded_path;
+    else free(loaded_path);
+    if (disk_ext_out) *disk_ext_out = loaded_ext;
     return live_tokens->len;
 }
 
@@ -10862,11 +12199,12 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL, false, 0);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
+            response_state_reset_checkpoint_cadence(slot);
         }
 
         char sync_err[160] = {0};
@@ -11201,38 +12539,60 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
-    /* Responses gets the first chance to continue from live state.  This is
-     * the whole point of the API shape: a request that is bound to prior live
-     * output by visible transcript or tool call ids does not need to prove an
-     * exact token-prefix match.  Exact token/text/disk matching remains the
-     * fallback when the live state is absent or no longer describes the
-     * request. */
-    int cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                      &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    int disk_cached = 0;
+    char *disk_cache_path = NULL;
+    uint8_t disk_cache_ext_flags = 0;
+    bool responses_state_continuation = false;
+    /* A response id is a stronger binding than visible replay or a tool id:
+     * its record names the exact KV frontier and the parser supplied only the
+     * new tail.  Try it before any generic prefix matcher. */
+    int cached = responses_state_continuation_prompt(
+        s, slot, &j->req, old_pos, &effective_prompt,
+        &disk_cached, &disk_cache_path, &disk_cache_ext_flags);
+    const char *cache_source = cached > 0 ?
+        (disk_cached > 0 ? "responses-id-disk" : "responses-id") : "none";
     if (cached > 0) {
-        responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, slot,
-                                           &j->req.responses_live_call_ids,
-                                           old_pos))
-        {
-            responses_live_match_ids = j->req.responses_live_call_ids.len;
+        responses_state_continuation = true;
+        prompt_for_sync = &effective_prompt;
+    }
+    if (cached == 0 && j->req.responses_stateful) {
+        ds4_tokens_free(&effective_prompt);
+        free(disk_cache_path);
+        http_error(j->fd, s->enable_cors, 409,
+                   "previous_response_id is no longer available; replay the full input history");
+        return;
+    }
+    /* Responses gets the next chance to continue from existing visible/tool
+     * live state.  Exact token/text/disk matching remains the fallback for
+     * stateless replay and edited branches. */
+    if (cached == 0) {
+        cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
+                                                       &effective_prompt);
+        cache_source = cached > 0 ? "responses-visible" : "none";
+        if (cached > 0) {
+            responses_live_match = "visible-prefix";
+            if (responses_live_matches_request(s, slot,
+                                               &j->req.responses_live_call_ids,
+                                               old_pos))
+            {
+                responses_live_match_ids = j->req.responses_live_call_ids.len;
+            }
         }
     }
     if (cached == 0) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
-                                                    &responses_live_match_ids);
+                                                     &effective_prompt,
+                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
-    if (cached > 0) {
+    if (cached > 0 && !responses_state_continuation) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else {
+    } else if (cached == 0) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
-                                                    &anthropic_live_match_ids);
+                                                     &effective_prompt,
+                                                     &anthropic_live_match_ids);
         if (cached > 0) {
             anthropic_live_continuation = true;
             cache_source = "anthropic-tool-output";
@@ -11287,9 +12647,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    int disk_cached = 0;
-    char *disk_cache_path = NULL;
-    uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
@@ -11299,6 +12656,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* A partial in-memory hit retains only an older shared prefix and will
+     * replace the live suffix during synchronization. Its response-id
+     * checkpoint cadence belongs to the old branch, not the new one. The
+     * response-id path is exempt: its disk restore seeded the cadence from the
+     * exact state record above. */
+    if (cached > 0 && cached < old_pos && !responses_state_continuation) {
+        response_state_reset_checkpoint_cadence(slot);
+    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
@@ -11306,7 +12671,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) slot->continued_last_store_tokens = 0;
+    if (cached == 0) {
+        slot->continued_last_store_tokens = 0;
+        response_state_reset_checkpoint_cadence(slot);
+    }
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
@@ -11325,8 +12693,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
-        ((!strcmp(cache_source, "responses-visible") ||
-          !strcmp(cache_source, "responses-tool-output")) ||
+        (responses_state_continuation || responses_live_continuation ||
          (!strcmp(cache_source, "disk-text") &&
           (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
     const bool responses_visible_replay_without_reasoning =
@@ -11334,6 +12701,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    if (prompt_tokens >= s->ctx_size) {
+        ds4_tokens_free(&effective_prompt);
+        free(disk_cache_path);
+        http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req,
+                                           prompt_tokens, s->ctx_size);
+        return;
+    }
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -11496,6 +12870,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&effective_prompt);
         return;
     }
+    response_state_advance_slot_epoch(s, slot);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
@@ -11526,6 +12901,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)response_seq);
+    char responses_response_id[40] = {0};
+    if (j->req.api == API_RESPONSES) {
+        responses_new_response_id(s, responses_response_id, sizeof(responses_response_id));
+    }
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -11581,7 +12960,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
         if (responses_live_chat) {
-            responses_stream_init(&j->req, &responses_live);
+            responses_stream_init(&j->req, &responses_live, responses_response_id);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
                 job_mark_cancelled(j);
@@ -11871,6 +13250,7 @@ decode_again:
                 pthread_mutex_lock(&s->inference_mu);
                 ds4_session_invalidate(slot->session);
                 pthread_mutex_unlock(&s->inference_mu);
+                response_state_reset_checkpoint_cadence(slot);
                 stop_decode = true;
                 break;
             }
@@ -12160,7 +13540,8 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (strcmp(final_finish, "error") && strcmp(final_finish, "length") &&
+            !j->req.responses_stateful) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -12216,6 +13597,36 @@ decode_again:
     }
 
     bool response_ok = !job_cancelled(j);
+    response_state_entry *new_state = NULL;
+    /* Publish the state before the response id reaches the client, then keep
+     * the producer reference until the final write confirms the response was
+     * delivered. A failed write removes both the live entry and its checkpoint
+     * below, so a disconnected client cannot leave a continuation behind. */
+    if (response_ok && j->req.api == API_RESPONSES && responses_response_id[0] &&
+        strcmp(final_finish, "error"))
+    {
+        const ds4_tokens *response_tokens = ds4_session_tokens(slot->session);
+        new_state = response_tokens ?
+            response_state_remember(s, slot->id, response_tokens->len,
+                                    response_state_slot_epoch(s, slot), responses_response_id,
+                                    &j->req, &parsed_calls) : NULL;
+        if (new_state) {
+            bool checkpoint_saved = false;
+            const int checkpoint_boundary = response_tokens ?
+                response_state_checkpoint_boundary(s, slot, response_tokens->len) : 0;
+            if (checkpoint_boundary > 0) {
+                /* Note the boundary before staging. A disk-full or oversize
+                 * outcome is still an attempted cadence point, so the next
+                 * short response remains live-only instead of retrying a full
+                 * checkpoint synchronously. */
+                response_state_note_checkpoint_attempt(slot, checkpoint_boundary);
+                checkpoint_saved = kv_cache_store_response_state_prefix(
+                    s, slot, response_tokens, new_state);
+            }
+            response_state_set_checkpoint_saved(s, new_state, checkpoint_saved);
+        }
+    }
+    if (job_cancelled(j)) response_ok = false;
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -12256,7 +13667,8 @@ decode_again:
                                                &parsed_calls, final_finish,
                                                prompt_tokens, completion);
     } else if (response_ok && j->req.api == API_RESPONSES) {
-        response_ok = responses_final_response(j->fd, s->enable_cors, &j->req, id,
+        response_ok = responses_final_response(j->fd, s->enable_cors, &j->req,
+                                               responses_response_id,
                                                parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                                parsed_reasoning,
                                                &parsed_calls, final_finish,
@@ -12270,6 +13682,11 @@ decode_again:
     }
     if (job_cancelled(j)) response_ok = false;
     if (!response_ok) {
+        if (new_state) {
+            kv_cache_discard_response_state_checkpoint(s, new_state);
+            response_state_forget(s, new_state);
+            response_state_reset_checkpoint_cadence(slot);
+        }
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
@@ -12281,6 +13698,7 @@ decode_again:
                    req_flags[0] ? " " : "",
                    req_flags);
     }
+    if (new_state) response_state_release(s, new_state);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -12383,6 +13801,13 @@ static bool live_state_contains_all(const live_tool_state *state,
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
+    if (r->responses_stateful && r->responses_state &&
+        r->responses_state->indexed &&
+        r->responses_state->slot_id >= 0 &&
+        r->responses_state->slot_id < s->slot_count)
+    {
+        return r->responses_state->slot_id;
+    }
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (r->responses_requires_live_tool_state &&
@@ -12855,7 +14280,7 @@ static void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
-    if (request_exceeds_context(&req, ctx_size)) {
+    if (!req.responses_stateful && request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
         request_free(&req);
         goto done;
@@ -12946,6 +14371,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    int response_state_max_ids;
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
@@ -13020,6 +14446,7 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    response_state_index_free(&s->response_states);
     tool_memory_free(&s->tool_mem);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
@@ -13087,6 +14514,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .response_state_max_ids = DS4_RESPONSE_STATE_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -13181,6 +14609,8 @@ static server_config parse_options(int argc, char **argv) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--response-state-max-ids")) {
+            c.response_state_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -13382,6 +14812,7 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    s.response_states.max_entries = cfg.response_state_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
@@ -13610,6 +15041,13 @@ static void test_mixed_prefill_quantum_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
     TEST_ASSERT(defaults.mixed_prefill_quantum == 128);
+    TEST_ASSERT(defaults.response_state_max_ids == DS4_RESPONSE_STATE_DEFAULT_MAX_IDS);
+
+    char *response_state_argv[] = {
+        "ds4-server", "--response-state-max-ids", "32"
+    };
+    server_config response_state_cfg = parse_options(3, response_state_argv);
+    TEST_ASSERT(response_state_cfg.response_state_max_ids == 32);
 
     char *custom_argv[] = {
         "ds4-server", "--mixed-prefill-quantum", "2048"
@@ -14420,18 +15858,29 @@ static void test_responses_usage_reports_cache_details(void) {
     r.cache_read_tokens = 7;
     r.cache_write_tokens = 3;
 
+    server id_server = {0};
+    pthread_mutex_init(&id_server.tool_mu, NULL);
+    char response_id[40] = {0};
+    responses_new_response_id(&id_server, response_id, sizeof(response_id));
+    TEST_ASSERT(!strncmp(response_id, "resp_", 5));
+
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) {
+        pthread_mutex_destroy(&id_server.tool_mu);
         request_free(&r);
         return;
     }
 
-    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_usage", "OK", NULL, NULL,
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, response_id, "OK", NULL, NULL,
                                          "stop", 10, 2));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
+    char expected_response_id[64];
+    snprintf(expected_response_id, sizeof(expected_response_id),
+             "\"id\":\"%s\"", response_id);
+    TEST_ASSERT(strstr(out, expected_response_id) != NULL);
     TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":10") != NULL);
     TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
@@ -14445,18 +15894,20 @@ static void test_responses_usage_reports_cache_details(void) {
 
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) {
+        pthread_mutex_destroy(&id_server.tool_mu);
         request_free(&r);
         return;
     }
 
     responses_stream st;
-    responses_stream_init(&r, &st);
+    responses_stream_init(&r, &st, response_id);
     TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
                                         "stop", 10, 2, 1234));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
 
     TEST_ASSERT(strstr(out, "\"type\":\"response.completed\"") != NULL);
+    TEST_ASSERT(strstr(out, expected_response_id) != NULL);
     TEST_ASSERT(strstr(out, "\"usage\":{\"input_tokens\":10") != NULL);
     TEST_ASSERT(strstr(out, "\"input_tokens_details\":{") != NULL);
     TEST_ASSERT(strstr(out, "\"cached_tokens\":7") != NULL);
@@ -14468,6 +15919,7 @@ static void test_responses_usage_reports_cache_details(void) {
     responses_stream_free(&st);
     close(sv[0]);
     close(sv[1]);
+    pthread_mutex_destroy(&id_server.tool_mu);
     request_free(&r);
 }
 
@@ -16289,6 +17741,263 @@ static void test_responses_tool_output_id_validation(void) {
     chat_msgs_free(&msgs);
     live_tool_state_free(&slot.responses_live);
     pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_responses_response_state_index(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.response_states.max_entries = 2;
+
+    request base;
+    request_init(&base, REQ_CHAT, 128);
+    base.api = API_RESPONSES;
+    base.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    base.think_mode = DS4_THINK_HIGH;
+    base.has_tools = true;
+    base.cache_read_tokens = 77;
+    responses_request_set_state_config(&base, "system", "tools-v1", "tools-v1", false);
+    base.responses_state_fingerprint = response_state_fingerprint_values(
+        base.model_syntax, base.think_mode, base.has_tools,
+        base.responses_state_tool_choice_none, base.model,
+        base.responses_state_instructions, base.responses_state_request_tools,
+        base.responses_state_active_tools);
+
+    tool_calls calls = {0};
+    tool_call call = {
+        .id = xstrdup("call_saved"),
+        .name = xstrdup("exec"),
+        .arguments = xstrdup("{}"),
+    };
+    tool_calls_push(&calls, call);
+
+    response_state_entry *saved = response_state_remember(
+        &s, 2, 77, 9, "resp_saved", &base, &calls);
+    TEST_ASSERT(saved != NULL);
+    TEST_ASSERT(saved && saved->fingerprint == base.responses_state_fingerprint);
+    TEST_ASSERT(saved && saved->live_tokens == 77);
+    TEST_ASSERT(saved && saved->prompt_prefix_tokens == 77);
+    TEST_ASSERT(saved && saved->frontier_epoch == 9);
+    TEST_ASSERT(saved && !strcmp(saved->checkpoint_key, "responses-id:resp_saved"));
+
+    request follow;
+    request_init(&follow, REQ_CHAT, 128);
+    follow.api = API_RESPONSES;
+    follow.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    follow.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(response_state_config_matches(saved, &follow));
+    follow.responses_state_instructions_set = true;
+    responses_request_set_state_config(&follow, "edited", "", "", false);
+    TEST_ASSERT(!response_state_config_matches(saved, &follow));
+    follow.responses_state_instructions_set = false;
+    free(follow.model);
+    follow.model = xstrdup("other-model");
+    follow.model_from_request = true;
+    TEST_ASSERT(!response_state_config_matches(saved, &follow));
+    request_free(&follow);
+
+    chat_msgs delta = {0};
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("ok");
+    chat_msg_add_tool_call_id(&tool, "call_saved");
+    chat_msgs_push(&delta, tool);
+    char err[160] = {0};
+    TEST_ASSERT(responses_input_is_append_only(&delta));
+    TEST_ASSERT(responses_validate_state_tool_outputs(
+        &delta, response_state_call_ids(saved), err, sizeof(err)));
+    chat_msgs unbound = {0};
+    chat_msg unbound_tool = {0};
+    unbound_tool.role = xstrdup("tool");
+    unbound_tool.content = xstrdup("unbound");
+    chat_msgs_push(&unbound, unbound_tool);
+    err[0] = '\0';
+    TEST_ASSERT(!responses_validate_state_tool_outputs(
+        &unbound, response_state_call_ids(saved), err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "requires a call_id") != NULL);
+    chat_msgs_free(&unbound);
+    free(delta.v[0].tool_call_id);
+    delta.v[0].tool_call_id = xstrdup("call_edited");
+    err[0] = '\0';
+    TEST_ASSERT(!responses_validate_state_tool_outputs(
+        &delta, response_state_call_ids(saved), err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "edited branch") != NULL);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("replayed");
+    chat_msgs_push(&delta, assistant);
+    TEST_ASSERT(!responses_input_is_append_only(&delta));
+    chat_msgs_free(&delta);
+
+    server_slot slots[3] = {0};
+    slots[2].id = 2;
+    slots[2].frontier_epoch = 9;
+    s.slots = slots;
+    s.slot_count = 3;
+    TEST_ASSERT(response_state_is_current(&s, saved, &slots[2], 77));
+    slots[2].frontier_epoch++;
+    TEST_ASSERT(!response_state_is_current(&s, saved, &slots[2], 77));
+    slots[2].frontier_epoch--;
+    ds4_tokens prefix = {0}, tail = {0}, joined = {0};
+    ds4_tokens_push(&prefix, 7);
+    ds4_tokens_push(&prefix, 11);
+    ds4_tokens_push(&tail, 13);
+    ds4_tokens_push(&tail, 17);
+    build_prompt_from_exact_prefix_and_token_suffix(&prefix, &tail, &joined);
+    TEST_ASSERT(joined.len == 4);
+    TEST_ASSERT(joined.v[0] == 7 && joined.v[1] == 11 &&
+                joined.v[2] == 13 && joined.v[3] == 17);
+    ds4_tokens_free(&prefix);
+    ds4_tokens_free(&tail);
+    ds4_tokens_free(&joined);
+    job j = {0};
+    j.req.responses_stateful = true;
+    j.req.responses_state = saved;
+    pthread_mutex_lock(&s.tool_mu);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 2);
+    pthread_mutex_unlock(&s.tool_mu);
+    j.req.responses_state = NULL;
+
+    /* A response whose final write fails must not remain resumable while its
+     * producer still owns the pinned record. */
+    response_state_entry *abandoned = response_state_remember(
+        &s, 1, 88, 10, "resp_abandoned", &base, NULL);
+    TEST_ASSERT(abandoned != NULL);
+    response_state_forget(&s, abandoned);
+    TEST_ASSERT(response_state_acquire(&s, "resp_abandoned") == NULL);
+    response_state_release(&s, abandoned);
+
+    response_state_release(&s, saved);
+    response_state_entry *second = response_state_remember(
+        &s, 1, 88, 10, "resp_second", &base, NULL);
+    TEST_ASSERT(second != NULL);
+    response_state_release(&s, second);
+    response_state_entry *third = response_state_remember(
+        &s, 0, 99, 11, "resp_third", &base, NULL);
+    TEST_ASSERT(third != NULL);
+    response_state_release(&s, third);
+    TEST_ASSERT(response_state_acquire(&s, "resp_saved") == NULL);
+    response_state_entry *kept = response_state_acquire(&s, "resp_second");
+    TEST_ASSERT(kept != NULL);
+    response_state_release(&s, kept);
+
+    tool_calls_free(&calls);
+    request_free(&base);
+    response_state_index_free(&s.response_states);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_responses_response_state_checkpoint_trailer(void) {
+    server writer = {0};
+    pthread_mutex_init(&writer.tool_mu, NULL);
+
+    request base;
+    request_init(&base, REQ_CHAT, 128);
+    base.api = API_RESPONSES;
+    base.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    base.think_mode = DS4_THINK_HIGH;
+    base.has_tools = true;
+    base.cache_read_tokens = 123;
+    responses_request_set_state_config(&base, "system", "tools-v1", "tools-v1", false);
+    tool_schema_order order = {
+        .name = xstrdup("exec"),
+        .wire_name = xstrdup("shell"),
+        .namespace = xstrdup("local_"),
+    };
+    tool_schema_order_prop_push(&order, xstrdup("command"));
+    tool_schema_orders_push(&base.tool_orders, order);
+    tool_calls calls = {0};
+    tool_call call = {
+        .id = xstrdup("call_checkpoint"),
+        .name = xstrdup("exec"),
+        .arguments = xstrdup("{\"command\":\"pwd\"}"),
+    };
+    tool_calls_push(&calls, call);
+    response_state_entry *saved = response_state_make(
+        "resp_checkpoint", -1, 123, 0, &base, &calls);
+    TEST_ASSERT(saved != NULL);
+
+    char dir[] = "/tmp/ds4-response-state-XXXXXX";
+    TEST_ASSERT(mkdtemp(dir) != NULL);
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(saved->checkpoint_key,
+                               strlen(saved->checkpoint_key), sha);
+    ds4_kvstore disk = {.enabled = true, .dir = dir};
+    char *path = ds4_kvstore_path_for_sha(&disk, sha);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    uint8_t header[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(header, 0, 2, KV_REASON_CONTINUED,
+                             KV_EXT_RESPONSES_ID | KV_EXT_TOOL_MAP,
+                             (uint32_t)saved->live_tokens, 0, 256, 1, 1, 0);
+    uint8_t text_len[4];
+    le_put32(text_len, (uint32_t)strlen(saved->checkpoint_key));
+    TEST_ASSERT(fwrite(header, 1, sizeof(header), fp) == sizeof(header));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fwrite(saved->checkpoint_key, 1, strlen(saved->checkpoint_key), fp) ==
+                strlen(saved->checkpoint_key));
+    kv_response_state_trailer trailer = {.server = &writer, .entry = saved};
+    uint64_t trailer_bytes = 0;
+    TEST_ASSERT(kv_response_state_trailer_write_cb(
+        &trailer, fp, saved->checkpoint_key, &trailer_bytes));
+    TEST_ASSERT(trailer_bytes > KV_RESPONSE_STATE_HEADER + KV_TOOL_MAP_HEADER);
+    TEST_ASSERT(fclose(fp) == 0);
+
+    server restarted = {0};
+    restarted.ctx_size = 256;
+    restarted.kv.enabled = true;
+    restarted.kv.dir = xstrdup(dir);
+    pthread_mutex_init(&restarted.tool_mu, NULL);
+    pthread_mutex_init(&restarted.kv_mu, NULL);
+    response_state_entry *restored = response_state_acquire_or_restore(
+        &restarted, "resp_checkpoint");
+    TEST_ASSERT(restored != NULL);
+    TEST_ASSERT(restored && restored->checkpoint_saved);
+    TEST_ASSERT(restored && restored->slot_id == -1 && restored->live_tokens == 123);
+    TEST_ASSERT(restored && response_state_config_matches(restored, &base));
+    TEST_ASSERT(restored && id_list_contains(response_state_call_ids(restored),
+                                             "call_checkpoint"));
+    TEST_ASSERT(restored && restored->tool_orders.len == 1);
+    const tool_schema_order *restored_order = restored ?
+        tool_schema_orders_find(&restored->tool_orders, "exec") : NULL;
+    TEST_ASSERT(restored_order && !strcmp(restored_order->wire_name, "shell"));
+    TEST_ASSERT(restored_order && !strcmp(restored_order->namespace, "local_"));
+    TEST_ASSERT(restored_order && restored_order->len == 1 &&
+                !strcmp(restored_order->prop[0], "command"));
+    response_state_release(&restarted, restored);
+
+    response_state_index_free(&restarted.response_states);
+    pthread_mutex_destroy(&restarted.kv_mu);
+    pthread_mutex_destroy(&restarted.tool_mu);
+    free(restarted.kv.dir);
+    TEST_ASSERT(unlink(path) == 0);
+    TEST_ASSERT(rmdir(dir) == 0);
+    free(path);
+    response_state_entry_free(saved);
+    tool_calls_free(&calls);
+    request_free(&base);
+    pthread_mutex_destroy(&writer.tool_mu);
+}
+
+static void test_response_state_checkpoint_cadence(void) {
+    server s = {0};
+    server_slot slot = {0};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.min_tokens = 512;
+    s.kv.opt.continued_interval_tokens = 8192;
+    s.kv.opt.boundary_align_tokens = 2048;
+
+    const int first = response_state_checkpoint_boundary(&s, &slot, 8198);
+    TEST_ASSERT(first == 8192);
+    response_state_note_checkpoint_attempt(&slot, first);
+    TEST_ASSERT(slot.response_state_last_checkpoint_tokens == 8192);
+    TEST_ASSERT(response_state_checkpoint_boundary(&s, &slot, 8200) == 0);
+    TEST_ASSERT(response_state_checkpoint_boundary(&s, &slot, 16383) == 0);
+    TEST_ASSERT(response_state_checkpoint_boundary(&s, &slot, 16384) == 16384);
+
+    response_state_reset_checkpoint_cadence(&slot);
+    response_state_seed_checkpoint_cadence(&s, &slot, 8198);
+    TEST_ASSERT(slot.response_state_last_checkpoint_tokens == 8192);
 }
 
 static void test_responses_stateless_tool_replay_requires_reasoning(void) {
@@ -18378,6 +20087,9 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();
+    test_responses_response_state_index();
+    test_responses_response_state_checkpoint_trailer();
+    test_response_state_checkpoint_cadence();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();

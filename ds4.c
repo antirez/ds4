@@ -36903,6 +36903,11 @@ struct ds4_engine {
      * caller that doesn't set the option observe the prior behavior). */
     int            placement_ctx_hint;
     int            placement_session_count_hint;
+#ifdef DS4_TEST_HOOKS
+    /* Test tokenizer fixtures have no routed tensors but still need to drive
+     * disk-KV policy that is normally selected from the model quantization. */
+    int test_routed_quant_bits;
+#endif
 };
 
 static uint64_t ds4_engine_dynamic_expert_cache_bytes(
@@ -37910,6 +37915,61 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
+
+#ifdef DS4_TEST_HOOKS
+/* Build only the tokenizer state needed by server/parser tests.  Each raw byte
+ * maps to its GPT-2 byte-encoding token, while synthetic special-token IDs make
+ * rendered chat delimiters take the same fast path as a loaded model tokenizer. */
+ds4_engine *ds4_test_engine_create_byte_tokenizer(void) {
+    enum { TEST_BYTE_TOKENS = 256, TEST_SPECIAL_FIRST = 256 };
+    ds4_engine *e = xcalloc(1, sizeof(*e));
+    e->backend = DS4_BACKEND_CPU;
+    e->test_routed_quant_bits = 2;
+    ds4_vocab *vocab = &e->vocab;
+    vocab->n_vocab = TEST_SPECIAL_FIRST + 20;
+    vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    table_init(&vocab->token_to_id, TEST_BYTE_TOKENS);
+    table_init(&vocab->merge_rank, 0);
+    for (int i = 0; i < TEST_BYTE_TOKENS; i++) {
+        char encoded[5];
+        char *end = encoded;
+        utf8_put(&end, gpt2_byte_to_codepoint((uint8_t)i));
+        size_t len = (size_t)(end - encoded);
+        char *owned = xmalloc(len + 1);
+        memcpy(owned, encoded, len);
+        owned[len] = '\0';
+        vocab->token[i] = (ds4_str){.ptr = owned, .len = len};
+        table_put(&vocab->token_to_id, vocab->token[i], i);
+    }
+    int special = TEST_SPECIAL_FIRST;
+    vocab->bos_id = special++;
+    vocab->eos_id = special++;
+    vocab->system_id = special++;
+    vocab->user_id = special++;
+    vocab->assistant_id = special++;
+    vocab->observation_id = special++;
+    vocab->sop_id = special++;
+    vocab->think_start_id = special++;
+    vocab->think_end_id = special++;
+    vocab->tool_call_start_id = special++;
+    vocab->tool_call_end_id = special++;
+    vocab->tool_response_start_id = special++;
+    vocab->tool_response_end_id = special++;
+    vocab->arg_key_start_id = special++;
+    vocab->arg_key_end_id = special++;
+    vocab->arg_value_start_id = special++;
+    vocab->arg_value_end_id = special++;
+    vocab->dsml_id = special++;
+    return e;
+}
+
+void ds4_test_engine_free_byte_tokenizer(ds4_engine *e) {
+    if (!e) return;
+    for (int i = 0; i < 256; i++) free((void *)e->vocab.token[i].ptr);
+    vocab_free(&e->vocab);
+    free(e);
+}
+#endif
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     chat_push_bos_sequence(&e->vocab, tokens);
@@ -49336,7 +49396,34 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+#ifdef DS4_TEST_HOOKS
+    bool test_token_only;
+    uint64_t test_payload_bytes;
+    uint64_t test_payload_save_count;
+#endif
 };
+
+#ifdef DS4_TEST_HOOKS
+ds4_session *ds4_test_session_create_token_only(ds4_engine *e, int ctx_size) {
+    if (!e || ctx_size <= 1) return NULL;
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->ctx_size = ctx_size;
+    s->prefill_cap = (uint32_t)ctx_size;
+    s->test_token_only = true;
+    return s;
+}
+
+bool ds4_test_session_set_payload_bytes(ds4_session *s, uint64_t bytes) {
+    if (!s || !s->test_token_only) return false;
+    s->test_payload_bytes = bytes;
+    return true;
+}
+
+uint64_t ds4_test_session_payload_save_count(const ds4_session *s) {
+    return s && s->test_token_only ? s->test_payload_save_count : 0;
+}
+#endif
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -50943,6 +51030,10 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+#ifdef DS4_TEST_HOOKS
+    if (e->test_routed_quant_bits == 2 || e->test_routed_quant_bits == 4)
+        return e->test_routed_quant_bits;
+#endif
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -51123,8 +51214,115 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 }
 #endif
 
+#ifdef DS4_TEST_HOOKS
+/* The server ingress fixture needs a real restartable payload so its disk-cache
+ * path copies the same byte volume as a production checkpoint. Keep this
+ * format private to the token-only fixture: it preserves exact tokens but has
+ * no model tensors or logits. */
+#define DS4_TEST_TOKEN_ONLY_PAYLOAD_MAGIC UINT32_C(0x54534b56)
+#define DS4_TEST_TOKEN_ONLY_PAYLOAD_VERSION UINT32_C(1)
+#define DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS 4u
+
+static uint64_t ds4_test_token_only_payload_size(const ds4_session *s) {
+    if (!s || !s->test_token_only || !s->checkpoint_valid ||
+        s->checkpoint.len < 0)
+        return 0;
+    const uint64_t token_bytes = (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    const uint64_t header_bytes =
+        (uint64_t)DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    if (token_bytes > UINT64_MAX - header_bytes) return 0;
+    const uint64_t minimum = header_bytes + token_bytes;
+    return s->test_payload_bytes > minimum ? s->test_payload_bytes : minimum;
+}
+
+static int ds4_test_save_token_only_payload(ds4_session *s, FILE *fp,
+                                            char *err, size_t errlen) {
+    const uint64_t payload_bytes = ds4_test_token_only_payload_size(s);
+    if (!payload_bytes || !fp || s->checkpoint.len >= s->ctx_size) {
+        payload_set_err(err, errlen, "invalid token-only session payload");
+        return 1;
+    }
+    s->test_payload_save_count++;
+    const uint32_t header[DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS] = {
+        DS4_TEST_TOKEN_ONLY_PAYLOAD_MAGIC,
+        DS4_TEST_TOKEN_ONLY_PAYLOAD_VERSION,
+        (uint32_t)s->ctx_size,
+        (uint32_t)s->checkpoint.len,
+    };
+    for (uint32_t i = 0; i < DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0)
+            return 1;
+    }
+
+    const uint64_t written =
+        (uint64_t)DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+        (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    static const uint8_t zeroes[4096];
+    uint64_t padding = payload_bytes - written;
+    while (padding != 0) {
+        const size_t n = padding > sizeof(zeroes) ? sizeof(zeroes) : (size_t)padding;
+        if (payload_write_bytes(fp, zeroes, n, err, errlen) != 0) return 1;
+        padding -= n;
+    }
+    return 0;
+}
+
+static int ds4_test_load_token_only_payload(ds4_session *s, FILE *fp,
+                                            uint64_t payload_bytes,
+                                            char *err, size_t errlen) {
+    if (!s || !fp || payload_bytes <
+        (uint64_t)DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS * sizeof(uint32_t))
+    {
+        payload_set_err(err, errlen, "truncated token-only session payload");
+        return 1;
+    }
+    uint64_t remaining = payload_bytes;
+    uint32_t header[DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS];
+    for (uint32_t i = 0; i < DS4_TEST_TOKEN_ONLY_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_read_u32(fp, &header[i], &remaining, err, errlen) != 0) return 1;
+    }
+    const uint32_t saved_tokens = header[3];
+    const uint64_t token_bytes = (uint64_t)saved_tokens * sizeof(uint32_t);
+    if (header[0] != DS4_TEST_TOKEN_ONLY_PAYLOAD_MAGIC ||
+        header[1] != DS4_TEST_TOKEN_ONLY_PAYLOAD_VERSION ||
+        header[2] > (uint32_t)s->ctx_size ||
+        saved_tokens >= (uint32_t)s->ctx_size || token_bytes > remaining)
+    {
+        payload_set_err(err, errlen, "invalid token-only session payload");
+        return 1;
+    }
+
+    s->checkpoint.len = 0;
+    for (uint32_t i = 0; i < saved_tokens; i++) {
+        uint32_t token = 0;
+        if (payload_read_u32(fp, &token, &remaining, err, errlen) != 0) return 1;
+        if (!s->engine || token >= (uint32_t)s->engine->vocab.n_vocab) {
+            payload_set_err(err, errlen, "token-only payload token is outside vocabulary");
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, (int)token);
+    }
+    if (remaining != 0) {
+        uint8_t discard[4096];
+        if (payload_skip_bytes(fp, remaining, discard, sizeof(discard),
+                               &remaining, err, errlen) != 0)
+            return 1;
+    }
+    s->test_payload_bytes = payload_bytes;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return 0;
+}
+#endif
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only) return ds4_test_token_only_payload_size(s);
+#endif
     if (s->distributed) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -51255,6 +51453,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only) return ds4_test_save_token_only_payload(s, fp, err, errlen);
+#endif
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
@@ -51564,6 +51765,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only)
+        return ds4_test_load_token_only_payload(s, fp, payload_bytes, err, errlen);
+#endif
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -59836,6 +60041,22 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only) {
+        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+            }
+        } else {
+            ds4_tokens_copy(&s->checkpoint, prompt);
+        }
+        s->checkpoint_valid = true;
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
+        return 0;
+    }
+#endif
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
@@ -60743,6 +60964,9 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+#ifdef DS4_TEST_HOOKS
+    if (s && s->test_token_only) return 'A';
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -61462,6 +61686,18 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+#ifdef DS4_TEST_HOOKS
+    if (s->test_token_only) {
+        if (s->checkpoint.len >= s->ctx_size - 1) {
+            if (errlen) snprintf(err, errlen, "test session context reached");
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
