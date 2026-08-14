@@ -28,6 +28,7 @@ extern "C" {
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
+void ds4_mmq_cleanup(void);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
@@ -570,6 +571,17 @@ int ds4_mmq_q8_0_aligned_dense_vec(
     float       * out_f32,
     int           M,
     int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q8_0_aligned_dense_pair_vec(
+    const void  * W0_aligned,
+    const void  * W1_aligned,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
     int           K,
     cudaStream_t  stream);
 
