@@ -62185,8 +62185,12 @@ static int ds4_sessions_eval_batch_metal(
     }
     bool native_shared = false;
     bool native_qkv = false;
+    /* SSD streaming's expert-cache slabs are process-global mutable state,
+     * so concurrently executing streams must not share them: keep streaming
+     * configurations on the single-queue path. */
     const bool stream_overlap =
         overlap_all_deepseek && !e->tp.active && !mirror && count > 1 &&
+        !e->ssd_streaming &&
         getenv("DS4_METAL_NO_STREAM_OVERLAP") == NULL;
     bool ok = true;
     if (stream_overlap) {
