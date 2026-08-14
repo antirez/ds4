@@ -20,6 +20,24 @@ static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
+
+/* Decode-island graph capture stream indirection.  While a HIP graph
+ * capture is in flight, every kernel launch and stream-wait in this
+ * backend must target the capture stream instead of the legacy default
+ * stream (which cannot be captured).  ds4_rocm_stream() returns the
+ * capture stream during capture and the legacy stream otherwise, so
+ * eager launches behave exactly as before.  The whole backend compiles
+ * into one translation unit, so a file-scope static is a single
+ * instance; the setter is exported for the API-glue TU
+ * (ds4_rocm_compat.cu), which owns the graph state machine. */
+static hipStream_t g_ds4_rocm_capture_stream = (hipStream_t)0;
+static inline hipStream_t ds4_rocm_stream(void) {
+    return g_ds4_rocm_capture_stream;
+}
+extern "C" void ds4_rocm_set_capture_stream(void *stream) {
+    g_ds4_rocm_capture_stream = (hipStream_t)stream;
+}
+
 static int g_quality_mode;
 static int g_glm_model;
 
@@ -876,7 +894,7 @@ static int cuda_stream_selected_wait_upload_ready(void) {
     if (!g_stream_selected_upload_event_pending) return 1;
 #ifdef __HIP_PLATFORM_AMD__
     cudaError_t err =
-        hipStreamWaitEvent(0, g_stream_selected_upload_ready_event, 0);
+        hipStreamWaitEvent(ds4_rocm_stream(), g_stream_selected_upload_ready_event, 0);
 #else
     cudaError_t err =
         cudaStreamWaitEvent(0, g_stream_selected_upload_ready_event, 0);
@@ -972,7 +990,7 @@ static int cuda_stream_batch_selected_wait_upload_ready(void) {
     if (!g_stream_batch_selected_upload_event_pending) return 1;
 #ifdef __HIP_PLATFORM_AMD__
     cudaError_t err =
-        hipStreamWaitEvent(0, g_stream_batch_selected_upload_ready_event, 0);
+        hipStreamWaitEvent(ds4_rocm_stream(), g_stream_batch_selected_upload_ready_event, 0);
 #else
     cudaError_t err =
         cudaStreamWaitEvent(0, g_stream_batch_selected_upload_ready_event, 0);
@@ -5078,7 +5096,7 @@ static const __half *cuda_q8_f16_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(dev,
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256, 0, ds4_rocm_stream()>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,
@@ -5133,7 +5151,7 @@ static const __half *cuda_q8_f16_transpose_ptr(
     }
     const uint64_t blocks = (in_dim + 31u) / 32u;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_transpose_kernel<<<(n + 255u) / 256u, 256>>>(dev,
+    dequant_q8_0_to_f16_transpose_kernel<<<(n + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(dev,
                                                                      (const unsigned char *)q8,
                                                                      in_dim,
                                                                      out_dim,
@@ -6017,7 +6035,7 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
-    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+    fill_f32_kernel<<<(count + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>((float *)tensor->ptr, count, value);
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 

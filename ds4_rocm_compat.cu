@@ -16,12 +16,244 @@ static int rocm_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;
 }
 
-/* Decode-island graph capture is CUDA-only for now; ROCm decodes eagerly. */
-extern "C" int ds4_gpu_decode_graphs_supported(void) { return 0; }
-extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
-extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
-extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
-extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
+/* ------------------------------------------------------------------------
+ * Decode-island HIP graph capture.  Port of the CUDA implementation in
+ * ds4_cuda.cu (design from the Entrpi/ds4 batched-serving fork): the
+ * position-independent islands of a decode layer are captured once per
+ * buffer-alias key and replayed afterwards.  A replayed graph re-runs
+ * the captured kernels byte-for-byte, so replay output is bit-identical
+ * to the eager encode it recorded; any capture failure retires the
+ * entry and the island runs eagerly, also byte-identical to before.
+ *
+ * Stream handling mirrors CUDA: kernels normally launch on the legacy
+ * default stream, which cannot be captured, so every launch site in the
+ * backend goes through ds4_rocm_stream(), which returns the capture
+ * stream while g_rocm_decode_graph_capturing is set.
+ */
+#define ROCM_DECODE_GRAPH_LAYERS   64u
+#define ROCM_DECODE_GRAPH_ISLANDS  4u
+#define ROCM_DECODE_GRAPH_VARIANTS 8u
+
+struct rocm_decode_graph_entry {
+    ds4_decode_graph_key key;
+    hipGraphExec_t       exec;
+    int                  state;   /* 0 empty, 1 warmed, 2 ready, 3 dead */
+    uint64_t             hits;
+};
+
+static rocm_decode_graph_entry
+    g_rocm_decode_graphs[ROCM_DECODE_GRAPH_LAYERS][ROCM_DECODE_GRAPH_ISLANDS]
+                        [ROCM_DECODE_GRAPH_VARIANTS];
+static hipStream_t g_rocm_decode_graph_stream = NULL;
+static int g_rocm_decode_graph_capturing = 0;
+static uint64_t g_rocm_decode_graph_replays = 0;
+static uint64_t g_rocm_decode_graph_captures = 0;
+
+extern "C" void ds4_rocm_set_capture_stream(void *stream);
+
+/* Island policy: islands 0/1 are the upstream eval-path islands
+ * (TO_QKV and FROM_ATTN_TO_FFN); island 2 is the speculative span's
+ * batched attention-output stage (C2), island 3 is the span's shared
+ * expert tail (stages D+E).  Live measurements on gfx1151 (MTP draft-2
+ * verify path): the small eval islands replay SLOWER than eager (rounds
+ * 91.0 -> 92.7 ms), and islands 2/3 replay byte-exact (SHA-gated) but
+ * time-neutral (91.1 ms) -- their 60-240 us kernels already hide launch
+ * latency, so the ~11 ms/span launch feed lives in the tiny per-row
+ * chains: position-dependent stages A/B and the per-row router/MoE
+ * stage C3, which is capture-unsafe (deterministic divergence with all
+ * buffer pointers keyed; cause not isolated).  The machinery is kept
+ * because capturing the small-op chains becomes attractive once they
+ * are rows-batched and position-indirect; until then it is dormant, so
+ * so the default is OFF (measured-neutral today) and the machinery is
+ * staged infrastructure: DS4_ROCM_DECODE_GRAPHS=span captures islands
+ * 2+, =all also captures the eval islands. */
+#define ROCM_DECODE_GRAPH_MODE_OFF  0
+#define ROCM_DECODE_GRAPH_MODE_SPAN 1
+#define ROCM_DECODE_GRAPH_MODE_ALL  2
+static int g_rocm_decode_graph_mode = ROCM_DECODE_GRAPH_MODE_OFF;
+
+extern "C" int ds4_gpu_decode_graphs_supported(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_ROCM_DECODE_GRAPHS");
+        if (s && (strcmp(s, "span") == 0 || strcmp(s, "SPAN") == 0)) {
+            g_rocm_decode_graph_mode = ROCM_DECODE_GRAPH_MODE_SPAN;
+        } else if (s && (strcmp(s, "all") == 0 || strcmp(s, "ALL") == 0)) {
+            g_rocm_decode_graph_mode = ROCM_DECODE_GRAPH_MODE_ALL;
+        } else {
+            g_rocm_decode_graph_mode = ROCM_DECODE_GRAPH_MODE_OFF;
+        }
+        enabled = g_rocm_decode_graph_mode != ROCM_DECODE_GRAPH_MODE_OFF;
+        if (enabled)
+            fprintf(stderr, "ds4: DS4_ROCM_DECODE_GRAPHS=%s - decode graph capture mode %d\n",
+                    s, g_rocm_decode_graph_mode);
+    }
+    return enabled && g_n_gpus == 1;
+}
+
+static void rocm_decode_graph_entry_kill(rocm_decode_graph_entry *e) {
+    if (e->exec) {
+        (void)hipGraphExecDestroy(e->exec);
+        e->exec = NULL;
+    }
+    e->state = 3;
+}
+
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
+    for (uint32_t il = 0; il < ROCM_DECODE_GRAPH_LAYERS; il++) {
+        for (uint32_t is = 0; is < ROCM_DECODE_GRAPH_ISLANDS; is++) {
+            for (uint32_t v = 0; v < ROCM_DECODE_GRAPH_VARIANTS; v++) {
+                rocm_decode_graph_entry *e = &g_rocm_decode_graphs[il][is][v];
+                if (e->exec) {
+                    (void)hipGraphExecDestroy(e->exec);
+                    e->exec = NULL;
+                }
+                e->state = 0;
+                e->hits = 0;
+                memset(&e->key, 0, sizeof(e->key));
+            }
+        }
+    }
+}
+
+static rocm_decode_graph_entry *rocm_decode_graph_find(
+        const ds4_decode_graph_key *key) {
+    if (key->il >= ROCM_DECODE_GRAPH_LAYERS ||
+        key->island >= ROCM_DECODE_GRAPH_ISLANDS) return NULL;
+    rocm_decode_graph_entry *slot = NULL;
+    for (uint32_t v = 0; v < ROCM_DECODE_GRAPH_VARIANTS; v++) {
+        rocm_decode_graph_entry *e = &g_rocm_decode_graphs[key->il][key->island][v];
+        if (e->state != 0 &&
+            memcmp(&e->key, key, sizeof(*key)) == 0) return e;
+        if (e->state == 0 && !slot) slot = e;
+    }
+    if (slot) {
+        memcpy(&slot->key, key, sizeof(*key));
+        slot->state = 0;   /* caller advances the state machine */
+        return slot;
+    }
+    return NULL;           /* all variants busy with other keys: stay eager */
+}
+
+extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
+    if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
+    if (g_rocm_decode_graph_mode != ROCM_DECODE_GRAPH_MODE_ALL &&
+        key->island < 2u) return -1;   /* eval islands: measured net-negative */
+    if (g_rocm_decode_graph_capturing) return -1;   /* no nesting */
+    rocm_decode_graph_entry *e = rocm_decode_graph_find(key);
+    if (!e || e->state == 3) return -1;
+    if (e->state == 0) {
+        /* Warm pass: run eagerly once so lazy allocators (tmp scratch,
+         * hipBLASLt workspaces) reach steady-state sizes before capture. */
+        e->state = 1;
+        return -1;
+    }
+    if (e->state == 2) {
+        /* Replay on the legacy default stream: the captured chain is
+         * single-stream, so it executes in order against the surrounding
+         * eager work with no cross-stream sync edges.  (Replaying on the
+         * capture stream raced the eager producers in live tests.) */
+        hipError_t err = hipGraphLaunch(e->exec, (hipStream_t)0);
+        if (err != hipSuccess) {
+            fprintf(stderr, "ds4: decode graph replay failed (il=%u island=%u): %s\n",
+                    key->il, key->island, hipGetErrorString(err));
+            (void)hipGetLastError();
+            rocm_decode_graph_entry_kill(e);
+            return -1;     /* caller encodes eagerly; nothing was consumed */
+        }
+        e->hits++;
+        g_rocm_decode_graph_replays++;
+        return 1;
+    }
+    /* state == 1: capture this encode. */
+    if (!g_rocm_decode_graph_stream) {
+        /* Blocking flag (no hipStreamNonBlocking): the legacy default
+         * stream implicitly serializes with blocking streams, so graph
+         * replays on this stream stay ordered against the surrounding
+         * eager work that still launches on the legacy stream. */
+        if (hipStreamCreate(&g_rocm_decode_graph_stream) != hipSuccess) {
+            g_rocm_decode_graph_stream = NULL;
+            rocm_decode_graph_entry_kill(e);
+            return -1;
+        }
+    }
+    if (hipStreamBeginCapture(g_rocm_decode_graph_stream,
+                              hipStreamCaptureModeGlobal) != hipSuccess) {
+        (void)hipGetLastError();
+        rocm_decode_graph_entry_kill(e);
+        return -1;
+    }
+    g_rocm_decode_graph_capturing = 1;
+    ds4_rocm_set_capture_stream(g_rocm_decode_graph_stream);
+    return 0;
+}
+
+extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
+    if (!key || !g_rocm_decode_graph_capturing) return -1;
+    g_rocm_decode_graph_capturing = 0;
+    ds4_rocm_set_capture_stream(NULL);
+    hipGraph_t graph = NULL;
+    hipError_t err = hipStreamEndCapture(g_rocm_decode_graph_stream, &graph);
+    rocm_decode_graph_entry *e = rocm_decode_graph_find(key);
+    if (err != hipSuccess || graph == NULL) {
+        fprintf(stderr, "ds4: decode graph capture failed (il=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGetLastError();
+        if (graph) (void)hipGraphDestroy(graph);
+        if (e) rocm_decode_graph_entry_kill(e);
+        return -1;         /* caller re-encodes the island eagerly */
+    }
+    if (!e) {              /* cannot happen: begin() found it */
+        (void)hipGraphDestroy(graph);
+        return -1;
+    }
+    hipGraphExec_t exec = NULL;
+    err = hipGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    (void)hipGraphDestroy(graph);
+    if (err != hipSuccess || exec == NULL) {
+        fprintf(stderr, "ds4: decode graph instantiate failed (il=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGetLastError();
+        rocm_decode_graph_entry_kill(e);
+        return -1;
+    }
+    /* Capture recorded the work without executing it: launch now so this
+     * token's island actually runs.  Legacy stream, same as replays. */
+    err = hipGraphLaunch(exec, (hipStream_t)0);
+    if (err != hipSuccess) {
+        fprintf(stderr, "ds4: decode graph first launch failed (il=%u island=%u): %s\n",
+                key->il, key->island, hipGetErrorString(err));
+        (void)hipGetLastError();
+        (void)hipGraphExecDestroy(exec);
+        rocm_decode_graph_entry_kill(e);
+        return -1;
+    }
+    e->exec = exec;
+    e->state = 2;
+    g_rocm_decode_graph_captures++;
+    if (getenv("DS4_ROCM_DECODE_GRAPH_LOG") != NULL) {
+        fprintf(stderr, "ds4: decode graph captured il=%u island=%u (total %llu)\n",
+                key->il, key->island,
+                (unsigned long long)g_rocm_decode_graph_captures);
+    }
+    return 0;
+}
+
+extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
+    if (!g_rocm_decode_graph_capturing) return;
+    g_rocm_decode_graph_capturing = 0;
+    ds4_rocm_set_capture_stream(NULL);
+    hipGraph_t graph = NULL;
+    (void)hipStreamEndCapture(g_rocm_decode_graph_stream, &graph);
+    if (graph) (void)hipGraphDestroy(graph);
+    (void)hipGetLastError();
+    if (key) {
+        rocm_decode_graph_entry *e = rocm_decode_graph_find(key);
+        if (e) rocm_decode_graph_entry_kill(e);
+    }
+}
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus != 1) {

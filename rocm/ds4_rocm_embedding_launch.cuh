@@ -10,7 +10,7 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255u) / 256u, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    embed_token_hc_kernel<<<(n + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -38,7 +38,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
-    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
+    embed_tokens_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_rocm_stream()>>>(
         (float *)out_hc->ptr,
         (const int32_t *)tokens_t->ptr,
         (const __half *)wptr,
@@ -68,7 +68,7 @@ extern "C" int ds4_gpu_embed_token_hc_q8_0_tensor(
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd_q8_0");
     if (!wptr) return 0;
     const uint64_t n = (uint64_t)n_embd * n_hc;
-    embed_token_hc_q8_0_kernel<<<(n + 255u) / 256u, 256>>>(
+    embed_token_hc_q8_0_kernel<<<(n + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(
             (float *)out_hc->ptr,
             (const unsigned char *)wptr,
             token,
@@ -101,7 +101,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_q8_0_tensor(
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd_q8_0");
     if (!wptr) return 0;
-    embed_tokens_hc_q8_0_kernel<<<(n + 255u) / 256u, 256>>>(
+    embed_tokens_hc_q8_0_kernel<<<(n + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(
             (float *)out_hc->ptr,
             (const int32_t *)tokens_t->ptr,
             (const unsigned char *)wptr,

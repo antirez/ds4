@@ -1,7 +1,7 @@
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(a, n) || !cuda_tensor_has_f32(b, n)) return 0;
     if (n == 0u) return 1;
-    add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    add_kernel<<<(n + 255) / 256, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "add launch");
 }
 
@@ -24,7 +24,7 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
     }
     const uint64_t blocks = (out_elems + 255u) / 256u;
     if (blocks > UINT32_MAX) return 0;
-    pack_slot_rows_f32_kernel<<<(unsigned)blocks, 256>>>(
+    pack_slot_rows_f32_kernel<<<(unsigned)blocks, 256, 0, ds4_rocm_stream()>>>(
             (float *)out->ptr,
             (const float *)slots->ptr,
             n_rows,
@@ -47,7 +47,7 @@ extern "C" int ds4_gpu_add3_tensor(
         return 0;
     }
     if (n == 0u) return 1;
-    add3_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr,
+    add3_kernel<<<(n + 255) / 256, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr,
                                           (const float *)a->ptr,
                                           (const float *)b->ptr,
                                           (const float *)c->ptr,
@@ -71,7 +71,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 
     uint32_t nth = 256u;
     while (nth > width && nth > 1u) nth >>= 1;
-    directional_steering_project_kernel<<<rows, nth>>>(
+    directional_steering_project_kernel<<<rows, nth, 0, ds4_rocm_stream()>>>(
             (float *)x->ptr,
             (const float *)directions->ptr,
             layer,

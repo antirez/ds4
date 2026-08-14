@@ -1,7 +1,7 @@
 extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(gate, n) || !cuda_tensor_has_f32(up, n)) return 0;
     if (n == 0u) return 1;
-    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+    swiglu_kernel<<<(n + 255) / 256, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
@@ -44,7 +44,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         const unsigned rows_per_block = 32u;
         shared_gate_up_swiglu_q8_0_rows_w32_kernel<<<
                 (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
-                rows_per_block * 32u>>>(
+                rows_per_block * 32u, 0, ds4_rocm_stream()>>>(
                 (float *)gate->ptr,
                 (float *)up->ptr,
                 (float *)mid->ptr,
@@ -429,7 +429,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
     const size_t shmem = (size_t)tile * block_tile * 32u * sizeof(float);
     const int store_gate_up = (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
 #define DS4_LAUNCH_SHARED_GU_BATCH(TT, BT) \
-    shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel<TT, BT><<<grid, rows_per_block * 32u, shmem>>>( \
+    shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel<TT, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>( \
             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \
             reinterpret_cast<const unsigned char *>(wg), reinterpret_cast<const unsigned char *>(wu), \
             (const float *)x->ptr, (uint32_t)blocks, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes, store_gate_up)

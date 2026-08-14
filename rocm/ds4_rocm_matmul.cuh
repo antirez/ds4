@@ -12,15 +12,15 @@ static void cuda_launch_q8_batch_sharedx_bt(
         uint32_t tile) {
     const size_t shmem = (size_t)tile * BT * 32u * sizeof(float);
     if (tile == 2u) {
-        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<2u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<2u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 4u) {
-        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<4u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<4u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 8u) {
-        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<8u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<8u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 16u) {
-        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<16u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<16u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else {
-        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<32u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<32u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     }
 }
 
@@ -62,15 +62,15 @@ static void cuda_launch_grouped_q8_a_sharedx_bt(
         uint32_t tile) {
     const size_t shmem = (size_t)tile * BT * 32u * sizeof(float);
     if (tile == 2u) {
-        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<2u, BT><<<grid, rows_per_block * 32u, shmem>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<2u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
     } else if (tile == 4u) {
-        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<4u, BT><<<grid, rows_per_block * 32u, shmem>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<4u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
     } else if (tile == 8u) {
-        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<8u, BT><<<grid, rows_per_block * 32u, shmem>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<8u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
     } else if (tile == 16u) {
-        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<16u, BT><<<grid, rows_per_block * 32u, shmem>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<16u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
     } else {
-        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<32u, BT><<<grid, rows_per_block * 32u, shmem>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
+        grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel<32u, BT><<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(low, w, heads, n_tokens, n_groups, n_blocks, rank, row_bytes);
     }
 }
 
@@ -117,27 +117,27 @@ static void cuda_launch_grouped_q8_a_sharedx_strided_bt(
     const size_t shmem = (size_t)tile * BT * 32u * sizeof(float);
     if (tile == 2u) {
         grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel<2u, BT>
-            <<<grid, rows_per_block * 32u, shmem>>>(
+            <<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(
                 low, w, heads, n_tokens, n_groups, n_blocks, rank,
                 x_token_stride, x_group_stride, row_bytes);
     } else if (tile == 4u) {
         grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel<4u, BT>
-            <<<grid, rows_per_block * 32u, shmem>>>(
+            <<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(
                 low, w, heads, n_tokens, n_groups, n_blocks, rank,
                 x_token_stride, x_group_stride, row_bytes);
     } else if (tile == 8u) {
         grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel<8u, BT>
-            <<<grid, rows_per_block * 32u, shmem>>>(
+            <<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(
                 low, w, heads, n_tokens, n_groups, n_blocks, rank,
                 x_token_stride, x_group_stride, row_bytes);
     } else if (tile == 16u) {
         grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel<16u, BT>
-            <<<grid, rows_per_block * 32u, shmem>>>(
+            <<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(
                 low, w, heads, n_tokens, n_groups, n_blocks, rank,
                 x_token_stride, x_group_stride, row_bytes);
     } else {
         grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel<32u, BT>
-            <<<grid, rows_per_block * 32u, shmem>>>(
+            <<<grid, rows_per_block * 32u, shmem, ds4_rocm_stream()>>>(
                 low, w, heads, n_tokens, n_groups, n_blocks, rank,
                 x_token_stride, x_group_stride, row_bytes);
     }
@@ -207,7 +207,7 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
     const uint64_t xh_count = n_tok * in_dim;
     __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
     if (!xh) return 0;
-    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
+    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -264,7 +264,7 @@ static int cuda_matmul_q8_0_tensor_f16_gemm_out_half(
     const uint64_t xh_count = n_tok * in_dim;
     __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16-out gemm activations");
     if (!xh) return 0;
-    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
+    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16-out activation convert launch")) return 0;
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -341,7 +341,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
                     (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
                     threads,
-                    (size_t)in_dim * sizeof(float)>>>(
+                    (size_t)in_dim * sizeof(float), ds4_rocm_stream()>>>(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     (const float *)x->ptr,
@@ -377,7 +377,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 fallback_notice_printed = 1;
             }
         }
-        matmul_q8_0_f32_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        matmul_q8_0_f32_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_rocm_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 (const float *)x->ptr,
@@ -395,7 +395,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
                             (uint32_t)((n_tok + 63u) / 64u),
                             1u);
-            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u, 0, ds4_rocm_stream()>>>(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     (const float *)x->ptr,
@@ -423,7 +423,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch sharedx launch");
         }
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_f32_batch_warp8_kernel<<<bgrid, 256>>>(
+        matmul_q8_0_f32_batch_warp8_kernel<<<bgrid, 256, 0, ds4_rocm_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 (const float *)x->ptr,
@@ -439,7 +439,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             const uint64_t xh_count = n_tok * in_dim;
             __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
             if (!xh) return 0;
-            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_rocm_stream()>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -481,13 +481,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
     const int use_dp4a = 1;
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_rocm_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         const uint32_t rows_per_block = cfg->q8_decode_rpb;
         matmul_q8_0_preq_rows_w32_kernel<<<
                 ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-                rows_per_block * 32u>>>(
+                rows_per_block * 32u, 0, ds4_rocm_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -501,7 +501,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256, 0, ds4_rocm_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -514,7 +514,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
+    matmul_q8_0_preq_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr,
                                            reinterpret_cast<const unsigned char *>(wptr),
                                            xq,
                                            xscale,
@@ -631,7 +631,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel<<<
                     (unsigned)((max_out + rows_per_block - 1u) / rows_per_block),
                     threads,
-                    (size_t)in_dim * sizeof(float)>>>(
+                    (size_t)in_dim * sizeof(float), ds4_rocm_stream()>>>(
                     (float *)out0->ptr,
                     (float *)out1->ptr,
                     reinterpret_cast<const unsigned char *>(w0),
@@ -643,7 +643,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                     blocks * 34u);
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 sharedx launch");
         }
-        matmul_q8_0_pair_f32_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
+        matmul_q8_0_pair_f32_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256, 0, ds4_rocm_stream()>>>(
                 (float *)out0->ptr,
                 (float *)out1->ptr,
                 reinterpret_cast<const unsigned char *>(w0),
@@ -665,14 +665,14 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = 1;
     dim3 qgrid((unsigned)blocks, 1, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_rocm_stream()>>>(
             xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) {
         return 0;
     }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     matmul_q8_0_pair_preq_warp8_kernel<<<
-            ((unsigned)max_out + 7u) / 8u, 256>>>(
+            ((unsigned)max_out + 7u) / 8u, 256, 0, ds4_rocm_stream()>>>(
             (float *)out0->ptr,
             (float *)out1->ptr,
             reinterpret_cast<const unsigned char *>(w0),
@@ -730,7 +730,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             matmul_q8_0_hc_expand_f32_sharedx_warp_rows_w32_kernel<<<
                     (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
                     threads,
-                    (size_t)in_dim * sizeof(float)>>>(
+                    (size_t)in_dim * sizeof(float), ds4_rocm_stream()>>>(
                     (float *)out_hc->ptr,
                     (float *)block_out->ptr,
                     block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -747,7 +747,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand f32 sharedx launch");
         }
         matmul_q8_0_hc_expand_f32_warp8_kernel<<<
-                ((unsigned)out_dim + 7u) / 8u, 256>>>(
+                ((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_rocm_stream()>>>(
                 (float *)out_hc->ptr,
                 (float *)block_out->ptr,
                 block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -773,7 +773,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
     const int use_dp4a = 1;
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_rocm_stream()>>>(
             xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) {
         return 0;
@@ -781,7 +781,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const uint32_t rows_per_block = cfg->q8_hc_decode_rpb;
     matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<
             ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-            rows_per_block * 32u>>>(
+            rows_per_block * 32u, 0, ds4_rocm_stream()>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -820,7 +820,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
-        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_rocm_stream()>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -856,17 +856,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
             matmul_f16_f32_sharedx_warp_rows_w32_kernel<<<
                     ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                     rows_per_block * 32u,
-                    (size_t)in_dim * sizeof(float)>>>(
+                    (size_t)in_dim * sizeof(float), ds4_rocm_stream()>>>(
                     (float *)out->ptr, w, (const float *)x->ptr, (uint32_t)in_dim, out_dim);
             return cuda_ok(cudaGetLastError(), "matmul_f16 sharedx launch");
         }
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     if (ordered_decode) {
-        matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+        matmul_f16_ordered_chunks_kernel<<<grid, 32, 0, ds4_rocm_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
-    matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    matmul_f16_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
@@ -912,13 +912,13 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
             matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
                     ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                     rows_per_block * 32u,
-                    (size_t)in_dim * sizeof(float)>>>(
+                    (size_t)in_dim * sizeof(float), ds4_rocm_stream()>>>(
                     (float *)out0->ptr, (float *)out1->ptr, w0, w1,
                     (const float *)x->ptr, (uint32_t)in_dim, out_dim);
             return cuda_ok(cudaGetLastError(), "matmul_f16_pair sharedx launch");
         }
     }
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32, 0, ds4_rocm_stream()>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -997,6 +997,6 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    matmul_f32_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }

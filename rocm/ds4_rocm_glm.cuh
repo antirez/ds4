@@ -1342,7 +1342,7 @@ extern "C" int ds4_gpu_glm_kv_lora_rms_norm_tensor(
                                                          weight_bytes,
                                                          "glm_kv_lora_norm");
     if (!w) return 0;
-    glm_kv_lora_rms_norm_kernel<<<n_tokens, 256>>>((float *)out->ptr,
+    glm_kv_lora_rms_norm_kernel<<<n_tokens, 256, 0, ds4_rocm_stream()>>>((float *)out->ptr,
                                                    (const float *)kv_raw->ptr,
                                                    w,
                                                    n_tokens,
@@ -1375,7 +1375,7 @@ extern "C" int ds4_gpu_glm_k_b_project_tensor(
         return 0;
     }
     dim3 grid(n_tokens, n_head, 1);
-    glm_k_b_project_q8_0_head_kernel<<<grid, 256, (size_t)kv_lora_dim * sizeof(float)>>>(
+    glm_k_b_project_q8_0_head_kernel<<<grid, 256, (size_t)kv_lora_dim * sizeof(float), ds4_rocm_stream()>>>(
             (float *)out->ptr,
             w,
             (const float *)kv_norm->ptr,
@@ -1410,7 +1410,7 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
         return 0;
     }
     dim3 grid(n_tokens, 2, 1);
-    glm_store_compact_kv_kernel<<<grid, 256>>>((char *)kv_lora_cache->ptr,
+    glm_store_compact_kv_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((char *)kv_lora_cache->ptr,
                                                (char *)k_rope_cache->ptr,
                                                (const float *)kv_norm->ptr,
                                                (const float *)kv_raw->ptr,
@@ -1466,7 +1466,7 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
                                                            "glm_kv_norm");
     if (!qw || !kvw) return 0;
     dim3 grid(n_tokens, 3, 1);
-    glm_qkv_norm_store_compact_kv_kernel<<<grid, 256>>>((float *)q_out->ptr,
+    glm_qkv_norm_store_compact_kv_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((float *)q_out->ptr,
                                                         (const float *)q->ptr,
                                                         qw,
                                                         q_n,
@@ -1521,7 +1521,7 @@ extern "C" int ds4_gpu_glm_store_indexer_k_tensor(
     const float *w = (const float *)cuda_model_range_ptr(model_map, weight_offset, bytes, "glm_indexer_weight");
     const float *b = (const float *)cuda_model_range_ptr(model_map, bias_offset, bytes, "glm_indexer_bias");
     if (!w || !b) return 0;
-    glm_store_indexer_k_kernel<<<n_tokens, 256>>>((char *)indexer_key_cache->ptr,
+    glm_store_indexer_k_kernel<<<n_tokens, 256, 0, ds4_rocm_stream()>>>((char *)indexer_key_cache->ptr,
                                                   (const float *)raw_k->ptr,
                                                   w,
                                                   b,
@@ -1581,7 +1581,7 @@ extern "C" int ds4_gpu_glm_build_kv_cache_tensor(
         return 0;
     }
     dim3 grid(n_tokens, n_head, 1);
-    glm_build_kv_cache_kernel<<<grid, 256>>>((char *)key_cache->ptr,
+    glm_build_kv_cache_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((char *)key_cache->ptr,
                                              (char *)value_cache->ptr,
                                              (const float *)kv_raw->ptr,
                                              (const float *)k_nope->ptr,
@@ -1666,7 +1666,7 @@ extern "C" int ds4_gpu_glm_attention_full_tensor(
     }
     const size_t shmem = ((size_t)256u + cache_len) * sizeof(float);
     dim3 grid(n_tokens, n_head, 1);
-    glm_attention_full_kernel<<<grid, 256, shmem>>>((float *)heads->ptr,
+    glm_attention_full_kernel<<<grid, 256, shmem, ds4_rocm_stream()>>>((float *)heads->ptr,
                                                     (const float *)q->ptr,
                                                     (const char *)key_cache->ptr,
                                                     (const char *)value_cache->ptr,
@@ -1720,7 +1720,7 @@ extern "C" int ds4_gpu_glm_attention_flash_tensor(
 extern "C" int ds4_gpu_glm_fill_selected_range_tensor(ds4_gpu_tensor *selected, uint32_t n_selected) {
     if (n_selected == 0u) return selected != NULL;
     if (!cuda_tensor_has_i32(selected, n_selected)) return 0;
-    glm_fill_selected_range_kernel<<<(n_selected + 255u) / 256u, 256>>>((int32_t *)selected->ptr, n_selected);
+    glm_fill_selected_range_kernel<<<(n_selected + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>((int32_t *)selected->ptr, n_selected);
     return cuda_ok(cudaGetLastError(), "glm fill selected range launch");
 }
 
@@ -1742,7 +1742,7 @@ extern "C" int ds4_gpu_glm_fill_selected_range_batch_tensor(
         !glm_rocm_launch_blocks(total, 256u, &blocks)) {
         return 0;
     }
-    glm_fill_selected_range_batch_kernel<<<blocks, 256>>>((int32_t *)selected->ptr,
+    glm_fill_selected_range_batch_kernel<<<blocks, 256, 0, ds4_rocm_stream()>>>((int32_t *)selected->ptr,
                                                                          n_tokens,
                                                                          pos0,
                                                                          n_selected,
@@ -1778,7 +1778,7 @@ extern "C" int ds4_gpu_glm_indexer_rope_tail_tensor(
     }
     if (pairs == 0u) return 1;
     if (!glm_rocm_launch_blocks(pairs, 256u, &blocks)) return 0;
-    glm_indexer_rope_tail_kernel<<<blocks, 256>>>((float *)x->ptr,
+    glm_indexer_rope_tail_kernel<<<blocks, 256, 0, ds4_rocm_stream()>>>((float *)x->ptr,
                                                                  n_tokens,
                                                                  n_head,
                                                                  head_dim,
@@ -1813,7 +1813,7 @@ extern "C" int ds4_gpu_glm_indexer_score_one_tensor(
         !glm_rocm_tensor_has_cache2(indexer_key_cache, n_rows, head_dim, elem)) {
         return 0;
     }
-    glm_indexer_score_one_kernel<<<n_rows, 256>>>((float *)scores->ptr,
+    glm_indexer_score_one_kernel<<<n_rows, 256, 0, ds4_rocm_stream()>>>((float *)scores->ptr,
                                                   (const float *)q->ptr,
                                                   (const float *)weights->ptr,
                                                   (const char *)indexer_key_cache->ptr,
@@ -1850,7 +1850,7 @@ extern "C" int ds4_gpu_glm_indexer_scores_batch_tensor(
         return 0;
     }
     dim3 grid(n_rows, n_tokens, 1);
-    glm_indexer_scores_batch_kernel<<<grid, 256>>>((float *)scores->ptr,
+    glm_indexer_scores_batch_kernel<<<grid, 256, 0, ds4_rocm_stream()>>>((float *)scores->ptr,
                                                    (const float *)q->ptr,
                                                    (const float *)weights->ptr,
                                                    (const char *)indexer_key_cache->ptr,
@@ -1890,7 +1890,7 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
                                 "glm_qk_lowrank", &w, &row_bytes)) {
         return 0;
     }
-    glm_q8_project_head_kernel<<<dim3(n_head, 1, 1), 256, (size_t)qk_nope * sizeof(float)>>>(
+    glm_q8_project_head_kernel<<<dim3(n_head, 1, 1), 256, (size_t)qk_nope * sizeof(float), ds4_rocm_stream()>>>(
             (float *)qk_low->ptr,
             w,
             (const float *)q->ptr,
@@ -1955,7 +1955,7 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(
                        "glm grouped qk lowrank batch launch");
     }
     dim3 grid(n_head, n_tokens, 1);
-    glm_q8_project_head_kernel<<<grid, 256, (size_t)qk_nope * sizeof(float)>>>(
+    glm_q8_project_head_kernel<<<grid, 256, (size_t)qk_nope * sizeof(float), ds4_rocm_stream()>>>(
             (float *)qk_low->ptr,
             w,
             (const float *)q->ptr,
@@ -2028,7 +2028,7 @@ extern "C" int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
         dim3 grid((value_dim + waves_per_block - 1u) / waves_per_block,
                   n_head,
                   n_tokens);
-        glm_q8_project_head_wave_kernel<<<grid, threads>>>(
+        glm_q8_project_head_wave_kernel<<<grid, threads, 0, ds4_rocm_stream()>>>(
                 (float *)heads->ptr,
                 w,
                 (const float *)lora->ptr,
@@ -2054,7 +2054,7 @@ extern "C" int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
                        "glm wave-parallel value project launch");
     }
     dim3 grid(n_head, n_tokens, 1);
-    glm_q8_project_head_kernel<<<grid, 256, (size_t)kv_lora_dim * sizeof(float)>>>(
+    glm_q8_project_head_kernel<<<grid, 256, (size_t)kv_lora_dim * sizeof(float), ds4_rocm_stream()>>>(
             (float *)heads->ptr,
             w,
             (const float *)lora->ptr,
@@ -2691,7 +2691,7 @@ static int glm_attention_indexed_lora_causal_gemm(
     float *head_out = (float *)(scratch + head_offset);
 
     glm_causal_gemm_cache_to_f16_kernel<<<
-        (kv_count + 255u) / 256u, 256>>>(
+        (kv_count + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(
             kv_h,
             (const char *)kv_lora_cache->ptr,
             kv_count,
@@ -2701,7 +2701,7 @@ static int glm_attention_indexed_lora_causal_gemm(
     }
     const uint64_t rope_pairs = (uint64_t)n_selected * (qk_rope >> 1u);
     glm_causal_gemm_rope_to_f16_kernel<<<
-        (rope_pairs + 255u) / 256u, 256>>>(
+        (rope_pairs + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(
             rope_h,
             (const char *)k_rope_cache->ptr,
             n_selected,
@@ -2725,7 +2725,7 @@ static int glm_attention_indexed_lora_causal_gemm(
     const uint32_t scatter_blocks =
         (uint32_t)((head_count + 255u) / 256u);
     for (uint32_t head = 0; head < n_head; head++) {
-        glm_causal_gemm_gather_head_f16_kernel<<<gather_blocks, 256>>>(
+        glm_causal_gemm_gather_head_f16_kernel<<<gather_blocks, 256, 0, ds4_rocm_stream()>>>(
             low_h,
             qrope_h,
             (const float *)qk_low->ptr,
@@ -2784,7 +2784,7 @@ static int glm_attention_indexed_lora_causal_gemm(
         if (!cublas_ok(st, "glm causal attention rope score gemm")) {
             return 0;
         }
-        glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
+        glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256, 0, ds4_rocm_stream()>>>(
             probs, scores, n_tokens, n_selected, pos0, scale);
         if (!cuda_ok(cudaGetLastError(),
                      "glm causal attention softmax launch")) {
@@ -2810,7 +2810,7 @@ static int glm_attention_indexed_lora_causal_gemm(
                           CUBLAS_COMPUTE_32F,
                           CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "glm causal attention value gemm")) return 0;
-        glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256>>>(
+        glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256, 0, ds4_rocm_stream()>>>(
             (float *)lora_out->ptr,
             head_out,
             n_tokens,
@@ -2934,7 +2934,7 @@ static int glm_attention_indexed_lora_selected_gemm(
     const uint32_t kv_blocks =
         (uint32_t)min((kv_count + 255u) / 256u, 4096ull);
     glm_selected_gemm_profile_begin(&profile);
-    glm_selected_gemm_kv_to_f16_kernel<<<kv_blocks, 256>>>(
+    glm_selected_gemm_kv_to_f16_kernel<<<kv_blocks, 256, 0, ds4_rocm_stream()>>>(
         kv_h,
         (const char *)kv_lora_cache->ptr,
         (const int32_t *)selected->ptr,
@@ -2953,7 +2953,7 @@ static int glm_attention_indexed_lora_selected_gemm(
     const uint32_t rope_blocks =
         (uint32_t)min((rope_pairs + 255u) / 256u, 4096ull);
     glm_selected_gemm_profile_begin(&profile);
-    glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256>>>(
+    glm_selected_gemm_rope_to_f16_kernel<<<rope_blocks, 256, 0, ds4_rocm_stream()>>>(
         rope_h,
         (const char *)k_rope_cache->ptr,
         (const int32_t *)selected->ptr,
@@ -2995,7 +2995,7 @@ static int glm_attention_indexed_lora_selected_gemm(
         const uint32_t tile_heads = min(head_tile, n_head - head0);
         glm_selected_gemm_profile_begin(&profile);
         if (head_tile == 1u) {
-            glm_causal_gemm_gather_head_f16_kernel<<<gather_blocks, 256>>>(
+            glm_causal_gemm_gather_head_f16_kernel<<<gather_blocks, 256, 0, ds4_rocm_stream()>>>(
                 low_h,
                 qrope_h,
                 (const float *)qk_low->ptr,
@@ -3007,7 +3007,7 @@ static int glm_attention_indexed_lora_selected_gemm(
                 qk_nope,
                 qk_rope);
         } else {
-            glm_selected_gemm_gather_heads_f16_kernel<<<gather_blocks, 256>>>(
+            glm_selected_gemm_gather_heads_f16_kernel<<<gather_blocks, 256, 0, ds4_rocm_stream()>>>(
                 low_h,
                 qrope_h,
                 (const float *)qk_low->ptr,
@@ -3089,12 +3089,12 @@ static int glm_attention_indexed_lora_selected_gemm(
             &profile, GLM_SELECTED_PROFILE_ROPE_SCORE);
         glm_selected_gemm_profile_begin(&profile);
         if (head_tile == 1u) {
-            glm_selected_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
+            glm_selected_gemm_softmax_f16_kernel<<<n_tokens, 256, 0, ds4_rocm_stream()>>>(
                 probs, scores, n_tokens, n_selected, scale);
         } else {
             const dim3 softmax_grid(n_tokens, tile_heads, 1u);
             glm_selected_gemm_softmax_heads_f16_kernel<<<
-                softmax_grid, 256>>>(
+                softmax_grid, 256, 0, ds4_rocm_stream()>>>(
                     probs,
                     scores,
                     n_tokens,
@@ -3145,7 +3145,7 @@ static int glm_attention_indexed_lora_selected_gemm(
             (uint32_t)((scatter_count + 255u) / 256u);
         glm_selected_gemm_profile_begin(&profile);
         if (head_tile == 1u) {
-            glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256>>>(
+            glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256, 0, ds4_rocm_stream()>>>(
                 (float *)lora_out->ptr,
                 head_out,
                 n_tokens,
@@ -3153,7 +3153,7 @@ static int glm_attention_indexed_lora_selected_gemm(
                 n_head,
                 kv_lora_dim);
         } else {
-            glm_selected_gemm_scatter_heads_kernel<<<scatter_blocks, 256>>>(
+            glm_selected_gemm_scatter_heads_kernel<<<scatter_blocks, 256, 0, ds4_rocm_stream()>>>(
                 (float *)lora_out->ptr,
                 head_out,
                 n_tokens,
@@ -3320,7 +3320,7 @@ static int glm_attention_indexed_lora_launch(
     }
     dim3 grid(n_head, n_tokens, 1);
     const size_t shmem = ((size_t)256u + n_selected) * sizeof(float);
-    glm_attention_indexed_lora_kernel<<<grid, 256, shmem>>>((float *)lora_out->ptr,
+    glm_attention_indexed_lora_kernel<<<grid, 256, shmem, ds4_rocm_stream()>>>((float *)lora_out->ptr,
                                                             (const float *)q->ptr,
                                                             (const float *)qk_low->ptr,
                                                             (const char *)kv_lora_cache->ptr,
@@ -3690,7 +3690,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
         glm_attention_indexed_decode_split_group8_partial_valid_kernel<<<
                 dim3(n_head / 8u, n_blocks, 1),
                 dim3(32u, 8u, 1),
-                partial_shmem>>>(
+                partial_shmem, ds4_rocm_stream()>>>(
                 (float *)partial_lora->ptr,
                 (float *)partial_ms->ptr,
                 (const float *)q->ptr,
@@ -3716,7 +3716,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
         const size_t partial_shmem = ((size_t)256u + block_rows) * sizeof(float);
         glm_attention_indexed_decode_split_partial_kernel<<<dim3(n_head, n_blocks, 1),
                                                             256,
-                                                            partial_shmem>>>(
+                                                            partial_shmem, ds4_rocm_stream()>>>(
                 (float *)partial_lora->ptr,
                 (float *)partial_ms->ptr,
                 (const float *)q->ptr,
@@ -3747,7 +3747,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
     const size_t reduce_shmem = ((size_t)256u + 64u + kv_lora_dim) * sizeof(float);
     glm_attention_indexed_decode_split_reduce_kernel<<<dim3(n_head, 1, 1),
                                                        256,
-                                                       reduce_shmem>>>(
+                                                       reduce_shmem, ds4_rocm_stream()>>>(
             (float *)heads->ptr,
             (const float *)partial_lora->ptr,
             (const float *)partial_ms->ptr,
@@ -3900,7 +3900,7 @@ static int glm_router_select_launch(
 
     dim3 block(32, 4, 1);
     if (active_n_expert == DS4_ROCM_MAX_N_EXPERT) {
-        glm_router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+        glm_router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block, 0, ds4_rocm_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,
@@ -3910,7 +3910,7 @@ static int glm_router_select_launch(
                 active_n_expert_used,
                 active_scale);
     } else {
-        glm_router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+        glm_router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<(n_tokens + 3u) / 4u, block, 0, ds4_rocm_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,

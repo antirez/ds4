@@ -151,12 +151,12 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     if (ok) {
         dim3 block(32, 4, 1);
         if (active_n_expert == DS4_ROCM_MAX_N_EXPERT) {
-            router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<1, block>>>(
+            router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<1, block, 0, ds4_rocm_stream()>>>(
                     (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                     active_n_expert_used, active_scale, has_bias && !hash_mode, hash_mode);
         } else {
-            router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<1, block>>>(
+            router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<1, block, 0, ds4_rocm_stream()>>>(
                     (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                     active_n_expert_used, active_scale, has_bias && !hash_mode, hash_mode);
@@ -197,7 +197,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     }
     dim3 block(32, 4, 1);
     if (active_n_expert == DS4_ROCM_MAX_N_EXPERT) {
-        router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+        router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block, 0, ds4_rocm_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,
@@ -213,7 +213,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                 has_bias && !hash_mode,
                 hash_mode);
     } else {
-        router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+        router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<(n_tokens + 3u) / 4u, block, 0, ds4_rocm_stream()>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,

@@ -85,7 +85,7 @@ extern "C" int ds4_gpu_tensor_copy_f32_to_f16(
     uint64_t src_bytes = count * sizeof(float);
     if (dst_bytes > dst->bytes - dst_offset || src_bytes > src->bytes - src_offset) return 0;
     if (count == 0) return 1;
-    f32_to_f16_kernel<<<(count + 255u) / 256u, 256>>>(
+    f32_to_f16_kernel<<<(count + 255u) / 256u, 256, 0, ds4_rocm_stream()>>>(
             (__half *)((char *)dst->ptr + dst_offset),
             (const float *)((const char *)src->ptr + src_offset),
             count);
