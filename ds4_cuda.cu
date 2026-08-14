@@ -942,11 +942,32 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
              strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
              strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
              strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
+        const int force = s && *s &&
+            (s[0] == '1' ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0);
         if (off) {
             fprintf(stderr, "ds4: DS4_CUDA_DECODE_GRAPHS=%s - decode graph capture disabled\n", s);
             enabled = 0;
-        } else {
+        } else if (force) {
+            fprintf(stderr, "ds4: DS4_CUDA_DECODE_GRAPHS=%s - decode graph capture forced on\n", s);
             enabled = 1;
+        } else {
+            /* Decode on integrated Blackwell (GB10) is bandwidth-bound, so
+             * eager launches edge out graph replay (~0.5% generation);
+             * discrete GPUs keep graphs to hide launch overhead. */
+            int dev = 0, major = 0, integrated = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major,
+                                   cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&integrated,
+                                   cudaDevAttrIntegrated, dev);
+            enabled = !(integrated && major >= 12);
+            if (!enabled) {
+                fprintf(stderr,
+                        "ds4: decode graph capture off by default on integrated Blackwell (DS4_CUDA_DECODE_GRAPHS=1 to force)\n");
+            }
         }
     }
     return enabled && g_n_gpus == 1;
@@ -15909,6 +15930,19 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                               CUBLAS_GEMM_DEFAULT);
             return cublas_ok(st, "f16 pair matmul1");
         }
+        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
+                                           in_dim, out_dim, x, n_tok) &&
+               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
+                                           in_dim, out_dim, x, n_tok);
+    }
+    /* Decode (n_tok==1): two cuBLAS GEMVs beat the fused ordered-chunks pair
+     * kernel on bandwidth-bound parts (+2% generation on GB10): the pair
+     * kernel's per-warp chunked reads are not coalesced.  The pair kernel
+     * remains for quality mode, no-cuBLAS builds, and the
+     * DS4_CUDA_NO_F16_PAIR_CUBLAS_ONE rollback. */
+    if (g_cublas_ready && !g_quality_mode &&
+        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") == NULL &&
+        getenv("DS4_CUDA_NO_F16_PAIR_CUBLAS_ONE") == NULL) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
