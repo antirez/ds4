@@ -12858,15 +12858,10 @@ static void server_mark_activity(server *s) {
     pthread_mutex_unlock(&s->mu);
 }
 
-/* True when nothing is in flight and the idle window has elapsed.  Metadata
- * requests never refresh last_activity, so a client polling /v1/models on a
- * shorter interval than the timeout cannot pin an unused server in memory. */
-static bool server_idle_expired(server *s) {
-    /* The elapsed test below would pass on its own with the flag unset, since
-     * any age is >= a zero window, so being disabled has to be part of the
-     * predicate rather than only of the caller that skips the monitor thread. */
+/* s->mu held.  Flag-disabled is part of the predicate so a zero window cannot
+ * expire on its own (any age is >= 0). */
+static bool server_idle_expired_holding_mu(const server *s) {
     if (s->idle_timeout_sec <= 0) return false;
-    pthread_mutex_lock(&s->mu);
     bool idle = s->clients == 0 && !s->head;
     if (idle && s->batched_mode) {
         for (int i = 0; i < s->slot_count; i++) {
@@ -12876,9 +12871,17 @@ static bool server_idle_expired(server *s) {
             }
         }
     }
-    const double since = now_sec() - s->last_activity;
+    return idle && (now_sec() - s->last_activity) >= (double)s->idle_timeout_sec;
+}
+
+/* True when nothing is in flight and the idle window has elapsed.  Metadata
+ * requests never refresh last_activity, so a client polling /v1/models on a
+ * shorter interval than the timeout cannot pin an unused server in memory. */
+static bool server_idle_expired(server *s) {
+    pthread_mutex_lock(&s->mu);
+    const bool expired = server_idle_expired_holding_mu(s);
     pthread_mutex_unlock(&s->mu);
-    return idle && since >= (double)s->idle_timeout_sec;
+    return expired;
 }
 
 /* engine_mu held.  Sessions go before the engine because they hold references
@@ -12984,10 +12987,21 @@ static void *idle_monitor_main(void *arg) {
         if (g_stop_requested) break;
         pthread_mutex_lock(&s->engine_mu);
         if (s->engine && !s->engine_loading && server_idle_expired(s)) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: idle timeout of %ds reached; freeing GPU and engine resources",
-                       s->idle_timeout_sec);
-            server_idle_unload_locked(s);
+            /* Accept can clients++ the instant the snapshot dropped mu.
+             * Recheck immediately before teardown so a request that arrived
+             * after that snapshot does not pay for an unload+reload.
+             * Remaining window is unlock-to-close; s->mu cannot be held
+             * across ds4_engine_close. Not a UAF: ensure_engine_loaded
+             * waits on engine_mu. */
+            pthread_mutex_lock(&s->mu);
+            const bool still_idle = server_idle_expired_holding_mu(s);
+            pthread_mutex_unlock(&s->mu);
+            if (still_idle) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: idle timeout of %ds reached; freeing GPU and engine resources",
+                           s->idle_timeout_sec);
+                server_idle_unload_locked(s);
+            }
         }
         pthread_mutex_unlock(&s->engine_mu);
     }
