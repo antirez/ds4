@@ -8425,6 +8425,9 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Wall time of the last completed job on this slot, stamped by the slot
+     * worker; drives the staleness tiers in job_slot_score(). */
+    time_t last_used;
     /* Cached rendered text of the checkpoint, refreshed by the slot worker
      * after each job; lets the reuse probe (slot_probe_reuse_locked) answer
      * the memory-text question with a memcmp instead of a detokenization. */
@@ -12444,34 +12447,70 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* A resident checkpoint idle longer than this is most likely a finished
+ * conversation: it becomes the preferred eviction victim regardless of its
+ * size (see job_slot_score).  Without this, long-forgotten sessions are
+ * never evicted (evicting them looks expensive), so they pile up on a
+ * long-running server until only short *active* conversations remain as
+ * victims - and prefill thrashing returns. */
+#define SLOT_STALE_AFTER_SEC ((time_t)60 * 60)
+
+/* Score layout for job_slot_score()'s no-reuse tiers (all negative; every
+ * score of a lower tier must stay strictly below every score of the tier
+ * above):
+ *   empty slot:            0
+ *   stale checkpoint:      [-1 - SLOT_IDLE_SCORE_CAP + SLOT_STALE_AFTER_SEC, -1]
+ *                          (more idle = better victim)
+ *   protected checkpoint:  SLOT_PROTECTED_SCORE_BASE - live
+ *                          (shorter = better victim) */
+#define SLOT_IDLE_SCORE_CAP (1 << 20)   /* ~12 days; keeps the tiers apart */
+#define SLOT_PROTECTED_SCORE_BASE (-2 - SLOT_IDLE_SCORE_CAP)
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
-                          int required_slot) {
+                          int required_slot, time_t now) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
     /* Reuse-aware routing: a slot is attractive only when this request would
      * actually reuse its live state - the same verdict the execution ladder
      * reaches via slot_probe_reuse_locked() (dispatch holds tool_mu here).
-     * A request that can reuse nothing is sent to the cheapest victim:
-     * scoring -live penalizes evicting a resident checkpoint in proportion
-     * to its length, so an empty slot (live==0, score 0) always wins, and
-     * when every slot holds an unusable checkpoint the shortest one is
-     * evicted rather than the longest. */
+     * The score is the reusable prefix length, so the slot where more of the
+     * prompt is already resident wins, and any reuse beats an empty slot.
+     *
+     * A request that can reuse nothing must evict a resident checkpoint, so
+     * it goes to the cheapest victim.  "Cheapest" is staleness-aware: a
+     * checkpoint idle past SLOT_STALE_AFTER_SEC is most likely a finished
+     * conversation, so the more idle it is the better a victim it makes,
+     * regardless of size; a fresher checkpoint belongs to an active
+     * conversation, so the shortest one is evicted, losing the least
+     * prefilled work.  Staleness only lowers a checkpoint's priority as a
+     * *victim* - it never blocks reuse: if the owner of a stale checkpoint
+     * continues its conversation, the reuse tier above still pins the slot. */
     const int live = slot->session &&
                      ds4_session_checkpoint_valid(slot->session)
                      ? ds4_session_pos(slot->session) : 0;
-    if (slot_probe_reuse_locked(s, slot, &j->req).reuse_tokens > 0)
-        return live;
-    return -live;
+    const int reuse = slot_probe_reuse_locked(s, slot, &j->req).reuse_tokens;
+    if (reuse > 0) return reuse;
+    if (live == 0) return 0;
+    const time_t idle = now > slot->last_used ? now - slot->last_used : 0;
+    if (idle >= SLOT_STALE_AFTER_SEC) {
+        const time_t capped = idle > SLOT_IDLE_SCORE_CAP
+                              ? SLOT_IDLE_SCORE_CAP : idle;
+        return -1 - SLOT_IDLE_SCORE_CAP + (int)capped;
+    }
+    return SLOT_PROTECTED_SCORE_BASE - live;
 }
 
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
+    const time_t now = time(NULL);
     for (;;) {
         job *chosen = NULL;
         job *chosen_prev = NULL;
         server_slot *chosen_slot = NULL;
         int chosen_score = INT_MIN;
+        int chosen_evict_live = 0;
+        time_t chosen_evict_idle = 0;
 
         pthread_mutex_lock(&s->tool_mu);
         job *prev = NULL;
@@ -12480,7 +12519,7 @@ static void dispatch_jobs_locked(server *s) {
             server_slot *best = NULL;
             int best_score = INT_MIN;
             for (int i = 0; i < s->slot_count; i++) {
-                int score = job_slot_score(s, &s->slots[i], j, required);
+                int score = job_slot_score(s, &s->slots[i], j, required, now);
                 if (score > best_score) {
                     best_score = score;
                     best = &s->slots[i];
@@ -12494,8 +12533,16 @@ static void dispatch_jobs_locked(server *s) {
                 break; /* FIFO among jobs that can run now. */
             }
         }
+        /* chosen_score < 0 means the request reuses nothing and is routed
+         * onto a resident checkpoint, evicting it: capture what is lost so
+         * the eviction is directly visible in the log. */
+        if (chosen && chosen_score < 0 && chosen_slot->session &&
+            ds4_session_checkpoint_valid(chosen_slot->session)) {
+            chosen_evict_live = ds4_session_pos(chosen_slot->session);
+            chosen_evict_idle = now > chosen_slot->last_used
+                                ? now - chosen_slot->last_used : 0;
+        }
         pthread_mutex_unlock(&s->tool_mu);
-        (void)chosen_score;
         if (!chosen || !chosen_slot) break;
 
         if (chosen_prev) chosen_prev->next = chosen->next;
@@ -12504,6 +12551,15 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        if (chosen_evict_live > 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "slot %d: request reuses nothing; evicting checkpoint "
+                       "(%d tokens, idle %lld s, %s)",
+                       chosen_slot->id, chosen_evict_live,
+                       (long long)chosen_evict_idle,
+                       chosen_evict_idle >= SLOT_STALE_AFTER_SEC
+                       ? "stale" : "protected");
+        }
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -12573,8 +12629,10 @@ static void *slot_worker_main(void *arg) {
         /* The checkpoint may have changed in any way during the job (sync,
          * rewind, generation, disk load, reset); refresh the rendered-text
          * cache the memory-text probe relies on before the slot becomes
-         * visible to the router as free again. */
+         * visible to the router as free again.  Also stamp the activity
+         * time the router's staleness tiers rely on. */
         slot_refresh_live_text(s, slot);
+        slot->last_used = time(NULL);
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
@@ -13695,6 +13753,10 @@ static void test_slot_probe_and_routing_scores(void) {
     server_slot slots[3] = {0};
     s.slots = slots;
     s.slot_count = 3;
+    /* All checkpoints freshly used: in the protected staleness tier, where
+     * the eviction cost is the checkpoint length (-live semantics). */
+    const time_t now = 1000000;
+    slots[0].last_used = slots[1].last_used = slots[2].last_used = now;
 
     /* slot[0]: resident long checkpoint [sys | main-history] (160 tokens).
      * slot[1]: resident short checkpoint sharing the sys prefix (101 tokens).
@@ -13721,9 +13783,11 @@ static void test_slot_probe_and_routing_scores(void) {
     for (int i = 0; i < 120; i++) ds4_tokens_push(&sub.req.prompt, sub_tok[i]);
     TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &sub.req).kind ==
                 REUSE_NONE);
-    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1) == -160);
-    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1) == -101);
-    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1) == 0);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 160);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 101);
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) == 0);
 
     /* 2. Extension request: the prompt extends slot[1]'s checkpoint, so it
      *    pins there (+live), and is an eviction elsewhere. */
@@ -13732,9 +13796,10 @@ static void test_slot_probe_and_routing_scores(void) {
     slot_reuse pr = slot_probe_reuse_locked(&s, &slots[1], &ext.req);
     TEST_ASSERT(pr.kind == REUSE_MEMORY_TOKEN);
     TEST_ASSERT(pr.reuse_tokens == 101);
-    TEST_ASSERT(job_slot_score(&s, &slots[1], &ext, -1) == 101);
-    TEST_ASSERT(job_slot_score(&s, &slots[0], &ext, -1) == -160);
-    TEST_ASSERT(job_slot_score(&s, &slots[2], &ext, -1) == 0);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &ext, -1, now) == 101);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &ext, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 160);
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &ext, -1, now) == 0);
 
     /* 3. Text-bound request (#62 class): the token prefix diverges, but the
      *    rendered checkpoint text is a byte prefix of the request text.
@@ -13743,6 +13808,7 @@ static void test_slot_probe_and_routing_scores(void) {
      *    slots > 1 would ping-pong and re-prefill every turn. */
     int stale_tok[3] = {5, 6, 7};
     server_slot tslot = {0};
+    tslot.last_used = now;
     tslot.session = ds4_session_new_test_checkpoint(stale_tok, 3);
     tslot.live_text = (char *)"hello world";
     tslot.live_text_len = 11;
@@ -13756,7 +13822,7 @@ static void test_slot_probe_and_routing_scores(void) {
     TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
     TEST_ASSERT(pr.reuse_tokens == 3);
     TEST_ASSERT(pr.suffix_off == 11);
-    TEST_ASSERT(job_slot_score(&s, &tslot, &txt, -1) == 3);
+    TEST_ASSERT(job_slot_score(&s, &tslot, &txt, -1, now) == 3);
 
     /* 4. Stale rendered-text cache (checkpoint moved past it) must not bind. */
     tslot.live_text_pos = 2;
@@ -13770,6 +13836,98 @@ static void test_slot_probe_and_routing_scores(void) {
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&ext.req.prompt);
     ds4_tokens_free(&txt.req.prompt);
+}
+
+/* Staleness tiers: a resident checkpoint idle past SLOT_STALE_AFTER_SEC is
+ * most likely a finished conversation, so it becomes the preferred eviction
+ * victim regardless of its size - while staying fully reusable if its own
+ * conversation continues.  This is what keeps long-forgotten sessions from
+ * piling up on a long-running server and pushing active ones out. */
+static void test_slot_routing_staleness_tiers(void) {
+    server s = {0};
+    server_slot slots[4] = {0};
+    s.slots = slots;
+    s.slot_count = 4;
+    const time_t now = 1000000;
+
+    /* slot[0]: long checkpoint (160), idle 2h - stale.
+     * slot[1]: short checkpoint (101), idle 1h - stale.
+     * slot[2]: mid checkpoint (120), idle 1min - protected.
+     * slot[3]: empty. */
+    int long_tok[160], short_tok[101], mid_tok[120];
+    for (int i = 0; i < 160; i++) long_tok[i] = i + 1;
+    for (int i = 0; i < 101; i++) short_tok[i] = 1000 + i;
+    for (int i = 0; i < 120; i++) mid_tok[i] = 2000 + i;
+    slots[0].session = ds4_session_new_test_checkpoint(long_tok, 160);
+    slots[1].session = ds4_session_new_test_checkpoint(short_tok, 101);
+    slots[2].session = ds4_session_new_test_checkpoint(mid_tok, 120);
+    slots[3].session = ds4_session_new_test_checkpoint(NULL, 0);
+    slots[0].last_used = now - 2 * 3600;
+    slots[1].last_used = now - 1 * 3600;
+    slots[2].last_used = now - 60;
+
+    /* Alien request: shares no prefix with any checkpoint, reuses nothing. */
+    job sub = {0};
+    for (int i = 0; i < 50; i++) ds4_tokens_push(&sub.req.prompt, 9000 + i);
+
+    /* 1. The empty slot beats every resident checkpoint. */
+    TEST_ASSERT(job_slot_score(&s, &slots[3], &sub, -1, now) == 0);
+
+    /* 2. Between stale checkpoints the more idle one is the better victim,
+     *    even though it is longer: plain -live scoring would evict slot[1]
+     *    and keep slot[0] forever - the finished-session leak. */
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1, now) ==
+                -1 - SLOT_IDLE_SCORE_CAP + 2 * 3600);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1, now) ==
+                -1 - SLOT_IDLE_SCORE_CAP + 1 * 3600);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1, now) >
+                job_slot_score(&s, &slots[1], &sub, -1, now));
+
+    /* 3. Any stale checkpoint is a better victim than any protected one,
+     *    even a shorter protected one: an active conversation keeps its
+     *    slot while a long-idle finished one is evicted first. */
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1, now) >
+                job_slot_score(&s, &slots[2], &sub, -1, now));
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 120);
+
+    /* 4. Boundary: idle == SLOT_STALE_AFTER_SEC is stale, one second less
+     *    is protected. */
+    slots[2].last_used = now - SLOT_STALE_AFTER_SEC;
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) ==
+                -1 - SLOT_IDLE_SCORE_CAP + (int)SLOT_STALE_AFTER_SEC);
+    slots[2].last_used = now - SLOT_STALE_AFTER_SEC + 1;
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 120);
+    slots[2].last_used = now - 60;
+
+    /* 5. The idle component is capped, so an ancient (or never-stamped,
+     *    last_used == 0) checkpoint maxes out at the top of the stale tier
+     *    instead of overflowing into another tier's range. */
+    slots[2].last_used = 0;
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1,
+                               now + SLOT_IDLE_SCORE_CAP + 5000) == -1);
+    slots[2].last_used = now - 60;
+
+    /* 6. Staleness never blocks reuse: the owner of a stale checkpoint
+     *    continues its conversation and the slot stays the most
+     *    attractive - staleness only lowers its priority as a victim. */
+    job cont = {0};
+    for (int i = 0; i < 160; i++) ds4_tokens_push(&cont.req.prompt,
+                                                  long_tok[i]);
+    ds4_tokens_push(&cont.req.prompt, 500);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &cont.req).kind ==
+                REUSE_MEMORY_TOKEN);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &cont, -1, now) == 160);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &cont, -1, now) >
+                job_slot_score(&s, &slots[3], &cont, -1, now));
+
+    ds4_session_free_test_checkpoint(slots[0].session);
+    ds4_session_free_test_checkpoint(slots[1].session);
+    ds4_session_free_test_checkpoint(slots[2].session);
+    ds4_session_free_test_checkpoint(slots[3].session);
+    ds4_tokens_free(&sub.req.prompt);
+    ds4_tokens_free(&cont.req.prompt);
 }
 
 static void test_slot_probe_live_state_tiers(void) {
@@ -13922,7 +14080,9 @@ static void test_slot_probe_live_state_tiers(void) {
         for (int i = 0; i < 5; i++) ds4_tokens_push(&j.req.prompt, i + 1);
         TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
                     REUSE_NONE);
-        TEST_ASSERT(job_slot_score(&s, &slot, &j, -1) == -10);
+        slot.last_used = time(NULL);
+        TEST_ASSERT(job_slot_score(&s, &slot, &j, -1, time(NULL)) ==
+                    SLOT_PROTECTED_SCORE_BASE - 10);
         live_tool_state_free(&slot.responses_live);
         visible_live_free(&slot.thinking_live);
         ds4_session_free_test_checkpoint(slot.session);
@@ -18654,6 +18814,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
+    test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
