@@ -17,6 +17,7 @@ if str(CHAT_UI_DIR) not in sys.path:
     sys.path.insert(0, str(CHAT_UI_DIR))
 
 import tts  # noqa: E402
+import auth  # noqa: E402
 from server import ChatUIHandler, ensure_chats_dir  # noqa: E402
 
 
@@ -117,13 +118,19 @@ class ApiTtsIntegrationTests(unittest.TestCase):
 
         cls._tmpdir = tempfile.TemporaryDirectory(prefix="ds4-chat-ui-test-")
         chats = ensure_chats_dir(Path(cls._tmpdir.name) / "chats")
+        auth_path = Path(cls._tmpdir.name) / "auth.yaml"
+        auth_path.write_text("username: test\npassword: test\n", encoding="utf-8")
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), ChatUIHandler)
-        cls.httpd.chats_dir = chats
+        cls.httpd.chats_root = chats
         cls.httpd.api_base = "http://127.0.0.1:9"
+        cls.httpd.user_store = auth.load_user_store(auth_path)
+        cls.httpd.sessions = auth.SessionManager()
+        cls._cookie = ""
         cls.port = cls.httpd.server_address[1]
         cls.base = f"http://127.0.0.1:{cls.port}"
         cls._thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls._thread.start()
+        cls._login()
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -131,19 +138,56 @@ class ApiTtsIntegrationTests(unittest.TestCase):
         cls.httpd.server_close()
         cls._tmpdir.cleanup()
 
+    @classmethod
+    def _login(cls) -> None:
+        status, _, headers = cls._post_json_static(
+            "/api/auth/login",
+            {"username": "test", "password": "test"},
+        )
+        assert status == 200
+        cls._cookie = headers.get("set-cookie", "")
+
+    @staticmethod
+    def _post_json_static(path: str, payload: dict) -> tuple[int, bytes, dict[str, str]]:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            ApiTtsIntegrationTests.base + path,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                headers = {k.lower(): v for k, v in resp.headers.items()}
+                return resp.status, resp.read(), headers
+        except urllib.error.HTTPError as exc:
+            headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
+            return exc.code, exc.read(), headers
+
+    def _auth_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self._cookie:
+            headers["Cookie"] = self._cookie
+        return headers
+
     def _get(self, path: str) -> tuple[int, bytes, dict[str, str]]:
-        req = urllib.request.Request(self.base + path, method="GET")
+        req = urllib.request.Request(
+            self.base + path,
+            method="GET",
+            headers=self._auth_headers(),
+        )
         with urllib.request.urlopen(req, timeout=60) as resp:
             headers = {k.lower(): v for k, v in resp.headers.items()}
             return resp.status, resp.read(), headers
 
     def _post_json(self, path: str, payload: dict) -> tuple[int, bytes, dict[str, str]]:
         body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
         req = urllib.request.Request(
             self.base + path,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:

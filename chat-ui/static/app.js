@@ -28,6 +28,7 @@
     railToggle: document.getElementById("railToggle"),
     chatList: document.getElementById("chatList"),
     statusLine: document.getElementById("statusLine"),
+    userLabel: document.getElementById("userLabel"),
     chatTitle: document.getElementById("chatTitle"),
     transcript: document.getElementById("transcript"),
     prompt: document.getElementById("prompt"),
@@ -48,6 +49,7 @@
     summarizeProgress: document.getElementById("summarizeProgress"),
     summarizeProgressLabel: document.getElementById("summarizeProgressLabel"),
     ramNotice: document.getElementById("ramNotice"),
+    logoutBtn: document.getElementById("logoutBtn"),
   };
 
   /** @type {{id:string,title:string,messages:any[],created_at?:string,updated_at?:string}|null} */
@@ -2321,6 +2323,19 @@
     renderAttachBar();
   }
 
+  async function logout() {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } catch {
+      /* redirect anyway */
+    }
+    window.location.replace("/");
+  }
+
+  if (els.logoutBtn) {
+    els.logoutBtn.addEventListener("click", () => logout());
+  }
+
   els.newChatBtn.addEventListener("click", () => createChat());
   els.renameBtn.addEventListener("click", () => renameChat());
   els.deleteBtn.addEventListener("click", () => deleteChat());
@@ -2412,6 +2427,11 @@
     pollRam();
     setInterval(pollRam, 2000);
     try {
+      const session = await api("/api/auth/session");
+      if (session?.username && els.userLabel) {
+        els.userLabel.hidden = false;
+        els.userLabel.textContent = `Signed in as ${session.username}`;
+      }
       const health = await api("/api/health");
       if (health?.ram_policy?.available && health.ram_policy.safe_ctx) {
         safeCtx = health.ram_policy.safe_ctx;

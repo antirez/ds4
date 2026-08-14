@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import platform
 import re
+import socket
 import subprocess
 import sys
 import uuid
@@ -25,6 +27,18 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ocr import OcrError, extract_attachment, tooling_status  # noqa: E402
+from auth import (  # noqa: E402
+    SESSION_COOKIE,
+    SessionManager,
+    UserStore,
+    default_auth_path,
+    load_user_store,
+    parse_cookie_value,
+    route_is_public,
+    session_clear_cookie,
+    session_set_cookie,
+    verify_login,
+)
 from tts import TtsError, synthesize_wav, tooling_status as tts_tooling_status  # noqa: E402
 from web_context import build_web_context, derive_search_query  # noqa: E402
 
@@ -38,7 +52,7 @@ except ImportError:  # pragma: no cover - optional helper
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_API = "http://127.0.0.1:8000"
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8787
 MAX_BODY = 32 * 1024 * 1024
 CHAT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -46,26 +60,36 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def ram_policy_status() -> dict[str, Any]:
-    """Mac-safe ctx policy: model + KV <= RAM - 6 GiB."""
+    """Mac-safe ctx policy: model + KV <= currently-free RAM - reserve.
+
+    Budgets off live free RAM (same reading the status bar uses) rather than
+    total physical RAM, since whatever the desktop already holds doesn't get
+    freed just because a fresh --ctx is being picked.
+    """
     if _safe_ctx is None:
         return {"available": False, "error": "safe_ctx helper missing"}
     try:
-        ram_gib = _safe_ctx.total_ram_bytes() / _safe_ctx.GIB
+        ram = system_ram_status()
+        if not ram.get("available"):
+            return {"available": False, "error": ram.get("error", "ram status unavailable")}
+        ram_gib = float(ram["total_gib"])
+        free_gib = float(ram["free_gib"])
         model = _safe_ctx.find_model(None, REPO_ROOT)
         model_gib = _safe_ctx.estimate_model_gib(model, None, _safe_ctx.DEFAULT_RESIDENT_FACTOR)
         reserve = _safe_ctx.DEFAULT_RESERVE_GIB
-        safe = _safe_ctx.max_safe_ctx(ram_gib=ram_gib, model_gib=model_gib, reserve_gib=reserve)
+        safe = _safe_ctx.max_safe_ctx(ram_gib=free_gib, model_gib=model_gib, reserve_gib=reserve)
         safe_aligned = max(0, (safe // 1024) * 1024)
         return {
             "available": True,
             "reserve_gib": reserve,
             "ram_gib": round(ram_gib, 2),
-            "ceiling_gib": round(ram_gib - reserve, 2),
+            "free_gib": round(free_gib, 2),
+            "ceiling_gib": round(free_gib - reserve, 2),
             "model_gib": round(model_gib, 2),
             "model_path": str(model) if model else None,
             "safe_ctx": safe_aligned,
             "kv_gib_per_mtoken": _safe_ctx.KV_GIB_PER_MTOKEN,
-            "policy": "planned_model_plus_ctx <= RAM - 6GiB",
+            "policy": "planned_model_plus_ctx <= free_RAM_now - 6GiB",
         }
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "error": str(exc)}
@@ -292,13 +316,44 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+DEFAULT_LEGACY_CHAT_OWNER = "davide"
+
+
 def default_chats_dir() -> Path:
     return Path.home() / ".ds4" / "chats"
+
+
+def legacy_chat_owner() -> str:
+    return (os.environ.get("DS4_LEGACY_CHAT_OWNER") or DEFAULT_LEGACY_CHAT_OWNER).strip()
 
 
 def ensure_chats_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def user_chats_dir(chats_root: Path, username: str) -> Path:
+    safe = username.strip()
+    if not safe or safe != username or "/" in safe or "\\" in safe or ".." in safe:
+        raise ValueError("invalid username")
+    path = chats_root / safe
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def migrate_legacy_chats(chats_root: Path, owner: str) -> int:
+    """Move flat ``chats_root/*.json`` into ``chats_root/<owner>/``."""
+    if not owner:
+        return 0
+    moved = 0
+    owner_dir = ensure_chats_dir(chats_root / owner)
+    for path in sorted(chats_root.glob("*.json")):
+        dest = owner_dir / path.name
+        if dest.exists():
+            continue
+        path.rename(dest)
+        moved += 1
+    return moved
 
 
 def chat_path(chats_dir: Path, chat_id: str) -> Path:
@@ -497,12 +552,56 @@ class ChatUIHandler(BaseHTTPRequestHandler):
     server_version = "ds4-chat-ui/1.0"
 
     @property
-    def chats_dir(self) -> Path:
-        return self.server.chats_dir  # type: ignore[attr-defined]
+    def chats_root(self) -> Path:
+        return self.server.chats_root  # type: ignore[attr-defined]
 
     @property
     def api_base(self) -> str:
         return self.server.api_base  # type: ignore[attr-defined]
+
+    @property
+    def user_store(self) -> UserStore:
+        return self.server.user_store  # type: ignore[attr-defined]
+
+    @property
+    def sessions(self) -> SessionManager:
+        return self.server.sessions  # type: ignore[attr-defined]
+
+    def _session_token(self) -> str | None:
+        return parse_cookie_value(self.headers.get("Cookie", ""), SESSION_COOKIE)
+
+    def _current_username(self) -> str | None:
+        return self.sessions.username(self._session_token())
+
+    def _is_authenticated(self) -> bool:
+        return self._current_username() is not None
+
+    @property
+    def chats_dir(self) -> Path:
+        username = self._current_username()
+        if not username:
+            raise RuntimeError("chats_dir requires an authenticated session")
+        return user_chats_dir(self.chats_root, username)
+
+    def _send_unauthorized(self) -> None:
+        self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "authentication required"})
+
+    def _auth_required(self, path: str) -> bool:
+        if route_is_public(path):
+            return False
+        if self._is_authenticated():
+            return False
+        if path in ("", "/") or path == "/index.html":
+            self._serve_static_file("login.html")
+            return True
+        if path == "/login.html":
+            self._serve_static_file("login.html")
+            return True
+        if path.startswith("/api/") or path.startswith("/v1/"):
+            self._send_unauthorized()
+            return True
+        self._send_unauthorized()
+        return True
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
@@ -545,6 +644,24 @@ class ChatUIHandler(BaseHTTPRequestHandler):
     def do_GET(self, head_only: bool = False) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if path == "/api/auth/session":
+            username = self._current_username()
+            payload: dict[str, Any] = {"authenticated": username is not None}
+            if username:
+                payload["username"] = username
+            self._send_json(HTTPStatus.OK, payload)
+            return
+
+        if self._auth_required(path):
+            return
+
+        if path == "/login.html":
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         if path == "/api/health":
             self._send_json(
@@ -600,6 +717,17 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/auth/login":
+            self._handle_login()
+            return
+
+        if path == "/api/auth/logout":
+            self._handle_logout()
+            return
+
+        if self._auth_required(path):
+            return
+
         if path == "/api/chats":
             try:
                 raw = self._read_body()
@@ -634,6 +762,8 @@ class ChatUIHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if self._auth_required(path):
+            return
         if not path.startswith("/api/chats/"):
             self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -655,6 +785,8 @@ class ChatUIHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        if self._auth_required(path):
+            return
         if not path.startswith("/api/chats/"):
             self._send_error_json(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -670,6 +802,9 @@ class ChatUIHandler(BaseHTTPRequestHandler):
 
     def _serve_static(self, path: str, head_only: bool = False) -> None:
         rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        self._serve_static_file(rel, head_only=head_only)
+
+    def _serve_static_file(self, rel: str, head_only: bool = False) -> None:
         candidate = (STATIC_DIR / rel).resolve()
         try:
             candidate.relative_to(STATIC_DIR.resolve())
@@ -687,6 +822,48 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if not head_only:
             self.wfile.write(data)
+
+    def _handle_login(self) -> None:
+        try:
+            raw = self._read_body()
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if not isinstance(payload, dict):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "body must be a JSON object")
+            return
+        username = payload.get("username")
+        password = payload.get("password")
+        if not isinstance(username, str) or not isinstance(password, str):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "username and password required")
+            return
+        if verify_login(username, password, self.user_store):
+            token = self.sessions.create(username)
+            body = json.dumps({"ok": True, "username": username}, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Set-Cookie",
+                session_set_cookie(token, self.sessions.ttl_seconds),
+            )
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._send_error_json(HTTPStatus.UNAUTHORIZED, "invalid username or password")
+
+    def _handle_logout(self) -> None:
+        self.sessions.revoke(self._session_token())
+        body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Set-Cookie", session_clear_cookie())
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_ocr(self) -> None:
         try:
@@ -891,9 +1068,80 @@ class ChatUIHandler(BaseHTTPRequestHandler):
                     pass
 
 
+def default_bind_host() -> str:
+    """Bind host from DS4_CHAT_HOST or DEFAULT_HOST (0.0.0.0 = LAN + localhost)."""
+    return os.environ.get("DS4_CHAT_HOST", DEFAULT_HOST)
+
+
+def local_lan_ips() -> list[str]:
+    """Best-effort LAN IPv4 addresses for startup hints."""
+    seen: set[str] = set()
+    ips: list[str] = []
+
+    def add(ip: str) -> None:
+        if ip.startswith("127.") or ip in seen:
+            return
+        seen.add(ip)
+        ips.append(ip)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            add(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    if platform.system() == "Darwin":
+        for iface in ("en0", "en1", "bridge0"):
+            try:
+                out = subprocess.check_output(
+                    ["ipconfig", "getifaddr", iface],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                if out:
+                    add(out)
+            except (subprocess.CalledProcessError, OSError, FileNotFoundError):
+                continue
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except OSError:
+        pass
+
+    return ips
+
+
+def format_startup_banner(host: str, port: int, api_base: str, chats_root: Path) -> str:
+    lines = ["DwarfStar chat UI"]
+    bind_all = host in ("0.0.0.0", "::")
+    if bind_all:
+        lines[0] += f" listening on all interfaces (:{port})"
+        lines.append(f"  local   http://127.0.0.1:{port}")
+        lan_ips = local_lan_ips()
+        if lan_ips:
+            for ip in lan_ips:
+                lines.append(f"  lan     http://{ip}:{port}")
+        else:
+            lines.append("  lan     (no LAN IP detected)")
+    else:
+        lines[0] += f" on http://{host}:{port}"
+    lines.append(f"  proxy -> {api_base}")
+    lines.append(f"  chats -> {chats_root}")
+    lines.append(f"  auth  -> {default_auth_path()}")
+    if bind_all:
+        lines.append("  note: upstream ds4-server stays on localhost; only this UI is LAN-visible.")
+    return "\n".join(lines)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DwarfStar local chat UI")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="UI bind host")
+    parser.add_argument(
+        "--host",
+        default=default_bind_host(),
+        help="UI bind host (default 0.0.0.0; env DS4_CHAT_HOST; 127.0.0.1 = localhost only)",
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="UI bind port")
     parser.add_argument(
         "--api",
@@ -911,18 +1159,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    chats_dir = ensure_chats_dir(args.chats_dir or default_chats_dir())
+    chats_root = ensure_chats_dir(args.chats_dir or default_chats_dir())
     if not STATIC_DIR.is_dir():
         print(f"missing static dir: {STATIC_DIR}", file=sys.stderr)
         return 1
 
+    auth_path = default_auth_path()
+    try:
+        user_store = load_user_store(auth_path)
+    except FileNotFoundError:
+        print(f"auth file missing: {auth_path}", file=sys.stderr)
+        print(
+            "copy chat-ui/auth.yaml.example to that path and set username/password",
+            file=sys.stderr,
+        )
+        return 1
+    except ValueError as exc:
+        print(f"invalid auth file {auth_path}: {exc}", file=sys.stderr)
+        return 1
+
+    migrated = migrate_legacy_chats(chats_root, legacy_chat_owner())
+    if migrated:
+        print(
+            f"migrated {migrated} legacy chat(s) into {chats_root / legacy_chat_owner()}",
+            flush=True,
+        )
+
     httpd = ThreadingHTTPServer((args.host, args.port), ChatUIHandler)
-    httpd.chats_dir = chats_dir
+    httpd.chats_root = chats_root
     httpd.api_base = args.api.rstrip("/")
+    httpd.user_store = user_store
+    httpd.sessions = SessionManager()
     print(
-        f"DwarfStar chat UI on http://{args.host}:{args.port}\n"
-        f"  proxy -> {httpd.api_base}\n"
-        f"  chats -> {chats_dir}",
+        format_startup_banner(args.host, args.port, httpd.api_base, chats_root),
         flush=True,
     )
     try:

@@ -34,7 +34,9 @@
 *.dSYM/
 __pycache__/
 *.pyc
-chat-ui/.venv-piper/
+# Local chat UI credentials (copy from chat-ui/auth.yaml.example)
+.ds4/auth.yaml
+chat-ui/auth.yaml
 /tts-smoke.wav
 /misc/
 .*.swp

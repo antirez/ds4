@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DwarfStar — Sign in</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="login-page">
+  <div class="sky" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="loginTitle">
+      <header class="login-head">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <p class="brand-name">DwarfStar</p>
+            <p class="brand-sub">ds4 local chat</p>
+          </div>
+        </div>
+        <h1 id="loginTitle" class="login-title">Sign in</h1>
+        <p class="login-lead">Credentials come from your local <code>auth.yaml</code>.</p>
+      </header>
+
+      <form id="loginForm" class="login-form" autocomplete="on">
+        <label class="login-field">
+          <span class="login-label">Username</span>
+          <input type="text" id="username" name="username" autocomplete="username" required />
+        </label>
+        <label class="login-field">
+          <span class="login-label">Password</span>
+          <input type="password" id="password" name="password" autocomplete="current-password" required />
+        </label>
+        <p id="loginError" class="login-error" hidden role="alert"></p>
+        <button type="submit" class="btn primary login-submit" id="loginBtn">Sign in</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/login.js"></script>
+</body>
+</html>

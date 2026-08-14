@@ -1003,23 +1003,49 @@ There is no built-in web chat in `ds4-server` itself. A small local UI lives in
 server on port 8000, and stores conversations as JSON under `~/.ds4/chats`.
 
 ```sh
-# terminal 1 — inference server (Metal, Mac-safe --ctx = RAM - 6GiB policy)
+# terminal 1 — inference server (Metal, Mac-safe --ctx = free RAM - 6GiB policy)
 make run-server-mac
 # or: ./scripts/run-ds4-server-mac.sh
 # inspect only: make safe-ctx   /   python3 scripts/safe_ctx.py
 
-# terminal 2 — chat UI
+# terminal 2 — chat UI (listens on all interfaces by default for LAN access)
 make chat-ui
-# or: python3 chat-ui/server.py --host 127.0.0.1 --port 8787
+# or: python3 chat-ui/server.py --port 8787
+# localhost only: python3 chat-ui/server.py --host 127.0.0.1
+# or: DS4_CHAT_HOST=127.0.0.1 make chat-ui
 ```
 
-On macOS the helper sizes `--ctx` so estimated resident model + context stays
-at or under **total RAM − 6 GiB** (headroom for the OS, chat-ui, and browser).
-It uses the README Flash figure of ~26 GiB context pressure per 1M tokens.
-Override with `DS4_CTX=...` only if you accept the risk; the launcher refuses
-values above the safe budget.
+On startup the UI prints **local** (`http://127.0.0.1:8787`) and **lan**
+(`http://<your-ip>:8787`) URLs when bound to `0.0.0.0` (the default). Other
+devices on the same network can open the LAN URL; inference still proxies to
+`ds4-server` on `127.0.0.1:8000` on this machine. Override the bind address
+with `--host` or `DS4_CHAT_HOST`. If you expose the UI on your LAN, configure
+login authentication (auth yaml) before allowing untrusted devices on the
+network.
 
-Open http://127.0.0.1:8787 . Use **New chat** to start, send messages as usual,
+On macOS the helper sizes `--ctx` so estimated resident model + context stays
+at or under **currently-free RAM − 6 GiB** (headroom for the OS, chat-ui, and
+browser to grow while the server runs) rather than total physical RAM, since
+whatever other apps already hold doesn't free up just because ds4-server is
+starting. It uses the README Flash figure of ~26 GiB context pressure per 1M
+tokens. Pass `--ignore-current-usage` to `safe_ctx.py` for the old total-RAM
+policy. For a tighter cap (~70% of total RAM for model+KV), use conservative
+mode: `./scripts/run-ds4-server-mac.sh --conservative`, `DS4_CONSERVATIVE=1
+make run-server-mac`, or `python3 scripts/safe_ctx.py --conservative`. If the
+model cannot fit under the cap, conservative mode falls back to the free-RAM
+policy. Override with `DS4_CTX=...` only if you accept the risk; the launcher
+refuses values above the safe budget.
+
+Open http://127.0.0.1:8787 on this machine, or the **lan** URL from the
+startup log on another device on the same network. Sign in with the username and
+password from your local auth file (default `~/.ds4/auth.yaml`; copy
+`chat-ui/auth.yaml.example` on first setup). Multiple users are supported — repeat
+`username` / `password` pairs or use a `users:` map in the yaml. Each user gets
+their own chat directory under `~/.ds4/chats/<username>/`. On first startup, any
+legacy flat files in `~/.ds4/chats/*.json` are moved into
+`~/.ds4/chats/davide/` (override owner with `DS4_LEGACY_CHAT_OWNER`). Override
+the auth path with `DS4_AUTH_FILE` if needed. Use **New chat** to start, send
+messages as usual,
 and pick an older entry in the left list to resume. Attach text or code files
 from the composer; their contents are inlined into the prompt. Images and PDFs
 are run through local OCR (`tesseract` + Poppler) and the extracted text is

@@ -367,6 +367,11 @@ body {
   margin-top: 0.35rem;
 }
 
+.rail-foot .login-out {
+  width: 100%;
+  margin-top: 0.65rem;
+}
+
 .rail-foot code {
   font-family: var(--font-mono);
   color: var(--accent);
@@ -1194,6 +1199,118 @@ textarea#prompt:focus {
   .btn.send {
     grid-column: 1 / -1;
   }
+}
+
+/* —— Login —— */
+body.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: auto;
+}
+
+.login-shell {
+  position: relative;
+  z-index: 2;
+  width: min(92vw, 26rem);
+  padding: 1.25rem;
+  animation: rise 0.45s ease both;
+}
+
+.login-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 1.35rem 1.35rem 1.5rem;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+}
+
+.login-head {
+  margin-bottom: 1.25rem;
+}
+
+.login-title {
+  margin: 1rem 0 0.35rem;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.login-lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.login-lead code {
+  font-family: var(--font-mono);
+  color: var(--accent);
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.login-label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.login-field input {
+  width: 100%;
+  padding: 0.72rem 0.85rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.35;
+  transition: border-color 0.15s ease;
+}
+
+.login-field input:hover {
+  border-color: var(--line-strong);
+}
+
+.login-field input:focus {
+  outline: 2px solid rgba(198, 241, 53, 0.4);
+  outline-offset: 1px;
+}
+
+.login-error {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(224, 112, 112, 0.45);
+  background: rgba(224, 112, 112, 0.12);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.login-error[hidden] {
+  display: none !important;
+}
+
+.login-submit {
+  width: 100%;
+  margin-top: 0.15rem;
+  padding: 0.72rem 1rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

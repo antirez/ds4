@@ -1,0 +1,15 @@
+# Copy to ~/.ds4/auth.yaml (or set DS4_AUTH_FILE to another path).
+# Keep this file out of version control — it holds login secrets.
+#
+# Option A — repeated username/password pairs (one block per user):
+username: davide
+password: change-me
+username: guest
+password: change-me-too
+#
+# Option B — users map:
+# users:
+#   davide:
+#     password: change-me
+#   guest:
+#     password: change-me-too
