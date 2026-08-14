@@ -8619,7 +8619,18 @@ typedef struct {
     uint64_t generated_tokens;
     double last_prefill_tps;
     double last_decode_tps;
+    uint64_t idle_unloads;
 } server_stats;
+
+/* Everything needed to reopen the engine after an idle unload.  The option
+ * strings point into argv, which lives as long as the process, and the GPU
+ * layout kept here is the one resolved at first open: an "auto" reload must
+ * not re-derive a different placement from whatever VRAM is free later. */
+typedef struct {
+    ds4_engine_options engine;
+    ds4_gpu_config gpu;
+    bool use_gpu_config;
+} server_engine_spec;
 
 struct server {
     ds4_engine *engine;
@@ -8662,6 +8673,28 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+
+    /* Idle unload policy (--idle-timeout).  engine_mu guards `engine` plus the
+     * engine_loading handshake, and engine_cv wakes threads waiting on a
+     * reload.  The listening socket is deliberately outside all of this: a
+     * client that connects while unloaded completes its TCP handshake at once
+     * and waits for the reload, so fallback chains never see ECONNREFUSED and
+     * walk away from the primary provider. */
+    int idle_timeout_sec;
+    pthread_mutex_t engine_mu;
+    pthread_cond_t engine_cv;
+    bool engine_loading;
+    bool idle_unloaded;   /* Guarded by mu, reported by GET /stats. */
+    double last_activity; /* Guarded by mu.  Inference requests only. */
+    pthread_t idle_thread;
+    bool idle_thread_started;
+    server_engine_spec engine_spec;
+    /* Model identity cached at first open so GET /health, /v1/models and
+     * /stats keep answering while unloaded.  Reloading 80 GB of weights to
+     * satisfy a liveness poll would defeat the whole feature. */
+    char *model_name;
+    const char *model_id;
+    bool model_is_glm_dsa;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -13442,7 +13475,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
-                             ds4_engine_model_name(s->engine),
+                             s->model_name,
                              s->ctx_size,
                              s->default_tokens);
 }
@@ -13459,7 +13492,7 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (s->model_is_glm_dsa) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
@@ -13481,7 +13514,7 @@ static bool send_models(server *s, int fd) {
 static bool send_health(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"status\":\"ok\",\"model\":");
-    json_escape(&b, ds4_engine_model_name(s->engine));
+    json_escape(&b, s->model_name);
     buf_printf(&b, ",\"uptime_s\":%.0f}\n", now_sec() - s->started_at);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -13494,6 +13527,7 @@ static bool send_stats(server *s, int fd) {
     const int queue_depth = s->queue_depth;
     bool busy = s->busy;
     const int clients = s->clients;
+    const bool idle_unloaded = s->idle_unloaded;
     if (s->batched_mode) {
         for (int i = 0; i < s->slot_count; i++) {
             if (s->slots[i].busy) {
@@ -13506,6 +13540,9 @@ static bool send_stats(server *s, int fd) {
     int live_tokens = 0;
     pthread_mutex_lock(&s->inference_mu);
     for (int i = 0; i < s->slot_count; i++) {
+        /* Sessions are NULL while idle-unloaded, and ds4_session_pos()
+         * dereferences its argument. */
+        if (!s->slots[i].session) continue;
         int pos = ds4_session_pos(s->slots[i].session);
         if (pos > live_tokens) live_tokens = pos;
     }
@@ -13524,6 +13561,9 @@ static bool send_stats(server *s, int fd) {
         "\"clients\":%d,"
         "\"live_tokens\":%d,"
         "\"ctx_size\":%d,"
+        "\"idle_timeout_s\":%d,"
+        "\"idle_unloaded\":%s,"
+        "\"idle_unloads\":%llu,"
         "\"requests\":%llu,"
         "\"queue_rejected\":%llu,"
         "\"queue_dropped_disconnected\":%llu,"
@@ -13550,6 +13590,9 @@ static bool send_stats(server *s, int fd) {
         clients,
         live_tokens,
         s->ctx_size,
+        s->idle_timeout_sec,
+        idle_unloaded ? "true" : "false",
+        (unsigned long long)st.idle_unloads,
         (unsigned long long)st.requests,
         (unsigned long long)st.queue_rejected,
         (unsigned long long)st.queue_dropped_disconnected,
@@ -13677,6 +13720,184 @@ static void wait_for_job_or_disconnect(server *s, job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* ---- Idle engine unload (--idle-timeout) ---------------------------------
+ *
+ * Freeing the engine while the process keeps serving is safe because of one
+ * invariant: server.clients is incremented in the accept loop before the
+ * client thread starts, decremented only in client_done(), and a client thread
+ * owns its job until a worker signals completion.  clients == 0 therefore
+ * proves no request path holds a session or engine pointer, which is what
+ * makes tearing both down race-free rather than merely unlikely. */
+
+static int server_engine_spec_open(const server_engine_spec *spec,
+                                   ds4_engine **out) {
+    ds4_engine_options opts = spec->engine;
+    if (spec->use_gpu_config) {
+        ds4_gpu_config gpu = spec->gpu;
+        return ds4_engine_create_with_gpu_config(out, &opts, &gpu);
+    }
+    return ds4_engine_open(out, &opts);
+}
+
+/* The inference endpoints, plus Anthropic's token counter because it needs the
+ * tokenizer.  Twin of the parse chain in client_main(): an inference endpoint
+ * missing here would be served against a NULL engine, and a metadata path
+ * leaking in would let a liveness poll reload the whole model. */
+static bool server_path_needs_engine(const http_request *hr) {
+    if (strcmp(hr->method, "POST")) return false;
+    return !strcmp(hr->path, "/v1/chat/completions") ||
+           !strcmp(hr->path, "/v1/responses") ||
+           !strcmp(hr->path, "/v1/completions") ||
+           !strcmp(hr->path, "/v1/messages") ||
+           !strcmp(hr->path, "/v1/messages/count_tokens");
+}
+
+static void server_mark_activity(server *s) {
+    if (s->idle_timeout_sec <= 0) return;
+    pthread_mutex_lock(&s->mu);
+    s->last_activity = now_sec();
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* True when nothing is in flight and the idle window has elapsed.  Metadata
+ * endpoints never refresh last_activity, so a /health poller on a shorter
+ * interval than the timeout cannot pin an otherwise unused server in memory. */
+static bool server_idle_expired(server *s) {
+    pthread_mutex_lock(&s->mu);
+    bool idle = s->clients == 0 && s->queue_depth == 0 && !s->busy && !s->head;
+    if (idle && s->batched_mode) {
+        for (int i = 0; i < s->slot_count; i++) {
+            if (s->slots[i].busy) {
+                idle = false;
+                break;
+            }
+        }
+    }
+    const double since = now_sec() - s->last_activity;
+    pthread_mutex_unlock(&s->mu);
+    return idle && since >= (double)s->idle_timeout_sec;
+}
+
+/* engine_mu held.  Sessions go before the engine because they hold references
+ * into engine-owned memory; the reverse order dangles. */
+static void server_idle_unload_locked(server *s) {
+    for (int i = 0; s->kv.enabled && i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (!slot->session) continue;
+        const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+        if (!tokens || tokens->len < s->kv.opt.min_tokens) continue;
+        /* Same reason the shutdown path persists: dropping a live session
+         * without checkpointing it would silently discard the newest
+         * conversation state and leave only an older prefix on disk. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: persisting resident KV cache before idle unload slot=%d tokens=%d",
+                   i, tokens->len);
+        kv_cache_store_current(s, slot, "idle");
+    }
+    pthread_mutex_lock(&s->inference_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        live_tool_state_free(&slot->responses_live);
+        live_tool_state_free(&slot->anthropic_live);
+        visible_live_free(&slot->thinking_live);
+        ds4_session_free(slot->session);
+        slot->session = NULL;
+        /* The reloaded session starts empty, so stale save-suppression state
+         * would skip the next checkpoint it should write. */
+        slot->continued_last_store_tokens = 0;
+    }
+    pthread_mutex_unlock(&s->inference_mu);
+    ds4_engine_close(s->engine);
+    s->engine = NULL;
+    pthread_mutex_lock(&s->mu);
+    s->stats.idle_unloads++;
+    s->idle_unloaded = true;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Reopen the engine and its resident sessions.  Concurrent cold requests wait
+ * on engine_cv while the first one reloads, so N simultaneous requests cost
+ * exactly one reload.  Returns false only when the reload itself failed; the
+ * caller must answer an error rather than use a NULL engine. */
+static bool server_ensure_engine_loaded(server *s) {
+    if (s->idle_timeout_sec <= 0) return true;
+    pthread_mutex_lock(&s->engine_mu);
+    for (;;) {
+        if (s->engine) {
+            pthread_mutex_unlock(&s->engine_mu);
+            return true;
+        }
+        if (!s->engine_loading) break;
+        pthread_cond_wait(&s->engine_cv, &s->engine_mu);
+    }
+    s->engine_loading = true;
+    pthread_mutex_unlock(&s->engine_mu);
+
+    const double t0 = now_sec();
+    ds4_engine *engine = NULL;
+    ds4_session **sessions = NULL;
+    bool ok = server_engine_spec_open(&s->engine_spec, &engine) == 0;
+    if (!ok) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: failed to reload engine after idle unload");
+    } else {
+        sessions = xmalloc((size_t)s->slot_count * sizeof(*sessions));
+        memset(sessions, 0, (size_t)s->slot_count * sizeof(*sessions));
+        for (int i = 0; i < s->slot_count; i++) {
+            if (ds4_session_create(&sessions[i], engine, s->ctx_size) == 0) continue;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to recreate session %d/%d after idle unload",
+                       i + 1, s->slot_count);
+            for (int j = 0; j < i; j++) ds4_session_free(sessions[j]);
+            free(sessions);
+            sessions = NULL;
+            ds4_engine_close(engine);
+            engine = NULL;
+            ok = false;
+            break;
+        }
+    }
+
+    pthread_mutex_lock(&s->engine_mu);
+    if (ok) {
+        s->engine = engine;
+        pthread_mutex_lock(&s->inference_mu);
+        for (int i = 0; i < s->slot_count; i++) {
+            s->slots[i].session = sessions[i];
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+        pthread_mutex_lock(&s->mu);
+        s->idle_unloaded = false;
+        pthread_mutex_unlock(&s->mu);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: engine reloaded after idle unload in %.2fs",
+                   now_sec() - t0);
+    }
+    s->engine_loading = false;
+    pthread_cond_broadcast(&s->engine_cv);
+    pthread_mutex_unlock(&s->engine_mu);
+    free(sessions);
+    return ok;
+}
+
+static void *idle_monitor_main(void *arg) {
+    server *s = arg;
+    while (!g_stop_requested) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 250000000 };
+        nanosleep(&ts, NULL);
+        if (g_stop_requested) break;
+        pthread_mutex_lock(&s->engine_mu);
+        if (s->engine && !s->engine_loading && server_idle_expired(s)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: idle timeout of %ds reached; freeing GPU and engine resources",
+                       s->idle_timeout_sec);
+            server_idle_unload_locked(s);
+        }
+        pthread_mutex_unlock(&s->engine_mu);
+    }
+    return NULL;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -13726,6 +13947,19 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    /* Request parsing tokenizes, so the engine has to be resident before the
+     * parse chain below runs.  Reaching an inference endpoint is also what
+     * defines activity for the idle clock; the GET metadata endpoints handled
+     * above deliberately do not refresh it. */
+    if (server_path_needs_engine(&hr)) {
+        server_mark_activity(s);
+        if (!server_ensure_engine_loaded(s)) {
+            http_error(fd, s->enable_cors, 503, "model engine unavailable");
+            http_request_free(&hr);
+            goto done;
+        }
+    }
+
     request req;
     char err[160];
     bool ok = false;
@@ -13769,7 +14003,7 @@ static void *client_main(void *arg) {
     }
     if (!req.model_from_request) {
         free(req.model);
-        req.model = xstrdup(server_model_id_from_engine(s->engine));
+        req.model = xstrdup(s->model_id);
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -13807,6 +14041,9 @@ static void *client_main(void *arg) {
         goto done;
     }
     wait_for_job_or_disconnect(s, &j);
+    /* Restart the idle clock at the end of the request, not its start, so a
+     * long generation cannot be unloaded moments after it finishes. */
+    server_mark_activity(s);
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
@@ -13885,6 +14122,7 @@ typedef struct {
     int max_queue;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int idle_timeout_sec;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -13975,6 +14213,9 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    pthread_mutex_destroy(&s->engine_mu);
+    pthread_cond_destroy(&s->engine_cv);
+    free(s->model_name);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -14113,6 +14354,9 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--idle-timeout")) {
+            c.idle_timeout_sec =
+                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--max-queue")) {
             c.max_queue = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -14290,6 +14534,7 @@ int main(int argc, char **argv) {
         cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
     ds4_engine *engine = NULL;
+    server_engine_spec engine_spec = {0};
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
         bool skip_cuda = false;
@@ -14302,6 +14547,7 @@ int main(int argc, char **argv) {
         }
         cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
+            engine_spec.engine = cfg.engine;
             if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
         } else {
             const bool was_auto =
@@ -14313,11 +14559,15 @@ int main(int argc, char **argv) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
             }
+            engine_spec.engine = cfg.engine;
+            engine_spec.gpu = gpu_cfg;
+            engine_spec.use_gpu_config = true;
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
-        return 1;
+    } else {
+        engine_spec.engine = cfg.engine;
+        if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
     }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -14350,6 +14600,12 @@ int main(int argc, char **argv) {
     s.enable_cors = cfg.enable_cors;
     s.max_queue = cfg.max_queue;
     s.started_at = now_sec();
+    s.last_activity = s.started_at;
+    s.idle_timeout_sec = cfg.idle_timeout_sec;
+    s.engine_spec = engine_spec;
+    s.model_name = xstrdup(ds4_engine_model_name(engine));
+    s.model_id = server_model_id_from_engine(engine);
+    s.model_is_glm_dsa = ds4_engine_is_glm_dsa(engine);
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -14370,6 +14626,8 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.engine_mu, NULL);
+    pthread_cond_init(&s.engine_cv, NULL);
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -14472,6 +14730,30 @@ int main(int argc, char **argv) {
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
+    if (cfg.idle_timeout_sec > 0) {
+        if (pthread_create(&s.idle_thread, NULL, idle_monitor_main, &s) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to start idle monitor");
+            close(lfd);
+            g_listen_fd = -1;
+            server_request_worker_stop(&s);
+            if (s.batched_mode) {
+                for (int i = 0; i < slot_threads_started; i++) {
+                    pthread_join(s.slot_threads[i], NULL);
+                }
+                server_request_decode_stop(&s);
+                if (decode_thread_started) pthread_join(s.decode_thread, NULL);
+            } else {
+                pthread_join(worker, NULL);
+            }
+            server_close_resources(&s);
+            return 1;
+        }
+        s.idle_thread_started = true;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: idle timeout %ds; GPU and engine resources are freed while no request is in flight",
+                   cfg.idle_timeout_sec);
+    }
+
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
@@ -14510,6 +14792,7 @@ int main(int argc, char **argv) {
     }
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
+    if (s.idle_thread_started) pthread_join(s.idle_thread, NULL);
     server_request_worker_stop(&s);
     if (s.batched_mode) {
         for (int i = 0; i < slot_threads_started; i++) {
@@ -14526,6 +14809,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
+        if (!slot->session) continue; /* Idle-unloaded. */
         const ds4_tokens *tokens = ds4_session_tokens(slot->session);
         if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
         server_log(DS4_LOG_KVCACHE,
@@ -19733,6 +20017,35 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+/* The reload gate must cover exactly the endpoints whose handlers touch the
+ * engine: an inference endpoint missing from it would be served against a NULL
+ * engine, and a metadata path leaking in would let a liveness poll pay for a
+ * full model reload. */
+static void test_engine_gate_covers_inference_endpoints_only(void) {
+    static const char *needs[] = {
+        "/v1/chat/completions", "/v1/responses", "/v1/completions",
+        "/v1/messages", "/v1/messages/count_tokens",
+    };
+    for (size_t i = 0; i < sizeof(needs) / sizeof(needs[0]); i++) {
+        http_request hr = {0};
+        snprintf(hr.method, sizeof(hr.method), "%s", "POST");
+        snprintf(hr.path, sizeof(hr.path), "%s", needs[i]);
+        TEST_ASSERT(server_path_needs_engine(&hr));
+        snprintf(hr.method, sizeof(hr.method), "%s", "GET");
+        TEST_ASSERT(!server_path_needs_engine(&hr));
+    }
+    static const char *free_paths[] = {
+        "/health", "/v1/health", "/stats", "/v1/stats", "/v1/models",
+        "/v1/models/deepseek-v4-flash", "/", "/v1/chat/completions/extra",
+    };
+    for (size_t i = 0; i < sizeof(free_paths) / sizeof(free_paths[0]); i++) {
+        http_request hr = {0};
+        snprintf(hr.method, sizeof(hr.method), "%s", "POST");
+        snprintf(hr.path, sizeof(hr.path), "%s", free_paths[i]);
+        TEST_ASSERT(!server_path_needs_engine(&hr));
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
@@ -19866,6 +20179,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_engine_gate_covers_inference_endpoints_only();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

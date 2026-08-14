@@ -333,11 +333,13 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--max-queue N", "Reject requests with 429 when N jobs are already waiting. 0 disables. Default: 0");
+    opt(fp, c, "--idle-timeout N", "Free GPU and engine after N idle seconds, reloading on the next request. 0 disables. Default: 0");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "GET /health and GET /stats report liveness and operational counters even mid-generation.");
+    para(fp, c, "With --idle-timeout the listening socket stays bound while unloaded, so a cold request waits for the reload instead of being refused; /health, /stats and /v1/models answer without reloading.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
 }
