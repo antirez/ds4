@@ -403,7 +403,7 @@ if [ "$MODEL" = "ds4f-dspark" ]; then
 elif [ "$MODEL" = "laguna-dflash" ]; then
     echo
     echo "Laguna DFlash downloaded. Enable it for greedy CUDA generation:"
-    echo "  ./ds4 -m ./ds4flash.gguf --cuda --mtp $OUT_DIR/$(basename "$LAGUNA_DFLASH_FILE") --mtp-draft 15 --temp 0"
+    echo "  ./ds4 -m $OUT_DIR/$LAGUNA_Q2_Q3_FILE --cuda --mtp $OUT_DIR/$(basename "$LAGUNA_DFLASH_FILE") --mtp-draft 15 --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
