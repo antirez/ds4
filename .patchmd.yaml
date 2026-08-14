@@ -1,0 +1,11 @@
+format: patchmd/v0.1
+upstream:
+    repository: https://github.com/antirez/ds4.git
+    ref: origin/laguna-s2.1
+paths:
+    patches: .patches
+    patchsets: .patchsets
+policy:
+    require_upstream_tests: true
+    require_patch_acceptance: true
+    allow_network_during_verification: false

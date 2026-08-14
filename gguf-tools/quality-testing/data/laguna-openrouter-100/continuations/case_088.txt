@@ -1,0 +1,1 @@
+Tokenizers must handle special tags carefully to ensure proper parsing, security, and functionality. Here's a structured breakdown of the

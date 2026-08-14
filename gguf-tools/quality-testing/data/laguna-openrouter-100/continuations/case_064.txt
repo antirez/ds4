@@ -1,0 +1,2 @@
+**Latency** and **throughput** are two key performance metrics that describe different aspects of system or network efficiency:
+

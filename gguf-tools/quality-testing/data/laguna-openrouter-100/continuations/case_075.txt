@@ -1,0 +1,1 @@
+Un **trie** (o albero di prefissi) rappresenta un insieme di string

@@ -56,6 +56,10 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_range_async(
+        ds4_gpu_tensor *dst, uint64_t dst_offset,
+        const ds4_gpu_tensor *src, uint64_t src_offset,
+        uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -159,7 +163,9 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
                                      uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+void ds4_gpu_set_tensor_matmul_suppressed(bool suppressed);
 void ds4_gpu_set_glm_model(bool enabled);
+void ds4_gpu_set_laguna_revised_q8(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
@@ -631,6 +637,18 @@ int ds4_gpu_matmul_quant_rows_scalar_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* The original Laguna Q4_K_M recipe keeps selected down projections and the
+ * output head in Q6_K. */
+int ds4_gpu_matmul_q6_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 /* Optional fused GPU operations.
  *
  * These are acceleration hooks, not required backend primitives.  A backend
@@ -817,6 +835,38 @@ int ds4_gpu_matmul_f16_rms_fold_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
         float                   norm_eps);
+
+int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
+int ds4_gpu_dflash_pack_features_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *features,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              aux_norm_offset,
+        uint32_t              n_embd,
+        uint32_t              n_aux,
+        uint32_t              n_rows,
+        uint32_t              feature_rows,
+        float                 eps);
+
+int ds4_gpu_dflash_store_kv_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              kv_width);
 
 /* Exact multi-row form of the DeepSeek 4096x256 F16 router projection. */
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(
@@ -1170,6 +1220,131 @@ int ds4_gpu_glm_rope_tail_tensor(
         float           attn_factor,
         float           beta_fast,
         float           beta_slow);
+
+int ds4_gpu_laguna_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
+
+int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+        ds4_gpu_tensor *q,
+        ds4_gpu_tensor *k,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        q_weight_offset,
+        uint64_t        k_weight_offset,
+        uint32_t        n_tokens,
+        uint32_t        n_q_head,
+        uint32_t        n_k_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps);
+
+int ds4_gpu_laguna_qkvg_f16_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint64_t              v_weight_offset,
+        uint64_t              gate_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              q_dim,
+        uint32_t              kv_dim,
+        uint32_t              gate_dim,
+        const ds4_gpu_tensor *x);
+
+/* Optional revised-checkpoint decode fusion. The CUDA Blackwell path
+ * prequantizes the shared F32 activation once and evaluates all four Q8_0
+ * projections in one launch. Other backends may return 0 so the graph falls
+ * back to two exact paired projections. */
+int ds4_gpu_laguna_qkvg_q8_0_tensor(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint64_t              k_weight_offset,
+        uint64_t              v_weight_offset,
+        uint64_t              gate_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              q_dim,
+        uint32_t              kv_dim,
+        uint32_t              gate_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_laguna_attn_output_residual_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual);
+
+int ds4_gpu_laguna_store_attention_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate,
+        uint32_t              pos,
+        uint32_t              cache_cap,
+        uint32_t              key_start,
+        uint32_t              key_count,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale);
+
+int ds4_gpu_laguna_attention_prefill_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        ds4_gpu_tensor       *staged_key,
+        ds4_gpu_tensor       *staged_value,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  commit_kv);
 
 int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         ds4_gpu_tensor       *out,
@@ -2353,6 +2528,43 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         bool                    force_resident);
+
+typedef struct {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t gate_type;
+    uint32_t up_type;
+    uint32_t down_type;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t up_expert_bytes;
+    uint64_t up_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+} ds4_gpu_laguna_moe_desc;
+
+/* Decode-only Laguna path. Routed and shared experts use independent thread
+ * groups in two common dispatches, preserving each projection's arithmetic. */
+int ds4_gpu_laguna_routed_shared_moe_one_tensor(
+        ds4_gpu_tensor                   *routed_out,
+        ds4_gpu_tensor                   *routed_mid,
+        ds4_gpu_tensor                   *shared_out,
+        ds4_gpu_tensor                   *shared_mid,
+        const void                       *model_map,
+        uint64_t                          model_size,
+        const ds4_gpu_laguna_moe_desc    *routed,
+        const ds4_gpu_laguna_moe_desc    *shared,
+        uint32_t                          expert_in_dim,
+        uint32_t                          expert_mid_dim,
+        uint32_t                          out_dim,
+        const ds4_gpu_tensor             *selected,
+        const ds4_gpu_tensor             *weights,
+        uint32_t                          n_total_expert,
+        uint32_t                          n_expert,
+        const ds4_gpu_tensor             *shared_selected,
+        const ds4_gpu_tensor             *shared_weight,
+        const ds4_gpu_tensor             *x);
 
 int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,

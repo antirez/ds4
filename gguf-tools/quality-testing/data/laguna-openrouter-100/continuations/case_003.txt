@@ -1,0 +1,1 @@
+RMSNorm is a normalization technique designed to stabilize training by scaling the input based on its root mean square (RMS) value

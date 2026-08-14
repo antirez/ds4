@@ -1,0 +1,1 @@
+To count rows per category in SQL, you can use the `GROUP BY` clause along with the `COUNT()` function

@@ -1,0 +1,5 @@
+Here's a concise checklist for reviewing PRs involving memory lifetimes:
+
+### Memory Lifetime Review Checklist
+
+**1. Ownership &

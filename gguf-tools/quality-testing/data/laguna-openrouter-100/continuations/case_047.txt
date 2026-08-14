@@ -1,0 +1,1 @@
+The difference between raw Key-Value (KV) rows and compressed KV rows lies in their storage format, efficiency, and use

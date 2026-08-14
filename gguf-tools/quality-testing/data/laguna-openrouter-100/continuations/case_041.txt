@@ -1,0 +1,1 @@
+Small logit differences can significantly alter greedy continuation because the **softmax function**, which converts logits into probabilities, amplifies differences through

@@ -1,0 +1,1 @@
+A **confidence interval** is a range of values that estimates where a population parameter (like an average or proportion) is

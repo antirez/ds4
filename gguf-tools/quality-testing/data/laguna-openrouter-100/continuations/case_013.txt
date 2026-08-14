@@ -1,0 +1,1 @@
+RMSNorm (Root Mean Square Layer Normalization) richiede la somma dei quadrati e il riscalamento per

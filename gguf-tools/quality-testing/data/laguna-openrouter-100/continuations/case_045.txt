@@ -1,0 +1,1 @@
+In the context of graphics rendering with Metal (and similar APIs like Vulkan or DirectX), using one large buffer can be less

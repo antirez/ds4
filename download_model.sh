@@ -3,6 +3,10 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
+LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
+LAGUNA_ANTIREZ_REPO="antirez/Laguna-S-2.1-GGUF"
+LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
+LAGUNA_DFLASH_REVISION="92b968eeba0fbb790ef4216e2a70ef079ed19b07"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -18,6 +22,9 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
+LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
+LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
+LAGUNA_DFLASH_FILE="gguf/laguna-s-2.1-DFlash-BF16.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -26,6 +33,7 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
+HF_REVISION=
 
 usage() {
     cat <<EOF
@@ -45,6 +53,9 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
+  ./download_model.sh laguna-q4 [--token TOKEN]
+  ./download_model.sh laguna-q2-q3 [--token TOKEN]
+  ./download_model.sh laguna-dflash [--token TOKEN]
 
 Targets:
 
@@ -104,6 +115,19 @@ Targets:
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
 
+  laguna-q4
+       Official imatrix-quantized Laguna S 2.1 Q4_K_M GGUF from Poolside.
+       About 68 GB on disk; supported by Metal and CUDA with full residency.
+
+  laguna-dflash
+       Official Laguna S 2.1 DFlash BF16 drafter from Poolside, about 2.1 GB.
+       Use it with a Laguna Q4 or mixed Q2_K/Q3_K model and --mtp on CUDA.
+
+  laguna-q2-q3
+       Mixed Laguna S 2.1 routed-expert quant for 64 GB systems. Routed
+       layers 1..20 use Q2_K and layers 21..47 use Q3_K; all other tensors
+       retain the official Q4_K_M layout. 44.95 GiB on disk.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -122,7 +146,7 @@ Then the default commands work:
 After downloading DSpark support, enable it explicitly in greedy mode:
   ./ds4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
 
-PRO and GLM files are downloaded with the official Hugging Face downloader
+Large PRO, GLM, and Laguna files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
 EOF
@@ -177,6 +201,25 @@ case "$MODEL" in
         REPO=$GLM_ANTIREZ_REPO
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
+        ;;
+    laguna-q4)
+        REPO=$LAGUNA_REPO
+        MODEL_FILE=$LAGUNA_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        HF_REVISION=$LAGUNA_REVISION
+        ;;
+    laguna-q2-q3)
+        REPO=$LAGUNA_ANTIREZ_REPO
+        MODEL_FILE=$LAGUNA_Q2_Q3_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    laguna-dflash)
+        REPO=$LAGUNA_REPO
+        MODEL_FILE=$LAGUNA_DFLASH_FILE
+        FORCE_HF_DOWNLOAD=1
+        FLATTEN_DOWNLOADS=1
+        LINK_MODEL=0
+        HF_REVISION=$LAGUNA_DFLASH_REVISION
         ;;
     -h|--help|help)
         usage
@@ -279,11 +322,18 @@ download_one_hf() {
 
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
+    if [ -n "$HF_REVISION" ]; then
+        echo "revision $HF_REVISION"
+    fi
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
-    if [ -n "$TOKEN" ]; then
+    if [ -n "$TOKEN" ] && [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    elif [ -n "$TOKEN" ]; then
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+    elif [ -n "$HF_REVISION" ]; then
+        "$HF_CMD" download "$REPO" "$file" --revision "$HF_REVISION" --repo-type model --local-dir "$OUT_DIR"
     else
         "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi
@@ -350,6 +400,10 @@ if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
     echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
+elif [ "$MODEL" = "laguna-dflash" ]; then
+    echo
+    echo "Laguna DFlash downloaded. Enable it for greedy CUDA generation:"
+    echo "  ./ds4 -m $OUT_DIR/$LAGUNA_Q2_Q3_FILE --cuda --mtp $OUT_DIR/$(basename "$LAGUNA_DFLASH_FILE") --mtp-draft 15 --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

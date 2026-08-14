@@ -129,6 +129,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model = enabled ? 1 : 0;
 }
 
+extern "C" void ds4_gpu_set_laguna_revised_q8(bool enabled) {
+    (void)enabled;
+}
+
 extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     (void)enabled;
 }
@@ -319,4 +323,36 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
     }
     g_routed_moe_selected_override_n = n_selected;
     return 1;
+}
+
+/* Laguna DFlash is CUDA-only. Engine validation rejects it on ROCm; these
+ * stubs keep the shared Laguna graph linkable. */
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dflash_pack_features_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *features,
+        const void *model_map, uint64_t model_size,
+        uint64_t aux_norm_offset, uint32_t n_embd, uint32_t n_aux,
+        uint32_t n_rows, float eps) {
+    (void)out; (void)features; (void)model_map; (void)model_size;
+    (void)aux_norm_offset; (void)n_embd; (void)n_aux; (void)n_rows;
+    (void)eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_dflash_store_kv_tensor(
+        ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap,
+        uint32_t kv_width) {
+    (void)key_cache; (void)value_cache; (void)k; (void)v; (void)pos0;
+    (void)n_tokens; (void)cache_cap; (void)kv_width;
+    return 0;
 }

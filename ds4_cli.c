@@ -61,13 +61,16 @@ static bool cli_greedy_argmax_requested(bool speculative_requested) {
 typedef struct {
     const char *prompt;
     const char *system;
+    bool system_set;
     bool raw_prompt;
     int n_predict;
     int ctx_size;
     float temperature;
+    int top_k;
     float top_p;
     float min_p;
     bool temperature_set;
+    bool top_k_set;
     bool top_p_set;
     bool min_p_set;
     uint64_t seed;
@@ -356,6 +359,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
 static bool is_rendered_chat_prompt(const char *prompt) {
     static const char *prefixes[] = {
+        "〈|EOS|〉",
         "<｜begin▁of▁sentence｜>",
         "<｜User｜>",
         "[gMASK]",
@@ -511,11 +515,14 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
-
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!engine || !gen) return;
+    float temperature, top_p, min_p;
+    int top_k;
+    ds4_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!gen->temperature_set) gen->temperature = temperature;
+    if (!gen->top_k_set) gen->top_k = top_k;
+    if (!gen->top_p_set) gen->top_p = top_p;
+    if (!gen->min_p_set) gen->min_p = min_p;
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -590,7 +597,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(session, cfg->gen.temperature, 0,
+            token = ds4_session_sample(session, cfg->gen.temperature, cfg->gen.top_k,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
@@ -1344,7 +1351,7 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
-    } else if (mode == DS4_THINK_MAX) {
+    } else if (!ds4_engine_is_laguna(engine) && mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(engine, prefix);
     }
 }
@@ -1409,10 +1416,6 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
     chat->session = NULL;
     chat->ctx_size = 0;
     return repl_chat_create_session(engine, chat, ctx_size);
-}
-
-static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
-    return !ds4_engine_is_glm_dsa(engine);
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
@@ -1496,7 +1499,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         } else {
             token = ds4_session_sample(chat->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -1566,8 +1569,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
         ds4_session_invalidate(chat->session);
-    } else if (repl_chat_assistant_turn_uses_eos(engine)) {
-        ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
+    } else {
+        ds4_chat_append_assistant_end(engine, &chat->transcript);
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -1764,7 +1767,7 @@ static cli_config parse_options(int argc, char **argv) {
         },
         .gen = {
             .prompt = NULL,
-            .system = "You are a helpful assistant",
+            .system = NULL,
             .n_predict = 50000,
             .ctx_size = 32768,
             .temperature = DS4_DEFAULT_TEMPERATURE,
@@ -1833,6 +1836,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.prompt = c.prompt_owned;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
+            c.gen.system_set = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
@@ -1865,6 +1869,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
@@ -2118,6 +2125,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (!cfg.gen.system_set) {
+        cfg.gen.system = ds4_engine_default_system_prompt(engine);
+    }
     if (cfg.engine.tp.role == DS4_TP_WORKER) {
         int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);

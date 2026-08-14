@@ -1,0 +1,1 @@
+Per inserire un elemento in un heap binario (assumendo un **max-heap**), seguiamo quest

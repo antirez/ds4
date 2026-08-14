@@ -1,0 +1,1 @@
+Ecco tre invarianti che potrebbero essere utili per una tabella di token speciali:

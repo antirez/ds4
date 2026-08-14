@@ -1,0 +1,1 @@
+Il modello dovrebbe rispondere solo dopo aver letto l'intero prompt.

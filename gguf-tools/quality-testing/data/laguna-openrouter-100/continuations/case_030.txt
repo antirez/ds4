@@ -1,0 +1,1 @@
+La ricerca binaria del punto di inserimento in una lista ordinata è un algoritmo che determin

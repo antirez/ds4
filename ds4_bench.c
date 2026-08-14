@@ -27,6 +27,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -41,6 +42,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int mtp_draft_tokens;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -206,6 +208,7 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx_max = 32768,
         .step_incr = 2048,
         .gen_tokens = 128,
+        .mtp_draft_tokens = 1,
         .step_mul = 1.0,
     };
 
@@ -236,6 +239,11 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -576,10 +584,12 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
@@ -732,12 +742,13 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -750,16 +761,51 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+            int cycle_tokens[17];
+            int cycle_n = 1;
+            cycle_tokens[0] = token;
+            if (ds4_engine_mtp_draft_tokens(engine) > 1) {
+                cycle_n = ds4_session_eval_speculative_argmax(
+                        session,
+                        token,
+                        cfg.gen_tokens - gen_done,
+                        -1,
+                        cycle_tokens,
+                        (int)(sizeof(cycle_tokens) /
+                              sizeof(cycle_tokens[0])),
+                        err,
+                        sizeof(err));
+                if (cycle_n < 0) {
+                    fprintf(stderr,
+                            "ds4-bench: speculative decode at frontier %d "
+                            "failed: %s\n",
+                            frontier,
+                            err);
+                    rc = 1;
+                    break;
+                }
+            } else if (ds4_session_eval(session, token,
+                                        err, sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4-bench: decode at frontier %d failed: %s\n",
+                        frontier,
+                        err);
                 rc = 1;
                 break;
             }
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            if (gen_done == 0) {
+                gen_first_sec = token_t1 - token_t0;
+                gen_first_tokens = cycle_n;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+            }
+            for (int i = 0; i < cycle_n; i++) {
+                if (gen_token_buf && gen_token_count < cfg.gen_tokens) {
+                    gen_token_buf[gen_token_count++] = cycle_tokens[i];
+                }
+            }
+            gen_done += cycle_n;
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,7 +841,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens =
+            gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,

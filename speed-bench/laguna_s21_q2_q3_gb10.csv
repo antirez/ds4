@@ -1,0 +1,5 @@
+workload,ctx_tokens,prefill_tokens,gen_tokens,mode,prefill_tps,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,rollback
+ds4.c,2048,2048,256,raw-sorted,275.41,25.65,41.070,255,25.84,-
+ds4.c,2048,2048,0,raw-unsorted,97.84,0.00,0.000,0,0.00,DS4_CUDA_LAGUNA_NO_SORTED_MOE=1
+ds4.c,2048,2048,256,dflash-portable,186.44,29.80,261.414,254,30.52,DS4_CUDA_DFLASH_NO_BLACKWELL=1
+ds4.c,2048,2048,256,dflash-blackwell,266.75,32.49,241.872,254,33.30,-

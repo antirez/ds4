@@ -23,6 +23,7 @@
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
 /tests/cuda_long_context_smoke
+/tests/cuda_laguna_smoke
 /tests/test_layer_pack
 /tests/test_metal_session_batch
 /tests/test_mxfp4_cuda
@@ -37,3 +38,4 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+.patchmd/

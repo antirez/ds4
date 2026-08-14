@@ -1,0 +1,3 @@
+Here's a simple example of a race condition in C using two threads that increment a shared variable without synchronization:
+
+```

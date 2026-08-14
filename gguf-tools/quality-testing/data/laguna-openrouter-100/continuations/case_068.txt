@@ -1,0 +1,1 @@
+Quantization error, the discrepancy introduced when converting continuous values to discrete representations, disproportionately impacts **rare experts** compared to **common

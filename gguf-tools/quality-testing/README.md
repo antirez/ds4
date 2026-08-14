@@ -15,6 +15,9 @@ calling hosted APIs:
 
 - `data/glm52-openrouter-100`: 100 GLM 5.2 continuations collected through
   OpenRouter `z-ai/glm-5.2` with `top_logprobs=20`.
+- `data/laguna-openrouter-100`: 100 Laguna S 2.1 continuations collected
+  through OpenRouter `poolside/laguna-s-2.1`. Poolside's endpoint does not
+  expose output-token logprobs.
 - `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
 - `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
@@ -65,8 +68,33 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort none
 ```
 
-Use one output directory per official model. For PRO through the official
-DeepSeek API:
+For Laguna S 2.1 through OpenRouter:
+
+```sh
+export OPENROUTER_API_KEY=...
+python3 gguf-tools/quality-testing/collect_official.py \
+  --model poolside/laguna-s-2.1 \
+  --endpoint https://openrouter.ai/api/v1/chat/completions \
+  --api-key-env OPENROUTER_API_KEY \
+  --prompts gguf-tools/quality-testing/prompts.jsonl \
+  --out gguf-tools/quality-testing/data/laguna-openrouter-100 \
+  --count 100 \
+  --max-tokens 24 \
+  --top-logprobs 0 \
+  --token-limit-field max_tokens \
+  --thinking omit \
+  --reasoning-effort none
+```
+
+The Laguna fixture supports local target-token NLL, first-token agreement, and
+greedy-prefix comparison. API logprob-delta and top-N agreement fields remain
+zero because the Poolside endpoint does not return logprobs. Its raw response
+files are retained for provenance but omitted from `manifest.tsv`, avoiding
+attempts to parse unavailable API logprobs during local scoring.
+
+Use one output directory per official model. The default model is Flash, so
+`data/flash` is the recommended path for Flash continuations. For PRO through
+the official DeepSeek API:
 
 ```sh
 python3 gguf-tools/quality-testing/collect_official.py \
@@ -84,6 +112,9 @@ The script writes:
 - `data/<model>/continuations/case_*.txt`
 - `data/<model>/responses/case_*.json`
 - `data/<model>/manifest.tsv`
+
+The response path is the optional fourth manifest column and is included only
+when `--top-logprobs` is greater than zero.
 
 The prompt list is tracked in `prompts.jsonl`.  Curated fixture directories are
 also tracked after review; ad-hoc API collection directories should stay
@@ -121,7 +152,8 @@ gguf-tools/quality-testing/score_official \
 
 Use `data/flash/manifest.tsv` for Flash GGUFs,
 `data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs, and
-`data/pro/manifest.tsv` for PRO GGUFs.  The scorer and comparator do not care
+`data/laguna-openrouter-100/manifest.tsv` for Laguna S 2.1 GGUFs, and
+`data/pro/manifest.tsv` for PRO GGUFs. The scorer and comparator do not care
 which model produced the manifest; the manifest path selects the continuation
 set.
 

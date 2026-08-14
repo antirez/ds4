@@ -1,0 +1,1 @@
+L'attenzione con **online softmax** è una tecnica utilizzata in modelli di intell

@@ -1,0 +1,3 @@
+To implement the push operation for a binary heap (specifically a min-heap), follow this pseudocode:
+
+```pseudocode

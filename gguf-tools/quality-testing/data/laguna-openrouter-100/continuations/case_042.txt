@@ -1,0 +1,1 @@
+Online softmax in attention is a technique that allows the softmax computation to be done incrementally, without needing to store all intermediate values

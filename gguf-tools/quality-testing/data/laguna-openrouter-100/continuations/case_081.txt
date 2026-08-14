@@ -1,0 +1,4 @@
+Here’s a completed version of the C comment with common documentation for a lock:
+
+```c
+/* This lock protects

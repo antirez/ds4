@@ -1,0 +1,1 @@
+L'approccio **top-p (nucleus sampling)** e la **temperatura zero** sono due strateg

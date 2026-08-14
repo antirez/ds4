@@ -1,0 +1,4 @@
+**Mutex vs. Atomic Counter: Key Differences**
+
+1. **Purpose and Scope**:
+   - **Mutex**:
