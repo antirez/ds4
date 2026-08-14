@@ -2837,13 +2837,20 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
                 ok = false;
                 break;
             }
-            if (!prior) {
+            if (!prior || live_known) {
+                /* Require live state when: (a) no prior in history (stateless replay
+                 * impossible), or (b) live state exists (bind to the slot with the
+                 * full KV context including hidden reasoning, even if history has
+                 * the call).  This prevents slot misassignment when the client
+                 * replays full history but the live frontier has richer state. */
                 if (requires_live_tool_state) *requires_live_tool_state = true;
-                continue;
             }
-            if (needs_reasoning &&
-                (!prior->reasoning || !prior->reasoning[0]))
-            {
+            if (!prior && needs_reasoning) {
+                /* When there's no prior in history, also check if reasoning is needed.
+                 * When live_known is true but prior exists, reasoning check below applies. */
+                if (requires_live_reasoning) *requires_live_reasoning = true;
+            } else if (prior && needs_reasoning &&
+                       (!prior->reasoning || !prior->reasoning[0])) {
                 if (requires_live_reasoning) *requires_live_reasoning = true;
             }
         }
@@ -10842,7 +10849,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
      * reasoning.summary (e.g. Zed with "summary": "auto") replay reasoning
      * summaries for all turns, not just tool-call turns.  Include reasoning in
      * the visible prefix whenever the client requested summaries, so the next
-     * request's prompt matches the saved checkpoint for KV cache reuse. */
+     * request's prompt matches the saved checkpoint for KV cache reuse.
+     * The suffix starts with reasoning (no <think> prefix) because the prompt_text
+     * already ends with <think> from the previous turn's render, so we only append
+     * the reasoning content and closing tag here. */
     if (r && ds4_think_mode_enabled(r->think_mode)) {
         if (r->reasoning_summary_emit) {
             buf_puts(&suffix, reasoning ? reasoning : "");
@@ -16615,7 +16625,9 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
-    TEST_ASSERT(!needs_live_tool_state);
+    /* When live state exists, require it even if history has the call.
+     * This binds the request to the slot with full KV context. */
+    TEST_ASSERT(needs_live_tool_state);
     TEST_ASSERT(needs_live_reasoning);
 
     free(msgs.v[0].reasoning);
@@ -16627,7 +16639,8 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
-    TEST_ASSERT(!needs_live_tool_state);
+    /* Live state still required; reasoning is now in history so doesn't need live. */
+    TEST_ASSERT(needs_live_tool_state);
     TEST_ASSERT(!needs_live_reasoning);
 
     free(msgs.v[0].reasoning);
@@ -16639,7 +16652,8 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
-    TEST_ASSERT(!needs_live_tool_state);
+    /* Thinking disabled: no reasoning requirement, but live state still required. */
+    TEST_ASSERT(needs_live_tool_state);
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
