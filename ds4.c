@@ -3110,6 +3110,16 @@ typedef struct {
     uint32_t borrowers;
 } ds4_shared_prefill_workspace_state;
 
+#ifdef DS4_TEST_HOOKS
+/* The CPU lifecycle test parks the releasing session immediately after it
+ * drops the workspace borrow.  This makes the close/free ordering proof
+ * scheduler-controlled without shipping instrumentation in normal builds. */
+typedef void (*ds4_test_shared_prefill_workspace_release_hook_fn)(void *ud);
+static ds4_test_shared_prefill_workspace_release_hook_fn
+    ds4_test_shared_prefill_workspace_release_hook;
+static void *ds4_test_shared_prefill_workspace_release_hook_ud;
+#endif
+
 static bool ds4_shared_prefill_workspace_state_init(
         ds4_shared_prefill_workspace_state *state) {
     if (!state) return false;
@@ -3221,6 +3231,12 @@ static void ds4_shared_prefill_workspace_release_borrow(
     if (state->borrowers != 0) state->borrowers--;
     pthread_cond_broadcast(&state->changed);
     pthread_mutex_unlock(&state->mutex);
+#ifdef DS4_TEST_HOOKS
+    if (ds4_test_shared_prefill_workspace_release_hook) {
+        ds4_test_shared_prefill_workspace_release_hook(
+                ds4_test_shared_prefill_workspace_release_hook_ud);
+    }
+#endif
 }
 
 /* Sets closing and waits until the workspace has no creator and no session
@@ -3235,6 +3251,7 @@ static bool ds4_shared_prefill_workspace_begin_close(
         return false;
     }
     state->closing = true;
+    pthread_cond_broadcast(&state->changed);
     while (state->creating || state->borrowers != 0) {
         if (pthread_cond_wait(&state->changed, &state->mutex) != 0) {
             pthread_mutex_unlock(&state->mutex);
@@ -64751,8 +64768,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         if (!support_kind_allowed_for_startup(
                     e->dspark, e->ssd_streaming, e->support_kind)) {
-        if (!support_kind_allowed_for_startup(
-                    e->dspark, e->ssd_streaming, e->support_kind)) {
             if (e->dspark && e->support_kind != DS4_SUPPORT_DSPARK) {
                 fprintf(stderr,
                         "ds4: explicit --dspark requires DSpark support content; "
@@ -66272,8 +66287,22 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+#ifdef DS4_TEST_HOOKS
+typedef void (*ds4_test_session_admission_release_hook_fn)(
+        ds4_session *s, void *ud);
+static ds4_test_session_admission_release_hook_fn
+    ds4_test_session_admission_release_hook;
+static void *ds4_test_session_admission_release_hook_ud;
+#endif
+
 static void ds4_session_release_admission_slot(ds4_session *s) {
     if (!s || !s->admission_slot_held) return;
+#ifdef DS4_TEST_HOOKS
+    if (ds4_test_session_admission_release_hook) {
+        ds4_test_session_admission_release_hook(
+                s, ds4_test_session_admission_release_hook_ud);
+    }
+#endif
 #ifndef DS4_NO_GPU
     ds4_engine_dspark_session_admission_release(s->engine);
 #endif
@@ -66281,7 +66310,7 @@ static void ds4_session_release_admission_slot(ds4_session *s) {
 }
 
 static void ds4_session_release_shared_prefill_workspace(ds4_session *s) {
-#ifndef DS4_NO_GPU
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
     if (!s || !s->shared_prefill_workspace_borrowed || !s->engine) return;
     ds4_shared_prefill_workspace_release_borrow(
             &s->engine->shared_prefill_workspace_state);
@@ -66289,6 +66318,15 @@ static void ds4_session_release_shared_prefill_workspace(ds4_session *s) {
 #else
     (void)s;
 #endif
+}
+
+/* Engine teardown can proceed as soon as the last shared-workspace borrow is
+ * released.  Every engine dereference owned by session destruction therefore
+ * has to precede that release.  Keep this order in one helper so error cleanup
+ * and the ordinary ds4_session_free() tail cannot diverge. */
+static void ds4_session_release_engine_lifetime_borrows(ds4_session *s) {
+    ds4_session_release_admission_slot(s);
+    ds4_session_release_shared_prefill_workspace(s);
 }
 
 static int ds4_session_create_impl(ds4_session **out,
@@ -66506,8 +66544,7 @@ static int ds4_session_create_impl(ds4_session **out,
                     "the configured session requirement %u; refusing session\n",
                     shared_workspace_cap,
                     workspace_prefill_cap);
-            ds4_session_release_shared_prefill_workspace(s);
-            ds4_session_release_admission_slot(s);
+            ds4_session_release_engine_lifetime_borrows(s);
             free(s);
             return 1;
         }
@@ -66529,8 +66566,7 @@ static int ds4_session_create_impl(ds4_session **out,
             ds4_shared_prefill_workspace_abort_create(
                     &e->shared_prefill_workspace_state);
         }
-        ds4_session_release_shared_prefill_workspace(s);
-        ds4_session_release_admission_slot(s);
+        ds4_session_release_engine_lifetime_borrows(s);
         free(s);
         return 1;
     }
@@ -66552,8 +66588,7 @@ static int ds4_session_create_impl(ds4_session **out,
                 ds4_shared_prefill_workspace_abort_create(
                         &e->shared_prefill_workspace_state);
             }
-            ds4_session_release_shared_prefill_workspace(s);
-            ds4_session_release_admission_slot(s);
+            ds4_session_release_engine_lifetime_borrows(s);
             free(s);
             return 1;
         }
@@ -66574,8 +66609,7 @@ static int ds4_session_create_impl(ds4_session **out,
                 ds4_shared_prefill_workspace_abort_create(
                         &e->shared_prefill_workspace_state);
             }
-            ds4_session_release_shared_prefill_workspace(s);
-            ds4_session_release_admission_slot(s);
+            ds4_session_release_engine_lifetime_borrows(s);
             free(s);
             return 1;
         }
@@ -66626,8 +66660,7 @@ static int ds4_session_create_impl(ds4_session **out,
                 half * sizeof(float));
         if (!s->graph.tp_logits_half) {
             metal_graph_free(&s->graph);
-            ds4_session_release_shared_prefill_workspace(s);
-            ds4_session_release_admission_slot(s);
+            ds4_session_release_engine_lifetime_borrows(s);
             free(s);
             return 1;
         }
@@ -66638,8 +66671,7 @@ static int ds4_session_create_impl(ds4_session **out,
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
         metal_graph_free(&s->graph);
-        ds4_session_release_shared_prefill_workspace(s);
-        ds4_session_release_admission_slot(s);
+        ds4_session_release_engine_lifetime_borrows(s);
         free(s);
         return 1;
     }
@@ -66648,8 +66680,7 @@ static int ds4_session_create_impl(ds4_session **out,
                                                   &e->dspark_weights)) {
             fprintf(stderr, "ds4: failed to configure DSpark target-hidden capture\n");
             metal_graph_free(&s->graph);
-            ds4_session_release_shared_prefill_workspace(s);
-            ds4_session_release_admission_slot(s);
+            ds4_session_release_engine_lifetime_borrows(s);
             free(s);
             return 1;
         }
@@ -66679,8 +66710,7 @@ static int ds4_session_create_impl(ds4_session **out,
                             s->admission_expected_context_scratch_bytes),
                         ds4_bytes_to_gib(allocated_context_scratch_bytes));
                 metal_graph_free(&s->graph);
-                ds4_session_release_shared_prefill_workspace(s);
-                ds4_session_release_admission_slot(s);
+                ds4_session_release_engine_lifetime_borrows(s);
                 free(s);
                 return 1;
             }
@@ -66694,8 +66724,7 @@ static int ds4_session_create_impl(ds4_session **out,
                         ds4_bytes_to_gib(s->admission_expected_graph_bytes),
                         ds4_bytes_to_gib(allocated_graph_bytes));
                 metal_graph_free(&s->graph);
-                ds4_session_release_shared_prefill_workspace(s);
-                ds4_session_release_admission_slot(s);
+                ds4_session_release_engine_lifetime_borrows(s);
                 free(s);
                 return 1;
             }
@@ -66711,8 +66740,7 @@ static int ds4_session_create_impl(ds4_session **out,
                             s->admission_expected_speculative_bytes),
                         ds4_bytes_to_gib(allocated_speculative_bytes));
                 metal_graph_free(&s->graph);
-                ds4_session_release_shared_prefill_workspace(s);
-                ds4_session_release_admission_slot(s);
+                ds4_session_release_engine_lifetime_borrows(s);
                 free(s);
                 return 1;
             }
@@ -66755,14 +66783,13 @@ static int ds4_session_create_impl(ds4_session **out,
                         "ds4: failed to create distributed coordinator session: %s\n",
                         err[0] ? err : "unknown error");
             metal_graph_free(&s->graph);
-            ds4_session_release_shared_prefill_workspace(s);
             free(s->logits);
             free(s->sample_probs);
             free(s->mtp_logits);
             free(s->spec_row_logits);
             free(s->dspark_markov_bias);
             free(s->dspark_conf_features);
-            ds4_session_release_admission_slot(s);
+            ds4_session_release_engine_lifetime_borrows(s);
             free(s);
             return 1;
         }
@@ -66823,7 +66850,6 @@ void ds4_session_free(ds4_session *s) {
         }
     }
 #endif
-    ds4_session_release_shared_prefill_workspace(s);
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
@@ -66839,9 +66865,243 @@ void ds4_session_free(ds4_session *s) {
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
 #endif
-    ds4_session_release_admission_slot(s);
+    ds4_session_release_engine_lifetime_borrows(s);
     free(s);
 }
+
+#ifdef DS4_TEST_HOOKS
+typedef struct {
+    ds4_engine engine;
+    ds4_session *session;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    bool admission_saw_host_buffers_released;
+    bool workspace_release_hook_entered;
+    bool allow_session_free_return;
+    bool allow_close_without_admission_observation;
+    bool close_finished;
+    bool close_saw_admission_released;
+} ds4_test_session_free_close_race_state;
+
+static void ds4_test_session_free_close_race_workspace_release_hook(void *ud) {
+    ds4_test_session_free_close_race_state *test = ud;
+    pthread_mutex_lock(&test->mutex);
+    test->workspace_release_hook_entered = true;
+    pthread_cond_broadcast(&test->changed);
+    while (!test->allow_session_free_return) {
+        if (pthread_cond_wait(&test->changed, &test->mutex) != 0) break;
+    }
+    pthread_mutex_unlock(&test->mutex);
+}
+
+static void ds4_test_session_free_close_race_admission_release_hook(
+        ds4_session *s, void *ud) {
+    ds4_test_session_free_close_race_state *test = ud;
+    pthread_mutex_lock(&test->mutex);
+    /* token_vec_free() clears its pointer after freeing it.  These are live
+     * session-owned host allocations, so the admission reservation cannot be
+     * returned until both have crossed that free boundary. */
+    test->admission_saw_host_buffers_released =
+        s->checkpoint.v == NULL && s->greedy_splitkv_segment.v == NULL;
+    pthread_cond_broadcast(&test->changed);
+    pthread_mutex_unlock(&test->mutex);
+}
+
+static void *ds4_test_session_free_close_race_free_thread(void *arg) {
+    ds4_test_session_free_close_race_state *test = arg;
+    ds4_session_free(test->session);
+    pthread_mutex_lock(&test->mutex);
+    test->session = NULL;
+    pthread_cond_broadcast(&test->changed);
+    pthread_mutex_unlock(&test->mutex);
+    return NULL;
+}
+
+static void *ds4_test_session_free_close_race_close_thread(void *arg) {
+    ds4_test_session_free_close_race_state *test = arg;
+    bool workspace_ready = false;
+    if (!ds4_shared_prefill_workspace_begin_close(
+                &test->engine.shared_prefill_workspace_state,
+                &workspace_ready) || !workspace_ready) {
+        return (void *)1;
+    }
+    pthread_mutex_lock(&test->mutex);
+    /* begin_close() can now tear down engine-owned state.  The admission
+     * release must already be complete before the last workspace borrow made
+    * that possible. */
+    test->close_saw_admission_released =
+        test->allow_close_without_admission_observation ||
+        test->admission_saw_host_buffers_released;
+    test->close_finished = true;
+    pthread_cond_broadcast(&test->changed);
+    pthread_mutex_unlock(&test->mutex);
+    ds4_shared_prefill_workspace_close_unlock(
+            &test->engine.shared_prefill_workspace_state);
+    return NULL;
+}
+
+static void ds4_test_session_free_close_race_clear_hooks(void) {
+    ds4_test_shared_prefill_workspace_release_hook = NULL;
+    ds4_test_shared_prefill_workspace_release_hook_ud = NULL;
+    ds4_test_session_admission_release_hook = NULL;
+    ds4_test_session_admission_release_hook_ud = NULL;
+}
+
+/* A scheduler-controlled close/free race proof.  The free thread is parked
+ * immediately after it releases the final shared-workspace borrow; close is
+ * therefore free to tear down engine state while the free thread remains
+ * paused.  Reversing the two releases in the shared helper makes close observe
+ * an unreleased admission slot, so this is a deterministic UAF regression,
+ * not a timing-sensitive stress test. */
+static int ds4_test_session_free_close_race_impl(
+        unsigned int fail_pthread_create) {
+    ds4_test_session_free_close_race_state test = {0};
+    ds4_shared_prefill_workspace_state *workspace =
+        &test.engine.shared_prefill_workspace_state;
+    bool creator = false;
+    bool ready = false;
+    uint32_t prefill_cap = 0;
+    pthread_t closer;
+    pthread_t freer;
+    bool closer_started = false;
+    bool freer_started = false;
+    void *closer_result = NULL;
+    void *freer_result = NULL;
+    int ok = 1;
+
+    if (!ds4_shared_prefill_workspace_state_init(workspace) ||
+        pthread_mutex_init(&test.mutex, NULL) != 0) {
+        ds4_shared_prefill_workspace_state_destroy(workspace);
+        return 0;
+    }
+    if (pthread_cond_init(&test.changed, NULL) != 0) {
+        pthread_mutex_destroy(&test.mutex);
+        ds4_shared_prefill_workspace_state_destroy(workspace);
+        return 0;
+    }
+    if (!ds4_shared_prefill_workspace_acquire(
+                workspace, &creator, &ready, &prefill_cap) ||
+        !creator || ready ||
+        !ds4_shared_prefill_workspace_begin_publish(workspace)) {
+        ok = 0;
+    } else {
+        ds4_shared_prefill_workspace_publish_locked(workspace, 4096);
+    }
+    test.session = calloc(1, sizeof(*test.session));
+    if (!test.session) ok = 0;
+    if (test.session) {
+        test.engine.backend = DS4_BACKEND_CPU;
+        test.session->engine = &test.engine;
+        test.session->admission_slot_held = true;
+        test.session->shared_prefill_workspace_borrowed = true;
+        test.session->checkpoint.v = malloc(sizeof(*test.session->checkpoint.v));
+        test.session->greedy_splitkv_segment.v =
+            malloc(sizeof(*test.session->greedy_splitkv_segment.v));
+        if (!test.session->checkpoint.v ||
+            !test.session->greedy_splitkv_segment.v) {
+            ok = 0;
+        } else {
+            test.session->checkpoint.len = test.session->checkpoint.cap = 1;
+            test.session->greedy_splitkv_segment.len =
+                test.session->greedy_splitkv_segment.cap = 1;
+        }
+    }
+
+    if (ok) {
+        if (fail_pthread_create == 1) {
+            closer_started = false;
+        } else {
+            closer_started = pthread_create(
+                    &closer, NULL,
+                    ds4_test_session_free_close_race_close_thread,
+                    &test) == 0;
+            ok = closer_started ? 1 : 0;
+        }
+    }
+    if (ok && closer_started) {
+        pthread_mutex_lock(&workspace->mutex);
+        while (!workspace->closing) {
+            if (pthread_cond_wait(&workspace->changed, &workspace->mutex) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&workspace->mutex);
+    }
+    if (ok && closer_started) {
+        ds4_test_shared_prefill_workspace_release_hook =
+            ds4_test_session_free_close_race_workspace_release_hook;
+        ds4_test_shared_prefill_workspace_release_hook_ud = &test;
+        ds4_test_session_admission_release_hook =
+            ds4_test_session_free_close_race_admission_release_hook;
+        ds4_test_session_admission_release_hook_ud = &test;
+        if (fail_pthread_create == 2) {
+            freer_started = false;
+        } else {
+            freer_started = pthread_create(
+                    &freer, NULL,
+                    ds4_test_session_free_close_race_free_thread,
+                    &test) == 0;
+            ok = freer_started ? 1 : 0;
+        }
+    }
+    if (freer_started) {
+        pthread_mutex_lock(&test.mutex);
+        while (!test.workspace_release_hook_entered) {
+            if (pthread_cond_wait(&test.changed, &test.mutex) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        while (ok && !test.close_finished) {
+            if (pthread_cond_wait(&test.changed, &test.mutex) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        ok = ok && test.admission_saw_host_buffers_released &&
+             test.close_saw_admission_released;
+        test.allow_session_free_return = true;
+        pthread_cond_broadcast(&test.changed);
+        pthread_mutex_unlock(&test.mutex);
+        if (pthread_join(freer, &freer_result) != 0 || freer_result != NULL) {
+            ok = 0;
+        }
+    } else {
+        /* A create failure is handled by this thread.  Remove callbacks which
+         * park an asynchronous free before entering the synchronous cleanup,
+         * and let an already-started closer finish without the normal race
+         * observation. */
+        pthread_mutex_lock(&test.mutex);
+        test.allow_close_without_admission_observation = true;
+        test.allow_session_free_return = true;
+        pthread_cond_broadcast(&test.changed);
+        pthread_mutex_unlock(&test.mutex);
+        ds4_test_session_free_close_race_clear_hooks();
+        ds4_session_free(test.session);
+        test.session = NULL;
+    }
+    ds4_test_session_free_close_race_clear_hooks();
+    if (closer_started &&
+        (pthread_join(closer, &closer_result) != 0 || closer_result != NULL)) {
+        ok = 0;
+    }
+    ok = ok && test.session == NULL;
+    pthread_cond_destroy(&test.changed);
+    pthread_mutex_destroy(&test.mutex);
+    ds4_shared_prefill_workspace_state_destroy(workspace);
+    return ok ? 1 : 0;
+}
+
+int ds4_test_session_free_close_race(void) {
+    return ds4_test_session_free_close_race_impl(0);
+}
+
+int ds4_test_session_free_close_create_failures(void) {
+    return ds4_test_session_free_close_race_impl(1) &&
+           ds4_test_session_free_close_race_impl(2);
+}
+#endif
 
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->distributed) {

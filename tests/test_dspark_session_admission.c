@@ -73,6 +73,19 @@ int main(void) {
         assert(ds4_test_session_creation_close_race());
     }
 
+    /* The final workspace borrow is the engine-freeing edge.  Release the
+     * admission slot first, and make close observe that order under a
+     * condition-variable-controlled concurrent close/free schedule. */
+    for (unsigned int round = 0; round < 32; round++) {
+        assert(ds4_test_session_free_close_race());
+    }
+    /* Each pthread_create failure has a distinct cleanup topology: the first
+     * has no closer, while the second must release and join a parked closer.
+     * Both are deterministic injections rather than resource exhaustion. */
+    for (unsigned int round = 0; round < 32; round++) {
+        assert(ds4_test_session_free_close_create_failures());
+    }
+
     puts("test_dspark_session_admission: PASS");
     return 0;
 }

@@ -507,13 +507,13 @@ test-dspark-final-wiring:
 tests/test_dspark_session_admission.o: tests/test_dspark_session_admission.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_dspark_session_admission: tests/test_dspark_session_admission.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_dspark_session_admission: tests/test_dspark_session_admission.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_dspark_startup_guards.o: tests/test_dspark_startup_guards.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_dspark_startup_guards: tests/test_dspark_startup_guards.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_dspark_startup_guards: tests/test_dspark_startup_guards.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test-dspark-final-remediation: test-ssd-admission test-dspark-readiness \

@@ -503,6 +503,8 @@ int ds4_test_shared_prefill_workspace_context_size(
         int requested_ctx_size,
         int admitted_ctx_size);
 int ds4_test_session_creation_close_race(void);
+int ds4_test_session_free_close_race(void);
+int ds4_test_session_free_close_create_failures(void);
 int ds4_test_dspark_small_context_admission_exact(void);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,

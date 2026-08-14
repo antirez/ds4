@@ -224,7 +224,7 @@ def test_shared_workspace_lifetime_and_admission_precede_allocation() -> None:
         "ds4_shared_prefill_workspace_begin_publish(",
         "ds4_shared_prefill_workspace_publish_locked(",
         "s->shared_prefill_workspace_borrowed = true",
-        "ds4_session_release_shared_prefill_workspace(s);",
+        "ds4_session_release_engine_lifetime_borrows(s);",
         "workspace_bytes != s->admission_expected_workspace_bytes",
         "admission_expected_context_scratch_bytes",
         "metal_graph_context_scratch_bytes(",
@@ -254,6 +254,59 @@ def test_shared_workspace_lifetime_and_admission_precede_allocation() -> None:
     )
     require_in(lifecycle, "state->closing = true", "session-creation close gate")
     require_in(lifecycle, "state->in_flight != 0", "session-creation close gate")
+
+    release_lifetimes = between(
+        ENGINE,
+        "static void ds4_session_release_engine_lifetime_borrows(",
+        "static int ds4_session_create_impl(",
+    )
+    require_ordered(
+        release_lifetimes,
+        (
+            "ds4_session_release_admission_slot(s);",
+            "ds4_session_release_shared_prefill_workspace(s);",
+        ),
+        "session teardown lifetime order",
+    )
+    session_free = between(
+        ENGINE,
+        "void ds4_session_free(ds4_session *s)",
+        "#ifdef DS4_TEST_HOOKS",
+    )
+    require_ordered(
+        session_free,
+        (
+            "token_vec_free(&s->checkpoint);",
+            "token_vec_free(&s->greedy_splitkv_segment);",
+            "free(s->logits);",
+            "free(s->sample_probs);",
+            "free(s->mtp_logits);",
+            "ds4_session_release_engine_lifetime_borrows(s);",
+            "free(s);",
+        ),
+        "ordinary session teardown admission accounting",
+    )
+    distributed_begin = create_impl.rfind(
+        "if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR)")
+    distributed_end = create_impl.find(
+        "if (!ds4_session_tp_register(s))", distributed_begin)
+    require(distributed_begin >= 0 and distributed_end >= 0,
+            "missing distributed-create failure cleanup")
+    distributed_create_failure = create_impl[distributed_begin:distributed_end]
+    require_ordered(
+        distributed_create_failure,
+        (
+            "free(s->logits);",
+            "free(s->sample_probs);",
+            "free(s->mtp_logits);",
+            "free(s->spec_row_logits);",
+            "free(s->dspark_markov_bias);",
+            "free(s->dspark_conf_features);",
+            "ds4_session_release_engine_lifetime_borrows(s);",
+            "free(s);",
+        ),
+        "distributed-create failure admission accounting",
+    )
 
     scratch = between(
         ENGINE,
