@@ -21,27 +21,56 @@ import server  # noqa: E402
 class ParseAuthYamlTests(unittest.TestCase):
     def test_parses_plain_keys(self) -> None:
         data = auth.parse_auth_yaml("username: admin\npassword: secret\n")
-        self.assertEqual(data["admin"], "secret")
+        self.assertEqual(data["admin"].password, "secret")
 
     def test_parses_quoted_values(self) -> None:
         data = auth.parse_auth_yaml('username: "admin"\npassword: \'s3cret\'\n')
-        self.assertEqual(data["admin"], "s3cret")
+        self.assertEqual(data["admin"].password, "s3cret")
 
     def test_parses_repeated_pairs(self) -> None:
         text = "username: davide\npassword: one\n\nusername: guest\npassword: two\n"
         data = auth.parse_auth_yaml(text)
-        self.assertEqual(data["davide"], "one")
-        self.assertEqual(data["guest"], "two")
+        self.assertEqual(data["davide"].password, "one")
+        self.assertEqual(data["guest"].password, "two")
 
     def test_parses_users_map(self) -> None:
         text = "users:\n  davide:\n    password: one\n  guest:\n    password: two\n"
         data = auth.parse_auth_yaml(text)
-        self.assertEqual(data["davide"], "one")
-        self.assertEqual(data["guest"], "two")
+        self.assertEqual(data["davide"].password, "one")
+        self.assertEqual(data["guest"].password, "two")
 
-    def test_requires_both_keys(self) -> None:
+    def test_parses_tts_lang_on_pairs(self) -> None:
+        text = (
+            "username: davide\npassword: one\ntts_lang: it\n"
+            "username: guest\npassword: two\n"
+        )
+        data = auth.parse_auth_yaml(text)
+        self.assertEqual(data["davide"].tts_lang, "it")
+        self.assertEqual(data["guest"].tts_lang, "en")
+
+    def test_parses_tts_lang_on_users_map(self) -> None:
+        text = (
+            "users:\n"
+            "  davide:\n"
+            "    password: one\n"
+            "    tts_lang: italiano\n"
+            "  guest:\n"
+            "    password: two\n"
+        )
+        data = auth.parse_auth_yaml(text)
+        self.assertEqual(data["davide"].tts_lang, "it")
+        self.assertEqual(data["guest"].tts_lang, "en")
         with self.assertRaises(ValueError):
             auth.parse_auth_yaml("username: only\n")
+
+
+class PublicRouteTests(unittest.TestCase):
+    def test_login_stylesheets_are_public(self) -> None:
+        self.assertTrue(auth.route_is_public("/styles.css"))
+        self.assertTrue(auth.route_is_public("/styles-mobile.css"))
+        self.assertTrue(auth.route_is_public("/login.js"))
+        self.assertFalse(auth.route_is_public("/app.js"))
+        self.assertFalse(auth.route_is_public("/index.html"))
 
 
 class UserStoreLoadTests(unittest.TestCase):
@@ -50,12 +79,12 @@ class UserStoreLoadTests(unittest.TestCase):
             path = Path(tmp) / "auth.yaml"
             path.write_text("username: alice\npassword: wonderland\n", encoding="utf-8")
             store = auth.load_user_store(path)
-            self.assertEqual(store.users["alice"], "wonderland")
+            self.assertEqual(store.users["alice"].password, "wonderland")
 
 
 class VerifyLoginTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.store = auth.UserStore(users={"admin": "secret"})
+        self.store = auth.UserStore(users={"admin": auth.UserRecord(password="secret")})
 
     def test_accepts_matching_credentials(self) -> None:
         self.assertTrue(auth.verify_login("admin", "secret", self.store))
@@ -147,7 +176,7 @@ class AuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             json.loads(raw.decode("utf-8")),
-            {"ok": True, "username": "testuser"},
+            {"ok": True, "username": "testuser", "tts_lang": "en"},
         )
         cookie = headers.get("set-cookie", "")
         self.assertIn("ds4_session=", cookie)
@@ -187,7 +216,7 @@ class MultiUserAuthTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.auth_path = Path(self.tmp.name) / "auth.yaml"
         self.auth_path.write_text(
-            "username: alice\npassword: pass-a\nusername: bob\npassword: pass-b\n",
+            "username: alice\npassword: pass-a\nusername: bob\npassword: pass-b\ntts_lang: it\n",
             encoding="utf-8",
         )
         self.chats_root = Path(self.tmp.name) / "chats"
@@ -238,12 +267,13 @@ class MultiUserAuthTests(unittest.TestCase):
         return headers.get("set-cookie", "")
 
     def test_session_reports_username(self) -> None:
-        cookie = self._login("alice", "pass-a")
+        cookie = self._login("bob", "pass-b")
         status, _, raw = self._request("GET", "/api/auth/session", cookie=cookie)
         self.assertEqual(status, 200)
         data = json.loads(raw.decode("utf-8"))
         self.assertTrue(data["authenticated"])
-        self.assertEqual(data["username"], "alice")
+        self.assertEqual(data["username"], "bob")
+        self.assertEqual(data.get("tts_lang"), "it")
 
     def test_users_have_isolated_chat_dirs(self) -> None:
         cookie_a = self._login("alice", "pass-a")

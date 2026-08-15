@@ -16,12 +16,26 @@ USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 @dataclass(frozen=True)
+class UserRecord:
+    password: str
+    tts_lang: str = "en"
+
+
+@dataclass(frozen=True)
 class UserStore:
-    users: dict[str, str]
+    users: dict[str, UserRecord]
 
     @property
     def usernames(self) -> frozenset[str]:
         return frozenset(self.users)
+
+    def password_for(self, username: str) -> str | None:
+        rec = self.users.get(username)
+        return rec.password if rec else None
+
+    def tts_lang_for(self, username: str) -> str:
+        rec = self.users.get(username)
+        return rec.tts_lang if rec else "en"
 
 
 @dataclass(frozen=True)
@@ -57,19 +71,49 @@ def _parse_kv_line(line: str) -> tuple[str, str] | None:
     return key, _strip_yaml_value(val)
 
 
-def parse_auth_yaml(text: str) -> dict[str, str]:
+def _normalize_tts_lang(value: str | None) -> str:
+    raw = (value or "en").strip().lower().replace("_", "-")
+    if raw in ("it", "it-it", "italian", "italiano"):
+        return "it"
+    return "en"
+
+
+def parse_auth_yaml(text: str) -> dict[str, UserRecord]:
     """Parse username/password pairs from a minimal YAML subset.
 
     Supported shapes:
-      - repeated top-level username/password pairs
-      - a ``users:`` map with ``username:`` / ``password:`` children
+      - repeated top-level username/password pairs (optional tts_lang)
+      - a ``users:`` map with ``password`` / ``tts_lang`` children
       - legacy single username/password block
     """
-    users: dict[str, str] = {}
+    users: dict[str, UserRecord] = {}
     pending_user: str | None = None
+    pending_password: str | None = None
+    pending_tts: str = "en"
     in_users = False
     users_base_indent: int | None = None
     current_map_user: str | None = None
+    current_map_password: str | None = None
+    current_map_tts: str = "en"
+
+    def flush_pending() -> None:
+        nonlocal pending_user, pending_password, pending_tts
+        if pending_user and pending_password:
+            users[pending_user] = UserRecord(password=pending_password, tts_lang=pending_tts)
+        pending_user = None
+        pending_password = None
+        pending_tts = "en"
+
+    def flush_map() -> None:
+        nonlocal current_map_user, current_map_password, current_map_tts
+        if current_map_user and current_map_password:
+            users[current_map_user] = UserRecord(
+                password=current_map_password,
+                tts_lang=current_map_tts,
+            )
+        current_map_user = None
+        current_map_password = None
+        current_map_tts = "en"
 
     for raw in text.splitlines():
         if not raw.strip() or raw.lstrip().startswith("#"):
@@ -82,52 +126,73 @@ def parse_auth_yaml(text: str) -> dict[str, str]:
         key, val = kv
 
         if not in_users and key == "users" and not val:
+            flush_pending()
             in_users = True
             users_base_indent = indent
-            pending_user = None
             current_map_user = None
+            current_map_password = None
+            current_map_tts = "en"
             continue
 
         if in_users and users_base_indent is not None and indent > users_base_indent:
-            if indent == users_base_indent + 2 and key not in ("password", "username") and not val:
+            if (
+                indent == users_base_indent + 2
+                and key not in ("password", "username", "tts_lang", "tts-lang")
+                and not val
+            ):
+                flush_map()
                 current_map_user = key
                 continue
             if key == "password" and current_map_user:
                 if not val:
                     raise ValueError(f"password required for user {current_map_user!r}")
-                users[current_map_user] = val
-                current_map_user = None
+                current_map_password = val
+                continue
+            if key in ("tts_lang", "tts-lang") and current_map_user:
+                current_map_tts = _normalize_tts_lang(val)
                 continue
             if key == "username" and val:
+                flush_map()
                 pending_user = val
+                pending_password = None
+                pending_tts = "en"
                 continue
             if key == "password" and pending_user:
                 if not val:
                     raise ValueError(f"password required for user {pending_user!r}")
-                users[pending_user] = val
-                pending_user = None
+                pending_password = val
+                continue
+            if key in ("tts_lang", "tts-lang") and pending_user:
+                pending_tts = _normalize_tts_lang(val)
                 continue
             continue
 
         if in_users and users_base_indent is not None and indent <= users_base_indent:
+            flush_map()
             in_users = False
             users_base_indent = None
-            current_map_user = None
 
         if key == "username":
+            flush_pending()
             pending_user = val
+            pending_password = None
+            pending_tts = "en"
             continue
         if key == "password":
             if not pending_user:
                 raise ValueError("password without preceding username")
             if not val:
                 raise ValueError(f"password required for user {pending_user!r}")
-            users[pending_user] = val
-            pending_user = None
+            pending_password = val
+            continue
+        if key in ("tts_lang", "tts-lang") and pending_user:
+            pending_tts = _normalize_tts_lang(val)
 
-    if pending_user:
+    flush_pending()
+    flush_map()
+    if pending_user and not pending_password:
         raise ValueError(f"password missing for user {pending_user!r}")
-    if current_map_user:
+    if current_map_user and not current_map_password:
         raise ValueError(f"password missing for user {current_map_user!r}")
     if not users:
         raise ValueError("auth yaml must define at least one username/password pair")
@@ -138,10 +203,10 @@ def load_user_store(path: Path) -> UserStore:
     if not path.is_file():
         raise FileNotFoundError(f"auth file not found: {path}")
     users = parse_auth_yaml(path.read_text(encoding="utf-8"))
-    for username, password in users.items():
+    for username, rec in users.items():
         if not USERNAME_RE.match(username):
             raise ValueError(f"invalid username {username!r}")
-        if not password:
+        if not rec.password:
             raise ValueError(f"password must be non-empty for user {username!r}")
     return UserStore(users=users)
 
@@ -149,7 +214,7 @@ def load_user_store(path: Path) -> UserStore:
 def verify_login(username: str, password: str, store: UserStore) -> bool:
     if not USERNAME_RE.match(username):
         return False
-    expected = store.users.get(username)
+    expected = store.password_for(username)
     if expected is None:
         return False
     return secrets.compare_digest(password, expected)
@@ -225,7 +290,7 @@ def session_clear_cookie(*, secure: bool = False) -> str:
     return "; ".join(parts)
 
 
-PUBLIC_STATIC = frozenset({"login.html", "login.js", "styles.css"})
+PUBLIC_STATIC = frozenset({"login.html", "login.js", "styles.css", "styles-mobile.css"})
 PUBLIC_API_PATHS = frozenset({"/api/auth/login", "/api/auth/session"})
 
 

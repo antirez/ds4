@@ -77,6 +77,33 @@ class PrepareTextTests(unittest.TestCase):
         self.assertNotIn("-", neg)
         self.assertIn("minus 3", neg)
 
+    def test_italian_punctuation_rewrites(self) -> None:
+        out = tts.prepare_text("Calore → vapore => moto <- fonte", lang="it")
+        self.assertNotRegex(out, r"[→⇒←]|=>|->|<-")
+        self.assertIn(" a ", out)
+        self.assertIn(" da ", out)
+        self.assertNotIn(" to ", out.lower())
+        checks = tts.prepare_text("• primo\n✓ fatto\n✗ no", lang="it")
+        self.assertIn("sì", checks)
+        self.assertNotRegex(checks, r"[•✓✗]")
+        cmp_out = tts.prepare_text("se n <= 3 e m >= 1", lang="it")
+        self.assertIn("minore o uguale a", cmp_out)
+        self.assertIn("maggiore o uguale a", cmp_out)
+
+    def test_italian_dashes_and_ranges(self) -> None:
+        out = tts.prepare_text("caldo — poi freddo - fine -- stop", lang="it")
+        self.assertNotIn("-", out)
+        self.assertNotRegex(out, r"[—–―]")
+        ranged = tts.prepare_text("pagine 3-5, ben-noto, città-stato", lang="it")
+        self.assertNotIn("-", ranged)
+        self.assertIn("3 a 5", ranged)
+        self.assertIn("ben noto", ranged)
+        self.assertIn("città stato", ranged)
+        neg = tts.prepare_text("valore è -3 gradi", lang="it")
+        self.assertNotIn("-", neg)
+        self.assertIn("meno 3", neg)
+        self.assertNotIn("minus", neg.lower())
+
 
 class SynthesizeTests(unittest.TestCase):
     @classmethod
@@ -96,7 +123,31 @@ class SynthesizeTests(unittest.TestCase):
         status = tts.tooling_status(self.tools)
         self.assertTrue(status["available"])
         self.assertEqual(status["engine"], self.tools.engine)
-        self.assertEqual(status["prefer"], "piper")
+        self.assertIn("languages", status)
+        self.assertIn("en", status["languages"])
+        self.assertIn("it", status["languages"])
+
+    def test_normalize_tts_lang(self) -> None:
+        self.assertEqual(tts.normalize_tts_lang("it"), "it")
+        self.assertEqual(tts.normalize_tts_lang("Italiano"), "it")
+        self.assertEqual(tts.normalize_tts_lang("en-US"), "en")
+        self.assertEqual(tts.normalize_tts_lang(None), "en")
+
+    def test_piper_for_lang_prefers_italian_model(self) -> None:
+        tools = tts.TtsTooling(
+            say=None,
+            afconvert=None,
+            piper="/tmp/piper",
+            piper_model="/tmp/en.onnx",
+            piper_config="/tmp/en.onnx.json",
+            piper_model_it="/tmp/it.onnx",
+            piper_config_it="/tmp/it.onnx.json",
+        )
+        model, config = tools.piper_for_lang("it")
+        self.assertEqual(model, "/tmp/it.onnx")
+        self.assertEqual(config, "/tmp/it.onnx.json")
+        model_en, _ = tools.piper_for_lang("en")
+        self.assertEqual(model_en, "/tmp/en.onnx")
 
     def test_prefers_piper_when_available(self) -> None:
         tools = tts.discover_tools()

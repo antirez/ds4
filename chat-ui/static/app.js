@@ -42,6 +42,7 @@
     attachBar: document.getElementById("attachBar"),
     webToggle: document.getElementById("webToggle"),
     ttsToggle: document.getElementById("ttsToggle"),
+    ttsLang: document.getElementById("ttsLang"),
     ttsStopBtn: document.getElementById("ttsStopBtn"),
     composerNote: document.querySelector(".composer-note"),
     ramStatus: document.getElementById("ram-status"),
@@ -50,7 +51,45 @@
     summarizeProgressLabel: document.getElementById("summarizeProgressLabel"),
     ramNotice: document.getElementById("ramNotice"),
     logoutBtn: document.getElementById("logoutBtn"),
+    railScrim: document.getElementById("railScrim"),
+    railClose: document.getElementById("railClose"),
   };
+
+  const MOBILE_MQ = window.matchMedia("(max-width: 860px)");
+
+  function setRailOpen(open) {
+    const next = !!open;
+    if (els.rail) els.rail.classList.toggle("open", next);
+    document.body.classList.toggle("rail-open", next);
+    if (els.railToggle) {
+      els.railToggle.setAttribute("aria-expanded", next ? "true" : "false");
+    }
+  }
+
+  function setAppHeight() {
+    const viewport = window.visualViewport;
+    const height = viewport ? viewport.height : window.innerHeight;
+    if (!Number.isFinite(height) || height <= 0) return;
+    document.documentElement.style.setProperty(
+      "--app-height",
+      `${Math.round(height)}px`
+    );
+  }
+
+  setAppHeight();
+  window.addEventListener("resize", setAppHeight);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", setAppHeight);
+    window.visualViewport.addEventListener("scroll", setAppHeight);
+  }
+  const onMobileChange = (ev) => {
+    if (!ev.matches) setRailOpen(false);
+  };
+  if (typeof MOBILE_MQ.addEventListener === "function") {
+    MOBILE_MQ.addEventListener("change", onMobileChange);
+  } else if (typeof MOBILE_MQ.addListener === "function") {
+    MOBILE_MQ.addListener(onMobileChange);
+  }
 
   /** @type {{id:string,title:string,messages:any[],created_at?:string,updated_at?:string}|null} */
   let current = null;
@@ -73,6 +112,7 @@
   let ttsAudio = null;
   let ttsToken = 0;
   let ttsAvailable = false;
+  let ttsLang = "en";
   let audioUnlocked = false;
   /** @type {AbortController|null} */
   let generationAbort = null;
@@ -1714,6 +1754,11 @@
     setTtsSpeaking(false);
   }
 
+  function currentTtsLang() {
+    if (els.ttsLang && els.ttsLang.value) return els.ttsLang.value;
+    return ttsLang || "en";
+  }
+
   async function speakFinal(text, opts = {}) {
     const force = !!opts.force;
     if (!force && (!els.ttsToggle || !els.ttsToggle.checked)) return;
@@ -1739,7 +1784,7 @@
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: spoken }),
+        body: JSON.stringify({ text: spoken, lang: currentTtsLang() }),
       });
       if (token !== ttsToken) return;
       if (!res.ok) {
@@ -1813,6 +1858,7 @@
     renderTranscript();
     updateRamPressureUi();
     await refreshList();
+    setRailOpen(false);
     els.prompt.focus();
   }
 
@@ -1825,7 +1871,7 @@
     updateRamPressureUi();
     await refreshList();
     warnIfHuge(apiMessages());
-    els.rail.classList.remove("open");
+    setRailOpen(false);
   }
 
   async function renameChat() {
@@ -2347,7 +2393,23 @@
   }
   els.sendBtn.addEventListener("click", () => sendMessage());
   els.fileInput.addEventListener("change", (e) => onFilesSelected(e.target.files));
-  els.railToggle.addEventListener("click", () => els.rail.classList.toggle("open"));
+  if (els.railToggle) {
+    els.railToggle.addEventListener("click", () => {
+      const open = els.rail && els.rail.classList.contains("open");
+      setRailOpen(!open);
+    });
+  }
+  if (els.railClose) {
+    els.railClose.addEventListener("click", () => setRailOpen(false));
+  }
+  if (els.railScrim) {
+    els.railScrim.addEventListener("click", () => setRailOpen(false));
+  }
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && els.rail && els.rail.classList.contains("open")) {
+      setRailOpen(false);
+    }
+  });
   if (els.ttsStopBtn) els.ttsStopBtn.addEventListener("click", () => stopSpeaking());
   if (els.ttsToggle) {
     try {
@@ -2363,6 +2425,16 @@
       }
       if (!els.ttsToggle.checked) stopSpeaking();
       else await unlockAudio();
+    });
+  }
+  if (els.ttsLang) {
+    els.ttsLang.addEventListener("change", () => {
+      ttsLang = els.ttsLang.value === "it" ? "it" : "en";
+      try {
+        localStorage.setItem("ds4-tts-lang", ttsLang);
+      } catch {
+        /* ignore */
+      }
     });
   }
   els.prompt.addEventListener("keydown", (e) => {
@@ -2432,6 +2504,22 @@
         els.userLabel.hidden = false;
         els.userLabel.textContent = `Signed in as ${session.username}`;
       }
+      if (els.ttsLang) {
+        const yamlLang =
+          session?.tts_lang === "it" || session?.tts_lang === "en"
+            ? session.tts_lang
+            : null;
+        let chosen = yamlLang || "en";
+        try {
+          const saved = localStorage.getItem("ds4-tts-lang");
+          if (!saved && yamlLang) chosen = yamlLang;
+          else if (saved === "it" || saved === "en") chosen = saved;
+        } catch {
+          /* private mode */
+        }
+        els.ttsLang.value = chosen;
+        ttsLang = chosen;
+      }
       const health = await api("/api/health");
       if (health?.ram_policy?.available && health.ram_policy.safe_ctx) {
         safeCtx = health.ram_policy.safe_ctx;
@@ -2451,13 +2539,23 @@
             "Read assistant answers aloud (Piper preferred; macOS say fallback)";
         }
       }
+      if (els.ttsLang) {
+        els.ttsLang.disabled = !ttsAvailable;
+        const langs = tts && tts.languages;
+        if (langs && langs.it && !langs.it.piper && !langs.it.say) {
+          els.ttsLang.title =
+            "Italian Piper voice missing — run: python3 chat-ui/install_piper.py --lang it";
+        } else {
+          els.ttsLang.title = "Voice language for read aloud";
+        }
+      }
       if (els.composerNote) {
         const ocr = health?.ocr;
         const webBit = health?.web?.enabled
           ? " Toggle Web for free DuckDuckGo context (no API key)."
           : "";
         const ttsBit = ttsAvailable
-          ? " Toggle Read aloud for new answers, or use the speaker icon on any message."
+          ? " Toggle Read aloud for new answers, pick EN or IT, or use the speaker icon on any message."
           : tts
             ? " Read aloud needs Piper (make install-piper) or macOS say+afconvert."
             : " Restart chat-ui to enable Read aloud (/api/tts).";

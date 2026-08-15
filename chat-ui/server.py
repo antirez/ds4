@@ -560,6 +560,10 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         return self.server.api_base  # type: ignore[attr-defined]
 
     @property
+    def auth_path(self) -> Path | None:
+        return getattr(self.server, "auth_path", None)
+
+    @property
     def user_store(self) -> UserStore:
         return self.server.user_store  # type: ignore[attr-defined]
 
@@ -650,6 +654,7 @@ class ChatUIHandler(BaseHTTPRequestHandler):
             payload: dict[str, Any] = {"authenticated": username is not None}
             if username:
                 payload["username"] = username
+                payload["tts_lang"] = self.user_store.tts_lang_for(username)
             self._send_json(HTTPStatus.OK, payload)
             return
 
@@ -838,9 +843,21 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         if not isinstance(username, str) or not isinstance(password, str):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "username and password required")
             return
-        if verify_login(username, password, self.user_store):
+        store = self.user_store
+        auth_p = self.auth_path
+        if auth_p and auth_p.is_file():
+            try:
+                store = load_user_store(auth_p)
+                self.server.user_store = store  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if verify_login(username, password, store):
             token = self.sessions.create(username)
-            body = json.dumps({"ok": True, "username": username}, ensure_ascii=False).encode("utf-8")
+            tts_lang = store.tts_lang_for(username)
+            body = json.dumps(
+                {"ok": True, "username": username, "tts_lang": tts_lang},
+                ensure_ascii=False,
+            ).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -914,8 +931,12 @@ class ChatUIHandler(BaseHTTPRequestHandler):
         if voice is not None and not isinstance(voice, str):
             self._send_error_json(HTTPStatus.BAD_REQUEST, "voice must be a string")
             return
+        lang = payload.get("lang")
+        if lang is not None and not isinstance(lang, str):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "lang must be a string")
+            return
         try:
-            wav, engine = synthesize_wav(text, voice=voice)
+            wav, engine = synthesize_wav(text, voice=voice, lang=lang)
             self._send(
                 HTTPStatus.OK,
                 wav,
@@ -1188,6 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), ChatUIHandler)
     httpd.chats_root = chats_root
     httpd.api_base = args.api.rstrip("/")
+    httpd.auth_path = auth_path
     httpd.user_store = user_store
     httpd.sessions = SessionManager()
     print(

@@ -2,12 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>DwarfStar</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles-mobile.css" />
 </head>
 <body>
   <div class="sky" aria-hidden="true"></div>
@@ -16,12 +17,15 @@
   <div class="shell">
     <aside class="rail" id="rail">
       <header class="rail-head">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true"></span>
-          <div>
-            <p class="brand-name">DwarfStar</p>
-            <p class="brand-sub">ds4 local chat</p>
+        <div class="brand-row">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <div>
+              <p class="brand-name">DwarfStar</p>
+              <p class="brand-sub">ds4 local chat</p>
+            </div>
           </div>
+          <button type="button" class="btn ghost rail-close" id="railClose" aria-label="Close conversations">Close</button>
         </div>
         <button type="button" class="btn primary" id="newChatBtn">New chat</button>
       </header>
@@ -33,14 +37,15 @@
         <button type="button" class="btn ghost login-out" id="logoutBtn">Sign out</button>
       </footer>
     </aside>
+    <button type="button" class="rail-scrim" id="railScrim" tabindex="-1" aria-label="Close conversations"></button>
 
     <main class="stage">
       <header class="stage-head">
-        <button type="button" class="btn ghost rail-toggle" id="railToggle" aria-label="Toggle conversation list">☰</button>
+        <button type="button" class="btn ghost rail-toggle" id="railToggle" aria-label="Conversations" aria-expanded="false" aria-controls="rail">Chats</button>
         <h1 id="chatTitle">New chat</h1>
         <div class="stage-actions">
           <button type="button" class="btn ghost" id="summarizeBtn" title="Compress older turns in this chat (force)">Summarize</button>
-          <button type="button" class="btn ghost" id="summarizeForkBtn" title="Summarize into a new chat; leave this one unchanged">Summarize to new chat</button>
+          <button type="button" class="btn ghost" id="summarizeForkBtn" title="Summarize into a new chat; leave this one unchanged"><span class="btn-label-long">Summarize to new chat</span><span class="btn-label-short">Fork</span></button>
           <button type="button" class="btn ghost" id="renameBtn" title="Rename">Rename</button>
           <button type="button" class="btn ghost danger" id="deleteBtn" title="Delete">Delete</button>
         </div>
@@ -61,24 +66,31 @@
       <section class="composer" aria-label="Message composer">
         <div class="attach-bar" id="attachBar" hidden></div>
         <div class="composer-row">
-          <label class="attach-btn" title="Attach text, code, images, or PDFs">
-            <input type="file" id="fileInput" multiple accept=".txt,.md,.py,.c,.h,.cpp,.hpp,.js,.ts,.tsx,.jsx,.json,.csv,.toml,.yaml,.yml,.rs,.go,.java,.sh,.css,.html,.xml,.sql,.ini,.cfg,.log,.png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,.bmp,.pdf,text/*,image/*,application/pdf" />
-            <span>Attach</span>
-          </label>
-          <label class="web-toggle" title="Search the web (DuckDuckGo HTML, no API key) and inject context">
-            <input type="checkbox" id="webToggle" />
-            <span>Web</span>
-          </label>
-          <label class="web-toggle" title="Read assistant answers aloud (Piper preferred; macOS say fallback)">
-            <input type="checkbox" id="ttsToggle" />
-            <span>Read aloud</span>
-          </label>
-          <button type="button" class="btn ghost" id="ttsStopBtn" title="Stop reading aloud" disabled>Stop</button>
+          <div class="composer-tools">
+            <label class="attach-btn" title="Attach text, code, images, or PDFs">
+              <input type="file" id="fileInput" multiple accept=".txt,.md,.py,.c,.h,.cpp,.hpp,.js,.ts,.tsx,.jsx,.json,.csv,.toml,.yaml,.yml,.rs,.go,.java,.sh,.css,.html,.xml,.sql,.ini,.cfg,.log,.png,.jpg,.jpeg,.webp,.gif,.tif,.tiff,.bmp,.pdf,text/*,image/*,application/pdf" />
+              <span>Attach</span>
+            </label>
+            <label class="web-toggle" title="Search the web (DuckDuckGo HTML, no API key) and inject context">
+              <input type="checkbox" id="webToggle" />
+              <span>Web</span>
+            </label>
+            <label class="web-toggle tts-toggle" title="Read assistant answers aloud (Piper preferred; macOS say fallback)">
+              <input type="checkbox" id="ttsToggle" />
+              <span class="tts-label-long">Read aloud</span>
+              <span class="tts-label-short">Speak</span>
+              <select id="ttsLang" aria-label="Read aloud language" title="Voice language">
+                <option value="en">EN</option>
+                <option value="it">IT</option>
+              </select>
+            </label>
+            <button type="button" class="btn ghost" id="ttsStopBtn" title="Stop reading aloud" disabled>Stop</button>
+          </div>
           <textarea id="prompt" rows="2" placeholder="Message DwarfStar…"></textarea>
           <button type="button" class="btn primary send" id="sendBtn">Send</button>
         </div>
         <p class="composer-note">
-          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for new answers. Near the context limit, older turns are auto-summarized; use <strong>Summarize</strong> or <strong>Summarize to new chat</strong> to compress manually. Use the speaker icon on any message to read that box on demand.
+          Text and code files are pasted into the prompt. Images and PDFs are OCR’d to text locally; the model API itself is text-only. Toggle <strong>Web</strong> for DuckDuckGo context, or <strong>Read aloud</strong> for new answers (EN / IT). Near the context limit, older turns are auto-summarized; use <strong>Summarize</strong> or <strong>Summarize to new chat</strong> to compress manually. Use the speaker icon on any message to read that box on demand.
         </p>
       </section>
     </main>

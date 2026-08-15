@@ -1040,7 +1040,9 @@ Open http://127.0.0.1:8787 on this machine, or the **lan** URL from the
 startup log on another device on the same network. Sign in with the username and
 password from your local auth file (default `~/.ds4/auth.yaml`; copy
 `chat-ui/auth.yaml.example` on first setup). Multiple users are supported — repeat
-`username` / `password` pairs or use a `users:` map in the yaml. Each user gets
+`username` / `password` pairs or use a `users:` map in the yaml. Optional
+`tts_lang: en` or `tts_lang: it` sets that user's default Read aloud language.
+Each user gets
 their own chat directory under `~/.ds4/chats/<username>/`. On first startup, any
 legacy flat files in `~/.ds4/chats/*.json` are moved into
 `~/.ds4/chats/davide/` (override owner with `DS4_LEGACY_CHAT_OWNER`). Override
@@ -1088,14 +1090,22 @@ blocks are not spoken; only the final answer text is. Use **Stop** to interrupt
 playback.
 
 Install Piper and the default English voice (`en_US-lessac-medium`) under
-`~/.ds4/piper`:
+`~/.ds4/piper`. Add Italian (`it_IT-paola-medium`) with `--lang it` or
+`--lang all`:
 
 ```sh
 python3 chat-ui/install_piper.py
+python3 chat-ui/install_piper.py --lang it
 # or: make install-piper
 ```
 
-Overrides: `DS4_PIPER_BIN`, `DS4_PIPER_MODEL`, `DS4_PIPER_ROOT`. Smoke-test:
+The chat UI Read aloud control has an **EN / IT** picker. Italian uses the
+Piper Paola voice when installed, otherwise macOS `say` (Alice / Luca).
+Before speaking, the same punctuation cleanup runs in both languages so the
+voice does not say “dash” or “trattino”: em-dashes become pauses, `3-5`
+becomes “3 to 5” / “3 a 5”, arrows become “to” / “a”, and so on.
+
+Overrides: `DS4_PIPER_BIN`, `DS4_PIPER_MODEL`, `DS4_PIPER_MODEL_IT`, `DS4_PIPER_ROOT`. Smoke-test:
 
 ```sh
 python3 chat-ui/tts.py "Hello from DwarfStar."

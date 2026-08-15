@@ -4,12 +4,17 @@
 # Option A — repeated username/password pairs (one block per user):
 username: davide
 password: change-me
+tts_lang: en
 username: guest
 password: change-me-too
+tts_lang: it
 #
 # Option B — users map:
 # users:
 #   davide:
 #     password: change-me
+#     tts_lang: en
 #   guest:
 #     password: change-me-too
+#     tts_lang: it
+

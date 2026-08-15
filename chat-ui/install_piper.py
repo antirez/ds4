@@ -11,11 +11,23 @@ import venv
 from pathlib import Path
 
 DEFAULT_VOICE = "en_US-lessac-medium"
-VOICE_ONNX_URL = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
-    f"en/en_US/lessac/medium/{DEFAULT_VOICE}.onnx"
-)
-VOICE_JSON_URL = VOICE_ONNX_URL + ".json"
+DEFAULT_VOICE_IT = "it_IT-paola-medium"
+VOICE_CATALOG = {
+    "en": {
+        "stem": DEFAULT_VOICE,
+        "onnx": (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            f"en/en_US/lessac/medium/{DEFAULT_VOICE}.onnx"
+        ),
+    },
+    "it": {
+        "stem": DEFAULT_VOICE_IT,
+        "onnx": (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            f"it/it_IT/paola/medium/{DEFAULT_VOICE_IT}.onnx"
+        ),
+    },
+}
 
 
 def default_root() -> Path:
@@ -92,6 +104,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Install root (default: ~/.ds4/piper or DS4_PIPER_ROOT)",
     )
     parser.add_argument(
+        "--lang",
+        choices=("en", "it", "all"),
+        default="en",
+        help="Voice language to install (default English; use all for English + Italian)",
+    )
+    parser.add_argument(
         "--skip-smoke",
         action="store_true",
         help="Skip synthesizing a short sample after install",
@@ -100,21 +118,26 @@ def main(argv: list[str] | None = None) -> int:
     root = (args.root or default_root()).expanduser()
     venv_dir = root / "venv"
     voices = root / "voices"
-    model = voices / f"{DEFAULT_VOICE}.onnx"
-    config = voices / f"{DEFAULT_VOICE}.onnx.json"
+    langs = ("en", "it") if args.lang == "all" else (args.lang,)
 
     piper_bin = ensure_venv(venv_dir)
-    download(VOICE_ONNX_URL, model)
-    download(VOICE_JSON_URL, config)
-    if not args.skip_smoke:
-        smoke_test(piper_bin, model)
+    installed: list[Path] = []
+    for lang in langs:
+        spec = VOICE_CATALOG[lang]
+        model = voices / f"{spec['stem']}.onnx"
+        config = voices / f"{spec['stem']}.onnx.json"
+        download(spec["onnx"], model)
+        download(spec["onnx"] + ".json", config)
+        installed.append(model)
+        if not args.skip_smoke:
+            smoke_test(piper_bin, model)
 
     print(
         "\nPiper ready.\n"
         f"  binary: {piper_bin}\n"
-        f"  model:  {model}\n"
-        "chat-ui auto-prefers this when present (override with DS4_PIPER_BIN / "
-        "DS4_PIPER_MODEL). Restart chat-ui after install.\n",
+        + "".join(f"  model:  {path}\n" for path in installed)
+        + "chat-ui auto-prefers this when present (override with DS4_PIPER_BIN / "
+        "DS4_PIPER_MODEL / DS4_PIPER_MODEL_IT). Restart chat-ui after install.\n",
         flush=True,
     )
     return 0
