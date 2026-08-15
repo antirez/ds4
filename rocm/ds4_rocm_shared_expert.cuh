@@ -79,10 +79,52 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
         float                   clamp) {
-    (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
-    (void)x; (void)n_tok; (void)clamp;
-    return 0;
+    /* Multi-row shared expert in the one-row reduction order.  With
+     * prequantized decode active, the one-row path is the fused pair
+     * matvec plus the elementwise swiglu, so the k-row pair tier plus the
+     * same swiglu over every row reproduces it bit-for-bit.  Quality mode
+     * uses the fused w32 kernel instead; return 0 there so the caller
+     * keeps its existing fallback. */
+    if (!gate || !up || !mid || !x || n_tok == 0u ||
+        out_dim > UINT32_MAX ||
+        !cuda_q8_prequant_decode_enabled()) {
+        return 0;
+    }
+    uint64_t mid_values = 0;
+    if (!cuda_u64_mul_checked(n_tok, out_dim, &mid_values) ||
+        mid_values > UINT32_MAX) {
+        return 0;
+    }
+    if (n_tok <= 5u) {
+        return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
+                                               model_map, model_size,
+                                               gate_offset, up_offset,
+                                               in_dim, out_dim, out_dim,
+                                               x, n_tok) &&
+               ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)mid_values,
+                                     clamp, 1.0f);
+    }
+    /* Wider spans: per-row through the one-row entry keeps the contract. */
+    for (uint64_t r = 0; r < n_tok; r++) {
+        ds4_gpu_tensor *g_row = ds4_gpu_tensor_view(
+            gate, r * out_dim * sizeof(float), out_dim * sizeof(float));
+        ds4_gpu_tensor *u_row = ds4_gpu_tensor_view(
+            up, r * out_dim * sizeof(float), out_dim * sizeof(float));
+        ds4_gpu_tensor *m_row = ds4_gpu_tensor_view(
+            mid, r * out_dim * sizeof(float), out_dim * sizeof(float));
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
+            x, r * in_dim * sizeof(float), in_dim * sizeof(float));
+        const int ok = g_row && u_row && m_row && x_row &&
+            ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                g_row, u_row, m_row, model_map, model_size,
+                gate_offset, up_offset, in_dim, out_dim, x_row, clamp);
+        if (g_row) ds4_gpu_tensor_free(g_row);
+        if (u_row) ds4_gpu_tensor_free(u_row);
+        if (m_row) ds4_gpu_tensor_free(m_row);
+        if (x_row) ds4_gpu_tensor_free(x_row);
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(

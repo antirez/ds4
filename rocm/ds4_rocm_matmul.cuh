@@ -321,7 +321,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
         !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
         x->bytes < x_bytes || out->bytes < out_bytes) return 0;
-    if (n_tok > 1 && !g_quality_mode &&
+    if (n_tok > 5u && !g_quality_mode &&
         cuda_runtime_config()->shared_down_cublas && in_dim == 2048u && out_dim == 4096u &&
         cuda_matmul_q8_0_tensor_f16_gemm(out, model_map, model_size, weight_offset,
                                          in_dim, out_dim, x, n_tok, label ? label : "shared_expert")) {
@@ -329,6 +329,55 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+    if (n_tok >= 2u && n_tok <= 5u && cuda_q8_prequant_decode_enabled()) {
+        /* Tiny multi-row spans (speculative verify, small dist chunks): one
+         * weight pass serves every row and each row keeps the decode tier's
+         * exact summation order.  The f32 batch tiers below re-read the
+         * weights per row and reduce in a different shape, which is both
+         * slower at these widths (gfx1151: 2 MB L2, no MALL, so re-reads
+         * always come from DRAM) and not usable by the exact verifier. */
+        const uint64_t xq_bytes = n_tok * blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 krow prequant");
+        if (tmp) {
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+            quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                    xq, xscale, (const float *)x->ptr, in_dim, blocks);
+            if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 krow quantize launch"))
+                return 0;
+            const uint32_t rows_per_block = cuda_runtime_config()->q8_decode_rpb;
+            const unsigned kgrid = ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block;
+            const unsigned kthreads = rows_per_block * 32u;
+            const int use_dp4a = 1;
+            switch (n_tok) {
+            case 2u:
+                matmul_q8_0_preq_krow_rows_w32_kernel<2u><<<kgrid, kthreads>>>(
+                        (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+                        xq, xscale, in_dim, out_dim, blocks, rows_per_block, use_dp4a);
+                break;
+            case 3u:
+                matmul_q8_0_preq_krow_rows_w32_kernel<3u><<<kgrid, kthreads>>>(
+                        (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+                        xq, xscale, in_dim, out_dim, blocks, rows_per_block, use_dp4a);
+                break;
+            case 4u:
+                matmul_q8_0_preq_krow_rows_w32_kernel<4u><<<kgrid, kthreads>>>(
+                        (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+                        xq, xscale, in_dim, out_dim, blocks, rows_per_block, use_dp4a);
+                break;
+            default:
+                matmul_q8_0_preq_krow_rows_w32_kernel<5u><<<kgrid, kthreads>>>(
+                        (float *)out->ptr, reinterpret_cast<const unsigned char *>(wptr),
+                        xq, xscale, in_dim, out_dim, blocks, rows_per_block, use_dp4a);
+                break;
+            }
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 krow launch");
+        }
+        /* Temporary-buffer pressure: fall through to the generic tiers. */
+    }
     if (n_tok == 1 && !cuda_q8_prequant_decode_enabled()) {
         const bool extended_sharedx =
             in_dim > 8192u &&
@@ -599,7 +648,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         in_dim > UINT32_MAX || out0_dim > UINT32_MAX || out1_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
     }
-    if (n_tok != 1) {
+    if (n_tok != 1 &&
+        !(n_tok <= 5u && cuda_q8_prequant_decode_enabled())) {
         return cuda_matmul_q8_0_tensor_labeled(out0, model_map, model_size, weight0_offset,
                                                in_dim, out0_dim, x, n_tok, "q8_0_pair0") &&
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
@@ -615,9 +665,9 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     }
     if (weight0_bytes > model_size - weight0_offset ||
         weight1_bytes > model_size - weight1_offset ||
-        x->bytes < in_dim * sizeof(float) ||
-        out0->bytes < out0_dim * sizeof(float) ||
-        out1->bytes < out1_dim * sizeof(float)) {
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out0->bytes < n_tok * out0_dim * sizeof(float) ||
+        out1->bytes < n_tok * out1_dim * sizeof(float)) {
         return 0;
     }
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset, weight0_bytes, "q8_0_pair0");
@@ -656,34 +706,66 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 warp launch");
     }
 
-    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = 1;
-    dim3 qgrid((unsigned)blocks, 1, 1);
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
             xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) {
         return 0;
     }
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
-    matmul_q8_0_pair_preq_warp8_kernel<<<
-            ((unsigned)max_out + 7u) / 8u, 256>>>(
-            (float *)out0->ptr,
-            (float *)out1->ptr,
-            reinterpret_cast<const unsigned char *>(w0),
-            reinterpret_cast<const unsigned char *>(w1),
-            xq,
-            xscale,
-            in_dim,
-            out0_dim,
-            out1_dim,
-            blocks,
-            use_dp4a);
+    const unsigned pgrid = ((unsigned)max_out + 7u) / 8u;
+    switch (n_tok) {
+    case 1u:
+        matmul_q8_0_pair_preq_warp8_kernel<<<pgrid, 256>>>(
+                (float *)out0->ptr,
+                (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq,
+                xscale,
+                in_dim,
+                out0_dim,
+                out1_dim,
+                blocks,
+                use_dp4a);
+        break;
+    case 2u:
+        matmul_q8_0_pair_preq_krow_warp8_kernel<2u><<<pgrid, 256>>>(
+                (float *)out0->ptr, (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a);
+        break;
+    case 3u:
+        matmul_q8_0_pair_preq_krow_warp8_kernel<3u><<<pgrid, 256>>>(
+                (float *)out0->ptr, (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a);
+        break;
+    case 4u:
+        matmul_q8_0_pair_preq_krow_warp8_kernel<4u><<<pgrid, 256>>>(
+                (float *)out0->ptr, (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a);
+        break;
+    default:
+        matmul_q8_0_pair_preq_krow_warp8_kernel<5u><<<pgrid, 256>>>(
+                (float *)out0->ptr, (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq, xscale, in_dim, out0_dim, out1_dim, blocks, use_dp4a);
+        break;
+    }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
