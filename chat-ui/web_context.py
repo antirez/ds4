@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""Keyless web search + page text for chat-ui context injection.
+
+Uses DuckDuckGo's HTML endpoint and plain HTTP fetches. No API keys.
+"""
+
+from __future__ import annotations
+
+import html
+import re
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+from search_intent import rewrite_search_query
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+DDG_HTML = "https://html.duckduckgo.com/html/"
+MAX_RESULTS_DEFAULT = 8
+MAX_FETCH_DEFAULT = 5
+MAX_SNIPPET_CHARS = 320
+MAX_PAGE_CHARS = 1800
+MAX_CONTEXT_CHARS = 16000
+FETCH_TIMEOUT_S = 12
+SEARCH_TIMEOUT_S = 20
+
+
+@dataclass
+class SearchHit:
+    title: str
+    url: str
+    snippet: str = ""
+
+
+class _DDGResultParser(HTMLParser):
+    """Pull title/url/snippet triples from DuckDuckGo HTML results."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hits: list[SearchHit] = []
+        self._in_result_a = False
+        self._in_snippet = False
+        self._title_parts: list[str] = []
+        self._snippet_parts: list[str] = []
+        self._href: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        ad = {k: (v or "") for k, v in attrs}
+        classes = set(ad.get("class", "").split())
+        if tag == "a" and "result__a" in classes:
+            self._in_result_a = True
+            self._title_parts = []
+            self._href = ad.get("href") or None
+        elif tag == "a" and "result__snippet" in classes:
+            self._in_snippet = True
+            self._snippet_parts = []
+        elif tag in {"td", "div"} and "result__snippet" in classes:
+            self._in_snippet = True
+            self._snippet_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._in_result_a:
+            self._in_result_a = False
+            title = _clean_text("".join(self._title_parts))
+            url = _unwrap_ddg_url(self._href or "")
+            if title and url and _http_url(url):
+                self.hits.append(SearchHit(title=title, url=url, snippet=""))
+            self._href = None
+            self._title_parts = []
+        elif tag in {"a", "td", "div"} and self._in_snippet:
+            self._in_snippet = False
+            snippet = _clean_text("".join(self._snippet_parts))
+            if snippet and self.hits and not self.hits[-1].snippet:
+                self.hits[-1].snippet = snippet[:MAX_SNIPPET_CHARS]
+            self._snippet_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_result_a:
+            self._title_parts.append(data)
+        elif self._in_snippet:
+            self._snippet_parts.append(data)
+
+
+class _TextExtractor(HTMLParser):
+    """Rough visible-text extractor for fetched pages."""
+
+    _SKIP = {"script", "style", "noscript", "svg", "template"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._parts: list[str] = []
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag == "title":
+            self._in_title = True
+        if tag in {"p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4", "section", "article"}:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        if self._in_title:
+            self.title += data
+            return
+        if data.strip():
+            self._parts.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self._parts)
+        raw = re.sub(r"[ \t]+", " ", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        return raw.strip()
+
+
+def _clean_text(s: str) -> str:
+    s = html.unescape(s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _http_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False
+    return p.scheme in ("http", "https") and bool(p.netloc)
+
+
+def _host(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower().removeprefix("www.")
+    except ValueError:
+        return ""
+
+
+def _unwrap_ddg_url(href: str) -> str:
+    if not href:
+        return ""
+    href = html.unescape(href.strip())
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    if "duckduckgo.com" in (parsed.netloc or "") and parsed.path.startswith("/l/"):
+        qs = parse_qs(parsed.query)
+        uddg = qs.get("uddg") or qs.get("u")
+        if uddg:
+            return unquote(uddg[0])
+    if href.startswith("/"):
+        return urljoin("https://duckduckgo.com", href)
+    return href
+
+
+def _http_get(url: str, timeout: float) -> tuple[str, str]:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        method="GET",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        raw = resp.read(512 * 1024)
+        charset = "utf-8"
+        if "charset=" in ctype:
+            charset = ctype.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
+        try:
+            text = raw.decode(charset, errors="replace")
+        except LookupError:
+            text = raw.decode("utf-8", errors="replace")
+        final = resp.geturl() or url
+        return final, text
+
+
+def search_duckduckgo(query: str, max_results: int = MAX_RESULTS_DEFAULT) -> list[SearchHit]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    body = urlencode({"q": q}).encode("utf-8")
+    req = Request(
+        DDG_HTML,
+        data=body,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=SEARCH_TIMEOUT_S) as resp:
+        html_text = resp.read().decode("utf-8", errors="replace")
+    parser = _DDGResultParser()
+    parser.feed(html_text)
+    # Dedupe by URL, preserve order.
+    seen: set[str] = set()
+    out: list[SearchHit] = []
+    for hit in parser.hits:
+        if hit.url in seen:
+            continue
+        seen.add(hit.url)
+        out.append(hit)
+        if len(out) >= max(1, max_results):
+            break
+    return out
+
+
+def fetch_page_text(url: str, max_chars: int = MAX_PAGE_CHARS) -> dict[str, str]:
+    if not _http_url(url):
+        raise ValueError("url must be http(s)")
+    final, html_text = _http_get(url, FETCH_TIMEOUT_S)
+    # Prefer HTML extraction; fall back to plain text.
+    ctype_hint = html_text.lstrip()[:40].lower()
+    text = ""
+    title = ""
+    if "<html" in ctype_hint or "<!doctype" in ctype_hint or "<head" in html_text[:500].lower():
+        extractor = _TextExtractor()
+        try:
+            extractor.feed(html_text)
+            extractor.close()
+            text = extractor.text()
+            title = _clean_text(extractor.title)
+        except Exception:
+            text = re.sub(r"<[^>]+>", " ", html_text)
+    else:
+        text = html_text
+    text = _clean_text(text)
+    text = re.sub(r"\s+", " ", text)
+    return {"url": final, "title": title, "text": text[:max_chars]}
+
+
+def _ordered_fetch_candidates(hits: list[SearchHit]) -> list[SearchHit]:
+    """Prefer host diversity so one domain does not consume every fetch slot."""
+    primary: list[SearchHit] = []
+    secondary: list[SearchHit] = []
+    seen_hosts: set[str] = set()
+    for hit in hits:
+        host = _host(hit.url)
+        if host and host in seen_hosts:
+            secondary.append(hit)
+        else:
+            if host:
+                seen_hosts.add(host)
+            primary.append(hit)
+    return primary + secondary
+
+
+def fetch_pages_until(
+    hits: list[SearchHit],
+    *,
+    max_fetch: int,
+    max_chars: int = MAX_PAGE_CHARS,
+) -> tuple[list[dict[str, str]], list[str], int]:
+    """Fetch until max_fetch successful pages, skipping failures and trying later hits."""
+    want = max(0, max_fetch)
+    if want == 0 or not hits:
+        return [], [], 0
+    pages: list[dict[str, str]] = []
+    errors: list[str] = []
+    seen_final: set[str] = set()
+    attempted = 0
+    for hit in _ordered_fetch_candidates(hits):
+        if len(pages) >= want:
+            break
+        attempted += 1
+        try:
+            page = fetch_page_text(hit.url, max_chars=max_chars)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            errors.append(f"{hit.url}: {exc}")
+            continue
+        text = (page.get("text") or "").strip()
+        if not text:
+            errors.append(f"{hit.url}: empty page text")
+            continue
+        final = page.get("url") or hit.url
+        if final in seen_final:
+            continue
+        seen_final.add(final)
+        if not page.get("title"):
+            page["title"] = hit.title
+        pages.append(page)
+    return pages, errors, attempted
+
+
+def _clip(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1].rstrip() + "…"
+
+
+_WEB_BLOCK_RE = re.compile(
+    r"----- web context \(.*?----- end web context -----",
+    re.DOTALL | re.IGNORECASE,
+)
+_ATTACH_BLOCK_RE = re.compile(
+    r"----- attached .*?----- end (?:file: )?[^\n-]+ -----",
+    re.DOTALL | re.IGNORECASE,
+)
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+./-]{1,}|[0-9]+(?:\.[0-9]+)?")
+_REF_START_RE = re.compile(
+    r"^(?:what about|how about|and(?: then)?|also|same for|same with|"
+    r"what(?:'s| is| are)? (?:the|its|their)|when (?:was|is|did) (?:it|that|this)|"
+    r"tell me more|more (?:on|about)|continue|follow ?up)\b",
+    re.IGNORECASE,
+)
+_PRONOUN_RE = re.compile(
+    r"\b(?:it|its|that|this|those|these|they|them|their|same|above|previous)\b",
+    re.IGNORECASE,
+)
+_LEAD_IN_RE = re.compile(
+    r"^(?:please |can you |could you |would you |tell me |search (?:for |the web for )?|"
+    r"look up |find (?:me )?|google |web search )\s*",
+    re.IGNORECASE,
+)
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "if", "then", "so", "to", "of", "in",
+        "on", "for", "from", "with", "as", "at", "by", "into", "about", "over",
+        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does",
+        "did", "doing", "have", "has", "had", "having", "can", "could", "would",
+        "should", "may", "might", "will", "shall", "not", "no", "yes", "just",
+        "than", "that", "this", "these", "those", "it", "its", "they", "them",
+        "their", "we", "you", "your", "i", "me", "my", "our", "ours", "what",
+        "which", "who", "whom", "when", "where", "why", "how", "there", "here",
+        "also", "very", "really", "please", "tell", "give", "show", "find",
+        "look", "search", "web", "google", "info", "information", "something",
+        "anything", "everything", "more", "some", "any", "all", "same", "again",
+        "still", "already", "maybe", "perhaps", "like", "know", "think", "want",
+        "need", "get", "got", "make", "made", "using", "use", "used", "via",
+        "per", "vs", "etc", "ok", "okay", "thanks", "thank", "hi", "hello",
+        "hey", "conversation", "summary", "assistant", "user",
+        "discussed", "discuss", "earlier", "previously", "mentioned",
+        "talking", "talk", "talked", "above", "before",
+    }
+)
+
+
+def _plain_chat_text(content: str) -> str:
+    """Drop injected web/attachment blocks; keep the human-readable chat text."""
+    text = content or ""
+    text = _WEB_BLOCK_RE.sub(" ", text)
+    text = _ATTACH_BLOCK_RE.sub(" ", text)
+    text = text.replace("[conversation summary]", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _content_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for tok in _TOKEN_RE.findall(text or ""):
+        low = tok.lower().strip("._/-")
+        if not low or low in _STOPWORDS:
+            continue
+        if len(low) < 2 and not low.isdigit():
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        terms.append(tok)
+    return terms
+
+
+def _needs_context(current: str, intent_terms: list[str]) -> bool:
+    stripped = (current or "").strip()
+    if not stripped:
+        return True
+    if len(intent_terms) < 3:
+        return True
+    if _REF_START_RE.search(stripped):
+        return True
+    pronouns = len(_PRONOUN_RE.findall(stripped))
+    words = max(1, len(stripped.split()))
+    if pronouns >= 1 and len(intent_terms) < 5:
+        return True
+    if pronouns / words >= 0.2:
+        return True
+    return False
+
+
+def _topic_terms(messages: list[dict[str, Any]], *, limit: int = 6) -> list[str]:
+    """Collect distinctive terms from recent turns, newest first."""
+    topic: list[str] = []
+    seen: set[str] = set()
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        plain = _plain_chat_text(str(msg.get("content") or ""))
+        if not plain:
+            continue
+        # User turns carry the ask; assistant turns help name the subject.
+        weight_cap = 5 if role == "user" else 3
+        added = 0
+        for term in _content_terms(plain):
+            low = term.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            topic.append(term)
+            added += 1
+            if len(topic) >= limit or added >= weight_cap:
+                break
+        if len(topic) >= limit:
+            break
+    # Newest substantive turn first, terms kept in natural phrase order.
+    return topic
+
+
+def _join_query_terms(terms: list[str], *, max_words: int) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        low = term.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(term)
+        if len(out) >= max_words:
+            break
+    return " ".join(out).strip()
+
+
+def heuristic_search_query(
+    current: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    max_words: int = 12,
+) -> str:
+    """Keyword fallback: current ask plus topic nouns from recent turns.
+
+    Used when the intent-rewrite LLM call is skipped or fails.
+    """
+    plain = _plain_chat_text(current)
+    plain = _LEAD_IN_RE.sub("", plain).strip()
+    plain = re.sub(r"[?！？]+$", "", plain).strip()
+    if not plain:
+        return ""
+
+    intent = _content_terms(plain)
+    recent = list(messages or [])[-12:]
+
+    if not _needs_context(plain, intent):
+        # Already self-contained: keep a short phrase, or keywordize longer prose.
+        words = plain.split()
+        multi_sentence = len(re.findall(r"[.!?]+", plain)) >= 1
+        if (
+            not multi_sentence
+            and len(words) <= max_words
+            and len(plain) <= 120
+        ):
+            return plain
+        return _join_query_terms(intent, max_words=max_words) or plain[:120].strip()
+
+    topic = _topic_terms(recent, limit=6)
+    topic_fresh = [t for t in topic if t.lower() not in {x.lower() for x in intent}]
+    # Lead with subject from prior turns, then the current intent words.
+    merged = topic_fresh[:4] + intent
+    q = _join_query_terms(merged, max_words=max_words)
+    if q:
+        return q
+    if intent:
+        return _join_query_terms(intent, max_words=max_words)
+    return plain[:120].strip()
+
+
+def derive_search_query(
+    current: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    max_words: int = 12,
+    api_base: str | None = None,
+    model: str | None = None,
+    llm_timeout_s: float = 20.0,
+    completion_fn: Callable[..., str] | None = None,
+) -> str:
+    """Resolve search intent from the latest message given recent turns.
+
+    Preferred path: one short non-streaming upstream completion that answers
+    "the user said X; given X-1..X-4, what do they mean?" — that text is the
+    DuckDuckGo query. On miss or failure, fall back to heuristic_search_query.
+    """
+    plain = _plain_chat_text(current)
+    if not plain.strip():
+        return ""
+
+    if api_base or completion_fn is not None:
+        rewritten = rewrite_search_query(
+            plain,
+            messages,
+            api_base=api_base or "",
+            model=model,
+            timeout_s=llm_timeout_s,
+            max_words=max_words,
+            completion_fn=completion_fn,
+        )
+        if rewritten:
+            return rewritten
+
+    return heuristic_search_query(plain, messages, max_words=max_words)
+
+
+def assemble_context(
+    query: str,
+    hits: list[SearchHit],
+    pages: list[dict[str, str]],
+    errors: list[str],
+    *,
+    max_chars: int = MAX_CONTEXT_CHARS,
+) -> str:
+    """Build the prompt block, budgeting space so later pages are not wiped."""
+    header = [
+        "----- web context (DuckDuckGo HTML, no API key) -----",
+        f"Query: {query}",
+        "",
+        "Search results:",
+    ]
+    if not hits:
+        header.append("(no results)")
+    for i, hit in enumerate(hits, 1):
+        header.append(f"{i}. {hit.title}")
+        header.append(f"   URL: {hit.url}")
+        if hit.snippet:
+            header.append(f"   {hit.snippet}")
+
+    footer: list[str] = []
+    if errors:
+        footer.append("Fetch notes:")
+        for err in errors[:8]:
+            footer.append(f"- {err}")
+    footer.append("----- end web context -----")
+
+    head_text = "\n".join(header)
+    foot_text = "\n".join(footer)
+    reserved = len(head_text) + len(foot_text) + 64
+    budget = max(0, max_chars - reserved)
+
+    page_blocks: list[str] = []
+    if pages and budget > 80:
+        page_blocks.append("Fetched page text:")
+        budget -= len(page_blocks[0]) + 1
+        per = max(400, budget // max(1, len(pages)))
+        for page in pages:
+            if budget < 120:
+                break
+            title = page.get("title") or page.get("url") or "page"
+            body = _clip(page.get("text") or "", min(MAX_PAGE_CHARS, per, budget - 80))
+            block = f"### {title}\nURL: {page.get('url', '')}\n{body}\n"
+            if len(block) > budget:
+                block = _clip(block, budget)
+            page_blocks.append(block.rstrip())
+            budget -= len(block) + 1
+
+    parts = [head_text]
+    if page_blocks:
+        parts.append("\n".join(page_blocks))
+    parts.append(foot_text)
+    context = "\n\n".join(parts).strip()
+    if len(context) > max_chars:
+        context = _clip(context, max_chars)
+    return context
+
+
+def build_web_context(
+    query: str,
+    *,
+    max_results: int = MAX_RESULTS_DEFAULT,
+    max_fetch: int = MAX_FETCH_DEFAULT,
+    fetch_pages: bool = True,
+) -> dict[str, Any]:
+    """Search the web and optionally fetch top pages into a prompt block."""
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query required")
+
+    try:
+        hits = search_duckduckgo(q, max_results=max_results)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"web search failed: {exc}") from exc
+
+    pages: list[dict[str, str]] = []
+    errors: list[str] = []
+    attempted = 0
+    if fetch_pages:
+        pages, errors, attempted = fetch_pages_until(hits, max_fetch=max_fetch)
+
+    context = assemble_context(q, hits, pages, errors)
+
+    return {
+        "query": q,
+        "results": [
+            {"title": h.title, "url": h.url, "snippet": h.snippet} for h in hits
+        ],
+        "pages_fetched": len(pages),
+        "pages_attempted": attempted,
+        "errors": errors,
+        "context": context,
+        "provider": "duckduckgo-html",
+    }

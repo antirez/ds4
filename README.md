@@ -1089,6 +1089,152 @@ For browser JavaScript clients served from another origin, start the server with
 headers; it does not expose the server on the LAN. Use `--host 0.0.0.0`
 explicitly when remote machines should be able to connect.
 
+### Local browser chat UI
+
+There is no built-in web chat in `ds4-server` itself. A small local UI lives in
+`chat-ui/`: it serves a page on port 8787, proxies OpenAI chat calls to the
+server on port 8000, and stores conversations as JSON under `~/.ds4/chats`.
+
+**Who it is for.** Operators running DwarfStar on their own Mac (Metal) or another
+LAN host who want a phone-friendly browser front-end to a self-hosted
+`ds4-server`, without cloud TTS or search APIs.
+
+**What you can do.** Chat against the local OpenAI-compatible server; attach
+text/code and OCR images/PDFs; optionally pull DuckDuckGo Web context (no API
+key); read answers aloud with Piper (EN/IT) or macOS `say`; keep chats under
+`~/.ds4/chats` with auto-summarize when context or free RAM is tight; open the
+UI from another device on the LAN (mobile layout included).
+
+**Login / sessions (beta).** YAML users, HttpOnly session cookies, and per-user
+chat directories are a temporary house rule. Expect them to be replaced with a
+more standard auth approach (password hashes + session store, or reverse-proxy
+auth) before treating this as production multi-user access.
+
+**Likely next steps.** Harden auth as above; clearer per-user TTS/Web prefs and
+smoother Italian voice install on first use; optional HTTPS / reverse-proxy
+notes for access beyond the plain LAN URL.
+
+```sh
+# terminal 1 — inference server (Metal, Mac-safe --ctx = free RAM - 6GiB policy)
+make run-server-mac
+# or: ./scripts/run-ds4-server-mac.sh
+# inspect only: make safe-ctx   /   python3 scripts/safe_ctx.py
+
+# terminal 2 — chat UI (listens on all interfaces by default for LAN access)
+make chat-ui
+# or: python3 chat-ui/server.py --port 8787
+# localhost only: python3 chat-ui/server.py --host 127.0.0.1
+# or: DS4_CHAT_HOST=127.0.0.1 make chat-ui
+```
+
+On startup the UI prints **local** (`http://127.0.0.1:8787`) and **lan**
+(`http://<your-ip>:8787`) URLs when bound to `0.0.0.0` (the default). Other
+devices on the same network can open the LAN URL; inference still proxies to
+`ds4-server` on `127.0.0.1:8000` on this machine. Override the bind address
+with `--host` or `DS4_CHAT_HOST`. If you expose the UI on your LAN, configure
+login authentication (auth yaml) before allowing untrusted devices on the
+network.
+
+On macOS the helper sizes `--ctx` so estimated resident model + context stays
+at or under **currently-free RAM − 6 GiB** (headroom for the OS, chat-ui, and
+browser to grow while the server runs) rather than total physical RAM, since
+whatever other apps already hold doesn't free up just because ds4-server is
+starting. It uses the README Flash figure of ~26 GiB context pressure per 1M
+tokens. Pass `--ignore-current-usage` to `safe_ctx.py` for the old total-RAM
+policy. For a tighter cap (~70% of total RAM for model+KV), use conservative
+mode: `./scripts/run-ds4-server-mac.sh --conservative`, `DS4_CONSERVATIVE=1
+make run-server-mac`, or `python3 scripts/safe_ctx.py --conservative`. If the
+model cannot fit under the cap, conservative mode falls back to the free-RAM
+policy. Override with `DS4_CTX=...` only if you accept the risk; the launcher
+refuses values above the safe budget.
+
+Open http://127.0.0.1:8787 on this machine, or the **lan** URL from the
+startup log on another device on the same network. Sign in with the username and
+password from your local auth file (default `~/.ds4/auth.yaml`; copy
+`chat-ui/auth.yaml.example` on first setup). Multiple users are supported — repeat
+`username` / `password` pairs or use a `users:` map in the yaml. Optional
+`tts_lang: en` or `tts_lang: it` sets that user's default Read aloud language.
+Each user gets their own chat directory under `~/.ds4/chats/<username>/`. On first
+startup, any legacy flat files in `~/.ds4/chats/*.json` are moved into
+`~/.ds4/chats/davide/` (override owner with `DS4_LEGACY_CHAT_OWNER`). Override
+the auth path with `DS4_AUTH_FILE` if needed. Use **New chat** to start, send
+messages as usual, and pick an older entry in the left list to resume. On narrow
+screens, **Chats** opens that list as a drawer. Attach text or code files from
+the composer; their contents are inlined into the prompt. Images and PDFs are
+run through local OCR (`tesseract` + Poppler) and the extracted text is inlined
+the same way — the HTTP API remains text-only (no native vision).
+
+OCR dependencies on macOS:
+
+```sh
+brew install tesseract poppler
+```
+
+Toggle **Web** in the composer to pull internet context into the next turn.
+The UI searches DuckDuckGo’s HTML endpoint (no API key), keeps multiple
+result snippets, and fetches several pages (default up to 8 results / 5
+pages). Failed page fetches are skipped so later hits still fill the quota;
+hosts are diversified when possible, and the prompt budget is split across
+pages so one long page does not wipe the rest. This is separate from
+`ds4-agent`’s Chrome-backed `google_search` / `visit_page` tools; the
+OpenAI-compatible server accepts client tool schemas but does not register
+web tools by itself. No extra pip packages are required for Web mode
+(stdlib `urllib` only). Be polite with rate limits. Restart chat-ui after
+pulling web-context changes.
+
+Message bubbles render Markdown as a preview (headings, lists, code, etc.).
+Copy still uses the underlying Markdown source; **Read aloud** / the speaker
+control speak the visible preview text (no raw `**` / `#` markup).
+
+When a send would approach the server `--ctx` limit (~72% by local estimate),
+chat-ui **auto-summarizes** older turns into a compact `summary` system message,
+keeps the latest exchanges, saves the chat, and continues. If the server still
+returns `context_length_exceeded`, it compresses once more and retries. Manual
+**Summarize** / **Summarize to new chat** (shown as **Fork** on small screens)
+are also available. Under low free RAM the UI can fork a summarized copy and
+lock the heavy chat until memory recovers.
+
+Toggle **Read aloud** to have new assistant answers spoken locally after they
+finish streaming. Each message also has a **speaker** control (top-right, next
+to Copy) to read that box on demand — useful for older turns or when the
+browser blocks autoplay. The UI calls `/api/tts`, which synthesizes WAV on the
+machine running chat-ui. **Piper** (local neural TTS, no API key) is preferred
+when installed; otherwise it falls back to macOS `say` + `afconvert`. Reasoning
+blocks are not spoken; only the final answer text is. Use **Stop** to interrupt
+playback.
+
+Install Piper and the default English voice (`en_US-lessac-medium`) under
+`~/.ds4/piper`. Add Italian (`it_IT-paola-medium`) with `--lang it` or
+`--lang all`:
+
+```sh
+python3 chat-ui/install_piper.py
+python3 chat-ui/install_piper.py --lang it
+# or: make install-piper
+```
+
+The chat UI Read aloud control has an **EN / IT** picker. Italian uses the
+Piper Paola voice when installed, otherwise macOS `say` (Alice / Luca).
+Before speaking, the same punctuation cleanup runs in both languages so the
+voice does not say “dash” or “trattino”: em-dashes become pauses, `3-5`
+becomes “3 to 5” / “3 a 5”, arrows become “to” / “a”, and so on.
+
+Overrides: `DS4_PIPER_BIN`, `DS4_PIPER_MODEL`, `DS4_PIPER_MODEL_IT`, `DS4_PIPER_ROOT`. Smoke-test:
+
+```sh
+python3 chat-ui/tts.py "Hello from DwarfStar."
+# writes ./tts-smoke.wav ; expect engine=piper after install
+python3 -m unittest discover -s chat-ui/tests -v
+# or: make test-chat-ui
+```
+
+Restart chat-ui after installing Piper or pulling TTS changes so `/api/tts` /
+engine discovery refresh (an older chat-ui process may 404 that route). Then
+hard-refresh the browser (Cmd+Shift+R) so CSS/JS reload.
+
+This UI store is separate from `ds4-agent` KV sessions in `~/.ds4/kvcache`
+(`/save`, `/list`, `/switch`).
+
 ### Tool call handling and canonicalization
 
 DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that

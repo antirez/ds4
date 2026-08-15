@@ -34,6 +34,13 @@
 *.dSYM/
 __pycache__/
 *.pyc
+# Local chat UI credentials (copy from chat-ui/auth.yaml.example)
+.ds4/auth.yaml
+chat-ui/auth.yaml
+/tts-smoke.wav
 /misc/
 .*.swp
 .DS_Store
+
+# Editor / agent local rules
+.cursor/

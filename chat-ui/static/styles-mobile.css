@@ -1,0 +1,212 @@
+/* Narrow-screen layout for chat-ui. Desktop rules stay in styles.css. */
+
+@media (max-width: 860px) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .rail,
+  .rail-scrim,
+  .stage {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .stage {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .brand-row .brand {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .rail {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(88vw, 20rem);
+    z-index: 5;
+    transform: translateX(-105%);
+    transition: transform 0.22s ease;
+    background: rgba(6, 8, 7, 0.96);
+    box-shadow: 8px 0 28px rgba(0, 0, 0, 0.45);
+  }
+
+  .rail.open {
+    transform: translateX(0);
+  }
+
+  .rail-toggle,
+  .rail-close {
+    display: inline-flex;
+    flex-shrink: 0;
+    min-height: 2.75rem;
+    align-items: center;
+  }
+
+  .rail-scrim {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 4;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: rgba(0, 0, 0, 0.55);
+    cursor: pointer;
+  }
+
+  body.rail-open .rail-scrim {
+    display: block;
+  }
+
+  .stage-head {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "toggle title"
+      "actions actions";
+    align-items: center;
+    gap: 0.55rem 0.65rem;
+    padding: 0.65rem 0.85rem;
+  }
+
+  .rail-toggle {
+    grid-area: toggle;
+  }
+
+  .stage-head h1 {
+    grid-area: title;
+    font-size: 1.02rem;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .stage-actions {
+    grid-area: actions;
+    justify-content: flex-start;
+  }
+
+  .stage-actions .btn {
+    padding: 0.45rem 0.65rem;
+    font-size: 0.8rem;
+  }
+
+  .btn-label-long {
+    display: none;
+  }
+
+  .btn-label-short {
+    display: inline;
+  }
+
+  .transcript {
+    padding: 1rem 0.85rem 0.75rem;
+  }
+
+  .msg .bubble {
+    padding: 0.75rem 3.4rem 0.75rem 0.85rem;
+    font-size: 0.95rem;
+    max-height: min(62vh, 24rem);
+  }
+
+  .composer-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .composer-tools {
+    grid-column: 1 / -1;
+  }
+
+  .composer-note {
+    display: none;
+  }
+
+  .attach-btn,
+  .web-toggle,
+  .btn,
+  .chat-item,
+  .rail-toggle,
+  .rail-close {
+    touch-action: manipulation;
+  }
+
+  .attach-btn,
+  .web-toggle,
+  .btn.send {
+    min-height: 2.75rem;
+  }
+
+  .tts-label-long {
+    display: none;
+  }
+
+  .tts-label-short {
+    display: inline;
+  }
+
+  .status-bar-value {
+    max-width: 46vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .empty {
+    padding: 0 0.5rem;
+  }
+
+  .empty strong {
+    font-size: 1.25rem;
+  }
+
+  .login-shell {
+    width: min(92vw, 26rem);
+    padding: max(1.25rem, env(safe-area-inset-top)) max(1.25rem, env(safe-area-inset-right))
+      max(1.25rem, env(safe-area-inset-bottom)) max(1.25rem, env(safe-area-inset-left));
+  }
+
+  .login-field input {
+    min-height: 2.75rem;
+  }
+
+  textarea#prompt,
+  .login-field input {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 520px) {
+  .composer-row {
+    grid-template-columns: 1fr;
+  }
+
+  .btn.send {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .status-bar-meter {
+    width: 48px;
+  }
+
+  .brand-name {
+    font-size: 1.2rem;
+  }
+}
+
+@media (max-width: 860px) and (max-height: 520px) {
+  .stage-head {
+    padding: 0.45rem 0.75rem;
+  }
+
+  .composer {
+    padding-top: 0.55rem;
+    padding-bottom: max(0.55rem, env(safe-area-inset-bottom));
+  }
+}
