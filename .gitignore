@@ -41,3 +41,6 @@ chat-ui/auth.yaml
 /misc/
 .*.swp
 .DS_Store
+
+# Editor / agent local rules
+.cursor/
