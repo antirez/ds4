@@ -3287,7 +3287,7 @@ static void dist_prefill_reader_emit_progress(
 
     while (*reported < completed) {
         (*reported)++;
-        uint32_t rel = (*reported) * reader->chunk_cap;
+        uint32_t rel = *reported * reader->chunk_cap;
         if (rel > reader->total_tokens) rel = reader->total_tokens;
         uint32_t current = reader->progress_base + rel;
         if (current > reader->progress_total) current = reader->progress_total;
@@ -3593,7 +3593,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     uint64_t chunk_prefix_hash = dist_token_hash_prefix(prompt->v, span_start);
     for (uint32_t i = 0, hash_pos = span_start; i < chunk_count; i++) {
         const uint32_t remaining = span_end - hash_pos;
-        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+        uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
         chunk_prefix_hash = dist_token_hash_update_span(chunk_prefix_hash,
                                                         prompt->v + hash_pos,
                                                         chunk);
@@ -3650,7 +3650,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
             break;
         }
         const uint32_t remaining = span_end - pos;
-        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+        uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
         const uint64_t hidden_bytes64 = (uint64_t)chunk * hc_values * sizeof(float);
         const uint32_t hidden_bytes = (uint32_t)hidden_bytes64;
         ds4_dist_prefill_send_slot *slot =

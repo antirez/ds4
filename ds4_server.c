@@ -11172,6 +11172,30 @@ static uint64_t server_next_sequence(server *s) {
     return seq;
 }
 
+/* Rewind-reuse decision for the live KV cache.  Returns the session position
+ * to rewind to, or -1 when the request must take the cold/disk path.
+ *
+ * The classic continuation case (live state is a prefix of the prompt) is
+ * handled by the caller and never reaches here.  Two miss shapes are
+ * recoverable:
+ *   - prompt is a strict prefix of live (exact repeat, regenerate, branch
+ *     from live): rewind one token before the prompt frontier so the sync
+ *     re-evals a single token, restoring frontier logits and leaving the
+ *     session in the same state as a completed prefill.
+ *   - prompt diverges from live after a substantial shared prefix (edited
+ *     history): rewind to the shared prefix and let the sync prefill only
+ *     the suffix.  Small prefixes are not worth skipping the disk cache
+ *     search for, hence the floor. */
+static int kv_rewind_reuse_target(int old_pos, int prompt_len, int common,
+                                  int rewind_min, bool enabled) {
+    if (!enabled || old_pos <= 0) return -1;
+    if (common == prompt_len && common >= 2 && old_pos > common)
+        return common - 1;
+    if (common >= rewind_min && common < prompt_len)
+        return common;
+    return -1;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -11210,6 +11234,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                       &effective_prompt);
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    /* Remember the responses-visible-source classes as booleans: later
+     * cache_source assignments only happen on cached==0 paths, and the
+     * strcmp-based check below otherwise trips -Wstring-compare literal
+     * tracking on GCC. */
+    int responses_src_visible = cached > 0;
+    int responses_src_tool_output = 0;
     if (cached > 0) {
         responses_live_match = "visible-prefix";
         if (responses_live_matches_request(s, slot,
@@ -11224,6 +11254,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
+        responses_src_tool_output = cached > 0;
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
     if (cached > 0) {
@@ -11258,22 +11289,50 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0) {
-        const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
-        if (rewind_to >= 0) {
-            pthread_mutex_lock(&s->inference_mu);
-            ds4_session_rewind(slot->session, rewind_to);
-            pthread_mutex_unlock(&s->inference_mu);
-            cached = rewind_to;
-            cache_source = "memory-rewind";
-            cache_diag.rewind_to = rewind_to;
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, rewind_to);
+        if (ds4_engine_is_glm_dsa(s->engine)) {
+            const int rewind_to = live_prefix_rewind_target(
+                ds4_engine_is_glm_dsa(s->engine), old_pos,
+                j->req.prompt.len, common);
+            if (rewind_to >= 0) {
+                pthread_mutex_lock(&s->inference_mu);
+                ds4_session_rewind(slot->session, rewind_to);
+                pthread_mutex_unlock(&s->inference_mu);
+                cached = rewind_to;
+                cache_source = "memory-rewind";
+                cache_diag.rewind_to = rewind_to;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                           old_pos, rewind_to);
+            } else {
+                cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
+                cache_source = cached > 0 ? "memory-token" : "none";
+            }
+        } else if (common == old_pos && j->req.prompt.len >= old_pos) {
+            cached = common;
+            cache_source = "memory-token";
         } else {
-            cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
-            cache_source = cached > 0 ? "memory-token" : "none";
+            const char *rr = getenv("DS4_KV_REWIND_REUSE");
+            const char *rm = getenv("DS4_KV_REWIND_MIN_TOKENS");
+            const int rewind_min = rm && atoi(rm) > 0 ? atoi(rm) : 256;
+            const int rewind_to = kv_rewind_reuse_target(
+                old_pos, j->req.prompt.len, common, rewind_min,
+                !(rr && strcmp(rr, "0") == 0));
+            if (rewind_to >= 0) {
+                if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens)
+                    kv_cache_store_current(s, slot, "branch");
+                ds4_session_rewind(slot->session, rewind_to);
+                cached = ds4_session_pos(slot->session);
+                cache_source = "memory-rewind";
+                /* The stored watermark described the discarded branch; let
+                 * continued stores track the new branch as it regrows. */
+                slot->continued_last_store_tokens = rewind_to;
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: live kv cache rewind-hit live=%d prompt=%d common=%d reused=%d",
+                           old_pos, j->req.prompt.len, common, cached);
+            } else {
+                cached = 0;
+                cache_source = "none";
+            }
         }
     }
     if (cached == 0) {
@@ -11325,8 +11384,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
-        ((!strcmp(cache_source, "responses-visible") ||
-          !strcmp(cache_source, "responses-tool-output")) ||
+        ((responses_src_visible || responses_src_tool_output) ||
          (!strcmp(cache_source, "disk-text") &&
           (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
     const bool responses_visible_replay_without_reasoning =
@@ -11469,6 +11527,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
+    /* DS4_PREFILL_TIMING: decompose the prompt window into cold-store, sync
+     * (the actual eval), and tail (continued-store bookkeeping) phases. */
+    const bool prefill_timing = getenv("DS4_PREFILL_TIMING") != NULL;
+    double t_cold = t0;
+    double t_sync = t0;
+    if (prefill_timing) t_cold = now_sec();
+
     if (server_session_sync(s, slot, prompt_for_sync,
                             err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
@@ -11487,6 +11552,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    if (prefill_timing) t_sync = now_sec();
     free(disk_cache_path);
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
@@ -11511,6 +11577,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
+    if (prefill_timing) {
+        const double t_tail = now_sec();
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s prompt timing cold=%.3fs sync=%.3fs tail=%.3fs",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags,
+                   t_cold - t0,
+                   t_sync - t_cold,
+                   t_tail - t_sync);
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -13604,6 +13682,29 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+}
+
+static void test_kv_rewind_reuse_target(void) {
+    /* Exact repeat / regenerate: prompt is a strict prefix of live; rewind
+     * one token early so the sync re-evals the frontier token. */
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 10545, 10545, 256, true) == 10544);
+    TEST_ASSERT(kv_rewind_reuse_target(300, 250, 250, 256, true) == 249);
+    /* Divergent history with a substantial shared prefix: keep the prefix. */
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 12000, 8000, 256, true) == 8000);
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 12000, 256, 256, true) == 256);
+    /* Divergent below the floor takes the cold/disk path. */
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 12000, 255, 256, true) == -1);
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 12000, 100, 256, true) == -1);
+    /* Full-prefix reuse below two tokens is not worth the rewind. */
+    TEST_ASSERT(kv_rewind_reuse_target(500, 1, 1, 256, true) == -1);
+    /* Continuation (live is a prefix of the prompt) is the caller's case. */
+    TEST_ASSERT(kv_rewind_reuse_target(500, 900, 500, 256, true) == 500);
+    /* Exact match with no extra live tokens needs no rewind. */
+    TEST_ASSERT(kv_rewind_reuse_target(500, 500, 500, 256, true) == -1);
+    /* No live state or disabled: always cold/disk. */
+    TEST_ASSERT(kv_rewind_reuse_target(0, 500, 0, 256, true) == -1);
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 10545, 10545, 256, false) == -1);
+    TEST_ASSERT(kv_rewind_reuse_target(10546, 12000, 8000, 256, false) == -1);
 }
 
 static void test_mixed_prefill_quantum_option(void) {
@@ -18311,6 +18412,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_kv_rewind_reuse_target();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
