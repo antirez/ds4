@@ -58546,7 +58546,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
 }
 #endif
 
-static bool ds4_session_tp_leader(const ds4_session *s) {
+bool ds4_session_tp_leader(const ds4_session *s) {
     return s && s->engine && s->engine->tp.active && s->engine->tp.rank == 0;
 }
 

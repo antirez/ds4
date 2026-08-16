@@ -9656,6 +9656,15 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
+    /* Tensor parallelism mirrors to the worker only the tokens the leader
+     * actually evaluates.  A disk-cache restore short-circuits the
+     * leader's prefill without mirroring it, so the ranks would run
+     * different prefill graphs (leader: restored suffix only; worker:
+     * full transcript) and the per-layer gate sequences diverge.  Skip
+     * restores on the TP leader until the worker can restore its own KV
+     * shard from disk; the leader then re-prefills the full transcript
+     * and mirrors it exactly. */
+    if (slot->session && ds4_session_tp_leader(slot->session)) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};

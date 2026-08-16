@@ -89,6 +89,7 @@ typedef struct {
     uint16_t layer;
     uint16_t gate;
     uint64_t seq;
+    uint64_t bytes;
 } ds4_tp_gate_header;
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -1107,6 +1108,108 @@ static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
  * are queued, so each round can post its 1 MiB receive window before sending
  * the matching 16 KiB messages.  Verify scratch provides already-registered
  * staging memory and is idle during normal prefill. */
+#define DS4_TP_RESET_MAGIC UINT32_C(0x44535232)      /* "DSR2" reset barrier */
+#define DS4_TP_RESET_INFO_MAGIC UINT32_C(0x44535249) /* "DSRI" bulk QP info */
+
+/* Rebuild the bulk QP in lockstep with the peer after a bulk exchange
+ * failure.  A failed round can leave receives posted on the bulk QP, and
+ * UC delivers to WQEs in post order: those stale receives would misalign
+ * every later bulk gate.  Both ranks rendezvous on the data socket (only
+ * the service thread uses it) with header-sized messages, destroy and
+ * recreate their bulk QPs, exchange the fresh QPN/PSN pair and reconnect.
+ * A peer that is still in its own (symmetric) failure path reaches the
+ * rendezvous right after; a peer mid-round reaches it when its round
+ * times out, so the handshake is bounded but not instant in that case. */
+static int tp_rdma_bulk_reset(ds4_tp *tp) {
+    ds4_tp_rdma *r = &tp->rdma;
+    if (!tp->rdma_active || !r->qp2) return 0;
+
+    ds4_tp_gate_header h = { DS4_TP_RESET_MAGIC, 0, 0, 0, 0 };
+    ds4_tp_gate_header p;
+    int ok = tp->rank == 0
+        ? (tp_write_full(tp->data_fd, &h, sizeof(h)) &&
+           tp_read_full(tp->data_fd, &p, sizeof(p)))
+        : (tp_read_full(tp->data_fd, &p, sizeof(p)) &&
+           tp_write_full(tp->data_fd, &h, sizeof(h)));
+    if (!ok || p.magic != DS4_TP_RESET_MAGIC) {
+        fprintf(stderr, "ds4-tp: bulk QP reset handshake failed\n");
+        return 0;
+    }
+
+    if (r->qp2) {
+        r->api.destroy_qp(r->qp2);
+        r->qp2 = NULL;
+    }
+    struct ibv_qp_init_attr qia = {0};
+    qia.send_cq = r->cq;
+    qia.recv_cq = r->cq;
+    qia.qp_type = IBV_QPT_UC;
+    qia.cap.max_send_wr = 512;
+    qia.cap.max_recv_wr = 512;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+    qia.cap.max_inline_data = 0;
+    r->qp2 = r->api.create_qp(r->pd, &qia);
+    if (!r->qp2) {
+        fprintf(stderr, "ds4-tp: bulk QP recreate failed: %s\n", strerror(errno));
+        return 0;
+    }
+    struct ibv_qp_attr a = {0};
+    a.qp_state = IBV_QPS_INIT;
+    a.pkey_index = 0;
+    a.port_num = 1;
+    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                        IBV_ACCESS_REMOTE_WRITE;
+    if (r->api.modify_qp(r->qp2, &a,
+            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+        fprintf(stderr, "ds4-tp: bulk QP INIT failed: %s\n", strerror(errno));
+        return 0;
+    }
+
+    /* Exchange the fresh QPN/PSN pair (header-sized so any stray gate
+     * header read by a desynced peer still parses and routes here). */
+    h.magic = DS4_TP_RESET_INFO_MAGIC;
+    h.seq = r->qp2->qp_num;
+    h.bytes = (uint32_t)(getpid() ^ (uintptr_t)tp ^ 0x9e3779b9u) & 0xffffff;
+    ok = tp->rank == 0
+        ? (tp_write_full(tp->data_fd, &h, sizeof(h)) &&
+           tp_read_full(tp->data_fd, &p, sizeof(p)))
+        : (tp_read_full(tp->data_fd, &p, sizeof(p)) &&
+           tp_write_full(tp->data_fd, &h, sizeof(h)));
+    if (!ok || p.magic != DS4_TP_RESET_INFO_MAGIC) {
+        fprintf(stderr, "ds4-tp: bulk QP info exchange failed\n");
+        return 0;
+    }
+
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTR;
+    a.path_mtu = IBV_MTU_1024;
+    a.dest_qp_num = (uint32_t)p.seq;
+    a.rq_psn = (uint32_t)p.bytes;
+    a.ah_attr.dlid = (uint16_t)r->peer.lid;
+    a.ah_attr.port_num = 1;
+    a.ah_attr.is_global = 1;
+    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
+    a.ah_attr.grh.hop_limit = 1;
+    if (r->api.modify_qp(r->qp2, &a,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN) != 0) {
+        fprintf(stderr, "ds4-tp: bulk QP RTR failed: %s\n", strerror(errno));
+        return 0;
+    }
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTS;
+    a.sq_psn = (uint32_t)h.bytes;
+    if (r->api.modify_qp(r->qp2, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+        fprintf(stderr, "ds4-tp: bulk QP RTS failed: %s\n", strerror(errno));
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: bulk QP rebuilt (qpn2=%u peer=%u)\n",
+            r->qp2->qp_num, (uint32_t)p.seq);
+    return 1;
+}
+
 static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      const void *out,
                                      void *in,
@@ -1171,6 +1274,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (post_rc != 0) {
             fprintf(stderr, "ds4-tp: bulk rdma post_recv: rc=%d (%s)\n",
                     post_rc, strerror(post_rc));
+            (void)tp_rdma_bulk_reset(tp);
             return 0;
         }
         /* Both ranks must have their recvs posted before either sends:
@@ -1182,6 +1286,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (!tp_write_full(tp->data_fd, &bb, 1) ||
             !tp_read_full(tp->data_fd, &bb, 1)) {
             fprintf(stderr, "ds4-tp: bulk rdma recv barrier failed\n");
+            (void)tp_rdma_bulk_reset(tp);
             return 0;
         }
         atomic_thread_fence(memory_order_release);
@@ -1207,6 +1312,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (send_rc != 0) {
             fprintf(stderr, "ds4-tp: bulk rdma post_send: rc=%d (%s)\n",
                     send_rc, strerror(send_rc));
+            (void)tp_rdma_bulk_reset(tp);
             return 0;
         }
 
@@ -1224,6 +1330,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     fprintf(stderr,
                             "ds4-tp: bulk rdma completion error: %s\n",
                             tp_wc_status_str(wc[i].status));
+                    (void)tp_rdma_bulk_reset(tp);
                     return 0;
                 }
                 if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
@@ -1250,6 +1357,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                         "ds4-tp: timeout waiting for bulk RDMA round "
                         "(%u/%u recvs, send=%d)\n",
                         recv_done, chunks, send_done);
+                (void)tp_rdma_bulk_reset(tp);
                 return 0;
             }
         }
@@ -1479,7 +1587,8 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
      * direction fits comfortably in the socket buffers, so the symmetric
      * write-then-read cannot deadlock.  Header and payload go out in one
      * writev so NODELAY does not split them into two segments. */
-    ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
+    ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq,
+                             tp->vec_bytes };
     struct iovec iov[2] = {
         { &h, sizeof(h) },
         { tp->slab + ds4_tp_slab_out_offset(tp, layer, gate), tp->vec_bytes },
@@ -1502,10 +1611,15 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     }
     ds4_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
-    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
-        fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
+    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate ||
+        ph.seq != seq || ph.bytes != tp->vec_bytes) {
+        fprintf(stderr,
+                "ds4-tp: gate desync: got l=%u g=%u seq=%llu b=%llu, "
+                "want l=%u g=%u seq=%llu b=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
-                layer, gate, (unsigned long long)seq);
+                (unsigned long long)ph.bytes,
+                layer, gate, (unsigned long long)seq,
+                (unsigned long long)tp->vec_bytes);
         return 0;
     }
     if (!tp_read_full(tp->data_fd, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
@@ -1522,19 +1636,22 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
-                             (uint16_t)rows, seq };
+                             (uint16_t)rows, seq, bytes };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
         ds4_tp_gate_header ph;
         if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
         if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-            ph.gate != rows || ph.seq != seq) {
+            ph.gate != rows || ph.seq != seq || ph.bytes != bytes) {
             fprintf(stderr,
-                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
+                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu b=%llu, "
+                    "want l=%u rows=%u seq=%llu b=%llu\n",
                     ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
+                    (unsigned long long)ph.bytes,
+                    layer, rows, (unsigned long long)seq,
+                    (unsigned long long)bytes);
+            (void)tp_rdma_bulk_reset(tp);
             return 0;
         }
         return tp_rdma_big_gate_exchange(
@@ -1568,12 +1685,14 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     ds4_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-        ph.gate != rows || ph.seq != seq) {
+        ph.gate != rows || ph.seq != seq || ph.bytes != bytes) {
         fprintf(stderr,
-                "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                "want l=%u rows=%u seq=%llu\n",
+                "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu b=%llu, "
+                "want l=%u rows=%u seq=%llu b=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
-                layer, rows, (unsigned long long)seq);
+                (unsigned long long)ph.bytes,
+                layer, rows, (unsigned long long)seq,
+                (unsigned long long)bytes);
         return 0;
     }
     return tp_read_full(tp->data_fd,
@@ -1590,16 +1709,20 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
-    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq,
+                             bytes };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-        ph.gate != 0xB16u || ph.seq != seq) {
+        ph.gate != 0xB16u || ph.seq != seq || ph.bytes != bytes) {
         fprintf(stderr,
-                "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu, want l=%u seq=%llu\n",
+                "ds4-tp: big gate desync: got l=%u tag=%x seq=%llu b=%llu, "
+                "want l=%u seq=%llu b=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
-                layer, (unsigned long long)seq);
+                (unsigned long long)ph.bytes,
+                layer, (unsigned long long)seq, (unsigned long long)bytes);
+        (void)tp_rdma_bulk_reset(tp);
         return 0;
     }
 #ifdef DS4_TP_HAVE_VERBS
