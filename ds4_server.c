@@ -11991,6 +11991,15 @@ decode_again:
                             &last_decode_log_completion);
     }
 
+    /* A generation cut mid-codepoint (max_tokens, a stop sequence) must not
+     * leak the partial sequence: no client can decode it and the JSON body is
+     * required to be UTF-8. Streaming already holds such a tail back between
+     * chunks; the final flush and the non-stream body have to drop it. */
+    if (text.ptr) {
+        text.len = utf8_stream_safe_len(text.ptr, 0, text.len, false);
+        text.ptr[text.len] = '\0';
+    }
+
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) {
@@ -14922,6 +14931,23 @@ static void test_streaming_holds_partial_utf8(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* The same boundary rule the stream applies between chunks is applied once to
+ * the finished text, so a generation cut inside a codepoint never reaches a
+ * response body: a lone lead byte and a half-written sequence are dropped, a
+ * complete sequence and plain ASCII are kept whole. */
+static void test_generation_tail_drops_partial_utf8(void) {
+    const char lead_only[] = {'A', ' ', (char)0xc3, 0};
+    const char half[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
+    const char whole[] = {'A', ' ', (char)0xf0, (char)0x9f, (char)0x9a, (char)0xa9, 0};
+    const char accent[] = {(char)0xc3, (char)0xa9, 0};
+
+    TEST_ASSERT(utf8_stream_safe_len(lead_only, 0, strlen(lead_only), false) == 2);
+    TEST_ASSERT(utf8_stream_safe_len(half, 0, strlen(half), false) == 2);
+    TEST_ASSERT(utf8_stream_safe_len(whole, 0, strlen(whole), false) == strlen(whole));
+    TEST_ASSERT(utf8_stream_safe_len(accent, 0, strlen(accent), false) == 2);
+    TEST_ASSERT(utf8_stream_safe_len("done", 0, 4, false) == 4);
 }
 
 static void test_request_defaults_use_min_p_filtering(void) {
@@ -18357,6 +18383,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
+    test_generation_tail_drops_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
