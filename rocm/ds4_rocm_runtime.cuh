@@ -4996,7 +4996,12 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    if (g_q8_f16_disabled_for_multi_model) return 0;
+    /* Multi-model (MTP) setups disable the cache by default to protect the
+     * memory margin for session/context tensors.  The budget check in
+     * cuda_q8_f16_cache_has_budget() still applies per allocation; the env
+     * opt-in re-enables the speed path when the host has headroom. */
+    if (g_q8_f16_disabled_for_multi_model &&
+        getenv("DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL") == NULL) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
