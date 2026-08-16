@@ -699,6 +699,10 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* Last assistant message's encrypted_content from Responses API.
+     * Used for checkpoint suffix building to match token stream when
+     * client sends opaque reasoning.encrypted_content for stateless replay. */
+    char *last_assistant_encrypted_content;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -834,6 +838,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->last_assistant_encrypted_content);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -2493,9 +2498,13 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    const bool has_reasoning = (m->reasoning && m->reasoning[0]) ||
-                                               (m->encrypted_content && m->encrypted_content[0]);
-                    if (preserve_reasoning ? has_reasoning : (tool_context || i > last_user_idx)) {
+                    /* Determine if we should include thinking tags. When preserve_reasoning
+                     * is true (e.g., tool context exists), we must include the tags even if
+                     * the client didn't send reasoning content - the token stream must match
+                     * what was generated, otherwise KV cache reuse fails. For Responses API,
+                     * prefer encrypted_content over plain reasoning. */
+                    bool should_include_thinking = preserve_reasoning ? true : (tool_context || i > last_user_idx);
+                    if (should_include_thinking) {
                         buf_puts(&out, "<think>");
                         /* Prefer encrypted_content (opaque base64 from Responses API)
                          * over plain reasoning when both are present, so the rendered
@@ -2602,10 +2611,10 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         } else if (!strcmp(m->role, "assistant")) {
             (void)pending_assistant;
             buf_puts(&out, "<|assistant|>");
-            const bool has_reasoning = (m->reasoning && m->reasoning[0]) ||
-                                       (m->encrypted_content && m->encrypted_content[0]);
-            const bool preserve = preserve_reasoning ? has_reasoning
-                                                     : (tool_context || i > last_user_idx);
+            /* When preserve_reasoning is true (e.g., tool context exists), we must
+             * include thinking tags even if the client didn't send reasoning content -
+             * the token stream must match what was generated for KV cache reuse. */
+            const bool preserve = preserve_reasoning ? true : (tool_context || i > last_user_idx);
             append_glm_assistant_message_prefix(&out, m, think && preserve);
             buf_puts(&out, m->content ? m->content : "");
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
@@ -3159,6 +3168,16 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    /* Extract the last assistant message's encrypted_content for checkpoint
+     * suffix building. This ensures KV cache reuse when client sends opaque
+     * reasoning.encrypted_content for stateless replay. */
+    for (int i = msgs.len - 1; i >= 0; i--) {
+        if (!strcmp(msgs.v[i].role, "assistant") &&
+            msgs.v[i].encrypted_content && msgs.v[i].encrypted_content[0]) {
+            r->last_assistant_encrypted_content = xstrdup(msgs.v[i].encrypted_content);
+            break;
+        }
+    }
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode, r->prompt_preserves_reasoning);
@@ -3375,6 +3394,16 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    /* Extract the last assistant message's encrypted_content for checkpoint
+     * suffix building. This ensures KV cache reuse when client sends opaque
+     * reasoning.encrypted_content for stateless replay. */
+    for (int i = msgs.len - 1; i >= 0; i--) {
+        if (!strcmp(msgs.v[i].role, "assistant") &&
+            msgs.v[i].encrypted_content && msgs.v[i].encrypted_content[0]) {
+            r->last_assistant_encrypted_content = xstrdup(msgs.v[i].encrypted_content);
+            break;
+        }
+    }
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode, r->prompt_preserves_reasoning);
@@ -4373,6 +4402,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    /* Extract the last assistant message's encrypted_content for checkpoint
+     * suffix building. This ensures KV cache reuse when client sends opaque
+     * reasoning.encrypted_content for stateless replay. */
+    for (int i = msgs.len - 1; i >= 0; i--) {
+        if (!strcmp(msgs.v[i].role, "assistant") &&
+            msgs.v[i].encrypted_content && msgs.v[i].encrypted_content[0]) {
+            r->last_assistant_encrypted_content = xstrdup(msgs.v[i].encrypted_content);
+            break;
+        }
+    }
     /* Responses API always preserves reasoning in the prompt so the model
      * sees its previous thinking and can continue from it. Without this the
      * prompt would differ from the live KV and cause a token-mismatch
@@ -8499,6 +8538,9 @@ typedef struct {
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
     stop_list call_ids;
+    /* Wall-clock time (ms) when this checkpoint was stored, for diagnosing
+     * time-based cache invalidations. */
+    long long stored_at_ms;
 } live_tool_state;
 
 typedef struct {
@@ -8513,6 +8555,9 @@ typedef struct {
     /* True when this frontier ends in an assistant tool-call turn rather than
      * a final answer; only used to label the cache hit source. */
     bool tool_turn;
+    /* Wall-clock time (ms) when this checkpoint was stored, for diagnosing
+     * time-based cache invalidations. */
+    long long stored_at_ms;
 } visible_live_state;
 
 struct server_slot {
@@ -8863,6 +8908,7 @@ static void thinking_live_remember(server *s, server_slot *slot,
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
     slot->thinking_live.tool_turn = tool_turn;
     slot->thinking_live.valid = true;
+    slot->thinking_live.stored_at_ms = wall_ms();
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -8881,6 +8927,7 @@ static void responses_live_remember(server *s, server_slot *slot,
     }
     slot->responses_live.live_tokens = ds4_session_pos(slot->session);
     slot->responses_live.valid = true;
+    slot->responses_live.stored_at_ms = wall_ms();
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -8894,6 +8941,7 @@ static void anthropic_live_remember(server *s, server_slot *slot,
     }
     slot->anthropic_live.live_tokens = ds4_session_pos(slot->session);
     slot->anthropic_live.valid = slot->anthropic_live.call_ids.len > 0;
+    slot->anthropic_live.stored_at_ms = wall_ms();
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -9893,14 +9941,58 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->responses_live.valid &&
-              slot->responses_live.live_tokens == live_pos &&
-              slot->responses_live.visible_text &&
-              slot->responses_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->responses_live.visible_text,
-                                slot->responses_live.visible_len);
+    bool valid = slot->responses_live.valid;
+    bool tokens_match = slot->responses_live.live_tokens == live_pos;
+    bool has_visible = slot->responses_live.visible_text != NULL;
+    bool len_ok = has_visible && slot->responses_live.visible_len < prompt_len;
+    bool byte_match = len_ok && byte_prefix_match(req->prompt_text, prompt_len,
+                                                   slot->responses_live.visible_text,
+                                                   slot->responses_live.visible_len);
+    bool ok = valid && tokens_match && has_visible && len_ok && byte_match;
     if (ok) visible_len = slot->responses_live.visible_len;
+    /* Diagnostic logging for time-based cache misses: log why byte-prefix match failed. */
+    if (!ok && slot->responses_live.valid && slot->responses_live.visible_text) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: responses-live prefix check failed valid=%d tokens_match=%d (live=%d vs req=%d) has_visible=%d len_ok=%d (visible=%zu vs prompt=%zu) byte_match=%d",
+                   (int)valid, (int)tokens_match, slot->responses_live.live_tokens, live_pos,
+                   (int)has_visible, (int)len_ok, slot->responses_live.visible_len, prompt_len,
+                   (int)byte_match);
+        if (!byte_match && len_ok) {
+            /* Find first mismatch byte for debugging time-varying prompt content. */
+            const char *visible = slot->responses_live.visible_text;
+            size_t min_len = slot->responses_live.visible_len < prompt_len ?
+                             slot->responses_live.visible_len : prompt_len;
+            size_t mismatch_pos = 0;
+            for (; mismatch_pos < min_len; mismatch_pos++) {
+                if (visible[mismatch_pos] != req->prompt_text[mismatch_pos]) break;
+            }
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: responses-live byte mismatch at position %zu/%zu: stored='%c' (0x%02x) vs req='%c' (0x%02x)",
+                       mismatch_pos, min_len,
+                       mismatch_pos < slot->responses_live.visible_len ? visible[mismatch_pos] : '?',
+                       mismatch_pos < slot->responses_live.visible_len ? (unsigned char)visible[mismatch_pos] : 0,
+                       mismatch_pos < prompt_len ? req->prompt_text[mismatch_pos] : '?',
+                       mismatch_pos < prompt_len ? (unsigned char)req->prompt_text[mismatch_pos] : 0);
+            /* Show 100 bytes of context around the mismatch to identify the differing region. */
+            size_t ctx_start = mismatch_pos > 50 ? mismatch_pos - 50 : 0;
+            size_t ctx_end_stored = mismatch_pos + 50 < slot->responses_live.visible_len ? mismatch_pos + 50 : slot->responses_live.visible_len;
+            size_t ctx_end_req = mismatch_pos + 50 < prompt_len ? mismatch_pos + 50 : prompt_len;
+            size_t ctx_len_stored = ctx_end_stored - ctx_start;
+            size_t ctx_len_req = ctx_end_req - ctx_start;
+            char *ctx_stored = xmalloc(ctx_len_stored + 1);
+            char *ctx_req = xmalloc(ctx_len_req + 1);
+            memcpy(ctx_stored, visible + ctx_start, ctx_len_stored);
+            ctx_stored[ctx_len_stored] = '\0';
+            memcpy(ctx_req, req->prompt_text + ctx_start, ctx_len_req);
+            ctx_req[ctx_len_req] = '\0';
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: responses-live mismatch context: stored[%zu..%zu]='%.*s' vs req[%zu..%zu]='%.*s'",
+                       ctx_start, ctx_end_stored, (int)ctx_len_stored, ctx_stored,
+                       ctx_start, ctx_end_req, (int)ctx_len_req, ctx_req);
+            free(ctx_stored);
+            free(ctx_req);
+        }
+    }
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -9936,14 +10028,70 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
-              slot->thinking_live.visible_text &&
-              slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
+    bool valid = slot->thinking_live.valid;
+    bool tokens_match = slot->thinking_live.live_tokens == live_pos;
+    bool has_visible = slot->thinking_live.visible_text != NULL;
+    /* Accept both extension (visible < prompt) and truncation (prompt < visible)
+     * cases. For truncation, check if prompt is a prefix of visible text.
+     * This handles client-side history pruning while preserving KV cache reuse. */
+    bool len_ok = has_visible && (slot->thinking_live.visible_len != prompt_len);
+    bool byte_match = false;
+    if (len_ok && slot->thinking_live.visible_len < prompt_len) {
+        /* Extension case: stored visible should be a prefix of new prompt */
+        byte_match = byte_prefix_match(req->prompt_text, prompt_len,
+                                       slot->thinking_live.visible_text,
+                                       slot->thinking_live.visible_len);
+    } else if (len_ok && prompt_len < slot->thinking_live.visible_len) {
+        /* Truncation case: new prompt should be a prefix of stored visible */
+        byte_match = byte_prefix_match(slot->thinking_live.visible_text,
+                                       slot->thinking_live.visible_len,
+                                       req->prompt_text, prompt_len);
+    }
+    bool ok = valid && tokens_match && has_visible && len_ok && byte_match;
     if (ok) visible_len = slot->thinking_live.visible_len;
+    /* Diagnostic logging for time-based cache misses: log why byte-prefix match failed. */
+    if (!ok && slot->thinking_live.valid && slot->thinking_live.visible_text) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking-live prefix check failed valid=%d tokens_match=%d (live=%d vs req=%d) has_visible=%d len_ok=%d (visible=%zu vs prompt=%zu) byte_match=%d",
+                   (int)valid, (int)tokens_match, slot->thinking_live.live_tokens, live_pos,
+                   (int)has_visible, (int)len_ok, slot->thinking_live.visible_len, prompt_len,
+                   (int)byte_match);
+        if (!byte_match && len_ok) {
+            /* Find first mismatch byte for debugging time-varying prompt content. */
+            const char *visible = slot->thinking_live.visible_text;
+            size_t min_len = slot->thinking_live.visible_len < prompt_len ?
+                             slot->thinking_live.visible_len : prompt_len;
+            size_t mismatch_pos = 0;
+            for (; mismatch_pos < min_len; mismatch_pos++) {
+                if (visible[mismatch_pos] != req->prompt_text[mismatch_pos]) break;
+            }
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: thinking-live byte mismatch at position %zu/%zu: stored='%c' (0x%02x) vs req='%c' (0x%02x)",
+                       mismatch_pos, min_len,
+                       mismatch_pos < slot->thinking_live.visible_len ? visible[mismatch_pos] : '?',
+                       mismatch_pos < slot->thinking_live.visible_len ? (unsigned char)visible[mismatch_pos] : 0,
+                       mismatch_pos < prompt_len ? req->prompt_text[mismatch_pos] : '?',
+                       mismatch_pos < prompt_len ? (unsigned char)req->prompt_text[mismatch_pos] : 0);
+            /* Show 100 bytes of context around the mismatch to identify the differing region. */
+            size_t ctx_start = mismatch_pos > 50 ? mismatch_pos - 50 : 0;
+            size_t ctx_end_stored = mismatch_pos + 50 < slot->thinking_live.visible_len ? mismatch_pos + 50 : slot->thinking_live.visible_len;
+            size_t ctx_end_req = mismatch_pos + 50 < prompt_len ? mismatch_pos + 50 : prompt_len;
+            size_t ctx_len_stored = ctx_end_stored - ctx_start;
+            size_t ctx_len_req = ctx_end_req - ctx_start;
+            char *ctx_stored = xmalloc(ctx_len_stored + 1);
+            char *ctx_req = xmalloc(ctx_len_req + 1);
+            memcpy(ctx_stored, visible + ctx_start, ctx_len_stored);
+            ctx_stored[ctx_len_stored] = '\0';
+            memcpy(ctx_req, req->prompt_text + ctx_start, ctx_len_req);
+            ctx_req[ctx_len_req] = '\0';
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: thinking-live mismatch context: stored[%zu..%zu]='%.*s' vs req[%zu..%zu]='%.*s'",
+                       ctx_start, ctx_end_stored, (int)ctx_len_stored, ctx_stored,
+                       ctx_start, ctx_end_req, (int)ctx_len_req, ctx_req);
+            free(ctx_stored);
+            free(ctx_req);
+        }
+    }
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -10824,7 +10972,13 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
         r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode)) {
-        buf_puts(&suffix, reasoning ? reasoning : "");
+        /* Prefer encrypted_content (opaque base64 from Responses API) over
+         * plain reasoning when present, matching the renderer logic at L2504-2506.
+         * This ensures checkpoint suffix matches what the next request will render
+         * for KV cache reuse during stateless replay. */
+        const char *reasoning_text = r->last_assistant_encrypted_content;
+        if (!reasoning_text || !reasoning_text[0]) reasoning_text = reasoning;
+        buf_puts(&suffix, reasoning_text ? reasoning_text : "");
         buf_puts(&suffix, "</think>");
     }
     buf_puts(&suffix, content ? content : "");
@@ -11463,11 +11617,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     if (cached == 0 && old_pos > 0) {
+        long long idle_ms = 0;
+        const char *idle_source = NULL;
+        pthread_mutex_lock(&s->tool_mu);
+        if (slot->thinking_live.valid && slot->thinking_live.live_tokens == old_pos) {
+            idle_ms = wall_ms() - slot->thinking_live.stored_at_ms;
+            idle_source = "thinking-live";
+        } else if (slot->responses_live.valid && slot->responses_live.live_tokens == old_pos) {
+            idle_ms = wall_ms() - slot->responses_live.stored_at_ms;
+            idle_source = "responses-live";
+        } else if (slot->anthropic_live.valid && slot->anthropic_live.live_tokens == old_pos) {
+            idle_ms = wall_ms() - slot->anthropic_live.stored_at_ms;
+            idle_source = "anthropic-live";
+        }
+        pthread_mutex_unlock(&s->tool_mu);
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s idle=%lldms (%s)",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   trace_cache_miss_reason(&cache_diag));
+                   trace_cache_miss_reason(&cache_diag),
+                   idle_ms, idle_source ? idle_source : "unknown");
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -15369,6 +15538,60 @@ static void test_responses_encrypted_reasoning_preserved(void) {
     chat_msgs_free(&msgs);
 }
 
+/* Test that build_tool_checkpoint_suffix uses encrypted_content from the
+ * request when present, ensuring KV cache reuse for stateless replay. */
+static void test_checkpoint_suffix_uses_encrypted_content(void) {
+    request r = {0};
+    request_init(&r, REQ_CHAT, 100);
+    r.think_mode = DS4_THINK_HIGH;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    
+    /* Set up encrypted_content as if it came from a Responses API request */
+    r.last_assistant_encrypted_content = xstrdup("VGhpcyBpcyBlbmNyeXB0ZWQ=");
+    
+    tool_calls calls = {0};
+    
+    /* Build suffix with both encrypted_content and plain reasoning */
+    char *suffix = build_tool_checkpoint_suffix(&r, "answer content", 
+                                                 "plain reasoning text", &calls);
+    TEST_ASSERT(suffix != NULL);
+    
+    /* Debug: print the suffix */
+    fprintf(stderr, "\n--- CHECKPOINT SUFFIX (encrypted) ---\n%s\n--- END ---\n", suffix);
+    
+    /* The suffix should use encrypted_content, not plain reasoning.
+     * Note: suffix format is "reasoning</think><content><｜end▁of▁sentence｜>"
+     * without the opening <think> tag (that's in the prompt prefix). */
+    TEST_ASSERT(strstr(suffix, "VGhpcyBpcyBlbmNyeXB0ZWQ=</think>") != NULL);
+    TEST_ASSERT(strstr(suffix, "answer content") != NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") != NULL);
+    /* Plain reasoning should NOT appear when encrypted_content is present */
+    TEST_ASSERT(strstr(suffix, "plain reasoning text") == NULL);
+    
+    free(suffix);
+    tool_calls_free(&calls);
+    request_free(&r);
+    
+    /* Now test without encrypted_content - should fall back to reasoning */
+    request r2 = {0};
+    request_init(&r2, REQ_CHAT, 100);
+    r2.think_mode = DS4_THINK_HIGH;
+    r2.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    
+    char *suffix2 = build_tool_checkpoint_suffix(&r2, "answer", "fallback reasoning", &calls);
+    TEST_ASSERT(suffix2 != NULL);
+    
+    /* Debug: print the suffix */
+    fprintf(stderr, "\n--- CHECKPOINT SUFFIX (fallback) ---\n%s\n--- END ---\n", suffix2);
+    
+    /* Without encrypted_content, should fall back to plain reasoning */
+    TEST_ASSERT(strstr(suffix2, "fallback reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(suffix2, "answer") != NULL);
+    
+    free(suffix2);
+    request_free(&r2);
+}
+
 static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     /* The tool-schema block must sit at the head of the system region so the
      * client's system content stays at the tail, right before <｜User｜>.
@@ -18640,6 +18863,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_responses_rendering_preserves_reasoning();
     test_responses_encrypted_reasoning_preserved();
+    test_checkpoint_suffix_uses_encrypted_content();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
