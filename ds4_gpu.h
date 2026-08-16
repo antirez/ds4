@@ -46,6 +46,9 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+/* Transport-shared allocation: memory both GPU kernels and the CPU can
+ * access directly (TP gate slab).  Metal: identical to tensor_alloc. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
@@ -279,6 +282,9 @@ int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
+/* Backends whose release protocol lives in the slab (ROCm flag gates) need
+ * the in-flags region offset; call right after ds4_gpu_tp_init. */
+void ds4_gpu_tp_set_slab_layout(uint64_t in_flags_off);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */

@@ -29,7 +29,7 @@
 
 #include "ds4_tp.h"
 
-#if defined(__APPLE__) && defined(__has_include)
+#if defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
 #include <infiniband/verbs.h>
 #include <dlfcn.h>
@@ -74,6 +74,8 @@ typedef struct {
     uint32_t rkey;
     uint32_t qpn;
     uint32_t psn;
+    uint32_t qpn2;       /* bulk QP (prefill row swaps) */
+    uint32_t psn2;
     uint32_t mtu;
     uint16_t lid;
     uint8_t gid[16];
@@ -90,10 +92,12 @@ typedef struct {
 } ds4_tp_gate_header;
 
 #ifdef DS4_TP_HAVE_VERBS
-/* librdma is loaded at runtime so builds and machines without the RDMA
- * stack (or with it disabled) fall back to TCP with no link-time cost.
- * ibv_post_send()/ibv_poll_cq() are header inlines over context->ops, so
- * only the setup entry points need dlsym. */
+/* The verbs stack is loaded at runtime so builds and machines without RDMA
+ * support (or with it disabled) fall back to TCP with no link-time cost.
+ * macOS resolves Apple's librdma.dylib; Linux resolves libibverbs from
+ * rdma-core (the thunderbolt-ibverbs kernel module exposes a standard
+ * uverbs device).  ibv_post_send()/ibv_poll_cq() are header inlines over
+ * context->ops, so only the setup entry points need dlsym. */
 typedef struct {
     void *handle;
     struct ibv_device **(*get_device_list)(int *);
@@ -115,12 +119,14 @@ typedef struct {
     int (*modify_qp)(struct ibv_qp *, struct ibv_qp_attr *, int);
 } ds4_tp_verbs_api;
 
-/* AppleThunderboltRDMA quirks (validated with scratchpad probes,
- * 2026-07-06): only UC queue pairs exist (RC/UD: ENOTSUP); RDMA WRITE work
- * requests are accepted but never execute, so the data plane is two-sided
- * SEND/RECV like Apple's own JACCL; messages above 16KB are not delivered;
- * RTR requires GRH addressing with the IPv4-mapped GID that appears only
- * once the Thunderbolt member interface has an IPv4 address of its own.
+/* AppleThunderboltRDMA / thunderbolt-ibverbs quirks (validated with
+ * scratchpad probes, 2026-07-06 on macOS, ported to the Linux
+ * thunderbolt-ibverbs module 2026-08): only UC queue pairs exist
+ * (RC/UD: ENOTSUP); RDMA WRITE work requests are accepted but never
+ * execute, so the data plane is two-sided SEND/RECV like Apple's own
+ * JACCL; messages above 16KB are not delivered; RTR requires GRH
+ * addressing with the IPv4-mapped GID that appears only once the
+ * Thunderbolt member interface has an IPv4 address of its own.
  * UC delivery is in-order and the gate sequence is globally deterministic
  * (86 gates per token, fixed order). After any initial bulk prefill, decode
  * keeps a receive window posted by sequence number: recv for seq s lands in
@@ -136,6 +142,9 @@ typedef struct {
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_qp *qp;
+    struct ibv_qp *qp2;        /* bulk QP: prefill row swaps; keeps its own
+                                * recv credits so the decode window on qp is
+                                * never drained */
     struct ibv_mr *mr;
     struct ibv_port_attr port;
     union ibv_gid gid;
@@ -495,10 +504,18 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
+#if defined(DS4_ROCM_BUILD)
+    if (opt->backend != DS4_BACKEND_CUDA) {
+        tp_set_err(err, errlen,
+                   "tensor parallelism requires the ROCm graph backend");
+        return 0;
+    }
+#else
     if (opt->backend != DS4_BACKEND_METAL) {
         tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
         return 0;
     }
+#endif
     if (opt->ssd_streaming) {
         tp_set_err(err, errlen, "tensor parallelism requires resident weights (no --ssd-streaming)");
         return 0;
@@ -551,6 +568,10 @@ uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
     return tp->gpu_flags_off;
 }
 
+uint64_t ds4_tp_slab_in_flags_offset(const ds4_tp *tp) {
+    return tp->in_flags_off;
+}
+
 static uint32_t tp_slot(const ds4_tp *tp, uint32_t layer, uint32_t gate) {
     (void)tp;
     return layer * DS4_TP_GATES_PER_LAYER + gate;
@@ -582,8 +603,29 @@ uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
 
 static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     if (api->handle) return 1;
-    void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
+    void *h = NULL;
+#if defined(__APPLE__)
+    h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
+#else
+    /* Inside Fedora toolbox containers the host rdma-core is reachable
+     * under /run/host; try it first, then the container-local install.
+     * The host library pulls host-only dependencies (libnl) that the
+     * container image does not ship, so load those explicitly with GLOBAL
+     * visibility, then preload the thunderbolt provider image the same
+     * way: libibverbs later dlopens the same soname internally and binds
+     * to the already-loaded object, bypassing the container's library
+     * search paths entirely (runtime setenv does not affect rtld). */
+    (void)dlopen("/run/host/usr/lib64/libnl-3.so.200", RTLD_NOW | RTLD_GLOBAL);
+    (void)dlopen("/run/host/usr/lib64/libnl-route-3.so.200", RTLD_NOW | RTLD_GLOBAL);
+    h = dlopen("/run/host/usr/lib64/libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libibverbs.so", RTLD_NOW | RTLD_LOCAL);
+    if (h && access("/run/host/usr/lib64/libibverbs/libusb4_rdma-rdmav59.so", R_OK) == 0) {
+        (void)dlopen("/run/host/usr/lib64/libibverbs/libusb4_rdma-rdmav59.so",
+                     RTLD_NOW | RTLD_GLOBAL);
+    }
+#endif
     if (!h) return 0;
 #define TP_SYM(field, name) \
     do { \
@@ -689,9 +731,10 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
         }
         if (r->gid_index < 0) {
             tp_set_err(err, errlen,
-                       "tp rdma: no IPv4-mapped GID on the active port; give the "
-                       "Thunderbolt interface its own IPv4 (e.g. sudo ifconfig en1 "
-                       "inet 10.99.0.2/30 alias) on both machines");
+                    "tp rdma: no IPv4-mapped GID on the active port; give the "
+                    "Thunderbolt interface its own IPv4 (e.g. macOS "
+                    "'sudo ifconfig en1 inet 10.99.0.2/30 alias', Linux "
+                    "'sudo ip addr add 10.99.0.2/30 dev en1') on both machines");
             return 0;
         }
     }
@@ -721,6 +764,26 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     }
     r->max_inline = qia.cap.max_inline_data;
 
+    /* Second UC QP dedicated to bulk prefill exchanges.  Keeping the bulk
+     * off the latency QP means the decode lookahead window stays armed for
+     * the whole session (no drain protocol), and the bulk can post its
+     * receives before the TCP barrier so no send ever races the peer's
+     * recv post (this provider RNR-errors the QP on that race). */
+    memset(&qia, 0, sizeof(qia));
+    qia.send_cq = r->cq;
+    qia.recv_cq = r->cq;
+    qia.qp_type = IBV_QPT_UC;
+    qia.cap.max_send_wr = 512;
+    qia.cap.max_recv_wr = 512;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+    qia.cap.max_inline_data = 0;
+    r->qp2 = r->api.create_qp(r->pd, &qia);
+    if (!r->qp2) {
+        tp_set_err(err, errlen, "tp rdma: create_qp(UC bulk): %s", strerror(errno));
+        return 0;
+    }
+
     pthread_mutex_init(&r->post_lock, NULL);
     return 1;
 }
@@ -742,6 +805,20 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.rkey = r->mr->rkey;
     mine.qpn = r->qp->qp_num;
     mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
+    mine.qpn2 = r->qp2->qp_num;
+    mine.psn2 = (uint32_t)(getpid() ^ (uintptr_t)(tp + 1)) & 0xffffff;
+    if (getenv("DS4_TP_CQ_DEBUG")) {
+        fprintf(stderr,
+                "ds4-tp: rdma hello local qpn=%u psn=%u qpn2=%u psn2=%u lid=%u mtu=%d gid_index=%d link=%d "
+                "gid=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                mine.qpn, mine.psn, mine.qpn2, mine.psn2,
+                r->port.lid, (int)r->port.active_mtu,
+                r->gid_index, (int)r->port.link_layer,
+                r->gid.raw[0], r->gid.raw[1], r->gid.raw[2], r->gid.raw[3],
+                r->gid.raw[4], r->gid.raw[5], r->gid.raw[6], r->gid.raw[7],
+                r->gid.raw[8], r->gid.raw[9], r->gid.raw[10], r->gid.raw[11],
+                r->gid.raw[12], r->gid.raw[13], r->gid.raw[14], r->gid.raw[15]);
+    }
     mine.mtu = (uint32_t)r->port.active_mtu;
     mine.lid = r->port.lid;
     memcpy(mine.gid, r->gid.raw, 16);
@@ -757,43 +834,55 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: info recv failed");
         return 0;
     }
+    if (getenv("DS4_TP_CQ_DEBUG")) {
+        fprintf(stderr, "ds4-tp: rdma hello peer qpn=%u psn=%u qpn2=%u psn2=%u lid=%u mtu=%u\n",
+                r->peer.qpn, r->peer.psn, r->peer.qpn2, r->peer.psn2,
+                r->peer.lid, r->peer.mtu);
+    }
 
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
-     * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
-    struct ibv_qp_attr a = {0};
-    a.qp_state = IBV_QPS_INIT;
-    a.pkey_index = 0;
-    a.port_num = 1;
-    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                        IBV_ACCESS_REMOTE_WRITE;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify INIT: %s", strerror(errno));
-        return 0;
-    }
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_RTR;
-    a.path_mtu = IBV_MTU_1024;
-    a.dest_qp_num = r->peer.qpn;
-    a.rq_psn = r->peer.psn;
-    a.ah_attr.dlid = (uint16_t)r->peer.lid;
-    a.ah_attr.port_num = 1;
-    a.ah_attr.is_global = 1;
-    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
-    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
-    a.ah_attr.grh.hop_limit = 1;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
-        return 0;
-    }
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_RTS;
-    a.sq_psn = mine.psn;
-    if (r->api.modify_qp(r->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
-        return 0;
+     * JACCL): MTU 1024 and GRH via the IPv4-mapped GID.  Both QPs ride the
+     * same recipe; the bulk QP addresses the peer's bulk QP. */
+    struct ibv_qp *qps[2] = { r->qp, r->qp2 };
+    uint32_t peer_qpn[2] = { r->peer.qpn, r->peer.qpn2 };
+    uint32_t peer_psn[2] = { r->peer.psn, r->peer.psn2 };
+    uint32_t my_psn[2] = { mine.psn, mine.psn2 };
+    for (int qi = 0; qi < 2; qi++) {
+        struct ibv_qp_attr a = {0};
+        a.qp_state = IBV_QPS_INIT;
+        a.pkey_index = 0;
+        a.port_num = 1;
+        a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                            IBV_ACCESS_REMOTE_WRITE;
+        if (r->api.modify_qp(qps[qi], &a,
+                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+            tp_set_err(err, errlen, "tp rdma: modify INIT (qp %d): %s", qi, strerror(errno));
+            return 0;
+        }
+        memset(&a, 0, sizeof(a));
+        a.qp_state = IBV_QPS_RTR;
+        a.path_mtu = IBV_MTU_1024;
+        a.dest_qp_num = peer_qpn[qi];
+        a.rq_psn = peer_psn[qi];
+        a.ah_attr.dlid = (uint16_t)r->peer.lid;
+        a.ah_attr.port_num = 1;
+        a.ah_attr.is_global = 1;
+        memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
+        a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
+        a.ah_attr.grh.hop_limit = 1;
+        if (r->api.modify_qp(qps[qi], &a,
+                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                IBV_QP_RQ_PSN) != 0) {
+            tp_set_err(err, errlen, "tp rdma: modify RTR (qp %d): %s", qi, strerror(errno));
+            return 0;
+        }
+        memset(&a, 0, sizeof(a));
+        a.qp_state = IBV_QPS_RTS;
+        a.sq_psn = my_psn[qi];
+        if (r->api.modify_qp(qps[qi], &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+            tp_set_err(err, errlen, "tp rdma: modify RTS (qp %d): %s", qi, strerror(errno));
+            return 0;
+        }
     }
     if (tp->vec_bytes > 2ull * DS4_TP_RDMA_MAX_MSG) {
         tp_set_err(err, errlen,
@@ -808,8 +897,13 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
                 "(%llu bytes > %u limit)\n",
                 (unsigned long long)tp->vec_bytes, DS4_TP_RDMA_MAX_MSG);
     }
-    /* Leave the receive queue empty for an initial bulk prefill.  The first
-     * decode gate arms the normal lookahead window after prefill finishes. */
+    /* The latency QP starts with an empty receive queue.  Arm the decode
+     * lookahead window NOW, before either rank can send: this provider
+     * RNR-errors the QP on the first send that arrives without a posted
+     * recv, so the window must be primed ahead of the very first gate
+     * (arming it at gate 1 leaves a race window against the peer's first
+     * sends).  Bulk prefill traffic runs on its own QP, so this window
+     * never needs draining. */
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_READY, NULL, 0)) {
         tp_set_err(err, errlen, "tp rdma: ready send failed");
         return 0;
@@ -818,6 +912,16 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     if (!tp_read_frame_header(tp->control_fd, &rtype, &rbytes) ||
         rtype != DS4_TP_FRAME_RDMA_READY || rbytes != 0) {
         tp_set_err(err, errlen, "tp rdma: ready barrier failed");
+        return 0;
+    }
+    pthread_mutex_lock(&r->post_lock);
+    int arm_ok = 1;
+    for (uint64_t s = 1; arm_ok && s <= DS4_TP_RDMA_RECV_WINDOW; s++)
+        arm_ok = tp_rdma_post_gate_recv(tp, s);
+    if (arm_ok) r->recv_window_active = true;
+    pthread_mutex_unlock(&r->post_lock);
+    if (!arm_ok) {
+        tp_set_err(err, errlen, "tp rdma: initial recv window arm failed");
         return 0;
     }
     return 1;
@@ -892,10 +996,11 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
         wr.wr_id = last ? seq : 0;
         wr.sg_list = &sge;
         wr.num_sge = 1;
-        if (ibv_post_recv(r->qp, &wr, &bad) != 0) {
-            fprintf(stderr, "ds4-tp: rdma post_recv(seq %llu off %llu): %s\n",
+        int post_rc = ibv_post_recv(r->qp, &wr, &bad);
+        if (post_rc != 0) {
+            fprintf(stderr, "ds4-tp: rdma post_recv(seq %llu off %llu): rc=%d (%s)\n",
                     (unsigned long long)seq, (unsigned long long)off,
-                    strerror(errno));
+                    post_rc, strerror(post_rc));
             return 0;
         }
         off += len;
@@ -921,6 +1026,12 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
+    /* Keep a lookahead window of receives armed so the peer's sends for
+     * the next 16 gates always find posted recvs even when its GPU runs a
+     * few gates ahead (this provider RNR-errors the QP on the first send
+     * that arrives without a posted recv).  The window lives on the
+     * latency QP only; bulk traffic has its own QP, so it never needs to
+     * be drained. */
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
@@ -940,9 +1051,20 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         wr.num_sge = 1;
         wr.opcode = IBV_WR_SEND;
         wr.send_flags = IBV_SEND_SIGNALED;
-        ok = ibv_post_send(r->qp, &wr, &bad) == 0;
+        int send_rc = ibv_post_send(r->qp, &wr, &bad);
+        ok = send_rc == 0;
         if (!ok) {
-            fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
+            fprintf(stderr, "ds4-tp: rdma post_send: rc=%d (%s)\n", send_rc, strerror(send_rc));
+            if (getenv("DS4_TP_CQ_DEBUG")) {
+                struct ibv_wc dbg_wc[64];
+                int dbg_n = ibv_poll_cq(r->cq, 64, dbg_wc);
+                fprintf(stderr, "ds4-tp: cq dump after failed send: %d entries\n", dbg_n);
+                for (int i = 0; i < dbg_n; i++) {
+                    fprintf(stderr, "ds4-tp:   wc opcode=%u status=%u wr_id=%llu byte_len=%u\n",
+                            dbg_wc[i].opcode, dbg_wc[i].status,
+                            (unsigned long long)dbg_wc[i].wr_id, dbg_wc[i].byte_len);
+                }
+            }
         } else {
             r->send_outstanding++;
         }
@@ -975,101 +1097,11 @@ static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
         (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
     const uint64_t batch_region_bytes =
         (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
-    return tp->rdma.qp && tp->rdma.mr && batch_region_bytes >= stage_bytes;
+    return tp->rdma.qp && tp->rdma.qp2 && tp->rdma.mr &&
+           batch_region_bytes >= stage_bytes;
 }
 
-/* Decode keeps a lookahead window of receives on the latency QP. Before a
- * later prompt can reuse that QP for bulk rows, consume those receives with
- * dummy sends on both ranks. The TCP big-gate header exchange is the barrier
- * that guarantees both sides have reached this transition. */
-static int tp_rdma_drain_decode_window(ds4_tp *tp) {
-    ds4_tp_rdma *r = &tp->rdma;
-    if (!r->recv_window_active) return 1;
 
-    const uint32_t chunks_per_gate =
-        (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                   DS4_TP_RDMA_MAX_MSG);
-    const uint32_t nwr = DS4_TP_RDMA_RECV_WINDOW * chunks_per_gate;
-    struct ibv_sge sge[DS4_TP_RDMA_RECV_WINDOW * 2u];
-    struct ibv_send_wr wr[DS4_TP_RDMA_RECV_WINDOW * 2u];
-    memset(wr, 0, sizeof(wr));
-    uint8_t *scratch = tp->slab + tp->batch_out_off;
-    uint32_t wi = 0;
-    for (uint32_t gate = 0; gate < DS4_TP_RDMA_RECV_WINDOW; gate++) {
-        for (uint64_t off = 0; off < tp->vec_bytes; ) {
-            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
-            sge[wi] = (struct ibv_sge) {
-                .addr = (uintptr_t)(scratch + off),
-                .length = (uint32_t)len,
-                .lkey = r->mr->lkey,
-            };
-            wr[wi].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)wi + 1u);
-            wr[wi].sg_list = &sge[wi];
-            wr[wi].num_sge = 1;
-            wr[wi].opcode = IBV_WR_SEND;
-            wr[wi].send_flags = wi + 1u == nwr ? IBV_SEND_SIGNALED : 0;
-            if (wi > 0) wr[wi - 1u].next = &wr[wi];
-            wi++;
-            off += len;
-        }
-    }
-
-    pthread_mutex_lock(&r->post_lock);
-    struct ibv_send_wr *bad = NULL;
-    if (ibv_post_send(r->qp, wr, &bad) != 0) {
-        fprintf(stderr, "ds4-tp: rdma receive-window drain post failed: %s\n",
-                strerror(errno));
-        pthread_mutex_unlock(&r->post_lock);
-        return 0;
-    }
-
-    uint32_t recv_done = 0;
-    int send_done = 0;
-    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
-    uint32_t peer_poll = 0;
-    while (recv_done < nwr || !send_done) {
-        struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 2u + 1u];
-        int n = ibv_poll_cq(r->cq,
-                           (int)(DS4_TP_RDMA_RECV_WINDOW * 2u + 1u), wc);
-        if (n < 0) {
-            pthread_mutex_unlock(&r->post_lock);
-            return 0;
-        }
-        for (int i = 0; i < n; i++) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "ds4-tp: rdma receive-window drain: %s\n",
-                        tp_wc_status_str(wc[i].status));
-                pthread_mutex_unlock(&r->post_lock);
-                return 0;
-            }
-            if (wc[i].opcode & IBV_WC_RECV) {
-                recv_done++;
-            } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
-                send_done = 1;
-            } else if (r->send_outstanding > 0) {
-                r->send_outstanding--;
-            }
-        }
-        if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-            fprintf(stderr,
-                    "ds4-tp: peer disconnected while draining RDMA receives\n");
-            pthread_mutex_unlock(&r->post_lock);
-            return 0;
-        }
-        if (tp_now_sec() > deadline) {
-            fprintf(stderr,
-                    "ds4-tp: timeout draining RDMA receive window (%u/%u)\n",
-                    recv_done, nwr);
-            pthread_mutex_unlock(&r->post_lock);
-            return 0;
-        }
-    }
-    r->recv_done = r->last_gate_seq;
-    r->recv_window_active = false;
-    pthread_mutex_unlock(&r->post_lock);
-    return 1;
-}
 
 /* Large prefill row swaps share the latency QP.  No future decode receives
  * are queued, so each round can post its 1 MiB receive window before sending
@@ -1080,11 +1112,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      void *in,
                                      uint64_t bytes) {
     ds4_tp_rdma *r = &tp->rdma;
-    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+    if (!tp_rdma_big_gate_capable(tp)) return 0;
 
     /* Payloads already inside the registered slab (verify batches) can ride
      * directly. Ordinary prefill tensors use the idle verify regions as
-     * registered staging because their standalone MTLBuffers are not in the
+     * registered staging because their standalone buffers are not in the
      * NIC memory region. */
     const uintptr_t slab_lo = (uintptr_t)tp->slab;
     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
@@ -1135,9 +1167,21 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
         }
         struct ibv_recv_wr *bad_recv = NULL;
-        if (ibv_post_recv(r->qp, recv_wr, &bad_recv) != 0) {
-            fprintf(stderr, "ds4-tp: bulk rdma post_recv: %s\n",
-                    strerror(errno));
+        int post_rc = ibv_post_recv(r->qp2, recv_wr, &bad_recv);
+        if (post_rc != 0) {
+            fprintf(stderr, "ds4-tp: bulk rdma post_recv: rc=%d (%s)\n",
+                    post_rc, strerror(post_rc));
+            return 0;
+        }
+        /* Both ranks must have their recvs posted before either sends:
+         * this provider RNR-errors the QP on the first send that arrives
+         * with no posted recv and never retransmits.  One byte each way on
+         * the data socket is the barrier (the gate-level header exchange
+         * already ordered the ranks into the same round sequence). */
+        char bb = 'R';
+        if (!tp_write_full(tp->data_fd, &bb, 1) ||
+            !tp_read_full(tp->data_fd, &bb, 1)) {
+            fprintf(stderr, "ds4-tp: bulk rdma recv barrier failed\n");
             return 0;
         }
         atomic_thread_fence(memory_order_release);
@@ -1159,9 +1203,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
         }
         struct ibv_send_wr *bad_send = NULL;
-        if (ibv_post_send(r->qp, send_wr, &bad_send) != 0) {
-            fprintf(stderr, "ds4-tp: bulk rdma post_send: %s\n",
-                    strerror(errno));
+        int send_rc = ibv_post_send(r->qp2, send_wr, &bad_send);
+        if (send_rc != 0) {
+            fprintf(stderr, "ds4-tp: bulk rdma post_send: rc=%d (%s)\n",
+                    send_rc, strerror(send_rc));
             return 0;
         }
 
@@ -1225,6 +1270,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
     if (r->qp) r->api.destroy_qp(r->qp);
+    if (r->qp2) r->api.destroy_qp(r->qp2);
     if (r->mr) r->api.dereg_mr(r->mr);
     if (r->cq) r->api.destroy_cq(r->cq);
     if (r->pd) r->api.dealloc_pd(r->pd);
@@ -1491,7 +1537,6 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                     layer, rows, (unsigned long long)seq);
             return 0;
         }
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
         return tp_rdma_big_gate_exchange(
                 tp,
                 tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
@@ -1559,7 +1604,6 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     }
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_rdma_drain_decode_window(tp)) return 0;
         return tp_rdma_big_gate_exchange(tp, out, in, bytes);
     }
 #endif

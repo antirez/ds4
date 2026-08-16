@@ -122,6 +122,8 @@ uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
+/* Offset of the per-slot u64 in-flags words (backend release protocol). */
+uint64_t ds4_tp_slab_in_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]

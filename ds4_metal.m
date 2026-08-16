@@ -8687,6 +8687,11 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes) {
+    /* Metal buffers are CPU-shared by construction. */
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -9552,6 +9557,12 @@ static volatile int g_tp_keepalive_paused;
 
 void ds4_gpu_tp_keepalive_pause(int paused) {
     g_tp_keepalive_paused = paused;
+}
+
+void ds4_gpu_tp_set_slab_layout(uint64_t in_flags_off) {
+    /* Metal releases through shared events; the slab in-flags region is
+     * unused on this backend. */
+    (void)in_flags_off;
 }
 
 void ds4_gpu_tp_set_session_batch_mode(int enabled) {

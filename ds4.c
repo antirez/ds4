@@ -28350,9 +28350,18 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *tp_attn_out = tp_row_split_attn ?
         metal_graph_tensor_row_range_view(metal_graph_batch_attn_out(g), tp_row0, tp_rows,
                                           DS4_N_EMBD) : NULL;
+    /* tp_q_half may legitimately be NULL (the F16 q_b output tensor is
+     * only allocated on some paths); the fused call below falls back to
+     * the F32 matmul when it is. */
     if (tp_row_split_attn &&
-        (!tp_q || !tp_q_half || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
+        (!tp_q || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
         ok = false;
+    }
+    if (getenv("DS4_TP_PREFILL_TRACE")) {
+        fprintf(stderr, "ds4-tp: layer %u tp views ok=%d q=%p qh=%p qrn=%p h=%p ao=%p (row0=%u rows=%u q_dim=%llu)\n",
+                il, ok, (void *)tp_q, (void *)tp_q_half, (void *)tp_qr_norm,
+                (void *)tp_heads, (void *)tp_attn_out,
+                tp_row0, tp_rows, (unsigned long long)q_dim);
     }
     bool q_b_f16_out = false;
     if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
@@ -28380,6 +28389,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                      DS4_RMS_EPS) != 0;
     }
     if (q_b_f16_out) {
+        if (getenv("DS4_TP_PREFILL_TRACE")) {
+            fprintf(stderr, "ds4-tp: layer %u q_b f16 ok=%d\n", il, ok);
+        }
         DS4_METAL_PROFILE_Q_STAGE("q_b");
         DS4_METAL_PROFILE_Q_STAGE("head_norm");
         if (ok) {
@@ -28461,6 +28473,10 @@ static bool metal_graph_encode_layer_attention_batch(
         DS4_METAL_PROFILE_Q_STAGE("rope");
     }
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
+    if (getenv("DS4_TP_PREFILL_TRACE")) {
+        fprintf(stderr, "ds4-tp: layer %u q_path done ok=%d (tp_row_split=%d)\n",
+                il, ok, tp_row_split_attn);
+    }
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -28506,6 +28522,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("KVrope", metal_graph_batch_kv(g),
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
+    }
+    if (getenv("DS4_TP_PREFILL_TRACE")) {
+        fprintf(stderr, "ds4-tp: layer %u kv_path done ok=%d\n", il, ok);
     }
     if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(metal_graph_batch_kv(g),
                                                        n_tokens,
@@ -58196,7 +58215,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
 
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;
     const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
@@ -58232,24 +58251,79 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 #endif
 
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+#if defined(DS4_NO_GPU) || (!defined(__APPLE__) && !defined(DS4_ROCM_BUILD))
     (void)e; (void)tp;
     snprintf(err, errlen, "tensor parallelism requires the Metal backend");
     return 0;
+#else
+#if defined(DS4_ROCM_BUILD)
+    if (e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "tensor parallelism requires the ROCm graph backend");
+        return 0;
+    }
 #else
     if (e->backend != DS4_BACKEND_METAL) {
         snprintf(err, errlen, "tensor parallelism requires the Metal backend");
         return 0;
     }
+#endif
     if (e->tp.active) {
         snprintf(err, errlen, "tensor parallelism already bound");
         return 0;
     }
+#if defined(DS4_ROCM_BUILD)
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        snprintf(err, errlen,
+                 "tensor parallelism for GLM models is not implemented on "
+                 "the ROCm backend yet (DeepSeek models only)");
+        return 0;
+    }
+    /* Ownership-aware ROCm kernels currently cover Q4_K routed experts and
+     * Q8_0 shared/attention/output tensors; refuse other layouts instead of
+     * silently miscomputing the split. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *rt = e->weights.layer[il].ffn_gate_exps;
+        const ds4_tensor *ut = e->weights.layer[il].ffn_up_exps;
+        const ds4_tensor *dt = e->weights.layer[il].ffn_down_exps;
+        if ((rt && rt->type != DS4_TENSOR_Q4_K) ||
+            (ut && ut->type != DS4_TENSOR_Q4_K) ||
+            (dt && dt->type != DS4_TENSOR_Q4_K)) {
+            snprintf(err, errlen,
+                     "tensor parallelism on ROCm requires Q4_K routed "
+                     "experts (layer %u); this build has ownership-aware "
+                     "kernels for Q4_K only", il);
+            return 0;
+        }
+        const ds4_tensor *sg = e->weights.layer[il].ffn_gate_shexp;
+        const ds4_tensor *sd = e->weights.layer[il].ffn_down_shexp;
+        if ((sg && sg->type != DS4_TENSOR_Q8_0) ||
+            (sd && sd->type != DS4_TENSOR_Q8_0)) {
+            snprintf(err, errlen,
+                     "tensor parallelism on ROCm requires Q8_0 shared "
+                     "experts (layer %u)", il);
+            return 0;
+        }
+        const ds4_tensor *oa = e->weights.layer[il].attn_output_a;
+        const ds4_tensor *ob = e->weights.layer[il].attn_output_b;
+        if ((oa && oa->type != DS4_TENSOR_Q8_0) ||
+            (ob && ob->type != DS4_TENSOR_Q8_0)) {
+            snprintf(err, errlen,
+                     "tensor parallelism on ROCm requires Q8_0 attention "
+                     "output projections (layer %u)", il);
+            return 0;
+        }
+    }
+    if (e->weights.output && e->weights.output->type != DS4_TENSOR_Q8_0) {
+        snprintf(err, errlen,
+                 "tensor parallelism on ROCm requires a Q8_0 output head");
+        return 0;
+    }
+#endif
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
-    e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
-    e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
+    e->tp.slab = ds4_gpu_tensor_alloc_shared(slab_bytes);
+    e->tp.zero_vec = ds4_gpu_tensor_alloc_shared(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
     e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
@@ -58296,6 +58370,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: gate service init failed");
         return 0;
     }
+    ds4_gpu_tp_set_slab_layout(ds4_tp_slab_in_flags_offset(tp));
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
@@ -58319,7 +58394,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
@@ -61642,7 +61717,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         ds4_session_invalidate(s);
         return rc;
     }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
     if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
         snprintf(err, errlen, "tp: gate transport failed");
         if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
@@ -62092,7 +62167,7 @@ static int ds4_sessions_eval_batch_metal(
         }
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -62130,7 +62205,7 @@ static int ds4_sessions_eval_batch_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_gpu_tp_failed()) {
         if (err && errlen) snprintf(err, errlen, "tp: batch gate transport failed");
@@ -62302,7 +62377,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
                      DS4_N_HC) != 0;
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -62360,7 +62435,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_gpu_tp_failed()) {
         if (err && errlen) snprintf(err, errlen,

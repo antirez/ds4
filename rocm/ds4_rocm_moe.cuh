@@ -989,12 +989,17 @@ __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
         uint32_t pair_count,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
     if (expert_i < 0) expert_i = 0;
     if ((uint32_t)expert_i >= n_total_expert) return;
+    /* TP expert ownership: non-owned experts never enter the sort. */
+    if (tp_count != 0u &&
+        ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count)) return;
     atomicAdd(counts + (uint32_t)expert_i, 1u);
 }
 
@@ -1019,12 +1024,16 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
         uint32_t *cursors,
         const int32_t *selected,
         uint32_t pair_count,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
     if (expert_i < 0) expert_i = 0;
     if ((uint32_t)expert_i >= n_total_expert) return;
+    if (tp_count != 0u &&
+        ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count)) return;
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
     sorted_pairs[pos] = pair;
 }
@@ -1036,9 +1045,13 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
         const uint32_t *offsets,
         const int32_t *selected,
         uint32_t pair_count,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     const uint32_t expert = (uint32_t)blockIdx.x;
     if (expert >= n_total_expert || threadIdx.x != 0u) return;
+    if (tp_count != 0u &&
+        (expert < tp_first || expert >= tp_first + tp_count)) return;
     uint32_t pos = offsets[expert];
     for (uint32_t pair = 0; pair < pair_count; pair++) {
         int32_t expert_i = selected[pair];
@@ -1634,6 +1647,8 @@ __global__ static void moe_gate_up_mid_q4K_sorted_qwarp32_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
+        uint32_t tp_first,
+        uint32_t tp_count,
         float clamp) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
@@ -1644,6 +1659,8 @@ __global__ static void moe_gate_up_mid_q4K_sorted_qwarp32_kernel(
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
+    /* The sort only admits owned experts; rebase onto the shifted tables. */
+    if (tp_count != 0u) expert -= tp_first;
     const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
@@ -1689,13 +1706,17 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile4_row32_kernel(
         uint32_t n_expert,
         uint32_t max_count,
         uint32_t write_aux,
+        uint32_t tp_first,
+        uint32_t tp_count,
         float clamp) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
-    uint32_t count = counts[expert];
+    const uint32_t expert_g = tile_experts[tile];
+    uint32_t expert = expert_g;
+    if (tp_count != 0u) expert -= tp_first;
+    uint32_t count = counts[expert_g];
     if (max_count != 0u && count >= max_count) return;
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[4][16];
@@ -1707,7 +1728,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile4_row32_kernel(
     for (; np < 4u; np++) {
         uint32_t local_pair = local_start + np;
         if (local_pair >= count) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        pair[np] = sorted_pairs[offsets[expert_g] + local_pair];
         tok[np] = pair[np] / n_expert;
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
@@ -1772,13 +1793,17 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
         uint32_t n_expert,
         uint32_t max_count,
         uint32_t write_aux,
+        uint32_t tp_first,
+        uint32_t tp_count,
         float clamp) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
-    uint32_t count = counts[expert];
+    const uint32_t expert_g = tile_experts[tile];
+    uint32_t expert = expert_g;
+    if (tp_count != 0u) expert -= tp_first;
+    uint32_t count = counts[expert_g];
     if (max_count != 0u && count >= max_count) return;
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
@@ -1790,7 +1815,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
     for (; np < 8u; np++) {
         uint32_t local_pair = local_start + np;
         if (local_pair >= count) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        pair[np] = sorted_pairs[offsets[expert_g] + local_pair];
         tok[np] = pair[np] / n_expert;
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
@@ -1963,6 +1988,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         uint32_t expert_mid_dim,
         uint32_t n_expert,
         uint32_t write_aux,
+        uint32_t tp_first,
+        uint32_t tp_count,
         float clamp) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row_lane = threadIdx.x >> 3u;
@@ -1971,7 +1998,14 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
+    /* TP ownership: skip the pair entirely; every consumer of this slot
+     * (down kernels, moe_sum) skips it too, so stale mid never matters. */
+    if (tp_count != 0u &&
+        ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count)) {
+        return;
+    }
     uint32_t expert = (uint32_t)expert_i;
+    if (tp_count != 0u) expert -= tp_first;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
@@ -2233,11 +2267,14 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         const char *down_base,
         const cuda_block_q8_K *midq,
         const int32_t *selected,
+        const float *add_in,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
@@ -2247,14 +2284,17 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         if (slot >= n_expert) continue;
         int32_t expert_i = selected[slot];
         if (expert_i < 0) expert_i = 0;
-        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        if (tp_count != 0u &&
+            ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count)) continue;
+        const uint32_t expert = tp_count != 0u ? (uint32_t)expert_i - tp_first : (uint32_t)expert_i;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
         for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
         acc = quarter_warp_sum_f32(acc, lane);
         if (lane == 0) total += acc;
     }
-    if (lane == 0) out[row] = total;
+    if (lane == 0) out[row] = total + (add_in ? add_in[row] : 0.0f);
 }
 
 __global__ static void moe_down_q4K_qwarp32_kernel(
@@ -2266,7 +2306,9 @@ __global__ static void moe_down_q4K_qwarp32_kernel(
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t pair = blockIdx.y;
@@ -2275,7 +2317,10 @@ __global__ static void moe_down_q4K_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    if (tp_count != 0u &&
+        ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count)) return;
+    const uint32_t expert = tp_count != 0u ? (uint32_t)expert_i - tp_first : (uint32_t)expert_i;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
     for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
@@ -2293,7 +2338,9 @@ __global__ static void moe_down_q4K_sorted_qwarp32_kernel(
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t pair = sorted_pairs[blockIdx.y];
@@ -2302,7 +2349,9 @@ __global__ static void moe_down_q4K_sorted_qwarp32_kernel(
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
     if (expert_i < 0) expert_i = 0;
-    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    uint32_t expert = (uint32_t)expert_i;
+    if (tp_count != 0u) expert -= tp_first;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
     for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
@@ -2325,12 +2374,16 @@ __global__ static void moe_down_q4K_expert_tile4_row32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim,
         uint32_t n_expert,
-        uint32_t atomic_out) {
+        uint32_t atomic_out,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
+    const uint32_t expert_g = tile_experts[tile];
+    uint32_t expert = expert_g;
+    if (tp_count != 0u) expert -= tp_first;
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[4][8];
     uint32_t pair[4] = {0, 0, 0, 0};
@@ -2338,8 +2391,8 @@ __global__ static void moe_down_q4K_expert_tile4_row32_kernel(
     uint32_t np = 0;
     for (; np < 4u; np++) {
         uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        if (local_pair >= counts[expert_g]) break;
+        pair[np] = sorted_pairs[offsets[expert_g] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
     if (midq_blocks <= 8u) {
@@ -2386,12 +2439,16 @@ __global__ static void moe_down_q4K_expert_tile8_row32_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim,
         uint32_t n_expert,
-        uint32_t atomic_out) {
+        uint32_t atomic_out,
+        uint32_t tp_first,
+        uint32_t tp_count) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
-    uint32_t expert = tile_experts[tile];
+    const uint32_t expert_g = tile_experts[tile];
+    uint32_t expert = expert_g;
+    if (tp_count != 0u) expert -= tp_first;
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][8];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -2399,8 +2456,8 @@ __global__ static void moe_down_q4K_expert_tile8_row32_kernel(
     uint32_t np = 0;
     for (; np < 8u; np++) {
         uint32_t local_pair = local_start + np;
-        if (local_pair >= counts[expert]) break;
-        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        if (local_pair >= counts[expert_g]) break;
+        pair[np] = sorted_pairs[offsets[expert_g] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
     if (midq_blocks <= 8u) {
@@ -2871,14 +2928,21 @@ __global__ static void moe_down_sorted_p2_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
-__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+__global__ static void moe_sum_kernel(float *out, const float *down, const int32_t *selected, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t tp_first, uint32_t tp_count) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
     if (gid >= n) return;
     uint32_t tok = gid / out_dim;
     uint32_t row = gid - (uint64_t)tok * out_dim;
     float acc = 0.0f;
-    for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    for (uint32_t e = 0; e < n_expert; e++) {
+        if (tp_count != 0u) {
+            int32_t expert_i = selected[(uint64_t)tok * n_expert + e];
+            if (expert_i < 0) expert_i = 0;
+            if ((uint32_t)expert_i < tp_first || (uint32_t)expert_i >= tp_first + tp_count) continue;
+        }
+        acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    }
     out[gid] = acc;
 }
 
