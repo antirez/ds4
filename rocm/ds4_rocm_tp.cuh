@@ -65,6 +65,7 @@ typedef struct {
     uint64_t seq;
     uint32_t big;    /* prefill big gate */
     uint64_t big_bytes;
+    uint32_t event_idx; /* arrival event */
 } ds4_rocm_tp_req;
 
 static ds4_rocm_tp_req g_tp_queue[DS4_ROCM_TP_QUEUE];
@@ -73,6 +74,17 @@ static uint32_t g_tp_qcount;
 
 static uint64_t g_tp_seq;        /* row gate sequence */
 static uint64_t g_tp_batch_seq;  /* batch + big gate sequence (shared, like Metal) */
+
+/* Arrival signaling via stream events instead of a flag kernel: one kernel
+ * launch per gate disappears from the critical path (the eager stream still
+ * orders the event after the partial-producing kernels). */
+/* Sized to the request queue: the encode thread blocks when the queue is
+ * full and the service thread consumes events in request order, so a slot
+ * is always free by the time the ring wraps. */
+#define DS4_ROCM_TP_EVENTS DS4_ROCM_TP_QUEUE
+static cudaEvent_t g_tp_events[DS4_ROCM_TP_EVENTS];
+static int g_tp_events_ready;
+static uint64_t g_tp_event_seq;   /* single counter across row/batch/big gates */
 
 static uint32_t g_tp_split_rank = 1;
 static uint32_t g_tp_split_world = 1;
@@ -214,12 +226,14 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
         pthread_mutex_unlock(&g_tp_mutex);
 
         const uint32_t slot = req.layer * 2u + (req.big ? 1u : req.gate);
-        unsigned int tag = ROCM_TP_TAG_ROW;
-        if (req.big) tag = ROCM_TP_TAG_BIG;
-        else if (req.rows != 0u) tag = ROCM_TP_TAG_BATCH;
-        const unsigned int arrival = tag | (unsigned int)(req.seq & ROCM_TP_SEQ_MASK);
 
-        int ok = ds4_rocm_tp_wait_arrival(slot, arrival);
+        double gate_t0 = 0.0, arrive_t = 0.0;
+        if (getenv("DS4_TP_TIMING")) gate_t0 = ds4_rocm_tp_now_sec();
+        /* The event completes when the stream reaches the partial
+         * kernels' boundary, i.e. the payload is written and visible. */
+        cudaEventSynchronize(g_tp_events[req.event_idx]);
+        int ok = 1;
+        if (getenv("DS4_TP_TIMING")) arrive_t = ds4_rocm_tp_now_sec();
         if (ok) {
             if (req.big) {
                 if (g_tp_big_exchange_fn) {
@@ -245,6 +259,23 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
                         g_tp_exchange_ud, req.layer, req.gate, req.seq) : 0;
                 ds4_rocm_tp_store_release(
                         slot, req.seq & ROCM_TP_SEQ_MASK);
+            }
+        }
+        if (getenv("DS4_TP_TIMING")) {
+            static uint64_t cnt;
+            static double sum_arr, sum_ex, sum_tot;
+            double after_ex = ds4_rocm_tp_now_sec();
+            cnt++;
+            sum_arr += arrive_t - gate_t0;
+            sum_ex += after_ex - arrive_t;
+            sum_tot += after_ex - gate_t0;
+            if ((cnt % 256u) == 0u) {
+                fprintf(stderr, "ds4-tp timing: n=%llu arrival=%5.1fus exchange=%5.1fus total=%5.1fus\n",
+                        (unsigned long long)cnt,
+                        sum_arr * 1e6 / (double)cnt,
+                        sum_ex * 1e6 / (double)cnt,
+                        sum_tot * 1e6 / (double)cnt);
+                sum_arr = sum_ex = sum_tot = 0.0;
             }
         }
         if (!ok) {
@@ -455,14 +486,20 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (!g_tp_thread_running || g_tp_failed) return 0;
     const uint64_t seq = ++g_tp_seq;
     const uint32_t slot = layer * 2u + gate;
-    tp_flag_set_kernel<<<1, 1>>>(
-            ds4_rocm_tp_gpu_flag_dev(slot),
-            ROCM_TP_TAG_ROW | (unsigned int)(seq & ROCM_TP_SEQ_MASK));
+    const uint32_t ev = (uint32_t)(++g_tp_event_seq % DS4_ROCM_TP_EVENTS);
+    if (!g_tp_events_ready) {
+        for (uint32_t i = 0; i < DS4_ROCM_TP_EVENTS; i++) {
+            if (cudaEventCreateWithFlags(&g_tp_events[i], cudaEventDisableTiming) != cudaSuccess) return 0;
+        }
+        g_tp_events_ready = 1;
+    }
+    cudaEventRecord(g_tp_events[ev], 0);
     ds4_rocm_tp_req req;
     memset(&req, 0, sizeof(req));
     req.layer = layer;
     req.gate = gate;
     req.seq = seq;
+    req.event_idx = ev;
     if (!ds4_rocm_tp_enqueue(&req)) return 0;
     tp_gate_wait_kernel<<<1, 1>>>(
             ds4_rocm_tp_release_dev(slot),
@@ -474,15 +511,21 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     if (!g_tp_thread_running || g_tp_failed || rows == 0u) return 0;
     const uint64_t seq = ++g_tp_batch_seq;
     const uint32_t slot = layer * 2u + 1u;
-    tp_flag_set_kernel<<<1, 1>>>(
-            ds4_rocm_tp_gpu_flag_dev(slot),
-            ROCM_TP_TAG_BATCH | (unsigned int)(seq & ROCM_TP_SEQ_MASK));
+    const uint32_t ev = (uint32_t)(++g_tp_event_seq % DS4_ROCM_TP_EVENTS);
+    if (!g_tp_events_ready) {
+        for (uint32_t i = 0; i < DS4_ROCM_TP_EVENTS; i++) {
+            if (cudaEventCreateWithFlags(&g_tp_events[i], cudaEventDisableTiming) != cudaSuccess) return 0;
+        }
+        g_tp_events_ready = 1;
+    }
+    cudaEventRecord(g_tp_events[ev], 0);
     ds4_rocm_tp_req req;
     memset(&req, 0, sizeof(req));
     req.layer = layer;
     req.gate = 1u;
     req.rows = rows;
     req.seq = seq;
+    req.event_idx = ev;
     if (!ds4_rocm_tp_enqueue(&req)) return 0;
     tp_gate_wait_kernel<<<1, 1>>>(
             ds4_rocm_tp_release_dev(slot),
@@ -539,9 +582,14 @@ extern "C" uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
      * kernel enqueued after the kick observes the swapped rows. */
     tp_stage_copy_kernel<<<(unsigned)((n + 255ull) / 256ull), 256>>>(
             (const float *)out_t->ptr, (float *)g_tp_stage_out_dev, n);
-    tp_flag_set_kernel<<<1, 1>>>(
-            ds4_rocm_tp_gpu_flag_dev(layer * 2u + 1u),
-            ROCM_TP_TAG_BIG | (unsigned int)(seq & ROCM_TP_SEQ_MASK));
+    const uint32_t ev = (uint32_t)(++g_tp_event_seq % DS4_ROCM_TP_EVENTS);
+    if (!g_tp_events_ready) {
+        for (uint32_t i = 0; i < DS4_ROCM_TP_EVENTS; i++) {
+            if (cudaEventCreateWithFlags(&g_tp_events[i], cudaEventDisableTiming) != cudaSuccess) return 0;
+        }
+        g_tp_events_ready = 1;
+    }
+    cudaEventRecord(g_tp_events[ev], 0);
     ds4_rocm_tp_req req;
     memset(&req, 0, sizeof(req));
     req.layer = layer;
@@ -550,6 +598,7 @@ extern "C" uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     req.seq = seq;
     req.big = 1;
     req.big_bytes = bytes;
+    req.event_idx = ev;
     if (!ds4_rocm_tp_enqueue(&req)) return 0;
     tp_big_gate_wait_kernel<<<1, 256>>>(
             (volatile unsigned long long *)g_tp_big_release_dev,
