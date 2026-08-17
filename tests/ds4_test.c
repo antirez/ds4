@@ -4868,7 +4868,123 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+#if defined(__APPLE__)
+typedef struct {
+    uint8_t *payload;
+    uint32_t payload_bytes;
+    uint32_t *ready;
+} test_pp_fence_release_ctx;
+
+static void *test_pp_fence_release_main(void *arg) {
+    test_pp_fence_release_ctx *ctx = arg;
+    const struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 5 * 1000 * 1000,
+    };
+    nanosleep(&delay, NULL);
+    for (uint32_t i = 0; i < ctx->payload_bytes; i++) {
+        ctx->payload[i] = (uint8_t)(i * 37u + 11u);
+    }
+    __atomic_store_n(ctx->ready, 1u, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void test_metal_pp_fast_fence_copy(void) {
+    enum { PAYLOAD_BYTES = 4096 };
+    const uint64_t ready_offset = 0;
+    const uint64_t timeout_offset = sizeof(uint32_t);
+    ds4_gpu_tensor *src = ds4_gpu_tensor_alloc(PAYLOAD_BYTES);
+    ds4_gpu_tensor *sync = ds4_gpu_tensor_alloc(2u * sizeof(uint32_t));
+    ds4_gpu_tensor *dst = ds4_gpu_tensor_alloc(PAYLOAD_BYTES);
+    TEST_ASSERT(src != NULL && sync != NULL && dst != NULL);
+    if (!src || !sync || !dst) {
+        ds4_gpu_tensor_free(dst);
+        ds4_gpu_tensor_free(sync);
+        ds4_gpu_tensor_free(src);
+        return;
+    }
+
+    uint8_t *src_bytes = ds4_gpu_tensor_contents(src);
+    uint8_t *sync_bytes = ds4_gpu_tensor_contents(sync);
+    uint32_t *ready = (uint32_t *)(sync_bytes + ready_offset);
+    uint32_t *timeout = (uint32_t *)(sync_bytes + timeout_offset);
+    memset(src_bytes, 0xa5, PAYLOAD_BYTES);
+    __atomic_store_n(ready, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(timeout, 0u, __ATOMIC_RELAXED);
+
+    TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+    TEST_ASSERT(ds4_gpu_pp_fence_wait_copy(dst,
+                                           src,
+                                           sync,
+                                           PAYLOAD_BYTES,
+                                           ready_offset,
+                                           timeout_offset,
+                                           1u) != 0);
+    TEST_ASSERT(ds4_gpu_commit_commands_async() != 0);
+    TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+    pthread_t tid;
+    test_pp_fence_release_ctx ctx = {
+        .payload = src_bytes,
+        .payload_bytes = PAYLOAD_BYTES,
+        .ready = ready,
+    };
+    const int thread_rc = pthread_create(&tid, NULL, test_pp_fence_release_main, &ctx);
+    TEST_ASSERT(thread_rc == 0);
+    if (thread_rc != 0) __atomic_store_n(ready, 1u, __ATOMIC_RELEASE);
+    TEST_ASSERT(ds4_gpu_end_commands() != 0);
+    if (thread_rc == 0) pthread_join(tid, NULL);
+
+    uint8_t got[PAYLOAD_BYTES];
+    TEST_ASSERT(ds4_gpu_tensor_read(dst, 0, got, sizeof(got)) != 0);
+    for (uint32_t i = 0; i < PAYLOAD_BYTES; i++) {
+        TEST_ASSERT(got[i] == (uint8_t)(i * 37u + 11u));
+    }
+    TEST_ASSERT(__atomic_load_n(timeout, __ATOMIC_ACQUIRE) == 0u);
+
+    memset(src_bytes, 0x3c, PAYLOAD_BYTES);
+    __atomic_store_n(ready, 2u, __ATOMIC_RELEASE);
+    __atomic_store_n(timeout, 0u, __ATOMIC_RELAXED);
+    TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+    TEST_ASSERT(ds4_gpu_pp_fence_wait_copy(dst,
+                                           src,
+                                           sync,
+                                           PAYLOAD_BYTES,
+                                           ready_offset,
+                                           timeout_offset,
+                                           1u) != 0);
+    TEST_ASSERT(ds4_gpu_end_commands() != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(dst, 0, got, sizeof(got)) != 0);
+    for (uint32_t i = 0; i < PAYLOAD_BYTES; i++) TEST_ASSERT(got[i] == 0u);
+    TEST_ASSERT(__atomic_load_n(timeout, __ATOMIC_ACQUIRE) == 1u);
+
+    char *saved_iters = test_save_env("DS4_PP_FENCE_MAX_ITERS");
+    setenv("DS4_PP_FENCE_MAX_ITERS", "1000", 1);
+    memset(src_bytes, 0x7e, PAYLOAD_BYTES);
+    __atomic_store_n(ready, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(timeout, 0u, __ATOMIC_RELAXED);
+    TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+    TEST_ASSERT(ds4_gpu_pp_fence_wait_copy(dst,
+                                           src,
+                                           sync,
+                                           PAYLOAD_BYTES,
+                                           ready_offset,
+                                           timeout_offset,
+                                           1u) != 0);
+    TEST_ASSERT(ds4_gpu_end_commands() != 0);
+    TEST_ASSERT(__atomic_load_n(timeout, __ATOMIC_ACQUIRE) == 1u);
+    TEST_ASSERT(ds4_gpu_tensor_read(dst, 0, got, sizeof(got)) != 0);
+    for (uint32_t i = 0; i < PAYLOAD_BYTES; i++) TEST_ASSERT(got[i] == 0u);
+    test_restore_env("DS4_PP_FENCE_MAX_ITERS", saved_iters);
+    ds4_gpu_tensor_free(dst);
+    ds4_gpu_tensor_free(sync);
+    ds4_gpu_tensor_free(src);
+}
+#endif
+
 static void test_metal_kernel_group(void) {
+#if defined(__APPLE__)
+    test_metal_pp_fast_fence_copy();
+#endif
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
@@ -6588,6 +6704,9 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+#if defined(__APPLE__)
+    {"--metal-pp-fast-fence", "metal-pp-fast-fence", "Metal PP coherent activation wait/copy", test_metal_pp_fast_fence_copy},
+#endif
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},

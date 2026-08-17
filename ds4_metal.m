@@ -8096,6 +8096,59 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+int ds4_gpu_pp_fence_wait_copy(ds4_gpu_tensor       *dst,
+                               const ds4_gpu_tensor *src,
+                               const ds4_gpu_tensor *sync,
+                               uint64_t              bytes,
+                               uint64_t              ready_offset,
+                               uint64_t              timeout_offset,
+                               uint32_t              ready_value) {
+    if (!dst || !src || !sync || ready_value == 0) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+    const DS4MetalTensor *f = ds4_gpu_tensor_const_obj(sync);
+    if (bytes > d.bytes || bytes > s.bytes) return 0;
+    if (ready_offset > f.bytes || sizeof(uint32_t) > f.bytes - ready_offset) return 0;
+    if (timeout_offset > f.bytes || sizeof(uint32_t) > f.bytes - timeout_offset) return 0;
+    if ((f.offset + ready_offset) > (uint64_t)NSUIntegerMax) return 0;
+    if ((f.offset + timeout_offset) > (uint64_t)NSUIntegerMax) return 0;
+    if (!g_batch_cb) return 0;
+
+    const uint32_t max_iters = (uint32_t)ds4_gpu_env_u64(
+            "DS4_PP_FENCE_MAX_ITERS", 200000000ull, 1000ull, 4000000000ull);
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_pp_fence_wait_copy");
+    if (!pipeline) return 0;
+
+    const uint32_t words = (uint32_t)(bytes / sizeof(uint32_t));
+    if ((uint64_t)words * sizeof(uint32_t) != bytes) return 0;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:d.buffer offset:(NSUInteger)d.offset atIndex:0];
+    [enc setBuffer:s.buffer offset:(NSUInteger)s.offset atIndex:1];
+    [enc setBuffer:f.buffer
+            offset:(NSUInteger)(f.offset + ready_offset)
+           atIndex:2];
+    [enc setBuffer:f.buffer
+            offset:(NSUInteger)(f.offset + timeout_offset)
+           atIndex:3];
+    [enc setBytes:&words length:sizeof(words) atIndex:4];
+    [enc setBytes:&ready_value length:sizeof(ready_value) atIndex:5];
+    [enc setBytes:&max_iters length:sizeof(max_iters) atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    ds4_gpu_close_batch_encoder();
+    return 1;
+}
+
+int ds4_gpu_pp_fast_fence_available(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_get_pipeline("kernel_dsv4_pp_fence_wait_copy") != nil;
+}
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {
@@ -8238,6 +8291,20 @@ int ds4_gpu_flush_commands(void) {
         [g_transient_buffers removeAllObjects];
         return 0;
     }
+    return 1;
+}
+
+int ds4_gpu_commit_commands_async(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb) return 0;
+
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
     return 1;
 }
 

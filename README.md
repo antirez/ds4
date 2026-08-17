@@ -566,6 +566,15 @@ the output for your use case. However experimentally reduction activation
 size didn't provide a significant improvement, so this option may be removed
 in the future.
 
+On Apple Metal, setting `DS4_METAL_FAST_SYNC=1` on every node also enables the
+experimental pipeline-parallel activation fence for one-token, 32-bit decode
+handoffs. Workers advertise support during route formation; unsupported paths
+(prefill, reduced-width activations, GLM, or disabled worker prefetch) retain
+the synchronous copy path. The worker pre-arms a system-coherent Metal wait,
+receives into a reusable shared staging slot, and releases the GPU after the
+activation is complete. `DS4_PP_FENCE_MAX_ITERS` bounds the GPU wait and is a
+diagnostic/rollback knob rather than a normal tuning parameter.
+
 **If a worker disconnects, the coordinator removes that worker from the active
 route**. The request already in flight can fail, and later calls report an
 incomplete route until a compatible worker reconnects and sends a new

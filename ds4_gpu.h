@@ -56,6 +56,18 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Pipeline-parallel activation handoff.  The source tensor is CPU-visible
+ * shared storage whose ready word is published after the transport has filled
+ * the payload.  The GPU waits coherently, then copies the payload into the
+ * graph-owned destination without a post-receive CPU memcpy. */
+int ds4_gpu_pp_fence_wait_copy(ds4_gpu_tensor       *dst,
+                               const ds4_gpu_tensor *src,
+                               const ds4_gpu_tensor *sync,
+                               uint64_t              bytes,
+                               uint64_t              ready_offset,
+                               uint64_t              timeout_offset,
+                               uint32_t              ready_value);
+int ds4_gpu_pp_fast_fence_available(void);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -77,6 +89,10 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
+/* Commit the active command buffer without waiting and without allocating its
+ * replacement.  Used by PP to pre-arm a coherent input wait before the
+ * activation has arrived; callers must begin the following command buffer. */
+int ds4_gpu_commit_commands_async(void);
 int ds4_gpu_commands_active(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);

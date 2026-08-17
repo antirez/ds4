@@ -6393,8 +6393,61 @@ kernel void kernel_dsv4_tp_fence_wait(
                                    metal::memory_order_seq_cst,
                                    metal::thread_scope_system);
         if (release[0] >= value) {
+            // Pair the CPU release-store with a final system-scope fence before
+            // any following command reads the activation payload.
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
             return;
         }
+    }
+}
+
+// Pipeline-parallel activation handoff.  One SIMD group waits on a CPU-published
+// ready state, then copies the shared activation into graph-owned storage.  A
+// separate timeout word makes bounded-wait failure observable to the host; the
+// copy is zeroed on failure so following kernels never consume stale state.
+kernel void kernel_dsv4_pp_fence_wait_copy(
+        device uint * dst [[buffer(0)]],
+        const device uint * src [[buffer(1)]],
+        volatile coherent(system) device uint * ready [[buffer(2)]],
+        volatile coherent(system) device uint * timeout [[buffer(3)]],
+        constant uint & words [[buffer(4)]],
+        constant uint & value [[buffer(5)]],
+        constant uint & max_iters [[buffer(6)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup uint copy_ready;
+    if (tid == 0) {
+        copy_ready = 0;
+        for (uint i = 0; i < max_iters; i++) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+            const uint state = ready[0];
+            if (state == value) {
+                metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                           metal::memory_order_seq_cst,
+                                           metal::thread_scope_system);
+                copy_ready = 1;
+                break;
+            }
+            if (state != 0) break;
+        }
+        if (copy_ready == 0) {
+            timeout[0] = 1;
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+        }
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (copy_ready) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+    }
+    for (uint i = tid; i < words; i += 32) {
+        dst[i] = copy_ready ? src[i] : 0;
     }
 }
 

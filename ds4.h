@@ -58,6 +58,19 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
+#ifndef DS4_GPU_TENSOR_DEFINED
+#define DS4_GPU_TENSOR_DEFINED
+typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+#endif
+
+typedef struct {
+    const ds4_gpu_tensor *tensor;
+    const ds4_gpu_tensor *sync_tensor;
+    uint64_t bytes;
+    uint64_t ready_offset;
+    uint64_t timeout_offset;
+    uint32_t ready_value;
+} ds4_pp_staged_input;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*ds4_session_cancel_fn)(void *ud);
@@ -436,6 +449,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen);
+int ds4_session_eval_layer_slice_staged(ds4_session *s,
+                                        const int *tokens,
+                                        uint32_t n_tokens,
+                                        uint32_t pos0,
+                                        uint32_t layer_start,
+                                        uint32_t layer_end,
+                                        const ds4_pp_staged_input *staged_input,
+                                        float *output_hc,
+                                        bool output_logits,
+                                        float *logits,
+                                        char *err,
+                                        size_t errlen);
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
                                          uint32_t n_tokens,

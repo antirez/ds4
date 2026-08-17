@@ -14,6 +14,9 @@
  */
 
 #include "ds4_distributed.h"
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include "ds4_gpu.h"
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -31,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -56,9 +60,12 @@
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
+#define DS4_DIST_WORK_F_PP_FAST_FENCE 0x00000010u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
-     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY)
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_PP_FAST_FENCE)
+#define DS4_DIST_FEATURE_PP_FAST_FENCE 0x00000001u
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -86,6 +93,7 @@ typedef struct {
     uint32_t n_layers;
     uint32_t listen_port;
     uint32_t model_name_len;
+    uint32_t features;
 } ds4_dist_hello_fixed;
 
 typedef struct {
@@ -117,6 +125,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     uint32_t flags;
+    uint32_t features;
 } ds4_dist_route_fixed;
 
 typedef struct {
@@ -219,6 +228,7 @@ typedef struct ds4_dist_worker_entry {
     uint32_t ctx_size;
     uint32_t n_layers;
     uint32_t listen_port;
+    uint32_t features;
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
@@ -310,13 +320,34 @@ struct ds4_dist_worker_upstream {
     ds4_dist_worker_forwarder *forwarders;
 };
 
+typedef struct ds4_dist_worker_job_queue ds4_dist_worker_job_queue;
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#define DS4_DIST_PP_FAST_STAGING_SLOTS 4u
+typedef struct {
+    ds4_gpu_tensor *tensor;
+    ds4_gpu_tensor *sync;
+    uint32_t bytes;
+    uint32_t refs;
+} ds4_dist_pp_fast_slot;
+#endif
+
 typedef struct ds4_dist_worker_job {
     void *payload;
     uint32_t bytes;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_tensor *fast_input;
+    ds4_gpu_tensor *fast_sync;
+    uint32_t fast_input_bytes;
+    uint32_t fast_ready_offset;
+    uint32_t fast_timeout_offset;
+    ds4_dist_worker_job_queue *fast_owner;
+    ds4_dist_pp_fast_slot *fast_slot;
+#endif
     struct ds4_dist_worker_job *next;
 } ds4_dist_worker_job;
 
-typedef struct {
+struct ds4_dist_worker_job_queue {
     ds4_dist_worker_state *state;
     ds4_dist_worker_upstream *upstream;
     pthread_mutex_t mu;
@@ -329,7 +360,10 @@ typedef struct {
     bool closed;
     bool canceled;
     int rc;
-} ds4_dist_worker_job_queue;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_dist_pp_fast_slot fast_slots[DS4_DIST_PP_FAST_STAGING_SLOTS];
+#endif
+};
 
 typedef struct {
     ds4_dist_worker_state *state;
@@ -350,6 +384,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     uint32_t flags;
+    uint32_t features;
     int fd;
 } ds4_dist_route_entry;
 
@@ -751,6 +786,23 @@ static uint32_t dist_worker_forward_window(void) {
 
 static bool dist_decode_profile_enabled(void) {
     return getenv("DS4_DIST_DECODE_PROFILE") != NULL;
+}
+
+static bool dist_pp_fast_fence_enabled(ds4_engine *engine) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const char *env = getenv("DS4_METAL_FAST_SYNC");
+    const bool requested = env && env[0] &&
+        strcmp(env, "0") != 0 && strcasecmp(env, "false") != 0 &&
+        strcasecmp(env, "off") != 0 && strcasecmp(env, "no") != 0;
+    return engine != NULL &&
+           requested &&
+           getenv("DS4_DIST_DISABLE_WORKER_PREFETCH") == NULL &&
+           !ds4_engine_is_glm_dsa(engine) &&
+           ds4_gpu_pp_fast_fence_available() != 0;
+#else
+    (void)engine;
+    return false;
+#endif
 }
 
 static bool dist_parse_positive_u32(
@@ -1467,6 +1519,7 @@ static void dist_hello_to_wire(ds4_dist_hello_fixed *h) {
     h->n_layers = htonl(h->n_layers);
     h->listen_port = htonl(h->listen_port);
     h->model_name_len = htonl(h->model_name_len);
+    h->features = htonl(h->features);
 }
 
 static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
@@ -1480,6 +1533,7 @@ static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
     h->n_layers = ntohl(h->n_layers);
     h->listen_port = ntohl(h->listen_port);
     h->model_name_len = ntohl(h->model_name_len);
+    h->features = ntohl(h->features);
 }
 
 static uint64_t dist_u64_from_halves(uint32_t hi, uint32_t lo) {
@@ -1586,6 +1640,7 @@ static void dist_route_from_wire(ds4_dist_route_fixed *r) {
     r->layer_start = ntohl(r->layer_start);
     r->layer_end = ntohl(r->layer_end);
     r->flags = ntohl(r->flags);
+    r->features = ntohl(r->features);
 }
 
 static void dist_route_to_wire(ds4_dist_route_fixed *r) {
@@ -1594,6 +1649,7 @@ static void dist_route_to_wire(ds4_dist_route_fixed *r) {
     r->layer_start = htonl(r->layer_start);
     r->layer_end = htonl(r->layer_end);
     r->flags = htonl(r->flags);
+    r->features = htonl(r->features);
 }
 
 static void dist_route_return_from_wire(ds4_dist_route_return_fixed *r) {
@@ -1767,16 +1823,19 @@ static int dist_send_hello(ds4_engine *engine, const ds4_dist_options *opt, int 
     if (model_name_len > DS4_DIST_MAX_MODEL_NAME) model_name_len = DS4_DIST_MAX_MODEL_NAME;
 
     ds4_dist_hello_fixed h = {
-        (uint32_t)ds4_engine_model_id(engine),
-        (uint32_t)ds4_engine_routed_quant_bits(engine),
-        opt->layers.start,
-        dist_resolved_layer_end(opt, n_layers),
-        opt->layers.has_output ? 1u : 0u,
-        1u,
-        ctx_size > 0 ? (uint32_t)ctx_size : 0u,
-        n_layers,
-        listen_port,
-        (uint32_t)model_name_len
+        .model_id = (uint32_t)ds4_engine_model_id(engine),
+        .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+        .layer_start = opt->layers.start,
+        .layer_end = dist_resolved_layer_end(opt, n_layers),
+        .has_output = opt->layers.has_output ? 1u : 0u,
+        .has_hidden = 1u,
+        .ctx_size = ctx_size > 0 ? (uint32_t)ctx_size : 0u,
+        .n_layers = n_layers,
+        .listen_port = listen_port,
+        .model_name_len = (uint32_t)model_name_len,
+        .features = dist_pp_fast_fence_enabled(engine)
+            ? DS4_DIST_FEATURE_PP_FAST_FENCE
+            : 0u,
     };
     ds4_dist_hello_fixed wire = h;
     dist_hello_to_wire(&wire);
@@ -1879,6 +1938,7 @@ static void dist_coordinator_add_worker(
     entry->ctx_size = hello->ctx_size;
     entry->n_layers = hello->n_layers;
     entry->listen_port = hello->listen_port;
+    entry->features = hello->features;
 
     pthread_mutex_lock(&state->mu);
     if (state->shutting_down) {
@@ -1917,7 +1977,7 @@ static void dist_coordinator_add_worker(
     if (entry->has_output) snprintf(layer_end, sizeof(layer_end), "output");
     else snprintf(layer_end, sizeof(layer_end), "%u", entry->layer_end);
     DIST_COORD_DEBUG(state,
-                     "ds4: distributed coordinator: registered worker %s:%s data_port=%u model_id=%u quant=Q%u layers=%u:%s hidden=%u ctx=%u\n",
+                     "ds4: distributed coordinator: registered worker %s:%s data_port=%u model_id=%u quant=Q%u layers=%u:%s hidden=%u ctx=%u features=0x%x\n",
                      entry->peer_host,
                      entry->peer_port,
                      entry->listen_port,
@@ -1926,7 +1986,8 @@ static void dist_coordinator_add_worker(
                      entry->layer_start,
                      layer_end,
                      entry->has_hidden,
-                     entry->ctx_size);
+                     entry->ctx_size,
+                     entry->features);
     if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
 }
 
@@ -2162,6 +2223,7 @@ static bool dist_route_plan_append_blob(
         entry->layer_start,
         entry->layer_end,
         entry->flags,
+        entry->features,
     };
     dist_route_to_wire(&fixed);
     memcpy(p, &fixed, sizeof(fixed));
@@ -2268,6 +2330,7 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
+        entry.features = w->features;
         if (state->use_control_for_work && plan->count == 0) {
             entry.fd = dup(w->fd);
             if (entry.fd < 0) {
@@ -2525,6 +2588,13 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.layer_start = first->layer_start;
     work.layer_end = first->layer_end;
     work.flags = DS4_DIST_WORK_F_INPUT_HC;
+    if (dist_pp_fast_fence_enabled(state->engine) &&
+        (first->features & DS4_DIST_FEATURE_PP_FAST_FENCE) != 0 &&
+        n_tokens == 1 && pos0 > 0 &&
+        state->activation_bits == 32u &&
+        !reset_session && !ack_only) {
+        work.flags |= DS4_DIST_WORK_F_PP_FAST_FENCE;
+    }
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
@@ -4248,6 +4318,13 @@ static void *dist_coordinator_client_main(void *arg) {
         close(fd);
         return NULL;
     }
+    if ((hello.features & ~DS4_DIST_FEATURE_PP_FAST_FENCE) != 0) {
+        snprintf(err, sizeof(err), "unsupported worker feature mask 0x%x", hello.features);
+        DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
+        dist_send_error(fd, err);
+        close(fd);
+        return NULL;
+    }
 
     dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name);
 
@@ -5464,6 +5541,10 @@ int ds4_dist_session_create(
                      opt->layers.start,
                      local_end,
                      d->state.activation_bits);
+    if (dist_pp_fast_fence_enabled(engine)) {
+        fprintf(stderr,
+                "ds4: PP fast activation fence enabled (one-token F32 handoffs)\n");
+    }
 
     d->accept_ctx.state = &d->state;
     d->accept_ctx.listen_fd = listen_fd;
@@ -5742,6 +5823,10 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
                      opt->layers.start,
                      local_end,
                      state.activation_bits);
+    if (dist_pp_fast_fence_enabled(engine)) {
+        fprintf(stderr,
+                "ds4: PP fast activation fence enabled (one-token F32 handoffs)\n");
+    }
 
     ds4_dist_accept_ctx accept_ctx = {
         .state = &state,
@@ -6047,6 +6132,7 @@ static bool dist_route_get_entry(
             out->layer_start = fixed.layer_start;
             out->layer_end = fixed.layer_end;
             out->flags = fixed.flags;
+            out->features = fixed.features;
             out->fd = -1;
             return true;
         }
@@ -6171,6 +6257,10 @@ static bool dist_route_validate_blob(
             if (errlen) snprintf(err, errlen, "invalid route port");
             return false;
         }
+        if ((fixed.features & ~DS4_DIST_FEATURE_PP_FAST_FENCE) != 0) {
+            if (errlen) snprintf(err, errlen, "unsupported route feature mask");
+            return false;
+        }
         if (fixed.layer_start >= n_layers || fixed.layer_end >= n_layers ||
             fixed.layer_end < fixed.layer_start) {
             if (errlen) snprintf(err, errlen, "invalid route layer range");
@@ -6239,6 +6329,13 @@ static int dist_send_work_frame(
     if (token_bytes > UINT32_MAX || work->token_bytes != (uint32_t)token_bytes) return -1;
     if (work->input_hc_bytes != 0 && !input_hc) return -1;
     if (work->route_bytes != 0 && !route_blob) return -1;
+    const bool pp_fast_fence =
+        (work->flags & DS4_DIST_WORK_F_PP_FAST_FENCE) != 0;
+    if (pp_fast_fence &&
+        (work->n_tokens != 1 || work->input_hc_bits != 32u ||
+         work->input_hc_bytes == 0 || work->route_bytes == 0)) {
+        return -1;
+    }
     uint64_t input_hc_values = 0;
     if (work->input_hc_bytes != 0 &&
         !dist_activation_values_from_wire_bytes(work->input_hc_bits,
@@ -6259,13 +6356,21 @@ static int dist_send_work_frame(
         uint32_t t = htonl((uint32_t)tokens[i]);
         if (dist_write_full(fd, &t, sizeof(t)) != 0) return -1;
     }
+    /* Fast PP decode sends the route before the activation.  That lets the
+     * receiver validate the entire request and submit a Metal command buffer
+     * which waits coherently while the activation bytes are still arriving. */
+    if (pp_fast_fence && work->route_bytes &&
+        dist_write_full(fd, route_blob, work->route_bytes) != 0)
+        return -1;
     if (work->input_hc_bytes &&
         dist_write_activation_payload(fd,
                                       input_hc,
                                       input_hc_values,
                                       work->input_hc_bits) != 0)
         return -1;
-    if (work->route_bytes && dist_write_full(fd, route_blob, work->route_bytes) != 0) return -1;
+    if (!pp_fast_fence && work->route_bytes &&
+        dist_write_full(fd, route_blob, work->route_bytes) != 0)
+        return -1;
     return 0;
 }
 
@@ -6738,6 +6843,16 @@ static int dist_forward_work_to_next(
     forwarded.route_index = work->route_index + 1u;
     forwarded.flags |= DS4_DIST_WORK_F_INPUT_HC;
     forwarded.input_hc_bits = dist_activation_bits_or_default(work->input_hc_bits);
+    if (dist_pp_fast_fence_enabled(upstream->state->engine) &&
+        (next->features & DS4_DIST_FEATURE_PP_FAST_FENCE) != 0 &&
+        forwarded.n_tokens == 1 && forwarded.pos0 > 0 &&
+        forwarded.input_hc_bits == 32u &&
+        (forwarded.flags & (DS4_DIST_WORK_F_RESET_SESSION |
+                            DS4_DIST_WORK_F_ACK_ONLY)) == 0) {
+        forwarded.flags |= DS4_DIST_WORK_F_PP_FAST_FENCE;
+    } else {
+        forwarded.flags &= ~DS4_DIST_WORK_F_PP_FAST_FENCE;
+    }
     if (!dist_activation_wire_bytes_from_f32_bytes(forwarded.input_hc_bits,
                                                    hidden_hc_bytes,
                                                    &forwarded.input_hc_bytes)) {
@@ -7168,11 +7283,13 @@ static int dist_worker_handle_snapshot_load(
  * Worker Layer Execution
  * ========================================================================= */
 
-static int dist_worker_process_work_payload(
+static int dist_worker_process_work_job(
         ds4_dist_worker_state *state,
         ds4_dist_worker_upstream *upstream,
-        const void *payload,
-        uint32_t bytes) {
+        ds4_dist_worker_job *job) {
+    if (!job) return -1;
+    const void *payload = job->payload;
+    const uint32_t bytes = job->bytes;
     uint64_t request_id = 0;
     char err[256];
     if (bytes < sizeof(ds4_dist_work_fixed)) {
@@ -7246,6 +7363,8 @@ static int dist_worker_process_work_payload(
     const bool output_logits = (work.flags & DS4_DIST_WORK_F_OUTPUT_LOGITS) != 0;
     const bool input_hc_present = (work.flags & DS4_DIST_WORK_F_INPUT_HC) != 0;
     const bool ack_only = (work.flags & DS4_DIST_WORK_F_ACK_ONLY) != 0;
+    const bool pp_fast_fence =
+        (work.flags & DS4_DIST_WORK_F_PP_FAST_FENCE) != 0;
     if (input_hc_present && work.layer_start == 0) {
         return dist_worker_upstream_send_work_error(upstream, request_id, "layer 0 WORK must not provide input hidden-state");
     }
@@ -7294,6 +7413,25 @@ static int dist_worker_process_work_payload(
     const uint32_t expected_hc_bytes = (uint32_t)expected_hc_bytes64;
     const uint32_t input_hc_bits = dist_activation_bits_or_default(work.input_hc_bits);
 
+    if (pp_fast_fence) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (!dist_pp_fast_fence_enabled(state->engine) ||
+            !job->fast_input || !job->fast_sync ||
+            job->fast_input_bytes != expected_hc_bytes ||
+            work.n_tokens != 1 || work.pos0 == 0 || input_hc_bits != 32u ||
+            job->fast_ready_offset != 0 ||
+            job->fast_timeout_offset != sizeof(uint32_t)) {
+            free(tokens);
+            return dist_worker_upstream_send_work_error(
+                upstream, request_id, "PP fast fence request is unavailable or malformed");
+        }
+#else
+        free(tokens);
+        return dist_worker_upstream_send_work_error(
+            upstream, request_id, "PP fast fence requires the Apple Metal backend");
+#endif
+    }
+
     float *input_hc = NULL;
     const void *input_hc_wire = NULL;
     if (input_hc_present) {
@@ -7317,7 +7455,13 @@ static int dist_worker_process_work_payload(
             free(tokens);
             return -1;
         }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        input_hc_wire = pp_fast_fence
+            ? ds4_gpu_tensor_contents(job->fast_input)
+            : reader.p;
+#else
         input_hc_wire = reader.p;
+#endif
         reader.p += work.input_hc_bytes;
         reader.remaining -= work.input_hc_bytes;
         DIST_DEBUG("worker input hidden read ok request=%llu bytes=%u bits=%u",
@@ -7498,18 +7642,69 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
     const double eval_t0 = dist_now_sec();
-    int eval_rc = ds4_session_eval_layer_slice(session->session,
-                                               tokens,
-                                               work.n_tokens,
-                                               work.pos0,
-                                               work.layer_start,
-                                               work.layer_end,
-                                               input_hc,
-                                               produce_hidden ? result : NULL,
-                                               local_output_logits,
-                                               local_output_logits ? result : NULL,
-                                               err,
-                                               sizeof(err));
+    const ds4_pp_staged_input *staged_input_ptr = NULL;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_pp_staged_input staged_input;
+    if (pp_fast_fence) {
+        staged_input.tensor = job->fast_input;
+        staged_input.sync_tensor = job->fast_sync;
+        staged_input.bytes = job->fast_input_bytes;
+        staged_input.ready_offset = job->fast_ready_offset;
+        staged_input.timeout_offset = job->fast_timeout_offset;
+        staged_input.ready_value = 1u;
+        staged_input_ptr = &staged_input;
+    }
+#endif
+    int eval_rc;
+    if (staged_input_ptr) {
+        eval_rc = ds4_session_eval_layer_slice_staged(
+            session->session,
+            tokens,
+            work.n_tokens,
+            work.pos0,
+            work.layer_start,
+            work.layer_end,
+            staged_input_ptr,
+            produce_hidden ? result : NULL,
+            local_output_logits,
+            local_output_logits ? result : NULL,
+            err,
+            sizeof(err));
+    } else {
+        eval_rc = ds4_session_eval_layer_slice(
+            session->session,
+            tokens,
+            work.n_tokens,
+            work.pos0,
+            work.layer_start,
+            work.layer_end,
+            input_hc,
+            produce_hidden ? result : NULL,
+            local_output_logits,
+            local_output_logits ? result : NULL,
+            err,
+            sizeof(err));
+    }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (eval_rc == 0 && pp_fast_fence) {
+        const uint8_t *sync = ds4_gpu_tensor_contents(job->fast_sync);
+        const uint32_t ready_state = sync
+            ? __atomic_load_n((const uint32_t *)(sync + job->fast_ready_offset),
+                              __ATOMIC_ACQUIRE)
+            : 0u;
+        const uint32_t timed_out = sync
+            ? __atomic_load_n((const uint32_t *)(sync + job->fast_timeout_offset),
+                              __ATOMIC_ACQUIRE)
+            : 1u;
+        if (ready_state != 1u || timed_out != 0u) {
+            (void)ds4_session_layer_slice_reset(session->session, NULL, 0);
+            snprintf(err, sizeof(err),
+                     "PP fast-fence activation handoff failed (ready=%u timeout=%u)",
+                     ready_state, timed_out);
+            eval_rc = 1;
+        }
+    }
+#endif
     const double eval_t1 = dist_now_sec();
     if (eval_rc == 0) {
         session->token_hash = work_result_hash;
@@ -7626,7 +7821,11 @@ static int dist_worker_handle_work(
         free(payload);
         return rc == 0 ? 0 : -1;
     }
-    rc = dist_worker_process_work_payload(state, upstream, payload, bytes);
+    ds4_dist_worker_job job = {
+        .payload = payload,
+        .bytes = bytes,
+    };
+    rc = dist_worker_process_work_job(state, upstream, &job);
     free(payload);
     return rc;
 }
@@ -7635,8 +7834,68 @@ static int dist_worker_handle_work(
  * Worker Prefetch Queue
  * ========================================================================= */
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static ds4_dist_pp_fast_slot *dist_worker_pp_fast_slot_acquire(
+        ds4_dist_worker_job_queue *q,
+        uint32_t bytes) {
+    if (!q || bytes == 0) return NULL;
+    pthread_mutex_lock(&q->mu);
+    for (;;) {
+        if (q->closed || q->canceled) {
+            pthread_mutex_unlock(&q->mu);
+            return NULL;
+        }
+        for (uint32_t i = 0; i < DS4_DIST_PP_FAST_STAGING_SLOTS; i++) {
+            ds4_dist_pp_fast_slot *slot = &q->fast_slots[i];
+            if (slot->refs != 0) continue;
+            if (!slot->tensor || slot->bytes < bytes) {
+                ds4_gpu_tensor_free(slot->tensor);
+                slot->tensor = ds4_gpu_tensor_alloc(bytes);
+                slot->bytes = slot->tensor ? bytes : 0u;
+            }
+            if (!slot->sync) {
+                slot->sync = ds4_gpu_tensor_alloc(2u * sizeof(uint32_t));
+            }
+            if (!slot->tensor || !slot->sync) {
+                ds4_gpu_tensor_free(slot->tensor);
+                ds4_gpu_tensor_free(slot->sync);
+                slot->tensor = NULL;
+                slot->sync = NULL;
+                slot->bytes = 0;
+                pthread_mutex_unlock(&q->mu);
+                return NULL;
+            }
+            /* One reference belongs to the queued evaluator and one to the
+             * socket reader which is still filling the shared tensor. */
+            slot->refs = 2;
+            pthread_mutex_unlock(&q->mu);
+            return slot;
+        }
+        pthread_cond_wait(&q->not_full, &q->mu);
+    }
+}
+
+static void dist_worker_pp_fast_slot_put(
+        ds4_dist_worker_job_queue *q,
+        ds4_dist_pp_fast_slot *slot) {
+    if (!q || !slot) return;
+    pthread_mutex_lock(&q->mu);
+    if (slot->refs != 0) slot->refs--;
+    if (slot->refs == 0) pthread_cond_broadcast(&q->not_full);
+    pthread_mutex_unlock(&q->mu);
+}
+#endif
+
 static void dist_worker_job_free(ds4_dist_worker_job *job) {
     if (!job) return;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (job->fast_owner && job->fast_slot) {
+        dist_worker_pp_fast_slot_put(job->fast_owner, job->fast_slot);
+    } else {
+        ds4_gpu_tensor_free(job->fast_input);
+        ds4_gpu_tensor_free(job->fast_sync);
+    }
+#endif
     free(job->payload);
     free(job);
 }
@@ -7654,11 +7913,16 @@ static void dist_worker_job_queue_init(
     pthread_cond_init(&q->not_full, NULL);
 }
 
-static void dist_worker_job_queue_clear_locked(ds4_dist_worker_job_queue *q) {
+static ds4_dist_worker_job *dist_worker_job_queue_detach_locked(
+        ds4_dist_worker_job_queue *q) {
     ds4_dist_worker_job *it = q->head;
     q->head = NULL;
     q->tail = NULL;
     q->queued = 0;
+    return it;
+}
+
+static void dist_worker_job_list_free(ds4_dist_worker_job *it) {
     while (it) {
         ds4_dist_worker_job *next = it->next;
         dist_worker_job_free(it);
@@ -7668,11 +7932,22 @@ static void dist_worker_job_queue_clear_locked(ds4_dist_worker_job_queue *q) {
 
 static void dist_worker_job_queue_destroy(ds4_dist_worker_job_queue *q) {
     pthread_mutex_lock(&q->mu);
-    dist_worker_job_queue_clear_locked(q);
+    ds4_dist_worker_job *detached = dist_worker_job_queue_detach_locked(q);
     pthread_mutex_unlock(&q->mu);
+    dist_worker_job_list_free(detached);
     pthread_cond_destroy(&q->not_full);
     pthread_cond_destroy(&q->not_empty);
     pthread_mutex_destroy(&q->mu);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    for (uint32_t i = 0; i < DS4_DIST_PP_FAST_STAGING_SLOTS; i++) {
+        ds4_gpu_tensor_free(q->fast_slots[i].tensor);
+        ds4_gpu_tensor_free(q->fast_slots[i].sync);
+        q->fast_slots[i].tensor = NULL;
+        q->fast_slots[i].sync = NULL;
+        q->fast_slots[i].bytes = 0;
+        q->fast_slots[i].refs = 0;
+    }
+#endif
 }
 
 static void dist_worker_job_queue_finish(ds4_dist_worker_job_queue *q) {
@@ -7687,10 +7962,11 @@ static void dist_worker_job_queue_cancel(ds4_dist_worker_job_queue *q) {
     pthread_mutex_lock(&q->mu);
     q->closed = true;
     q->canceled = true;
-    dist_worker_job_queue_clear_locked(q);
+    ds4_dist_worker_job *detached = dist_worker_job_queue_detach_locked(q);
     pthread_cond_broadcast(&q->not_empty);
     pthread_cond_broadcast(&q->not_full);
     pthread_mutex_unlock(&q->mu);
+    dist_worker_job_list_free(detached);
 }
 
 static bool dist_worker_job_queue_enqueue(
@@ -7737,10 +8013,9 @@ static void *dist_worker_prefetch_eval_main(void *arg) {
     for (;;) {
         ds4_dist_worker_job *job = dist_worker_job_queue_pop(q);
         if (!job) break;
-        int rc = dist_worker_process_work_payload(q->state,
-                                                  q->upstream,
-                                                  job->payload,
-                                                  job->bytes);
+        int rc = dist_worker_process_work_job(q->state,
+                                              q->upstream,
+                                              job);
         dist_worker_job_free(job);
         if (rc <= 0) {
             pthread_mutex_lock(&q->mu);
@@ -7752,6 +8027,137 @@ static void *dist_worker_prefetch_eval_main(void *arg) {
         }
     }
     return NULL;
+}
+
+/* Read and enqueue one WORK frame.  In the PP fast-fence layout the route is
+ * on the wire before the activation.  The evaluator can therefore validate
+ * the complete request and submit a command buffer which waits on the shared
+ * staging tensor while this reader is still receiving the activation bytes. */
+static int dist_worker_prefetch_read_work(
+        ds4_dist_worker_job_queue *q,
+        int fd,
+        uint32_t bytes) {
+    ds4_dist_worker_job *job = calloc(1, sizeof(*job));
+    if (!job) {
+        dist_discard_bytes(fd, bytes);
+        dist_worker_upstream_send_work_error(
+            q->upstream, 0, "out of memory queueing distributed WORK");
+        return -1;
+    }
+    job->payload = calloc(1, bytes ? bytes : 1u);
+    job->bytes = bytes;
+    if (!job->payload) {
+        dist_worker_job_free(job);
+        dist_discard_bytes(fd, bytes);
+        dist_worker_upstream_send_work_error(
+            q->upstream, 0, "out of memory reading distributed WORK frame");
+        return -1;
+    }
+
+    if (!dist_pp_fast_fence_enabled(q->state->engine) ||
+        bytes < sizeof(ds4_dist_work_fixed)) {
+        const int rc = dist_read_full(fd, job->payload, bytes);
+        if (rc <= 0) {
+            dist_worker_job_free(job);
+            return rc;
+        }
+        if (!dist_worker_job_queue_enqueue(q, job)) {
+            dist_worker_job_free(job);
+            return -1;
+        }
+        return 1;
+    }
+
+    int rc = dist_read_full(fd, job->payload, sizeof(ds4_dist_work_fixed));
+    if (rc <= 0) {
+        dist_worker_job_free(job);
+        return rc;
+    }
+    ds4_dist_work_fixed work;
+    memcpy(&work, job->payload, sizeof(work));
+    dist_work_from_wire(&work);
+    const uint32_t body_bytes = bytes - (uint32_t)sizeof(ds4_dist_work_fixed);
+    const uint64_t expected_body =
+        (uint64_t)work.token_bytes + work.input_hc_bytes + work.route_bytes;
+    const bool fast_layout =
+        (work.flags & DS4_DIST_WORK_F_PP_FAST_FENCE) != 0 &&
+        expected_body == body_bytes &&
+        work.n_tokens == 1 && work.pos0 > 0 &&
+        work.token_bytes == sizeof(uint32_t) &&
+        work.input_hc_bits == 32u && work.input_hc_bytes != 0 &&
+        work.route_bytes != 0 &&
+        work.input_hc_bytes <= UINT32_MAX - 2u * (uint32_t)sizeof(uint32_t);
+
+    if (!fast_layout) {
+        rc = dist_read_full(fd,
+                            (uint8_t *)job->payload + sizeof(ds4_dist_work_fixed),
+                            body_bytes);
+        if (rc <= 0) {
+            dist_worker_job_free(job);
+            return rc;
+        }
+        if (!dist_worker_job_queue_enqueue(q, job)) {
+            dist_worker_job_free(job);
+            return -1;
+        }
+        return 1;
+    }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    uint8_t *logical = job->payload;
+    uint8_t *token_dst = logical + sizeof(ds4_dist_work_fixed);
+    uint8_t *route_dst = token_dst + work.token_bytes + work.input_hc_bytes;
+    rc = dist_read_full(fd, token_dst, work.token_bytes);
+    if (rc > 0) rc = dist_read_full(fd, route_dst, work.route_bytes);
+    if (rc <= 0) {
+        dist_worker_job_free(job);
+        return rc;
+    }
+
+    const uint32_t ready_offset = 0;
+    const uint32_t timeout_offset = (uint32_t)sizeof(uint32_t);
+    const uint32_t staging_bytes = work.input_hc_bytes;
+    ds4_dist_pp_fast_slot *slot =
+        dist_worker_pp_fast_slot_acquire(q, staging_bytes);
+    job->fast_owner = slot ? q : NULL;
+    job->fast_slot = slot;
+    job->fast_input = slot ? slot->tensor : NULL;
+    job->fast_sync = slot ? slot->sync : NULL;
+    uint8_t *staging = job->fast_input
+        ? ds4_gpu_tensor_contents(job->fast_input)
+        : NULL;
+    uint8_t *sync = job->fast_sync
+        ? ds4_gpu_tensor_contents(job->fast_sync)
+        : NULL;
+    if (!slot || !job->fast_input || !job->fast_sync || !staging || !sync) {
+        dist_worker_job_free(job);
+        if (slot) dist_worker_pp_fast_slot_put(q, slot);
+        dist_discard_bytes(fd, work.input_hc_bytes);
+        dist_worker_upstream_send_work_error(
+            q->upstream, 0, "failed to allocate PP fast-fence staging tensor");
+        return -1;
+    }
+    memset(sync, 0, 2u * sizeof(uint32_t));
+    job->fast_input_bytes = work.input_hc_bytes;
+    job->fast_ready_offset = ready_offset;
+    job->fast_timeout_offset = timeout_offset;
+
+    if (!dist_worker_job_queue_enqueue(q, job)) {
+        dist_worker_job_free(job);
+        dist_worker_pp_fast_slot_put(q, slot);
+        return -1;
+    }
+
+    rc = dist_read_full(fd, staging, work.input_hc_bytes);
+    __atomic_store_n((uint32_t *)(sync + ready_offset),
+                     rc > 0 ? 1u : 2u,
+                     __ATOMIC_RELEASE);
+    dist_worker_pp_fast_slot_put(q, slot);
+    return rc;
+#else
+    dist_worker_job_free(job);
+    return -1;
+#endif
 }
 
 static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) {
@@ -7798,31 +8204,9 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
             break;
         }
         if (type == DS4_DIST_MSG_WORK) {
-            ds4_dist_worker_job *job = calloc(1, sizeof(*job));
-            if (!job) {
-                dist_discard_bytes(fd, bytes);
-                dist_worker_upstream_send_work_error(&upstream, 0, "out of memory queueing distributed WORK");
-                loop_rc = 1;
-                break;
-            }
-            job->payload = malloc(bytes);
-            job->bytes = bytes;
-            if (!job->payload) {
-                dist_worker_job_free(job);
-                dist_discard_bytes(fd, bytes);
-                dist_worker_upstream_send_work_error(&upstream, 0, "out of memory reading distributed WORK frame");
-                loop_rc = 1;
-                break;
-            }
-            rc = dist_read_full(fd, job->payload, bytes);
+            rc = dist_worker_prefetch_read_work(&queue, fd, bytes);
             if (rc <= 0) {
-                dist_worker_job_free(job);
                 loop_rc = rc == 0 ? 0 : 1;
-                break;
-            }
-            if (!dist_worker_job_queue_enqueue(&queue, job)) {
-                dist_worker_job_free(job);
-                loop_rc = 1;
                 break;
             }
             continue;
@@ -7984,6 +8368,10 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             listen_port,
             opt->coordinator_host,
             opt->coordinator_port);
+    if (dist_pp_fast_fence_enabled(engine)) {
+        fprintf(stderr,
+                "ds4: PP fast activation fence enabled (one-token F32 handoffs)\n");
+    }
 
     for (;;) {
         int fd = dist_connect_endpoint(opt->coordinator_host, opt->coordinator_port, err, sizeof(err));

@@ -58165,18 +58165,19 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     ds4_session_dspark_capture_note_checkpoint(s);
 }
 
-int ds4_session_eval_layer_slice(ds4_session *s,
-                                 const int *tokens,
-                                 uint32_t n_tokens,
-                                 uint32_t pos0,
-                                 uint32_t layer_start,
-                                 uint32_t layer_end,
-                                 const float *input_hc,
-                                 float *output_hc,
-                                 bool output_logits,
-                                 float *logits,
-                                 char *err,
-                                 size_t errlen) {
+static int ds4_session_eval_layer_slice_impl(ds4_session *s,
+                                             const int *tokens,
+                                             uint32_t n_tokens,
+                                             uint32_t pos0,
+                                             uint32_t layer_start,
+                                             uint32_t layer_end,
+                                             const float *input_hc,
+                                             const ds4_pp_staged_input *staged_input,
+                                             float *output_hc,
+                                             bool output_logits,
+                                             float *logits,
+                                             char *err,
+                                             size_t errlen) {
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -58189,9 +58190,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                              layer_start, layer_end);
         return 1;
     }
-    if (layer_start != 0 && !input_hc) {
+    if (layer_start != 0 && !input_hc && !staged_input) {
         if (errlen) snprintf(err, errlen, "layer-slice layer %u requires input hidden-state",
                              layer_start);
+        return 1;
+    }
+    if (input_hc && staged_input) {
+        if (errlen) snprintf(err, errlen, "layer-slice input hidden-state is ambiguous");
         return 1;
     }
     if (output_logits && layer_end + 1u != executable_layers) {
@@ -58207,7 +58212,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                              layer_start, layer_end);
         return 1;
     }
-    if (!input_hc && !s->engine->weights.token_embd) {
+    if (!input_hc && !staged_input && !s->engine->weights.token_embd) {
         if (errlen) snprintf(err, errlen, "token embedding is not loaded");
         return 1;
     }
@@ -58232,6 +58237,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     return 1;
 #else
     if (ds4_session_is_glm(s)) {
+        if (staged_input) {
+            if (errlen) snprintf(err, errlen,
+                                 "GLM layer slices do not support staged PP input");
+            return 1;
+        }
         ds4_engine *e = s->engine;
         ds4_glm_gpu_graph *g = &s->glm_graph;
         if (!s->glm_graph_ready) {
@@ -58445,6 +58455,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    if (staged_input &&
+        (!staged_input->tensor || staged_input->ready_value == 0 ||
+         n_tokens != 1 || pos0 == 0 || layer_start == 0 ||
+         staged_input->bytes != hc_dim * sizeof(float))) {
+        if (errlen) snprintf(err, errlen, "invalid staged PP layer-slice input");
+        return 1;
+    }
     if (n_tokens == 1 && pos0 > 0) {
         if (g->raw_cap == 0) {
             if (errlen) snprintf(err, errlen, "%s layer-slice decode has no raw KV cache",
@@ -58454,7 +58471,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         bool ok = true;
-        if (g->ssd_streaming && !input_hc) {
+        const bool has_remote_input = input_hc != NULL || staged_input != NULL;
+        if (g->ssd_streaming && !has_remote_input) {
             g->streaming_static_decode_map_current = false;
             ok = metal_graph_stream_map_token(&e->model, &e->weights);
         }
@@ -58462,7 +58480,22 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             ok = ds4_gpu_tensor_write(metal_graph_cur_hc(g), 0, input_hc, hc_dim * sizeof(float)) != 0;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok && !input_hc) {
+        if (ok && staged_input) {
+#if defined(__APPLE__)
+            ok = ds4_gpu_pp_fence_wait_copy(metal_graph_cur_hc(g),
+                                             staged_input->tensor,
+                                             staged_input->sync_tensor,
+                                             staged_input->bytes,
+                                             staged_input->ready_offset,
+                                             staged_input->timeout_offset,
+                                             staged_input->ready_value) != 0;
+            if (ok) ok = ds4_gpu_commit_commands_async() != 0;
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+#else
+            ok = false;
+#endif
+        }
+        if (ok && !has_remote_input) {
             ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
                                                e->model.map,
                                                e->model.size,
@@ -58561,6 +58594,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .len = (int)n_tokens,
         .cap = (int)n_tokens,
     };
+
+    if (staged_input) {
+        if (errlen) snprintf(err, errlen,
+                             "staged PP input is decode-only");
+        return 1;
+    }
 
     bool ok = true;
     if (g->ssd_streaming && !input_hc) {
@@ -58661,6 +58700,60 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
     return 0;
 #endif
+}
+
+int ds4_session_eval_layer_slice(ds4_session *s,
+                                 const int *tokens,
+                                 uint32_t n_tokens,
+                                 uint32_t pos0,
+                                 uint32_t layer_start,
+                                 uint32_t layer_end,
+                                 const float *input_hc,
+                                 float *output_hc,
+                                 bool output_logits,
+                                 float *logits,
+                                 char *err,
+                                 size_t errlen) {
+    return ds4_session_eval_layer_slice_impl(s,
+                                             tokens,
+                                             n_tokens,
+                                             pos0,
+                                             layer_start,
+                                             layer_end,
+                                             input_hc,
+                                             NULL,
+                                             output_hc,
+                                             output_logits,
+                                             logits,
+                                             err,
+                                             errlen);
+}
+
+int ds4_session_eval_layer_slice_staged(ds4_session *s,
+                                        const int *tokens,
+                                        uint32_t n_tokens,
+                                        uint32_t pos0,
+                                        uint32_t layer_start,
+                                        uint32_t layer_end,
+                                        const ds4_pp_staged_input *staged_input,
+                                        float *output_hc,
+                                        bool output_logits,
+                                        float *logits,
+                                        char *err,
+                                        size_t errlen) {
+    return ds4_session_eval_layer_slice_impl(s,
+                                             tokens,
+                                             n_tokens,
+                                             pos0,
+                                             layer_start,
+                                             layer_end,
+                                             NULL,
+                                             staged_input,
+                                             output_hc,
+                                             output_logits,
+                                             logits,
+                                             err,
+                                             errlen);
 }
 
 #ifndef DS4_NO_GPU
