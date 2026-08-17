@@ -14885,6 +14885,62 @@ static void output_logits_one_decode_scratch(
     matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
 }
 
+/*
+ * Classify one chunk of resumed SSD-streaming prefill.
+ *
+ * This is deliberately GPU-independent so the production chunk scheduler and
+ * CPU-only regression tests exercise the same policy.
+ *
+ * Return values:
+ *   0 = ordinary layer-major path
+ *   1 = boundary-head decode-style path
+ *   2 = ordinary short decode-style path
+ */
+enum {
+    DS4_STREAMING_PREFILL_LAYER_MAJOR = 0,
+    DS4_STREAMING_PREFILL_BOUNDARY    = 1,
+    DS4_STREAMING_PREFILL_SHORT       = 2,
+};
+
+static int ds4_streaming_prefill_chunk_path(
+        bool     ssd_streaming,
+        bool     quality,
+        bool     imatrix,
+        bool     short_decode_allowed,
+        uint32_t start,
+        uint32_t pos0,
+        uint32_t chunk,
+        uint32_t remaining,
+        uint32_t prefill_cap,
+        uint32_t boundary_max,
+        uint32_t short_max) {
+    if (!ssd_streaming || quality || imatrix || chunk == 0) {
+        return DS4_STREAMING_PREFILL_LAYER_MAJOR;
+    }
+
+    const bool boundary_head =
+        start != 0 &&
+        pos0 == start &&
+        chunk < remaining &&
+        prefill_cap != 0 &&
+        (pos0 % prefill_cap) != 0 &&
+        chunk == prefill_cap - (pos0 % prefill_cap) &&
+        boundary_max != 0 &&
+        chunk <= boundary_max;
+
+    if (boundary_head) {
+        return DS4_STREAMING_PREFILL_BOUNDARY;
+    }
+
+    if (short_decode_allowed &&
+        short_max != 0 &&
+        chunk <= short_max) {
+        return DS4_STREAMING_PREFILL_SHORT;
+    }
+
+    return DS4_STREAMING_PREFILL_LAYER_MAJOR;
+}
+
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
 
@@ -30849,7 +30905,45 @@ static bool metal_graph_use_streaming_decode_prefill_range(
     return metal_graph_use_streaming_decode_prefill(g, weights, n_tokens);
 }
 
-static bool metal_graph_prefill_decode_streaming_range(
+/*
+ * Optional continuation-only escape hatch for the small alignment fragment
+ * immediately before an absolute prefill-cap boundary.
+ *
+ * Layer-major SSD-streaming prefill has a substantial fixed cost even when the
+ * fragment contains only a few hundred tokens.  A resumed continuation that
+ * starts close to the next prefill-cap boundary can otherwise pay that fixed
+ * cost twice: once for the short head fragment and again for the aligned
+ * remainder.
+ *
+ * Keep this separate from the ordinary short-prefill threshold.  The default
+ * permits boundary fragments up to 320 tokens while still allowing an explicit
+ * environment override; setting the threshold to zero disables the optimization.
+ */
+static uint32_t metal_graph_streaming_boundary_decode_prefill_max_tokens(void) {
+    const char *env = glm_graph_env_value(
+            "DS4_ROCM_STREAMING_BOUNDARY_DECODE_PREFILL_MAX",
+            "DS4_METAL_STREAMING_BOUNDARY_DECODE_PREFILL_MAX");
+    /*
+     * An explicit environment value overrides the default; setting it to zero
+     * disables the optimization.
+     */
+    if (!env || !env[0]) return 320u;
+
+    char *end = NULL;
+    const long v = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || v < 0) return 320u;
+    if ((unsigned long)v > (unsigned long)UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)v;
+}
+
+
+/*
+ * Execute decode-style streamed prefill after the caller has already selected
+ * the policy that permits it.  Keeping policy outside this worker allows the
+ * ordinary short-prefill threshold and the boundary-head threshold to remain
+ * independent.
+ */
+static bool metal_graph_prefill_decode_streaming_range_unchecked(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -30865,7 +30959,6 @@ static bool metal_graph_prefill_decode_streaming_range(
         ds4_session_cancel_fn  cancel,
         void                  *cancel_ud,
         bool                  *cancelled) {
-    if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) return false;
     if (!prompt || start > (uint32_t)prompt->len ||
         n_tokens > (uint32_t)prompt->len - start) return false;
     if (start == 0) {
@@ -30936,6 +31029,51 @@ static bool metal_graph_prefill_decode_streaming_range(
                 (t1 - t0) * 1000.0);
     }
     return true;
+}
+
+/*
+ * Compatibility wrapper for the existing short-prefill path.
+ *
+ * Existing callers continue to pass through the ordinary short-prefill
+ * policy.  Boundary handling calls the unchecked worker only after its
+ * separate boundary policy has approved the fragment.
+ */
+static bool metal_graph_prefill_decode_streaming_range(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_session_progress_fn progress,
+        void                  *progress_ud,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
+    if (!metal_graph_use_streaming_decode_prefill(g, weights, n_tokens)) {
+        return false;
+    }
+
+    return metal_graph_prefill_decode_streaming_range_unchecked(
+            g,
+            model,
+            weights,
+            prompt,
+            start,
+            n_tokens,
+            logits,
+            show_progress,
+            progress,
+            progress_ud,
+            display_progress,
+            display_progress_ud,
+            cancel,
+            cancel_ud,
+            cancelled);
 }
 
 static bool metal_graph_capture_prefill_seed_router_selected(
@@ -35255,17 +35393,91 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
-        bool ok = metal_graph_prefill_layer_major(g,
-                                                  model,
-                                                  weights,
-                                                  prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
-                                                  show_progress,
-                                                  imatrix,
-                                                  display_progress,
-                                                  display_progress_ud);
+
+        /*
+         * A resumed range can begin just before an absolute prefill-cap
+         * boundary.  If this first alignment fragment is small enough, cross
+         * it with the decode-style SSD-streaming path instead of paying an
+         * entire layer-major batch setup for only that fragment.
+         *
+         * Restrict the boundary optimization to resumed continuations, the
+         * first chunk, ranges that continue past the boundary, and non-imatrix
+         * execution.  Classify every resulting chunk through the same pure
+         * policy used by the CPU regression test so an aligned short tail can
+         * independently re-enter the ordinary short-prefill path.
+         */
+        const uint32_t boundary_max =
+            metal_graph_streaming_boundary_decode_prefill_max_tokens();
+        const uint32_t short_max =
+            metal_graph_streaming_decode_prefill_max_tokens(g, weights);
+
+        /*
+         * This loop-level short path is continuation-only.  Cold short
+         * prefills are already handled by the whole-range fast path above;
+         * keeping cold chunk tails layer-major avoids changing long-prompt
+         * chunking semantics as a side effect of the boundary optimization.
+         */
+        const bool short_decode_allowed = start != 0;
+
+        const int chunk_path =
+            ds4_streaming_prefill_chunk_path(
+                g->ssd_streaming,
+                g->quality,
+                imatrix != NULL,
+                short_decode_allowed,
+                start,
+                pos0,
+                chunk,
+                remaining,
+                g->prefill_cap,
+                boundary_max,
+                short_max);
+
+        const bool boundary_head =
+            chunk_path == DS4_STREAMING_PREFILL_BOUNDARY;
+        const bool short_chunk =
+            chunk_path == DS4_STREAMING_PREFILL_SHORT;
+
+        bool ok;
+        if (boundary_head || short_chunk) {
+            /*
+             * Treat each decode-style chunk as one checkpoint-atomic unit.
+             *
+             * The worker mutates KV state token-by-token.  Suppress its
+             * progress and cancellation callbacks here, then let this enclosing
+             * loop publish exactly one canonical chunk_end checkpoint and test
+             * cancellation immediately afterwards.  This keeps the published
+             * session frontier consistent with the actual KV frontier.
+             */
+            ok = metal_graph_prefill_decode_streaming_range_unchecked(
+                                                            g,
+                                                            model,
+                                                            weights,
+                                                            prompt,
+                                                            pos0,
+                                                            chunk,
+                                                            chunk_logits,
+                                                            show_progress,
+                                                            NULL,
+                                                            NULL,
+                                                            display_progress,
+                                                            display_progress_ud,
+                                                            NULL,
+                                                            NULL,
+                                                            NULL);
+        } else {
+            ok = metal_graph_prefill_layer_major(g,
+                                                 model,
+                                                 weights,
+                                                 prompt,
+                                                 pos0,
+                                                 chunk,
+                                                 chunk_logits,
+                                                 show_progress,
+                                                 imatrix,
+                                                 display_progress,
+                                                 display_progress_ud);
+        }
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
@@ -57015,6 +57227,24 @@ void ds4_test_clear_compress_ratios(void) {
 uint32_t ds4_test_effective_prefill_chunk(bool cuda_tensor_parallel,
                                           uint32_t requested_chunk) {
     return ds4_effective_prefill_chunk(cuda_tensor_parallel, requested_chunk);
+}
+
+int ds4_test_streaming_prefill_chunk_path(
+        bool     ssd_streaming,
+        bool     quality,
+        bool     imatrix,
+        bool     short_decode_allowed,
+        uint32_t start,
+        uint32_t pos0,
+        uint32_t chunk,
+        uint32_t remaining,
+        uint32_t prefill_cap,
+        uint32_t boundary_max,
+        uint32_t short_max) {
+    return ds4_streaming_prefill_chunk_path(
+        ssd_streaming, quality, imatrix, short_decode_allowed,
+        start, pos0, chunk, remaining,
+        prefill_cap, boundary_max, short_max);
 }
 
 uint32_t ds4_test_planner_prefill_cap(int prompt_len,
