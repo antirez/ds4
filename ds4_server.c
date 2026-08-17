@@ -10826,7 +10826,7 @@ static bool should_remember_thinking_checkpoint(const request *r,
 static bool should_remember_tool_context_checkpoint(const request *r,
                                                     const thinking_state *thinking,
                                                     const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
     if (!r->prompt_preserves_reasoning) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
@@ -17776,7 +17776,7 @@ static void test_tool_context_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "length"));
 
     r.api = API_RESPONSES;
-    TEST_ASSERT(!should_remember_tool_context_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_tool_context_checkpoint(&r, &st, "stop"));
     r.api = API_OPENAI;
     TEST_ASSERT(should_remember_tool_context_checkpoint(&r, &st, "stop"));
 
