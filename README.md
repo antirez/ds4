@@ -208,6 +208,15 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
+Accepted proposals keep the state produced by the batched target verifier
+instead of running the same tokens through one-token decode again. Both paths
+execute the same inference graph, but floating-point operations are grouped in
+a different order. A long greedy DSpark run may therefore diverge from a run
+without DSpark after an otherwise valid accepted block. This is not a reduced
+precision or approximate-model mode; use ordinary decoding, `--quality`, or
+`--dspark-strict` when byte-for-byte reproducibility with one-token decode is
+required.
+
 The DSpark checkpoint for Flash 0731 is packaged here as a separate support
 GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 
@@ -232,11 +241,12 @@ Run it with greedy decoding:
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-The default confidence threshold is `0.7`; it prunes suffixes that are unlikely
-to repay their verification cost. `--dspark-confidence 0` forces fixed
-five-token blocks and is intended for diagnostics. Sampled decoding does not
-use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
-decoding, which is useful for comparisons and correctness checks.
+The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm;
+it prunes suffixes that are unlikely to repay their verification cost.
+`--dspark-confidence 0` forces fixed five-token blocks and is intended for
+diagnostics. Sampled decoding does not use DSpark proposals. `--quality` and
+`--dspark-strict` also keep target-only decoding, which is useful for
+reproducibility checks.
 
 ## Speed
 

@@ -184,7 +184,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
-            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: 0.7");
+            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: Metal 0.6; CUDA/ROCm 0.7");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");

@@ -8427,6 +8427,7 @@ struct server_slot {
     int continued_last_store_tokens;
 
     job *assigned;
+    job *running;
     bool busy;
     bool prefill_waiting;
 
@@ -8485,10 +8486,38 @@ struct job {
     int fd;
     request req;
     bool done;
+    bool cancelled;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+static bool job_cancelled(void *ud) {
+    job *j = ud;
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool cancelled = j->cancelled;
+    pthread_mutex_unlock(&j->mu);
+    return cancelled;
+}
+
+static void job_mark_cancelled(job *j) {
+    if (!j) return;
+    pthread_mutex_lock(&j->mu);
+    j->cancelled = true;
+    pthread_mutex_unlock(&j->mu);
+}
+
+static void job_complete(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+static bool slot_job_cancelled(const server_slot *slot) {
+    return slot && slot->running && job_cancelled(slot->running);
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -8779,6 +8808,12 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->anthropic_live);
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void request_live_state_clear(server *s, server_slot *slot) {
+    responses_live_clear(s, slot);
+    anthropic_live_clear(s, slot);
+    thinking_live_clear(s, slot);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -10163,6 +10198,7 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    job *request_job;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -10378,22 +10414,27 @@ static int server_next_prefill_slot_locked(const server *s) {
 }
 
 static bool server_prefill_enter(server *s, server_slot *slot) {
-    if (!s || !slot) return false;
+    if (!s || !slot || slot_job_cancelled(slot)) return false;
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
+        if (slot_job_cancelled(slot)) {
+            pthread_mutex_unlock(&s->inference_mu);
+            return false;
+        }
         return true;
     }
 
     pthread_mutex_lock(&s->model_mu);
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
-    while (!g_stop_requested &&
+    while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || s->decode_pending > 0 ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    if (g_stop_requested) {
+    if (g_stop_requested || slot_job_cancelled(slot)) {
         slot->prefill_waiting = false;
+        pthread_cond_broadcast(&s->model_cv);
         pthread_mutex_unlock(&s->model_mu);
         return false;
     }
@@ -10449,7 +10490,8 @@ static int server_session_sync(server *s, server_slot *slot,
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
-    while (!g_stop_requested && (!called || done < prompt->len)) {
+    while (!g_stop_requested && !slot_job_cancelled(slot) &&
+           (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
@@ -10469,7 +10511,8 @@ static int server_session_sync(server *s, server_slot *slot,
             return 1;
         }
     }
-    return g_stop_requested ? DS4_SESSION_SYNC_INTERRUPTED : 0;
+    return (g_stop_requested || slot_job_cancelled(slot)) ?
+           DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
 
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
@@ -10549,7 +10592,7 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
-    if (!p || !event) return;
+    if (!p || !event || job_cancelled(p->request_job)) return;
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
@@ -10558,9 +10601,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
      * comment line (`:` prefix, ignored by SSE clients) every few seconds.
-     * Best-effort: if the client has already gone away, the writes fail
-     * silently and the outer code will discover the closed socket the next
-     * time it tries to stream a real event. */
+     * A failed write marks the job cancelled; the session callback then stops
+     * prefill at the next backend-safe boundary. */
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
@@ -10568,6 +10610,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
+                job_mark_cancelled(p->request_job);
+                return;
             }
         } else if (now - p->last_keepalive >= 5.0) {
             static const char ka[] = ": prefill\n\n";
@@ -10575,6 +10619,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
+                job_mark_cancelled(p->request_job);
+                return;
             }
         }
     }
@@ -10755,7 +10801,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
-                                         const job *j, const char *ctx,
+                                         job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
@@ -10861,6 +10907,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             .fd = j->fd,
             .stream = j->req.stream,
             .enable_cors = s->enable_cors,
+            .request_job = j,
             /* Tool checkpoint rebuild only runs after the response stream is
              * already in flight, so the SSE headers were sent long ago.
              * Pre-arm the flag so the progress callback only emits keepalive
@@ -10940,10 +10987,30 @@ static void server_generation_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* model_mu must be held. An in-flight batch owns the session until it
+ * completes, but a pending token can be withdrawn without touching backend
+ * state. */
+static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
+    if (!s || !slot || !slot->decode_pending || slot->decode_in_flight) return false;
+    slot->decode_pending = false;
+    s->decode_pending--;
+    slot->decode_rc = DS4_SESSION_SYNC_INTERRUPTED;
+    snprintf(slot->decode_err, sizeof(slot->decode_err), "client disconnected");
+    slot->decode_done = true;
+    pthread_cond_broadcast(&s->model_cv);
+    return true;
+}
+
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
     if (!s || !slot) return 1;
     if (!s->batched_mode) {
+        if (g_stop_requested || slot_job_cancelled(slot)) {
+            if (err && errlen) snprintf(err, errlen, "%s",
+                                        g_stop_requested ? "shutdown requested" :
+                                                           "client disconnected");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
         pthread_mutex_lock(&s->inference_mu);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
@@ -10951,6 +11018,13 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     }
 
     pthread_mutex_lock(&s->model_mu);
+    if (g_stop_requested || slot_job_cancelled(slot)) {
+        pthread_mutex_unlock(&s->model_mu);
+        if (err && errlen) snprintf(err, errlen, "%s",
+                                    g_stop_requested ? "shutdown requested" :
+                                                       "client disconnected");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
     if (slot->decode_pending || slot->decode_in_flight) {
         pthread_mutex_unlock(&s->model_mu);
         if (err && errlen) snprintf(err, errlen, "session already has a decode in flight");
@@ -10963,13 +11037,27 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     slot->decode_pending = true;
     s->decode_pending++;
     pthread_cond_broadcast(&s->model_cv);
-    while (!slot->decode_done && !g_stop_requested) {
+    while (!slot->decode_done) {
+        const bool client_cancelled = slot_job_cancelled(slot);
+        if ((client_cancelled || g_stop_requested) &&
+            server_cancel_pending_decode_locked(s, slot)) {
+            if (!client_cancelled) {
+                snprintf(slot->decode_err, sizeof(slot->decode_err),
+                         "shutdown requested");
+            }
+            break;
+        }
+        /* An in-flight backend call still owns the session. Even during
+         * shutdown or client cancellation, wait for that safe boundary before
+         * the stack-owned job and its cancellation callback can be released. */
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
-    int rc = slot->decode_done ? slot->decode_rc : 1;
+    int rc = slot->decode_rc;
+    if (g_stop_requested && rc == 0) rc = DS4_SESSION_SYNC_INTERRUPTED;
     if (rc != 0 && err && errlen) {
         snprintf(err, errlen, "%s",
-                 slot->decode_err[0] ? slot->decode_err : "decode interrupted");
+                 g_stop_requested ? "shutdown requested" :
+                 (slot->decode_err[0] ? slot->decode_err : "decode interrupted"));
     }
     slot->decode_done = false;
     pthread_mutex_unlock(&s->model_mu);
@@ -11096,7 +11184,7 @@ static uint64_t server_next_sequence(server *s) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
-static void generate_job(server *s, server_slot *slot, job *j) {
+static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
@@ -11269,6 +11357,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .request_job = j,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
@@ -11359,6 +11448,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
+            if (job_cancelled(j)) {
+                request_live_state_clear(s, slot);
+                trace_event(s, trace_id, "cancelled during prefill");
+                return;
+            }
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -11384,11 +11478,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                          cold_store_len);
         kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
         free(disk_cache_path);
+        if (job_cancelled(j)) {
+            request_live_state_clear(s, slot);
+            trace_event(s, trace_id, "cancelled during prefill");
+            return;
+        }
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
     free(disk_cache_path);
+    if (job_cancelled(j)) {
+        ds4_session_set_progress(slot->session, NULL, NULL);
+        ds4_session_set_display_progress(slot->session, NULL, NULL);
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled after prefill");
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
@@ -11435,6 +11542,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -11442,12 +11550,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
         if (!progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+            job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -11455,13 +11565,17 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
                                       prompt_tokens, &anthropic_live)) {
+            job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+            job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -11470,12 +11584,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             responses_stream_init(&j->req, &responses_live);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
+                job_mark_cancelled(j);
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: chat ctx=%s%s%s responses created event failed",
                            ctx_span,
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
+                request_live_state_clear(s, slot);
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
@@ -11516,7 +11632,7 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -11579,6 +11695,10 @@ decode_again:
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+            if (job_cancelled(j)) {
+                stop_decode = true;
+                break;
+            }
             token = toks[ti];
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
@@ -11618,6 +11738,7 @@ decode_again:
                 bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
                 free(delta);
                 if (!ok) {
+                    job_mark_cancelled(j);
                     finish = "error";
                     snprintf(err, sizeof(err), "client stream write failed");
                     free(piece);
@@ -11630,6 +11751,7 @@ decode_again:
                 !anthropic_sse_stream_update(j->fd, s, &j->req, id,
                                              &anthropic_live, text.ptr, stream_len,
                                              false)) {
+                job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
@@ -11640,6 +11762,7 @@ decode_again:
                 !openai_sse_stream_update(j->fd, s, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
+                job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
@@ -11650,6 +11773,7 @@ decode_again:
                 !responses_sse_stream_update(j->fd, &j->req,
                                              &responses_live, text.ptr, stream_len,
                                              false)) {
+                job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
@@ -11761,6 +11885,17 @@ decode_again:
     }
     server_generation_leave(s);
 
+    if (job_cancelled(j)) {
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
+
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
@@ -11858,8 +11993,21 @@ decode_again:
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
+        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) {
+            job_mark_cancelled(j);
+            finish = "error";
+        }
         free(tail);
+    }
+    if (job_cancelled(j)) {
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled while flushing generation");
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
 
     tool_calls parsed_calls = {0};
@@ -11966,6 +12114,19 @@ decode_again:
                             final_finish);
             }
         }
+        if (job_cancelled(j)) {
+            request_live_state_clear(s, slot);
+            trace_event(s, trace_id, "cancelled during response parsing");
+            free(parsed_content);
+            free(parsed_reasoning);
+            tool_calls_free(&parsed_calls);
+            anthropic_stream_free(&anthropic_live);
+            openai_stream_free(&openai_live);
+            responses_stream_free(&responses_live);
+            buf_free(&text);
+            ds4_tokens_free(&effective_prompt);
+            return;
+        }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
@@ -11976,6 +12137,19 @@ decode_again:
         } else if (j->req.api == API_RESPONSES) {
             responses_live_clear(s, slot);
         }
+    }
+    if (job_cancelled(j)) {
+        request_live_state_clear(s, slot);
+        trace_event(s, trace_id, "cancelled before publishing response state");
+        free(parsed_content);
+        free(parsed_reasoning);
+        tool_calls_free(&parsed_calls);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
@@ -12041,8 +12215,8 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
-    if (j->req.stream) {
-        bool response_ok = true;
+    bool response_ok = !job_cancelled(j);
+    if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -12075,32 +12249,37 @@ decode_again:
             response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
                           sse_done(j->fd, &j->req, id, prompt_tokens, completion);
         }
-        if (!response_ok) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: %s ctx=%s%s%s final stream failed",
-                       j->req.kind == REQ_CHAT ? "chat" : "completion",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags);
-        }
-    } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
-    } else {
-        final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+    } else if (response_ok && j->req.api == API_ANTHROPIC) {
+        response_ok = anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
+                                               parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                               parsed_reasoning,
+                                               &parsed_calls, final_finish,
+                                               prompt_tokens, completion);
+    } else if (response_ok && j->req.api == API_RESPONSES) {
+        response_ok = responses_final_response(j->fd, s->enable_cors, &j->req, id,
+                                               parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                               parsed_reasoning,
+                                               &parsed_calls, final_finish,
+                                               prompt_tokens, completion);
+    } else if (response_ok) {
+        response_ok = final_response(j->fd, s->enable_cors, &j->req, id,
+                                     parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                     parsed_reasoning,
+                                     &parsed_calls, final_finish,
+                                     prompt_tokens, completion);
+    }
+    if (job_cancelled(j)) response_ok = false;
+    if (!response_ok) {
+        job_mark_cancelled(j);
+        final_finish = "error";
+        snprintf(err, sizeof(err), "client disconnected");
+        request_live_state_clear(s, slot);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: %s ctx=%s%s%s client disconnected",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -12169,6 +12348,24 @@ decode_again:
     responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+}
+
+/* Keep cancellation installed for the entire request, including every early
+ * return in the large protocol/generation path. The callback is cleared before
+ * the client thread can destroy its stack-owned job. */
+static void generate_job(server *s, server_slot *slot, job *j) {
+    pthread_mutex_lock(&s->model_mu);
+    slot->running = j;
+    pthread_mutex_unlock(&s->model_mu);
+
+    ds4_session_set_cancel(slot->session, job_cancelled, j);
+    if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    ds4_session_set_cancel(slot->session, NULL, NULL);
+
+    pthread_mutex_lock(&s->model_mu);
+    if (slot->running == j) slot->running = NULL;
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
 }
 
 static bool live_state_contains_all(const live_tool_state *state,
@@ -12293,10 +12490,7 @@ static void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         generate_job(s, &s->slots[0], j);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        job_complete(j);
     }
     return NULL;
 }
@@ -12318,10 +12512,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        job_complete(j);
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
@@ -12505,6 +12696,100 @@ static void client_done(server *s) {
 
 static void set_client_socket_nonblocking(int fd);
 
+static bool client_poll_revents_disconnected(short revents) {
+    return (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+}
+
+static bool client_recv_errno_disconnected(int err) {
+    return err != EINTR && err != EAGAIN && err != EWOULDBLOCK;
+}
+
+/* The request body has already been consumed and this one-request server sends
+ * Connection: close, so EOF is cancellation. Discard unsupported pipelined
+ * bytes nonblockingly: otherwise they can hide the FIN behind readable data. */
+static bool client_socket_disconnected(int fd) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return client_recv_errno_disconnected(errno);
+    if (rc == 0) return false;
+    if (client_poll_revents_disconnected(pfd.revents)) return true;
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char discard[256];
+    for (;;) {
+        ssize_t n = recv(fd, discard, sizeof(discard), 0);
+        if (n > 0) continue;
+        if (n == 0) return true;
+        if (errno == EINTR) continue;
+        return client_recv_errno_disconnected(errno);
+    }
+}
+
+/* Mark first, then detach only work that no worker owns yet. No job mutex is
+ * held while entering either server scheduler mutex. */
+static void server_cancel_job(server *s, job *j) {
+    job_mark_cancelled(j);
+
+    bool detached = false;
+    pthread_mutex_lock(&s->mu);
+    job *prev = NULL;
+    for (job *it = s->head; it; prev = it, it = it->next) {
+        if (it != j) continue;
+        if (prev) prev->next = it->next;
+        else s->head = it->next;
+        if (s->tail == it) s->tail = prev;
+        it->next = NULL;
+        detached = true;
+        break;
+    }
+    if (!detached && s->batched_mode) {
+        for (int i = 0; i < s->slot_count; i++) {
+            server_slot *slot = &s->slots[i];
+            if (slot->assigned != j) continue;
+            slot->assigned = NULL;
+            slot->busy = false;
+            detached = true;
+            dispatch_jobs_locked(s);
+            break;
+        }
+    }
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+
+    pthread_mutex_lock(&s->model_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (slot->running == j) {
+            (void)server_cancel_pending_decode_locked(s, slot);
+            break;
+        }
+    }
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
+
+    if (detached) job_complete(j);
+}
+
+static void wait_for_job_or_disconnect(server *s, job *j) {
+    pthread_mutex_lock(&j->mu);
+    while (!j->done) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        timespec_add_us(&deadline, 100000);
+        (void)pthread_cond_timedwait(&j->cv, &j->mu, &deadline);
+        bool done = j->done;
+        pthread_mutex_unlock(&j->mu);
+        if (!done && client_socket_disconnected(j->fd)) {
+            server_cancel_job(s, j);
+        }
+        pthread_mutex_lock(&j->mu);
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -12584,17 +12869,14 @@ static void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
-    pthread_mutex_lock(&j.mu);
     if (!enqueue(s, &j)) {
-        pthread_mutex_unlock(&j.mu);
         http_error(fd, s->enable_cors, 503, "server shutting down");
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
-    pthread_mutex_unlock(&j.mu);
+    wait_for_job_or_disconnect(s, &j);
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
@@ -16648,7 +16930,7 @@ static void test_live_prefix_rewind_target(void) {
 }
 
 static void test_client_socket_nonblocking_flag(void) {
-    int sv[2];
+    int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
     set_client_socket_nonblocking(sv[0]);
@@ -16657,6 +16939,255 @@ static void test_client_socket_nonblocking_flag(void) {
     TEST_ASSERT((flags & O_NONBLOCK) != 0);
     close(sv[0]);
     close(sv[1]);
+}
+
+static void test_client_disconnect_probe(void) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+
+    TEST_ASSERT(!client_socket_disconnected(sv[0]));
+    TEST_ASSERT(write(sv[1], "x", 1) == 1);
+    TEST_ASSERT(!client_socket_disconnected(sv[0]));
+    char byte = '\0';
+    TEST_ASSERT(recv(sv[0], &byte, 1, 0) < 0);
+    TEST_ASSERT(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    close(sv[1]);
+    sv[1] = -1;
+    TEST_ASSERT(client_socket_disconnected(sv[0]));
+    close(sv[0]);
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    set_client_socket_nonblocking(sv[0]);
+
+    /* Unsupported pipelined input must not hide the FIN behind readable data. */
+    TEST_ASSERT(write(sv[1], "extra", 5) == 5);
+    close(sv[1]);
+    sv[1] = -1;
+    TEST_ASSERT(client_socket_disconnected(sv[0]));
+    close(sv[0]);
+
+    TEST_ASSERT(client_poll_revents_disconnected(POLLERR));
+    TEST_ASSERT(client_poll_revents_disconnected(POLLHUP));
+    TEST_ASSERT(client_poll_revents_disconnected(POLLNVAL));
+    TEST_ASSERT(!client_poll_revents_disconnected(POLLIN | POLLOUT));
+    TEST_ASSERT(client_recv_errno_disconnected(ECONNRESET));
+    TEST_ASSERT(client_recv_errno_disconnected(EPIPE));
+    TEST_ASSERT(!client_recv_errno_disconnected(EINTR));
+    TEST_ASSERT(!client_recv_errno_disconnected(EAGAIN));
+    TEST_ASSERT(!client_recv_errno_disconnected(EWOULDBLOCK));
+}
+
+static void test_cancel_job_init(job *j) {
+    memset(j, 0, sizeof(*j));
+    j->fd = -1;
+    pthread_mutex_init(&j->mu, NULL);
+    pthread_cond_init(&j->cv, NULL);
+}
+
+static void test_cancel_job_destroy(job *j) {
+    pthread_cond_destroy(&j->cv);
+    pthread_mutex_destroy(&j->mu);
+}
+
+static void test_cancelled_progress_callback_is_inert(void) {
+    job j;
+    test_cancel_job_init(&j);
+    job_mark_cancelled(&j);
+    server_prefill_progress progress = {
+        .request_job = &j,
+        .prompt_tokens = 100,
+        .cached_tokens = 10,
+    };
+    server_progress_cb(&progress, "prefill_chunk", 50, 100);
+    TEST_ASSERT(!progress.seen);
+    TEST_ASSERT(progress.last_current == 0);
+    test_cancel_job_destroy(&j);
+}
+
+static void test_cancel_server_init(server *s) {
+    memset(s, 0, sizeof(*s));
+    pthread_mutex_init(&s->mu, NULL);
+    pthread_cond_init(&s->cv, NULL);
+    pthread_mutex_init(&s->model_mu, NULL);
+    pthread_cond_init(&s->model_cv, NULL);
+    pthread_mutex_init(&s->tool_mu, NULL);
+}
+
+static void test_cancel_server_destroy(server *s) {
+    pthread_mutex_destroy(&s->tool_mu);
+    pthread_cond_destroy(&s->model_cv);
+    pthread_mutex_destroy(&s->model_mu);
+    pthread_cond_destroy(&s->cv);
+    pthread_mutex_destroy(&s->mu);
+}
+
+typedef struct {
+    server *srv;
+    job *request_job;
+} test_cancel_wait_arg;
+
+static void *test_wait_for_disconnect_main(void *ud) {
+    test_cancel_wait_arg *arg = ud;
+    wait_for_job_or_disconnect(arg->srv, arg->request_job);
+    return NULL;
+}
+
+static void test_waiting_job_cancels_on_client_close(void) {
+    server s;
+    job j;
+    int sv[2] = {-1, -1};
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) {
+        test_cancel_job_destroy(&j);
+        test_cancel_server_destroy(&s);
+        return;
+    }
+    set_client_socket_nonblocking(sv[0]);
+    j.fd = sv[0];
+    s.head = s.tail = &j;
+
+    test_cancel_wait_arg arg = {.srv = &s, .request_job = &j};
+    pthread_t waiter;
+    int thread_rc = pthread_create(&waiter, NULL, test_wait_for_disconnect_main, &arg);
+    TEST_ASSERT(thread_rc == 0);
+    if (thread_rc == 0) {
+        TEST_ASSERT(write(sv[1], "pipelined", 9) == 9);
+        close(sv[1]);
+        sv[1] = -1;
+        TEST_ASSERT(pthread_join(waiter, NULL) == 0);
+        TEST_ASSERT(job_cancelled(&j));
+        TEST_ASSERT(j.done);
+        TEST_ASSERT(s.head == NULL);
+        TEST_ASSERT(s.tail == NULL);
+    }
+
+    close(sv[0]);
+    if (sv[1] >= 0) close(sv[1]);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_unlinks_queued_jobs(void) {
+    server s;
+    job head, middle, tail;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&head);
+    test_cancel_job_init(&middle);
+    test_cancel_job_init(&tail);
+    head.next = &middle;
+    middle.next = &tail;
+    s.head = &head;
+    s.tail = &tail;
+
+    server_cancel_job(&s, &middle);
+    TEST_ASSERT(job_cancelled(&middle));
+    TEST_ASSERT(middle.done);
+    TEST_ASSERT(s.head == &head);
+    TEST_ASSERT(head.next == &tail);
+    TEST_ASSERT(s.tail == &tail);
+
+    server_cancel_job(&s, &head);
+    TEST_ASSERT(job_cancelled(&head));
+    TEST_ASSERT(head.done);
+    TEST_ASSERT(s.head == &tail);
+    TEST_ASSERT(s.tail == &tail);
+
+    server_cancel_job(&s, &tail);
+    TEST_ASSERT(job_cancelled(&tail));
+    TEST_ASSERT(tail.done);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(s.tail == NULL);
+
+    test_cancel_job_destroy(&tail);
+    test_cancel_job_destroy(&middle);
+    test_cancel_job_destroy(&head);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_detaches_assigned_job(void) {
+    server s;
+    server_slot slot = {0};
+    job j;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    s.batched_mode = true;
+    test_server_bind_slot(&s, &slot);
+    slot.assigned = &j;
+    slot.busy = true;
+
+    server_cancel_job(&s, &j);
+    TEST_ASSERT(job_cancelled(&j));
+    TEST_ASSERT(j.done);
+    TEST_ASSERT(slot.assigned == NULL);
+    TEST_ASSERT(!slot.busy);
+
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_running_job_keeps_worker_ownership(void) {
+    server s;
+    server_slot slot = {0};
+    job j;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&j);
+    test_server_bind_slot(&s, &slot);
+    slot.running = &j;
+
+    server_cancel_job(&s, &j);
+    TEST_ASSERT(job_cancelled(&j));
+    TEST_ASSERT(!j.done);
+    TEST_ASSERT(slot.running == &j);
+
+    slot.running = NULL;
+    job_complete(&j);
+    TEST_ASSERT(j.done);
+    test_cancel_job_destroy(&j);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_cancel_withdraws_only_pending_decode(void) {
+    server s;
+    server_slot slot = {0};
+    job pending, in_flight;
+    test_cancel_server_init(&s);
+    test_cancel_job_init(&pending);
+    test_cancel_job_init(&in_flight);
+    s.batched_mode = true;
+    test_server_bind_slot(&s, &slot);
+
+    slot.running = &pending;
+    slot.decode_pending = true;
+    s.decode_pending = 1;
+    server_cancel_job(&s, &pending);
+    TEST_ASSERT(job_cancelled(&pending));
+    TEST_ASSERT(!pending.done);
+    TEST_ASSERT(!slot.decode_pending);
+    TEST_ASSERT(slot.decode_done);
+    TEST_ASSERT(slot.decode_rc == DS4_SESSION_SYNC_INTERRUPTED);
+    TEST_ASSERT(s.decode_pending == 0);
+
+    slot.running = &in_flight;
+    slot.decode_done = false;
+    slot.decode_pending = false;
+    slot.decode_in_flight = true;
+    s.decode_pending = 0;
+    server_cancel_job(&s, &in_flight);
+    TEST_ASSERT(job_cancelled(&in_flight));
+    TEST_ASSERT(!in_flight.done);
+    TEST_ASSERT(slot.decode_in_flight);
+    TEST_ASSERT(!slot.decode_done);
+    TEST_ASSERT(s.decode_pending == 0);
+
+    test_cancel_job_destroy(&in_flight);
+    test_cancel_job_destroy(&pending);
+    test_cancel_server_destroy(&s);
 }
 
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
@@ -17872,6 +18403,13 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
+    test_client_disconnect_probe();
+    test_cancelled_progress_callback_is_inert();
+    test_waiting_job_cancels_on_client_close();
+    test_cancel_unlinks_queued_jobs();
+    test_cancel_detaches_assigned_job();
+    test_cancel_running_job_keeps_worker_ownership();
+    test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
