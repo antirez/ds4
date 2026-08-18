@@ -509,6 +509,15 @@ int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
 int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
                                    int *drafts, int max_drafts, int *n_drafts,
                                    char *err, size_t errlen);
+/* Commit an accepted verify-prefix without a replay span: rewinds the
+ * timeline to pos0, restores the per-prefix compressor/indexer state the
+ * verify span captured after the accepted row, and re-appends the accepted
+ * tokens.  Fails (without replay side effects beyond the timeline rewind)
+ * when the span did not capture prefixes; callers then use the rollback
+ * re-eval path. */
+int ds4_session_dist_spec_commit_prefix(ds4_session *s, const int *tokens,
+                                        uint32_t n_accept, uint32_t pos0,
+                                        char *err, size_t errlen);
 /* Snapshot/restore the session's owned compressor/indexer frontiers.  Cheap:
  * only small per-layer state tensors, never the full KV caches. */
 bool ds4_session_dist_frontier_snapshot(ds4_session *s,

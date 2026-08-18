@@ -15033,6 +15033,9 @@ typedef struct {
     uint32_t spec_prefix_n_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
     uint32_t spec_prefix_n_index_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
     bool spec_capture_prefixes;
+    /* Rows whose per-prefix state the last layer-slice span captured
+     * (0 = stale); consumed by the distributed prefix commit. */
+    uint32_t spec_prefix_rows;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -51239,6 +51242,79 @@ int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
     }
 }
 
+int ds4_session_dist_spec_commit_prefix(ds4_session *s, const int *tokens,
+                                        uint32_t n_accept, uint32_t pos0,
+                                        char *err, size_t errlen) {
+    if (!s || !s->engine || !tokens || n_accept == 0) {
+        if (errlen) snprintf(err, errlen, "invalid distributed prefix commit");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        if (errlen) snprintf(err, errlen, "prefix commits require the DS4 graph backend");
+        return 1;
+    }
+    ds4_gpu_graph *g = &s->graph;
+    /* The verify span must have captured strictly more rows than we keep,
+     * and the timeline must still hold exactly that span. */
+    if (n_accept > DS4_SPEC_PREFIX_SLOTS ||
+        g->spec_prefix_rows == 0 ||
+        n_accept >= g->spec_prefix_rows ||
+        !s->checkpoint_valid ||
+        (uint32_t)s->checkpoint.len != pos0 + g->spec_prefix_rows) {
+        if (errlen) snprintf(err, errlen,
+                             "no prefix snapshot for commit (rows=%u accept=%u len=%d pos=%u)",
+                             g->spec_prefix_rows, n_accept,
+                             s->checkpoint.len, pos0);
+        return 1;
+    }
+    /* Same recipe as the single-node direct-partial commit: rewind the
+     * timeline, restore the compressor/indexer state captured after the
+     * accepted row, then re-append the accepted tokens.  Append-only cache
+     * rows beyond the prefix remain as invisible garbage.  Only layers this
+     * slice owns carry state. */
+    s->checkpoint.len = (int)pos0;
+    ds4_session_dspark_capture_invalidate(s);
+    const uint32_t slot = n_accept - 1u;
+    const ds4_weights *w = &s->engine->weights;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&w->layer[il], il)) continue;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        g->layer_n_comp[il] = g->spec_prefix_n_comp[slot][il];
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint64_t aoff = (uint64_t)slot * ab;
+        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                   g->spec_prefix1_attn_state_kv[il], aoff, ab) != 0 &&
+             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
+                                   g->spec_prefix1_attn_state_score[il], aoff, ab) != 0;
+        if (ok && ratio == 4) {
+            g->layer_n_index_comp[il] = g->spec_prefix_n_index_comp[slot][il];
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            const uint64_t ioff = (uint64_t)slot * ib;
+            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
+                                       g->spec_prefix1_index_state_kv[il], ioff, ib) != 0 &&
+                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
+                                       g->spec_prefix1_index_state_score[il], ioff, ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    g->spec_prefix_rows = 0;
+    if (!ok) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "prefix state commit failed");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_accept; i++) {
+        token_vec_push(&s->checkpoint, tokens[i]);
+    }
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_note_checkpoint(s);
+    return 0;
+}
+
 bool ds4_session_dist_frontier_snapshot(ds4_session *s,
                                         ds4_dist_mtp_frontier *f) {
     if (!f) return false;
@@ -51369,6 +51445,14 @@ int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
                                    char *err, size_t errlen) {
     (void)s; (void)token; (void)pos; (void)drafts; (void)max_drafts;
     if (n_drafts) *n_drafts = 0;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+}
+
+int ds4_session_dist_spec_commit_prefix(ds4_session *s, const int *tokens,
+                                        uint32_t n_accept, uint32_t pos0,
+                                        char *err, size_t errlen) {
+    (void)s; (void)tokens; (void)n_accept; (void)pos0;
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 }
@@ -59814,6 +59898,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
          * target layers, so the worker can draft after this decode.  Every
          * call below no-ops when this slice has no capture targets. */
         metal_graph_dspark_capture_begin(g);
+        g->spec_prefix_rows = 0;
         if (g->ssd_streaming) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
@@ -59972,6 +60057,13 @@ static int ds4_session_eval_layer_slice_span(
     if (ok && !dspark_suffix_capture) {
         metal_graph_dspark_capture_begin_prefill(g);
     }
+    /* Capture per-prefix compressor/indexer state during short spans (the
+     * same gating as the single-node verifier) so a distributed partial
+     * accept can commit an intermediate prefix without a replay span. */
+    const bool saved_prefix_capture = g->spec_capture_prefixes;
+    g->spec_prefix_rows = 0;
+    g->spec_capture_prefixes = n_tokens > 1u &&
+                               n_tokens <= DS4_SPEC_PREFIX_SLOTS + 1u;
     const bool batch_selected_addr =
         g->ssd_streaming &&
         layer_start == 0 &&
@@ -60023,6 +60115,11 @@ static int ds4_session_eval_layer_slice_span(
                               g, il, pos0, n_tokens);
             }
         }
+    }
+    {
+        const bool prefix_rows_captured = g->spec_capture_prefixes;
+        g->spec_capture_prefixes = saved_prefix_capture;
+        if (ok && prefix_rows_captured) g->spec_prefix_rows = n_tokens;
     }
     if (ok && output_logits) {
         ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];

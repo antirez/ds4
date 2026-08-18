@@ -65,11 +65,16 @@
 #define DS4_DIST_WORK_F_SPEC_ROLLBACK 0x00000020u
 #define DS4_DIST_WORK_F_OUTPUT_DRAFTS 0x00000040u
 #define DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS 0x00000080u
+/* F_SPEC_COMMIT: commit the accepted prefix of the last verify span from
+ * the per-prefix state snapshots (no re-eval); tokens carry the accepted
+ * ids, pos0 the pre-draft timeline length, the reply is a bare ack. */
+#define DS4_DIST_WORK_F_SPEC_COMMIT 0x00000100u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
      DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
      DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_SPEC_ROLLBACK | \
-     DS4_DIST_WORK_F_OUTPUT_DRAFTS | DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS)
+     DS4_DIST_WORK_F_OUTPUT_DRAFTS | DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS | \
+     DS4_DIST_WORK_F_SPEC_COMMIT)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -5839,6 +5844,80 @@ int ds4_dist_session_eval(
  * Distributed Legacy-MTP Speculative Cycle
  * ========================================================================= */
 
+/* Commit an accepted verify prefix on both machines without a replay span:
+ * each rank restores the per-prefix compressor/indexer state its verify
+ * slice captured and re-appends the accepted tokens.  Returns nonzero when
+ * either side cannot commit; callers then fall back to the rollback
+ * re-eval path (the local rewind is safely overridden by the frontier
+ * restore there). */
+static int dist_coordinator_spec_commit_prefix(
+        ds4_dist_coordinator_state *state,
+        ds4_session *owner,
+        const ds4_dist_route_plan *plan,
+        const int *accepted,
+        uint32_t n_accept,
+        uint32_t pos0,
+        uint64_t session_id,
+        uint64_t request_id,
+        char *err,
+        size_t errlen) {
+    if (ds4_session_dist_spec_commit_prefix(owner, accepted, n_accept, pos0,
+                                            err, errlen) != 0) {
+        return 1;
+    }
+    uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
+    if (dist_session_token_hash_prefix(owner, pos0, &prefix_hash,
+                                       err, errlen) != 0) {
+        return 1;
+    }
+    const uint64_t result_hash =
+        dist_token_hash_update_span(prefix_hash, accepted, n_accept);
+    if (plan->count == 0) return 0;
+    const ds4_dist_route_entry *first = &plan->entry[0];
+    const int fd = first->fd;
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "distributed route has no live first-hop connection");
+        return 1;
+    }
+    int rc = dist_coordinator_send_remote_work_on_fd(state,
+                                                     plan,
+                                                     fd,
+                                                     accepted,
+                                                     n_accept,
+                                                     pos0,
+                                                     session_id,
+                                                     request_id,
+                                                     prefix_hash,
+                                                     result_hash,
+                                                     false,
+                                                     false,
+                                                     DS4_DIST_WORK_F_SPEC_COMMIT,
+                                                     NULL,
+                                                     0,
+                                                     err,
+                                                     errlen);
+    if (rc != 0) return rc;
+    uint32_t kind = 0, payload_bytes = 0;
+    uint64_t got_hash = 0;
+    void *payload = NULL;
+    rc = dist_recv_result_alloc(fd,
+                                state,
+                                request_id,
+                                &kind,
+                                &got_hash,
+                                &payload,
+                                &payload_bytes,
+                                err,
+                                errlen);
+    if (rc != 0) return rc;
+    free(payload);
+    if (kind != DS4_DIST_RESULT_ACK || got_hash != result_hash) {
+        if (errlen) snprintf(err, errlen, "distributed prefix commit was not acknowledged");
+        return 1;
+    }
+    return 0;
+}
+
 int ds4_dist_session_mtp_spec_cycle(
         ds4_dist_session *d,
         ds4_session *owner,
@@ -6074,11 +6153,47 @@ int ds4_dist_session_mtp_spec_cycle(
                 verify_ms);
     }
     if (accept_n < draft_n) {
-        /* Partial accept: the KV state now covers all draft rows, but only
-         * the accepted prefix may remain.  Rewind both machines and re-eval
-         * the accepted prefix (the worker restores its own frontier via the
-         * F_SPEC_ROLLBACK flag); the re-eval's last row is the base logits
-         * for the next cycle. */
+        /* Partial accept.  Preferred path: both machines commit the
+         * accepted prefix from the per-prefix state snapshots their verify
+         * slices captured -- no replay span.  The base logits for the next
+         * cycle are the accepted row's logits, already in hand. */
+        {
+            char commit_err[192] = "";
+            if (dist_coordinator_spec_commit_prefix(&d->state,
+                                                    owner,
+                                                    &d->plan,
+                                                    drafts,
+                                                    (uint32_t)accept_n,
+                                                    start + 1u,
+                                                    d->session_id,
+                                                    d->request_id++,
+                                                    commit_err,
+                                                    sizeof(commit_err)) == 0) {
+                ds4_session_set_logits(owner,
+                                       rows + (uint64_t)(accept_n - 1) * vocab,
+                                       vocab);
+                free(rows);
+                for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
+                    accepted[n_accept++] = drafts[i];
+                    if (drafts[i] == eos_token) break;
+                }
+                if (getenv("DS4_MTP_SPEC_LOG")) {
+                    fprintf(stderr,
+                            "ds4: dist spec prefix commit accepted=%d\n",
+                            accept_n);
+                }
+                return n_accept;
+            }
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: dist spec prefix commit fallback: %s\n",
+                        commit_err);
+            }
+        }
+        /* Fallback: rewind both machines and re-eval the accepted prefix
+         * (the worker restores its own frontier via the F_SPEC_ROLLBACK
+         * flag); the re-eval's last row is the base logits for the next
+         * cycle. */
         (void)ds4_session_dist_frontier_restore(owner, &frontier);
         if (!ds4_session_dist_timeline_truncate(owner, start + 1u)) {
             free(rows);
@@ -7741,7 +7856,12 @@ static int dist_worker_process_work_payload(
 
     float *input_hc = NULL;
     const void *input_hc_wire = NULL;
-    if (input_hc_present) {
+    /* Prefix commits carry no hidden payload: the flags still say INPUT_HC
+     * (the sender sets it for every mid-stack hop) but there is nothing to
+     * read or size-check. */
+    const bool frame_spec_commit =
+        (work.flags & DS4_DIST_WORK_F_SPEC_COMMIT) != 0;
+    if (input_hc_present && !frame_spec_commit) {
         uint32_t expected_hc_wire_bytes = 0;
         if (!dist_activation_bits_valid(input_hc_bits) ||
             !dist_activation_wire_bytes(input_hc_bits,
@@ -7860,7 +7980,15 @@ static int dist_worker_process_work_payload(
     const bool spec_rollback = (work.flags & DS4_DIST_WORK_F_SPEC_ROLLBACK) != 0;
     const bool output_drafts = (work.flags & DS4_DIST_WORK_F_OUTPUT_DRAFTS) != 0;
     const bool output_all_logits = (work.flags & DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS) != 0;
+    const bool spec_commit = (work.flags & DS4_DIST_WORK_F_SPEC_COMMIT) != 0;
     if (spec_verify && spec_rollback) {
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(upstream, request_id, "conflicting speculative WORK flags");
+    }
+    if (spec_commit &&
+        (spec_verify || spec_rollback || output_drafts || output_all_logits ||
+         ack_only || has_next || work.n_tokens == 0u)) {
         free(route_blob);
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "conflicting speculative WORK flags");
@@ -7887,7 +8015,7 @@ static int dist_worker_process_work_payload(
     if (drafts_max > 16) drafts_max = 16;
     const bool decode2_span =
         output_all_logits && work.n_tokens == 2u && !spec_rollback;
-    const uint32_t result_kind = final_ack_only
+    const uint32_t result_kind = final_ack_only || spec_commit
         ? DS4_DIST_RESULT_ACK
         : output_drafts
             ? DS4_DIST_RESULT_LOGITS_DRAFTS
@@ -7896,7 +8024,7 @@ static int dist_worker_process_work_payload(
                 : output_all_logits
                     ? DS4_DIST_RESULT_LOGITS_NROWS
                     : (local_output_logits ? DS4_DIST_RESULT_LOGITS : DS4_DIST_RESULT_HIDDEN_STATE);
-    const uint32_t result_bytes = final_ack_only
+    const uint32_t result_bytes = final_ack_only || spec_commit
         ? 0u
         : output_drafts
             ? vocab * 4u + 4u + 4u * (uint32_t)drafts_max
@@ -7917,7 +8045,7 @@ static int dist_worker_process_work_payload(
     const double decode_t0 = profile ? dist_now_sec() : 0.0;
     bool input_hc_uses_wire = false;
     uint32_t input_hc_decoded_bytes = 0;
-    if (input_hc_present &&
+    if (input_hc_present && !spec_commit &&
         dist_decode_activation_payload(input_hc_wire,
                                        input_hc_bits,
                                        work.input_hc_bytes,
@@ -7931,7 +8059,8 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
-    if (input_hc_present && input_hc_decoded_bytes != expected_hc_bytes) {
+    if (input_hc_present && !spec_commit &&
+        input_hc_decoded_bytes != expected_hc_bytes) {
         if (!input_hc_uses_wire) free(input_hc);
         free(result);
         free(route_blob);
@@ -7994,7 +8123,10 @@ static int dist_worker_process_work_payload(
         session->token_hash = dist_token_hash_prefix(timeline->v, (uint32_t)timeline->len);
         session->token_hash_valid = true;
     }
-    if (session->token_hash != work_prefix_hash) {
+    /* A prefix commit intentionally rewinds the timeline, so its incoming
+     * hash cannot match the post-verify state; the ack carries the new
+     * hash and the next span's prefix check covers any divergence. */
+    if (!spec_commit && session->token_hash != work_prefix_hash) {
         pthread_mutex_unlock(&state->mu);
         if (!input_hc_uses_wire) free(input_hc);
         free(result);
@@ -8014,7 +8146,14 @@ static int dist_worker_process_work_payload(
         }
     }
     const double eval_t0 = dist_now_sec();
-    int eval_rc = decode2_span
+    int eval_rc = spec_commit
+        ? ds4_session_dist_spec_commit_prefix(session->session,
+                                              tokens,
+                                              work.n_tokens,
+                                              work.pos0,
+                                              err,
+                                              sizeof(err))
+        : decode2_span
         ? ds4_session_eval_layer_slice_decode2(session->session,
                                                tokens[0],
                                                tokens[1],
@@ -8058,6 +8197,8 @@ static int dist_worker_process_work_payload(
     if (eval_rc == 0) {
         session->token_hash = work_result_hash;
         session->token_hash_valid = true;
+        /* The pre-verify frontier snapshot is consumed by a prefix commit. */
+        if (spec_commit) session->frontier.valid = false;
     } else {
         session->token_hash_valid = false;
     }
