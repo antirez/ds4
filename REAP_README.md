@@ -38,9 +38,14 @@ The **DeepSeek-V4-Flash-REAP25-LCB50-DS4** model applies REAP pruning with 50-sa
 ```bash
 cd /path/to/ds4
 ./ds4 -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
-       --ctx 32768 --nothink --temp 0 -n 64 \
+       --ctx 32768 --nothink --temp 0 --n-active-experts 6 -n 64 \
        -p 'write a python function to merge two sorted lists'
 ```
+
+`--n-active-experts N` caps routed expert activation per token; `0` keeps the
+model default. On a 96GB M2 Max, the REAP25 compact model is usable with six
+active experts instead of an eight-expert default. Use the same option with
+`ds4-server` or `ds4-agent` when running those frontends.
 
 ### Server Mode
 

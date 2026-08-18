@@ -64,6 +64,19 @@ make
   --host 127.0.0.1 --port 8000
 ```
 
+### Routed expert activation
+
+`--n-active-experts N` caps the number of routed experts activated per token;
+`0` keeps the model default. For the REAP25 compact GGUF on a 96GB M2 Max,
+six active experts is the recommended setting instead of an eight-expert
+default. It keeps the model usable while reducing per-token routed work:
+
+```bash
+./ds4 -m DeepSeek-V4-Flash-REAP25-LCB50-DS4-compact-IQ2XXS.gguf \
+       --ctx 32768 --nothink --temp 0 --n-active-experts 6 -n 64 \
+       -p 'write a python function to merge two sorted lists'
+```
+
 **Important**
 
 Make sure you allowed use of the unified memory for vram so the models can be loaded.
