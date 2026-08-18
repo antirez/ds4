@@ -12235,7 +12235,43 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        /* Even on cancellation, save a checkpoint so the next request can
+         * reuse the KV cache instead of reprocessing from scratch.  Parse the
+         * generated text and remember the visible prefix. */
+        if (j->req.kind == REQ_CHAT && text.len > 0) {
+            tool_calls parsed_calls = {0};
+            char *parsed_content = NULL;
+            char *parsed_reasoning = NULL;
+            bool recovered = false;
+            const char *cancel_finish = finish ? finish : "stop";
+            parse_generated_message_for_response_for_syntax(
+                j->req.model_syntax,
+                text.ptr ? text.ptr : "",
+                j->req.has_tools,
+                saw_tool_start,
+                ds4_think_mode_enabled(j->req.think_mode),
+                &cancel_finish,
+                NULL, 0,
+                &parsed_content,
+                &parsed_reasoning,
+                &parsed_calls,
+                &recovered);
+            /* Save checkpoint with whatever was generated, even if incomplete. */
+            if (parsed_calls.len) {
+                remember_tool_visible_checkpoint(s, slot, j, ctx_span, trace_id,
+                                                 parsed_content ? parsed_content : "",
+                                                 parsed_reasoning, &parsed_calls, true);
+            } else if (j->req.prompt_preserves_reasoning || j->req.has_tools) {
+                remember_tool_visible_checkpoint(s, slot, j, ctx_span, trace_id,
+                                                 parsed_content ? parsed_content : "",
+                                                 parsed_reasoning, NULL, false);
+            }
+            tool_calls_free(&parsed_calls);
+            free(parsed_content);
+            free(parsed_reasoning);
+        } else {
+            request_live_state_clear(s, slot);
+        }
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
