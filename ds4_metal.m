@@ -10079,6 +10079,87 @@ int ds4_gpu_end_commands(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
 }
 
+/* Non-blocking stage timing (DS4_METAL_GPU_STAGE_TIMESTAMPS).  Every stage
+ * boundary commits the batch in flight and starts a new one; the committed
+ * buffers stay retained here and their GPUStartTime/GPUEndTime are read by
+ * ds4_gpu_stage_report once the caller has waited for the whole layer or token
+ * (ds4_gpu_end_commands waits for every pending buffer first).  Unlike the
+ * DS4_METAL_*_STAGE_PROFILE printers this never blocks the CPU, so a stage's
+ * number is GPU busy time on the GPU clock, the stages of a chunk add up to
+ * its total, and first-start-to-last-end minus busy is scheduling gap. */
+typedef struct {
+    const char *part;
+    const char *stage;
+    uint32_t    layer;
+    uint32_t    pos0;
+    uint32_t    n_tokens;
+} ds4_gpu_stage_tag;
+static ds4_gpu_stage_tag *g_stage_tags;
+static size_t g_stage_tag_n;
+static size_t g_stage_tag_cap;
+static NSMutableArray<id<MTLCommandBuffer>> *g_stage_cbs;
+
+int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens) {
+    if (!g_batch_cb) return 0;
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    if (ds4_gpu_flush_commands() == 0) return 0;
+    if (g_stage_tag_n == g_stage_tag_cap) {
+        const size_t cap = g_stage_tag_cap ? g_stage_tag_cap * 2 : 4096;
+        ds4_gpu_stage_tag *tags = realloc(g_stage_tags, cap * sizeof(*tags));
+        if (!tags) return 0;
+        g_stage_tags = tags;
+        g_stage_tag_cap = cap;
+    }
+    if (!g_stage_cbs) g_stage_cbs = [NSMutableArray array];
+    g_stage_tags[g_stage_tag_n++] = (ds4_gpu_stage_tag){part, stage, layer, pos0, n_tokens};
+    [g_stage_cbs addObject:cb];
+    return 1;
+}
+
+void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens) {
+    if (g_stage_tag_n == 0) return;
+    const bool detail = getenv("DS4_METAL_GPU_STAGE_TIMESTAMPS_DETAIL") != NULL;
+    enum { MAX_KEYS = 128 };
+    struct { const char *part; const char *stage; size_t buffers; double busy; } keys[MAX_KEYS];
+    size_t n_keys = 0;
+    double first_start = 0.0, last_end = 0.0, busy_total = 0.0;
+    size_t incomplete = 0;
+    for (size_t i = 0; i < g_stage_tag_n; i++) {
+        id<MTLCommandBuffer> cb = g_stage_cbs[i];
+        const ds4_gpu_stage_tag *t = &g_stage_tags[i];
+        if (cb.status != MTLCommandBufferStatusCompleted) { incomplete++; continue; }
+        const double start = cb.GPUStartTime, end = cb.GPUEndTime;
+        const double busy = end > start ? end - start : 0.0;
+        if (i == 0 || start < first_start) first_start = start;
+        if (end > last_end) last_end = end;
+        busy_total += busy;
+        size_t k = 0;
+        for (; k < n_keys; k++) {
+            if (keys[k].part == t->part && keys[k].stage == t->stage) break;
+        }
+        if (k == n_keys && n_keys < MAX_KEYS) keys[n_keys++] = (typeof(keys[0])){t->part, t->stage, 0, 0.0};
+        if (k < n_keys) { keys[k].buffers++; keys[k].busy += busy; }
+        if (detail) {
+            fprintf(stderr,
+                    "ds4: gpu stage buffer what=%s part=%s stage=%s layer=%u pos=%u tokens=%u start_ms=%.3f gpu_ms=%.3f\n",
+                    what, t->part, t->stage ? t->stage : "-", t->layer, t->pos0, t->n_tokens,
+                    (start - first_start) * 1000.0, busy * 1000.0);
+        }
+    }
+    for (size_t k = 0; k < n_keys; k++) {
+        fprintf(stderr,
+                "ds4: gpu stage times what=%s pos=%u tokens=%u part=%s stage=%s buffers=%zu gpu_ms=%.3f\n",
+                what, pos0, n_tokens, keys[k].part, keys[k].stage ? keys[k].stage : "-",
+                keys[k].buffers, keys[k].busy * 1000.0);
+    }
+    fprintf(stderr,
+            "ds4: gpu stage times what=%s pos=%u tokens=%u total gpu_busy_ms=%.3f span_ms=%.3f gap_ms=%.3f buffers=%zu incomplete=%zu\n",
+            what, pos0, n_tokens, busy_total * 1000.0, (last_end - first_start) * 1000.0,
+            (last_end - first_start - busy_total) * 1000.0, g_stage_tag_n, incomplete);
+    g_stage_tag_n = 0;
+    [g_stage_cbs removeAllObjects];
+}
+
 static int ds4_gpu_flash_attn_stage_profile_boundary(
         id<MTLCommandBuffer> __strong *cbp,
         const char           *mode,

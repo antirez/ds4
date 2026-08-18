@@ -3682,6 +3682,11 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens) {
+    (void)part; (void)stage; (void)layer; (void)pos0; (void)n_tokens;
+    return ds4_gpu_flush_commands();
+}
+extern "C" void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens) { (void)what; (void)pos0; (void)n_tokens; }
 extern "C" int ds4_gpu_end_commands(void) {
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");

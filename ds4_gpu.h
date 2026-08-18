@@ -109,6 +109,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS: commit the command batch in flight without
+ * waiting and remember it under a stage tag; the report reads GPU start/end
+ * timestamps once the caller has waited for the whole layer or token.  Metal
+ * only: other backends flush and record nothing. */
+int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens);
+void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
