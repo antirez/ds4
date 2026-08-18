@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -39,7 +40,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 7u
+#define DS4_TP_PROTOCOL_VERSION 8u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -197,6 +198,7 @@ struct ds4_tp {
     uint64_t split_out_off;     /* [layer][kind] kv-split local payloads */
     uint64_t split_in_off;      /* [layer][kind] kv-split peer payloads */
     uint64_t timeout_sec;
+    uint64_t go_seq;            /* mirrored-sync barrier sequence */
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
@@ -243,6 +245,35 @@ static int tp_write_full(int fd, const void *buf, size_t len) {
 static int tp_read_full(int fd, void *buf, size_t len) {
     char *p = buf;
     while (len) {
+        ssize_t r = read(fd, p, len);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (r == 0) return 0;
+        p += r;
+        len -= (size_t)r;
+    }
+    return 1;
+}
+
+/* Read with the pair timeout while watching the failure flag: gate header
+ * reads legitimately wait for the peer to reach the same gate, but must not
+ * wait forever if the peer abandoned its graph (hard leader-side error). */
+static int tp_read_full_deadline(ds4_tp *tp, int fd, void *buf, size_t len) {
+    char *p = buf;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    while (len) {
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        const int pr = poll(&pfd, 1, 1000);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (pr == 0) {
+            if (ds4_tp_failed(tp) || tp_now_sec() > deadline) return 0;
+            continue;
+        }
         ssize_t r = read(fd, p, len);
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -1784,7 +1815,7 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
             return 0;
     }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_full_deadline(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate ||
         ph.seq != seq || ph.bytes != tp->vec_bytes) {
         fprintf(stderr,
@@ -1815,7 +1846,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
         ds4_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+        if (!tp_read_full_deadline(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
         if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
             ph.gate != rows || ph.seq != seq || ph.bytes != bytes) {
             fprintf(stderr,
@@ -1857,7 +1888,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
             return 0;
     }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_full_deadline(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq || ph.bytes != bytes) {
         fprintf(stderr,
@@ -1887,7 +1918,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              bytes };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (!tp_read_full_deadline(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq || ph.bytes != bytes) {
         fprintf(stderr,
@@ -2065,8 +2096,32 @@ int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
                          &ack, sizeof(ack));
 }
 
-int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
-                            const char *operation, char *err, size_t errlen) {
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, double timeout_sec,
+                                   int *status, char *err, size_t errlen) {
+    if (status) *status = -1;
+    if (timeout_sec < 0) timeout_sec = (double)tp->timeout_sec;
+    if (timeout_sec > 0) {
+        const double deadline = tp_now_sec() + timeout_sec;
+        for (;;) {
+            struct pollfd pfd = { tp->control_fd, POLLIN, 0 };
+            const int pr = poll(&pfd, 1, 1000);
+            if (pr > 0) break;
+            if (pr < 0 && errno != EINTR) {
+                ds4_tp_mark_failed(tp);
+                tp_set_err(err, errlen, "tp: worker failed during %s",
+                           operation ? operation : "command");
+                return 0;
+            }
+            if (tp_now_sec() > deadline) {
+                ds4_tp_poison(tp);
+                tp_set_err(err, errlen,
+                           "tp: no worker ack for %s within %.0fs",
+                           operation ? operation : "command", timeout_sec);
+                return 0;
+            }
+        }
+    }
     uint32_t type = 0, bytes = 0;
     ds4_tp_command_ack ack;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
@@ -2077,14 +2132,81 @@ int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                    operation ? operation : "command");
         return 0;
     }
-    if (ack.session_id != session_id || ack.status != 0) {
+    if (ack.session_id != session_id) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen,
+                   "tp: %s ack for wrong session %llu (want %llu)",
+                   operation ? operation : "command",
+                   (unsigned long long)ack.session_id,
+                   (unsigned long long)session_id);
+        return 0;
+    }
+    if (status) *status = (int)ack.status;
+    return 1;
+}
+
+int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
+                            const char *operation, char *err, size_t errlen) {
+    int status = 0;
+    if (!ds4_tp_wait_command_ack_status(tp, session_id, operation, 0,
+                                        &status, err, errlen)) {
+        return 0;
+    }
+    if (status != 0) {
         tp_set_err(err, errlen,
                    "tp: worker %s failed (session %llu, status %d)",
                    operation ? operation : "command",
-                   (unsigned long long)ack.session_id, (int)ack.status);
+                   (unsigned long long)session_id, status);
         return 0;
     }
     return 1;
+}
+
+typedef struct {
+    uint64_t go_seq;
+    int32_t stop;
+    uint32_t reserved;
+} ds4_tp_sync_go;
+
+int ds4_tp_send_sync_go(ds4_tp *tp, int stop) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
+    ds4_tp_sync_go msg = { ++tp->go_seq, stop ? 1 : 0, 0 };
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_GO,
+                       &msg, sizeof(msg))) {
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_tp_recv_sync_go(ds4_tp *tp, int *stop) {
+    if (stop) *stop = 1;
+    if (!tp || ds4_tp_failed(tp)) return 0;
+    uint32_t type = 0, bytes = 0;
+    ds4_tp_sync_go msg;
+    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_SYNC_GO || bytes != sizeof(msg) ||
+        !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    if (msg.go_seq != ++tp->go_seq) {
+        fprintf(stderr,
+                "ds4-tp: sync barrier desync (got %llu want %llu)\n",
+                (unsigned long long)msg.go_seq,
+                (unsigned long long)tp->go_seq);
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    if (stop) *stop = msg.stop != 0;
+    return 1;
+}
+
+void ds4_tp_poison(ds4_tp *tp) {
+    if (!tp) return;
+    ds4_tp_mark_failed(tp);
+    if (tp->control_fd >= 0) shutdown(tp->control_fd, SHUT_RDWR);
+    if (tp->data_fd >= 0) shutdown(tp->data_fd, SHUT_RDWR);
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
@@ -2467,9 +2589,15 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             for (uint32_t i = 0; i < command.n_tokens; i++) {
                 ds4_tokens_push(&prompt, command.tokens[i]);
             }
+            ds4_session_tp_sync_lockstep(session, 1);
             int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+            ds4_session_tp_sync_lockstep(session, 0);
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
                 rc = 1;
+            } else if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                /* Leader-driven lockstep cancel: both ranks stopped at the
+                 * same chunk boundary and the session keeps the mirrored
+                 * prefix, so keep serving commands. */
             } else if (sync_rc != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker sync: %s", err);
                 rc = 1;

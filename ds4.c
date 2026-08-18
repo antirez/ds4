@@ -49413,6 +49413,9 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    /* Mirrored sync in flight: cancellation checks double as the TP
+     * lockstep barrier (see ds4_session_cancelled). */
+    bool tp_sync_lockstep;
 };
 
 #ifndef DS4_NO_GPU
@@ -59048,8 +59051,31 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
+void ds4_session_tp_sync_lockstep(ds4_session *s, int enabled) {
+    if (s) s->tp_sync_lockstep = enabled != 0;
+}
+
+/* Cooperative cancellation; under tensor parallelism, also the mirrored-sync
+ * lockstep barrier.  A sync can only stop at these checks, so pairing every
+ * check across the ranks (leader publishes go/stop, worker adopts it)
+ * guarantees a cancelled prefill leaves both engines at the same chunk
+ * boundary.  A lone leader stop would strand the worker inside gate
+ * exchanges the leader no longer serves — that deadlocks the pair. */
 static bool ds4_session_cancelled(ds4_session *s) {
-    return s && s->cancel && s->cancel(s->cancel_ud);
+    if (!s) return false;
+    const bool local = s->cancel && s->cancel(s->cancel_ud);
+    if (!s->tp_sync_lockstep || !s->engine || !s->engine->tp.active ||
+        !s->engine->tp.ctx) {
+        return local;
+    }
+    if (s->engine->tp.rank == 0) {
+        /* Transport failure: stop locally; the sync ack path surfaces it. */
+        if (!ds4_tp_send_sync_go(s->engine->tp.ctx, local ? 1 : 0)) return true;
+        return local;
+    }
+    int stop = 1;
+    if (!ds4_tp_recv_sync_go(s->engine->tp.ctx, &stop)) return true;
+    return stop != 0;
 }
 
 static bool ds4_session_cancelled_cb(void *ud) {
@@ -59923,14 +59949,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     const bool mirror = ds4_session_tp_leader(s);
+    bool lockstep = false;
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
                               prompt->v, (uint32_t)prompt->len)) {
             snprintf(err, errlen, "tp: worker sync send failed");
             return 1;
         }
+        /* From here every cancellation check below doubles as the worker's
+         * lockstep barrier (see ds4_session_cancelled); the worker sets its
+         * own flag in ds4_tp_worker_run around the mirrored sync. */
+        lockstep = true;
+        s->tp_sync_lockstep = true;
     }
     int rc = ds4_session_sync_internal(s, prompt, err, errlen);
+    if (lockstep) s->tp_sync_lockstep = false;
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
@@ -59958,20 +59991,44 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #endif
     if (mirror) {
-        const bool worker_ok = ds4_tp_wait_command_ack(
-            s->engine->tp.ctx, s->tp_session_id, "prefill sync", err, errlen);
+        /* A hard local error mid-sync may have stopped this rank between two
+         * barrier checks, stranding the worker inside a gate exchange this
+         * rank no longer serves; it will never ack.  Bound the wait by the
+         * pair timeout so the pair poisons itself instead of deadlocking
+         * (symmetric validation failures still ack within milliseconds). */
+        const bool local_hard_error =
+            rc != 0 && rc != DS4_SESSION_SYNC_INTERRUPTED;
+        int worker_status = -1;
+        char ack_err[256] = "";
+        const bool worker_ok = ds4_tp_wait_command_ack_status(
+            s->engine->tp.ctx, s->tp_session_id, "prefill sync",
+            local_hard_error ? -1.0 : 0.0, &worker_status,
+            ack_err, sizeof(ack_err));
+        if (!worker_ok && !local_hard_error) snprintf(err, errlen, "%s", ack_err);
         bool logits_ok = true;
         /* A successful worker sends its split logits even if the leader's
          * local prefill failed. Drain them to keep the control stream framed
          * before invalidating the mirrored session. */
-        if (worker_ok && s->engine->tp.vocab_split) {
+        if (worker_ok && worker_status == 0 && s->engine->tp.vocab_split) {
             const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
             if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
                 snprintf(err, errlen, "tp: worker sync logits half missing");
                 logits_ok = false;
             }
         }
-        if (rc != 0 || !worker_ok || !logits_ok) {
+        if (worker_ok && logits_ok &&
+            rc == DS4_SESSION_SYNC_INTERRUPTED &&
+            worker_status == DS4_SESSION_SYNC_INTERRUPTED) {
+            /* Lockstep cancel: both ranks stopped at the same chunk boundary
+             * and hold the same live prefix; keep it for KV reuse. */
+            return rc;
+        }
+        if (rc != 0 || !worker_ok || worker_status != 0 || !logits_ok) {
+            if (rc == 0 && worker_ok && logits_ok && worker_status != 0) {
+                snprintf(err, errlen,
+                         "tp: worker prefill sync failed (status %d)",
+                         worker_status);
+            }
             ds4_session_invalidate(s);
             return rc != 0 ? rc : 1;
         }

@@ -183,6 +183,27 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+/* Status-aware variant: returns 1 when a well-formed ack for session_id
+ * arrived and copies its status out (the worker forwards
+ * DS4_SESSION_SYNC_INTERRUPTED for a lockstep-cancelled sync), 0 on
+ * transport failure or session mismatch.  timeout_sec 0 waits forever,
+ * negative uses the pair timeout; on expiry the pair is poisoned. */
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, double timeout_sec,
+                                   int *status, char *err, size_t errlen);
+/* Mirrored-sync lockstep barrier.  Prefill can only stop at the cooperative
+ * cancellation checks inside ds4_session_sync(); the leader publishes its
+ * verdict (go or stop) at every check and the worker blocks until it
+ * arrives, so a cancelled sync leaves both ranks at the same chunk boundary
+ * with identical live prefixes instead of stranding the worker inside gate
+ * exchanges the leader no longer serves.  Rides the control socket, which
+ * is otherwise idle during a mirrored sync. */
+int ds4_tp_send_sync_go(ds4_tp *tp, int stop);
+int ds4_tp_recv_sync_go(ds4_tp *tp, int *stop);
+/* Hard-failure poison: mark the pair failed and shut both sockets down so a
+ * peer blocked in a gate or ack read unblocks with an error instead of
+ * waiting forever. */
+void ds4_tp_poison(ds4_tp *tp);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -207,6 +228,7 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_SYNC_GO = 18,
 } ds4_tp_frame_type;
 
 typedef struct {
