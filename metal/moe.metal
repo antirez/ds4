@@ -3266,7 +3266,8 @@ kernel void kernel_mul_mv_id(
 
     device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
 
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+    if (i02 < 0 || i02 >= args.ne02 ||
+        !ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert under the TP split: zero this threadgroup's output
          * rows so the downstream expert-sum stages stay unchanged. */
         const short NSG = FC_mul_mv_nsg;
@@ -3488,7 +3489,8 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
     device char * dst_gate_cur = dst_gate + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
     device char * dst_up_cur   = dst_up   + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
 
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+    if (i02 < 0 || i02 >= args.ne02 ||
+        !ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert: zero this threadgroup's gate/up rows so the
          * separate swiglu-weight stage yields zero mid rows. */
         const short NSG_z = FC_mul_mv_nsg;
@@ -3563,13 +3565,23 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
-    const int i02b = i02 - args.tp_expert_base;
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
-
-    const int nb = args.ne00 / QK_K;
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *dst_mid_f32 =
+        (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    if (i02 < 0 || i02 >= args.ne02 ||
+        !ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+        if (tiisg == 0u) {
+            for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; row++) {
+                dst_mid_f32[first_row + row] = 0.0f;
+            }
+        }
+        return;
+    }
+    const int i02b = i02 - args.tp_expert_base;
+    const int nb = args.ne00 / QK_K;
     const int nb32 = nb * (QK_K / 32);
 
     device const block_iq2_xxs *xg =
@@ -3650,9 +3662,6 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
         (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
     device float *dst_up_f32 =
         (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
-    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
-    device float *dst_mid_f32 =
-        (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w =
         (device const float *)(weights + pair_row * act.weight_stride);
 
@@ -3706,13 +3715,23 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
-    const int i02b = i02 - args.tp_expert_base;
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
-
-    const int nb = args.ne00 / QK_K;
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *dst_mid_f32 =
+        (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    if (i02 < 0 || i02 >= args.ne02 ||
+        !ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+        if (tiisg == 0u) {
+            for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; row++) {
+                dst_mid_f32[first_row + row] = 0.0f;
+            }
+        }
+        return;
+    }
+    const int i02b = i02 - args.tp_expert_base;
+    const int nb = args.ne00 / QK_K;
     const int nb32 = nb * (QK_K / 32);
 
     device const block_iq2_xxs *xg =
@@ -3802,9 +3821,6 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
         (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
     device float *dst_up_f32 =
         (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
-    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
-    device float *dst_mid_f32 =
-        (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w =
         (device const float *)(weights + pair_row * act.weight_stride);
 
@@ -4231,7 +4247,8 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+    if (i02 < 0 || i02 >= args.ne02 ||
+        !ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         const short NSG_z = FC_mul_mv_nsg;
         const int row0_z = (tgpig.x * NSG_z + sgitg) * args.nr0;
         device float *zg = (device float *)dst_gate_cur;
@@ -4305,7 +4322,8 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
+    if (i02 < 0 || i02 >= args.ne02 ||
+        !ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
     const int i02b = i02 - args.tp_expert_base;
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
@@ -5759,7 +5777,8 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
 
     for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        if (expert < 0 || expert >= args.ne02 ||
+            !ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_iq2_xxs *x =
             (device const block_iq2_xxs *)(src0s + (int64_t)(expert - args.tp_expert_base)*args.nb02 + first_row*args.nb01);
         device const float *y = (device const float *)(token_src1 + expert_slot*args.nb11);
@@ -5849,7 +5868,8 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
 
     for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        if (expert < 0 || expert >= args.ne02 ||
+            !ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_q2_K * x = (device const block_q2_K *)(src0s + (int64_t)(expert - args.tp_expert_base)*args.nb02 + first_row*args.nb01);
         device const float * y = (device const float *)(token_src1 + expert_slot*args.nb11);
         device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
@@ -6652,7 +6672,8 @@ kernel void kernel_mul_mv_id_q4_K_sum6_f32(
 
     for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        if (expert < 0 || expert >= args.ne02 ||
+            !ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_q4_K *x =
             (device const block_q4_K *)(src0s + (int64_t)(expert - args.tp_expert_base) * args.nb02 + first_row * args.nb01);
         device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);

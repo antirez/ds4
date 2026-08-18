@@ -31813,6 +31813,37 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+static int ds4_gpu_encode_router_clamp_active(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>         selectedbuf,
+        NSUInteger            selected_off,
+        id<MTLBuffer>         weightsbuf,
+        NSUInteger            weights_off,
+        uint32_t              n_tokens,
+        uint32_t              n_expert_used) {
+    const uint32_t n_active = ds4_get_n_experts_active();
+    if (n_active < 1 || n_active >= n_expert_used) return 1;
+    if (!cb || !selectedbuf || !weightsbuf || n_tokens == 0 ||
+        n_expert_used == 0 || !g_router_clamp_active_pipeline) {
+        return 0;
+    }
+
+    uint32_t knu = n_expert_used;
+    uint32_t kat = n_active;
+    uint32_t knt = n_tokens;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_router_clamp_active_pipeline];
+    [enc setBuffer:selectedbuf offset:selected_off atIndex:0];
+    [enc setBuffer:weightsbuf offset:weights_off atIndex:1];
+    [enc setBytes:&knu length:sizeof(knu) atIndex:2];
+    [enc setBytes:&kat length:sizeof(kat) atIndex:3];
+    [enc setBytes:&knt length:sizeof(knt) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(knt, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_router_select(
         id<MTLCommandBuffer>  cb,
         ds4_gpu_tensor     *selected,
@@ -31997,7 +32028,12 @@ static int ds4_gpu_encode_router_select(
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (use_simd_weights_fusion) return 1;
+        if (use_simd_weights_fusion) {
+            return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                      selected_off, weightsbuf,
+                                                      weights_off, n_tokens,
+                                                      n_expert_used);
+        }
 
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:router_weights_pipeline];
@@ -32007,7 +32043,10 @@ static int ds4_gpu_encode_router_select(
         [enc dispatchThreads:MTLSizeMake(6, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return 1;
+        return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                  selected_off, weightsbuf,
+                                                  weights_off, n_tokens,
+                                                  n_expert_used);
     }
 
     if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
@@ -32119,7 +32158,10 @@ static int ds4_gpu_encode_router_select(
         [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return 1;
+        return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                  selected_off, weightsbuf,
+                                                  weights_off, n_tokens,
+                                                  n_expert_used);
     }
 
     if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
@@ -32135,7 +32177,10 @@ static int ds4_gpu_encode_router_select(
         [enc dispatchThreads:MTLSizeMake(6, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return 1;
+        return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                  selected_off, weightsbuf,
+                                                  weights_off, n_tokens,
+                                                  n_expert_used);
     }
 
     const NSUInteger sum_bytes = (NSUInteger)n_tokens * sizeof(float);
@@ -32203,21 +32248,10 @@ static int ds4_gpu_encode_router_select(
          threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
-    /* Optional activation cap: rank by weight, keep the top-k, deactivate
-     * the rest (selected = -1). All consumers skip negative ids. */
-    const uint32_t n_active = ds4_get_n_experts_active();
-    if (n_active >= 1 && n_active < n_expert_used) {
-        uint32_t knu = n_expert_used, kat = n_active, knt = (uint32_t)n_tokens;
-        enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_router_clamp_active_pipeline];
-        [enc setBuffer:selectedbuf offset:selected_off atIndex:0];
-        [enc setBuffer:weightsbuf offset:weights_off atIndex:1];
-        [enc setBytes:&knu length:sizeof(knu) atIndex:2];
-        [enc setBytes:&kat length:sizeof(kat) atIndex:3];
-        [enc setBytes:&knt length:sizeof(knt) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(knt, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
+    if (!ds4_gpu_encode_router_clamp_active(cb, selectedbuf, selected_off,
+                                             weightsbuf, weights_off,
+                                             n_tokens, n_expert_used)) {
+        return 0;
     }
 
     return 1;

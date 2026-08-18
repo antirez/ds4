@@ -11055,7 +11055,7 @@ static void layer_routed_moe_one(
         }
         matvec_q8_0_experts_accum_prequant(out, model, layer->ffn_down_exps,
                                            midq8, midscale8, selected,
-                                           DS4_N_EXPERT_USED);
+                                           n_active);
         free(midscale8);
         free(midq8);
         free(xscale8);
@@ -11080,7 +11080,7 @@ static void layer_routed_moe_one(
                                     xq,
                                     selected,
                                     expert_weight,
-                                    DS4_N_EXPERT_USED,
+                                    n_active,
                                     clamp);
         for (uint32_t i = 0; i < n_active; i++) {
             ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
@@ -11208,7 +11208,7 @@ static void layer_routed_moe_one_prealloc(
         }
         matvec_q8_0_experts_accum_prequant(out, model, layer->ffn_down_exps,
                                            q8_midq, q8_midscale, selected,
-                                           DS4_N_EXPERT_USED);
+                                           n_active);
         (void)il;
         return;
     }
@@ -11282,15 +11282,16 @@ static void layer_routed_moe_batch(
     }
 
     const uint32_t n_expert = reap_layer_expert_count(il);
-    const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
+    const uint32_t max_pairs = n_tok * DS4_N_EXPERT_USED;
+    uint32_t n_pairs = 0;
     uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
     uint32_t cursor[DS4_MAX_EXPERT] = {0};
     uint32_t active_expert[DS4_MAX_EXPERT];
     uint32_t n_active = 0;
 
-    int *selected = xmalloc((size_t)total_pairs * sizeof(selected[0]));
-    float *pair_weight = xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
-    ds4_expert_pair *pairs = xmalloc((size_t)total_pairs * sizeof(pairs[0]));
+    int *selected = xmalloc((size_t)max_pairs * sizeof(selected[0]));
+    float *pair_weight = xmalloc((size_t)max_pairs * sizeof(pair_weight[0]));
+    ds4_expert_pair *pairs = xmalloc((size_t)max_pairs * sizeof(pairs[0]));
 
     for (uint32_t t = 0; t < n_tok; t++) {
         int sel[DS4_MAX_EXPERT_USED];
@@ -11301,13 +11302,14 @@ static void layer_routed_moe_batch(
         } else {
             layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim, il);
         }
+        const uint32_t n_selected = ds4_clamp_expert_selection(sel, weights);
 
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
+        for (uint32_t slot = 0; slot < n_selected; slot++) {
+            const uint32_t pair_id = n_pairs++;
             selected[pair_id] = sel[slot];
             pair_weight[pair_id] = weights[slot];
             pairs[pair_id] = (ds4_expert_pair){ .token = t, .slot = slot };
-            if (sel[slot] < 0 || (uint32_t)sel[slot] >= n_expert) ds4_die("selected expert is outside range");
+            if ((uint32_t)sel[slot] >= n_expert) ds4_die("selected expert is outside range");
             counts[(uint32_t)sel[slot] + 1]++;
         }
     }
@@ -11318,8 +11320,8 @@ static void layer_routed_moe_batch(
         if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
     }
 
-    uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
-    for (uint32_t p = 0; p < total_pairs; p++) {
+    uint32_t *pair_ids = xmalloc((size_t)n_pairs * sizeof(pair_ids[0]));
+    for (uint32_t p = 0; p < n_pairs; p++) {
         const uint32_t e = (uint32_t)selected[p];
         pair_ids[cursor[e]++] = p;
     }
@@ -11335,7 +11337,7 @@ static void layer_routed_moe_batch(
                                      expert_in_dim);
         }
 
-        float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
+        float *mid = xmalloc((size_t)n_pairs * expert_out_dim * sizeof(mid[0]));
         matvec_q8_0_batch_mid_ctx mid_ctx = {
             .mid = mid,
             .xq = xq8,
@@ -11366,9 +11368,9 @@ static void layer_routed_moe_batch(
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_0_batch_mid_worker, &mid_ctx);
 
         const uint64_t mid_blocks = down_in_dim / 32u;
-        int8_t *midq8 = xmalloc((size_t)total_pairs * mid_blocks * 32u);
-        float *midscale8 = xmalloc((size_t)total_pairs * mid_blocks * sizeof(float));
-        for (uint32_t p = 0; p < total_pairs; p++) {
+        int8_t *midq8 = xmalloc((size_t)n_pairs * mid_blocks * 32u);
+        float *midscale8 = xmalloc((size_t)n_pairs * mid_blocks * sizeof(float));
+        for (uint32_t p = 0; p < n_pairs; p++) {
             quantize_q8_0_activation(mid + (uint64_t)p * down_in_dim,
                                      midq8 + (uint64_t)p * mid_blocks * 32u,
                                      midscale8 + (uint64_t)p * mid_blocks,
@@ -11422,8 +11424,7 @@ static void layer_routed_moe_batch(
                                   (int64_t)expert_in_dim);
         }
 
-        float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
-
+        float *mid = xmalloc((size_t)n_pairs * expert_out_dim * sizeof(mid[0]));
         matvec_q8_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
             .xq = xq,
@@ -11455,14 +11456,14 @@ static void layer_routed_moe_batch(
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_k_batch_mid_worker, &mid_ctx);
 
         const uint64_t midq_blocks = down_in_dim / QK_K;
-        block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
+        block_q8_K *midq = xmalloc((size_t)n_pairs * midq_blocks * sizeof(midq[0]));
         quantize_mid_pairs_ctx quant_ctx = {
             .mid = mid,
             .midq = midq,
             .down_in_dim = down_in_dim,
             .down_blocks = midq_blocks,
         };
-        ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+        ds4_parallel_for(n_pairs, quantize_mid_pairs_worker, &quant_ctx);
         free(mid);
 
         matvec_q8_k_batch_accum_rows_ctx down_ctx = {
@@ -11510,7 +11511,7 @@ static void layer_routed_moe_batch(
                               (int64_t)expert_in_dim);
     }
 
-    float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
+    float *mid = xmalloc((size_t)n_pairs * expert_out_dim * sizeof(mid[0]));
 
     const uint32_t gate_type = layer->ffn_gate_exps->type;
 
@@ -11610,14 +11611,14 @@ static void layer_routed_moe_batch(
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
-    block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
+    block_q8_K *midq = xmalloc((size_t)n_pairs * midq_blocks * sizeof(midq[0]));
     quantize_mid_pairs_ctx quant_ctx = {
         .mid = mid,
         .midq = midq,
         .down_in_dim = down_in_dim,
         .down_blocks = midq_blocks,
     };
-    ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+    ds4_parallel_for(n_pairs, quantize_mid_pairs_worker, &quant_ctx);
     free(mid);
 
     /* Down projection: dispatch based on down tensor type. */

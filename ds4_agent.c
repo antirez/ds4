@@ -641,7 +641,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--n-active-experts")) {
-            ds4_set_n_experts_active((uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg));
+            ds4_set_n_experts_active((uint32_t)parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg));
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
