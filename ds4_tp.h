@@ -30,6 +30,15 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
+    /* KV-split gate kinds (DS4_TP_KV_SPLIT): exchanged on the dedicated
+     * split channel, not the row-gate schedule. */
+    DS4_TP_SPLIT_GATE_INDEXER = 0,
+    DS4_TP_SPLIT_GATE_ATTN_SCORES = 1,
+    DS4_TP_SPLIT_GATES_PER_LAYER = 2,
+    /* Bytes reserved per split-gate slot: the attention score partials are
+     * 32 heads x 256 rows in fp16 (16 KiB); the indexer merge carries 512
+     * (id, fp32 score) candidates (4 KiB). */
+    DS4_TP_SPLIT_SLOT_BYTES = 16384,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
@@ -121,7 +130,11 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate)
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_split_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind);
+uint64_t ds4_tp_slab_split_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
+/* Offset of the per-slot u64 in-flags words (backend release protocol). */
+uint64_t ds4_tp_slab_in_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]
@@ -139,6 +152,12 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes);
+
+/* KV-split gate: small fixed-slot payload exchange (indexer candidates,
+ * attention score partials) on the dedicated split channel.  Both ranks
+ * derive (layer, kind, bytes) from seq through the lockstep order. */
+int ds4_tp_split_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t kind,
+                               uint64_t seq, uint64_t bytes);
 
 /* Lockstep mirroring (leader side) and worker loop primitives. */
 typedef struct {
@@ -164,6 +183,27 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+/* Status-aware variant: returns 1 when a well-formed ack for session_id
+ * arrived and copies its status out (the worker forwards
+ * DS4_SESSION_SYNC_INTERRUPTED for a lockstep-cancelled sync), 0 on
+ * transport failure or session mismatch.  timeout_sec 0 waits forever,
+ * negative uses the pair timeout; on expiry the pair is poisoned. */
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, double timeout_sec,
+                                   int *status, char *err, size_t errlen);
+/* Mirrored-sync lockstep barrier.  Prefill can only stop at the cooperative
+ * cancellation checks inside ds4_session_sync(); the leader publishes its
+ * verdict (go or stop) at every check and the worker blocks until it
+ * arrives, so a cancelled sync leaves both ranks at the same chunk boundary
+ * with identical live prefixes instead of stranding the worker inside gate
+ * exchanges the leader no longer serves.  Rides the control socket, which
+ * is otherwise idle during a mirrored sync. */
+int ds4_tp_send_sync_go(ds4_tp *tp, int stop);
+int ds4_tp_recv_sync_go(ds4_tp *tp, int *stop);
+/* Hard-failure poison: mark the pair failed and shut both sockets down so a
+ * peer blocked in a gate or ack read unblocks with an error instead of
+ * waiting forever. */
+void ds4_tp_poison(ds4_tp *tp);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -188,6 +228,7 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_SYNC_GO = 18,
 } ds4_tp_frame_type;
 
 typedef struct {

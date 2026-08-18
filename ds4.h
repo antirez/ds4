@@ -340,6 +340,11 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* Internal TP plumbing: marks a worker-side session as running a
+ * leader-mirrored sync, turning the cooperative-cancellation checks into
+ * lockstep barrier reads (see ds4_tp.h).  Only ds4_tp_worker_run() and the
+ * leader-side mirror in ds4_session_sync() set this. */
+void ds4_session_tp_sync_lockstep(ds4_session *s, int enabled);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
@@ -410,6 +415,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+/* True when this session is the tensor-parallel leader rank. */
+bool ds4_session_tp_leader(const ds4_session *s);
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);

@@ -90,13 +90,17 @@ __global__ static void attention_prefill_raw_kernel(
         const float *raw_kv,
         uint32_t n_tokens,
         uint32_t window,
+        uint32_t q_row0,
         uint32_t n_head,
         uint32_t head_dim) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
-    uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
-    uint32_t raw_start = t + 1u - raw_count;
+    /* q/heads are row-range views: local index t addresses them, while the
+     * causal KV extent follows the global row q_row0 + t. */
+    const uint32_t tg = q_row0 + t;
+    uint32_t raw_count = (window != 0u && tg + 1u > window) ? window : tg + 1u;
+    uint32_t raw_start = tg + 1u - raw_count;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     __shared__ float scores[256];
     __shared__ float partial[128];
@@ -1273,11 +1277,14 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         uint32_t n_comp,
         uint32_t window,
         uint32_t ratio,
+        uint32_t q_row0,
         uint32_t n_head,
         uint32_t head_dim) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
+    /* TP prefill row ranges: local row t, global causal row q_row0 + t. */
+    const uint32_t tg = q_row0 + t;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t head = head_group * 8u + warp;
@@ -1285,11 +1292,11 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
 
     __shared__ float4 kv_shared[4 * 128];
 
-    const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
-    const uint32_t raw_start = t + 1u - raw_count;
+    const uint32_t raw_count = window != 0u && tg + 1u > window ? window : tg + 1u;
+    const uint32_t raw_start = tg + 1u - raw_count;
     uint32_t comp_count = 0;
     if (n_comp != 0u && ratio != 0u) {
-        comp_count = (t + 1u) / ratio;
+        comp_count = (tg + 1u) / ratio;
         if (comp_count > n_comp) comp_count = n_comp;
     }
     const uint32_t n_score = raw_count + comp_count;

@@ -40,6 +40,104 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
     xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
 }
 
+/* KV-split one-token indexer scoring: each rank scores only the compressed
+ * rows whose global index parity matches its rank, writing dense scores at
+ * [0..local_n).  Numerics match the replicated gridstride kernel exactly. */
+__global__ static void indexer_score_one_split_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t n_comp,
+        uint32_t ratio,
+        float scale,
+        uint32_t rank) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 512u) return;
+    (void)ratio;
+
+    __shared__ float krow[128];
+    __shared__ float gsum[16];
+
+    for (uint32_t c = blockIdx.x * 2u + rank; c < n_comp; c += gridDim.x * 2u) {
+        if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+        __syncthreads();
+
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < 4u; j++) {
+            const uint32_t h = warp * 4u + j;
+            const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
+            const float4 kv = ((const float4 *)krow)[lane];
+            float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            dot = warp_sum_f32(dot);
+            if (lane == 0) acc += fmaxf(dot, 0.0f) * weights[h] * scale;
+        }
+        if (lane == 0) gsum[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float total = gsum[0];
+            for (uint32_t g = 1; g < 16u; g++) total += gsum[g];
+            scores[c >> 1u] = total;
+        }
+        __syncthreads();
+    }
+}
+
+/* Pack the local top-k into the split payload: ids (as global row ids) in
+ * the first half, fp32 scores in the second half, sorted by score desc
+ * (the top-k kernels emit sorted desc).  Entries beyond local_n are
+ * invalid and pack as id=-1, score=-INFINITY. */
+__global__ static void indexer_topk_split_pack_kernel(
+        int32_t *ids_out,
+        float *scores_out,
+        const uint32_t *local_selected,
+        const float *scores,
+        uint32_t local_n,
+        uint32_t top_k,
+        uint32_t rank) {
+    const uint32_t tid = threadIdx.x;
+    if (tid >= top_k) return;
+    const uint32_t dense = local_selected[tid];
+    if (dense < local_n) {
+        ids_out[tid] = (int32_t)(dense * 2u + rank);
+        scores_out[tid] = scores[dense];
+    } else {
+        ids_out[tid] = -1;
+        scores_out[tid] = -INFINITY;
+    }
+}
+
+/* Merge the two ranks' candidate lists (sorted desc by score, ties broken
+ * by lower global row id) into the global top-k selection. */
+__global__ static void indexer_topk_split_merge_kernel(
+        int32_t *selected,
+        const int32_t *local_ids,
+        const float *local_scores,
+        const int32_t *peer_ids,
+        const float *peer_scores,
+        uint32_t top_k) {
+    if (threadIdx.x != 0u) return;
+    uint32_t li = 0, pi = 0, out = 0;
+    while (out < top_k) {
+        const float lv = local_scores[li];
+        const float pv = peer_scores[pi];
+        if (lv > pv) {
+            selected[out++] = local_ids[li++];
+        } else if (pv > lv) {
+            selected[out++] = peer_ids[pi++];
+        } else if (lv == -INFINITY) {
+            break;
+        } else if (local_ids[li] <= peer_ids[pi]) {
+            selected[out++] = local_ids[li++];
+        } else {
+            selected[out++] = peer_ids[pi++];
+        }
+    }
+    for (; out < top_k; out++) selected[out] = -1;
+}
+
 __global__ static void indexer_scores_kernel(
         float *scores,
         const float *q,
@@ -123,6 +221,62 @@ __global__ static void indexer_score_one_direct_kernel(
         __syncthreads();
     }
     if (tid == 0) scores[c] = total;
+}
+
+/* Grid-stride variant of the one-token indexer scoring kernel.  Each block
+ * processes many rows sequentially; per row the sixteen 4-head groups are
+ * computed in parallel by sixteen warps and accumulated in the exact same
+ * order as the one-block-per-row kernel, so the emitted scores are
+ * bit-identical while the launch count drops by orders of magnitude at
+ * long context. */
+__global__ static void indexer_score_one_gridstride_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t n_comp,
+        uint32_t pos0,
+        uint32_t ratio,
+        float scale,
+        int causal) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (tid >= 512u) return;
+
+    __shared__ float krow[128];
+    __shared__ float gsum[16];
+    const uint32_t visible = causal ? (ratio ? (pos0 + 1u) / ratio : n_comp)
+                                    : n_comp;
+
+    for (uint32_t c = blockIdx.x; c < n_comp; c += gridDim.x) {
+        if (c >= visible) {
+            if (tid == 0) scores[c] = -INFINITY;
+            continue;
+        }
+        if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+        __syncthreads();
+
+        /* Warp w computes the four heads h0 = 4*w .. 4*w+3 sequentially,
+         * mirroring the original per-head dot and the partial sum order. */
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < 4u; j++) {
+            const uint32_t h = warp * 4u + j;
+            const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
+            const float4 kv = ((const float4 *)krow)[lane];
+            float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+            dot = warp_sum_f32(dot);
+            if (lane == 0) acc += fmaxf(dot, 0.0f) * weights[h] * scale;
+        }
+        if (lane == 0) gsum[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float total = gsum[0];
+            for (uint32_t g = 1; g < 16u; g++) total += gsum[g];
+            scores[c] = total;
+        }
+        __syncthreads();
+    }
 }
 
 __global__ static void indexer_scores_wmma128_kernel(
@@ -852,13 +1006,16 @@ static int indexer_scores_launch(
     }
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
-                                                         n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0);
-        return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
+        uint32_t grid = n_comp;
+        if (grid > 4096u) grid = 4096u;
+        if (grid == 0u) grid = 1u;
+        indexer_score_one_gridstride_kernel<<<grid, 512>>>((float *)scores->ptr,
+                                                           (const float *)q->ptr,
+                                                           (const float *)weights->ptr,
+                                                           (const float *)index_comp->ptr,
+                                                           n_comp, pos0, ratio,
+                                                           scale, causal ? 1 : 0);
+        return cuda_ok(cudaGetLastError(), "indexer score one gridstride launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
@@ -891,6 +1048,78 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0);
+}
+
+extern "C" int ds4_gpu_indexer_score_one_split_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                rank) {
+    if (!scores || !q || !weights || !index_comp || n_comp == 0 ||
+        q->bytes < 64u * 128u * sizeof(float) ||
+        weights->bytes < 64u * sizeof(float) ||
+        index_comp->bytes < (uint64_t)n_comp * 128u * sizeof(float) ||
+        scores->bytes < (uint64_t)n_comp * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t local_n = n_comp / 2u + ((n_comp & 1u) && rank == 0u ? 1u : 0u);
+    uint32_t grid = local_n;
+    if (grid > 2048u) grid = 2048u;
+    if (grid == 0u) grid = 1u;
+    indexer_score_one_split_kernel<<<grid, 512>>>(
+            (float *)scores->ptr,
+            (const float *)q->ptr,
+            (const float *)weights->ptr,
+            (const float *)index_comp->ptr,
+            n_comp, ratio, scale, rank);
+    return cuda_ok(cudaGetLastError(), "indexer score one split launch");
+}
+
+extern "C" int ds4_gpu_indexer_topk_split_pack_tensor(
+        ds4_gpu_tensor       *payload,
+        const ds4_gpu_tensor *local_selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                local_n,
+        uint32_t                top_k,
+        uint32_t                rank) {
+    if (!payload || !local_selected || !scores ||
+        payload->bytes < 2u * top_k * 4u ||
+        local_selected->bytes < (uint64_t)top_k * sizeof(uint32_t) ||
+        scores->bytes < (uint64_t)local_n * sizeof(float)) {
+        return 0;
+    }
+    indexer_topk_split_pack_kernel<<<1, 512>>>(
+            (int32_t *)payload->ptr,
+            (float *)((char *)payload->ptr + (uint64_t)top_k * 4u),
+            (const uint32_t *)local_selected->ptr,
+            (const float *)scores->ptr,
+            local_n, top_k, rank);
+    return cuda_ok(cudaGetLastError(), "indexer topk split pack launch");
+}
+
+extern "C" int ds4_gpu_indexer_topk_split_merge_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *local_payload,
+        const ds4_gpu_tensor *peer_payload,
+        uint32_t                top_k) {
+    if (!selected || !local_payload || !peer_payload ||
+        selected->bytes < (uint64_t)top_k * sizeof(int32_t) ||
+        local_payload->bytes < 2u * top_k * 4u ||
+        peer_payload->bytes < 2u * top_k * 4u) {
+        return 0;
+    }
+    indexer_topk_split_merge_kernel<<<1, 32>>>(
+            (int32_t *)selected->ptr,
+            (const int32_t *)local_payload->ptr,
+            (const float *)((const char *)local_payload->ptr + (uint64_t)top_k * 4u),
+            (const int32_t *)peer_payload->ptr,
+            (const float *)((const char *)peer_payload->ptr + (uint64_t)top_k * 4u),
+            top_k);
+    return cuda_ok(cudaGetLastError(), "indexer topk split merge launch");
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(

@@ -46,6 +46,9 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+/* Transport-shared allocation: memory both GPU kernels and the CPU can
+ * access directly (TP gate slab).  Metal: identical to tensor_alloc. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
@@ -279,6 +282,9 @@ int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
+/* Backends whose release protocol lives in the slab (ROCm flag gates) need
+ * the in-flags region offset; call right after ds4_gpu_tp_init. */
+void ds4_gpu_tp_set_slab_layout(uint64_t in_flags_off);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
@@ -316,6 +322,18 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   ds4_gpu_tensor *in_t,
                                   uint64_t bytes);
 int ds4_gpu_tp_big_gate_wait(uint64_t seq);
+/* KV-split small gates: fixed-slot payloads (indexer candidates, attention
+ * score partials) staged through the dedicated split slab regions. */
+typedef int (*ds4_gpu_tp_split_exchange_fn)(void *ud, uint32_t layer,
+                                            uint32_t kind, uint64_t seq,
+                                            uint64_t bytes);
+void ds4_gpu_tp_set_split_exchange(ds4_gpu_tp_split_exchange_fn fn);
+void ds4_gpu_tp_set_split_layout(uint64_t split_out_off, uint64_t split_in_off,
+                                 uint64_t split_slot_bytes);
+int ds4_gpu_tp_split_gate_encode(uint32_t layer, uint32_t kind,
+                                 const ds4_gpu_tensor *out_t,
+                                 ds4_gpu_tensor *in_t,
+                                 uint64_t bytes);
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */
 void ds4_gpu_tp_keepalive_pause(int paused);
@@ -472,6 +490,30 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale);
+
+/* KV-split indexer: rank-scoped scoring (dense local output) plus the
+ * candidate-list pack and merge around the split gate. */
+int ds4_gpu_indexer_score_one_split_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                rank);
+int ds4_gpu_indexer_topk_split_pack_tensor(
+        ds4_gpu_tensor       *payload,
+        const ds4_gpu_tensor *local_selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                local_n,
+        uint32_t                top_k,
+        uint32_t                rank);
+int ds4_gpu_indexer_topk_split_merge_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *local_payload,
+        const ds4_gpu_tensor *peer_payload,
+        uint32_t                top_k);
 
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,

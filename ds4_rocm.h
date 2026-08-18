@@ -43,6 +43,10 @@
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemsetAsync hipMemsetAsync
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocWriteCombined hipHostMallocWriteCombined
 
 #define cudaHostRegister hipHostRegister
 #define cudaHostUnregister hipHostUnregister

@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -9655,6 +9656,15 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
+    /* Tensor parallelism mirrors to the worker only the tokens the leader
+     * actually evaluates.  A disk-cache restore short-circuits the
+     * leader's prefill without mirroring it, so the ranks would run
+     * different prefill graphs (leader: restored suffix only; worker:
+     * full transcript) and the per-layer gate sequences diverge.  Skip
+     * restores on the TP leader until the worker can restore its own KV
+     * shard from disk; the leader then re-prefills the full transcript
+     * and mirrors it exactly. */
+    if (slot->session && ds4_session_tp_leader(slot->session)) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
@@ -13117,6 +13127,23 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.engine.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -13276,12 +13303,24 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                          &c.engine.distributed,
+                                          tp_err,
+                                          sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
     return c;
@@ -13363,6 +13402,37 @@ int main(int argc, char **argv) {
         int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
         ds4_engine_close(engine);
         return rc;
+    }
+
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token);
+        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-server: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;

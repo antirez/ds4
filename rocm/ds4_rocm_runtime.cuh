@@ -5952,6 +5952,36 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_shared(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    /* Host-mapped pinned memory: kernels reach it through the device alias
+     * (identical to the host pointer on coherent APUs) and the CPU reaches
+     * it directly — exactly what the TP transport slab and the gate service
+     * thread need.  It can also be registered with IB verbs for RDMA. */
+    void *host = NULL;
+    if (!cuda_ok(cudaHostAlloc(&host, (size_t)bytes, cudaHostAllocMapped),
+                 "shared tensor alloc")) {
+        free(t);
+        return NULL;
+    }
+    void *dev = host;
+    if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared tensor device alias failed: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cudaFreeHost(host);
+        free(t);
+        return NULL;
+    }
+    memset(host, 0, (size_t)bytes);
+    t->ptr = dev;
+    t->host_alias = host;
+    t->bytes = bytes;
+    t->owner = 1;
+    return t;
+}
+
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
@@ -6000,7 +6030,10 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner && tensor->ptr) {
+        if (tensor->host_alias) (void)cudaFreeHost(tensor->host_alias);
+        else (void)cudaFree(tensor->ptr);
+    }
     free(tensor);
 }
 
@@ -6011,7 +6044,7 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
-    return tensor->ptr;
+    return tensor->host_alias ? tensor->host_alias : tensor->ptr;
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

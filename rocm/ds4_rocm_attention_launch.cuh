@@ -19,7 +19,15 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+        kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch validation failed: "
+                "raw_cache=%p bytes=%llu raw_cap=%u kv=%p kv_bytes=%llu n_tokens=%u head_dim=%u\n",
+                (void *)raw_cache,
+                (unsigned long long)(raw_cache ? raw_cache->bytes : 0),
+                raw_cap, (void *)kv,
+                (unsigned long long)(kv ? kv->bytes : 0), n_tokens, head_dim);
+        return 0;
+    }
     uint64_t n = (uint64_t)n_tokens * head_dim;
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
@@ -254,6 +262,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    0,
                                                                    window,
                                                                    1,
+                                                                   0u,
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
@@ -327,7 +336,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                 sinks,
                                                 (const float *)q->ptr,
                                                 (const float *)raw_kv->ptr,
-                                                n_tokens, window, n_head, head_dim);
+                                                n_tokens, window, 0u, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention_prefill_raw launch");
 }
 static int attention_decode_batch_launch(
@@ -778,6 +787,7 @@ static int attention_prefill_mixed_launch(
                                                                    n_comp,
                                                                    window,
                                                                    ratio,
+                                                                   0u,
                                                                    n_head,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");

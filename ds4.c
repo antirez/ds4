@@ -15268,6 +15268,11 @@ typedef struct {
     uint32_t tp_batch_rows;
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
+    /* KV-split indexer payloads: local/peer candidate lists exchanged
+     * through the split gate (ids + fp32 scores, 2 * TOP_K * 4 bytes). */
+    ds4_gpu_tensor *tp_split_idx_out;
+    ds4_gpu_tensor *tp_split_idx_in;
+    bool tp_kv_split;
 } ds4_gpu_graph;
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
@@ -22978,14 +22983,65 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_score_one_tensor(metal_graph_indexer_scores(g),
-                                                                metal_graph_indexer_q(g),
-                                                                metal_graph_indexer_weights(g),
-                                                                g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
-                                                                DS4_N_INDEXER_HEAD,
-                                                                DS4_N_INDEXER_HEAD_DIM,
-                                                                index_scale) != 0;
+                if (ok && g->tp_kv_split) {
+                    /* KV split: each rank scores only its parity rows, packs
+                     * its local top-k, exchanges candidate lists through the
+                     * split gate, and merges into the identical global
+                     * selection on both ranks. */
+                    const uint32_t n_idx = g->layer_n_index_comp[il];
+                    const uint32_t local_n =
+                        n_idx / 2u + ((n_idx & 1u) && g->tp_rank == 0u ? 1u : 0u);
+                    ok = ds4_gpu_indexer_score_one_split_tensor(
+                                 metal_graph_indexer_scores(g),
+                                 metal_graph_indexer_q(g),
+                                 metal_graph_indexer_weights(g),
+                                 g->layer_index_comp_cache[il],
+                                 n_idx,
+                                 ds4_layer_compress_ratio(il),
+                                 index_scale,
+                                 g->tp_rank) != 0;
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_tensor(
+                                     metal_graph_comp_selected(g),
+                                     metal_graph_indexer_scores(g),
+                                     local_n,
+                                     1,
+                                     DS4_N_INDEXER_TOP_K) != 0;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_split_pack_tensor(
+                                     g->tp_split_idx_out,
+                                     metal_graph_comp_selected(g),
+                                     metal_graph_indexer_scores(g),
+                                     local_n,
+                                     DS4_N_INDEXER_TOP_K,
+                                     g->tp_rank) != 0;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_tp_split_gate_encode(
+                                     il,
+                                     DS4_TP_SPLIT_GATE_INDEXER,
+                                     g->tp_split_idx_out,
+                                     g->tp_split_idx_in,
+                                     2u * DS4_N_INDEXER_TOP_K * 4u) != 0;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_split_merge_tensor(
+                                     metal_graph_comp_selected(g),
+                                     g->tp_split_idx_out,
+                                     g->tp_split_idx_in,
+                                     DS4_N_INDEXER_TOP_K) != 0;
+                    }
+                } else {
+                    ok = ds4_gpu_indexer_score_one_tensor(metal_graph_indexer_scores(g),
+                                                          metal_graph_indexer_q(g),
+                                                          metal_graph_indexer_weights(g),
+                                                          g->layer_index_comp_cache[il],
+                                                          g->layer_n_index_comp[il],
+                                                          DS4_N_INDEXER_HEAD,
+                                                          DS4_N_INDEXER_HEAD_DIM,
+                                                          index_scale) != 0;
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -22994,11 +23050,13 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                                           metal_graph_indexer_scores(g),
-                                                           g->layer_n_index_comp[il],
-                                                           1,
-                                                           DS4_N_INDEXER_TOP_K) != 0;
+                if (ok && !g->tp_kv_split) {
+                    ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
+                                                     metal_graph_indexer_scores(g),
+                                                     g->layer_n_index_comp[il],
+                                                     1,
+                                                     DS4_N_INDEXER_TOP_K) != 0;
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
                                                                     il,
@@ -28350,9 +28408,18 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *tp_attn_out = tp_row_split_attn ?
         metal_graph_tensor_row_range_view(metal_graph_batch_attn_out(g), tp_row0, tp_rows,
                                           DS4_N_EMBD) : NULL;
+    /* tp_q_half may legitimately be NULL (the F16 q_b output tensor is
+     * only allocated on some paths); the fused call below falls back to
+     * the F32 matmul when it is. */
     if (tp_row_split_attn &&
-        (!tp_q || !tp_q_half || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
+        (!tp_q || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
         ok = false;
+    }
+    if (getenv("DS4_TP_PREFILL_TRACE")) {
+        fprintf(stderr, "ds4-tp: layer %u tp views ok=%d q=%p qh=%p qrn=%p h=%p ao=%p (row0=%u rows=%u q_dim=%llu)\n",
+                il, ok, (void *)tp_q, (void *)tp_q_half, (void *)tp_qr_norm,
+                (void *)tp_heads, (void *)tp_attn_out,
+                tp_row0, tp_rows, (unsigned long long)q_dim);
     }
     bool q_b_f16_out = false;
     if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
@@ -28380,6 +28447,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                      DS4_RMS_EPS) != 0;
     }
     if (q_b_f16_out) {
+        if (getenv("DS4_TP_PREFILL_TRACE")) {
+            fprintf(stderr, "ds4-tp: layer %u q_b f16 ok=%d\n", il, ok);
+        }
         DS4_METAL_PROFILE_Q_STAGE("q_b");
         DS4_METAL_PROFILE_Q_STAGE("head_norm");
         if (ok) {
@@ -28461,6 +28531,10 @@ static bool metal_graph_encode_layer_attention_batch(
         DS4_METAL_PROFILE_Q_STAGE("rope");
     }
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
+    if (getenv("DS4_TP_PREFILL_TRACE")) {
+        fprintf(stderr, "ds4-tp: layer %u q_path done ok=%d (tp_row_split=%d)\n",
+                il, ok, tp_row_split_attn);
+    }
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -28506,6 +28580,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("KVrope", metal_graph_batch_kv(g),
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
+    }
+    if (getenv("DS4_TP_PREFILL_TRACE")) {
+        fprintf(stderr, "ds4-tp: layer %u kv_path done ok=%d\n", il, ok);
     }
     if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(metal_graph_batch_kv(g),
                                                        n_tokens,
@@ -49336,6 +49413,9 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    /* Mirrored sync in flight: cancellation checks double as the TP
+     * lockstep barrier (see ds4_session_cancelled). */
+    bool tp_sync_lockstep;
 };
 
 #ifndef DS4_NO_GPU
@@ -58196,7 +58276,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
 
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;
     const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
@@ -58208,6 +58288,15 @@ static int ds4_engine_tp_batch_exchange(void *ud, uint32_t layer,
                                         uint32_t rows, uint64_t seq) {
     ds4_tp *tp = ud;
     const int ok = ds4_tp_batch_gate_exchange(tp, layer, rows, seq);
+    if (!ok) ds4_tp_mark_failed(tp);
+    return ok;
+}
+
+static int ds4_engine_tp_split_exchange(void *ud, uint32_t layer,
+                                          uint32_t kind, uint64_t seq,
+                                          uint64_t bytes) {
+    ds4_tp *tp = ud;
+    const int ok = ds4_tp_split_gate_exchange(tp, layer, kind, seq, bytes);
     if (!ok) ds4_tp_mark_failed(tp);
     return ok;
 }
@@ -58232,24 +58321,79 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 #endif
 
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+#if defined(DS4_NO_GPU) || (!defined(__APPLE__) && !defined(DS4_ROCM_BUILD))
     (void)e; (void)tp;
     snprintf(err, errlen, "tensor parallelism requires the Metal backend");
     return 0;
+#else
+#if defined(DS4_ROCM_BUILD)
+    if (e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "tensor parallelism requires the ROCm graph backend");
+        return 0;
+    }
 #else
     if (e->backend != DS4_BACKEND_METAL) {
         snprintf(err, errlen, "tensor parallelism requires the Metal backend");
         return 0;
     }
+#endif
     if (e->tp.active) {
         snprintf(err, errlen, "tensor parallelism already bound");
         return 0;
     }
+#if defined(DS4_ROCM_BUILD)
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        snprintf(err, errlen,
+                 "tensor parallelism for GLM models is not implemented on "
+                 "the ROCm backend yet (DeepSeek models only)");
+        return 0;
+    }
+    /* Ownership-aware ROCm kernels currently cover Q4_K routed experts and
+     * Q8_0 shared/attention/output tensors; refuse other layouts instead of
+     * silently miscomputing the split. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *rt = e->weights.layer[il].ffn_gate_exps;
+        const ds4_tensor *ut = e->weights.layer[il].ffn_up_exps;
+        const ds4_tensor *dt = e->weights.layer[il].ffn_down_exps;
+        if ((rt && rt->type != DS4_TENSOR_Q4_K) ||
+            (ut && ut->type != DS4_TENSOR_Q4_K) ||
+            (dt && dt->type != DS4_TENSOR_Q4_K)) {
+            snprintf(err, errlen,
+                     "tensor parallelism on ROCm requires Q4_K routed "
+                     "experts (layer %u); this build has ownership-aware "
+                     "kernels for Q4_K only", il);
+            return 0;
+        }
+        const ds4_tensor *sg = e->weights.layer[il].ffn_gate_shexp;
+        const ds4_tensor *sd = e->weights.layer[il].ffn_down_shexp;
+        if ((sg && sg->type != DS4_TENSOR_Q8_0) ||
+            (sd && sd->type != DS4_TENSOR_Q8_0)) {
+            snprintf(err, errlen,
+                     "tensor parallelism on ROCm requires Q8_0 shared "
+                     "experts (layer %u)", il);
+            return 0;
+        }
+        const ds4_tensor *oa = e->weights.layer[il].attn_output_a;
+        const ds4_tensor *ob = e->weights.layer[il].attn_output_b;
+        if ((oa && oa->type != DS4_TENSOR_Q8_0) ||
+            (ob && ob->type != DS4_TENSOR_Q8_0)) {
+            snprintf(err, errlen,
+                     "tensor parallelism on ROCm requires Q8_0 attention "
+                     "output projections (layer %u)", il);
+            return 0;
+        }
+    }
+    if (e->weights.output && e->weights.output->type != DS4_TENSOR_Q8_0) {
+        snprintf(err, errlen,
+                 "tensor parallelism on ROCm requires a Q8_0 output head");
+        return 0;
+    }
+#endif
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
-    e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
-    e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
+    e->tp.slab = ds4_gpu_tensor_alloc_shared(slab_bytes);
+    e->tp.zero_vec = ds4_gpu_tensor_alloc_shared(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
     e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
@@ -58267,6 +58411,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
     if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab), err, errlen))
         return 0;
+    ds4_gpu_tp_set_split_layout(
+            ds4_tp_slab_split_out_offset(tp, 0, 0),
+            ds4_tp_slab_split_in_offset(tp, 0, 0),
+            DS4_TP_SPLIT_SLOT_BYTES);
     for (uint32_t l = 0; l < (uint32_t)DS4_N_LAYER; l++) {
         for (uint32_t gate = 0; gate < DS4_TP_GATES_PER_LAYER; gate++) {
             const uint32_t slot = l * DS4_TP_GATES_PER_LAYER + gate;
@@ -58296,8 +58444,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: gate service init failed");
         return 0;
     }
+    ds4_gpu_tp_set_slab_layout(ds4_tp_slab_in_flags_offset(tp));
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
+    ds4_gpu_tp_set_split_exchange(ds4_engine_tp_split_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
      * leader computes full logits and nothing crosses the wire. */
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
@@ -58319,7 +58469,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
@@ -58471,7 +58621,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
 }
 #endif
 
-static bool ds4_session_tp_leader(const ds4_session *s) {
+bool ds4_session_tp_leader(const ds4_session *s) {
     return s && s->engine && s->engine->tp.active && s->engine->tp.rank == 0;
 }
 
@@ -58686,6 +58836,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     if (e->tp.active) {
+        const char *kv_split_env = getenv("DS4_TP_KV_SPLIT");
+        s->graph.tp_kv_split =
+            kv_split_env && kv_split_env[0] && strcmp(kv_split_env, "0") != 0;
+        if (s->graph.tp_kv_split) {
+            s->graph.tp_split_idx_out =
+                ds4_gpu_tensor_alloc(2u * DS4_N_INDEXER_TOP_K * 4u);
+            s->graph.tp_split_idx_in =
+                ds4_gpu_tensor_alloc(2u * DS4_N_INDEXER_TOP_K * 4u);
+            if (!s->graph.tp_split_idx_out || !s->graph.tp_split_idx_in) {
+                fprintf(stderr, "ds4: TP kv-split payload allocation failed\n");
+                metal_graph_free(&s->graph);
+                free(s);
+                return 1;
+            }
+        }
         s->graph.tp_world = 2;
         s->graph.tp_rank = (uint32_t)e->tp.rank;
         s->graph.tp_out = e->tp.out_views;
@@ -58886,8 +59051,31 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
+void ds4_session_tp_sync_lockstep(ds4_session *s, int enabled) {
+    if (s) s->tp_sync_lockstep = enabled != 0;
+}
+
+/* Cooperative cancellation; under tensor parallelism, also the mirrored-sync
+ * lockstep barrier.  A sync can only stop at these checks, so pairing every
+ * check across the ranks (leader publishes go/stop, worker adopts it)
+ * guarantees a cancelled prefill leaves both engines at the same chunk
+ * boundary.  A lone leader stop would strand the worker inside gate
+ * exchanges the leader no longer serves — that deadlocks the pair. */
 static bool ds4_session_cancelled(ds4_session *s) {
-    return s && s->cancel && s->cancel(s->cancel_ud);
+    if (!s) return false;
+    const bool local = s->cancel && s->cancel(s->cancel_ud);
+    if (!s->tp_sync_lockstep || !s->engine || !s->engine->tp.active ||
+        !s->engine->tp.ctx) {
+        return local;
+    }
+    if (s->engine->tp.rank == 0) {
+        /* Transport failure: stop locally; the sync ack path surfaces it. */
+        if (!ds4_tp_send_sync_go(s->engine->tp.ctx, local ? 1 : 0)) return true;
+        return local;
+    }
+    int stop = 1;
+    if (!ds4_tp_recv_sync_go(s->engine->tp.ctx, &stop)) return true;
+    return stop != 0;
 }
 
 static bool ds4_session_cancelled_cb(void *ud) {
@@ -59761,14 +59949,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     const bool mirror = ds4_session_tp_leader(s);
+    bool lockstep = false;
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
                               prompt->v, (uint32_t)prompt->len)) {
             snprintf(err, errlen, "tp: worker sync send failed");
             return 1;
         }
+        /* From here every cancellation check below doubles as the worker's
+         * lockstep barrier (see ds4_session_cancelled); the worker sets its
+         * own flag in ds4_tp_worker_run around the mirrored sync. */
+        lockstep = true;
+        s->tp_sync_lockstep = true;
     }
     int rc = ds4_session_sync_internal(s, prompt, err, errlen);
+    if (lockstep) s->tp_sync_lockstep = false;
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
@@ -59796,20 +59991,44 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #endif
     if (mirror) {
-        const bool worker_ok = ds4_tp_wait_command_ack(
-            s->engine->tp.ctx, s->tp_session_id, "prefill sync", err, errlen);
+        /* A hard local error mid-sync may have stopped this rank between two
+         * barrier checks, stranding the worker inside a gate exchange this
+         * rank no longer serves; it will never ack.  Bound the wait by the
+         * pair timeout so the pair poisons itself instead of deadlocking
+         * (symmetric validation failures still ack within milliseconds). */
+        const bool local_hard_error =
+            rc != 0 && rc != DS4_SESSION_SYNC_INTERRUPTED;
+        int worker_status = -1;
+        char ack_err[256] = "";
+        const bool worker_ok = ds4_tp_wait_command_ack_status(
+            s->engine->tp.ctx, s->tp_session_id, "prefill sync",
+            local_hard_error ? -1.0 : 0.0, &worker_status,
+            ack_err, sizeof(ack_err));
+        if (!worker_ok && !local_hard_error) snprintf(err, errlen, "%s", ack_err);
         bool logits_ok = true;
         /* A successful worker sends its split logits even if the leader's
          * local prefill failed. Drain them to keep the control stream framed
          * before invalidating the mirrored session. */
-        if (worker_ok && s->engine->tp.vocab_split) {
+        if (worker_ok && worker_status == 0 && s->engine->tp.vocab_split) {
             const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
             if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
                 snprintf(err, errlen, "tp: worker sync logits half missing");
                 logits_ok = false;
             }
         }
-        if (rc != 0 || !worker_ok || !logits_ok) {
+        if (worker_ok && logits_ok &&
+            rc == DS4_SESSION_SYNC_INTERRUPTED &&
+            worker_status == DS4_SESSION_SYNC_INTERRUPTED) {
+            /* Lockstep cancel: both ranks stopped at the same chunk boundary
+             * and hold the same live prefix; keep it for KV reuse. */
+            return rc;
+        }
+        if (rc != 0 || !worker_ok || worker_status != 0 || !logits_ok) {
+            if (rc == 0 && worker_ok && logits_ok && worker_status != 0) {
+                snprintf(err, errlen,
+                         "tp: worker prefill sync failed (status %d)",
+                         worker_status);
+            }
             ds4_session_invalidate(s);
             return rc != 0 ? rc : 1;
         }
@@ -61642,7 +61861,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         ds4_session_invalidate(s);
         return rc;
     }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
     if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
         snprintf(err, errlen, "tp: gate transport failed");
         if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
@@ -62092,7 +62311,7 @@ static int ds4_sessions_eval_batch_metal(
         }
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -62130,7 +62349,7 @@ static int ds4_sessions_eval_batch_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_gpu_tp_failed()) {
         if (err && errlen) snprintf(err, errlen, "tp: batch gate transport failed");
@@ -62302,7 +62521,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
                      DS4_N_HC) != 0;
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -62360,7 +62579,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_gpu_tp_failed()) {
         if (err && errlen) snprintf(err, errlen,
