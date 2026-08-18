@@ -10458,7 +10458,15 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    return generation_active ? s->mixed_prefill_quantum : 2048;
+    if (generation_active) return s->mixed_prefill_quantum;
+    /* With nobody decoding, the quantum only bounds how long the executor is
+     * held before another request can enter; follow the engine's own prefill
+     * cap (4096 for Flash, 8192 for PRO) instead of halving it.  Measured on
+     * M3 Ultra + Flash MXFP4: a 16k cold prefill runs 574 t/s in 2048-token
+     * chunks vs 590 t/s in 4096-token chunks, and every partial chunk pays
+     * the same fixed MoE expert scan as a full one. */
+    const int cap = s->engine ? (int)ds4_engine_prefill_quantum(s->engine) : 0;
+    return cap > 2048 ? cap : 2048;
 }
 
 static int server_prefill_quantum(server *s) {
@@ -13618,6 +13626,7 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
+    /* engine == NULL: the idle quantum floors at the historical 2048. */
     TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;

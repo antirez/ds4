@@ -58088,6 +58088,14 @@ uint32_t ds4_engine_prefill_chunk(ds4_engine *e) {
     return e ? e->prefill_chunk : 0;
 }
 
+/* The chunk size a long prompt actually prefills with: the explicit
+ * --prefill-chunk when set, otherwise the model's automatic cap (4096 for
+ * Flash, 8192 for PRO, DS4_METAL_PREFILL_CHUNK honored). */
+uint32_t ds4_engine_prefill_quantum(ds4_engine *e) {
+    if (!e) return 0;
+    return ds4_prefill_cap_for_prompt(INT32_MAX, e->prefill_chunk);
+}
+
 
 int ds4_engine_power(ds4_engine *e) {
     return e ? e->power_percent : 100;
