@@ -10644,9 +10644,13 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
-    int interval_tokens = p->seen ? current - p->last_current : 0;
+    /* First callback: the interval is everything since prefill start, not
+     * zero — otherwise the first chunk always logs a bogus 0.00 t/s (most
+     * visible in distributed mode, where the first callback covers a whole
+     * pipeline chunk). */
+    int interval_tokens = p->seen ? current - p->last_current : display_current;
     if (interval_tokens < 0) interval_tokens = 0;
-    double interval_s = p->seen ? now - p->last_t : 0.0;
+    double interval_s = p->seen ? now - p->last_t : elapsed;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
     p->last_t = now;
