@@ -6714,3 +6714,37 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+/* Cap the number of activated routed experts. Rank each token's N selected
+ * slots by router weight, keep the top n_active, rescale the kept weights so
+ * their sum (and thus the layer output scale) is unchanged, and deactivate
+ * the rest (selected = -1, weight = 0). Every consumer — MoE matvec kernels,
+ * expert streaming/page-in, hotlists — skips negative expert ids, so
+ * deactivated experts cost neither compute nor memory traffic. One thread
+ * per token. */
+kernel void kernel_router_clamp_active(
+        device int   *selected [[buffer(0)]],   /* [n_tokens, n_used] */
+        device float *weights  [[buffer(1)]],   /* [n_tokens, n_used] */
+        constant uint &n_used   [[buffer(2)]],
+        constant uint &n_active [[buffer(3)]],
+        constant uint &n_tokens [[buffer(4)]],
+        uint t [[thread_position_in_grid]]) {
+    if (t >= n_tokens) return;
+    device int   *sel = selected + (uint64_t)t * n_used;
+    device float *w   = weights  + (uint64_t)t * n_used;
+    for (uint i = 0; i < n_used; i++) {
+        for (uint j = i + 1; j < n_used; j++) {
+            if (w[j] > w[i]) {
+                float wf = w[i]; w[i] = w[j]; w[j] = wf;
+                int   sf = sel[i]; sel[i] = sel[j]; sel[j] = sf;
+            }
+        }
+    }
+    float all_sum = 0.0f, kept_sum = 0.0f;
+    for (uint i = 0; i < n_used; i++) all_sum += w[i];
+    for (uint i = 0; i < n_active; i++) kept_sum += w[i];
+    if (kept_sum < 6.103515625e-5f) kept_sum = 6.103515625e-5f;
+    const float f = all_sum / kept_sum;
+    for (uint i = 0; i < n_active; i++) w[i] *= f;
+    for (uint i = n_active; i < n_used; i++) { w[i] = 0.0f; sel[i] = -1; }
+}

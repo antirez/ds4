@@ -200,6 +200,7 @@ static __weak id<MTLBuffer> g_dsv4_hc_producer_last_mix_buffer;
 static NSUInteger g_dsv4_hc_producer_last_mix_offset;
 static id<MTLBuffer> g_dsv4_hc_producer_last_completion;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
+static id<MTLComputePipelineState> g_router_clamp_active_pipeline;
 static id<MTLComputePipelineState> g_glm_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_glm_kv_lora_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_glm_k_b_project_pipeline;
@@ -8441,6 +8442,12 @@ int ds4_gpu_init(void) {
                 "kernel_dsv4_router_transform_finalize_weights_one_simd");
         g_dsv4_router_weights_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
+        g_router_clamp_active_pipeline =
+            ds4_gpu_get_pipeline("kernel_router_clamp_active");
+        if (g_router_clamp_active_pipeline == nil) {
+            fprintf(stderr, "ds4: missing kernel_router_clamp_active pipeline\n");
+            return 0;
+        }
         g_glm_router_select_one_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_router_select_one");
         g_glm_kv_lora_rms_norm_pipeline =
@@ -10317,6 +10324,7 @@ void ds4_gpu_cleanup(void) {
         [g_dsv4_completion_cache removeAllObjects];
         g_dsv4_completion_cache = nil;
         g_dsv4_router_weights_one_pipeline = nil;
+        g_router_clamp_active_pipeline = nil;
         g_glm_router_select_one_pipeline = nil;
         g_glm_kv_lora_rms_norm_pipeline = nil;
         g_glm_k_b_project_pipeline = nil;
@@ -32194,6 +32202,23 @@ static int ds4_gpu_encode_router_select(
                                           (NSUInteger)scale_args.ne3)
          threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+
+    /* Optional activation cap: rank by weight, keep the top-k, deactivate
+     * the rest (selected = -1). All consumers skip negative ids. */
+    const uint32_t n_active = ds4_get_n_experts_active();
+    if (n_active >= 1 && n_active < n_expert_used) {
+        uint32_t knu = n_expert_used, kat = n_active, knt = (uint32_t)n_tokens;
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_router_clamp_active_pipeline];
+        [enc setBuffer:selectedbuf offset:selected_off atIndex:0];
+        [enc setBuffer:weightsbuf offset:weights_off atIndex:1];
+        [enc setBytes:&knu length:sizeof(knu) atIndex:2];
+        [enc setBytes:&kat length:sizeof(kat) atIndex:3];
+        [enc setBytes:&knt length:sizeof(knt) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(knt, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+    }
 
     return 1;
 }

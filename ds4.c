@@ -722,6 +722,20 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_LORA_O                  (g_ds4_shape.n_lora_o)
 #define DS4_N_EXPERT                  (g_ds4_shape.n_expert)
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
+
+/* Cap on routed experts ACTIVATED per token (0 = model default top-N). The
+ * router still scores and ranks every expert; only the top-k weights are
+ * kept, renormalized to preserve the layer output scale. Deactivated slots
+ * get selected = -1 / weight = 0, the established skip sentinel. */
+static uint32_t g_ds4_n_experts_active = 0;
+
+void ds4_set_n_experts_active(uint32_t n_experts_active) {
+    g_ds4_n_experts_active = n_experts_active;
+}
+
+uint32_t ds4_get_n_experts_active(void) {
+    return g_ds4_n_experts_active;
+}
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
 #define DS4_N_FF_DENSE                (g_ds4_shape.n_ff_dense)
@@ -10934,6 +10948,34 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n);
 
 /* Single-token routed MoE.  It selects six experts, runs IQ2_XXS gate/up,
  * applies SwiGLU and router weights, then accumulates Q2_K down projections. */
+/* Rank the router's selected slots by weight, keep the top
+ * g_ds4_n_experts_active, renormalize the kept weights so their sum matches
+ * the full selection's sum, and deactivate the rest. Returns the slot count
+ * the caller should iterate (DS4_N_EXPERT_USED when the override is off). */
+static uint32_t ds4_clamp_expert_selection(
+        int   selected[DS4_MAX_EXPERT_USED],
+        float weights[DS4_MAX_EXPERT_USED]) {
+    const uint32_t n = DS4_N_EXPERT_USED;
+    uint32_t k = g_ds4_n_experts_active;
+    if (k == 0 || k >= n) return n;
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (weights[j] > weights[i]) {
+                float wf = weights[i]; weights[i] = weights[j]; weights[j] = wf;
+                int   sf = selected[i]; selected[i] = selected[j]; selected[j] = sf;
+            }
+        }
+    }
+    float all_sum = 0.0f, kept_sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) all_sum += weights[i];
+    for (uint32_t i = 0; i < k; i++) kept_sum += weights[i];
+    if (kept_sum < 6.103515625e-5f) kept_sum = 6.103515625e-5f;
+    const float f = all_sum / kept_sum;
+    for (uint32_t i = 0; i < k; i++) weights[i] *= f;
+    for (uint32_t i = k; i < n; i++) { weights[i] = 0.0f; selected[i] = -1; }
+    return k;
+}
+
 static void layer_routed_moe_one(
         float             * out,
         const ds4_model   * model,
@@ -10988,6 +11030,7 @@ static void layer_routed_moe_one(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
+    const uint32_t n_active = ds4_clamp_expert_selection(selected, expert_weight);
 
     if (routed_q8_0) {
         const uint64_t x_blocks = expert_in_dim / 32u;
@@ -10999,12 +11042,12 @@ static void layer_routed_moe_one(
                                          layer->ffn_up_exps,
                                          xq8, xscale8, selected,
                                          expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
+                                         n_active, clamp);
 
         const uint64_t mid_blocks = down_in_dim / 32u;
         int8_t *midq8 = xmalloc((size_t)DS4_N_EXPERT_USED * mid_blocks * 32u);
         float *midscale8 = xmalloc((size_t)DS4_N_EXPERT_USED * mid_blocks * sizeof(float));
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             quantize_q8_0_activation(mid_all + (uint64_t)i * down_in_dim,
                                      midq8 + (uint64_t)i * mid_blocks * 32u,
                                      midscale8 + (uint64_t)i * mid_blocks,
@@ -11022,14 +11065,14 @@ static void layer_routed_moe_one(
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
                                          xq, selected, expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                                         n_active, clamp);
+        for (uint32_t i = 0; i < n_active; i++) {
             ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
         matvec_q8_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq, selected, DS4_N_EXPERT_USED);
+                                           midq, selected, n_active);
     } else if (!trace) {
         matvec_experts_mid_prequant(mid_all, model,
                                     layer->ffn_gate_exps,
@@ -11039,14 +11082,14 @@ static void layer_routed_moe_one(
                                     expert_weight,
                                     DS4_N_EXPERT_USED,
                                     clamp);
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
-        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, n_active);
     } else {
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             const uint32_t expert = (uint32_t)selected[i];
 
             matvec_expert_pair_prequant(gate, up, model,
@@ -11143,6 +11186,7 @@ static void layer_routed_moe_one_prealloc(
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
+    const uint32_t n_active = ds4_clamp_expert_selection(selected, expert_weight);
 
     if (routed_q8_0) {
         if (!q8_xq || !q8_xscale || !q8_midq || !q8_midscale) {
@@ -11154,9 +11198,9 @@ static void layer_routed_moe_one_prealloc(
                                          layer->ffn_up_exps,
                                          q8_xq, q8_xscale, selected,
                                          expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
+                                         n_active, clamp);
         const uint64_t mid_blocks = down_in_dim / 32u;
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             quantize_q8_0_activation(mid_all + (uint64_t)i * down_in_dim,
                                      q8_midq + (uint64_t)i * mid_blocks * 32u,
                                      q8_midscale + (uint64_t)i * mid_blocks,
@@ -11177,26 +11221,26 @@ static void layer_routed_moe_one_prealloc(
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
                                          xq, selected, expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
+                                         n_active, clamp);
     } else {
         matvec_experts_mid_prequant(mid_all, model,
                                     layer->ffn_gate_exps,
                                     layer->ffn_up_exps,
                                     xq, selected, expert_weight,
-                                    DS4_N_EXPERT_USED, clamp);
+                                    n_active, clamp);
     }
 
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+    for (uint32_t i = 0; i < n_active; i++) {
         ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
     if (routed_q8_k) {
         matvec_q8_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq, selected, DS4_N_EXPERT_USED);
+                                           midq, selected, n_active);
     } else {
         matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq, selected, DS4_N_EXPERT_USED);
+                                           midq, selected, n_active);
     }
 
     (void)il;
