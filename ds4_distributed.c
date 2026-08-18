@@ -415,6 +415,14 @@ struct ds4_dist_session {
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    /* Continuation drafts from the last fully-accepted verify span: valid
+     * only for spec_pending_token decoded at timeline length
+     * spec_pending_pos, letting the next speculative cycle fuse the base
+     * decode into its verify span (one span, one round trip). */
+    int spec_pending_drafts[16];
+    int spec_pending_count;
+    int spec_pending_token;
+    uint32_t spec_pending_pos;
 };
 
 typedef struct {
@@ -2719,8 +2727,35 @@ static int dist_coordinator_eval_remote_on_fd(
         return 0;
     }
     if (kind == DS4_DIST_RESULT_LOGITS_NROWS &&
-        payload_bytes == (uint64_t)n_tokens * logits_bytes) {
-        memcpy(logits, payload, (size_t)payload_bytes);
+        payload_bytes >= (uint64_t)n_tokens * logits_bytes) {
+        const uint64_t rows_bytes = (uint64_t)n_tokens * logits_bytes;
+        memcpy(logits, payload, (size_t)rows_bytes);
+        if (payload_bytes > rows_bytes) {
+            /* Fused verify spans append continuation drafts after the rows. */
+            uint8_t *p = (uint8_t *)payload + rows_bytes;
+            uint32_t nd = 0;
+            if (payload_bytes < rows_bytes + 4u) {
+                free(payload);
+                if (errlen) snprintf(err, errlen, "distributed route returned invalid draft payload");
+                return 1;
+            }
+            memcpy(&nd, p, 4u);
+            p += 4u;
+            if (nd > 16u || payload_bytes != rows_bytes + 4u + 4u * nd) {
+                free(payload);
+                if (errlen) snprintf(err, errlen, "distributed route returned invalid draft payload");
+                return 1;
+            }
+            if (drafts_out && n_drafts_out) {
+                for (uint32_t i = 0; i < nd; i++) {
+                    int32_t dv = 0;
+                    memcpy(&dv, p, 4u);
+                    p += 4u;
+                    drafts_out[i] = (int)dv;
+                }
+                *n_drafts_out = (int)nd;
+            }
+        }
         free(payload);
         if (profile) {
             const double copy_t1 = dist_now_sec();
@@ -5980,6 +6015,208 @@ int ds4_dist_session_mtp_spec_cycle(
         } \
     } while (0)
 
+    int min_verify = 3;
+    {
+        const char *env = getenv("DS4_DIST_SPEC_MIN_DRAFT");
+        if (env && env[0]) {
+            const int v = atoi(env);
+            if (v >= 2 && v <= 16) min_verify = v;
+        }
+    }
+
+    /* 0. Fused span: when the previous cycle fully accepted its block, the
+     * worker already proposed continuation drafts for exactly this token at
+     * exactly this position.  Verify them together with the base token in a
+     * single span (rows = [first_token, drafts...]), skipping the separate
+     * base decode and its round trip.  Any invalidation (different token,
+     * moved timeline, too few drafts) falls through to the classic cycle. */
+    int fused_pending[16];
+    int fused_k = 0;
+    if (d->spec_pending_count > 0 &&
+        d->spec_pending_token == first_token &&
+        d->spec_pending_pos == start) {
+        fused_k = d->spec_pending_count;
+        memcpy(fused_pending, d->spec_pending_drafts,
+               (size_t)fused_k * sizeof(fused_pending[0]));
+    }
+    d->spec_pending_count = 0;
+    if (fused_k > draft_cap) fused_k = draft_cap;
+    /* Prefix commits need span rows <= DS4_SPEC_PREFIX_SLOTS + 1. */
+    if (fused_k > 4) fused_k = 4;
+    if (fused_k > max_tokens - 1) fused_k = max_tokens - 1;
+    if (fused_k > accepted_cap - 1) fused_k = accepted_cap - 1;
+    {
+        const int room = ds4_session_ctx(owner) - (int)start;
+        if (fused_k > room - 2) fused_k = room - 2;
+    }
+    if (first_token == eos_token) fused_k = 0;
+    if (fused_k >= min_verify) {
+        ds4_dist_mtp_frontier fused_frontier;
+        if (!ds4_session_dist_frontier_snapshot(owner, &fused_frontier)) {
+            if (errlen) snprintf(err, errlen, "coordinator speculative frontier snapshot failed");
+            return -1;
+        }
+        int span_tokens[17];
+        span_tokens[0] = first_token;
+        memcpy(span_tokens + 1, fused_pending,
+               (size_t)fused_k * sizeof(span_tokens[0]));
+        const uint32_t rows_n = (uint32_t)fused_k + 1u;
+        float *rows = malloc((size_t)rows_n * (size_t)vocab * sizeof(float));
+        if (!rows) {
+            if (errlen) snprintf(err, errlen, "out of memory allocating speculative verify rows");
+            return -1;
+        }
+        int cont[16];
+        int n_cont = 0;
+        const double fused_t0 = dist_now_sec();
+        const int frc = dist_coordinator_eval_span(&d->state,
+                                                   owner,
+                                                   &d->plan,
+                                                   span_tokens,
+                                                   rows_n,
+                                                   start,
+                                                   d->session_id,
+                                                   d->request_id++,
+                                                   false,
+                                                   DS4_DIST_WORK_F_SPEC_VERIFY |
+                                                       DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS |
+                                                       DS4_DIST_WORK_F_OUTPUT_DRAFTS,
+                                                   false,
+                                                   NULL,
+                                                   rows,
+                                                   cont,
+                                                   &n_cont,
+                                                   err,
+                                                   errlen);
+        const double fused_ms = (dist_now_sec() - fused_t0) * 1000.0;
+        if (frc != 0) {
+            free(rows);
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: dist mtp spec fused span failed rc=%d: %s\n",
+                        frc, err && err[0] ? err : "(no detail)");
+            }
+            (void)ds4_session_dist_frontier_restore(owner, &fused_frontier);
+            int n_accept = 0;
+            accepted[n_accept++] = first_token;
+            DIST_MTP_SPEC_REBUILD(frc);
+            if (rebuilt) {
+                ds4_session_set_logits(owner, rebuild_logits, vocab);
+                free(rebuild_logits);
+                return n_accept;
+            }
+            if (errlen) snprintf(err, errlen, "%s", fail_msg);
+            return -1;
+        }
+        int accept_n = 0;
+        for (int i = 0; i < fused_k; i++) {
+            if (dist_logits_argmax(rows + (uint64_t)i * vocab, vocab) !=
+                span_tokens[i + 1]) {
+                break;
+            }
+            accept_n++;
+        }
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist mtp spec fused drafted=%d accepted=%d cont=%d span=%.1fms\n",
+                    fused_k, accept_n, n_cont, fused_ms);
+        }
+        if (accept_n == fused_k) {
+            if (n_cont > 0 && span_tokens[fused_k] != eos_token) {
+                int cnt = n_cont > 16 ? 16 : n_cont;
+                memcpy(d->spec_pending_drafts, cont,
+                       (size_t)cnt * sizeof(cont[0]));
+                d->spec_pending_count = cnt;
+                d->spec_pending_token =
+                    dist_logits_argmax(rows + (uint64_t)fused_k * vocab, vocab);
+                d->spec_pending_pos = start + rows_n;
+            }
+            ds4_session_set_logits(owner,
+                                   rows + (uint64_t)fused_k * vocab,
+                                   vocab);
+        } else {
+            char commit_err[192] = "";
+            if (dist_coordinator_spec_commit_prefix(&d->state,
+                                                    owner,
+                                                    &d->plan,
+                                                    span_tokens,
+                                                    (uint32_t)(1 + accept_n),
+                                                    start,
+                                                    d->session_id,
+                                                    d->request_id++,
+                                                    commit_err,
+                                                    sizeof(commit_err)) == 0) {
+                ds4_session_set_logits(owner,
+                                       rows + (uint64_t)accept_n * vocab,
+                                       vocab);
+            } else {
+                if (getenv("DS4_MTP_SPEC_LOG")) {
+                    fprintf(stderr,
+                            "ds4: dist spec prefix commit fallback: %s\n",
+                            commit_err);
+                }
+                (void)ds4_session_dist_frontier_restore(owner, &fused_frontier);
+                if (!ds4_session_dist_timeline_truncate(owner, start)) {
+                    free(rows);
+                    if (errlen) snprintf(err, errlen, "coordinator speculative timeline rewind failed");
+                    return -1;
+                }
+                float *reeval_logits = malloc((size_t)vocab * sizeof(float));
+                if (!reeval_logits) {
+                    free(rows);
+                    if (errlen) snprintf(err, errlen, "out of memory allocating speculative re-eval logits");
+                    return -1;
+                }
+                const int rrc = dist_coordinator_eval_span(&d->state,
+                                                           owner,
+                                                           &d->plan,
+                                                           span_tokens,
+                                                           (uint32_t)(1 + accept_n),
+                                                           start,
+                                                           d->session_id,
+                                                           d->request_id++,
+                                                           false,
+                                                           DS4_DIST_WORK_F_SPEC_ROLLBACK,
+                                                           false,
+                                                           NULL,
+                                                           reeval_logits,
+                                                           NULL,
+                                                           NULL,
+                                                           err,
+                                                           errlen);
+                if (rrc != 0) {
+                    free(reeval_logits);
+                    free(rows);
+                    if (getenv("DS4_MTP_SPEC_LOG")) {
+                        fprintf(stderr,
+                                "ds4: dist mtp spec rollback span failed rc=%d: %s\n",
+                                rrc, err && err[0] ? err : "(no detail)");
+                    }
+                    int n_accept = 0;
+                    accepted[n_accept++] = first_token;
+                    DIST_MTP_SPEC_REBUILD(rrc);
+                    if (rebuilt) {
+                        ds4_session_set_logits(owner, rebuild_logits, vocab);
+                        free(rebuild_logits);
+                        return n_accept;
+                    }
+                    if (errlen) snprintf(err, errlen, "%s", fail_msg);
+                    return -1;
+                }
+                ds4_session_set_logits(owner, reeval_logits, vocab);
+                free(reeval_logits);
+            }
+        }
+        free(rows);
+        int n_accept = 0;
+        accepted[n_accept++] = first_token;
+        for (int i = 0; i < accept_n && n_accept < accepted_cap; i++) {
+            accepted[n_accept++] = span_tokens[i + 1];
+            if (span_tokens[i + 1] == eos_token) break;
+        }
+        return n_accept;
+    }
+
     /* 1. Base decode of first_token; the worker returns its logits plus the
      * MTP head's draft tokens for the following positions. */
     int n_accept = 0;
@@ -6056,14 +6293,6 @@ int ds4_dist_session_mtp_spec_cycle(
      * return that even when fully accepted.  Below the threshold, emit the
      * base token and keep its logits live (the worker also rejects
      * single-token verify spans). */
-    int min_verify = 3;
-    {
-        const char *env = getenv("DS4_DIST_SPEC_MIN_DRAFT");
-        if (env && env[0]) {
-            const int v = atoi(env);
-            if (v >= 2 && v <= 16) min_verify = v;
-        }
-    }
     if (draft_n < min_verify || draft_n < 2) {
         ds4_session_set_logits(owner, logits0, vocab);
         free(logits0);
@@ -6090,6 +6319,11 @@ int ds4_dist_session_mtp_spec_cycle(
      * DSpark capture, which would starve the next propose; keep it for the
      * legacy MTP head only. */
     const bool decode2_verify = draft_n == 2 && ds4_engine_has_mtp(e);
+    /* DSpark verify spans also return continuation drafts proposed from the
+     * last row, so a full accept can fuse the next cycle into one span. */
+    const bool want_cont = !decode2_verify && !ds4_engine_has_mtp(e);
+    int cont[16];
+    int n_cont = 0;
     const double verify_t0 = dist_now_sec();
     rc = dist_coordinator_eval_span(&d->state,
                                     owner,
@@ -6101,12 +6335,13 @@ int ds4_dist_session_mtp_spec_cycle(
                                     d->request_id++,
                                     false,
                                     DS4_DIST_WORK_F_SPEC_VERIFY |
-                                        DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS,
+                                        DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS |
+                                        (want_cont ? DS4_DIST_WORK_F_OUTPUT_DRAFTS : 0u),
                                     decode2_verify,
                                     decode2_verify ? &verify_top0 : NULL,
                                     rows,
-                                    NULL,
-                                    NULL,
+                                    want_cont ? cont : NULL,
+                                    want_cont ? &n_cont : NULL,
                                     err,
                                     errlen);
     const double verify_ms = (dist_now_sec() - verify_t0) * 1000.0;
@@ -6243,6 +6478,16 @@ int ds4_dist_session_mtp_spec_cycle(
         ds4_session_set_logits(owner, reeval_logits, vocab);
         free(reeval_logits);
     } else {
+        if (want_cont && n_cont > 0 && drafts[draft_n - 1] != eos_token) {
+            /* Full accept: arm the next cycle's fused span. */
+            int cnt = n_cont > 16 ? 16 : n_cont;
+            memcpy(d->spec_pending_drafts, cont,
+                   (size_t)cnt * sizeof(cont[0]));
+            d->spec_pending_count = cnt;
+            d->spec_pending_token = dist_logits_argmax(
+                    rows + (uint64_t)(draft_n - 1) * vocab, vocab);
+            d->spec_pending_pos = start + 1u + (uint32_t)draft_n;
+        }
         /* decode2 payload carries row-1 logits at the buffer base; the
          * batch path carries them at the last row offset. */
         ds4_session_set_logits(owner,
@@ -8004,7 +8249,10 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "speculative verify span needs multiple tokens");
     }
-    if (output_drafts && work.n_tokens != 1u) {
+    /* Drafts ride either a single-token base decode or, combined with
+     * OUTPUT_ALL_LOGITS, a fused verify span (continuation drafts proposed
+     * from the last verified row). */
+    if (output_drafts && work.n_tokens != 1u && !output_all_logits) {
         free(route_blob);
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "draft output needs a single-token span");
@@ -8014,9 +8262,12 @@ static int dist_worker_process_work_payload(
     if (drafts_max < 0) drafts_max = 0;
     if (drafts_max > 16) drafts_max = 16;
     const bool decode2_span =
-        output_all_logits && work.n_tokens == 2u && !spec_rollback;
+        output_all_logits && work.n_tokens == 2u && !spec_rollback &&
+        !output_drafts;
     const uint32_t result_kind = final_ack_only || spec_commit
         ? DS4_DIST_RESULT_ACK
+        : output_drafts && output_all_logits
+            ? DS4_DIST_RESULT_LOGITS_NROWS
         : output_drafts
             ? DS4_DIST_RESULT_LOGITS_DRAFTS
             : decode2_span
@@ -8026,6 +8277,8 @@ static int dist_worker_process_work_payload(
                     : (local_output_logits ? DS4_DIST_RESULT_LOGITS : DS4_DIST_RESULT_HIDDEN_STATE);
     const uint32_t result_bytes = final_ack_only || spec_commit
         ? 0u
+        : output_drafts && output_all_logits
+            ? work.n_tokens * vocab * 4u + 4u + 4u * (uint32_t)drafts_max
         : output_drafts
             ? vocab * 4u + 4u + 4u * (uint32_t)drafts_max
             : decode2_span
@@ -8230,9 +8483,24 @@ static int dist_worker_process_work_payload(
          * DSpark propose pipeline). */
         if (drafts_max > 0) {
             char draft_err[128];
+            int draft_token = tokens[0];
+            uint32_t draft_pos = work.pos0 + 1u;
+            if (output_all_logits) {
+                /* Continuation drafts for a fused verify span: propose from
+                 * the last verified row, whose greedy token becomes the next
+                 * base token whenever the whole span is accepted. */
+                const float *last_row =
+                    result + (uint64_t)(work.n_tokens - 1u) * vocab;
+                uint32_t am = 0;
+                for (uint32_t vi = 1; vi < vocab; vi++) {
+                    if (last_row[vi] > last_row[am]) am = vi;
+                }
+                draft_token = (int)am;
+                draft_pos = work.pos0 + work.n_tokens;
+            }
             if (ds4_session_dist_support_draft(session->session,
-                                               tokens[0],
-                                               work.pos0 + 1u,
+                                               draft_token,
+                                               draft_pos,
                                                drafts,
                                                drafts_max,
                                                &n_drafts,
@@ -8252,8 +8520,12 @@ static int dist_worker_process_work_payload(
     if (output_drafts) {
         /* Always write the draft count: a zero-draft cycle (scheduler or
          * confidence skip, or a failed drafter) must ship count=0, not an
-         * uninitialized count under a drafts_max-sized payload. */
-        uint8_t *p = (uint8_t *)result + (uint64_t)vocab * 4u;
+         * uninitialized count under a drafts_max-sized payload.  The drafts
+         * trail the logits payload: one row for a base decode, n rows for a
+         * fused verify span. */
+        const uint64_t logits_payload =
+            (uint64_t)(output_all_logits ? work.n_tokens : 1u) * vocab * 4u;
+        uint8_t *p = (uint8_t *)result + logits_payload;
         const uint32_t nd = n_drafts > 0 ? (uint32_t)n_drafts : 0u;
         memcpy(p, &nd, 4u);
         p += 4u;
@@ -8262,7 +8534,7 @@ static int dist_worker_process_work_payload(
             memcpy(p, &dv, 4u);
             p += 4u;
         }
-        payload_bytes = vocab * 4u + 4u + 4u * nd;
+        payload_bytes = (uint32_t)logits_payload + 4u + 4u * nd;
     }
 
     uint32_t result_wire_bytes = payload_bytes;
