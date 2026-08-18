@@ -50973,9 +50973,11 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
+    /* DSpark drafts flow through the distributed route too: the worker owns
+     * the capture target layers in the pipeline split and runs the propose
+     * there, so the coordinator sizes its cycle from the same block. */
     if (e &&
         e->backend != DS4_BACKEND_CPU &&
-        e->distributed.role == DS4_DISTRIBUTED_NONE &&
         e->support_kind == DS4_SUPPORT_DSPARK &&
         e->dspark &&
         e->dspark_weights.block_size > 1) {
@@ -51178,6 +51180,65 @@ int ds4_session_dist_mtp_draft(ds4_session *s, int token, uint32_t pos,
     return 0;
 }
 
+static bool ds4_session_prepare_dspark_draft(ds4_session *s,
+                                             int token,
+                                             uint32_t pos);
+
+int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
+                                  int *drafts, int max_drafts, int *n_drafts,
+                                  char *err, size_t errlen) {
+    if (n_drafts) *n_drafts = 0;
+    if (!s || !drafts || max_drafts <= 0 || !s->engine) {
+        if (errlen) snprintf(err, errlen, "invalid distributed DSpark draft request");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    if (e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark) {
+        if (errlen) snprintf(err, errlen, "DSpark runtime drafting is not enabled");
+        return 1;
+    }
+    /* Same contract as the local speculative cycle: prepare fills the
+     * session draft block from the captured target hiddens, or leaves it
+     * invalid when the scheduler or the confidence gate skips this cycle
+     * (that is a normal outcome, not an error). */
+    (void)ds4_session_prepare_dspark_draft(s, token, pos);
+    if (!s->dspark_draft_valid || s->dspark_draft_len == 0) {
+        ds4_session_dspark_scheduler_note(s, 0, true, 0.0);
+        return 0;
+    }
+    int n = (int)s->dspark_draft_len;
+    if (n > max_drafts) n = max_drafts;
+    for (int i = 0; i < n; i++) drafts[i] = s->dspark_draft_tokens[i];
+    /* The coordinator consumes the block this cycle either way. */
+    s->dspark_draft_valid = false;
+    s->dspark_draft_len = 0;
+    *n_drafts = n;
+    return 0;
+}
+
+int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
+                                   int *drafts, int max_drafts, int *n_drafts,
+                                   char *err, size_t errlen) {
+    if (n_drafts) *n_drafts = 0;
+    if (!s || !s->engine) {
+        if (errlen) snprintf(err, errlen, "missing distributed draft session");
+        return 1;
+    }
+    switch (s->engine->support_kind) {
+    case DS4_SUPPORT_DSPARK:
+        return ds4_session_dist_dspark_draft(s, token, pos, drafts,
+                                             max_drafts, n_drafts,
+                                             err, errlen);
+    case DS4_SUPPORT_MTP_LEGACY:
+        return ds4_session_dist_mtp_draft(s, token, pos, drafts,
+                                          max_drafts, n_drafts,
+                                          err, errlen);
+    default:
+        if (errlen) snprintf(err, errlen, "no support model for drafting");
+        return 1;
+    }
+}
+
 bool ds4_session_dist_frontier_snapshot(ds4_session *s,
                                         ds4_dist_mtp_frontier *f) {
     if (!f) return false;
@@ -51288,6 +51349,24 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 int ds4_session_dist_mtp_draft(ds4_session *s, int token, uint32_t pos,
                                int *drafts, int max_drafts, int *n_drafts,
                                char *err, size_t errlen) {
+    (void)s; (void)token; (void)pos; (void)drafts; (void)max_drafts;
+    if (n_drafts) *n_drafts = 0;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+}
+
+int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
+                                  int *drafts, int max_drafts, int *n_drafts,
+                                  char *err, size_t errlen) {
+    (void)s; (void)token; (void)pos; (void)drafts; (void)max_drafts;
+    if (n_drafts) *n_drafts = 0;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+}
+
+int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
+                                   int *drafts, int max_drafts, int *n_drafts,
+                                   char *err, size_t errlen) {
     (void)s; (void)token; (void)pos; (void)drafts; (void)max_drafts;
     if (n_drafts) *n_drafts = 0;
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
@@ -59731,6 +59810,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
+        /* Keep the DSpark capture ring fresh on the rank that owns the
+         * target layers, so the worker can draft after this decode.  Every
+         * call below no-ops when this slice has no capture targets. */
+        metal_graph_dspark_capture_begin(g);
         if (g->ssd_streaming) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
@@ -59752,6 +59835,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                     g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
                     g->after_ffn_hc_by_tier[g->active_tier] = tmp;
                 }
+                if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
             if (ok && output_logits) {
@@ -59776,6 +59860,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
                 g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
                 g->after_ffn_hc_by_tier[g->active_tier] = tmp;
+                if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
                 encoded_layers++;
                 if (ok &&
                     split_after_layers != 0 &&
@@ -59875,6 +59960,18 @@ static int ds4_session_eval_layer_slice_span(
     }
 
     const int src_tier = g->active_tier;
+    /* DSpark capture across pipeline spans: a span that continues exactly
+     * from a captured checkpoint (the speculative verify) extends the
+     * previous capture row, so the post-accept batch window covers the
+     * base token too; any other span (prefill chunks, rollback re-evals)
+     * rebuilds the window from scratch.  Everything below no-ops unless
+     * this slice owns the capture target layers. */
+    const bool dspark_suffix_capture = ok &&
+        metal_graph_dspark_capture_verified_suffix_begin(g, pos0, n_tokens,
+                                                         false);
+    if (ok && !dspark_suffix_capture) {
+        metal_graph_dspark_capture_begin_prefill(g);
+    }
     const bool batch_selected_addr =
         g->ssd_streaming &&
         layer_start == 0 &&
@@ -59900,6 +59997,13 @@ static int ds4_session_eval_layer_slice_span(
                                                     pos0,
                                                     n_tokens);
             }
+            if (ok) {
+                ok = dspark_suffix_capture
+                    ? metal_graph_dspark_capture_verified_suffix_layer(
+                              g, il, pos0, n_tokens)
+                    : metal_graph_dspark_capture_prefill_layer(
+                              g, il, pos0, n_tokens);
+            }
             if (ok) ok = ds4_gpu_end_commands() != 0;
         }
     } else {
@@ -59911,11 +60015,36 @@ static int ds4_session_eval_layer_slice_span(
                                                 il,
                                                 pos0,
                                                 n_tokens);
+            if (ok) {
+                ok = dspark_suffix_capture
+                    ? metal_graph_dspark_capture_verified_suffix_layer(
+                              g, il, pos0, n_tokens)
+                    : metal_graph_dspark_capture_prefill_layer(
+                              g, il, pos0, n_tokens);
+            }
         }
     }
     if (ok && output_logits) {
         ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
-        if (output_all_logits) {
+        if (output_all_logits && !g->ssd_streaming && g->spec_logits &&
+            ds4_gpu_tensor_bytes(g->spec_logits) >=
+                (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float)) {
+            /* Batched output head, same as the single-node verifier: one
+             * pass over the head weights for all rows instead of one full
+             * ~vocab x embd stream per draft row. */
+            ok = metal_graph_encode_output_head_batch(g,
+                                                      &e->model,
+                                                      &e->weights,
+                                                      n_tokens,
+                                                      e->weights.output->dim[1]);
+            if (ok) {
+                ok = ds4_gpu_tensor_read(g->spec_logits,
+                                         0,
+                                         logits,
+                                         (uint64_t)n_tokens * DS4_N_VOCAB *
+                                             sizeof(float)) != 0;
+            }
+        } else if (output_all_logits) {
             for (uint32_t i = 0; ok && i < n_tokens; i++) {
                 ds4_gpu_tensor *row_hc =
                     metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), i, hc_dim);
@@ -66484,12 +66613,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
         if (!accepted) return 0;
-        /* Legacy MTP speculative cycle over the pipeline split: the worker
-         * drafts with the MTP head and the coordinator verifies multi-row
-         * spans through the normal route.  Falls back to per-token decode
-         * when the support model is absent or disabled. */
-        if (s->engine && s->engine->mtp_ready &&
-            s->engine->mtp_draft_tokens > 1) {
+        /* Speculative cycle over the pipeline split: the worker drafts with
+         * whichever support model it loaded (legacy MTP head or the DSpark
+         * propose pipeline; both own the final hidden state there) and the
+         * coordinator verifies multi-row spans through the normal route.
+         * Falls back to per-token decode when the support model is absent
+         * or disabled. */
+        if (s->engine && ds4_engine_mtp_draft_tokens(s->engine) > 1) {
             return ds4_dist_session_mtp_spec_cycle(s->distributed, s,
                                                    first_token, max_tokens,
                                                    eos_token, accepted,

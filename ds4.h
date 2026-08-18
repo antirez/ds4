@@ -498,6 +498,17 @@ typedef struct ds4_dist_mtp_frontier {
 int ds4_session_dist_mtp_draft(ds4_session *s, int token, uint32_t pos,
                                int *drafts, int max_drafts, int *n_drafts,
                                char *err, size_t errlen);
+/* DSpark drafting for the pipeline worker: runs the full propose pipeline
+ * (stage chain, confidence gate, markov bias) from the hidden states this
+ * rank captured at the target layers during its slice evals.  Zero drafts
+ * with a 0 return is a normal skip (scheduler or confidence gate). */
+int ds4_session_dist_dspark_draft(ds4_session *s, int token, uint32_t pos,
+                                  int *drafts, int max_drafts, int *n_drafts,
+                                  char *err, size_t errlen);
+/* Dispatch by the loaded support model kind (legacy MTP head or DSpark). */
+int ds4_session_dist_support_draft(ds4_session *s, int token, uint32_t pos,
+                                   int *drafts, int max_drafts, int *n_drafts,
+                                   char *err, size_t errlen);
 /* Snapshot/restore the session's owned compressor/indexer frontiers.  Cheap:
  * only small per-layer state tensors, never the full KV caches. */
 bool ds4_session_dist_frontier_snapshot(ds4_session *s,

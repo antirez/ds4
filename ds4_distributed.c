@@ -5933,6 +5933,11 @@ int ds4_dist_session_mtp_spec_cycle(
     const double base_ms = (dist_now_sec() - cycle_t0) * 1000.0;
     if (rc != 0) {
         free(logits0);
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist mtp spec base span failed rc=%d: %s\n",
+                    rc, err && err[0] ? err : "(no detail)");
+        }
         DIST_MTP_SPEC_REBUILD(rc);
         if (rebuilt) {
             ds4_session_set_logits(owner, rebuild_logits, vocab);
@@ -5962,15 +5967,30 @@ int ds4_dist_session_mtp_spec_cycle(
         free(logits0);
         return n_accept;
     }
-    free(logits0);
-
     int draft_n = draft_cap;
     if (draft_n > max_tokens - n_accept) draft_n = max_tokens - n_accept;
     if (draft_n > accepted_cap - n_accept) draft_n = accepted_cap - n_accept;
     int room = ds4_session_ctx(owner) - ds4_session_tokens(owner)->len;
     if (draft_n > room - 1) draft_n = room - 1;
-    if (draft_n <= 0) return n_accept;
     if (n_drafts < draft_n) draft_n = n_drafts;
+    /* A verify span costs two serialized slice evals; shallow blocks cannot
+     * return that even when fully accepted.  Below the threshold, emit the
+     * base token and keep its logits live (the worker also rejects
+     * single-token verify spans). */
+    int min_verify = 3;
+    {
+        const char *env = getenv("DS4_DIST_SPEC_MIN_DRAFT");
+        if (env && env[0]) {
+            const int v = atoi(env);
+            if (v >= 2 && v <= 16) min_verify = v;
+        }
+    }
+    if (draft_n < min_verify || draft_n < 2) {
+        ds4_session_set_logits(owner, logits0, vocab);
+        free(logits0);
+        return n_accept;
+    }
+    free(logits0);
 
     /* 2. Speculative verify span: decode the draft rows in one multi-token
      * span per machine.  Both sides snapshot their frontier first so a
@@ -5987,7 +6007,10 @@ int ds4_dist_session_mtp_spec_cycle(
         return -1;
     }
     int verify_top0 = -1;
-    const bool decode2_verify = draft_n == 2;
+    /* The exact two-row verifier skips the batch path but also skips the
+     * DSpark capture, which would starve the next propose; keep it for the
+     * legacy MTP head only. */
+    const bool decode2_verify = draft_n == 2 && ds4_engine_has_mtp(e);
     const double verify_t0 = dist_now_sec();
     rc = dist_coordinator_eval_span(&d->state,
                                     owner,
@@ -6010,6 +6033,11 @@ int ds4_dist_session_mtp_spec_cycle(
     const double verify_ms = (dist_now_sec() - verify_t0) * 1000.0;
     if (rc != 0) {
         free(rows);
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            fprintf(stderr,
+                    "ds4: dist mtp spec verify span failed rc=%d: %s\n",
+                    rc, err && err[0] ? err : "(no detail)");
+        }
         (void)ds4_session_dist_frontier_restore(owner, &frontier);
         DIST_MTP_SPEC_REBUILD(rc);
         if (rebuilt) {
@@ -6083,6 +6111,11 @@ int ds4_dist_session_mtp_spec_cycle(
         if (rc != 0) {
             free(reeval_logits);
             free(rows);
+            if (getenv("DS4_MTP_SPEC_LOG")) {
+                fprintf(stderr,
+                        "ds4: dist mtp spec rollback span failed rc=%d: %s\n",
+                        rc, err && err[0] ? err : "(no detail)");
+            }
             DIST_MTP_SPEC_REBUILD(rc);
             if (rebuilt) {
                 ds4_session_set_logits(owner, rebuild_logits, vocab);
@@ -8050,22 +8083,24 @@ static int dist_worker_process_work_payload(
     int drafts[16];
     int n_drafts = 0;
     if (output_drafts) {
-        /* Drafts are advisory: on any MTP failure the result degrades to
-         * plain logits and the coordinator runs ordinary decode. */
+        /* Drafts are advisory: on any drafting failure the result degrades
+         * to plain logits and the coordinator runs ordinary decode.  The
+         * dispatcher picks the loaded support model (legacy MTP head or the
+         * DSpark propose pipeline). */
         if (drafts_max > 0) {
             char draft_err[128];
-            if (ds4_session_dist_mtp_draft(session->session,
-                                           tokens[0],
-                                           work.pos0 + 1u,
-                                           drafts,
-                                           drafts_max,
-                                           &n_drafts,
-                                           draft_err,
-                                           sizeof(draft_err)) != 0) {
+            if (ds4_session_dist_support_draft(session->session,
+                                               tokens[0],
+                                               work.pos0 + 1u,
+                                               drafts,
+                                               drafts_max,
+                                               &n_drafts,
+                                               draft_err,
+                                               sizeof(draft_err)) != 0) {
                 n_drafts = 0;
                 if (getenv("DS4_MTP_SPEC_LOG")) {
                     fprintf(stderr,
-                            "ds4: dist worker MTP draft failed: %s\n",
+                            "ds4: dist worker draft failed: %s\n",
                             draft_err);
                 }
             }
@@ -8073,17 +8108,20 @@ static int dist_worker_process_work_payload(
     }
 
     uint32_t payload_bytes = result_bytes;
-    if (n_drafts > 0) {
+    if (output_drafts) {
+        /* Always write the draft count: a zero-draft cycle (scheduler or
+         * confidence skip, or a failed drafter) must ship count=0, not an
+         * uninitialized count under a drafts_max-sized payload. */
         uint8_t *p = (uint8_t *)result + (uint64_t)vocab * 4u;
-        uint32_t nd = (uint32_t)n_drafts;
+        const uint32_t nd = n_drafts > 0 ? (uint32_t)n_drafts : 0u;
         memcpy(p, &nd, 4u);
         p += 4u;
-        for (int i = 0; i < n_drafts; i++) {
+        for (uint32_t i = 0; i < nd; i++) {
             int32_t dv = (int32_t)drafts[i];
             memcpy(p, &dv, 4u);
             p += 4u;
         }
-        payload_bytes = vocab * 4u + 4u + 4u * (uint32_t)n_drafts;
+        payload_bytes = vocab * 4u + 4u + 4u * nd;
     }
 
     uint32_t result_wire_bytes = payload_bytes;
