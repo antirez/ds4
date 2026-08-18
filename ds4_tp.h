@@ -30,6 +30,15 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
+    /* KV-split gate kinds (DS4_TP_KV_SPLIT): exchanged on the dedicated
+     * split channel, not the row-gate schedule. */
+    DS4_TP_SPLIT_GATE_INDEXER = 0,
+    DS4_TP_SPLIT_GATE_ATTN_SCORES = 1,
+    DS4_TP_SPLIT_GATES_PER_LAYER = 2,
+    /* Bytes reserved per split-gate slot: the attention score partials are
+     * 32 heads x 256 rows in fp16 (16 KiB); the indexer merge carries 512
+     * (id, fp32 score) candidates (4 KiB). */
+    DS4_TP_SPLIT_SLOT_BYTES = 16384,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
@@ -121,6 +130,8 @@ uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate)
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_split_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind);
+uint64_t ds4_tp_slab_split_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 /* Offset of the per-slot u64 in-flags words (backend release protocol). */
 uint64_t ds4_tp_slab_in_flags_offset(const ds4_tp *tp);
@@ -141,6 +152,12 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes);
+
+/* KV-split gate: small fixed-slot payload exchange (indexer candidates,
+ * attention score partials) on the dedicated split channel.  Both ranks
+ * derive (layer, kind, bytes) from seq through the lockstep order. */
+int ds4_tp_split_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t kind,
+                               uint64_t seq, uint64_t bytes);
 
 /* Lockstep mirroring (leader side) and worker loop primitives. */
 typedef struct {

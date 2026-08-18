@@ -35,6 +35,10 @@
  * unit; match the numeric convention already used by the MoE launcher
  * (Q4_K = 12u there). */
 #define DS4_ROCM_TP_TENSOR_Q8_0 8u
+/* KV-split channel geometry (mirrors ds4_tp.h; this unit does not include
+ * the transport header). */
+#define DS4_ROCM_TP_SPLIT_GATES_PER_LAYER 2u
+#define DS4_ROCM_TP_SPLIT_SLOT_BYTES 16384u
 
 #define DS4_ROCM_TP_QUEUE 512u
 #define DS4_ROCM_TP_TIMEOUT_SEC 300.0
@@ -44,12 +48,14 @@
 #define ROCM_TP_TAG_ROW 0x00000000u
 #define ROCM_TP_TAG_BATCH 0x80000000u
 #define ROCM_TP_TAG_BIG 0x40000000u
-#define ROCM_TP_TAG_MASK 0xC0000000u
+#define ROCM_TP_TAG_SPLIT 0x20000000u
+#define ROCM_TP_TAG_MASK 0xE0000000u
 #define ROCM_TP_SEQ_MASK 0x3FFFFFFFu
 
 static ds4_gpu_tp_exchange_fn g_tp_exchange_fn;
 static ds4_gpu_tp_batch_exchange_fn g_tp_batch_exchange_fn;
 static ds4_gpu_tp_big_exchange_fn g_tp_big_exchange_fn;
+static ds4_gpu_tp_split_exchange_fn g_tp_split_exchange_fn;
 static void *g_tp_exchange_ud;
 
 static pthread_t g_tp_thread;
@@ -65,6 +71,9 @@ typedef struct {
     uint64_t seq;
     uint32_t big;    /* prefill big gate */
     uint64_t big_bytes;
+    uint32_t split;   /* kv-split small gate */
+    uint32_t split_kind;
+    uint64_t split_bytes;
     uint32_t event_idx; /* arrival event */
 } ds4_rocm_tp_req;
 
@@ -74,6 +83,7 @@ static uint32_t g_tp_qcount;
 
 static uint64_t g_tp_seq;        /* row gate sequence */
 static uint64_t g_tp_batch_seq;  /* batch + big gate sequence (shared, like Metal) */
+static uint64_t g_tp_split_seq;  /* kv-split gate sequence */
 
 /* Arrival signaling via stream events instead of a flag kernel: one kernel
  * launch per gate disappears from the critical path (the eager stream still
@@ -95,6 +105,9 @@ static void *g_tp_slab_dev;    /* device alias of the slab base */
 static void *g_tp_slab_host;  /* host alias of the slab base */
 static uint64_t g_tp_gpu_flags_off;
 static uint64_t g_tp_in_flags_off;
+static uint64_t g_tp_split_out_off;
+static uint64_t g_tp_split_in_off;
+static uint64_t g_tp_split_slot_bytes;
 
 /* Big-gate staging: pinned, host-mapped pair plus a global monotonic
  * release word (covers all earlier kicks of the shared batch sequence). */
@@ -130,14 +143,36 @@ __global__ static void tp_gate_wait_kernel(
         volatile const unsigned long long *release,
         unsigned long long expected) {
     if (blockIdx.x == 0u && threadIdx.x == 0u) {
-        const unsigned long long tag = expected & 0xC000000000000000ull;
+        const unsigned long long tag = expected & 0xE000000000000000ull;
         const unsigned long long seq = expected & 0x3FFFFFFFFFFFFFFFull;
         for (;;) {
             const unsigned long long v = *release;
-            if ((v & 0xC000000000000000ull) == tag &&
+            if ((v & 0xE000000000000000ull) == tag &&
                 (v & 0x3FFFFFFFFFFFFFFFull) >= seq) break;
         }
         __threadfence_system();
+    }
+}
+
+__global__ static void tp_split_gate_wait_kernel(
+        volatile const unsigned long long *release,
+        unsigned long long expected_seq,
+        const float *src,
+        float *dst,
+        unsigned long long n) {
+    if (threadIdx.x == 0u) {
+        const unsigned long long tag = expected_seq & 0xE000000000000000ull;
+        const unsigned long long seq = expected_seq & 0x3FFFFFFFFFFFFFFFull;
+        for (;;) {
+            const unsigned long long v = *release;
+            if ((v & 0xE000000000000000ull) == tag &&
+                (v & 0x3FFFFFFFFFFFFFFFull) >= seq) break;
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (unsigned long long i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = src[i];
     }
 }
 
@@ -235,7 +270,14 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
         int ok = 1;
         if (getenv("DS4_TP_TIMING")) arrive_t = ds4_rocm_tp_now_sec();
         if (ok) {
-            if (req.big) {
+            if (req.split) {
+                ok = g_tp_split_exchange_fn ? g_tp_split_exchange_fn(
+                        g_tp_exchange_ud, req.layer, req.split_kind,
+                        req.seq, req.split_bytes) : 0;
+                ds4_rocm_tp_store_release(
+                        slot, 0x2000000000000000ull |
+                              (req.seq & ROCM_TP_SEQ_MASK));
+            } else if (req.big) {
                 if (g_tp_big_exchange_fn) {
                     ok = g_tp_big_exchange_fn(g_tp_exchange_ud, req.layer,
                                               req.seq, g_tp_stage_out,
@@ -282,7 +324,11 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
             g_tp_failed = 1;
             /* Unblock the GPU regardless; the garbage combine aborts at the
              * next gate encode through the failure flag. */
-            if (req.big) {
+            if (req.split) {
+                ds4_rocm_tp_store_release(
+                        slot, 0x2000000000000000ull |
+                              (req.seq & ROCM_TP_SEQ_MASK));
+            } else if (req.big) {
                 __atomic_store_n(g_tp_big_release_host,
                                  (unsigned long long)(req.seq & ROCM_TP_SEQ_MASK),
                                  __ATOMIC_RELEASE);
@@ -321,6 +367,14 @@ extern "C" void ds4_gpu_tp_set_slab_layout(uint64_t in_flags_off) {
     g_tp_in_flags_off = in_flags_off;
 }
 
+extern "C" void ds4_gpu_tp_set_split_layout(uint64_t split_out_off,
+                                            uint64_t split_in_off,
+                                            uint64_t split_slot_bytes) {
+    g_tp_split_out_off = split_out_off;
+    g_tp_split_in_off = split_in_off;
+    g_tp_split_slot_bytes = split_slot_bytes;
+}
+
 extern "C" int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab,
                     uint64_t gpu_flags_off,
@@ -339,11 +393,13 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     g_tp_failed = 0;
     g_tp_seq = 0;
     g_tp_batch_seq = 0;
+    g_tp_split_seq = 0;
     g_tp_qhead = 0;
     g_tp_qcount = 0;
     g_tp_exchange_fn = fn;
     g_tp_batch_exchange_fn = NULL;
     g_tp_big_exchange_fn = NULL;
+    g_tp_split_exchange_fn = NULL;
     g_tp_exchange_ud = ud;
 
     /* Pinned staging pair for big gates + the global big release word. */
@@ -405,6 +461,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     g_tp_exchange_fn = NULL;
     g_tp_batch_exchange_fn = NULL;
     g_tp_big_exchange_fn = NULL;
+    g_tp_split_exchange_fn = NULL;
     g_tp_exchange_ud = NULL;
     g_tp_slab_dev = NULL;
     g_tp_slab_host = NULL;
@@ -624,12 +681,61 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
     return ds4_gpu_tp_big_gate_kick(layer, rows, out_t, in_t, bytes) != 0;
 }
 
+extern "C" int ds4_gpu_tp_split_gate_encode(uint32_t layer, uint32_t kind,
+                                            const ds4_gpu_tensor *out_t,
+                                            ds4_gpu_tensor *in_t,
+                                            uint64_t bytes) {
+    if (!g_tp_thread_running || g_tp_failed || !out_t || !in_t ||
+        bytes == 0u || bytes > g_tp_split_slot_bytes || (bytes & 3ull) != 0ull) {
+        return 0;
+    }
+    const uint64_t seq = ++g_tp_split_seq;
+    const uint64_t n = bytes / 4ull;
+    const uint32_t slot = layer * 2u + 1u;
+    const uint64_t s_slot = (uint64_t)layer * DS4_ROCM_TP_SPLIT_GATES_PER_LAYER + kind;
+    char *split_out_dev = (char *)g_tp_slab_dev + g_tp_split_out_off +
+                          s_slot * g_tp_split_slot_bytes;
+    char *split_in_dev = (char *)g_tp_slab_dev + g_tp_split_in_off +
+                         s_slot * g_tp_split_slot_bytes;
+    tp_stage_copy_kernel<<<(unsigned)((n + 255ull) / 256ull), 256>>>(
+            (const float *)out_t->ptr, (float *)split_out_dev, n);
+    const uint32_t ev = (uint32_t)(++g_tp_event_seq % DS4_ROCM_TP_EVENTS);
+    if (!g_tp_events_ready) {
+        for (uint32_t i = 0; i < DS4_ROCM_TP_EVENTS; i++) {
+            if (cudaEventCreateWithFlags(&g_tp_events[i], cudaEventDisableTiming) != cudaSuccess) return 0;
+        }
+        g_tp_events_ready = 1;
+    }
+    cudaEventRecord(g_tp_events[ev], 0);
+    ds4_rocm_tp_req req;
+    memset(&req, 0, sizeof(req));
+    req.layer = layer;
+    req.gate = 1u;
+    req.seq = seq;
+    req.split = 1;
+    req.split_kind = kind;
+    req.split_bytes = bytes;
+    req.event_idx = ev;
+    if (!ds4_rocm_tp_enqueue(&req)) return 0;
+    tp_split_gate_wait_kernel<<<1, 256>>>(
+            ds4_rocm_tp_release_dev(slot),
+            0x2000000000000000ull | (unsigned long long)(seq & ROCM_TP_SEQ_MASK),
+            (const float *)split_in_dev,
+            (float *)in_t->ptr,
+            n);
+    return cuda_ok(cudaGetLastError(), "tp split gate encode");
+}
+
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
     g_tp_batch_exchange_fn = fn;
 }
 
 extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
     g_tp_big_exchange_fn = fn;
+}
+
+extern "C" void ds4_gpu_tp_set_split_exchange(ds4_gpu_tp_split_exchange_fn fn) {
+    g_tp_split_exchange_fn = fn;
 }
 
 /* ------------------------------------------------------------------ */

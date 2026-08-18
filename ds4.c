@@ -15268,6 +15268,11 @@ typedef struct {
     uint32_t tp_batch_rows;
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
+    /* KV-split indexer payloads: local/peer candidate lists exchanged
+     * through the split gate (ids + fp32 scores, 2 * TOP_K * 4 bytes). */
+    ds4_gpu_tensor *tp_split_idx_out;
+    ds4_gpu_tensor *tp_split_idx_in;
+    bool tp_kv_split;
 } ds4_gpu_graph;
 
 /* Tensors that are temporary for chunked prefill and grouped multi-session
@@ -22978,14 +22983,65 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_score_one_tensor(metal_graph_indexer_scores(g),
-                                                                metal_graph_indexer_q(g),
-                                                                metal_graph_indexer_weights(g),
-                                                                g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
-                                                                DS4_N_INDEXER_HEAD,
-                                                                DS4_N_INDEXER_HEAD_DIM,
-                                                                index_scale) != 0;
+                if (ok && g->tp_kv_split) {
+                    /* KV split: each rank scores only its parity rows, packs
+                     * its local top-k, exchanges candidate lists through the
+                     * split gate, and merges into the identical global
+                     * selection on both ranks. */
+                    const uint32_t n_idx = g->layer_n_index_comp[il];
+                    const uint32_t local_n =
+                        n_idx / 2u + ((n_idx & 1u) && g->tp_rank == 0u ? 1u : 0u);
+                    ok = ds4_gpu_indexer_score_one_split_tensor(
+                                 metal_graph_indexer_scores(g),
+                                 metal_graph_indexer_q(g),
+                                 metal_graph_indexer_weights(g),
+                                 g->layer_index_comp_cache[il],
+                                 n_idx,
+                                 ds4_layer_compress_ratio(il),
+                                 index_scale,
+                                 g->tp_rank) != 0;
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_tensor(
+                                     metal_graph_comp_selected(g),
+                                     metal_graph_indexer_scores(g),
+                                     local_n,
+                                     1,
+                                     DS4_N_INDEXER_TOP_K) != 0;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_split_pack_tensor(
+                                     g->tp_split_idx_out,
+                                     metal_graph_comp_selected(g),
+                                     metal_graph_indexer_scores(g),
+                                     local_n,
+                                     DS4_N_INDEXER_TOP_K,
+                                     g->tp_rank) != 0;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_tp_split_gate_encode(
+                                     il,
+                                     DS4_TP_SPLIT_GATE_INDEXER,
+                                     g->tp_split_idx_out,
+                                     g->tp_split_idx_in,
+                                     2u * DS4_N_INDEXER_TOP_K * 4u) != 0;
+                    }
+                    if (ok) {
+                        ok = ds4_gpu_indexer_topk_split_merge_tensor(
+                                     metal_graph_comp_selected(g),
+                                     g->tp_split_idx_out,
+                                     g->tp_split_idx_in,
+                                     DS4_N_INDEXER_TOP_K) != 0;
+                    }
+                } else {
+                    ok = ds4_gpu_indexer_score_one_tensor(metal_graph_indexer_scores(g),
+                                                          metal_graph_indexer_q(g),
+                                                          metal_graph_indexer_weights(g),
+                                                          g->layer_index_comp_cache[il],
+                                                          g->layer_n_index_comp[il],
+                                                          DS4_N_INDEXER_HEAD,
+                                                          DS4_N_INDEXER_HEAD_DIM,
+                                                          index_scale) != 0;
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -22994,11 +23050,13 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                                           metal_graph_indexer_scores(g),
-                                                           g->layer_n_index_comp[il],
-                                                           1,
-                                                           DS4_N_INDEXER_TOP_K) != 0;
+                if (ok && !g->tp_kv_split) {
+                    ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
+                                                     metal_graph_indexer_scores(g),
+                                                     g->layer_n_index_comp[il],
+                                                     1,
+                                                     DS4_N_INDEXER_TOP_K) != 0;
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
                                                                     il,
@@ -58231,6 +58289,15 @@ static int ds4_engine_tp_batch_exchange(void *ud, uint32_t layer,
     return ok;
 }
 
+static int ds4_engine_tp_split_exchange(void *ud, uint32_t layer,
+                                          uint32_t kind, uint64_t seq,
+                                          uint64_t bytes) {
+    ds4_tp *tp = ud;
+    const int ok = ds4_tp_split_gate_exchange(tp, layer, kind, seq, bytes);
+    if (!ok) ds4_tp_mark_failed(tp);
+    return ok;
+}
+
 static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
                                       const void *out, void *in,
                                       uint64_t bytes) {
@@ -58341,6 +58408,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
     if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab), err, errlen))
         return 0;
+    ds4_gpu_tp_set_split_layout(
+            ds4_tp_slab_split_out_offset(tp, 0, 0),
+            ds4_tp_slab_split_in_offset(tp, 0, 0),
+            DS4_TP_SPLIT_SLOT_BYTES);
     for (uint32_t l = 0; l < (uint32_t)DS4_N_LAYER; l++) {
         for (uint32_t gate = 0; gate < DS4_TP_GATES_PER_LAYER; gate++) {
             const uint32_t slot = l * DS4_TP_GATES_PER_LAYER + gate;
@@ -58373,6 +58444,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_gpu_tp_set_slab_layout(ds4_tp_slab_in_flags_offset(tp));
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
+    ds4_gpu_tp_set_split_exchange(ds4_engine_tp_split_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
      * leader computes full logits and nothing crosses the wire. */
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
@@ -58761,6 +58833,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     if (e->tp.active) {
+        const char *kv_split_env = getenv("DS4_TP_KV_SPLIT");
+        s->graph.tp_kv_split =
+            kv_split_env && kv_split_env[0] && strcmp(kv_split_env, "0") != 0;
+        if (s->graph.tp_kv_split) {
+            s->graph.tp_split_idx_out =
+                ds4_gpu_tensor_alloc(2u * DS4_N_INDEXER_TOP_K * 4u);
+            s->graph.tp_split_idx_in =
+                ds4_gpu_tensor_alloc(2u * DS4_N_INDEXER_TOP_K * 4u);
+            if (!s->graph.tp_split_idx_out || !s->graph.tp_split_idx_in) {
+                fprintf(stderr, "ds4: TP kv-split payload allocation failed\n");
+                metal_graph_free(&s->graph);
+                free(s);
+                return 1;
+            }
+        }
         s->graph.tp_world = 2;
         s->graph.tp_rank = (uint32_t)e->tp.rank;
         s->graph.tp_out = e->tp.out_views;

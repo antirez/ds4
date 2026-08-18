@@ -76,6 +76,8 @@ typedef struct {
     uint32_t psn;
     uint32_t qpn2;       /* bulk QP (prefill row swaps) */
     uint32_t psn2;
+    uint32_t qpn3;       /* split QP (kv-split gates) */
+    uint32_t psn3;
     uint32_t mtu;
     uint16_t lid;
     uint8_t gid[16];
@@ -136,6 +138,7 @@ typedef struct {
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+#define DS4_TP_RDMA_SPLIT_WR_TAG (UINT64_C(1) << 62)
 
 typedef struct {
     ds4_tp_verbs_api api;
@@ -146,6 +149,9 @@ typedef struct {
     struct ibv_qp *qp2;        /* bulk QP: prefill row swaps; keeps its own
                                 * recv credits so the decode window on qp is
                                 * never drained */
+    struct ibv_qp *qp3;        /* split QP: kv-split gates, isolated so the
+                                * sliding split window and the bulk rounds
+                                * never misorder each other's recvs */
     struct ibv_mr *mr;
     struct ibv_port_attr port;
     union ibv_gid gid;
@@ -154,6 +160,8 @@ typedef struct {
     ds4_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
+    uint64_t split_recv_done;   /* highest kv-split seq whose recv completed */
+    uint64_t split_recv_armed;  /* highest kv-split seq with a posted recv */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
     pthread_mutex_t post_lock;
@@ -186,6 +194,8 @@ struct ds4_tp {
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
+    uint64_t split_out_off;     /* [layer][kind] kv-split local payloads */
+    uint64_t split_in_off;      /* [layer][kind] kv-split peer payloads */
     uint64_t timeout_sec;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
@@ -542,11 +552,13 @@ int ds4_tp_validate_engine_options(
 uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
     uint64_t vec = (uint64_t)n_embd * sizeof(float);
     uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
+    uint64_t split_slots = (uint64_t)n_layer * DS4_TP_SPLIT_GATES_PER_LAYER;
     return slots * vec * 2 +    /* out + in vectors */
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2 + /* batch out+in */
+           split_slots * DS4_TP_SPLIT_SLOT_BYTES * 2; /* kv-split out+in */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -561,8 +573,14 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
-    tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->split_out_off = tp->batch_in_off +
+                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->split_in_off = tp->split_out_off +
+                       (uint64_t)tp->n_layer * DS4_TP_SPLIT_GATES_PER_LAYER *
+                           DS4_TP_SPLIT_SLOT_BYTES;
+    tp->slab_bytes = tp->split_in_off +
+                     (uint64_t)tp->n_layer * DS4_TP_SPLIT_GATES_PER_LAYER *
+                         DS4_TP_SPLIT_SLOT_BYTES;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -594,6 +612,20 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
     return tp->batch_in_off +
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
+}
+
+static uint32_t tp_split_slot(uint32_t layer, uint32_t kind) {
+    return layer * DS4_TP_SPLIT_GATES_PER_LAYER + kind;
+}
+
+uint64_t ds4_tp_slab_split_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind) {
+    return tp->split_out_off +
+           (uint64_t)tp_split_slot(layer, kind) * DS4_TP_SPLIT_SLOT_BYTES;
+}
+
+uint64_t ds4_tp_slab_split_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t kind) {
+    return tp->split_in_off +
+           (uint64_t)tp_split_slot(layer, kind) * DS4_TP_SPLIT_SLOT_BYTES;
 }
 
 /* ------------------------------------------------------------------------
@@ -784,6 +816,11 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: create_qp(UC bulk): %s", strerror(errno));
         return 0;
     }
+    r->qp3 = r->api.create_qp(r->pd, &qia);
+    if (!r->qp3) {
+        tp_set_err(err, errlen, "tp rdma: create_qp(UC split): %s", strerror(errno));
+        return 0;
+    }
 
     pthread_mutex_init(&r->post_lock, NULL);
     return 1;
@@ -808,6 +845,8 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
     mine.qpn2 = r->qp2->qp_num;
     mine.psn2 = (uint32_t)(getpid() ^ (uintptr_t)(tp + 1)) & 0xffffff;
+    mine.qpn3 = r->qp3->qp_num;
+    mine.psn3 = (uint32_t)(getpid() ^ (uintptr_t)(tp + 2)) & 0xffffff;
     if (getenv("DS4_TP_CQ_DEBUG")) {
         fprintf(stderr,
                 "ds4-tp: rdma hello local qpn=%u psn=%u qpn2=%u psn2=%u lid=%u mtu=%d gid_index=%d link=%d "
@@ -842,13 +881,14 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     }
 
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
-     * JACCL): MTU 1024 and GRH via the IPv4-mapped GID.  Both QPs ride the
-     * same recipe; the bulk QP addresses the peer's bulk QP. */
-    struct ibv_qp *qps[2] = { r->qp, r->qp2 };
-    uint32_t peer_qpn[2] = { r->peer.qpn, r->peer.qpn2 };
-    uint32_t peer_psn[2] = { r->peer.psn, r->peer.psn2 };
-    uint32_t my_psn[2] = { mine.psn, mine.psn2 };
-    for (int qi = 0; qi < 2; qi++) {
+     * JACCL): MTU 1024 and GRH via the IPv4-mapped GID.  All three QPs ride
+     * the same recipe; the bulk QP addresses the peer's bulk QP and the
+     * split QP the peer's split QP. */
+    struct ibv_qp *qps[3] = { r->qp, r->qp2, r->qp3 };
+    uint32_t peer_qpn[3] = { r->peer.qpn, r->peer.qpn2, r->peer.qpn3 };
+    uint32_t peer_psn[3] = { r->peer.psn, r->peer.psn2, r->peer.psn3 };
+    uint32_t my_psn[3] = { mine.psn, mine.psn2, mine.psn3 };
+    for (int qi = 0; qi < 3; qi++) {
         struct ibv_qp_attr a = {0};
         a.qp_state = IBV_QPS_INIT;
         a.pkey_index = 0;
@@ -962,7 +1002,12 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
             return 0;
         }
         if (wc[i].opcode & IBV_WC_RECV) {
-            if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+            if (wc[i].wr_id & DS4_TP_RDMA_SPLIT_WR_TAG) {
+                const uint64_t s = wc[i].wr_id & ~DS4_TP_RDMA_SPLIT_WR_TAG;
+                if (s > r->split_recv_done) r->split_recv_done = s;
+            } else if (wc[i].wr_id > r->recv_done) {
+                r->recv_done = wc[i].wr_id;
+            }
         } else if (r->send_outstanding > 0) {
             r->send_outstanding--;
         }
@@ -1091,6 +1136,134 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
     return ok;
+}
+
+/* KV-split channel: payloads of DS4_TP_SPLIT_SLOT_BYTES per (layer, kind)
+ * ride the latency QP with their own sequence space and receive window,
+ * like the row gates but on the split slab regions.  Both ranks derive the
+ * (layer, kind, bytes) of a seq deterministically from the lockstep order:
+ * kind = (seq-1) % 2, layer = ((seq-1)/2) % n_layer. */
+static void tp_split_seq_decode(const ds4_tp *tp, uint64_t seq,
+                                uint32_t *layer, uint32_t *kind) {
+    const uint64_t s = seq - 1u;
+    const uint64_t per_layer = DS4_TP_SPLIT_GATES_PER_LAYER;
+    *kind = (uint32_t)(s % per_layer);
+    *layer = (uint32_t)((s / per_layer) % tp->n_layer);
+}
+
+static int tp_rdma_post_split_recv(ds4_tp *tp, uint64_t seq) {
+    ds4_tp_rdma *r = &tp->rdma;
+    uint32_t layer = 0, kind = 0;
+    tp_split_seq_decode(tp, seq, &layer, &kind);
+    const uint32_t slot = layer * DS4_TP_SPLIT_GATES_PER_LAYER + kind;
+    const uintptr_t base = (uintptr_t)(tp->slab + tp->split_in_off +
+                                       (uint64_t)slot * DS4_TP_SPLIT_SLOT_BYTES);
+    struct ibv_sge sge;
+    struct ibv_recv_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+    sge.addr = base;
+    sge.length = DS4_TP_SPLIT_SLOT_BYTES;
+    sge.lkey = r->mr->lkey;
+    wr.wr_id = DS4_TP_RDMA_SPLIT_WR_TAG | seq;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    /* The split channel rides its own QP so its sliding lookahead window
+     * can never misorder the row gates or the prefill bulk rounds. */
+    const int post_rc = ibv_post_recv(r->qp3, &wr, &bad);
+    if (post_rc != 0) {
+        fprintf(stderr, "ds4-tp: rdma post_split_recv(seq %llu): rc=%d (%s)\n",
+                (unsigned long long)seq, post_rc, strerror(post_rc));
+        return 0;
+    }
+    return 1;
+}
+
+static int tp_rdma_split_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t kind,
+                                       uint64_t seq, uint64_t bytes) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const uint32_t slot = layer * DS4_TP_SPLIT_GATES_PER_LAYER + kind;
+    if (bytes == 0 || bytes > DS4_TP_SPLIT_SLOT_BYTES) return 0;
+    const uintptr_t send_base = (uintptr_t)(tp->slab + tp->split_out_off +
+                                            (uint64_t)slot * DS4_TP_SPLIT_SLOT_BYTES);
+    pthread_mutex_lock(&r->post_lock);
+    int ok = 1;
+    /* Sliding receive window, exactly like the row gates: arm up to 16
+     * receives ahead, then one more per completed gate. */
+    for (uint64_t s = r->split_recv_armed + 1u;
+         ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++) {
+        ok = tp_rdma_post_split_recv(tp, s);
+        if (ok) r->split_recv_armed = s;
+    }
+    struct ibv_sge sge;
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+    sge.addr = send_base;
+    sge.length = (uint32_t)bytes;
+    sge.lkey = r->mr->lkey;
+    wr.wr_id = seq;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    const int send_rc = ibv_post_send(r->qp3, &wr, &bad);
+    ok = send_rc == 0;
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: rdma split post_send: rc=%d (%s)\n",
+                send_rc, strerror(send_rc));
+    } else {
+        r->send_outstanding++;
+    }
+    double deadline = 0.0;
+    uint32_t peer_poll = 0;
+    while (ok && r->split_recv_done < seq) {
+        ok = tp_rdma_drain_cq(tp);
+        if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
+            fprintf(stderr, "ds4-tp: peer disconnected during RDMA split gate\n");
+            ok = 0;
+        }
+        if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->timeout_sec;
+        else if (tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: timeout waiting split gate seq %llu (done %llu)\n",
+                    (unsigned long long)seq, (unsigned long long)r->split_recv_done);
+            ok = 0;
+        }
+    }
+    pthread_mutex_unlock(&r->post_lock);
+    return ok;
+}
+
+int ds4_tp_split_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t kind,
+                               uint64_t seq, uint64_t bytes) {
+    if (!tp || bytes == 0 || bytes > DS4_TP_SPLIT_SLOT_BYTES ||
+        layer >= tp->n_layer || kind >= DS4_TP_SPLIT_GATES_PER_LAYER) return 0;
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        return tp_rdma_split_gate_exchange(tp, layer, kind, seq, bytes);
+    }
+#endif
+    ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
+                             (uint16_t)(0x5717u + kind), seq, bytes };
+    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+    ds4_tp_gate_header ph;
+    if (!tp_read_full_deadline(tp, tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+        ph.gate != (uint16_t)(0x5717u + kind) || ph.seq != seq ||
+        ph.bytes != bytes) {
+        fprintf(stderr,
+                "ds4-tp: split gate desync: got l=%u tag=%x seq=%llu b=%llu, "
+                "want l=%u seq=%llu b=%llu\n",
+                ph.layer, ph.gate, (unsigned long long)ph.seq,
+                (unsigned long long)ph.bytes, layer,
+                (unsigned long long)seq, (unsigned long long)bytes);
+        return 0;
+    }
+    const uint32_t slot = layer * DS4_TP_SPLIT_GATES_PER_LAYER + kind;
+    const void *out = tp->slab + tp->split_out_off +
+                      (uint64_t)slot * DS4_TP_SPLIT_SLOT_BYTES;
+    void *in = tp->slab + tp->split_in_off +
+               (uint64_t)slot * DS4_TP_SPLIT_SLOT_BYTES;
+    if (!tp_write_full(tp->data_fd, out, bytes)) return 0;
+    return tp_read_full(tp->data_fd, in, bytes);
 }
 
 static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
@@ -1379,6 +1552,7 @@ static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
     if (r->qp) r->api.destroy_qp(r->qp);
     if (r->qp2) r->api.destroy_qp(r->qp2);
+    if (r->qp3) r->api.destroy_qp(r->qp3);
     if (r->mr) r->api.dereg_mr(r->mr);
     if (r->cq) r->api.destroy_cq(r->cq);
     if (r->pd) r->api.dealloc_pd(r->pd);
