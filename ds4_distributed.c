@@ -6041,8 +6041,10 @@ int ds4_dist_session_mtp_spec_cycle(
     }
     d->spec_pending_count = 0;
     if (fused_k > draft_cap) fused_k = draft_cap;
-    /* Prefix commits need span rows <= DS4_SPEC_PREFIX_SLOTS + 1. */
-    if (fused_k > 4) fused_k = 4;
+    /* Prefix commits need span rows <= DS4_SPEC_PREFIX_SLOTS + 1 (the
+     * constant lives in ds4.c; the commit helper validates the real value
+     * and falls back to the rollback re-eval on any mismatch). */
+    if (fused_k > 5) fused_k = 5;
     if (fused_k > max_tokens - 1) fused_k = max_tokens - 1;
     if (fused_k > accepted_cap - 1) fused_k = accepted_cap - 1;
     {

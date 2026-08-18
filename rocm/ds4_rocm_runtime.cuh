@@ -4785,8 +4785,21 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
              cuda_env_present(dsv4_prequant_env));
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
-        g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
-        g_rocm_cfg.shared_down_cublas = !g_quality_mode;
+        /* Explicit =0 rollbacks so small speculative-verify batches can be
+         * A/B tested against the Q8 kernels (the f16 copies double the
+         * weight bytes read per matmul). */
+        const char *attn_out_cublas_env =
+            getenv("DS4_ROCM_ATTN_OUTPUT_CUBLAS");
+        g_rocm_cfg.attention_output_cublas_all =
+            !g_quality_mode &&
+            (attn_out_cublas_env == NULL ||
+             cuda_env_present(attn_out_cublas_env));
+        const char *shared_down_cublas_env =
+            getenv("DS4_ROCM_SHARED_DOWN_CUBLAS");
+        g_rocm_cfg.shared_down_cublas =
+            !g_quality_mode &&
+            (shared_down_cublas_env == NULL ||
+             cuda_env_present(shared_down_cublas_env));
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
         /*

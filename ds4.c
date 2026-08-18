@@ -2505,7 +2505,10 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
-#define DS4_SPEC_PREFIX_SLOTS 4
+/* Five slots let a fused distributed verify span carry the full 5-draft
+ * DSpark block (span rows = drafts + 1 must stay <= SLOTS + 1 for prefix
+ * capture, and partial commits reach 1 + (drafts - 1)). */
+#define DS4_SPEC_PREFIX_SLOTS 5
 
 typedef struct {
     uint32_t stages;
@@ -60113,6 +60116,17 @@ static int ds4_session_eval_layer_slice_span(
                               g, il, pos0, n_tokens)
                     : metal_graph_dspark_capture_prefill_layer(
                               g, il, pos0, n_tokens);
+            }
+            if (ok && output_all_logits &&
+                metal_graph_dspark_verify_selected_profile_enabled()) {
+                ok = ds4_gpu_end_commands() != 0 &&
+                     metal_graph_selected_profile_layer_impl(
+                             g,
+                             &e->weights.layer[il],
+                             il,
+                             n_tokens,
+                             "dist verify selected profile") &&
+                     ds4_gpu_begin_commands() != 0;
             }
         }
     }
