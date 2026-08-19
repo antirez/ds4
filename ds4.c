@@ -614,6 +614,14 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
+/* REAP-compact support: per-layer expert counts for models with REAP pruning.
+ * REAP25 models have 256 experts in hash-preserved layers (0-2) and 192 experts
+ * in pruned layers (3-42). This array stores the actual expert count per layer. */
+static uint32_t g_reap_layer_expert_count[DS4_MAX_LAYER];
+
+/* Forward declaration for REAP support */
+static uint32_t reap_layer_expert_count(uint32_t il);
+
 static const ds4_shape DS4_SHAPE_GLM52 = {
     .name = "GLM 5.2",
     .family = DS4_MODEL_FAMILY_GLM_DSA,
@@ -714,6 +722,20 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_LORA_O                  (g_ds4_shape.n_lora_o)
 #define DS4_N_EXPERT                  (g_ds4_shape.n_expert)
 #define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
+
+/* Cap on routed experts ACTIVATED per token (0 = model default top-N). The
+ * router still scores and ranks every expert; only the top-k weights are
+ * kept, renormalized to preserve the layer output scale. Deactivated slots
+ * get selected = -1 / weight = 0, the established skip sentinel. */
+static uint32_t g_ds4_n_experts_active = 0;
+
+void ds4_set_n_experts_active(uint32_t n_experts_active) {
+    g_ds4_n_experts_active = n_experts_active;
+}
+
+uint32_t ds4_get_n_experts_active(void) {
+    return g_ds4_n_experts_active;
+}
 #define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
 #define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
 #define DS4_N_FF_DENSE                (g_ds4_shape.n_ff_dense)
@@ -5096,11 +5118,14 @@ static void weights_validate_layout(
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+
+        /* REAP support: use per-layer expert count */
+        const uint32_t n_expert = reap_layer_expert_count(il);
+        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, n_expert, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_expert, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -5147,11 +5172,14 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+
+    /* MTP uses a single block; use layer 0 expert count for validation */
+    const uint32_t n_expert = reap_layer_expert_count(0);
+    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, n_expert, 0);
+    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, n_expert, 0, 0);
+    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_expert);
+    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_expert);
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
         ds4_die("MTP routed gate/up experts use different quant types");
     }
@@ -5501,6 +5529,22 @@ static void ds4_select_shape_from_metadata(
         g_ds4_shape = DS4_SHAPE_FLASH;
         return;
     }
+    if (n_expert >= n_expert_used && n_expert < DS4_SHAPE_FLASH.n_expert) {
+        ds4_shape compact_flash = DS4_SHAPE_FLASH;
+        compact_flash.name = "DeepSeek V4 Flash Compact";
+        compact_flash.n_expert = n_expert;
+        if (ds4_shape_matches_metadata(&compact_flash,
+                                       n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                       n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                       n_lora_o, n_out_group, n_expert,
+                                       n_expert_used, n_ff_exp, n_expert_shared,
+                                       n_hash_layer, n_swa, n_indexer_head,
+                                       n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                       n_hc_sinkhorn_iter)) {
+            g_ds4_shape = compact_flash;
+            return;
+        }
+    }
     if (ds4_shape_matches_metadata(&DS4_SHAPE_PRO,
                                    n_layer, n_embd, n_vocab, n_head, n_head_kv,
                                    n_head_dim, n_value_dim, n_rot, n_lora_q,
@@ -5525,6 +5569,78 @@ static void ds4_select_shape_from_metadata(
             n_ff_exp,
             n_indexer_top_k);
     exit(1);
+}
+
+/* =========================================================================
+ * REAP-Compact GGUF Support
+ * =========================================================================
+ *
+ * Compact models can store fewer routed experts than stock Flash. Older REAP25
+ * GGUFs advertise the original metadata count (256) while layers 3+ are
+ * physically compacted to 192 experts. Newer Spark/Spark-Mini compact GGUFs
+ * advertise the compact count directly and do not carry reap.* metadata.
+ *
+ * The tensor directory is the source of truth for runtime routing width.
+ */
+
+static void reap_init_layer_expert_counts(void) {
+    /* Initialize all layers to the default expert count from the shape */
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        g_reap_layer_expert_count[il] = g_ds4_shape.n_expert;
+    }
+}
+
+static void reap_read_metadata(const ds4_model *m) {
+    reap_init_layer_expert_counts();
+
+    bool reap_enabled = false;
+    model_get_bool(m, "reap.enabled", &reap_enabled);
+
+    uint32_t min_expert = UINT32_MAX;
+    uint32_t max_expert = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char name[128];
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", il);
+        const ds4_tensor *t = model_find_tensor(m, name);
+        if (!t || t->ndim != 2 || t->dim[1] < DS4_N_EXPERT_USED || t->dim[1] > DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: invalid routed expert count in tensor %s\n", name);
+            exit(1);
+        }
+        const uint32_t n_expert = (uint32_t)t->dim[1];
+        g_reap_layer_expert_count[il] = n_expert;
+        if (n_expert < min_expert) min_expert = n_expert;
+        if (n_expert > max_expert) max_expert = n_expert;
+    }
+
+    if (reap_enabled || min_expert != DS4_N_EXPERT || max_expert != DS4_N_EXPERT) {
+        fprintf(stderr,
+                "ds4: compact routed expert counts inferred from tensors: min=%u max=%u metadata=%u\n",
+                min_expert, max_expert, DS4_N_EXPERT);
+    }
+
+    /* Read and log REAP layout string */
+    ds4_array_ref layout_arr;
+    if (model_get_array(m, "reap.layout", &layout_arr)) {
+        if (layout_arr.type == GGUF_VALUE_STRING) {
+            ds4_cursor lc = cursor_at(m, layout_arr.data_pos);
+            uint64_t str_len = 0;
+            if (cursor_u64(&lc, &str_len) && str_len < 128) {
+                char layout_str[128];
+                if (cursor_read(&lc, layout_str, str_len)) {
+                    layout_str[str_len] = '\0';
+                    fprintf(stderr, "ds4: REAP layout=%s\n", layout_str);
+                }
+            }
+        }
+    }
+}
+
+/* Get the expert count for a specific layer, accounting for REAP compaction */
+static inline uint32_t reap_layer_expert_count(uint32_t il) {
+    if (il >= DS4_MAX_LAYER) {
+        ds4_die("layer index out of range in reap_layer_expert_count");
+    }
+    return g_reap_layer_expert_count[il];
 }
 
 static void validate_compress_ratio_metadata(const ds4_model *m) {
@@ -5676,6 +5792,9 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
                                    n_indexer_top_k,
                                    n_hc,
                                    n_hc_sinkhorn_iter);
+
+    /* Read REAP metadata for compact models after shape is set */
+    reap_read_metadata(m);
 
     config_expect_u32("embedding_length",            n_embd,         DS4_N_EMBD);
     config_expect_u32("vocab_size",                  n_vocab,        DS4_N_VOCAB);
@@ -10715,11 +10834,13 @@ static void layer_router_probs_one(
         float             probs[DS4_MAX_EXPERT],
         const ds4_model   * model,
         const ds4_layer_weights * layer,
-        const float       * x) {
+        const float       * x,
+        uint32_t            il) {
     float logits[DS4_MAX_EXPERT];
 
     matvec_any(logits, model, layer->ffn_gate_inp, x);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+    const uint32_t n_expert = reap_layer_expert_count(il);
+    for (uint32_t i = 0; i < n_expert; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
 }
@@ -10727,10 +10848,12 @@ static void layer_router_probs_one(
 static void layer_hash_router_weights_from_probs(
         float             weights_out[DS4_MAX_EXPERT_USED],
         const float       probs[DS4_MAX_EXPERT],
-        const int          selected[DS4_MAX_EXPERT_USED]) {
+        const int          selected[DS4_MAX_EXPERT_USED],
+        uint32_t            il) {
+    const uint32_t n_expert = reap_layer_expert_count(il);
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) ds4_die("hash-selected expert is outside router range");
+        if (selected[i] < 0 || (uint32_t)selected[i] >= n_expert) ds4_die("hash-selected expert is outside router range");
         weights_out[i] = probs[selected[i]];
         sum += weights_out[i];
     }
@@ -10746,11 +10869,12 @@ static void layer_hash_router_weights_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * x,
-        const int          selected[DS4_MAX_EXPERT_USED]) {
+        const int          selected[DS4_MAX_EXPERT_USED],
+        uint32_t            il) {
     float probs[DS4_MAX_EXPERT];
 
-    layer_router_probs_one(probs, model, layer, x);
-    layer_hash_router_weights_from_probs(weights_out, probs, selected);
+    layer_router_probs_one(probs, model, layer, x, il);
+    layer_hash_router_weights_from_probs(weights_out, probs, selected, il);
 }
 
 static void topk_desc(const float *score, int n, int k, int *idx) {
@@ -10774,18 +10898,20 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]);
+        const float           probs[DS4_MAX_EXPERT],
+        uint32_t               il);
 
 static void layer_topk_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           *x) {
+        const float           *x,
+        uint32_t               il) {
     float probs[DS4_MAX_EXPERT] = {0};
 
-    layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    layer_router_probs_one(probs, model, layer, x, il);
+    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs, il);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -10793,17 +10919,19 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_MAX_EXPERT]) {
+        const float           probs[DS4_MAX_EXPERT],
+        uint32_t               il) {
+    const uint32_t n_expert = reap_layer_expert_count(il);
     float selection[DS4_MAX_EXPERT];
 
-    memcpy(selection, probs, sizeof(selection));
+    memcpy(selection, probs, n_expert * sizeof(selection[0]));
 
     if (layer->ffn_exp_probs_b) {
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
-        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+        for (uint32_t i = 0; i < n_expert; i++) selection[i] += bias[i];
     }
 
-    topk_desc(selection, (int)DS4_N_EXPERT, (int)DS4_N_EXPERT_USED, selected);
+    topk_desc(selection, (int)n_expert, (int)DS4_N_EXPERT_USED, selected);
 
     float sum = 0.0f;
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
@@ -10820,6 +10948,34 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n);
 
 /* Single-token routed MoE.  It selects six experts, runs IQ2_XXS gate/up,
  * applies SwiGLU and router weights, then accumulates Q2_K down projections. */
+/* Rank the router's selected slots by weight, keep the top
+ * g_ds4_n_experts_active, renormalize the kept weights so their sum matches
+ * the full selection's sum, and deactivate the rest. Returns the slot count
+ * the caller should iterate (DS4_N_EXPERT_USED when the override is off). */
+static uint32_t ds4_clamp_expert_selection(
+        int   selected[DS4_MAX_EXPERT_USED],
+        float weights[DS4_MAX_EXPERT_USED]) {
+    const uint32_t n = DS4_N_EXPERT_USED;
+    uint32_t k = g_ds4_n_experts_active;
+    if (k == 0 || k >= n) return n;
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (weights[j] > weights[i]) {
+                float wf = weights[i]; weights[i] = weights[j]; weights[j] = wf;
+                int   sf = selected[i]; selected[i] = selected[j]; selected[j] = sf;
+            }
+        }
+    }
+    float all_sum = 0.0f, kept_sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) all_sum += weights[i];
+    for (uint32_t i = 0; i < k; i++) kept_sum += weights[i];
+    if (kept_sum < 6.103515625e-5f) kept_sum = 6.103515625e-5f;
+    const float f = all_sum / kept_sum;
+    for (uint32_t i = 0; i < k; i++) weights[i] *= f;
+    for (uint32_t i = k; i < n; i++) { weights[i] = 0.0f; selected[i] = -1; }
+    return k;
+}
+
 static void layer_routed_moe_one(
         float             * out,
         const ds4_model   * model,
@@ -10870,10 +11026,11 @@ static void layer_routed_moe_one(
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, x, selected, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
+    const uint32_t n_active = ds4_clamp_expert_selection(selected, expert_weight);
 
     if (routed_q8_0) {
         const uint64_t x_blocks = expert_in_dim / 32u;
@@ -10885,12 +11042,12 @@ static void layer_routed_moe_one(
                                          layer->ffn_up_exps,
                                          xq8, xscale8, selected,
                                          expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
+                                         n_active, clamp);
 
         const uint64_t mid_blocks = down_in_dim / 32u;
         int8_t *midq8 = xmalloc((size_t)DS4_N_EXPERT_USED * mid_blocks * 32u);
         float *midscale8 = xmalloc((size_t)DS4_N_EXPERT_USED * mid_blocks * sizeof(float));
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             quantize_q8_0_activation(mid_all + (uint64_t)i * down_in_dim,
                                      midq8 + (uint64_t)i * mid_blocks * 32u,
                                      midscale8 + (uint64_t)i * mid_blocks,
@@ -10898,7 +11055,7 @@ static void layer_routed_moe_one(
         }
         matvec_q8_0_experts_accum_prequant(out, model, layer->ffn_down_exps,
                                            midq8, midscale8, selected,
-                                           DS4_N_EXPERT_USED);
+                                           n_active);
         free(midscale8);
         free(midq8);
         free(xscale8);
@@ -10908,14 +11065,14 @@ static void layer_routed_moe_one(
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
                                          xq, selected, expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                                         n_active, clamp);
+        for (uint32_t i = 0; i < n_active; i++) {
             ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
         matvec_q8_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq, selected, DS4_N_EXPERT_USED);
+                                           midq, selected, n_active);
     } else if (!trace) {
         matvec_experts_mid_prequant(mid_all, model,
                                     layer->ffn_gate_exps,
@@ -10923,16 +11080,16 @@ static void layer_routed_moe_one(
                                     xq,
                                     selected,
                                     expert_weight,
-                                    DS4_N_EXPERT_USED,
+                                    n_active,
                                     clamp);
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                                   midq + (uint64_t)i * (down_in_dim / QK_K),
                                   (int64_t)down_in_dim);
         }
-        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
+        matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, n_active);
     } else {
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             const uint32_t expert = (uint32_t)selected[i];
 
             matvec_expert_pair_prequant(gate, up, model,
@@ -11025,10 +11182,11 @@ static void layer_routed_moe_one_prealloc(
 
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, x, selected, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
+    const uint32_t n_active = ds4_clamp_expert_selection(selected, expert_weight);
 
     if (routed_q8_0) {
         if (!q8_xq || !q8_xscale || !q8_midq || !q8_midscale) {
@@ -11040,9 +11198,9 @@ static void layer_routed_moe_one_prealloc(
                                          layer->ffn_up_exps,
                                          q8_xq, q8_xscale, selected,
                                          expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
+                                         n_active, clamp);
         const uint64_t mid_blocks = down_in_dim / 32u;
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        for (uint32_t i = 0; i < n_active; i++) {
             quantize_q8_0_activation(mid_all + (uint64_t)i * down_in_dim,
                                      q8_midq + (uint64_t)i * mid_blocks * 32u,
                                      q8_midscale + (uint64_t)i * mid_blocks,
@@ -11050,7 +11208,7 @@ static void layer_routed_moe_one_prealloc(
         }
         matvec_q8_0_experts_accum_prequant(out, model, layer->ffn_down_exps,
                                            q8_midq, q8_midscale, selected,
-                                           DS4_N_EXPERT_USED);
+                                           n_active);
         (void)il;
         return;
     }
@@ -11063,26 +11221,26 @@ static void layer_routed_moe_one_prealloc(
                                          layer->ffn_gate_exps,
                                          layer->ffn_up_exps,
                                          xq, selected, expert_weight,
-                                         DS4_N_EXPERT_USED, clamp);
+                                         n_active, clamp);
     } else {
         matvec_experts_mid_prequant(mid_all, model,
                                     layer->ffn_gate_exps,
                                     layer->ffn_up_exps,
                                     xq, selected, expert_weight,
-                                    DS4_N_EXPERT_USED, clamp);
+                                    n_active, clamp);
     }
 
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+    for (uint32_t i = 0; i < n_active; i++) {
         ds4_quantize_row_q8_K(mid_all + (uint64_t)i * down_in_dim,
                               midq + (uint64_t)i * (down_in_dim / QK_K),
                               (int64_t)down_in_dim);
     }
     if (routed_q8_k) {
         matvec_q8_k_experts_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq, selected, DS4_N_EXPERT_USED);
+                                           midq, selected, n_active);
     } else {
         matvec_experts_down_accum_prequant(out, model, layer->ffn_down_exps,
-                                           midq, selected, DS4_N_EXPERT_USED);
+                                           midq, selected, n_active);
     }
 
     (void)il;
@@ -11123,44 +11281,47 @@ static void layer_routed_moe_batch(
         ds4_die("routed expert tensor layout is unexpected");
     }
 
-    const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
+    const uint32_t n_expert = reap_layer_expert_count(il);
+    const uint32_t max_pairs = n_tok * DS4_N_EXPERT_USED;
+    uint32_t n_pairs = 0;
     uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
     uint32_t cursor[DS4_MAX_EXPERT] = {0};
     uint32_t active_expert[DS4_MAX_EXPERT];
     uint32_t n_active = 0;
 
-    int *selected = xmalloc((size_t)total_pairs * sizeof(selected[0]));
-    float *pair_weight = xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
-    ds4_expert_pair *pairs = xmalloc((size_t)total_pairs * sizeof(pairs[0]));
+    int *selected = xmalloc((size_t)max_pairs * sizeof(selected[0]));
+    float *pair_weight = xmalloc((size_t)max_pairs * sizeof(pair_weight[0]));
+    ds4_expert_pair *pairs = xmalloc((size_t)max_pairs * sizeof(pairs[0]));
 
     for (uint32_t t = 0; t < n_tok; t++) {
         int sel[DS4_MAX_EXPERT_USED];
         float weights[DS4_MAX_EXPERT_USED];
         if (layer->ffn_gate_tid2eid) {
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
-            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
+            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel, il);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim, il);
         }
+        const uint32_t n_selected = ds4_clamp_expert_selection(sel, weights);
 
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
+        for (uint32_t slot = 0; slot < n_selected; slot++) {
+            const uint32_t pair_id = n_pairs++;
             selected[pair_id] = sel[slot];
             pair_weight[pair_id] = weights[slot];
             pairs[pair_id] = (ds4_expert_pair){ .token = t, .slot = slot };
-            if (sel[slot] < 0 || (uint32_t)sel[slot] >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
+            if ((uint32_t)sel[slot] >= n_expert) ds4_die("selected expert is outside range");
             counts[(uint32_t)sel[slot] + 1]++;
         }
     }
 
-    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+    for (uint32_t e = 0; e < n_expert; e++) {
         counts[e + 1] += counts[e];
         cursor[e] = counts[e];
         if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
     }
 
-    uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
-    for (uint32_t p = 0; p < total_pairs; p++) {
+    uint32_t *pair_ids = xmalloc((size_t)n_pairs * sizeof(pair_ids[0]));
+    for (uint32_t p = 0; p < n_pairs; p++) {
         const uint32_t e = (uint32_t)selected[p];
         pair_ids[cursor[e]++] = p;
     }
@@ -11176,7 +11337,7 @@ static void layer_routed_moe_batch(
                                      expert_in_dim);
         }
 
-        float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
+        float *mid = xmalloc((size_t)n_pairs * expert_out_dim * sizeof(mid[0]));
         matvec_q8_0_batch_mid_ctx mid_ctx = {
             .mid = mid,
             .xq = xq8,
@@ -11207,9 +11368,9 @@ static void layer_routed_moe_batch(
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_0_batch_mid_worker, &mid_ctx);
 
         const uint64_t mid_blocks = down_in_dim / 32u;
-        int8_t *midq8 = xmalloc((size_t)total_pairs * mid_blocks * 32u);
-        float *midscale8 = xmalloc((size_t)total_pairs * mid_blocks * sizeof(float));
-        for (uint32_t p = 0; p < total_pairs; p++) {
+        int8_t *midq8 = xmalloc((size_t)n_pairs * mid_blocks * 32u);
+        float *midscale8 = xmalloc((size_t)n_pairs * mid_blocks * sizeof(float));
+        for (uint32_t p = 0; p < n_pairs; p++) {
             quantize_q8_0_activation(mid + (uint64_t)p * down_in_dim,
                                      midq8 + (uint64_t)p * mid_blocks * 32u,
                                      midscale8 + (uint64_t)p * mid_blocks,
@@ -11263,8 +11424,7 @@ static void layer_routed_moe_batch(
                                   (int64_t)expert_in_dim);
         }
 
-        float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
-
+        float *mid = xmalloc((size_t)n_pairs * expert_out_dim * sizeof(mid[0]));
         matvec_q8_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
             .xq = xq,
@@ -11296,14 +11456,14 @@ static void layer_routed_moe_batch(
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_k_batch_mid_worker, &mid_ctx);
 
         const uint64_t midq_blocks = down_in_dim / QK_K;
-        block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
+        block_q8_K *midq = xmalloc((size_t)n_pairs * midq_blocks * sizeof(midq[0]));
         quantize_mid_pairs_ctx quant_ctx = {
             .mid = mid,
             .midq = midq,
             .down_in_dim = down_in_dim,
             .down_blocks = midq_blocks,
         };
-        ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+        ds4_parallel_for(n_pairs, quantize_mid_pairs_worker, &quant_ctx);
         free(mid);
 
         matvec_q8_k_batch_accum_rows_ctx down_ctx = {
@@ -11351,7 +11511,7 @@ static void layer_routed_moe_batch(
                               (int64_t)expert_in_dim);
     }
 
-    float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
+    float *mid = xmalloc((size_t)n_pairs * expert_out_dim * sizeof(mid[0]));
 
     const uint32_t gate_type = layer->ffn_gate_exps->type;
 
@@ -11451,14 +11611,14 @@ static void layer_routed_moe_batch(
     }
 
     const uint64_t midq_blocks = down_in_dim / QK_K;
-    block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
+    block_q8_K *midq = xmalloc((size_t)n_pairs * midq_blocks * sizeof(midq[0]));
     quantize_mid_pairs_ctx quant_ctx = {
         .mid = mid,
         .midq = midq,
         .down_in_dim = down_in_dim,
         .down_blocks = midq_blocks,
     };
-    ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
+    ds4_parallel_for(n_pairs, quantize_mid_pairs_worker, &quant_ctx);
     free(mid);
 
     /* Down projection: dispatch based on down tensor type. */
@@ -20959,9 +21119,9 @@ static bool metal_graph_decode_cpu_router(
     }
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, (int)token);
-        layer_hash_router_weights_from_probs(weights, probs, selected);
+        layer_hash_router_weights_from_probs(weights, probs, selected, il);
     } else {
-        layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs);
+        layer_topk_selected_experts_from_probs(selected, weights, model, layer, probs, il);
     }
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
@@ -21876,6 +22036,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint32_t n_expert = reap_layer_expert_count(il);
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -23831,7 +23992,7 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         if (ok && router_shared_done == 0 && router_only_done == 0)
         ok = metal_graph_matmul_plain_tensor(metal_graph_router_logits(g), model, layer->ffn_gate_inp,
-                                                     DS4_N_EMBD, DS4_N_EXPERT, metal_graph_ffn_norm(g), 1);
+                                                     DS4_N_EMBD, n_expert, metal_graph_ffn_norm(g), 1);
         if (ok && !router_project_select_fused)
             ok = ds4_gpu_router_select_tensor(metal_graph_router_selected(g), metal_graph_router_weights(g), metal_graph_router_probs(g),
                                                     model->map, model->size,
@@ -23839,7 +24000,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                     layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
                                                     layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                     (uint32_t)token,
-                                                    DS4_N_EXPERT,
+                                                    n_expert,
                                                     DS4_N_EXPERT_USED,
                                                     DS4_EXPERT_WEIGHT_SCALE,
                                                     0,
@@ -23859,8 +24020,8 @@ static bool metal_graph_encode_decode_layer_phase(
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);
-        metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_router_probs(g), DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), n_expert, il, pos);
+        metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_router_probs(g), n_expert, il, pos);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_router_selected(g), DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_router_weights(g), DS4_N_EXPERT_USED, il, pos);
     }
@@ -24739,7 +24900,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  metal_graph_router_selected(g), metal_graph_router_weights(g),
-                                                 DS4_N_EXPERT,
+                                                 n_expert,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                  NULL,
                                                  il,
@@ -26221,9 +26382,9 @@ static void metal_graph_trace_layer_stages(
                                   routed_q8_midscale);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected, il);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, il);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -26464,9 +26625,9 @@ static int metal_graph_decode_test(
                                   routed_q8_midscale);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
-        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
+        layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected, 0);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, 0);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -29911,6 +30072,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    const uint32_t n_expert = reap_layer_expert_count(il);
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled(il);
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_FFN_STAGE(name) do { \
@@ -30008,7 +30170,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                  model,
                                                  layer->ffn_gate_inp,
                                                  DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
+                                                 n_expert,
                                                  metal_graph_batch_ffn_norm(g),
                                                  n_tokens);
 
@@ -30033,16 +30195,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       metal_graph_batch_router_logits(g),
                                                       metal_graph_prefill_tokens(g),
-                                                      DS4_N_EXPERT,
+                                                      n_expert,
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
                                                       n_tokens) != 0;
     ds4_gpu_tensor_free(router_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_batch_router_logits(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * n_expert, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_batch_router_probs(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
+                                      (uint64_t)n_tokens * n_expert, il, pos0);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_batch_router_selected(g),
                                           (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_batch_router_weights(g),
@@ -30367,7 +30529,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                metal_graph_batch_router_selected(g),
                                                metal_graph_batch_router_weights(g),
-                                               DS4_N_EXPERT,
+                                               n_expert,
                                                DS4_N_EXPERT_USED,
                                                DS4_SWIGLU_CLAMP_EXP,
                                                metal_graph_batch_ffn_norm(g),

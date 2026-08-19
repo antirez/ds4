@@ -218,6 +218,13 @@ struct ds4_gpu_config;
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg);
+/* Cap routed experts activated per token (0 = model default top-N). The
+ * router still ranks all experts; only the top-k weights are kept,
+ * renormalized to preserve the layer output scale. Set before the first
+ * forward; applies to CPU and Metal graph paths. */
+void ds4_set_n_experts_active(uint32_t n_experts_active);
+uint32_t ds4_get_n_experts_active(void);
+
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);

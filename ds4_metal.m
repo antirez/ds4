@@ -200,6 +200,7 @@ static __weak id<MTLBuffer> g_dsv4_hc_producer_last_mix_buffer;
 static NSUInteger g_dsv4_hc_producer_last_mix_offset;
 static id<MTLBuffer> g_dsv4_hc_producer_last_completion;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
+static id<MTLComputePipelineState> g_router_clamp_active_pipeline;
 static id<MTLComputePipelineState> g_glm_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_glm_kv_lora_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_glm_k_b_project_pipeline;
@@ -8441,6 +8442,12 @@ int ds4_gpu_init(void) {
                 "kernel_dsv4_router_transform_finalize_weights_one_simd");
         g_dsv4_router_weights_one_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
+        g_router_clamp_active_pipeline =
+            ds4_gpu_get_pipeline("kernel_router_clamp_active");
+        if (g_router_clamp_active_pipeline == nil) {
+            fprintf(stderr, "ds4: missing kernel_router_clamp_active pipeline\n");
+            return 0;
+        }
         g_glm_router_select_one_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_router_select_one");
         g_glm_kv_lora_rms_norm_pipeline =
@@ -10317,6 +10324,7 @@ void ds4_gpu_cleanup(void) {
         [g_dsv4_completion_cache removeAllObjects];
         g_dsv4_completion_cache = nil;
         g_dsv4_router_weights_one_pipeline = nil;
+        g_router_clamp_active_pipeline = nil;
         g_glm_router_select_one_pipeline = nil;
         g_glm_kv_lora_rms_norm_pipeline = nil;
         g_glm_k_b_project_pipeline = nil;
@@ -31805,6 +31813,37 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+static int ds4_gpu_encode_router_clamp_active(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>         selectedbuf,
+        NSUInteger            selected_off,
+        id<MTLBuffer>         weightsbuf,
+        NSUInteger            weights_off,
+        uint32_t              n_tokens,
+        uint32_t              n_expert_used) {
+    const uint32_t n_active = ds4_get_n_experts_active();
+    if (n_active < 1 || n_active >= n_expert_used) return 1;
+    if (!cb || !selectedbuf || !weightsbuf || n_tokens == 0 ||
+        n_expert_used == 0 || !g_router_clamp_active_pipeline) {
+        return 0;
+    }
+
+    uint32_t knu = n_expert_used;
+    uint32_t kat = n_active;
+    uint32_t knt = n_tokens;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_router_clamp_active_pipeline];
+    [enc setBuffer:selectedbuf offset:selected_off atIndex:0];
+    [enc setBuffer:weightsbuf offset:weights_off atIndex:1];
+    [enc setBytes:&knu length:sizeof(knu) atIndex:2];
+    [enc setBytes:&kat length:sizeof(kat) atIndex:3];
+    [enc setBytes:&knt length:sizeof(knt) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(knt, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_router_select(
         id<MTLCommandBuffer>  cb,
         ds4_gpu_tensor     *selected,
@@ -31989,7 +32028,12 @@ static int ds4_gpu_encode_router_select(
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (use_simd_weights_fusion) return 1;
+        if (use_simd_weights_fusion) {
+            return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                      selected_off, weightsbuf,
+                                                      weights_off, n_tokens,
+                                                      n_expert_used);
+        }
 
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:router_weights_pipeline];
@@ -31999,7 +32043,10 @@ static int ds4_gpu_encode_router_select(
         [enc dispatchThreads:MTLSizeMake(6, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return 1;
+        return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                  selected_off, weightsbuf,
+                                                  weights_off, n_tokens,
+                                                  n_expert_used);
     }
 
     if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
@@ -32111,7 +32158,10 @@ static int ds4_gpu_encode_router_select(
         [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return 1;
+        return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                  selected_off, weightsbuf,
+                                                  weights_off, n_tokens,
+                                                  n_expert_used);
     }
 
     if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
@@ -32127,7 +32177,10 @@ static int ds4_gpu_encode_router_select(
         [enc dispatchThreads:MTLSizeMake(6, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        return 1;
+        return ds4_gpu_encode_router_clamp_active(cb, selectedbuf,
+                                                  selected_off, weightsbuf,
+                                                  weights_off, n_tokens,
+                                                  n_expert_used);
     }
 
     const NSUInteger sum_bytes = (NSUInteger)n_tokens * sizeof(float);
@@ -32194,6 +32247,12 @@ static int ds4_gpu_encode_router_select(
                                           (NSUInteger)scale_args.ne3)
          threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+
+    if (!ds4_gpu_encode_router_clamp_active(cb, selectedbuf, selected_off,
+                                             weightsbuf, weights_off,
+                                             n_tokens, n_expert_used)) {
+        return 0;
+    }
 
     return 1;
 }

@@ -37,3 +37,6 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+*~
+.viminfo
+.*.s[wv]?

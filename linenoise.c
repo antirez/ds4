@@ -2240,10 +2240,20 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
         break;
     case ESC:    /* escape sequence */
-        /* Read the next two bytes representing the escape sequence.
-         * Use two calls to handle slow terminals returning the two
-         * chars at different times. */
+        /* Read first byte after ESC. */
         if (linenoiseReadByte(l, seq) != 1) break;
+
+        /* Option+Enter / Meta+Enter on macOS and many terminals
+         * sends ESC followed by CR (or LF).  In multiline mode,
+         * insert a literal newline; otherwise ignore. */
+        if (seq[0] == '\r' || seq[0] == '\n') {
+            if (mlmode) {
+                linenoiseEditInsert(l, "\n", 1);
+            }
+            break;
+        }
+
+        /* Read second byte of escape sequence. */
         if (linenoiseReadByte(l, seq + 1) != 1) break;
 
         /* ESC [ sequences. */
@@ -2270,6 +2280,12 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
                     } else if (plen == 3 && memcmp(param,"200",3) == 0) {
                         linenoiseEditPaste(l);
                     }
+                } else if (final == 'u') {
+                    /* Kitty keyboard protocol: ESC [ keycode ; modifier u
+                     * Insert newline for Enter (13) with any modifier. */
+                    long keycode = strtol(param, NULL, 10);
+                    if (keycode == 13 && mlmode)
+                        linenoiseEditInsert(l, "\n", 1);
                 }
             } else {
                 switch(seq[1]) {
