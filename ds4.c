@@ -49364,7 +49364,7 @@ static bool ds4_dspark_scheduler_enabled(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_window(void) {
-    uint32_t v = ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_WINDOW", 4);
+    uint32_t v = ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_WINDOW", 8);
     return v ? v : 4;
 }
 
@@ -49377,7 +49377,7 @@ static uint32_t ds4_dspark_scheduler_slow_skip_cycles(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_min_avg_milli(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", 1500);
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", 2000);
 }
 
 static uint32_t ds4_dspark_scheduler_max_ms_per_accept_milli(void) {
@@ -49395,7 +49395,7 @@ static uint32_t ds4_dspark_scheduler_break_even_window(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 0);
 }
 
 static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
@@ -62695,6 +62695,25 @@ static int ds4_session_eval_dspark_speculative_argmax(
         return n_accept;
     }
     if (drafts[0] == eos_token) draft_n = 1;
+    if (draft_n == 1) {
+        if (ds4_session_eval_probe_tp(s, drafts[0], true, err, errlen) != 0) {
+            return -1;
+        }
+        if (n_accept < accepted_cap) accepted[n_accept++] = drafts[0];
+        if (stats_enabled) {
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.accepted_draft_tokens += 1;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 1);
+        }
+        ds4_session_dspark_scheduler_note(s, 1, false, DS4_DSPARK_SCHED_EXTRA_MS());
+        if (spec_log) {
+            fprintf(stderr, "ds4: DSpark spec one-token decode accepted=%d\n",
+                    n_accept);
+        }
+        DS4_DSPARK_STATS_FINISH();
+        return n_accept;
+    }
+
 
     ds4_engine *e = s->engine;
     ds4_spec_frontier frontier;
