@@ -745,11 +745,31 @@ static int routed_moe_launch(
         /* Correctness rollback for the optimized resident IQ2 prefill path. */
         const uint32_t disable_resident_iq2_sorted =
             iq2_gate_path && getenv("DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED") != NULL;
+        /* Q4_K historically kept the per-pair path below 32 tokens, but
+         * speculative verify spans (2..8 rows) re-read duplicate experts
+         * from DRAM there: measured 36 pair reads vs ~21 unique experts at
+         * 6 rows.  DS4_ROCM_Q4K_SORTED_MIN overrides the threshold. */
+        static uint32_t q4k_sorted_min_cached = 0;
+        if (q4k_sorted_min_cached == 0u) {
+            uint32_t v = 32u;
+            const char *env = getenv("DS4_ROCM_Q4K_SORTED_MIN");
+            if (env && env[0]) {
+                const long parsed = strtol(env, NULL, 10);
+                if (parsed >= 2 && parsed <= 4096) v = (uint32_t)parsed;
+            }
+            q4k_sorted_min_cached = v;
+        }
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
-            (!q4k_path || n_tokens >= 32u) &&
+            (!q4k_path || n_tokens >= q4k_sorted_min_cached) &&
             !disable_resident_iq2_sorted;
-        const uint32_t use_expert_tiles = use_sorted_pairs;
+        /* Q4_K expert tiles starve the GPU below ~32 tokens (measured 4.0 ms
+         * vs 2.4 ms per layer at 6 rows: ~21 single-pair tiles leave most
+         * CUs idle while each streams a whole expert).  Sorted-but-untiled
+         * keeps full pair parallelism with duplicate experts adjacent so
+         * their weight reads coalesce in cache. */
+        const uint32_t use_expert_tiles =
+            use_sorted_pairs && (!q4k_path || n_tokens >= 32u);
         const uint32_t expert_tile_m = 8u;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;

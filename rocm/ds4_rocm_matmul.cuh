@@ -24,6 +24,19 @@ static void cuda_launch_q8_batch_sharedx_bt(
     }
 }
 
+/* Verify-sized batches (2..8 tokens) skip the shared-x tile kernel: its
+ * per-chunk block barriers dominate at these sizes while x fits L2, so the
+ * direct kernel streams weights barrier-free.  DS4_ROCM_BATCH_DIRECT=0
+ * restores the tile kernel for A/B runs. */
+static bool cuda_q8_batch_direct_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_BATCH_DIRECT");
+        cached = (env == NULL || env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static void cuda_launch_q8_batch_sharedx(
         float *out,
         const unsigned char *w,
@@ -35,6 +48,20 @@ static void cuda_launch_q8_batch_sharedx(
         uint32_t rows_per_block,
         uint32_t tile,
         uint32_t block_tile) {
+    if (n_tok >= 2u && n_tok <= 8u && cuda_q8_batch_direct_enabled()) {
+        const uint32_t direct_rows = 8u;
+        const dim3 dgrid((out_dim + direct_rows - 1u) / direct_rows, 1u, 1u);
+        const uint32_t dthreads = direct_rows * 32u;
+        switch (n_tok) {
+        case 2u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<2u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 3u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<3u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 4u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<4u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 5u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<5u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 6u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<6u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        case 7u: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<7u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        default: matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel<8u><<<dgrid, dthreads>>>(out, w, x, n_blocks, out_dim, row_bytes); return;
+        }
+    }
     const dim3 grid((out_dim + rows_per_block - 1u) / rows_per_block,
                     (n_tok + tile - 1u) / tile,
                     1u);
