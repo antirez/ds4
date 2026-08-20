@@ -115,8 +115,13 @@ Targets:
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
 
-  qwen-dflash / qwen3.8 / qwen
-       Preferred Qwen + DFlash2 combination. Downloads both the matching
+  qwen-q4 / qwen / qwen3.8 / qwen-base / qwen38
+       Preferred default Qwen 3.8 27B Q4_K_M base model GGUF from
+       ggml-org/Qwen3.8-27B-GGUF (~17.7 GiB). Links ./ds4flash.gguf and
+       ./qwen38.gguf.
+
+  qwen-dflash / qwen-combo
+       Optional Qwen + DFlash2 combination. Downloads both the matching
        Qwen 3.8 27B Q4_K_M base model from ggml-org/Qwen3.8-27B-GGUF (~17.7 GiB)
        and the DFlash2 Q4_K_M draft model from z-lab/Qwen3.8-27B-DFlash2-GGUF
        (~1.06 GiB). Links ./ds4flash.gguf and ./qwen38.gguf.
@@ -125,9 +130,6 @@ Targets:
        Matching DFlash2 Q4_K_M draft GGUF from z-lab/Qwen3.8-27B-DFlash2-GGUF
        (~1.06 GiB). Enable with --dflash when running the Qwen base model.
 
-  qwen-q4 / qwen-base
-       Qwen 3.8 27B Q4_K_M base model GGUF from ggml-org/Qwen3.8-27B-GGUF
-       (~17.7 GiB). Links ./ds4flash.gguf and ./qwen38.gguf.
 
   qwen-q8
        Qwen 3.8 27B Q8_0 base model GGUF from ggml-org/Qwen3.8-27B-GGUF
@@ -136,8 +138,6 @@ Targets:
   qwen-dflash-q8
        DFlash2 Q8_0 draft GGUF from z-lab/Qwen3.8-27B-DFlash2-GGUF (~1.92 GiB).
 
-  qwen-dflash-bf16
-       DFlash2 BF16 draft GGUF from z-lab/Qwen3.8-27B-DFlash2-GGUF (~3.60 GiB).
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -217,7 +217,12 @@ case "$MODEL" in
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    qwen-dflash|qwen3.8|qwen-3.8|qwen38|qwen|qwen-combo|qwen38-combo|qwen-dflash2|qwen38-dflash)
+    qwen-q4|qwen|qwen3.8|qwen-3.8|qwen38|qwen38-q4|qwen-base|qwen38-base)
+        REPO=$QWEN_GGML_REPO
+        MODEL_FILE=$QWEN38_Q4_FILE
+        MODEL=qwen-q4
+        ;;
+    qwen-dflash|qwen-combo|qwen38-combo|qwen-dflash2|qwen38-dflash)
         DOWNLOAD_ITEMS="$QWEN_GGML_REPO:$QWEN38_Q4_FILE $QWEN_DFLASH_REPO:$QWEN38_DFLASH_Q4_FILE"
         MODEL_FILE=$QWEN38_Q4_FILE
         MODEL=qwen-dflash
@@ -234,16 +239,7 @@ case "$MODEL" in
         LINK_MODEL=0
         MODEL=qwen-dflash-q8
         ;;
-    qwen-dflash-bf16|qwen38-dflash-bf16)
-        REPO=$QWEN_DFLASH_REPO
-        MODEL_FILE=$QWEN38_DFLASH_BF16_FILE
-        LINK_MODEL=0
-        MODEL=qwen-dflash-bf16
         ;;
-    qwen-q4|qwen38-q4|qwen-base|qwen38-base)
-        REPO=$QWEN_GGML_REPO
-        MODEL_FILE=$QWEN38_Q4_FILE
-        MODEL=qwen-q4
         ;;
     qwen-q8|qwen38-q8)
         REPO=$QWEN_GGML_REPO

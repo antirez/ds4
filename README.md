@@ -182,17 +182,14 @@ file are not supported for GLM yet.
 Qwen 3.8 27B support is provided for Q4_K_M GGUF models with optional DFlash2 block-diffusion speculative decoding:
 
 ```sh
-./download_model.sh qwen-dflash          # preferred combo: Qwen 3.8 27B Q4_K_M + DFlash2 Q4_K_M (~18.7 GiB total)
-./download_model.sh qwen3.8              # alias for qwen-dflash
+./download_model.sh qwen-q4              # preferred default standalone Qwen 3.8 27B Q4_K_M base GGUF (~17.7 GiB)
+./download_model.sh qwen                 # alias for qwen-q4
+./download_model.sh qwen3.8              # alias for qwen-q4
+./download_model.sh qwen-dflash          # optional combo: Qwen 3.8 27B Q4_K_M + DFlash2 Q4_K_M (~18.7 GiB total)
 ./download_model.sh qwen-dflash-support  # standalone DFlash2 Q4_K_M draft GGUF (~1.06 GiB)
-./download_model.sh qwen-q4              # standalone Qwen 3.8 27B Q4_K_M base GGUF (~17.7 GiB)
 ```
 
-The preferred combination downloads the `Q4_K_M` base model from
-[`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF)
-and the matching DFlash2 draft model from
-[`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF).
-It links `./ds4flash.gguf` and `./qwen38.gguf` to the base model.
+The base model downloads from [`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF) and links `./ds4flash.gguf` and `./qwen38.gguf`. The optional `qwen-dflash` target additionally downloads the matching DFlash2 draft model from [`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF).
 
 Then build:
 
