@@ -16,6 +16,11 @@ Preferred release test hosts:
 - Metal / distributed Mac testing: `mac-m5max-it` and `mac-m5max-us`.
 - ROCm: The Strix Halo system at antirez@strixhalo (Framework Desktop).
 
+`192.168.60.250` is permission-only. Never connect to it for QA, stop or start
+its server, build there, or run tests or benchmarks there without asking
+Salvatore and receiving explicit permission for that specific QA pass. Earlier
+permission does not carry over to later work.
+
 The Mac hosts have DNS entries and are reached through an internet VPN.  They
 are connected to each other over WiFi and also through a Thunderbolt 5
 point-to-point link.  The TB5 route is the preferred distributed-inference
@@ -43,7 +48,8 @@ in this system.
 - Repeat the warning-free build gate on the release hardware:
   `make clean && make` on Metal,
   `make clean && make cuda-spark` on DGX Spark,
-  `make clean && make cuda-generic CUDA_HOME=/usr` on the multi-GPU CUDA host,
+  `make clean && make cuda-generic CUDA_HOME=/usr` on the multi-GPU CUDA host
+  only after receiving permission for `192.168.60.250`,
   `make clean && make strix-halo` on Strix Halo.
 - Run whitespace checks before committing:
   `git diff --check`.
@@ -74,6 +80,60 @@ in this system.
   replay changed:
   `./ds4_test --server`.
 - Run `./ds4-eval --self-test-extractors`.
+
+### Critical Input And Server Regression Pass
+
+Run these checks after changing parsers, server generation, model loading,
+distributed snapshots, caches, DSpark, or CUDA build rules. Keep the item
+numbers in the QA report so omissions are visible.
+
+1. Send malformed OpenAI, Responses, and Anthropic requests with repeated
+   owned string or array fields under ASan. Each request must fail cleanly and
+   a following valid request must still work. Run `./ds4_test --server` too.
+2. Replay at least 4,096 assistant/tool-result pairs through the Responses and
+   Anthropic validators. Validation must remain linear-time and preserve the
+   same accepted and rejected histories as a short replay.
+3. Feed a distributed worker a snapshot header whose declared lengths exceed
+   the configured and protocol limits. It must reject the header before a
+   large allocation or payload read, without growing RSS materially.
+4. Run malformed safetensors and GGUF fixtures through the loader and
+   `gguf-tools/deepseek4-quantize` under ASan and UBSan. Truncated files,
+   impossible dimensions, and overflowing tensor sizes must be rejected.
+5. With a checkpoint-matched DSpark drafter, compare temperature-zero output
+   against a no-drafter run for 400 and 800 generated tokens. Record the first
+   output difference, acceptance, direct commits, replay fallbacks, and decode
+   speed. Byte identity is not required: DSpark commits the batched verifier
+   state, whose floating-point operation order differs from one-token decode.
+   Verifier errors, invalid text, or a material continuation-quality regression
+   remain release blockers. Use `--dspark-strict` for the target-only control.
+6. Exercise unterminated and twice-closed reasoning in streaming and
+   non-streaming OpenAI, Responses, and Anthropic requests, with and without
+   tools. Reasoning must never leak into answer content.
+7. On real Blackwell hardware, build the CUDA targets for `sm_120` or `sm_120a`
+   and for DGX Spark `sm_121`. Confirm the emitted architecture flags retain
+   the architecture-specific feature suffix and run `make cuda-regression`.
+8. Build with CUDA 12.8 or newer and require the CUDA translation units to
+   compile warning-free, including the `FLT_MAX` users.
+9. Force a conversation past the in-memory KV threshold, restore the same disk
+   checkpoint twice, and confirm the checkpoint file remains present after
+   both successful loads. Corrupt checkpoints must still be rejected.
+10. Run `make dspark-verify-depth` with matching 0731 target and drafter files.
+    Strict capture must skip layers without a compressor and compare every
+    captured compressor layer.
+11. Send the same long GLM 5.2 prompt twice to one server session. The second
+    request must report `cache_source: memory-rewind`, reuse through one token
+    before the prompt boundary, and produce the same greedy output as a fresh
+    session.
+12. Run `./ds4_test --think-tool-recovery`, then repeat through all three HTTP
+    APIs. A complete tool block inside unclosed reasoning must be recovered
+    once, preceding prose must remain reasoning, and no synthetic continuation
+    may be generated.
+13. Run `./ds4_agent_test` under ASan with agent-cache strings whose declared
+    lengths exceed the remaining file. Loading must fail without allocating
+    the declared size, and a valid cache must still load.
+14. Run the server parser tests under UBSan with `NaN`, positive infinity, and
+    negative infinity where integer JSON fields are expected. Conversion must
+    be defined and clamped, with no sanitizer report.
 
 ## 3. Official Continuation Quality Gates
 
@@ -162,20 +222,27 @@ Use the 0731 DSpark support GGUF only with a Flash 0731 target. A support model
 from another checkpoint can have plausible acceptance statistics while
 producing a different greedy continuation.
 
+Normal DSpark runs commit accepted target-verifier state directly. The batched
+verifier and one-token decode use the same graph with different floating-point
+operation order, so `output_match=0` against the baseline is diagnostic rather
+than a failure. `--dspark-strict` remains the byte-identical target-only mode.
+
 - Default greedy acceptance fixture:
   `DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - 64-token guardrail:
   `DS4_DSPARK_FIXTURE_TOKENS=64 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
-- Fixed-block partial-accept fallback:
+- Fixed-block direct partial commit:
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
   `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
 - If shared support-model or verifier structures changed, also run legacy MTP:
   `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
-- Record `c_add` `accepted_draft`, `errors=0`, `verify_layer`, and `net_saved`
-  for both 32-token and 64-token runs.  A faster run with lower proposal
-  quality is a regression unless it was an intentional scheduler change.
+- Record `c_add` `accepted_draft`, `direct_full`, `direct_partial`,
+  `replay_fallbacks`, `errors=0`, `verify_layer`, `net_saved`, and
+  `output_match` for both 32-token and 64-token runs. At least one direct commit
+  must occur. A faster run with lower proposal quality is a regression unless
+  it was an intentional scheduler change.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
   `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the Metal MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
@@ -281,9 +348,10 @@ substitute for this matrix.
   kernels. Also test a Q4-routed GLM file as a negative gate: until Q4 ownership
   kernels are implemented, both ranks must reject it clearly before evaluation
   rather than loading a partial split or hanging.
-- On the eight-GPU CUDA host, run one resident GLM Q2 prompt, a long-context
-  prompt, integrated GLM MTP, and concurrent server requests. Use ordinary
-  eight-GPU layer placement for GLM; do not pass the Flash-specific
+- With explicit permission for the current QA pass, run one resident GLM Q2
+  prompt, a long-context prompt, integrated GLM MTP, and concurrent server
+  requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement
+  for GLM; do not pass the Flash-specific
   `--cuda-tensor-parallel` option. Multi-tier GLM prefill must
   report progress through the tier-switching token-major path, and decode,
   cache updates, and output-head/logit assembly must complete without CPU spill.
@@ -329,24 +397,27 @@ release-ready without this pass.
 - Build:
   `make clean && make cuda-spark`.
 - Require both the DGX Spark build and the eight-GPU CUDA build to complete
-  without compiler warnings.
+  without compiler warnings. The eight-GPU build is performed only after
+  receiving explicit permission to use `192.168.60.250` for this QA pass.
 - Run:
   `make cuda-regression`.
 - For native MXFP4 changes, run
-  `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host and
+  `make test-mxfp4-cuda CUDA_ARCH=native` on the multi-GPU CUDA host only after
+  receiving explicit permission for `192.168.60.250`, and
   `make test-mxfp4-cuda CUDA_ARCH=sm_121` on DGX Spark. Dense MMQ, routed MMQ,
   routed MMVQ, fused gate/up, and fused down must pass. The Spark run must also
   pass the Blackwell K-tile guard. This synthetic parity test does not replace
   full-model continuation scoring.
-- Run the native MXFP4 GGUF resident on the multi-GPU host and with
-  `--ssd-streaming` on DGX Spark. Use the same greedy prompt and continuation
+- With that permission, run the native MXFP4 GGUF resident on the multi-GPU
+  host, and run it with `--ssd-streaming` on DGX Spark. Use the same greedy prompt and continuation
   fixture on both. Record prefill and generation speed, require finite logits,
   and compare quality with the Metal MXFP4 result. Blackwell MMQ quantizes
   activations to native FP4 for batched work; decode MMVQ keeps Q8 activations,
   so quality must be checked rather than inferred from kernel-only parity.
 - Run a short CLI prompt with the Flash GGUF and record generation t/s.
 - Run a longer prompt that exercises routed experts past a few thousand tokens.
-- On the eight-GPU CUDA host, run the full-vocabulary decode oracle:
+- With explicit permission for this QA pass, run the full-vocabulary decode
+  oracle on the eight-GPU CUDA host:
   `DS4_TEST_MODEL=/path/to/flash.gguf make test-cuda-session-batch`.
   Preserve the per-batch timing for 2, 4, and 8 rows and require
   `nonexact_logits=0`. Run the released Q4 file and the reduced-precision Q2
@@ -369,9 +440,10 @@ release-ready without this pass.
   capability checks pass; record correctness and speedup separately. Also
   force an 800-row prefill quantum with
   `DS4_TEST_ALLOW_FALLBACK=1`; it must report the serialized safety fallback.
-- Start `ds4-server` with 8 and 16 batched sessions and issue at least that many
-  simultaneous requests with mixed prompt lengths. Verify no session mix-up,
-  deadlock, or starvation and record aggregate generation throughput.
+- With explicit permission for the eight-GPU host, start `ds4-server` with 8
+  and 16 batched sessions and issue at least that many simultaneous requests
+  with mixed prompt lengths. Verify no session mix-up, deadlock, or starvation
+  and record aggregate generation throughput.
 - On DGX Spark, verify the same public batch API and server concurrency use the
   single-GPU fallback without creating peer-only TP/EP state. The eight-GPU
   native oracle is not a valid Spark test because its topology is intentionally
@@ -403,6 +475,15 @@ a substitute for CUDA or Metal release testing.
   `DS4_ROCM_DSV4_PREQUANT_DECODE=0` only as a diagnostic control. The default
   must be materially faster and must still pass the continuation-quality gate.
   GLM and `--quality` must stay on the full-FP32 activation path.
+- Test DSpark with the matched 0731 target and support files:
+  `DS4_BIN=./ds4 DS4_DSPARK_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf DS4_DSPARK_FIXTURE_TOKENS=64 sh tests/dspark_acceptance_fixture.sh`.
+  Require proposals, accepted draft tokens, at least one direct state commit,
+  zero verifier errors, and zero replay fallbacks. Record ordinary and DSpark
+  generation speed separately. When direct verifier-state handling changes,
+  also compare with a test-only build of its immediate replay predecessor; the
+  direct build must be faster. DSpark is not currently expected to beat
+  ordinary ROCm decode, so do not describe it as a ROCm speedup without a new
+  measurement.
 - Run one longer prompt if ROCm kernels, backend hooks, tensor loading, model
   cache, KV cache, or graph prefill code changed.
 - Run the GLM Q2 release model through ROCm SSD streaming with at least four
@@ -461,9 +542,14 @@ clients.
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
 - Test SSE streaming with thinking enabled and disabled.
 - Test keepalive during long prefill and confirm clients do not time out.
-- On the eight-L40S CUDA TP target, start `ds4-server` with the release TP
-  options and verify all 16 100k-context sessions allocate. Startup must report
-  a 2048-token prefill cap; a silent fallback to 4096 is an OOM regression.
+- In batched mode, close clients while their requests are queued, prefilling,
+  and streaming decode. Repeat across OpenAI chat, Responses, Anthropic, and
+  completions. Abandoned work must stop at the next backend-safe boundary, and
+  a valid request after each cancellation must complete normally.
+- Only after receiving explicit permission for this QA pass, start
+  `ds4-server` on the eight-L40S CUDA TP target with the release TP options and
+  verify all 16 100k-context sessions allocate. Startup must report a
+  2048-token prefill cap; a silent fallback to 4096 is an OOM regression.
 - Test `--trace` and confirm rendered prompts, cache decisions, generated text,
   and tool-parser events are useful without leaking unrelated state.
 
@@ -478,8 +564,10 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Queue messages while the model is busy.  Queued messages must not skip tool
   execution; after tool results, the queued user text must be provided.
 - Read/search/edit/write tools:
-  create a temp project, ask for edits, verify old/new and `[upto]` anchored
-  edits fail safely on ambiguous matches and do not require retyping whole files.
+  create a temp project and ask for edits. By default, verify that exact old/new
+  replacements work and the tool prompt does not advertise `[upto]`. In a
+  separate `--edit-upto` run, verify anchored edits fail safely on ambiguous
+  matches and do not require retyping whole files.
 - Real coding edit loop:
   delete `/tmp/mymandel`, ask ds4-agent to create a small C ASCII Mandelbrot
   program there, build and run it, then in a second user turn ask for a small
@@ -550,14 +638,17 @@ claims across different models or contexts.
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token context | about 94 t/s | 15.4 t/s |
 | DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
-| Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 16.78 t/s; FP32 rollback 9.43 t/s |
+| DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture | - | 24.48 t/s direct; 13.93 t/s replay predecessor |
+| Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 17.27 t/s; FP32 rollback 9.70 t/s |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
+| Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture | - | 11.40 t/s direct; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
 | 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
 | 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
 
 The 8x L40S values are retained from the last recorded run on `192.168.60.250`.
-Do not interrupt a production server merely to refresh them. When that host is
-available for release QA, the existing hard floor remains 110 aggregate t/s for
+They are historical references only: never connect to that host or interrupt
+its production server without explicit permission for the current QA pass. If
+permission is granted, the existing hard floor remains 110 aggregate t/s for
 the 16-row decode oracle.
 
 ## 17. Release Sign-off

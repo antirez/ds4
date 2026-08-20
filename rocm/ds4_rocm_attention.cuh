@@ -1,4 +1,79 @@
 // DS4 ROCm attention kernels (prefill/decode, raw/mixed KV).
+
+/* Non-causal attention used by the small DSpark draft block. Each query row
+ * sees the complete raw-KV ring rather than a causal prefix. */
+__global__ static void attention_noncausal_raw_batch_heads_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (tok >= n_tokens || h >= n_head) return;
+
+    extern __shared__ float sh_scores[];
+    const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        const uint32_t row = (raw_start + r) % raw_cap;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+        sh_scores[r] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    float local_max = sinks[h];
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        local_max = fmaxf(local_max, sh_scores[r]);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+
+    float den_local = 0.0f;
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        sh_scores[r] = expf(sh_scores[r] - max_s);
+        den_local += sh_scores[r];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+
+    float *oh = heads + ((uint64_t)tok * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = (raw_start + r) % raw_cap;
+            acc += raw_kv[(uint64_t)row * head_dim + d] * sh_scores[r];
+        }
+        oh[d] = acc / denom;
+    }
+}
 //
 // Included from ds4_cuda.cu in the same translation unit to keep launch/API
 // glue unchanged while kernel implementations are split into modules.

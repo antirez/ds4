@@ -61,6 +61,15 @@ The software is currently very fast changing. Consider it beta quality.
 Before each release, a big QA run is executed, however instabilities
 are definitely possible.
 
+# How to use this project?
+
+I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
+
+1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
+2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
+
+So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
+
 ## More Documentation
 
 If you are looking for very specific things, we have other
@@ -199,6 +208,15 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
+Accepted proposals keep the state produced by the batched target verifier
+instead of running the same tokens through one-token decode again. Both paths
+execute the same inference graph, but floating-point operations are grouped in
+a different order. A long greedy DSpark run may therefore diverge from a run
+without DSpark after an otherwise valid accepted block. This is not a reduced
+precision or approximate-model mode; use ordinary decoding, `--quality`, or
+`--dspark-strict` when byte-for-byte reproducibility with one-token decode is
+required.
+
 The DSpark checkpoint for Flash 0731 is packaged here as a separate support
 GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 
@@ -223,39 +241,47 @@ Run it with greedy decoding:
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-The default confidence threshold is `0.7`; it prunes suffixes that are unlikely
-to repay their verification cost. `--dspark-confidence 0` forces fixed
-five-token blocks and is intended for diagnostics. Sampled decoding does not
-use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
-decoding, which is useful for comparisons and correctness checks.
+The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm;
+it prunes suffixes that are unlikely to repay their verification cost.
+`--dspark-confidence 0` forces fixed five-token blocks and is intended for
+diagnostics. Sampled decoding does not use DSpark proposals. `--quality` and
+`--dspark-strict` also keep target-only decoding, which is useful for
+reproducibility checks.
 
 ## Speed
 
-*Warning: some of those numbers may no longer be updated, because of the optimization
-efforts that improved the runtime speed without updating the benchmark
-results.*
+The current q2 results use `ds4-bench` with the standard *Promessi sposi*
+input, 2048-token context steps, and 128 greedy generation tokens at every
+frontier. Each prefill number is for the next 2048-token chunk. The complete
+sweeps are in [m5_max.csv](speed-bench/m5_max.csv) and
+[gb10.csv](speed-bench/gb10.csv).
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+| Machine | Backend | Context | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| MacBook Pro M5 Max, 128 GB | Metal | 2048 | 790.18 t/s | 39.35 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 16384 | 572.53 t/s | 36.14 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 32768 | 557.04 t/s | 34.36 t/s |
+| MacBook Pro M5 Max, 128 GB | Metal | 65536 | 398.50 t/s | 27.64 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 2048 | 825.76 t/s | 18.05 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 16384 | 872.44 t/s | 15.10 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 32768 | 855.94 t/s | 14.43 t/s |
+| DGX Spark GB10, 128 GB | CUDA | 65536 | 822.98 t/s | 13.84 t/s |
+
+Older measurements for machines and model variants not rerun in this pass are
+kept for reference. They used the earlier CLI prompt procedure and are not
+directly comparable with the table above.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
 | MacBook Pro M3 Max, 128 GB | q2 | short | 58.52 t/s | 26.68 t/s |
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
-| MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
-| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
-| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
-| DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
-![M3 Max t/s](speed-bench/m3_max_ts.svg)
+![M5 Max t/s](speed-bench/m5_max_ts.svg)
 ![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
 
 ## Running models larger than RAM
