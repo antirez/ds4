@@ -58,6 +58,11 @@ struct ds4_metal_args_dsv4_head_norm_rope {
     float beta_slow;
 };
 
+struct ds4_metal_args_dsv4_batch_qkv_finalize {
+    uint32_t raw_cap;
+    uint32_t raw_pos0;
+};
+
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -420,6 +425,101 @@ kernel void kernel_dsv4_head_rms_norm_rope_tail_f32(
         const float x1 = xs[i0 + 1] * scale;
         xs[i0] = x0 * cos_theta - x1 * sin_theta;
         xs[i0 + 1] = x0 * sin_theta + x1 * cos_theta;
+    }
+}
+
+// KV half of the batch finalizer as a separate PSO. The host can dispatch it
+// concurrently with the unchanged Q-head norm/RoPE PSO, retaining that PSO's
+// exact compiled arithmetic. The KV PSO collapses the four post-q_b KV
+// dispatches; together the active path turns five serial dispatches into two
+// concurrent dispatches.
+kernel void kernel_dsv4_batch_kv_rope_fp8_store_f32(
+        constant ds4_metal_args_dsv4_rope_tail & args,
+        constant ds4_metal_args_dsv4_batch_qkv_finalize & store,
+        device const int32_t * positions,
+        device float * kvraw,
+        device float * raw_cache,
+        threadgroup float * scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y;
+    const int n_nope = (int)args.ne00 - args.n_dims;
+    if (args.mode != 0 || n_nope < 0) {
+        return;
+    }
+
+    device float *kv = (device float *)((device char *)kvraw +
+        (uint64_t)i2 * args.nb02 + (uint64_t)i1 * args.nb01);
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base,
+                        args.beta_fast, args.beta_slow, corr_dims);
+    const float theta_base = (float)positions[i2];
+    const float inv_ndims = -1.f / args.n_dims;
+
+    for (int r = tid; r < args.n_dims; r += ntg.x) {
+        if ((r & 1) != 0) {
+            continue;
+        }
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta =
+            theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta =
+            theta_base * pow(args.freq_base, inv_ndims * r);
+#endif
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta, args.freq_scale, corr_dims, r,
+                  args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = kv[j0];
+        const float x1 = kv[j1];
+        kv[j0] = x0 * cos_theta - x1 * sin_theta;
+        kv[j1] = x0 * sin_theta + x1 * cos_theta;
+    }
+
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+
+    device float *raw = raw_cache +
+        (uint64_t)((store.raw_pos0 + (uint)i2) % store.raw_cap) *
+        (uint64_t)args.ne00;
+    for (int off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + (int)tid < n_nope) {
+            v = kv[off + tid];
+            scratch[tid] = abs(v);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float amax = max(scratch[0], 1.0e-4f);
+        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        if (off + (int)tid < n_nope) {
+            const float q = dsv4_e4m3fn_dequant(
+                clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
+            kv[off + tid] = q;
+            raw[off + tid] = (float)((half)q);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = n_nope + (int)tid; i < args.ne00; i += 64) {
+        raw[i] = (float)((half)kv[i]);
     }
 }
 

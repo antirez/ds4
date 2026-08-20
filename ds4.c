@@ -29709,6 +29709,7 @@ static bool metal_graph_encode_layer_attention_batch(
         ok = false;
     }
     bool q_b_f16_out = false;
+    bool batch_qkv_finalized = false;
     if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
                                                                      tp_q_half ? tp_q_half : g->batch_q_half,
@@ -29759,8 +29760,59 @@ static bool metal_graph_encode_layer_attention_batch(
         DS4_METAL_PROFILE_Q_STAGE("q_b");
         const bool q_norm_debug =
             metal_graph_debug_wants("Qnorm", il, pos0);
-        bool q_norm_rope_fused = false;
-        if (ok && !q_norm_debug) {
+#if defined(__APPLE__)
+        const bool kv_rope_debug =
+            metal_graph_debug_wants("KVrope", il, pos0);
+        const uint32_t prior_raw =
+            pos0 < g->raw_window ? pos0 : g->raw_window;
+        const bool batch_qkv_finalize_eligible =
+            qkv_rms_fused &&
+            !q_path_debug &&
+            !kv_rope_debug &&
+            !q_stage_profile &&
+            !layer_stage_profile &&
+            !tp_row_split_attn &&
+            !g->ssd_streaming &&
+            !g->quality &&
+            g->tp_world < 2 &&
+            n_tokens >= 128u &&
+            n_tokens <= 4096u &&
+            DS4_N_HEAD == 64u &&
+            DS4_N_HEAD_KV == 1u &&
+            DS4_N_HEAD_DIM == 512u &&
+            DS4_N_ROT == 64u &&
+            g->layer_raw_cache[il] != NULL &&
+            (uint64_t)n_tokens + prior_raw <= g->raw_cap &&
+            !metal_graph_use_reference_kv_decode() &&
+            getenv("DS4_METAL_DISABLE_PRE_M5_BATCH_QKV_FINALIZE") == NULL &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_available() != 0;
+        if (ok && batch_qkv_finalize_eligible) {
+            batch_qkv_finalized =
+                ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_tensor(
+                    metal_graph_batch_q(g),
+                    metal_graph_batch_kv(g),
+                    g->layer_raw_cache[il],
+                    g->raw_cap,
+                    n_tokens,
+                    DS4_N_HEAD,
+                    DS4_N_HEAD_DIM,
+                    DS4_N_ROT,
+                    pos0,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    false,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW,
+                    DS4_RMS_EPS) != 0;
+            if (!batch_qkv_finalized) ok = false;
+        }
+#endif
+        bool q_norm_rope_fused = batch_qkv_finalized;
+        if (ok && !q_norm_debug && !q_norm_rope_fused) {
             q_norm_rope_fused = ds4_gpu_head_rms_norm_rope_tail_tensor(
                 tp_q ? tp_q : metal_graph_batch_q(g),
                 tp_rows,
@@ -29843,7 +29895,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
         }
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_kv(g),
+    if (ok && !batch_qkv_finalized) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_kv(g),
                                             n_tokens,
                                             DS4_N_HEAD_KV,
                                             DS4_N_HEAD_DIM,
@@ -29861,7 +29913,7 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("KVrope", metal_graph_batch_kv(g),
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
-    if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(metal_graph_batch_kv(g),
+    if (ok && !batch_qkv_finalized) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(metal_graph_batch_kv(g),
                                                        n_tokens,
                                                        DS4_N_HEAD_DIM,
                                                        DS4_N_ROT) != 0;
@@ -29878,7 +29930,7 @@ static bool metal_graph_encode_layer_attention_batch(
      * sized to hold the current chunk plus the previous SWA window, while the
      * attention mask still enforces the 128-token logical window.
      */
-    if (ok && zero_prefix) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+    if (ok && zero_prefix && !batch_qkv_finalized) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                                     metal_graph_batch_kv(g),
                                                                     g->raw_cap,
                                                                     pos0,
@@ -29941,12 +29993,14 @@ static bool metal_graph_encode_layer_attention_batch(
         const uint32_t raw_start = metal_graph_raw_start_for_span(g,
                                                                   pos0 + n_tokens - 1u,
                                                                   n_raw);
-        ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                 metal_graph_batch_kv(g),
-                                                 g->raw_cap,
-                                                 pos0,
-                                                 n_tokens,
-                                                 DS4_N_HEAD_DIM) != 0;
+        if (!batch_qkv_finalized) {
+            ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+                                                     metal_graph_batch_kv(g),
+                                                     g->raw_cap,
+                                                     pos0,
+                                                     n_tokens,
+                                                     DS4_N_HEAD_DIM) != 0;
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("raw_cache",
                                           g->layer_raw_cache[il],
@@ -30675,12 +30729,14 @@ static bool metal_graph_encode_layer_attention_batch(
             bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
 
-            ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                     metal_graph_batch_kv(g),
-                                                     g->raw_cap,
-                                                     pos0,
-                                                     n_tokens,
-                                                     DS4_N_HEAD_DIM) != 0;
+            if (!batch_qkv_finalized) {
+                ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+                                                         metal_graph_batch_kv(g),
+                                                         g->raw_cap,
+                                                         pos0,
+                                                         n_tokens,
+                                                         DS4_N_HEAD_DIM) != 0;
+            }
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {

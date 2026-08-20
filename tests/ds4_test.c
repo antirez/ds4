@@ -866,6 +866,214 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
     ds4_gpu_tensor_free(raw);
 }
 
+#if defined(__APPLE__)
+static void test_metal_batch_qkv_finalizer_exact_case(
+        uint32_t n_tokens,
+        uint32_t raw_cap,
+        uint32_t pos0,
+        uint32_t seed,
+        bool     yarn,
+        bool     batch_commands,
+        bool     force_pos_buffer) {
+    const uint32_t n_head = 64u;
+    const uint32_t head_dim = 512u;
+    const uint32_t n_rot = 64u;
+    const uint64_t q_count =
+        (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t kv_count = (uint64_t)n_tokens * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t q_bytes = q_count * sizeof(float);
+    const uint64_t kv_bytes = kv_count * sizeof(float);
+    const uint64_t raw_bytes = raw_count * sizeof(float);
+
+    ds4_gpu_tensor *ref_q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *fused_q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *ref_kv = ds4_gpu_tensor_alloc(kv_bytes);
+    ds4_gpu_tensor *fused_kv = ds4_gpu_tensor_alloc(kv_bytes);
+    ds4_gpu_tensor *ref_raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *fused_raw = ds4_gpu_tensor_alloc(raw_bytes);
+    float *q_input = malloc((size_t)q_bytes);
+    float *kv_input = malloc((size_t)kv_bytes);
+    float *raw_input = malloc((size_t)raw_bytes);
+    float *ref_host = malloc((size_t)q_bytes);
+    float *fused_host = malloc((size_t)q_bytes);
+
+    TEST_ASSERT(ref_q != NULL);
+    TEST_ASSERT(fused_q != NULL);
+    TEST_ASSERT(ref_kv != NULL);
+    TEST_ASSERT(fused_kv != NULL);
+    TEST_ASSERT(ref_raw != NULL);
+    TEST_ASSERT(fused_raw != NULL);
+    TEST_ASSERT(q_input != NULL);
+    TEST_ASSERT(kv_input != NULL);
+    TEST_ASSERT(raw_input != NULL);
+    TEST_ASSERT(ref_host != NULL);
+    TEST_ASSERT(fused_host != NULL);
+
+    const bool allocated = ref_q && fused_q && ref_kv && fused_kv &&
+        ref_raw && fused_raw && q_input && kv_input && raw_input &&
+        ref_host && fused_host;
+    if (allocated) {
+        for (uint64_t i = 0; i < q_count; i++) {
+            const int value =
+                (int)((i * 29u + (i >> 5u) * 17u + seed * 31u) % 509u) -
+                254;
+            q_input[i] = (float)value / 47.0f;
+        }
+        for (uint64_t i = 0; i < kv_count; i++) {
+            const int value =
+                (int)((i * 37u + (i >> 4u) * 13u + seed * 19u) % 521u) -
+                260;
+            kv_input[i] = (float)value / 53.0f;
+        }
+        const uint32_t negative_zero = 0x80000000u;
+        memcpy(q_input + (seed % q_count), &negative_zero,
+               sizeof(negative_zero));
+        memcpy(kv_input + (seed % kv_count), &negative_zero,
+               sizeof(negative_zero));
+        for (uint64_t i = 0; i < raw_count; i++) {
+            const uint32_t poison =
+                0x7fc00001u + (uint32_t)(i & 0x3ffu);
+            memcpy(raw_input + i, &poison, sizeof(poison));
+        }
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_q, 0, q_input, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_q, 0, q_input, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_kv, 0, kv_input, kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_kv, 0, kv_input, kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_raw, 0, raw_input, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_raw, 0, raw_input, raw_bytes) != 0);
+
+        const float freq_base = yarn ? 160000.0f : 10000.0f;
+        const float freq_scale = yarn ? 1.0f / 16.0f : 1.0f;
+        const float ext_factor = yarn ? 1.0f : 0.0f;
+        const uint32_t n_ctx_orig = yarn ? 65536u : 0u;
+        const float attn_factor = yarn
+            ? 1.0f / (1.0f + 0.1f * logf(1.0f / freq_scale))
+            : 1.0f;
+        const float beta_fast = 32.0f;
+        const float beta_slow = 1.0f;
+        const float eps = 1.0e-6f;
+
+        TEST_ASSERT(ds4_gpu_head_rms_norm_rope_tail_tensor(
+                        ref_q, n_tokens, n_head, head_dim, n_rot, pos0,
+                        n_ctx_orig,
+                        false, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow, eps) != 0);
+        TEST_ASSERT(ds4_gpu_rope_tail_tensor(
+                        ref_kv, n_tokens, 1u, head_dim, n_rot, pos0,
+                        n_ctx_orig,
+                        false, freq_base, freq_scale, ext_factor,
+                        attn_factor, beta_fast, beta_slow) != 0);
+        TEST_ASSERT(ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                        ref_kv, n_tokens, head_dim, n_rot) != 0);
+        TEST_ASSERT(ds4_gpu_store_raw_kv_batch_tensor(
+                        ref_raw, ref_kv, raw_cap, pos0,
+                        n_tokens, head_dim) != 0);
+
+        const char *pos_buffer_env =
+            "DS4_GPU_TEST_BATCH_QKV_FINALIZE_POS_BUFFER";
+        char *saved_pos_buffer_env = force_pos_buffer
+            ? test_save_env(pos_buffer_env) : NULL;
+        if (force_pos_buffer) {
+            TEST_ASSERT(setenv(pos_buffer_env, "1", 1) == 0);
+        }
+        const int begun = batch_commands ? ds4_gpu_begin_commands() : 1;
+        TEST_ASSERT(begun != 0);
+        const int finalized = begun
+            ? ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_tensor(
+                  fused_q, fused_kv, fused_raw, raw_cap, n_tokens,
+                  n_head, head_dim, n_rot, pos0, n_ctx_orig, false,
+                  freq_base, freq_scale, ext_factor, attn_factor,
+                  beta_fast, beta_slow, eps)
+            : 0;
+        const int ended = batch_commands && begun
+            ? ds4_gpu_end_commands() : begun;
+        if (force_pos_buffer) {
+            test_restore_env(pos_buffer_env, saved_pos_buffer_env);
+        }
+        TEST_ASSERT(finalized != 0);
+        TEST_ASSERT(ended != 0);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_q, 0, ref_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_q, 0, fused_host, q_bytes) != 0);
+        const test_float_compare_stats q_stats =
+            test_compare_float_bits(ref_host, fused_host, (size_t)q_count);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_kv, 0, ref_host, kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_kv, 0, fused_host, kv_bytes) != 0);
+        const test_float_compare_stats kv_stats =
+            test_compare_float_bits(ref_host, fused_host, (size_t)kv_count);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_raw, 0, ref_host, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_raw, 0, fused_host, raw_bytes) != 0);
+        const test_float_compare_stats raw_stats =
+            test_compare_float_bits(ref_host, fused_host, (size_t)raw_count);
+
+        fprintf(stderr,
+                "ds4-test: batch Q/KV finalizer rows=%u yarn=%d batch=%d "
+                "posbuf=%d "
+                "q=%zu kv=%zu raw=%zu "
+                "max_ulp=%u/%u/%u\n",
+                n_tokens,
+                yarn ? 1 : 0,
+                batch_commands ? 1 : 0,
+                force_pos_buffer ? 1 : 0,
+                q_stats.mismatch_count,
+                kv_stats.mismatch_count,
+                raw_stats.mismatch_count,
+                q_stats.max_ulp,
+                kv_stats.max_ulp,
+                raw_stats.max_ulp);
+        TEST_ASSERT(q_stats.mismatch_count == 0);
+        TEST_ASSERT(kv_stats.mismatch_count == 0);
+        TEST_ASSERT(raw_stats.mismatch_count == 0);
+    }
+
+    free(fused_host);
+    free(ref_host);
+    free(raw_input);
+    free(kv_input);
+    free(q_input);
+    ds4_gpu_tensor_free(fused_raw);
+    ds4_gpu_tensor_free(ref_raw);
+    ds4_gpu_tensor_free(fused_kv);
+    ds4_gpu_tensor_free(ref_kv);
+    ds4_gpu_tensor_free(fused_q);
+    ds4_gpu_tensor_free(ref_q);
+}
+
+static void test_metal_batch_qkv_finalizer_exact(void) {
+    if (!ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_available()) {
+        fprintf(stderr,
+                "ds4-test: batch Q/KV finalizer unavailable; skipping exact oracle\n");
+        return;
+    }
+    test_metal_batch_qkv_finalizer_exact_case(
+        7u, 13u, 10u, 17u, false, false, false);
+    test_metal_batch_qkv_finalizer_exact_case(
+        33u, 43u, 39u, 29u, false, false, false);
+    test_metal_batch_qkv_finalizer_exact_case(
+        17u, 29u, 32761u, 43u, true, false, false);
+    /* Production-sized admission, the batch-owned concurrent encoder, and
+     * the same MTLBuffer binding path used by >1024-token position arrays. */
+    test_metal_batch_qkv_finalizer_exact_case(
+        128u, 139u, 131u, 59u, true, true, true);
+}
+#endif
+
 static void test_dspark_cache_window_crop(void) {
     TEST_ASSERT(ds4_test_dspark_cache_window_crop());
 }
@@ -4733,6 +4941,7 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
+    test_metal_batch_qkv_finalizer_exact();
     test_metal_f16_compressor_pair_state_store_exact();
     test_metal_compressor_ape_add_exact();
     test_metal_compressor_ratio4_pack_exact();

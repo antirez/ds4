@@ -492,6 +492,8 @@ static id<MTLComputePipelineState> g_dsv4_fp8_kv_quantize_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_qat_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_fp8_store_pipeline;
 static id<MTLComputePipelineState> g_dsv4_kv_rope_fp8_store_pipeline;
+static id<MTLComputePipelineState> g_dsv4_batch_qkv_finalize_pipeline;
+static bool g_dsv4_batch_qkv_finalize_unavailable;
 static id<MTLComputePipelineState> g_dsv4_ratio4_shift_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_pack_ratio4_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_pack_ratio4_decode_ggml_pipeline;
@@ -5541,6 +5543,34 @@ typedef struct {
     uint32_t tasks;
 } ds4_gpu_qkv_rms_norm_args;
 
+typedef struct {
+    int32_t n_head;
+    int32_t head_dim;
+    int32_t head_dim4;
+    int32_t n_dims;
+    int32_t n_ctx_orig;
+    int32_t pos0;
+    int32_t inverse;
+    float eps;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+} ds4_gpu_dsv4_head_norm_rope_args;
+
+_Static_assert(sizeof(ds4_gpu_dsv4_head_norm_rope_args) == 56,
+               "Metal DSV4 head norm/RoPE argument ABI changed");
+
+typedef struct {
+    uint32_t raw_cap;
+    uint32_t raw_pos0;
+} ds4_gpu_dsv4_batch_qkv_finalize_args;
+
+_Static_assert(sizeof(ds4_gpu_dsv4_batch_qkv_finalize_args) == 8,
+               "Metal batch Q/KV finalizer argument ABI changed");
+
 static ds4_gpu_rms_norm_args ds4_gpu_make_rms_norm_args(uint32_t n, uint32_t rows, float eps) {
     const uint64_t row_bytes = (uint64_t)n * sizeof(float);
     return (ds4_gpu_rms_norm_args) {
@@ -6153,7 +6183,9 @@ static int ds4_gpu_encode_rope_tail_inplace(
             pos[t] = (int32_t)(pos0 + t * pos_step);
         }
 
-        if (pos_bytes > 4096u) {
+        const bool force_pos_buffer =
+            getenv("DS4_GPU_TEST_BATCH_QKV_FINALIZE_POS_BUFFER") != NULL;
+        if (pos_bytes > 4096u || force_pos_buffer) {
             /*
              * Metal inline setBytes data is meant for small constants. Long
              * prefill RoPE calls need thousands of positions; passing that much
@@ -11615,6 +11647,8 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
         g_dsv4_kv_rope_fp8_store_pipeline = nil;
+        g_dsv4_batch_qkv_finalize_pipeline = nil;
+        g_dsv4_batch_qkv_finalize_unavailable = false;
         g_dsv4_ratio4_shift_pipeline = nil;
         g_dsv4_compressor_pack_ratio4_pipeline = nil;
         g_dsv4_compressor_pack_ratio4_decode_ggml_pipeline = nil;
@@ -22710,22 +22744,7 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
                   "kernel_dsv4_head_rms_norm_rope_tail_f32");
         if (!pipeline) return 0;
 
-        struct {
-            int32_t n_head;
-            int32_t head_dim;
-            int32_t head_dim4;
-            int32_t n_dims;
-            int32_t n_ctx_orig;
-            int32_t pos0;
-            int32_t inverse;
-            float eps;
-            float freq_base;
-            float freq_scale;
-            float ext_factor;
-            float attn_factor;
-            float beta_fast;
-            float beta_slow;
-        } args = {
+        ds4_gpu_dsv4_head_norm_rope_args args = {
             .n_head = (int32_t)n_head,
             .head_dim = (int32_t)head_dim,
             .head_dim4 = (int32_t)(head_dim / 4u),
@@ -22760,6 +22779,209 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
 
         if (!ds4_gpu_finish_command_buffer(
                 cb, owned, "fused head norm/RoPE")) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_available(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_dsv4_batch_qkv_finalize_unavailable ||
+        !ds4_gpu_device_is_pre_m5_apple_silicon() ||
+        !g_use_dsv4_head_rms_norm_rope_tail_pipeline ||
+        !ds4_gpu_device_name_contains("M3") ||
+        !g_rope_tail_inplace_pair_pipeline ||
+        getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) {
+        return 0;
+    }
+    if (!g_dsv4_batch_qkv_finalize_pipeline) {
+        g_dsv4_batch_qkv_finalize_pipeline = ds4_gpu_get_pipeline(
+            "kernel_dsv4_batch_kv_rope_fp8_store_f32");
+    }
+    if (!g_dsv4_batch_qkv_finalize_pipeline) {
+        g_dsv4_batch_qkv_finalize_unavailable = true;
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_tensor(
+        ds4_gpu_tensor *q,
+        ds4_gpu_tensor *kv,
+        ds4_gpu_tensor *raw_cache,
+        uint32_t        raw_cap,
+        uint32_t        n_tok,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        n_rot,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        bool            inverse,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow,
+        float           eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!q || !kv || !raw_cache || raw_cap == 0u || n_tok <= 1u ||
+        n_tok > raw_cap || n_head != 64u || head_dim != 512u ||
+        n_rot != 64u || pos0 > (uint32_t)INT32_MAX - n_tok ||
+        !ds4_gpu_dsv4_batch_qnorm_rope_kv_finalize_available()) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> kvbuf = ds4_gpu_tensor_buffer(kv);
+        id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_cache);
+        const uint64_t q_bytes =
+            (uint64_t)n_tok * n_head * head_dim * sizeof(float);
+        const uint64_t kv_bytes =
+            (uint64_t)n_tok * head_dim * sizeof(float);
+        const uint64_t raw_bytes =
+            (uint64_t)raw_cap * head_dim * sizeof(float);
+        if (!qbuf || !kvbuf || !rawbuf ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(kv) < kv_bytes ||
+            ds4_gpu_tensor_bytes(raw_cache) < raw_bytes) {
+            fprintf(stderr,
+                    "ds4: Metal batch Q/KV finalizer received undersized buffers\n");
+            return 0;
+        }
+
+        id<MTLComputePipelineState> kv_pipeline =
+            g_dsv4_batch_qkv_finalize_pipeline;
+        id<MTLComputePipelineState> q_pipeline =
+            g_dsv4_head_rms_norm_rope_tail_pipeline;
+        if (!q_pipeline || !kv_pipeline) {
+            g_dsv4_batch_qkv_finalize_unavailable = true;
+            return 0;
+        }
+        if (g_batch_encoder_concurrent) return 0;
+
+        ds4_gpu_dsv4_head_norm_rope_args args = {
+            .n_head = (int32_t)n_head,
+            .head_dim = (int32_t)head_dim,
+            .head_dim4 = (int32_t)(head_dim / 4u),
+            .n_dims = (int32_t)n_rot,
+            .n_ctx_orig = (int32_t)n_ctx_orig,
+            .pos0 = (int32_t)pos0,
+            .inverse = inverse ? 1 : 0,
+            .eps = eps,
+            .freq_base = freq_base,
+            .freq_scale = freq_scale,
+            .ext_factor = ext_factor,
+            .attn_factor = attn_factor,
+            .beta_fast = beta_fast,
+            .beta_slow = beta_slow,
+        };
+        ds4_gpu_dsv4_batch_qkv_finalize_args store = {
+            .raw_cap = raw_cap,
+            .raw_pos0 = pos0,
+        };
+
+        int32_t pos_stack[256];
+        int32_t *positions = pos_stack;
+        if (n_tok > (uint32_t)(sizeof(pos_stack) / sizeof(pos_stack[0]))) {
+            positions = malloc((size_t)n_tok * sizeof(*positions));
+            if (!positions) {
+                fprintf(stderr,
+                        "ds4: failed to allocate batch Q/KV finalizer positions\n");
+                return 0;
+            }
+        }
+        for (uint32_t t = 0; t < n_tok; t++) {
+            positions[t] = (int32_t)(pos0 + t);
+        }
+
+        const NSUInteger pos_bytes =
+            (NSUInteger)n_tok * sizeof(*positions);
+        id<MTLBuffer> posbuf = nil;
+        if (pos_bytes > 4096u) {
+            posbuf = ds4_gpu_new_transient_buffer(
+                pos_bytes, "ds4_batch_qkv_finalize_positions");
+            if (!posbuf) {
+                if (positions != pos_stack) free(positions);
+                return 0;
+            }
+            memcpy([posbuf contents], positions, pos_bytes);
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) {
+            if (positions != pos_stack) free(positions);
+            return 0;
+        }
+
+        const BOOL batch_owned_encoder =
+            g_batch_cb && cb == g_batch_cb;
+        if (batch_owned_encoder) {
+            ds4_gpu_close_batch_encoder();
+            g_batch_encoder_concurrent = YES;
+        }
+        id<MTLComputeCommandEncoder> enc = batch_owned_encoder
+            ? ds4_gpu_compute_encoder(cb)
+            : [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) {
+            if (batch_owned_encoder) {
+                ds4_gpu_close_batch_encoder();
+                g_batch_encoder_concurrent = NO;
+            }
+            if (positions != pos_stack) free(positions);
+            return 0;
+        }
+
+        /* Keep the established Q PSO intact: only its dispatch is moved into
+         * the concurrent encoder. This avoids the fast-math drift seen when
+         * the same source body was embedded in a compound Q/KV kernel. */
+        [enc setComputePipelineState:q_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
+             threadsPerThreadgroup:MTLSizeMake(
+                 ds4_gpu_rms_norm_pipeline_threads(head_dim, q_pipeline),
+                 1,
+                 1)];
+
+        /* The KV PSO is independent of Q, and preserves the batch pair-RoPE,
+         * FP8 round trip, and F16-rounded raw-ring write in one threadgroup per
+         * token. DispatchTypeConcurrent lets the GPU hide this short tail
+         * under the 64 Q-head threadgroups for each token. */
+        ds4_gpu_rope_tail_batch_args rope_args =
+            ds4_gpu_make_rope_tail_args(
+                n_tok, 1u, head_dim, n_rot, n_ctx_orig, inverse,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                beta_fast, beta_slow);
+        [enc setComputePipelineState:kv_pipeline];
+        [enc setBytes:&rope_args length:sizeof(rope_args) atIndex:0];
+        [enc setBytes:&store length:sizeof(store) atIndex:1];
+        if (posbuf) {
+            [enc setBuffer:posbuf offset:0 atIndex:2];
+        } else {
+            [enc setBytes:positions length:pos_bytes atIndex:2];
+        }
+        [enc setBuffer:kvbuf offset:ds4_gpu_tensor_offset(kv) atIndex:3];
+        [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:4];
+        [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, n_tok, 1)
+             threadsPerThreadgroup:MTLSizeMake(64u, 1, 1)];
+
+        if (batch_owned_encoder) {
+            ds4_gpu_close_batch_encoder();
+            g_batch_encoder_concurrent = NO;
+        } else {
+            [enc endEncoding];
+        }
+
+        if (positions != pos_stack) free(positions);
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "batch Q norm/RoPE + KV finalizer")) {
             return 0;
         }
     }

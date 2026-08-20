@@ -113,6 +113,37 @@ one of the 64 measured runs produced bit-identical full-vocabulary logits.
 Performance was measured on M3 Ultra; the guarded default also covers the
 shared resident M1-M4 path.
 
+### Metal batch Q/KV finalizer A/B
+
+The M3 resident Flash prefill path now follows vLLM's horizontal Q/KV
+finalization schedule while retaining DS4's existing Q-head PSO. It dispatches
+that exact Q RMSNorm+RoPE kernel concurrently with a KV-only kernel that folds
+KV RoPE, the FP8 round trip, F16 rounding, and raw-ring insertion together.
+The default covers 128 through 4096 tokens per dispatch; longer contexts use
+the normal 4096-token chunks. A 32-token dispatch regressed and 64 tokens did
+not clear the 0.3% acceptance threshold. Compare the retained path with its
+serial rollback using:
+
+```
+./speed-bench/metal_prefill_variant_bench \
+  --prefix-tokens 512 \
+  --warmup-tokens 512 \
+  --repeats 4 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_BATCH_QKV_FINALIZE
+```
+
+Balanced M3 Ultra A/B throughput for the concurrent path versus rollback was
+273.60/272.63 tok/s at 128 tokens (+0.36%), 502.44/500.37 at 512 (+0.41%),
+598.07/595.87 at 1024 (+0.37%), 651.27/649.11 at 2048 (+0.33%), and
+615.06/612.37 at 8192 (+0.44%). All 56 prefill runs and 7,239,680 compared
+full-vocabulary logits were bit-identical.
+A 512-token prefill followed by decode also matched 73 full-vocabulary rows and
+72 selected token IDs exactly, covering the persisted raw-cache state. The
+schedule is based on vLLM's
+[fused DeepSeek V4 finalizer](https://github.com/vllm-project/vllm/blob/c8de519917ce549f72132952116185e38b37c95d/csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu#L382-L603),
+but keeps Q and KV in separate Metal pipeline states to preserve DS4's exact Q
+fast-math code generation.
+
 The harness uses one Metal engine and fresh sessions for every run. It warms
 both variants with at least 32 tokens, alternates control/candidate order in
 ABBA and BAAB blocks, poisons host logit buffers before copying, and aborts
