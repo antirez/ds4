@@ -254,6 +254,7 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
     DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC = 1u << 7,
     DS4_GPU_TEST_INDEXED_ATTN_PREFILL_RB4 = 1u << 8,
+    DS4_GPU_TEST_BATCH_ATTN_OUT_HC_FUSION = 1u << 9,
 };
 int ds4_gpu_test_get_quality(void);
 void ds4_gpu_test_set_flags(uint32_t flags);
@@ -2343,6 +2344,31 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+
+#ifdef __APPLE__
+/* Optional pre-M5 batch Q8 attention-output B + HC4 epilogue. Returns 1
+ * when fused work was encoded, 0 when unsupported without encoding work,
+ * and -1 after an attempted-path failure. */
+int ds4_gpu_attention_output_q8_batch_hc_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                n_hc);
+#endif
 int ds4_gpu_attention_output_q4_K_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2811,6 +2837,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
+        bool                    defer_sum6,
         bool                    force_resident);
 
 /* =========================================================================
@@ -3016,6 +3043,23 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+#ifdef __APPLE__
+int ds4_gpu_moe_sum6_hc_expand_available(void);
+int ds4_gpu_moe_sum6_hc_expand_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *expert_down,
+        const ds4_gpu_tensor *shared_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_test_moe_sum6_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *expert_down,
+        uint32_t                n_embd,
+        uint32_t                n_tokens);
+#endif
 
 int ds4_gpu_hc_expand_add_split_half_add_tensor(
         ds4_gpu_tensor       *out_hc,

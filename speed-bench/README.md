@@ -205,6 +205,98 @@ also exact but was 0.17-0.21% slower at the first two screened sizes, so only
 the four-row specialization is retained. Performance was measured on M3
 Ultra; the guarded default covers the shared resident M1-M4 path.
 
+The same guarded path now groups sixteen heads per 256-thread workgroup by
+having each SIMDgroup update two heads from every staged four-row block. This
+halves K/V staging and workgroup count without changing either head's row
+order or online-softmax arithmetic. Compare it with the accepted eight-head
+RB4 rollback using:
+
+```
+./speed-bench/metal_prefill_variant_bench \
+  --prefix-tokens 8192 \
+  --warmup-tokens 4096 \
+  --repeats 1 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_PREFILL_HEADS16_DUAL_RB4
+```
+
+Balanced M3 Ultra A/B throughput for heads16 dual RB4 versus heads8 RB4 was
+638.45/629.00 tok/s at 2052 tokens (+1.50%), 651.08/637.46 at 4100
+(+2.14%), 640.33/626.12 at 8192 (+2.27%), and 613.72/600.81 at 16384
+(+2.15%). The first matched 32768-token pair was 576.10/563.42 (+2.25%);
+later slots in that process encountered severe system throttling and are not
+used for the comparison. All 28 timed full-vocabulary rows were bit-identical.
+The forced direct oracle matched all 1,048,576 attention-output floats and
+proved both the dedicated rollback and new selector. Separate 8K and 32K
+prefix-to-decode checks matched 94 full-vocabulary frontiers, 12,152,320
+floats, and 92 selected token IDs.
+
+### Metal batch MoE sum6-to-HC4 epilogue A/B
+
+The resident single-device pre-M5 MXFP4 prefill path now consumes the six
+routed expert-down rows directly in the HC4 expand/add/split epilogue. The
+kernel preserves the original `s0 + s1 + ... + s5`, shared-expert add, and HC4
+post/comb accumulation order while removing the standalone sum6 dispatch and
+the routed-output F32 materialization. The default covers batches of 32 through
+4096 tokens; longer prefixes use the normal 4096-token chunks. Debug, profiling,
+steering, SSD, TP2, quality, decode, and other tensor shapes keep the original
+path. Compare the fused path with its rollback using:
+
+```
+./speed-bench/metal_prefill_variant_bench \
+  --prefix-tokens 8192 \
+  --warmup-tokens 4096 \
+  --repeats 4 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_BATCH_MOE_SUM6_HC_FUSION
+```
+
+Balanced M3 Ultra A/B throughput for the fused path versus rollback was
+663.24/660.81 tok/s at 2048 tokens (+0.37%), 621.83/619.49 at 8192
+(+0.38%), 596.50/594.76 at 16384 (+0.29%), and 560.30/558.54 at 32768
+(+0.32%). The 32-token point was flat (-0.03%); 128, 512, and 4096 tokens
+gained 0.19%, 0.18%, and 0.28%, respectively. All 64 prefill runs and
+8,273,920 compared full-vocabulary logits were bit-identical. A direct oracle
+also matched all 527,372 HC output floats exactly for a tail shape and the
+production 32-by-4096 shape. Separate 8K and 32K prefix-to-decode checks
+matched 146 full-vocabulary frontiers, 18,874,880 floats, and 144 selected
+token IDs exactly. Performance was measured on M3 Ultra; the guarded default
+covers the shared resident M1-M4 shape.
+
+### Metal batch Q8 attention-output-to-HC4 epilogue A/B
+
+The resident single-device pre-M5 Q8 attention-output path now feeds the
+aligned 8192-to-4096 output-B matmul tile directly into the HC4 expand/split
+epilogue. The specialization preserves the legacy Q8_0 dequantization and
+simdgroup-MMA order, stages every 64-by-32 result through an 8 KiB F32
+threadgroup tile, and then repeats the original scalar HC4 post/comb
+accumulation order. This removes the global F32 `attn_out` write/read and the
+standalone HC dispatch without removing the materialized F32 rounding
+boundary. The default is deliberately limited to aligned batches of 512
+through 4096 tokens; shorter batches, tails, debug/profiling/steering,
+quality, SSD, TP2, M5, and other shapes retain the original path. Compare the
+fused path with rollback using:
+
+```
+./speed-bench/metal_prefill_variant_bench \
+  --prefix-tokens 8192 \
+  --warmup-tokens 4096 \
+  --repeats 2 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION
+```
+
+Balanced M3 Ultra A/B throughput for the fused path versus rollback was
+526.16/523.77 tok/s at 512 tokens (+0.46%), 668.43/663.66 at 2048
+(+0.72%), 626.47/621.49 at 8192 (+0.80%), and 599.57/596.92 at 16384
+(+0.44%). All 44 retained timing runs and 5,688,320 compared
+full-vocabulary logits were bit-identical. A direct production-shape oracle
+also matched all 262,144 low-rank values and 524,288 HC outputs exactly and
+confirmed that the fused path did not touch the dead `attn_out` buffer.
+Separate 8K and 32K prefix-to-decode checks matched 14 full-vocabulary
+frontiers, 1,809,920 floats, and 12 selected token IDs exactly. A standalone
+32K timing process was discarded because sustained thermal throttling changed
+slot time from 58 to 142 seconds; the 32K run is correctness evidence only.
+Performance was measured on M3 Ultra; the guarded default covers the shared
+resident M1-M4 path.
+
 The harness uses one Metal engine and fresh sessions for every run. It warms
 both variants with at least 32 tokens, alternates control/candidate order in
 ABBA and BAAB blocks, poisons host logit buffers before copying, and aborts

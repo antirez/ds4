@@ -31229,7 +31229,43 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     metal_graph_batch_heads(g),
                                                                     n_tokens) != 0;
     }
-    if (!attn_out_f16) {
+    bool attn_out_hc_fused = false;
+#if defined(__APPLE__)
+    if (ok && !attn_out_f16 && !attn_out_debug && !tp_row_split_attn &&
+        n_tokens >= 512u && n_tokens <= 4096u &&
+        (n_tokens % 32u) == 0u && !g->quality && !g->placement &&
+        g->tp_world < 2u && !g->ssd_streaming && !g->ssd_streaming_cold &&
+        !layer_stage_profile && !q_stage_profile &&
+        metal_graph_debug_get_config()->prefix == NULL &&
+        !metal_graph_directional_steering_attn_enabled(g) &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+        DS4_N_EMBD == 4096u && DS4_N_HC == 4u) {
+        const int fused = ds4_gpu_attention_output_q8_batch_hc_tensor(
+            metal_graph_batch_attn_out(g),
+            after_attn_hc_view,
+            metal_graph_batch_cur_hc(g),
+            hc_split_view,
+            metal_graph_batch_attn_low(g),
+            metal_graph_batch_group_tmp(g),
+            metal_graph_batch_low_tmp(g),
+            model->map,
+            model->size,
+            layer->attn_output_a->abs_offset,
+            layer->attn_output_b->abs_offset,
+            group_dim,
+            rank,
+            n_groups,
+            DS4_N_EMBD,
+            metal_graph_batch_heads(g),
+            n_tokens,
+            DS4_N_HC);
+        if (fused < 0) ok = false;
+        attn_out_hc_fused = fused > 0;
+    }
+#endif
+    if (!attn_out_f16 && !attn_out_hc_fused) {
         if (ok) {
             ok = metal_graph_attention_output_dense_quant_batch(tp_attn_out ? tp_attn_out : metal_graph_batch_attn_out(g),
                                                                 metal_graph_batch_attn_low(g),
@@ -31276,7 +31312,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, metal_graph_batch_attn_out(g), il, n_tokens);
     }
-    if (ok && attn_out_f16) {
+    if (ok && attn_out_hc_fused) {
+        /* The Q8 output-B specialization already wrote after_attn_hc_view. */
+    } else if (ok && attn_out_f16) {
         ok = ds4_gpu_hc_expand_split_half_tensor(after_attn_hc_view,
                                                  g->batch_q_half,
                                                  metal_graph_batch_cur_hc(g),
@@ -31586,10 +31624,40 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos0);
+#if defined(__APPLE__)
+    const bool fuse_moe_sum6_hc =
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        ds4_gpu_moe_sum6_hc_expand_available() != 0 &&
+        n_tokens >= 32u && n_tokens <= 4096u && decode_count == 0 &&
+        !g->quality && !g->placement && g->tp_world < 2 &&
+        !g->ssd_streaming && !g->ssd_streaming_cold &&
+        !layer_stage_profile && !keep_ffn_out &&
+        !metal_graph_directional_steering_ffn_enabled(g) &&
+        metal_graph_debug_get_config()->prefix == NULL &&
+        getenv("DS4_METAL_MOE_STAGE_PROFILE") == NULL &&
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+        getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
+        getenv("DS4_METAL_DISABLE_PRE_M5_BATCH_MOE_SUM6_HC_FUSION") == NULL &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+        layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+        layer->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        DS4_N_HC == 4u && DS4_N_EXPERT == 256u &&
+        DS4_N_EXPERT_USED == 6u && DS4_N_EMBD == 4096u &&
+        shared_dim == 2048u && expert_in_dim == 4096u &&
+        expert_mid_dim == 2048u && down_in_dim == 2048u &&
+        routed_out_dim == 4096u && gate_row_bytes == 2176u &&
+        gate_expert_bytes == 4456448u && down_row_bytes == 1088u &&
+        down_expert_bytes == 4456448u;
+#else
+    const bool fuse_moe_sum6_hc = false;
+#endif
     bool shared_down_f16 = false;
 
 #define DS4_METAL_TRY_SHARED_DOWN_F16() do { \
-        if (ok && !tp_row_split_ffn && !keep_ffn_out && \
+        if (ok && !fuse_moe_sum6_hc && !tp_row_split_ffn && !keep_ffn_out && \
             !metal_graph_debug_wants("ffn_shexp", il, pos0)) { \
             shared_down_f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(g->batch_q_half, \
                                                                  model->map, \
@@ -31836,6 +31904,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
+                                               fuse_moe_sum6_hc,
                                                false) != 0;
     }
     if (ok && tp_split_batch_moe && !cuda_tp_owned_batch_moe) {
@@ -31942,6 +32011,16 @@ static bool metal_graph_encode_layer_ffn_batch(
                                               hc_split_view,
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
+    }
+    else if (ok && fuse_moe_sum6_hc) {
+        ok = ds4_gpu_moe_sum6_hc_expand_split_tensor(
+                 next_hc_view,
+                 metal_graph_batch_routed_down(g),
+                 metal_graph_batch_shared_out(g),
+                 metal_graph_batch_after_attn_hc(g),
+                 hc_split_view,
+                 DS4_N_EMBD,
+                 DS4_N_HC) != 0;
     }
     else if (ok && shared_down_f16) {
         ok = ds4_gpu_hc_expand_add_split_half_add_tensor(next_hc_view,
@@ -44782,6 +44861,7 @@ static int glm_graph_routed_moe_batch_dispatch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
+                                               false,
                                                force_resident);
     }
 
