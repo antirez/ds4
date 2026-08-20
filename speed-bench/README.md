@@ -113,6 +113,34 @@ one of the 64 measured runs produced bit-identical full-vocabulary logits.
 Performance was measured on M3 Ultra; the guarded default also covers the
 shared resident M1-M4 path.
 
+### Metal batch indexer-query pruning A/B
+
+On zero-prefix ratio-4 layers, the indexer query and its per-head weights are
+not consumed until the compressed cache grows beyond the 512-row top-k.  The
+resident pre-M5 path now skips the otherwise dead Q projection, RoPE, QAT, and
+weight projection for batches of at least 32 tokens while the final compressed
+count remains at or below top-k.  The indexer compressor and its persistent
+cache/state updates are unchanged.  Compare the pruned path with its rollback:
+
+```
+./speed-bench/metal_prefill_variant_bench \
+  --prefix-tokens 2048 \
+  --warmup-tokens 2048 \
+  --repeats 4 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_QUERY_PRUNE
+```
+
+Balanced M3 Ultra A/B throughput for the pruned path versus rollback was
+115.00/112.98 tok/s at 32 tokens (+1.79%), 277.42/273.81 at 128 (+1.32%),
+509.19/502.28 at 512 (+1.38%), 606.13/597.65 at 1024 (+1.42%), and
+660.17/651.29 at 2048 (+1.36%).  The last eligible prefix, 2051 tokens, gained
+1.41%; 2052 tokens was flat, confirming that the query path remains enabled
+when the 513th compressed row first makes top-k selection necessary.  All 56
+prefill runs and 7,239,680 compared full-vocabulary logits were bit-identical.
+A 2051-token prefix followed across the row-513 transition also matched three
+full-vocabulary rows and two selected token IDs exactly.  Performance was
+measured on M3 Ultra; the guarded path covers resident single-device M1-M4.
+
 ### Metal batch Q/KV finalizer A/B
 
 The M3 resident Flash prefill path now follows vLLM's horizontal Q/KV

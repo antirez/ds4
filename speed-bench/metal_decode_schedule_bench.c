@@ -418,8 +418,12 @@ int main(int argc, char **argv) {
         .len = cfg.prefix_tokens,
         .cap = cfg.prefix_tokens,
     };
+    /* Build each session's persistent KV/compressor state under its own
+     * variant.  This also makes the first frontier comparison cover prefill
+     * features instead of comparing two default-prefix sessions. */
     for (int i = 0; i < VARIANT_COUNT; i++) {
-        if (ds4_session_create(&sessions[i], engine, cfg.ctx) != 0 ||
+        if (select_variant(&cfg, i) != 0 ||
+            ds4_session_create(&sessions[i], engine, cfg.ctx) != 0 ||
             ds4_session_sync(sessions[i], &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "metal-decode-schedule-bench: session %d prefill failed: %s\n",
