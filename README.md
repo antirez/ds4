@@ -179,6 +179,21 @@ GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
 `--power` below 100, an explicit `--prefill-chunk`, and the external `--mtp`
 file are not supported for GLM yet.
 
+Qwen 3.8 27B support is provided for Q4_K_M GGUF models with optional DFlash2 block-diffusion speculative decoding:
+
+```sh
+./download_model.sh qwen-dflash          # preferred combo: Qwen 3.8 27B Q4_K_M + DFlash2 Q4_K_M (~18.7 GiB total)
+./download_model.sh qwen3.8              # alias for qwen-dflash
+./download_model.sh qwen-dflash-support  # standalone DFlash2 Q4_K_M draft GGUF (~1.06 GiB)
+./download_model.sh qwen-q4              # standalone Qwen 3.8 27B Q4_K_M base GGUF (~17.7 GiB)
+```
+
+The preferred combination downloads the `Q4_K_M` base model from
+[`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF)
+and the matching DFlash2 draft model from
+[`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF).
+It links `./ds4flash.gguf` and `./qwen38.gguf` to the base model.
+
 Then build:
 
 ```sh
@@ -247,6 +262,30 @@ it prunes suffixes that are unlikely to repay their verification cost.
 diagnostics. Sampled decoding does not use DSpark proposals. `--quality` and
 `--dspark-strict` also keep target-only decoding, which is useful for
 reproducibility checks.
+
+
+## DFlash2 Speculative Decoding (Qwen)
+
+DFlash 2 is a block-diffusion drafter for speculative decoding on Qwen 3.8.
+It predicts a block of draft tokens in parallel and selects a coherent path
+with a lightweight candidate selector. Run speculative decoding by passing
+`--dflash`:
+
+```sh
+./ds4 -m ds4flash.gguf \
+  --dflash gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  -p "Hello"
+```
+
+Or run the server:
+
+```sh
+./ds4-server -m ds4flash.gguf \
+  --dflash gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --ctx 32768
+```
+
+You can optionally configure maximum draft tokens with `--dflash-n-max N` (default 7).
 
 ## Speed
 

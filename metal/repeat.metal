@@ -50,3 +50,109 @@ typedef decltype(kernel_repeat<float>) kernel_repeat_t;
 
 // Host-visible F32 repeat used for HC expansion of embeddings.
 template [[host_name("kernel_repeat_f32")]] kernel kernel_repeat_t kernel_repeat<float>;
+
+// Qwen GQA expand: 4 kv heads (1024) -> 24 heads (6144), head_dim 256, factor 6.
+struct ds4_gqa_args {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+};
+
+kernel void kernel_gqa_expand_f32(
+        device const float * src [[buffer(0)]],
+        device float * dst [[buffer(1)]],
+        constant ds4_gqa_args & args [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_head * args.head_dim;
+    if (gid >= total) return;
+    const uint h = gid / args.head_dim;
+    const uint off = gid % args.head_dim;
+    const uint group = args.n_head / args.n_head_kv;
+    const uint kv_h = h / group;
+    dst[gid] = src[kv_h * args.head_dim + off];
+}
+
+// Fill with zero (or arbitrary value) for attn_out zero path
+kernel void kernel_fill_f32(
+        device float * dst [[buffer(0)]],
+        constant float & value [[buffer(1)]],
+        constant uint & n [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    dst[gid] = value;
+}
+
+// Qwen GQA causal attention decode with online FlashAttention softmax
+struct ds4_qwen_attn_args {
+    uint32_t pos;
+    uint32_t max_ctx;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+};
+
+kernel void kernel_qwen_gqa_attn_decode(
+        device const float * q         [[buffer(0)]],
+        device const float * k_new     [[buffer(1)]],
+        device const float * v_new     [[buffer(2)]],
+        device       float * k_cache   [[buffer(3)]],
+        device       float * v_cache   [[buffer(4)]],
+        device       float * heads_out [[buffer(5)]],
+        constant ds4_qwen_attn_args & args [[buffer(6)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig;
+    if (h >= args.n_head) return;
+    const uint kv_dim = args.n_head_kv * args.head_dim;
+    const uint group = args.n_head / args.n_head_kv;
+    const uint kv_h = h / group;
+
+    // Lane 0..31 stores new K and V into KV cache at position pos
+    if (h == 0) {
+        for (uint i = tiisg; i < kv_dim; i += 32) {
+            k_cache[(uint64_t)args.pos * kv_dim + i] = k_new[i];
+            v_cache[(uint64_t)args.pos * kv_dim + i] = v_new[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    device const float * qh = q + (uint64_t)h * args.head_dim;
+
+    // Each thread in simdgroup holds 8 floats (32 threads * 8 = 256 head_dim)
+    float q_local[8];
+    for (int j = 0; j < 8; j++) {
+        q_local[j] = qh[tiisg * 8 + j];
+    }
+
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+    float acc[8] = {0.0f};
+    const float kq_scale = 1.0f / sqrt((float)args.head_dim);
+
+    for (uint t = 0; t <= args.pos; t++) {
+        device const float * kt = k_cache + (uint64_t)t * kv_dim + (uint64_t)kv_h * args.head_dim;
+        float dot = 0.0f;
+        for (int j = 0; j < 8; j++) {
+            dot += q_local[j] * kt[tiisg * 8 + j];
+        }
+        dot = simd_sum(dot) * kq_scale;
+
+        float m_curr = max(m_prev, dot);
+        float alpha = exp(m_prev - m_curr);
+        float beta = exp(dot - m_curr);
+        l_prev = l_prev * alpha + beta;
+
+        device const float * vt = v_cache + (uint64_t)t * kv_dim + (uint64_t)kv_h * args.head_dim;
+        for (int j = 0; j < 8; j++) {
+            acc[j] = acc[j] * alpha + beta * vt[tiisg * 8 + j];
+        }
+        m_prev = m_curr;
+    }
+
+    float inv_l = 1.0f / (l_prev > 1e-8f ? l_prev : 1.0f);
+    device float * oh = heads_out + (uint64_t)h * args.head_dim;
+    for (int j = 0; j < 8; j++) {
+        oh[tiisg * 8 + j] = acc[j] * inv_l;
+    }
+}
+
