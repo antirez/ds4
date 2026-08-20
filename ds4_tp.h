@@ -8,16 +8,16 @@
 
 #include "ds4.h"
 
-/* Tensor-parallel transport and lockstep protocol.
+/* Expert/tensor-parallel transport and lockstep protocol.
  *
- * Two ranks run the same logical model, each with one contiguous half of the
- * routed experts resident. Rank 0 (leader) is a normal frontend session that
- * mirrors every ds4_session_sync()/ds4_session_eval() call to rank 1 (worker)
- * over a TCP control socket, so both engines execute the identical graph
- * sequence.
- * Inside each decoded token, partial block outputs are exchanged through a
- * registered memory slab: two-sided RDMA SEND/RECV when RDMA over
- * Thunderbolt is available, or a full-duplex TCP exchange as fallback.
+ * Two, four, or eight ranks run the same logical model, each with one contiguous
+ * routed-expert range resident. Rank 0 (leader) is a normal frontend session
+ * that mirrors every session operation to all workers over TCP, so every
+ * engine executes the identical graph sequence.
+ * Metal's two-rank path exchanges partial block outputs through a registered
+ * memory slab using RDMA SEND/RECV or a full-duplex TCP fallback. CUDA's
+ * two/four/eight-rank path bootstraps NCCL over the same control connection and
+ * combines f32 partials in place with collectives.
  *
  * Layering: ds4.c calls the session-mirroring and slab entry points;
  * ds4_metal.m only ever sees ds4_tp_gate_exchange() through a callback
@@ -25,6 +25,9 @@
  */
 
 typedef struct ds4_tp ds4_tp;
+
+#define DS4_TP_MAX_WORLD 8u
+#define DS4_TP_PROTOCOL_VERSION 11u
 
 enum {
     DS4_TP_GATE_ATTN = 0,
@@ -38,11 +41,13 @@ enum {
  * any inference runs. */
 typedef struct {
     uint64_t gguf_bytes;
+    uint64_t layout_fingerprint;
     uint32_t model_id;
     uint32_t n_layer;
     uint32_t n_embd;
     uint32_t n_vocab;
     uint32_t quant_bits;
+    uint32_t quant_profile;
     uint32_t ctx_size;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
      * slot: slot(seq) = start + ((seq-1) % per_token) * step.
@@ -56,6 +61,11 @@ typedef struct {
 } ds4_tp_identity;
 
 bool ds4_tp_enabled(const ds4_tp_options *opt);
+
+/* Contiguous floor partition used by model mapping and ownership-aware
+ * kernels: [floor(total*rank/world), floor(total*(rank+1)/world)). */
+bool ds4_tp_partition(uint32_t total, uint32_t rank, uint32_t world,
+                      uint32_t *base, uint32_t *count);
 
 typedef enum {
     DS4_TP_CLI_ERROR = -1,
@@ -87,8 +97,8 @@ int ds4_tp_validate_engine_options(
         char *err,
         size_t errlen);
 
-/* Connection bring-up.  The leader listens and accepts one worker; the
- * worker dials with retry.  Both then exchange and validate identities.
+/* Connection bring-up.  The leader listens and accepts world_size-1 workers;
+ * workers dial with retry.  All ranks exchange and validate identities.
  * Blocking; call after the engine is loaded (identity needs the shape). */
 int ds4_tp_create(
         ds4_tp **out,
@@ -99,10 +109,26 @@ int ds4_tp_create(
 void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
+uint32_t ds4_tp_world(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+bool ds4_tp_is_collective(const ds4_tp *tp);
+bool ds4_tp_is_expert_only(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
+/* Leader failure path: wake every worker blocked on control or pairwise data
+ * I/O. Workers keep their control socket long enough to report a negative ACK. */
+void ds4_tp_abort_peers(ds4_tp *tp);
+
+/* All ranks report whether their collective runtime loaded successfully.
+ * No rank enters the blocking communicator constructor unless all agree. */
+int ds4_tp_collective_preflight(ds4_tp *tp, int local_ready,
+                                char *err, size_t errlen);
+
+/* Small startup broadcast used to distribute an opaque collective bootstrap
+ * payload. Rank 0 supplies initialized bytes; workers receive them. */
+int ds4_tp_broadcast_blob(ds4_tp *tp, void *data, uint32_t bytes,
+                          char *err, size_t errlen);
 
 /* Gate slab.  The engine allocates one shared GPU-visible block and hands
  * its base VA here; ds4_tp registers it with the NIC (RDMA) and exchanges
@@ -188,6 +214,8 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_BOOTSTRAP = 18,
+    DS4_TP_FRAME_COLLECTIVE_PREFLIGHT = 19,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -208,8 +236,8 @@ int ds4_tp_recv_command(
         size_t errlen);
 void ds4_tp_command_free(ds4_tp_command *command);
 
-/* Debug lockstep check: both sides send their hidden-state hash for a token
- * and compare.  Returns 0 on transport failure, -1 on hash mismatch. */
+/* Debug lockstep check: every rank sends its hidden-state hash for a token
+ * and rank 0 compares them. Returns 0 on transport failure, -1 on mismatch. */
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen);
 
 /* Vocab-split output head: the worker ships its logits half to the leader
@@ -217,18 +245,28 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
-/* Speculative verify mirroring.  The leader announces a draft block right
- * before both ranks run the expert-split batch verify; the worker then blocks
- * on the commit frame, which carries the leader's decision: full_accept keeps
- * the pushed rows, otherwise both sides roll back and replay replay_n tokens
- * through the gated single-token decode in lockstep. */
+/* Speculative verify mirroring. The leader announces a draft block before all
+ * ranks run the expert-split batch verify; workers then block on the commit
+ * frame, which carries the leader's decision: full_accept keeps the pushed
+ * rows, otherwise every rank rolls back and replays replay_n tokens through
+ * the gated single-token decode in lockstep. */
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n);
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
 
+/* Shared frontend lifecycle.  The leader helper builds the engine identity,
+ * accepts every worker, and binds the collective before any session is
+ * created.  Shutdown must run after all frontend sessions are destroyed and
+ * before the engine is closed. */
+int ds4_tp_leader_bind(ds4_engine *engine, const ds4_tp_options *opt,
+                       uint32_t ctx_size, ds4_tp **out,
+                       char *err, size_t errlen);
+void ds4_tp_leader_shutdown(ds4_engine *engine, ds4_tp **tp);
+
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */
-int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt);
+int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt,
+                      uint32_t ctx_size);
 
 #endif

@@ -239,12 +239,15 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
     fputc('\n', fp);
-    title(fp, c, "Tensor Parallelism");
+    title(fp, c, "Network Expert/Tensor Parallelism");
     fputc('\n', fp);
-    para(fp, c, "Tensor parallelism uses the same coordinator/worker addresses as distributed mode, but always runs one 50/50 worker. Add --tensor-parallel, omit --layers, start the worker, then start the coordinator.");
+    para(fp, c, "Network parallelism uses the same coordinator/worker addresses as distributed mode. It runs two, four, or eight full-model ranks in lockstep and owns weight placement, so omit --layers. Eight-rank mode is CUDA/NCCL expert parallelism only. Start every explicitly numbered worker, then start rank 0 as the coordinator. CUDA uses NCCL; Metal retains its two-rank RDMA/TCP path.");
     fputc('\n', fp);
-    opt(fp, c, "--tensor-parallel", "Switch --role/--listen/--coordinator to two-machine tensor parallelism.");
-    opt(fp, c, "--transport auto|rdma|tcp", "Tensor gate transport. Default: auto");
+    opt(fp, c, "--expert-parallel", "Shard routed experts across CUDA network ranks.");
+    opt(fp, c, "--tensor-parallel", "Shard routed experts plus supported model-specific attention/dense decode work.");
+    opt(fp, c, "--tensor-parallel-world 2|4|8", "Number of ranks. World 8 requires --expert-parallel. Default: 2");
+    opt(fp, c, "--tensor-parallel-rank N", "Worker rank. Required for every worker in four/eight-rank mode.");
+    opt(fp, c, "--transport auto|nccl|rdma|tcp", "Collective/gate transport. CUDA auto selects NCCL.");
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");
@@ -465,6 +468,17 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     if (topic_is(topic, "distributed")) {
         opt(fp, c, "worker", "./ds4 --role worker --layers 21:output --coordinator 192.168.0.181 9000 -m ds4flash.gguf");
         opt(fp, c, "coordinator", "./ds4 --role coordinator --layers 0:20 --listen 0.0.0.0 9000 -p \"Hello\" -m ds4flash.gguf");
+        if (tool == DS4_HELP_SERVER) {
+            opt(fp, c, "TP server", "./ds4-server --cuda --ctx 4096 --tensor-parallel --tensor-parallel-world 4 --role coordinator --listen 10.100.184.4 9911 --host 127.0.0.1 --port 8000 -m model.gguf");
+        } else if (tool == DS4_HELP_AGENT) {
+            opt(fp, c, "TP agent", "./ds4-agent --cuda --ctx 4096 --tensor-parallel --tensor-parallel-world 4 --role coordinator --listen 10.100.184.4 9911 --non-interactive -p \"Hello\" -m model.gguf");
+        } else if (tool == DS4_HELP_EVAL) {
+            opt(fp, c, "TP eval", "./ds4-eval --cuda --ctx 4096 --tensor-parallel --tensor-parallel-world 4 --role coordinator --listen 10.100.184.4 9911 --questions 1 --plain -m model.gguf");
+        } else if (tool == DS4_HELP_BENCH) {
+            opt(fp, c, "TP benchmark", "./ds4-bench --cuda --tensor-parallel --tensor-parallel-world 4 --role coordinator --listen 10.100.184.4 9911 --prompt-file long.txt -m model.gguf");
+        } else {
+            opt(fp, c, "TP coordinator", "./ds4 --cuda --ctx 4096 --tensor-parallel --tensor-parallel-world 4 --role coordinator --listen 10.100.184.4 9911 -p \"Hello\" -m model.gguf");
+        }
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");

@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -51,6 +52,7 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -234,6 +236,24 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    tp_parse_err[0] ? tp_parse_err :
+                                      "invalid network parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
@@ -358,6 +378,19 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
     if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+        exit(2);
+    }
+    if (c.tp.requested && c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr,
+                "ds4-bench: network workers are a serving mode; "
+                "start them with ./ds4\n");
+        exit(2);
+    }
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&c.tp, &c.dist,
+                                           tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n",
+                tp_err[0] ? tp_err : "invalid network parallel options");
         exit(2);
     }
     char dist_err[256];
@@ -579,6 +612,7 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
+        .placement_ctx_hint = placement_ctx_hint,
         .prefill_chunk = cfg.prefill_chunk,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
@@ -594,10 +628,17 @@ int main(int argc, char **argv) {
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
+    char tp_err[256] = {0};
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n",
+                tp_err[0] ? tp_err : "invalid network parallel options");
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -640,10 +681,26 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    ds4_tp *tp_leader = NULL;
+    if (cfg.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        if (!ds4_tp_leader_bind(engine, &cfg.tp,
+                                (uint32_t)cfg.ctx_alloc,
+                                &tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-bench: %s\n",
+                    tp_err[0] ? tp_err :
+                                "network parallel initialization failed");
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
+        ds4_tp_leader_shutdown(engine, &tp_leader);
         ds4_engine_close(engine);
         return 1;
     }
@@ -652,6 +709,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
+        ds4_tp_leader_shutdown(engine, &tp_leader);
         ds4_engine_close(engine);
         return 1;
     }
@@ -664,6 +722,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.csv_path, strerror(errno));
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
+            ds4_tp_leader_shutdown(engine, &tp_leader);
             ds4_engine_close(engine);
             return 1;
         }
@@ -672,7 +731,8 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
-    const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool distributed =
+        cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR || tp_leader != NULL;
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;
@@ -817,6 +877,7 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
+    ds4_tp_leader_shutdown(engine, &tp_leader);
     ds4_engine_close(engine);
     return rc;
 }

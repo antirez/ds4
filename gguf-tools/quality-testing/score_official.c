@@ -1,6 +1,12 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_ssd.h"
+#include "ds4_tp.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -11,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -25,8 +32,11 @@ static void usage(const char *prog) {
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
-            "[--ssd-streaming-preload-experts N]\n",
+            "[--ssd-streaming-preload-experts N] "
+            "[distributed/network-parallel options]\n",
             prog);
+    ds4_dist_usage(stderr);
+    ds4_tp_usage(stderr);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -510,6 +520,34 @@ static double safe_ratio(long num, long den) {
     return den ? (double)num / (double)den : 0.0;
 }
 
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "score_official: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "score_official: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "waiting for workers";
+        if (!ticks || strcmp(last, why) != 0 || ticks % 20u == 0u) {
+            fprintf(stderr, "score_official: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        ticks++;
+        nanosleep(&delay, NULL);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         usage(argv[0]);
@@ -530,9 +568,35 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_cache_experts = 0;
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
+    ds4_dist_options dist = {0};
+    ds4_tp_options tp = {0};
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg, &i, argc, argv, &dist,
+                                   dist_parse_err, sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n",
+                    dist_parse_err[0] ? dist_parse_err :
+                                        "invalid distributed option");
+            return 2;
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &tp,
+                                 tp_parse_err, sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n",
+                    tp_parse_err[0] ? tp_parse_err :
+                                      "invalid network parallel option");
+            return 2;
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "--quality")) {
             quality = true;
         } else if (!strcmp(arg, "--gpu-vram")) {
@@ -568,6 +632,26 @@ int main(int argc, char **argv) {
     }
     if (ctx_size < 1024) ctx_size = 1024;
 
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&tp, &dist,
+                                           tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n",
+                tp_err[0] ? tp_err : "invalid network parallel options");
+        return 2;
+    }
+    char dist_err[256] = {0};
+    if (ds4_dist_prepare_engine_options(&dist, NULL,
+                                        dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "score_official: %s\n", dist_err);
+        return 2;
+    }
+    if (dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr,
+                "score_official: --role worker is a serving mode; "
+                "start pipeline workers with ./ds4\n");
+        return 2;
+    }
+
     ds4_engine_options opt = {
         .model_path = model_path,
 #ifdef __APPLE__
@@ -586,7 +670,19 @@ int main(int argc, char **argv) {
         .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
+        .distributed = dist,
+        .tp = tp,
     };
+    if (ds4_dist_prepare_engine_options(&dist, &opt,
+                                        dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "score_official: %s\n", dist_err);
+        return 2;
+    }
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n",
+                tp_err[0] ? tp_err : "invalid network parallel options");
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (gpu_vram_arg || gpu_devices_arg) {
@@ -616,21 +712,68 @@ int main(int argc, char **argv) {
         if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
     }
 
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
-
-    const int n_vocab = ds4_engine_vocab_size(engine);
-    float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
-    if (!logits) die("out of memory");
+    if (tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &tp, (uint32_t)ctx_size);
+        ds4_engine_close(engine);
+        return rc;
+    }
 
     FILE *mf = fopen(manifest_path, "rb");
     if (!mf) {
         fprintf(stderr, "open %s: %s\n", manifest_path, strerror(errno));
+        ds4_engine_close(engine);
         return 1;
     }
     FILE *out = fopen(out_path, "wb");
     if (!out) {
         fprintf(stderr, "open %s: %s\n", out_path, strerror(errno));
+        fclose(mf);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    ds4_tp *tp_leader = NULL;
+    if (tp.role == DS4_TP_LEADER) {
+        if (!ds4_tp_leader_bind(engine, &tp, (uint32_t)ctx_size,
+                                &tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "score_official: %s\n",
+                    tp_err[0] ? tp_err :
+                                "network parallel initialization failed");
+            fclose(out);
+            fclose(mf);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, ctx_size) != 0) {
+        fprintf(stderr, "score_official: failed to create session\n");
+        ds4_tp_leader_shutdown(engine, &tp_leader);
+        fclose(out);
+        fclose(mf);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    if (dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0) {
+        ds4_session_free(session);
+        ds4_tp_leader_shutdown(engine, &tp_leader);
+        fclose(out);
+        fclose(mf);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    const int n_vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)n_vocab * sizeof(logits[0]));
+    if (!logits) {
+        fprintf(stderr, "score_official: out of memory allocating logits\n");
+        ds4_session_free(session);
+        ds4_tp_leader_shutdown(engine, &tp_leader);
+        fclose(out);
+        fclose(mf);
+        ds4_engine_close(engine);
         return 1;
     }
     fprintf(out,
@@ -651,6 +794,7 @@ int main(int argc, char **argv) {
     long total_api_ref_tokens = 0;
     api_metrics total_api = {0};
     char err[256];
+    int result = 0;
 
     while (fgets(line, sizeof(line), mf)) {
         strip_newline(line);
@@ -660,7 +804,11 @@ int main(int argc, char **argv) {
         char *prompt_path = strtok(NULL, "\t");
         char *cont_path = strtok(NULL, "\t");
         char *resp_path = strtok(NULL, "\t");
-        if (!id || !prompt_path || !cont_path) die("bad manifest row");
+        if (!id || !prompt_path || !cont_path) {
+            fprintf(stderr, "score_official: bad manifest row\n");
+            result = 1;
+            goto cleanup;
+        }
 
         char *prompt_text = read_file(prompt_path);
         char *cont_text = read_file(cont_path);
@@ -676,7 +824,8 @@ int main(int argc, char **argv) {
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);
-            return 1;
+            result = 1;
+            goto case_cleanup;
         }
         if (resp_path && resp_path[0]) {
             have_api = api_ref_load(resp_path, &ref);
@@ -695,7 +844,8 @@ int main(int argc, char **argv) {
 
         if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
             fprintf(stderr, "%s sync failed: %s\n", id, err);
-            return 1;
+            result = 1;
+            goto case_cleanup;
         }
 
         double nll = 0.0;
@@ -707,7 +857,8 @@ int main(int argc, char **argv) {
             int greedy = -1;
             if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
                 fprintf(stderr, "%s logits failed at target token %d\n", id, i);
-                return 1;
+                result = 1;
+                goto case_cleanup;
             }
 
             if (i == 0) first_match = (greedy == target.v[i]);
@@ -717,7 +868,8 @@ int main(int argc, char **argv) {
             const double target_lp = local_logprob(logits, n_vocab, target.v[i], logsum);
             if (!isfinite(target_lp)) {
                 fprintf(stderr, "%s logprob failed at target token %d\n", id, i);
-                return 1;
+                result = 1;
+                goto case_cleanup;
             }
             nll += -target_lp;
 
@@ -782,7 +934,8 @@ int main(int argc, char **argv) {
 
             if (ds4_session_eval(session, target.v[i], err, sizeof(err)) != 0) {
                 fprintf(stderr, "%s eval failed at target token %d: %s\n", id, i, err);
-                return 1;
+                result = 1;
+                goto case_cleanup;
             }
         }
 
@@ -835,12 +988,16 @@ int main(int argc, char **argv) {
                 safe_ratio(cm.topn_hit, cm.topn_ref),
                 safe_ratio(cm.pair_agree, cm.pair_total));
 
+case_cleanup:
         api_ref_free(&ref);
         ds4_tokens_free(&prompt);
         ds4_tokens_free(&target);
         free(prompt_text);
         free(cont_text);
+        if (result != 0) break;
     }
+
+    if (result != 0) goto cleanup;
 
     fprintf(stderr,
             "summary cases=%d tokens=%ld avg_nll=%.9f first_match=%ld avg_lcp=%.3f\n",
@@ -875,10 +1032,12 @@ int main(int argc, char **argv) {
             total_api.pair_total,
             safe_ratio(total_api.pair_agree, total_api.pair_total));
 
+cleanup:
     fclose(out);
     fclose(mf);
     free(logits);
     ds4_session_free(session);
+    ds4_tp_leader_shutdown(engine, &tp_leader);
     ds4_engine_close(engine);
-    return 0;
+    return result;
 }

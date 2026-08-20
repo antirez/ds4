@@ -1,13 +1,11 @@
-/* Tensor-parallel transport and lockstep protocol.  See ds4_tp.h and
- * misc/METAL_TENSOR_PARALLELISM.md for the design.
+/* Network-parallel transport and lockstep protocol. See ds4_tp.h and
+ * misc/METAL_TENSOR_PARALLELISM.md for the original Metal design.
  *
- * Wire notes: both ranks are identical Apple Silicon machines by
- * definition, so the wire format is host little-endian; the hello magic
- * doubles as a byte-order check.  The control socket is a plain blocking
- * TCP stream carrying framed commands.  Gate traffic goes over RDMA
- * (Thunderbolt UC queue pair, two-sided send/recv — see the driver quirks
- * note at ds4_tp_rdma) or over a dedicated full-duplex TCP socket at 16KB
- * per direction as the fallback. */
+ * Wire notes: ranks are homogeneous machines and the wire format is host
+ * little-endian; the hello magic doubles as a byte-order check. The control
+ * path is a plain blocking TCP stream carrying framed commands. Metal gate
+ * traffic uses RDMA (Thunderbolt UC queue pair, two-sided send/recv — see
+ * ds4_tp_rdma) or a dedicated TCP socket. CUDA gate traffic uses NCCL. */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -39,7 +37,6 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 7u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -55,18 +52,23 @@ typedef struct {
     uint32_t magic;      /* also detects byte-order mismatch */
     uint32_t version;
     uint32_t role;
+    uint32_t rank;
+    uint32_t world;
+    uint32_t collective;
+    uint32_t expert_only;
     uint32_t rdma_ok;    /* this side has a usable verbs device */
     uint64_t gguf_bytes;
+    uint64_t layout_fingerprint;
     uint32_t model_id;
     uint32_t n_layer;
     uint32_t n_embd;
     uint32_t n_vocab;
     uint32_t quant_bits;
+    uint32_t quant_profile;
     uint32_t ctx_size;
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -152,10 +154,13 @@ typedef struct {
 
 struct ds4_tp {
     ds4_tp_options opt;
-    int rank;                   /* 0 leader, 1 worker */
-    int control_fd;
+    int rank;                   /* 0 leader, workers 1..world-1 */
+    uint32_t world;
+    int control_fd;             /* rank 0 peer alias for worker; rank 1 for leader */
+    int control_fds[DS4_TP_MAX_WORLD];
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
+    bool collective_active;
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -280,7 +285,8 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
         if (fd < 0) continue;
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 2) == 0) break;
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
+            listen(fd, (int)(DS4_TP_MAX_WORLD * 2u)) == 0) break;
         close(fd);
         fd = -1;
     }
@@ -334,6 +340,19 @@ static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t by
     return 1;
 }
 
+static int tp_send_frame_workers(ds4_tp *tp, uint32_t type,
+                                 const void *payload, uint32_t bytes) {
+    if (!tp || tp->rank != 0) return 0;
+    for (uint32_t rank = 1; rank < tp->world; rank++) {
+        if (tp->control_fds[rank] < 0 ||
+            !tp_send_frame(tp->control_fds[rank], type, payload, bytes)) {
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     ds4_tp_frame_header h;
     if (!tp_read_full(fd, &h, sizeof(h))) return 0;
@@ -347,15 +366,47 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
  * Options and CLI.
  * --------------------------------------------------------------------- */
 
+static int tp_parse_u32_arg(const char *name, const char *value,
+                            uint32_t min_value, uint32_t max_value,
+                            uint32_t *out, char *err, size_t errlen) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' ||
+        parsed < min_value || parsed > max_value) {
+        tp_set_err(err, errlen, "invalid %s %s", name, value);
+        return 0;
+    }
+    *out = (uint32_t)parsed;
+    return 1;
+}
+
+bool ds4_tp_partition(uint32_t total, uint32_t rank, uint32_t world,
+                      uint32_t *base, uint32_t *count) {
+    if (!base || !count || total == 0u || world < 2u ||
+        world > DS4_TP_MAX_WORLD || rank >= world) {
+        return false;
+    }
+    const uint32_t first = (uint32_t)((uint64_t)total * rank / world);
+    const uint32_t last = (uint32_t)((uint64_t)total * (rank + 1u) / world);
+    if (last <= first) return false;
+    *base = first;
+    *count = last - first;
+    return true;
+}
+
 bool ds4_tp_enabled(const ds4_tp_options *opt) {
     return opt && opt->role != DS4_TP_NONE;
 }
 
 void ds4_tp_usage(FILE *fp) {
     fprintf(fp,
-        "Tensor parallelism (two identical machines):\n"
-        "  --tensor-parallel           Use --role/--listen/--coordinator for a 50/50 TP pair.\n"
-        "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
+        "Network expert/tensor parallelism (two, four, or eight machines):\n"
+        "  --expert-parallel           Shard routed experts across network ranks.\n"
+        "  --tensor-parallel           Shard attention, dense FFNs, and routed experts.\n"
+        "  --tensor-parallel-world <2|4|8> Number of ranks (default 2).\n"
+        "  --tensor-parallel-rank <n>  Worker rank; required for four/eight-rank mode.\n"
+        "  --transport <auto|nccl|rdma|tcp> Collective/gate transport (default auto).\n"
         "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
@@ -373,18 +424,51 @@ int ds4_tp_parse_cli_arg(
         size_t errlen)
 {
     int i = *index;
-    if (!strcmp(arg, "--tensor-parallel")) {
+    if (!strcmp(arg, "--expert-parallel")) {
+        if (opt->requested && !opt->expert_only) {
+            tp_set_err(err, errlen,
+                       "--expert-parallel and --tensor-parallel are exclusive");
+            return DS4_TP_CLI_ERROR;
+        }
         opt->requested = true;
+        opt->expert_only = true;
+    } else if (!strcmp(arg, "--tensor-parallel")) {
+        if (opt->requested && opt->expert_only) {
+            tp_set_err(err, errlen,
+                       "--expert-parallel and --tensor-parallel are exclusive");
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->requested = true;
+        opt->expert_only = false;
     } else if (!strcmp(arg, "--transport")) {
         if (i + 1 >= argc) goto missing;
         const char *v = argv[++i];
         if (!strcmp(v, "auto")) opt->transport = DS4_TP_TRANSPORT_AUTO;
+        else if (!strcmp(v, "nccl")) opt->transport = DS4_TP_TRANSPORT_NCCL;
         else if (!strcmp(v, "rdma")) opt->transport = DS4_TP_TRANSPORT_RDMA;
         else if (!strcmp(v, "tcp")) opt->transport = DS4_TP_TRANSPORT_TCP;
         else {
             tp_set_err(err, errlen, "invalid %s value: %s", arg, v);
             return DS4_TP_CLI_ERROR;
         }
+    } else if (!strcmp(arg, "--tensor-parallel-world")) {
+        if (i + 1 >= argc) goto missing;
+        if (!tp_parse_u32_arg(arg, argv[++i], 2, DS4_TP_MAX_WORLD,
+                              &opt->world_size, err, errlen) ||
+            (opt->world_size != 2 && opt->world_size != 4 &&
+             opt->world_size != 8)) {
+            if (!err || !err[0]) {
+                tp_set_err(err, errlen, "%s must be 2, 4, or 8", arg);
+            }
+            return DS4_TP_CLI_ERROR;
+        }
+    } else if (!strcmp(arg, "--tensor-parallel-rank")) {
+        if (i + 1 >= argc) goto missing;
+        if (!tp_parse_u32_arg(arg, argv[++i], 0, DS4_TP_MAX_WORLD - 1,
+                              &opt->rank, err, errlen)) {
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->rank_set = true;
     } else if (!strcmp(arg, "--rdma-device")) {
         if (i + 1 >= argc) goto missing;
         opt->rdma_device = argv[++i];
@@ -421,32 +505,40 @@ int ds4_tp_adopt_distributed_options(
         size_t errlen)
 {
     if (!tp || !dist || !tp->requested) return 1;
+    if (tp->world_size == 0) tp->world_size = 2;
+    if (tp->world_size != 2 && tp->world_size != 4 &&
+        tp->world_size != 8) {
+        tp_set_err(err, errlen,
+                   "--tensor-parallel-world must be 2, 4, or 8");
+        return 0;
+    }
     if (tp->role != DS4_TP_NONE) {
         tp_set_err(err, errlen,
-                   "--tensor-parallel selects its role through --role");
+                   "network parallelism selects its role through --role");
         return 0;
     }
     if (dist->role == DS4_DISTRIBUTED_NONE) {
         tp_set_err(err, errlen,
-                   "--tensor-parallel requires --role coordinator or --role worker");
+                   "network parallelism requires --role coordinator or --role worker");
         return 0;
     }
     if (dist->layers.set) {
         tp_set_err(err, errlen,
-                   "tensor parallelism always uses one 50/50 worker; omit --layers");
+                   "network parallelism owns model placement; omit --layers");
         return 0;
     }
     if (dist->prefill_chunk || dist->prefill_window || dist->activation_bits ||
         dist->replay_check || dist->debug) {
         tp_set_err(err, errlen,
-                   "--dist-* and distributed debug options cannot be used with --tensor-parallel");
+                   "--dist-* and distributed debug options cannot be used with "
+                   "network parallelism");
         return 0;
     }
 
     if (dist->role == DS4_DISTRIBUTED_COORDINATOR) {
         if (!dist->listen_host || dist->listen_port <= 0) {
             tp_set_err(err, errlen,
-                       "--role coordinator --tensor-parallel requires --listen HOST PORT");
+                       "network parallel coordinator requires --listen HOST PORT");
             return 0;
         }
         if (dist->coordinator_host || dist->coordinator_port) {
@@ -455,20 +547,45 @@ int ds4_tp_adopt_distributed_options(
             return 0;
         }
         tp->role = DS4_TP_LEADER;
+        if (tp->rank_set && tp->rank != 0) {
+            tp_set_err(err, errlen,
+                       "the coordinator is always --tensor-parallel-rank 0");
+            return 0;
+        }
+        tp->rank = 0;
+        tp->rank_set = true;
         tp->listen_host = dist->listen_host;
         tp->listen_port = dist->listen_port;
     } else if (dist->role == DS4_DISTRIBUTED_WORKER) {
         if (!dist->coordinator_host || dist->coordinator_port <= 0) {
             tp_set_err(err, errlen,
-                       "--role worker --tensor-parallel requires --coordinator HOST PORT");
+                       "network parallel worker requires --coordinator HOST PORT");
             return 0;
         }
         if (dist->listen_host || dist->listen_port) {
             tp_set_err(err, errlen,
-                       "--role worker --tensor-parallel must not use --listen");
+                       "network parallel worker must not use --listen");
             return 0;
         }
         tp->role = DS4_TP_WORKER;
+        if (!tp->rank_set) {
+            if (tp->world_size == 2) {
+                tp->rank = 1;
+                tp->rank_set = true;
+            } else {
+                tp_set_err(err, errlen,
+                           "%u-rank workers require an explicit "
+                           "--tensor-parallel-rank in 1..%u",
+                           tp->world_size, tp->world_size - 1u);
+                return 0;
+            }
+        }
+        if (tp->rank == 0 || tp->rank >= tp->world_size) {
+            tp_set_err(err, errlen,
+                       "worker --tensor-parallel-rank %u is outside 1..%u",
+                       tp->rank, tp->world_size - 1u);
+            return 0;
+        }
         tp->leader_host = dist->coordinator_host;
         tp->leader_port = dist->coordinator_port;
     } else {
@@ -487,31 +604,86 @@ int ds4_tp_validate_engine_options(
 {
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
+            opt->tp.world_size != 0 || opt->tp.rank_set ||
             opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
             opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
             tp_set_err(err, errlen,
-                       "tensor-parallel options require --tensor-parallel and --role");
+                       "network parallel options require --expert-parallel or "
+                       "--tensor-parallel and --role");
             return 0;
         }
         return 1;
     }
-    if (opt->backend != DS4_BACKEND_METAL) {
-        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+    if (opt->tp.world_size == 8u && !opt->tp.expert_only) {
+        tp_set_err(err, errlen, "TP8 unsupported; use EP8");
         return 0;
     }
+#ifdef __APPLE__
+    if (opt->backend != DS4_BACKEND_METAL) {
+        tp_set_err(err, errlen, "network parallelism requires the Metal backend on macOS");
+        return 0;
+    }
+    if (opt->tp.world_size != 2) {
+        tp_set_err(err, errlen, "Metal network parallelism currently supports two ranks");
+        return 0;
+    }
+    if (opt->tp.expert_only) {
+        tp_set_err(err, errlen,
+                   "--expert-parallel is currently implemented by the CUDA backend");
+        return 0;
+    }
+    if (opt->tp.transport == DS4_TP_TRANSPORT_NCCL) {
+        tp_set_err(err, errlen, "--transport nccl requires the CUDA backend");
+        return 0;
+    }
+#else
+#ifdef DS4_ROCM_BUILD
+    tp_set_err(err, errlen,
+               "network parallelism is not implemented for the ROCm backend");
+    return 0;
+#endif
+    if (opt->backend != DS4_BACKEND_CUDA) {
+        tp_set_err(err, errlen, "network parallelism requires the CUDA backend on Linux");
+        return 0;
+    }
+    if (opt->tp.transport != DS4_TP_TRANSPORT_AUTO &&
+        opt->tp.transport != DS4_TP_TRANSPORT_NCCL) {
+        tp_set_err(err, errlen,
+                   "CUDA network parallelism requires --transport nccl (or auto)");
+        return 0;
+    }
+    if (opt->glm_mtp || opt->glm_mtp_timing) {
+        tp_set_err(err, errlen,
+                   "CUDA network parallelism does not yet support --glm-mtp");
+        return 0;
+    }
+#endif
     if (opt->ssd_streaming) {
-        tp_set_err(err, errlen, "tensor parallelism requires resident weights (no --ssd-streaming)");
+        tp_set_err(err, errlen,
+                   "network parallelism requires resident weights (no --ssd-streaming)");
+        return 0;
+    }
+    if ((opt->mtp_path && opt->mtp_path[0]) || opt->dspark) {
+        tp_set_err(err, errlen,
+                   "network parallelism does not yet support MTP/DSpark speculative drafting");
+        return 0;
+    }
+    if ((opt->directional_steering_file &&
+         opt->directional_steering_file[0]) ||
+        opt->directional_steering_attn != 0.0f ||
+        opt->directional_steering_ffn != 0.0f) {
+        tp_set_err(err, errlen,
+                   "network parallelism does not yet support directional steering");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
-        tp_set_err(err, errlen, "tensor parallelism and --role distributed modes are exclusive");
+        tp_set_err(err, errlen,
+                   "network parallelism and distributed layer roles are exclusive");
         return 0;
     }
-    /* Speculative drafting (DSpark/MTP) is allowed on the leader: the
-     * verify block is mirrored to the worker via DS4_TP_FRAME_VERIFY and
-     * the legacy MTP path falls back to per-token decode under TP. */
     if (opt->load_slice) {
-        tp_set_err(err, errlen, "tensor parallelism does not use distributed layer slices");
+        tp_set_err(err, errlen,
+                   "network parallelism does not use distributed layer slices");
         return 0;
     }
     return 1;
@@ -1238,27 +1410,36 @@ static void tp_rdma_close(ds4_tp *tp) {
  * Bring-up.
  * --------------------------------------------------------------------- */
 
-static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
-                             char *err, size_t errlen) {
+static int tp_hello_exchange_fd(ds4_tp *tp, int fd,
+                                const ds4_tp_identity *id, int rdma_ok,
+                                uint32_t *peer_rank, int *peer_rdma_ok,
+                                char *err, size_t errlen) {
     ds4_tp_hello_fixed mine = {
         .magic = DS4_TP_MAGIC,
         .version = DS4_TP_PROTOCOL_VERSION,
         .role = (uint32_t)tp->opt.role,
+        .rank = (uint32_t)tp->rank,
+        .world = tp->world,
+        .collective = tp->collective_active ? 1u : 0u,
+        .expert_only = tp->opt.expert_only ? 1u : 0u,
         .rdma_ok = (uint32_t)rdma_ok,
         .gguf_bytes = id->gguf_bytes,
+        .layout_fingerprint = id->layout_fingerprint,
         .model_id = id->model_id,
         .n_layer = id->n_layer,
         .n_embd = id->n_embd,
         .n_vocab = id->n_vocab,
         .quant_bits = id->quant_bits,
+        .quant_profile = id->quant_profile,
         .ctx_size = id->ctx_size,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
     };
-    ds4_tp_hello_fixed theirs;
-    if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+    ds4_tp_hello_fixed theirs = {0};
+    const size_t version_prefix_bytes = 2u * sizeof(uint32_t);
+    if (!tp_write_full(fd, &mine, sizeof(mine)) ||
+        !tp_read_full(fd, &theirs, version_prefix_bytes)) {
         tp_set_err(err, errlen, "tp hello exchange failed");
         return 0;
     }
@@ -1271,8 +1452,67 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.version, DS4_TP_PROTOCOL_VERSION);
         return 0;
     }
+    if (!tp_read_full(fd,
+                      (uint8_t *)&theirs + version_prefix_bytes,
+                      sizeof(theirs) - version_prefix_bytes)) {
+        tp_set_err(err, errlen, "tp hello exchange failed after version prefix");
+        return 0;
+    }
     if (theirs.role == mine.role) {
         tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
+        return 0;
+    }
+    if (theirs.world != mine.world || theirs.rank >= mine.world ||
+        theirs.rank == mine.rank ||
+        (theirs.role == DS4_TP_LEADER && theirs.rank != 0) ||
+        (theirs.role == DS4_TP_WORKER && theirs.rank == 0)) {
+        tp_set_err(err, errlen,
+                   "tp hello: invalid peer topology rank=%u world=%u role=%u "
+                   "(local rank=%u world=%u)",
+                   theirs.rank, theirs.world, theirs.role,
+                   mine.rank, mine.world);
+        return 0;
+    }
+    if (theirs.collective != mine.collective) {
+        tp_set_err(err, errlen,
+                   "tp hello: transport mismatch (local collective=%u, peer=%u)",
+                   mine.collective, theirs.collective);
+        return 0;
+    }
+    if (theirs.expert_only != mine.expert_only) {
+        tp_set_err(err, errlen,
+                   "tp hello: parallel mode mismatch (local expert_only=%u, peer=%u)",
+                   mine.expert_only, theirs.expert_only);
+        return 0;
+    }
+    if (mine.ctx_size == 0 || theirs.ctx_size == 0) {
+        tp_set_err(err, errlen,
+                   "tp hello: every rank must advertise a nonzero context capacity");
+        return 0;
+    }
+    if (theirs.ctx_size != mine.ctx_size) {
+        tp_set_err(err, errlen,
+                   "tp hello: context capacity mismatch (local=%u, peer=%u)",
+                   mine.ctx_size, theirs.ctx_size);
+        return 0;
+    }
+    if (theirs.quant_profile != mine.quant_profile) {
+        tp_set_err(err, errlen,
+                   "tp hello: quant profile mismatch (local=%u, peer=%u)",
+                   mine.quant_profile, theirs.quant_profile);
+        return 0;
+    }
+    if (mine.layout_fingerprint == 0u || theirs.layout_fingerprint == 0u) {
+        tp_set_err(err, errlen,
+                   "tp hello: every rank must advertise a layout fingerprint");
+        return 0;
+    }
+    if (theirs.layout_fingerprint != mine.layout_fingerprint) {
+        tp_set_err(err, errlen,
+                   "tp hello: layout fingerprint mismatch "
+                   "(local=%016llx, peer=%016llx)",
+                   (unsigned long long)mine.layout_fingerprint,
+                   (unsigned long long)theirs.layout_fingerprint);
         return 0;
     }
     if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
@@ -1297,14 +1537,8 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     tp->gate_slot_step = id->gate_slot_step;
     tp->gates_per_token = id->gates_per_token;
     tp_slab_layout(tp);
-    /* Transport decision: RDMA only when both sides can. */
-    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
-    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
-        tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
-                   rdma_ok ? "the peer" : "this");
-        return 0;
-    }
+    if (peer_rank) *peer_rank = theirs.rank;
+    if (peer_rdma_ok) *peer_rdma_ok = (int)theirs.rdma_ok;
     return 1;
 }
 
@@ -1315,16 +1549,48 @@ int ds4_tp_create(
         char *err,
         size_t errlen)
 {
+    if (!out || !opt || !id) {
+        tp_set_err(err, errlen, "tp: invalid initialization request");
+        return 0;
+    }
     *out = NULL;
     ds4_tp *tp = calloc(1, sizeof(*tp));
     if (!tp) {
         tp_set_err(err, errlen, "tp: out of memory");
         return 0;
     }
-    tp->opt = *opt;
-    tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+    int listener = -1;
     tp->control_fd = -1;
     tp->data_fd = -1;
+    for (uint32_t r = 0; r < DS4_TP_MAX_WORLD; r++) {
+        tp->control_fds[r] = -1;
+    }
+    tp->opt = *opt;
+    tp->world = opt->world_size ? opt->world_size : 2u;
+    tp->rank = opt->role == DS4_TP_LEADER ? 0 : (int)opt->rank;
+    if ((tp->world != 2u && tp->world != 4u && tp->world != 8u) ||
+        tp->world > DS4_TP_MAX_WORLD || tp->rank < 0 ||
+        (uint32_t)tp->rank >= tp->world) {
+        tp_set_err(err, errlen, "tp: invalid rank %d of %u", tp->rank, tp->world);
+        goto fail;
+    }
+    if (tp->world == 8u && !opt->expert_only) {
+        tp_set_err(err, errlen, "TP8 unsupported; use EP8");
+        goto fail;
+    }
+#ifdef __APPLE__
+    tp->collective_active = opt->transport == DS4_TP_TRANSPORT_NCCL;
+#else
+    tp->collective_active =
+        opt->transport == DS4_TP_TRANSPORT_AUTO ||
+        opt->transport == DS4_TP_TRANSPORT_NCCL;
+#endif
+    if (tp->world > 2u && !tp->collective_active) {
+        tp_set_err(err, errlen,
+                   "tp: %u ranks require a collective transport", tp->world);
+        goto fail;
+    }
+    tp->peer_ctx = UINT32_MAX;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
@@ -1336,32 +1602,80 @@ int ds4_tp_create(
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
 #endif
 
-    int listener = -1;
     if (tp->rank == 0) {
         listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
         if (listener < 0) goto fail;
-        fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
+        fprintf(stderr, "ds4-tp: waiting for %u worker%s on %s:%d ...\n",
+                tp->world - 1u, tp->world == 2u ? "" : "s",
                 opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+        for (uint32_t connected = 0; connected < tp->world - 1u; connected++) {
+            int fd = accept(listener, NULL, NULL);
+            if (fd < 0) {
+                tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+                goto fail;
+            }
+            tp_socket_tune(fd);
+            uint32_t peer_rank = UINT32_MAX;
+            int peer_rdma = 0;
+            if (!tp_hello_exchange_fd(tp, fd, id, rdma_ok,
+                                      &peer_rank, &peer_rdma, err, errlen)) {
+                close(fd);
+                goto fail;
+            }
+            if (peer_rank == 0 || peer_rank >= tp->world ||
+                tp->control_fds[peer_rank] >= 0) {
+                close(fd);
+                tp_set_err(err, errlen,
+                           "tp: duplicate or invalid worker rank %u", peer_rank);
+                goto fail;
+            }
+            tp->control_fds[peer_rank] = fd;
+            if (tp->world == 2u && !tp->collective_active) {
+                int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
+                tp->rdma_active = want_rdma && rdma_ok && peer_rdma;
+            }
+            fprintf(stderr, "ds4-tp: worker rank %u connected (%u/%u)\n",
+                    peer_rank, connected + 1u, tp->world - 1u);
+        }
+        tp->control_fd = tp->control_fds[1];
+    } else {
+        int fd = tp_dial(opt->leader_host, opt->leader_port,
+                         (double)tp->timeout_sec, err, errlen);
+        if (fd < 0) goto fail;
+        tp_socket_tune(fd);
+        uint32_t peer_rank = UINT32_MAX;
+        int peer_rdma = 0;
+        if (!tp_hello_exchange_fd(tp, fd, id, rdma_ok,
+                                  &peer_rank, &peer_rdma, err, errlen)) {
+            close(fd);
             goto fail;
         }
-    } else {
-        tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                 (double)tp->timeout_sec, err, errlen);
-        if (tp->control_fd < 0) goto fail;
+        if (peer_rank != 0) {
+            close(fd);
+            tp_set_err(err, errlen, "tp: worker connected to non-leader rank %u",
+                       peer_rank);
+            goto fail;
+        }
+        tp->control_fds[0] = fd;
+        tp->control_fd = fd;
+        if (tp->world == 2u && !tp->collective_active) {
+            int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
+            tp->rdma_active = want_rdma && rdma_ok && peer_rdma;
+        }
     }
-    tp_socket_tune(tp->control_fd);
-
-    if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
+    if (tp->peer_ctx == UINT32_MAX) tp->peer_ctx = id->ctx_size;
+    if (opt->transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
+        tp_set_err(err, errlen,
+                   "tp: --transport rdma but one side has no active device");
+        goto fail;
+    }
 
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
         if (!tp_rdma_open(tp, err, errlen)) goto fail;
     }
 #endif
-    {
+    if (!tp->collective_active) {
         /* Second socket dedicated to gate traffic so control frames never
          * interleave with gate payloads.  Created under RDMA too for
          * headers, verify-block gates, and transport fallback. */
@@ -1379,8 +1693,13 @@ int ds4_tp_create(
         tp_socket_tune(tp->data_fd);
     }
     if (listener >= 0) close(listener);
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s\n",
-            tp->rank == 0 ? "worker" : "leader",
+    fprintf(stderr,
+            "ds4-tp: rank %d/%u ready, profile=%s, layout=%016llx, "
+            "transport=%s\n",
+            tp->rank, tp->world,
+            ds4_quant_profile_name((ds4_quant_profile)id->quant_profile),
+            (unsigned long long)id->layout_fingerprint,
+            tp->collective_active ? "nccl" :
             tp->rdma_active ? "rdma" : "tcp");
     *out = tp;
     return 1;
@@ -1406,19 +1725,123 @@ void ds4_tp_free(ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
-    if (tp->control_fd >= 0) close(tp->control_fd);
+    for (uint32_t r = 0; r < DS4_TP_MAX_WORLD; r++) {
+        if (tp->control_fds[r] >= 0) close(tp->control_fds[r]);
+    }
     if (tp->data_fd >= 0) close(tp->data_fd);
     free(tp);
 }
 
-int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
-bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
-uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
+int ds4_tp_rank(const ds4_tp *tp) { return tp ? tp->rank : -1; }
+uint32_t ds4_tp_world(const ds4_tp *tp) { return tp ? tp->world : 0u; }
+bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp && tp->rdma_active; }
+bool ds4_tp_is_collective(const ds4_tp *tp) {
+    return tp && tp->collective_active;
+}
+bool ds4_tp_is_expert_only(const ds4_tp *tp) {
+    return tp && tp->opt.expert_only;
+}
+uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) {
+    return tp ? tp->peer_ctx : 0u;
+}
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
 void ds4_tp_mark_failed(ds4_tp *tp) {
     if (tp) atomic_store_explicit(&tp->failed, true, memory_order_release);
+}
+
+void ds4_tp_abort_peers(ds4_tp *tp) {
+    if (!tp || tp->rank != 0) return;
+    for (uint32_t rank = 1u; rank < tp->world; rank++) {
+        if (tp->control_fds[rank] >= 0) {
+            (void)shutdown(tp->control_fds[rank], SHUT_RDWR);
+        }
+    }
+    if (tp->data_fd >= 0) (void)shutdown(tp->data_fd, SHUT_RDWR);
+}
+
+int ds4_tp_collective_preflight(ds4_tp *tp, int local_ready,
+                                char *err, size_t errlen) {
+    if (!tp || !tp->collective_active) {
+        tp_set_err(err, errlen, "tp: invalid collective preflight request");
+        return 0;
+    }
+    uint32_t ready = local_ready ? 1u : 0u;
+    if (tp->rank == 0) {
+        for (uint32_t rank = 1; rank < tp->world; rank++) {
+            uint32_t type = 0, bytes = 0, peer_ready = 0;
+            const int fd = tp->control_fds[rank];
+            if (fd < 0 || !tp_read_frame_header(fd, &type, &bytes) ||
+                type != DS4_TP_FRAME_COLLECTIVE_PREFLIGHT ||
+                bytes != sizeof(peer_ready) ||
+                !tp_read_full(fd, &peer_ready, sizeof(peer_ready))) {
+                ds4_tp_mark_failed(tp);
+                tp_set_err(err, errlen,
+                           "tp: collective preflight failed for rank %u", rank);
+                return 0;
+            }
+            ready &= peer_ready == 1u;
+        }
+        if (!tp_send_frame_workers(tp, DS4_TP_FRAME_COLLECTIVE_PREFLIGHT,
+                                   &ready, sizeof(ready))) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: collective preflight result broadcast failed");
+            return 0;
+        }
+    } else {
+        if (!tp_send_frame(tp->control_fd,
+                           DS4_TP_FRAME_COLLECTIVE_PREFLIGHT,
+                           &ready, sizeof(ready))) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: rank %d collective preflight send failed", tp->rank);
+            return 0;
+        }
+        uint32_t type = 0, bytes = 0;
+        if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+            type != DS4_TP_FRAME_COLLECTIVE_PREFLIGHT ||
+            bytes != sizeof(ready) ||
+            !tp_read_full(tp->control_fd, &ready, sizeof(ready))) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: rank %d collective preflight receive failed", tp->rank);
+            return 0;
+        }
+    }
+    if (ready != 1u) {
+        tp_set_err(err, errlen,
+                   "tp: NCCL runtime is unavailable on one or more ranks");
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_tp_broadcast_blob(ds4_tp *tp, void *data, uint32_t bytes,
+                          char *err, size_t errlen) {
+    if (!tp || !data || bytes == 0 || !tp->collective_active) {
+        tp_set_err(err, errlen, "tp: invalid collective bootstrap request");
+        return 0;
+    }
+    if (tp->rank == 0) {
+        if (!tp_send_frame_workers(tp, DS4_TP_FRAME_BOOTSTRAP, data, bytes)) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: collective bootstrap broadcast failed");
+            return 0;
+        }
+        return 1;
+    }
+    uint32_t type = 0, received = 0;
+    if (!tp_read_frame_header(tp->control_fd, &type, &received) ||
+        type != DS4_TP_FRAME_BOOTSTRAP || received != bytes ||
+        !tp_read_full(tp->control_fd, data, bytes)) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen,
+                   "tp: rank %d collective bootstrap receive failed", tp->rank);
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------------
@@ -1634,20 +2057,20 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    const int ok = tp_send_frame_workers(tp, type, payload, bytes);
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
-                         &msg, sizeof(msg));
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_SESSION_CREATE,
+                                 &msg, sizeof(msg));
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
-                         &session_id, sizeof(session_id));
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_SESSION_DESTROY,
+                                 &session_id, sizeof(session_id));
 }
 
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
@@ -1659,18 +2082,18 @@ int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
-                         &msg, sizeof(msg));
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_REWIND,
+                                 &msg, sizeof(msg));
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
-                         &session_id, sizeof(session_id));
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_INVALIDATE,
+                                 &session_id, sizeof(session_id));
 }
 
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -1684,8 +2107,8 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
-                                 payload, bytes);
+    const int ok = tp_send_frame_workers(tp, DS4_TP_FRAME_EVAL_BATCH,
+                                         payload, bytes);
     free(payload);
     return ok;
 }
@@ -1712,8 +2135,8 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
-                                 payload, bytes);
+    const int ok = tp_send_frame_workers(tp, DS4_TP_FRAME_MIXED_BATCH,
+                                         payload, bytes);
     free(payload);
     return ok;
 }
@@ -1726,28 +2149,34 @@ int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
 
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen) {
-    uint32_t type = 0, bytes = 0;
-    ds4_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
-        !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
-        ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen, "tp: worker failed during %s",
-                   operation ? operation : "command");
-        return 0;
-    }
-    if (ack.session_id != session_id || ack.status != 0) {
-        tp_set_err(err, errlen,
-                   "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command",
-                   (unsigned long long)ack.session_id, (int)ack.status);
-        return 0;
+    if (!tp || tp->rank != 0) return 0;
+    for (uint32_t rank = 1; rank < tp->world; rank++) {
+        uint32_t type = 0, bytes = 0;
+        ds4_tp_command_ack ack;
+        const int fd = tp->control_fds[rank];
+        if (fd < 0 || !tp_read_frame_header(fd, &type, &bytes) ||
+            type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
+            !tp_read_full(fd, &ack, sizeof(ack))) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: worker rank %u failed during %s",
+                       rank, operation ? operation : "command");
+            return 0;
+        }
+        if (ack.session_id != session_id || ack.status != 0) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: worker rank %u %s failed "
+                       "(session %llu, status %d)",
+                       rank, operation ? operation : "command",
+                       (unsigned long long)ack.session_id, (int)ack.status);
+            return 0;
+        }
     }
     return 1;
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_STOP, NULL, 0);
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -1894,11 +2323,13 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
 }
 
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
+    if (!tp || tp->world != 2u) return 0;
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_LOGITS,
                          half, count * sizeof(float));
 }
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
+    if (!tp || tp->world != 2u) return 0;
     uint32_t type = 0, bytes = 0;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
@@ -1916,8 +2347,8 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
 
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n) {
     struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
-                         &msg, sizeof(msg));
+    return tp_send_frame_workers(tp, DS4_TP_FRAME_VERIFY_COMMIT,
+                                 &msg, sizeof(msg));
 }
 
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n) {
@@ -1937,23 +2368,53 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_
 
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
     struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
-        tp_set_err(err, errlen, "tp: hash send failed");
-        return 0;
-    }
-    uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-        tp_set_err(err, errlen, "tp: hash recv failed");
-        return 0;
-    }
-    if (theirs.seq != seq || theirs.hash != hash) {
-        tp_set_err(err, errlen,
-                   "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
-                   (unsigned long long)seq,
-                   (unsigned long long)hash, (unsigned long long)theirs.hash);
-        return -1;
+    if (!tp) return 0;
+    if (tp->rank == 0) {
+        if (!tp_send_frame_workers(tp, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
+            tp_set_err(err, errlen, "tp: hash broadcast failed");
+            return 0;
+        }
+        for (uint32_t rank = 1; rank < tp->world; rank++) {
+            uint32_t type = 0, bytes = 0;
+            const int fd = tp->control_fds[rank];
+            if (fd < 0 || !tp_read_frame_header(fd, &type, &bytes) ||
+                type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
+                !tp_read_full(fd, &theirs, sizeof(theirs))) {
+                tp_set_err(err, errlen, "tp: hash recv from rank %u failed", rank);
+                return 0;
+            }
+            if (theirs.seq != seq || theirs.hash != hash) {
+                tp_set_err(err, errlen,
+                           "tp: LOCKSTEP DIVERGENCE at seq %llu: "
+                           "rank 0 %016llx rank %u %016llx",
+                           (unsigned long long)seq,
+                           (unsigned long long)hash, rank,
+                           (unsigned long long)theirs.hash);
+                return -1;
+            }
+        }
+    } else {
+        if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH,
+                           &mine, sizeof(mine))) {
+            tp_set_err(err, errlen, "tp: hash send failed");
+            return 0;
+        }
+        uint32_t type = 0, bytes = 0;
+        if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+            type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
+            !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+            tp_set_err(err, errlen, "tp: hash recv failed");
+            return 0;
+        }
+        if (theirs.seq != seq || theirs.hash != hash) {
+            tp_set_err(err, errlen,
+                       "tp: LOCKSTEP DIVERGENCE at seq %llu: "
+                       "rank %d %016llx rank 0 %016llx",
+                       (unsigned long long)seq, tp->rank,
+                       (unsigned long long)hash,
+                       (unsigned long long)theirs.hash);
+            return -1;
+        }
     }
     return 1;
 }
@@ -2023,21 +2484,61 @@ static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
            ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
 }
 
-int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
-    char err[256] = "";
+static ds4_tp_identity tp_engine_identity(ds4_engine *engine,
+                                           uint32_t ctx_size) {
     ds4_tp_identity id = {
         .gguf_bytes = ds4_engine_model_bytes(engine),
+        .layout_fingerprint = ds4_engine_layout_fingerprint(engine),
         .model_id = (uint32_t)ds4_engine_model_id(engine),
         .n_layer = (uint32_t)ds4_engine_layer_count(engine),
         .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
         .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
         .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
-        .ctx_size = 0, /* adopt the leader's */
+        .quant_profile = (uint32_t)ds4_engine_quant_profile(engine),
+        .ctx_size = ctx_size,
     };
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,
                                 &id.gate_slot_step,
                                 &id.gates_per_token);
+    return id;
+}
+
+int ds4_tp_leader_bind(ds4_engine *engine, const ds4_tp_options *opt,
+                       uint32_t ctx_size, ds4_tp **out,
+                       char *err, size_t errlen) {
+    if (!engine || !opt || !out || opt->role != DS4_TP_LEADER ||
+        ctx_size == 0) {
+        tp_set_err(err, errlen, "tp: invalid leader bind request");
+        return 0;
+    }
+    *out = NULL;
+    ds4_tp_identity id = tp_engine_identity(engine, ctx_size);
+    ds4_tp *tp = NULL;
+    if (!ds4_tp_create(&tp, opt, &id, err, errlen)) return 0;
+    if (!ds4_engine_tp_bind(engine, tp, err, errlen)) {
+        (void)ds4_tp_send_stop(tp);
+        ds4_engine_tp_unbind(engine);
+        ds4_tp_free(tp);
+        return 0;
+    }
+    *out = tp;
+    return 1;
+}
+
+void ds4_tp_leader_shutdown(ds4_engine *engine, ds4_tp **tp_ptr) {
+    if (!tp_ptr || !*tp_ptr) return;
+    ds4_tp *tp = *tp_ptr;
+    *tp_ptr = NULL;
+    (void)ds4_tp_send_stop(tp);
+    if (engine) ds4_engine_tp_unbind(engine);
+    ds4_tp_free(tp);
+}
+
+int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt,
+                      uint32_t ctx_size) {
+    char err[256] = "";
+    ds4_tp_identity id = tp_engine_identity(engine, ctx_size);
 
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, sizeof(err))) {
@@ -2046,6 +2547,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     if (!ds4_engine_tp_bind(engine, tp, err, sizeof(err))) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: %s", err);
+        ds4_engine_tp_unbind(engine);
         ds4_tp_free(tp);
         return 1;
     }
@@ -2055,10 +2557,11 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         malloc((size_t)vocab * sizeof(*logits)) : NULL;
     if (ds4_engine_tp_vocab_split(engine) && !logits) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: logits buffer allocation failed");
+        ds4_engine_tp_unbind(engine);
         ds4_tp_free(tp);
         return 1;
     }
-    ds4_log(stderr, DS4_LOG_OK, "tp worker ready for mirrored sessions");
+    ds4_log(stderr, DS4_LOG_OK, "tp worker ready for mirrored sessions\n");
 
     int rc = 0;
     ds4_tokens prompt = {0};
@@ -2070,7 +2573,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             break;
         }
         if (command.type == DS4_TP_FRAME_STOP) {
-            ds4_log(stderr, DS4_LOG_DEFAULT, "tp worker: leader finished");
+            ds4_log(stderr, DS4_LOG_DEFAULT, "tp worker: leader finished\n");
             ds4_tp_command_free(&command);
             break;
         }
@@ -2183,6 +2686,22 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                     items, (int)command.n_items, prefill, &prompt,
                     err, sizeof(err));
             }
+            if (batch_rc != 0) {
+                /* A mapping/validation failure happens before this rank enters
+                 * the ordered collectives. Abort first so ranks that did enter
+                 * are released, then poison every session named by the frame. */
+                ds4_engine_tp_abort(engine);
+                if (prefill) ds4_session_invalidate(prefill);
+                for (uint32_t i = 0; items && i < command.n_items; i++) {
+                    if (items[i].session) {
+                        ds4_session_invalidate(items[i].session);
+                    }
+                }
+                if (!err[0]) {
+                    snprintf(err, sizeof(err),
+                             "batch contains an unknown or invalid session");
+                }
+            }
             if (!ds4_tp_send_command_ack(tp, command.session_id, batch_rc)) {
                 rc = 1;
             } else if (batch_rc != 0) {
@@ -2209,11 +2728,13 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         if (rc != 0) break;
     }
     ds4_tokens_free(&prompt);
+    if (rc != 0) ds4_engine_tp_abort(engine);
     while (sessions.len != 0) {
         tp_worker_session_remove(&sessions, sessions.len - 1u);
     }
     free(sessions.v);
     free(logits);
+    ds4_engine_tp_unbind(engine);
     ds4_tp_free(tp);
     return rc;
 }

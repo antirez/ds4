@@ -16,6 +16,7 @@
 #include "ds4_gpu_mgpu.h"
 
 #include <cuda_runtime.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -982,76 +983,263 @@ static int run_q8_kslice(void) {
 
     const uint64_t in_dim = 128;
     const uint64_t out_dim = 96;
-    const uint64_t split = 64;
+    const uint64_t world = 4;
+    const uint64_t split = in_dim / world;
+    const uint64_t n_tok = 16;
     const uint64_t blocks = (in_dim + 31u) / 32u;
     const uint64_t model_size = out_dim * blocks * 34u;
     unsigned char *model = (unsigned char *)malloc((size_t)model_size);
-    float *host_x = (float *)malloc((size_t)in_dim * sizeof(float));
-    float *host_full = (float *)malloc((size_t)out_dim * sizeof(float));
-    float *host_sum = (float *)malloc((size_t)out_dim * sizeof(float));
-    CHECK(model && host_x && host_full && host_sum, "q8_kslice host alloc");
+    float *host_x = (float *)malloc((size_t)(n_tok * in_dim) * sizeof(float));
+    float *host_local = (float *)malloc((size_t)(n_tok * split) * sizeof(float));
+    float *host_full = (float *)malloc((size_t)(n_tok * out_dim) * sizeof(float));
+    float *host_part = (float *)malloc((size_t)(n_tok * out_dim) * sizeof(float));
+    float *host_sum = (float *)calloc((size_t)(n_tok * out_dim), sizeof(float));
+    CHECK(model && host_x && host_local && host_full && host_part && host_sum,
+          "q8_kslice host alloc");
     pack_q8_identity_scale(model, in_dim, out_dim);
-    for (uint64_t i = 0; i < in_dim; i++) {
-        host_x[i] = (float)((int)(i % 37u) - 18) * 0.03125f;
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint64_t i = 0; i < in_dim; i++) {
+            host_x[t * in_dim + i] =
+                (float)((int)((i * 5u + t * 11u) % 53u) - 26) * 0.0234375f;
+        }
     }
     CHECK(ds4_gpu_set_model_map(model, model_size), "q8_kslice set model map");
 
     ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
     ds4_gpu_tensor full; memset(&full, 0, sizeof(full));
-    ds4_gpu_tensor p0; memset(&p0, 0, sizeof(p0));
-    ds4_gpu_tensor p1; memset(&p1, 0, sizeof(p1));
-    ds4_gpu_tensor sum; memset(&sum, 0, sizeof(sum));
-    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, in_dim * sizeof(float)) == 0,
+    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0,
           "q8_kslice alloc x");
-    CHECK(ds4_gpu_tensor_alloc_on(&full, 0, out_dim * sizeof(float)) == 0,
+    CHECK(ds4_gpu_tensor_alloc_on(&full, 0, n_tok * out_dim * sizeof(float)) == 0,
           "q8_kslice alloc full");
-    CHECK(ds4_gpu_tensor_alloc_on(&p0, 0, out_dim * sizeof(float)) == 0,
-          "q8_kslice alloc p0");
-    CHECK(ds4_gpu_tensor_alloc_on(&p1, 0, out_dim * sizeof(float)) == 0,
-          "q8_kslice alloc p1");
-    CHECK(ds4_gpu_tensor_alloc_on(&sum, 0, out_dim * sizeof(float)) == 0,
-          "q8_kslice alloc sum");
-    CHECK(ds4_gpu_tensor_write(&x, 0, host_x, in_dim * sizeof(float)),
+    CHECK(ds4_gpu_tensor_write(&x, 0, host_x,
+                               n_tok * in_dim * sizeof(float)),
           "q8_kslice write x");
 
-    ds4_gpu_tensor *x0 = ds4_gpu_tensor_view(&x, 0, split * sizeof(float));
-    ds4_gpu_tensor *x1 = ds4_gpu_tensor_view(&x, split * sizeof(float),
-                                             (in_dim - split) * sizeof(float));
-    CHECK(x0 && x1, "q8_kslice views");
     int ok = ds4_gpu_matmul_q8_0_tensor(&full, model, model_size, 0,
-                                        in_dim, out_dim, &x, 1) &&
-             ds4_gpu_matmul_q8_0_kslice_rows_tensor(&p0, model, model_size, 0,
-                                               in_dim, out_dim, 0, split, x0, 1) &&
-             ds4_gpu_matmul_q8_0_kslice_rows_tensor(&p1, model, model_size, 0,
-                                               in_dim, out_dim, split,
-                                               in_dim - split, x1, 1) &&
-             ds4_gpu_add_tensor(&sum, &p0, &p1, (uint32_t)out_dim) &&
-             ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
-             ds4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
+                                        in_dim, out_dim, &x, n_tok);
+    for (uint64_t rank = 0; ok && rank < world; rank++) {
+        for (uint64_t t = 0; t < n_tok; t++) {
+            memcpy(host_local + t * split,
+                   host_x + t * in_dim + rank * split,
+                   (size_t)split * sizeof(float));
+        }
+        ds4_gpu_tensor local; memset(&local, 0, sizeof(local));
+        ds4_gpu_tensor part; memset(&part, 0, sizeof(part));
+        ok = ds4_gpu_tensor_alloc_on(&local, 0,
+                                     n_tok * split * sizeof(float)) == 0 &&
+             ds4_gpu_tensor_alloc_on(&part, 0,
+                                     n_tok * out_dim * sizeof(float)) == 0 &&
+             ds4_gpu_tensor_write(&local, 0, host_local,
+                                  n_tok * split * sizeof(float)) &&
+             ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                     &part, model, model_size, 0,
+                     in_dim, out_dim, rank * split, split, &local, n_tok) &&
+             ds4_gpu_tensor_read(&part, 0, host_part,
+                                 n_tok * out_dim * sizeof(float));
+        if (ok) {
+            for (uint64_t i = 0; i < n_tok * out_dim; i++) {
+                host_sum[i] += host_part[i];
+            }
+        }
+        ds4_gpu_tensor_free_in_place(&part);
+        ds4_gpu_tensor_free_in_place(&local);
+    }
+    ok = ok && ds4_gpu_tensor_read(&full, 0, host_full,
+                                    n_tok * out_dim * sizeof(float));
     CHECK(ok, "q8_kslice compute");
-    for (uint64_t i = 0; i < out_dim; i++) {
+    for (uint64_t i = 0; i < n_tok * out_dim; i++) {
         float diff = fabsf(host_full[i] - host_sum[i]);
-        if (diff > 1.0e-4f) {
+        if (diff > 2.0e-4f) {
             fprintf(stderr,
-                    "FAIL: q8_kslice mismatch row=%llu full=%f sum=%f diff=%g\n",
-                    (unsigned long long)i, host_full[i], host_sum[i], diff);
+                    "FAIL: q8_kslice mismatch elem=%llu full=%f sum=%f diff=%g\n",
+                    (unsigned long long)i,
+                    host_full[i], host_sum[i], diff);
             return 1;
         }
     }
 
-    ds4_gpu_tensor_free(x0);
-    ds4_gpu_tensor_free(x1);
     ds4_gpu_tensor_free_in_place(&x);
     ds4_gpu_tensor_free_in_place(&full);
-    ds4_gpu_tensor_free_in_place(&p0);
-    ds4_gpu_tensor_free_in_place(&p1);
-    ds4_gpu_tensor_free_in_place(&sum);
     free(model);
     free(host_x);
+    free(host_local);
     free(host_full);
+    free(host_part);
     free(host_sum);
     ds4_gpu_cleanup();
     fprintf(stderr, "  q8_kslice OK\n");
+    return 0;
+}
+
+static int run_q8_ffn_tp4(void) {
+    int dev_count = 0;
+    (void)cudaGetDeviceCount(&dev_count);
+    if (dev_count < 1) {
+        fprintf(stderr, "  skipping q8_ffn_tp4 (need CUDA device)\n");
+        return 0;
+    }
+
+    ds4_gpu_config cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 1;
+    cfg.device_indices[0] = 0;
+    CHECK(ds4_gpu_init_multi(&cfg), "q8_ffn_tp4 init_multi");
+
+    const uint64_t in_dim = 128;
+    const uint64_t hidden = 256;
+    const uint64_t out_dim = 96;
+    const uint64_t world = 4;
+    const uint64_t split = hidden / world;
+    const uint64_t n_tok = 16;
+    const uint64_t gu_row_bytes = ((in_dim + 31u) / 32u) * 34u;
+    const uint64_t down_row_bytes = ((hidden + 31u) / 32u) * 34u;
+    const uint64_t gate_off = 0;
+    const uint64_t up_off = gate_off + hidden * gu_row_bytes;
+    const uint64_t down_off = up_off + hidden * gu_row_bytes;
+    const uint64_t model_size = down_off + out_dim * down_row_bytes;
+    unsigned char *model = (unsigned char *)malloc((size_t)model_size);
+    float *host_x = (float *)malloc((size_t)(n_tok * in_dim) * sizeof(float));
+    float *host_mid = (float *)malloc((size_t)(n_tok * hidden) * sizeof(float));
+    float *host_local_mid = (float *)malloc((size_t)(n_tok * split) * sizeof(float));
+    float *host_full = (float *)malloc((size_t)(n_tok * out_dim) * sizeof(float));
+    float *host_part = (float *)malloc((size_t)(n_tok * out_dim) * sizeof(float));
+    float *host_sum = (float *)calloc((size_t)(n_tok * out_dim), sizeof(float));
+    CHECK(model && host_x && host_mid && host_local_mid && host_full &&
+          host_part && host_sum, "q8_ffn_tp4 host alloc");
+    pack_q8_identity_scale(model + gate_off, in_dim, hidden);
+    pack_q8_identity_scale(model + up_off, in_dim, hidden);
+    pack_q8_identity_scale(model + down_off, hidden, out_dim);
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint64_t i = 0; i < in_dim; i++) {
+            host_x[t * in_dim + i] =
+                (float)((int)((i * 7u + t * 13u) % 61u) - 30) * 0.01953125f;
+        }
+    }
+    CHECK(ds4_gpu_set_model_map(model, model_size),
+          "q8_ffn_tp4 set model map");
+
+    ds4_gpu_tensor x; memset(&x, 0, sizeof(x));
+    ds4_gpu_tensor full_gate; memset(&full_gate, 0, sizeof(full_gate));
+    ds4_gpu_tensor full_up; memset(&full_up, 0, sizeof(full_up));
+    ds4_gpu_tensor full_mid; memset(&full_mid, 0, sizeof(full_mid));
+    ds4_gpu_tensor full_out; memset(&full_out, 0, sizeof(full_out));
+    CHECK(ds4_gpu_tensor_alloc_on(&x, 0, n_tok * in_dim * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&full_gate, 0,
+                                  n_tok * hidden * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&full_up, 0,
+                                  n_tok * hidden * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&full_mid, 0,
+                                  n_tok * hidden * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&full_out, 0,
+                                  n_tok * out_dim * sizeof(float)) == 0,
+          "q8_ffn_tp4 alloc full tensors");
+    CHECK(ds4_gpu_tensor_write(&x, 0, host_x,
+                               n_tok * in_dim * sizeof(float)),
+          "q8_ffn_tp4 write x");
+
+    int ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                     &full_gate, &full_up, &full_mid,
+                     model, model_size, gate_off, up_off,
+                     in_dim, hidden, &x, n_tok, 0.0f) &&
+             ds4_gpu_matmul_q8_0_tensor(&full_out,
+                                        model, model_size, down_off,
+                                        hidden, out_dim, &full_mid, n_tok) &&
+             ds4_gpu_tensor_read(&full_mid, 0, host_mid,
+                                 n_tok * hidden * sizeof(float));
+    for (uint64_t rank = 0; ok && rank < world; rank++) {
+        ds4_gpu_tensor gate; memset(&gate, 0, sizeof(gate));
+        ds4_gpu_tensor up; memset(&up, 0, sizeof(up));
+        ds4_gpu_tensor mid; memset(&mid, 0, sizeof(mid));
+        ds4_gpu_tensor part; memset(&part, 0, sizeof(part));
+        ok = ds4_gpu_tensor_alloc_on(&gate, 0,
+                                     n_tok * split * sizeof(float)) == 0 &&
+             ds4_gpu_tensor_alloc_on(&up, 0,
+                                     n_tok * split * sizeof(float)) == 0 &&
+             ds4_gpu_tensor_alloc_on(&mid, 0,
+                                     n_tok * split * sizeof(float)) == 0 &&
+             ds4_gpu_tensor_alloc_on(&part, 0,
+                                     n_tok * out_dim * sizeof(float)) == 0 &&
+             ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                     &gate, &up, &mid,
+                     model, model_size,
+                     gate_off + rank * split * gu_row_bytes,
+                     up_off + rank * split * gu_row_bytes,
+                     in_dim, split, &x, n_tok, 0.0f) &&
+             ds4_gpu_tensor_read(&mid, 0, host_local_mid,
+                                 n_tok * split * sizeof(float));
+        for (uint64_t t = 0; ok && t < n_tok; t++) {
+            for (uint64_t i = 0; i < split; i++) {
+                const float want = host_mid[t * hidden + rank * split + i];
+                const float got = host_local_mid[t * split + i];
+                if (want != got) {
+                    fprintf(stderr,
+                            "FAIL: q8_ffn_tp4 mid mismatch rank=%llu token=%llu "
+                            "row=%llu full=%f local=%f diff=%g\n",
+                            (unsigned long long)rank,
+                            (unsigned long long)t,
+                            (unsigned long long)i,
+                            want, got, fabsf(want - got));
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+        if (ok) {
+            ok = ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                         &part, model, model_size, down_off,
+                         hidden, out_dim, rank * split, split,
+                         &mid, n_tok) &&
+                 ds4_gpu_tensor_read(&part, 0, host_part,
+                                     n_tok * out_dim * sizeof(float));
+        }
+        if (ok) {
+            for (uint64_t i = 0; i < n_tok * out_dim; i++) {
+                host_sum[i] += host_part[i];
+            }
+        }
+        ds4_gpu_tensor_free_in_place(&part);
+        ds4_gpu_tensor_free_in_place(&mid);
+        ds4_gpu_tensor_free_in_place(&up);
+        ds4_gpu_tensor_free_in_place(&gate);
+    }
+    ok = ok && ds4_gpu_tensor_read(&full_out, 0, host_full,
+                                    n_tok * out_dim * sizeof(float));
+    CHECK(ok, "q8_ffn_tp4 compute");
+    float max_abs = 0.0f;
+    float max_scaled = 0.0f;
+    for (uint64_t i = 0; i < n_tok * out_dim; i++) {
+        const float diff = fabsf(host_full[i] - host_sum[i]);
+        const float scale = fmaxf(1.0f, fabsf(host_full[i]));
+        const float scaled = diff / scale;
+        if (diff > max_abs) max_abs = diff;
+        if (scaled > max_scaled) max_scaled = scaled;
+        /* Four partial dot products change only the floating-point
+         * association.  Allow a small number of ulps plus an absolute
+         * floor for values around zero. */
+        if (diff > 2.0e-4f + 4.0f * FLT_EPSILON * scale) {
+            fprintf(stderr,
+                    "FAIL: q8_ffn_tp4 output mismatch elem=%llu "
+                    "full=%f sum=%f diff=%g scaled=%g\n",
+                    (unsigned long long)i,
+                    host_full[i], host_sum[i], diff, scaled);
+            return 1;
+        }
+    }
+
+    ds4_gpu_tensor_free_in_place(&full_out);
+    ds4_gpu_tensor_free_in_place(&full_mid);
+    ds4_gpu_tensor_free_in_place(&full_up);
+    ds4_gpu_tensor_free_in_place(&full_gate);
+    ds4_gpu_tensor_free_in_place(&x);
+    free(model);
+    free(host_x);
+    free(host_mid);
+    free(host_local_mid);
+    free(host_full);
+    free(host_part);
+    free(host_sum);
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  q8_ffn_tp4 OK (max_abs=%g max_scaled=%g)\n",
+            max_abs, max_scaled);
     return 0;
 }
 
@@ -1854,6 +2042,7 @@ int main(void) {
     if (run_glm_decode_attention_staged()) return 1;
     if (run_moe_handoff_pack()) return 1;
     if (run_q8_kslice()) return 1;
+    if (run_q8_ffn_tp4()) return 1;
     if (run_q8_matmul_top1_fused()) return 1;
     if (run_f16_small_out()) return 1;
     if (run_f16_small_batch()) return 1;

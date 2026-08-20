@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -8444,6 +8445,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
     ds4_engine *engine;
+    ds4_tp *tp_leader;
     server_slot *slots;
     int slot_count;
     int ctx_size;
@@ -9657,6 +9659,9 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    /* A payload restore would update rank 0 only. Normal prompt sync below
+     * mirrors replay to every network-parallel rank. */
+    if (ds4_engine_network_parallel(s->engine)) return 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -10488,6 +10493,11 @@ static int server_session_sync(server *s, server_slot *slot,
     int common = ds4_session_common_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
+    /* An exact resident-prefix hit is already synchronized and its logits are
+     * live.  Calling ds4_session_sync() again is a no-op, but entering the
+     * serialized prefill lane can strand every later slot behind a pending
+     * decode batch and prevent those ready sessions from coalescing. */
+    if (done > 0 && done == prompt->len) return 0;
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
@@ -11070,7 +11080,11 @@ static long server_decode_coalesce_us(void) {
     if (env && env[0]) {
         char *end = NULL;
         long v = strtol(env, &end, 10);
-        if (end != env && *end == '\0' && v >= 0 && v <= 100000) us = v;
+        /* Large expert-parallel models can serialize enough first-token work
+         * that a model-backed batch acceptance run needs a much wider window
+         * than production serving.  This remains opt-in: the default is still
+         * 2 ms, while the upper bound merely permits an explicit 60 s barrier. */
+        if (end != env && *end == '\0' && v >= 0 && v <= 60000000) us = v;
     }
     return us;
 }
@@ -11101,8 +11115,12 @@ static void *decode_worker_main(void *arg) {
             clock_gettime(CLOCK_REALTIME, &deadline);
             timespec_add_us(&deadline, coalesce_us);
             int observed = s->decode_pending;
-            while (!s->model_stopping && s->decode_pending < s->slot_count &&
-                   s->decode_pending < s->active_generations) {
+            /* Honor the coalescing window even when all generations that have
+             * already cleared prefill are pending.  Otherwise the first slot
+             * to reach decode observes active_generations == decode_pending
+             * and immediately closes the batch, preventing slightly staggered
+             * resident slots from ever joining it. */
+            while (!s->model_stopping && s->decode_pending < s->slot_count) {
                 int rc = pthread_cond_timedwait(&s->model_cv, &s->model_mu,
                                                 &deadline);
                 if (rc == ETIMEDOUT) break;
@@ -13039,6 +13057,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    ds4_tp_leader_shutdown(s->engine, &s->tp_leader);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -13116,6 +13135,18 @@ static server_config parse_options(int argc, char **argv) {
             exit(2);
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &c.engine.tp,
+                                 tp_parse_err, sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s",
+                       tp_parse_err[0] ? tp_parse_err :
+                                         "invalid network parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
@@ -13276,12 +13307,23 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                           &c.engine.distributed,
+                                           tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
     return c;
@@ -13356,13 +13398,38 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp,
+                                   (uint32_t)cfg.ctx_size);
+        ds4_engine_close(engine);
+        return rc;
+    }
+
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
         ds4_dist_generation_options gen = {
             .ctx_size = cfg.ctx_size,
         };
         int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
         ds4_engine_close(engine);
         return rc;
+    }
+
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = {0};
+        if (!ds4_tp_leader_bind(engine, &cfg.engine.tp,
+                                (uint32_t)cfg.ctx_size,
+                                &tp_leader, tp_err, sizeof(tp_err))) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s",
+                       tp_err[0] ? tp_err :
+                                   "network parallel initialization failed");
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
@@ -13374,6 +13441,7 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
@@ -18308,9 +18376,32 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_decode_coalesce_window_option(void) {
+    const char *env = getenv("DS4_SERVER_DECODE_COALESCE_US");
+    char *saved = env ? xstrdup(env) : NULL;
+
+    unsetenv("DS4_SERVER_DECODE_COALESCE_US");
+    TEST_ASSERT(server_decode_coalesce_us() == 2000);
+    setenv("DS4_SERVER_DECODE_COALESCE_US", "0", 1);
+    TEST_ASSERT(server_decode_coalesce_us() == 0);
+    setenv("DS4_SERVER_DECODE_COALESCE_US", "10000000", 1);
+    TEST_ASSERT(server_decode_coalesce_us() == 10000000);
+    setenv("DS4_SERVER_DECODE_COALESCE_US", "60000000", 1);
+    TEST_ASSERT(server_decode_coalesce_us() == 60000000);
+    setenv("DS4_SERVER_DECODE_COALESCE_US", "60000001", 1);
+    TEST_ASSERT(server_decode_coalesce_us() == 2000);
+    setenv("DS4_SERVER_DECODE_COALESCE_US", "invalid", 1);
+    TEST_ASSERT(server_decode_coalesce_us() == 2000);
+
+    if (saved) setenv("DS4_SERVER_DECODE_COALESCE_US", saved, 1);
+    else unsetenv("DS4_SERVER_DECODE_COALESCE_US");
+    free(saved);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_decode_coalesce_window_option();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

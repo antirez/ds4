@@ -22,6 +22,13 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Exact model/quant layouts that have dedicated distributed admission and
+ * kernel coverage. Zero remains the generic/unclassified profile. */
+typedef enum {
+    DS4_QUANT_PROFILE_NONE = 0,
+    DS4_QUANT_PROFILE_PRO_IQ2_Q2 = 1,
+} ds4_quant_profile;
+
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
@@ -91,12 +98,9 @@ typedef struct {
     bool debug;
 } ds4_distributed_options;
 
-/* Tensor parallelism: two identical machines run the model in lockstep and
- * split the heavy per-layer matvecs, exchanging partial sums at gates inside
- * the graph (see misc/METAL_TENSOR_PARALLELISM.md).  Each rank keeps one
- * contiguous half of the routed experts resident; dense and shared weights
- * remain replicated.  The leader owns prompt/sampling and listens; the worker
- * dials in and mirrors every session sync/eval. */
+/* Network expert/tensor parallelism.  Ranks run the model in lockstep and
+ * keep one contiguous routed-expert range resident.  The leader owns
+ * prompt/sampling and workers mirror every session operation. */
 typedef enum {
     DS4_TP_NONE = 0,
     DS4_TP_LEADER,
@@ -107,15 +111,20 @@ typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    DS4_TP_TRANSPORT_NCCL,
 } ds4_tp_transport;
 
 typedef struct {
     ds4_tp_role role;
-    bool requested;             /* --tensor-parallel with shared role options */
-    const char *listen_host;    /* leader listens here for the worker */
+    bool requested;             /* network parallel mode with shared role options */
+    bool expert_only;           /* --expert-parallel; false is full tensor parallel */
+    const char *listen_host;    /* leader listens here for workers */
     int listen_port;
     const char *leader_host;    /* worker dials the leader */
     int leader_port;
+    uint32_t world_size;        /* 2, 4, or 8; zero means the default 2 */
+    uint32_t rank;              /* leader=0, workers=1..world_size-1 */
+    bool rank_set;
     ds4_tp_transport transport;
     const char *rdma_device;
     int rdma_gid_index;
@@ -185,6 +194,26 @@ typedef struct {
     uint32_t comp_cap;
 } ds4_context_memory;
 
+/* Startup admission for a resident network-parallel rank. Artifact terms are
+ * separated from GGUF spans so callers can explain exactly what consumes the
+ * CUDA working-set budget. */
+typedef struct {
+    uint64_t model_span_bytes;
+    uint64_t mandatory_artifact_bytes;
+    uint64_t optional_fast_artifact_bytes;
+    uint64_t shared_workspace_bytes;
+    uint64_t ordered_reduce_bytes;
+    uint64_t per_session_bytes;
+    uint64_t working_set_bytes;
+    uint64_t reserve_bytes;
+    uint64_t required_bytes;
+    uint64_t budget_bytes;
+    uint32_t session_count;
+    bool fast_aligned_requested;
+    bool ordered_reduce_requested;
+    bool admitted;
+} ds4_memory_plan;
+
 typedef struct {
     uint8_t *ptr;
     uint64_t len;
@@ -235,7 +264,16 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+ds4_quant_profile ds4_engine_quant_profile(ds4_engine *e);
+const char *ds4_quant_profile_name(ds4_quant_profile profile);
+uint64_t ds4_engine_layout_fingerprint(ds4_engine *e);
+bool ds4_memory_plan_evaluate(ds4_memory_plan *plan);
+bool ds4_engine_memory_plan(ds4_engine *e, ds4_memory_plan *plan);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
+bool ds4_engine_network_parallel(ds4_engine *e);
+/* Failure-only teardown: abort an active collective and poison the transport
+ * so no rank accepts another inference command. */
+void ds4_engine_tp_abort(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
                                         uint32_t full_live,
@@ -326,6 +364,9 @@ int ds4_token_assistant(ds4_engine *e);
  * with the caller. */
 struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
+/* Detach GPU collective/gate state before its frontend-owned transport is
+ * released. Safe to call after a partial bind or more than once. */
+void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);

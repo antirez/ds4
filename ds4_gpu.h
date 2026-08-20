@@ -115,6 +115,12 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                     const char *model_path);
+int ds4_gpu_build_sharded_derived_artifacts(const void *model_map,
+                                            uint64_t model_size,
+                                            const char *model_path,
+                                            uint32_t expert_base,
+                                            uint32_t expert_count);
+uint64_t ds4_gpu_derived_artifact_additive_bytes(const void *model_map);
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
@@ -263,6 +269,20 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 #endif
 void ds4_gpu_print_memory_report(const char *label);
 
+/* CUDA network collectives.  NCCL is loaded dynamically, so ordinary CUDA,
+ * CPU, ROCm and Metal builds do not acquire a mandatory runtime dependency.
+ * The bootstrap callback broadcasts an opaque startup payload from rank 0. */
+typedef int (*ds4_gpu_tp_bootstrap_fn)(void *ud, void *data, uint32_t bytes);
+int ds4_gpu_tp_collective_probe(void);
+int ds4_gpu_tp_collective_init(uint32_t rank, uint32_t world,
+                               ds4_gpu_tp_bootstrap_fn bootstrap, void *ud);
+/* Abort is the failure path: it tears down the communicator without waiting
+ * for peers that may be blocked in a mismatched collective. */
+void ds4_gpu_tp_collective_abort(void);
+void ds4_gpu_tp_collective_shutdown(void);
+int ds4_gpu_tp_allreduce_f32(ds4_gpu_tensor *tensor, uint64_t count);
+int ds4_gpu_tp_collective_ready(void);
+
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
  * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial
  * block output in the TP slab: it closes the current encoder, makes the GPU
@@ -273,8 +293,8 @@ void ds4_gpu_print_memory_report(const char *label);
  * construction.  The exchange callback runs on the service thread and must
  * return nonzero on success. */
 typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
-/* Bind one rank of the two-way split. slab is the transport slab tensor and
- * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
+/* Bind one rank of the Metal two-way split. slab is the transport slab tensor
+ * and gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
 int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
@@ -324,7 +344,7 @@ void ds4_gpu_tp_keepalive_pause(int paused);
  * zeroes the unowned head range of the heads buffer and combines the
  * attn-output partials over the TP big-gate exchange. */
 void ds4_gpu_tp_set_attn_head_split(int enabled);
-/* Skip the whole-file model residency set (TP sharding: only the
+/* Skip the whole-file model residency set (network sharding: only the
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
@@ -2495,7 +2515,8 @@ int ds4_gpu_routed_moe_batch_owned_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              layer_index,
         uint32_t              n_tokens,
-        bool                 *mid_is_f16);
+        bool                 *mid_is_f16,
+        bool                  leave_slots);
 
 int ds4_gpu_routed_moe_owned_slots_combine_tensor(
         ds4_gpu_tensor       *out,
@@ -2513,6 +2534,13 @@ int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
         uint32_t              out_dim,
         uint32_t              expert_split,
         uint32_t              rows);
+
+int ds4_gpu_routed_moe_slots_sum_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *slots,
+        uint32_t              out_dim,
+        uint32_t              n_expert,
+        uint32_t              n_tokens);
 
 int ds4_gpu_routed_moe_owned_packed_combine_tensor(
         ds4_gpu_tensor       *out,

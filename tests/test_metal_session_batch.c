@@ -152,7 +152,7 @@ int main(void) {
     if (ds4_engine_open(&engine, &opt) != 0) fail("engine open", -1, -1);
 
     if (tp_worker) {
-        const int worker_rc = ds4_tp_worker_run(engine, &opt.tp);
+        const int worker_rc = ds4_tp_worker_run(engine, &opt.tp, TEST_CTX);
         ds4_engine_close(engine);
         return worker_rc;
     }
@@ -162,11 +162,13 @@ int main(void) {
         char tp_err[256] = "";
         ds4_tp_identity identity = {
             .gguf_bytes = ds4_engine_model_bytes(engine),
+            .layout_fingerprint = ds4_engine_layout_fingerprint(engine),
             .model_id = (uint32_t)ds4_engine_model_id(engine),
             .n_layer = (uint32_t)ds4_engine_layer_count(engine),
             .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
             .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
             .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .quant_profile = (uint32_t)ds4_engine_quant_profile(engine),
             .ctx_size = TEST_CTX,
         };
         ds4_engine_tp_gate_schedule(engine,
