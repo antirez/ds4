@@ -4037,6 +4037,7 @@ static int dist_run_coordinator_generation(
                                       0,
                                       gen->top_p,
                                       gen->min_p,
+                                      gen->top_n_sigma,
                                       &rng);
         if (token == eos) break;
 

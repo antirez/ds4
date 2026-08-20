@@ -4794,7 +4794,7 @@ static void test_long_story_fact_recall(void) {
     int generated = 0;
     bool decode_ok = true;
     for (; generated < 350; generated++) {
-        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        int token = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, 0.0f, &rng);
         if (token == ds4_token_eos(engine)) break;
 
         size_t piece_len = 0;
@@ -6014,7 +6014,7 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
 
     for (int i = 0; i < r->max_tokens; i++) {
         int token = ds4_session_sample(session, r->temperature, r->top_k,
-                                       r->top_p, r->min_p, &rng);
+                                       r->top_p, r->min_p, 0.0f, &rng);
         if (ds4_token_is_stop_for_think_mode(engine, token, r->think_mode)) {
             finish = "stop";
             break;

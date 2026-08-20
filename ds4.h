@@ -366,12 +366,14 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
-                      int top_k, float top_p, float min_p, uint64_t *rng);
-int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+                      int top_k, float top_p, float min_p, float top_n_sigma,
+                      uint64_t *rng);
+int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, float top_n_sigma, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
-                           float top_p, float min_p, uint64_t *rng,
+                           float top_p, float min_p, float top_n_sigma,
+                           uint64_t *rng,
                            float *prob_scratch);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
