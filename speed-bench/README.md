@@ -172,6 +172,39 @@ schedule is based on vLLM's
 but keeps Q and KV in separate Metal pipeline states to preserve DS4's exact Q
 fast-math code generation.
 
+### Metal prefill indexed-attention four-row staging A/B
+
+The resident single-device pre-M5 indexed-attention prefill path now stages
+four raw or F16-compressed K/V rows per threadgroup barrier while consuming
+them in the original scalar-kernel row order. The specialization covers
+non-quality batches of at least 32 tokens with 64 heads, 512-wide heads,
+top-k 512, a 128-row raw window, ratio 4, and more than 512 compressed rows;
+SSD streaming, TP2, decode, M5, and other shapes keep the original path.
+Compare it with the
+one-row staging rollback using:
+
+```
+./speed-bench/metal_prefill_variant_bench \
+  --prefix-tokens 8192 \
+  --warmup-tokens 4096 \
+  --repeats 1 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_PREFILL_RB4
+```
+
+Balanced M3 Ultra A/B throughput for four-row staging versus rollback was
+631.53/626.50 tok/s at 4100 tokens (+0.80%),
+620.39/614.76 at 8192 (+0.92%), 594.11/589.36 at 16384 (+0.81%), and
+557.91/553.71 at 32768 (+0.76%). The 2048-token boundary, where compressed
+rows do not yet exceed top-k, was flat. All 16 active-path prefill runs and
+2,068,480 compared full-vocabulary logits were bit-identical. A direct forced
+kernel oracle also matched all 1,048,576 attention-output floats exactly while
+covering raw-ring wrap, visibility stops, and one- through three-row tails.
+Separate 8K and 32K prefix-to-decode checks matched 106 full-vocabulary
+frontiers, 13,703,680 floats, and 104 selected token IDs. Eight-row staging was
+also exact but was 0.17-0.21% slower at the first two screened sizes, so only
+the four-row specialization is retained. Performance was measured on M3
+Ultra; the guarded default covers the shared resident M1-M4 path.
+
 The harness uses one Metal engine and fresh sessions for every run. It warms
 both variants with at least 32 tokens, alternates control/candidate order in
 ABBA and BAAB blocks, poisons host logit buffers before copying, and aborts

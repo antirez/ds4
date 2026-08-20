@@ -253,7 +253,9 @@ enum {
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
     DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC = 1u << 7,
+    DS4_GPU_TEST_INDEXED_ATTN_PREFILL_RB4 = 1u << 8,
 };
+int ds4_gpu_test_get_quality(void);
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else

@@ -3332,6 +3332,173 @@ static void test_metal_contiguous_compressed_f16_attention_exact(void) {
     ds4_gpu_tensor_free(raw);
 }
 
+static void test_metal_indexed_attention_prefill_rb4_exact(void) {
+    const uint32_t n_tokens = 32;
+    const uint32_t n_head = 64;
+    const uint32_t head_dim = 512;
+    const uint32_t top_k = 512;
+    const uint32_t n_comp = 520;
+    const uint32_t ratio = 4;
+    const uint32_t window = 128;
+    const uint32_t pos0 = 2035;
+    const uint32_t n_raw = 128;
+    const uint32_t raw_cap = 137;
+    const uint32_t raw_start = 133;
+    const uint64_t q_count =
+        (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t raw_count = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_count = (uint64_t)n_comp * head_dim;
+    const uint64_t topk_count = (uint64_t)n_tokens * top_k;
+    const uint64_t q_bytes = q_count * sizeof(float);
+    const uint64_t raw_bytes = raw_count * sizeof(float);
+    const uint64_t comp_bytes = comp_count * sizeof(uint16_t);
+    const uint64_t topk_bytes = topk_count * sizeof(int32_t);
+    const uint64_t page = (uint64_t)getpagesize();
+    const char *disable_env =
+        "DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_PREFILL_RB4";
+    const char *require_env =
+        "DS4_METAL_REQUIRE_PRE_M5_INDEXED_ATTN_PREFILL_RB4";
+    char *saved_disable = test_save_env(disable_env);
+    char *saved_require = test_save_env(require_env);
+    const int saved_quality = ds4_gpu_test_get_quality();
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)page, (size_t)page) == 0);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(topk_bytes);
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(q_bytes);
+    float *q_host = malloc((size_t)q_bytes);
+    float *raw_host = malloc((size_t)raw_bytes);
+    uint16_t *comp_host = malloc((size_t)comp_bytes);
+    int32_t *topk_host = malloc((size_t)topk_bytes);
+    float *reference_host = malloc((size_t)q_bytes);
+    float *candidate_host = malloc((size_t)q_bytes);
+    TEST_ASSERT(model_raw != NULL);
+    TEST_ASSERT(q != NULL);
+    TEST_ASSERT(raw != NULL);
+    TEST_ASSERT(comp != NULL);
+    TEST_ASSERT(topk != NULL);
+    TEST_ASSERT(reference != NULL);
+    TEST_ASSERT(candidate != NULL);
+    TEST_ASSERT(q_host != NULL);
+    TEST_ASSERT(raw_host != NULL);
+    TEST_ASSERT(comp_host != NULL);
+    TEST_ASSERT(topk_host != NULL);
+    TEST_ASSERT(reference_host != NULL);
+    TEST_ASSERT(candidate_host != NULL);
+
+    const bool allocated = model_raw && q && raw && comp && topk &&
+        reference && candidate && q_host && raw_host && comp_host &&
+        topk_host && reference_host && candidate_host;
+    test_float_compare_stats stats = {0};
+    if (allocated) {
+        memset(model_raw, 0, (size_t)page);
+        float *sinks = model_raw;
+        for (uint32_t head = 0; head < n_head; head++) {
+            const int value = (int)((head * 29u + 7u) % 61u) - 30;
+            sinks[head] = (float)value / 32.0f;
+        }
+        for (uint64_t i = 0; i < q_count; i++) {
+            const int value =
+                (int)((i * 37u + (i ^ (i >> 5u)) * 11u) % 251u) - 125;
+            q_host[i] = (float)value / 128.0f;
+        }
+        for (uint64_t i = 0; i < raw_count; i++) {
+            const int value =
+                (int)((i * 19u + (i ^ (i >> 4u)) * 7u) % 233u) - 116;
+            raw_host[i] = (float)value / 128.0f;
+        }
+        for (uint64_t i = 0; i < comp_count; i++) {
+            const int value =
+                (int)((i * 23u + (i ^ (i >> 3u)) * 13u) % 227u) - 113;
+            comp_host[i] = test_float_to_f16((float)value / 128.0f);
+        }
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            uint32_t visible = (pos0 + token + 1u) / ratio;
+            if (visible > n_comp) visible = n_comp;
+            const uint32_t valid = visible < top_k ? visible : top_k;
+            for (uint32_t i = 0; i < top_k; i++) {
+                const uint32_t desc = top_k - 1u - i;
+                const uint32_t index = desc < valid
+                    ? desc
+                    : visible + desc - valid;
+                topk_host[(uint64_t)token * top_k + i] = (int32_t)index;
+            }
+        }
+        memset(reference_host, 0xa5, (size_t)q_bytes);
+        memset(candidate_host, 0x5a, (size_t)q_bytes);
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(raw, 0, raw_host, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(comp, 0, comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(topk, 0, topk_host, topk_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        reference, 0, reference_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        candidate, 0, candidate_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
+
+        /* Quality mode selects the original heads8 kernel even on M5, where
+         * the normal fast fallback is heads16_dual. */
+        ds4_gpu_test_set_flags(0);
+        ds4_gpu_set_quality(true);
+        TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(require_env) == 0);
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            reference, model_raw, page, 0, q, raw, comp, 1, topk,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, n_head, head_dim) != 0);
+
+        /* The force bit changes only the Apple-generation gate. REQUIRE makes
+         * this call fail instead of silently comparing heads8 with itself. */
+        ds4_gpu_set_quality(false);
+        ds4_gpu_test_set_flags(DS4_GPU_TEST_INDEXED_ATTN_PREFILL_RB4);
+        TEST_ASSERT(unsetenv(disable_env) == 0);
+        TEST_ASSERT(setenv(require_env, "1", 1) == 0);
+        TEST_ASSERT(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            candidate, model_raw, page, 0, q, raw, comp, 1, topk,
+            n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+            window, ratio, n_head, head_dim) != 0);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        reference, 0, reference_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        candidate, 0, candidate_host, q_bytes) != 0);
+        stats = test_compare_float_bits(
+            reference_host, candidate_host, (size_t)q_count);
+    }
+
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_set_quality(saved_quality != 0);
+    test_restore_env(require_env, saved_require);
+    test_restore_env(disable_env, saved_disable);
+    fprintf(stderr,
+            "ds4-test: indexed-attention prefill RB4 exactness "
+            "mismatches=%zu/%llu max_ulp=%u max_abs=%g\n",
+            stats.mismatch_count,
+            (unsigned long long)q_count,
+            stats.max_ulp,
+            stats.max_abs);
+    TEST_ASSERT(stats.mismatch_count == 0);
+    TEST_ASSERT(stats.max_ulp == 0);
+
+    free(candidate_host);
+    free(reference_host);
+    free(topk_host);
+    free(comp_host);
+    free(raw_host);
+    free(q_host);
+    ds4_gpu_tensor_free(candidate);
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    free(model_raw);
+}
+
 static void test_metal_persistent_zero_attention_mask_exact_case(
         uint32_t raw_cap,
         uint32_t n_raw,
@@ -4951,6 +5118,7 @@ static void test_metal_kernel_group(void) {
     test_metal_contiguous_f32_f16_roundtrip_exact();
     test_metal_gathered_kv_stage_exact();
     test_metal_contiguous_compressed_f16_attention_exact();
+    test_metal_indexed_attention_prefill_rb4_exact();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
