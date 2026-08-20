@@ -3,6 +3,8 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
+QWEN_GGML_REPO="ggml-org/Qwen3.8-27B-GGUF"
+QWEN_DFLASH_REPO="z-lab/Qwen3.8-27B-DFlash2-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -18,7 +20,11 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
-
+QWEN38_Q4_FILE="Qwen3.8-27B-Q4_K_M.gguf"
+QWEN38_Q8_FILE="Qwen3.8-27B-Q8_0.gguf"
+QWEN38_DFLASH_Q4_FILE="Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+QWEN38_DFLASH_Q8_FILE="Qwen3.8-27B-DFlash2-Q8_0.gguf"
+QWEN38_DFLASH_BF16_FILE="Qwen3.8-27B-DFlash2-BF16.gguf"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
 case "$OUT_DIR" in
@@ -37,7 +43,6 @@ Usage:
   ./download_model.sh ds4f-q4 [--token TOKEN]
   ./download_model.sh ds4f-mxfp4 [--token TOKEN]
   ./download_model.sh ds4f-dspark [--token TOKEN]
-  ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
   ./download_model.sh pro-q4-split [--token TOKEN]
@@ -45,7 +50,14 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
-
+  ./download_model.sh qwen-dflash [--token TOKEN]
+  ./download_model.sh qwen3.8 [--token TOKEN]
+  ./download_model.sh qwen [--token TOKEN]
+  ./download_model.sh qwen-dflash-support [--token TOKEN]
+  ./download_model.sh qwen-q4 [--token TOKEN]
+  ./download_model.sh qwen-q8 [--token TOKEN]
+  ./download_model.sh qwen-dflash-q8 [--token TOKEN]
+  ./download_model.sh qwen-dflash-bf16 [--token TOKEN]
 Targets:
 
   ds4f-q2
@@ -71,7 +83,6 @@ Targets:
        Optional DSpark speculative decoding support GGUF for Flash 0731, about
        6 GB. Enable it with --dspark and --mtp when running ds4 or ds4-server.
 
-  pro-q2-imatrix
        DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
        on disk; intended for 512 GB RAM machines.
 
@@ -104,6 +115,29 @@ Targets:
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
 
+  qwen-dflash / qwen3.8 / qwen
+       Preferred Qwen + DFlash2 combination. Downloads both the matching
+       Qwen 3.8 27B Q4_K_M base model from ggml-org/Qwen3.8-27B-GGUF (~17.7 GiB)
+       and the DFlash2 Q4_K_M draft model from z-lab/Qwen3.8-27B-DFlash2-GGUF
+       (~1.06 GiB). Links ./ds4flash.gguf and ./qwen38.gguf.
+
+  qwen-dflash-support / dflash2 / dflash
+       Matching DFlash2 Q4_K_M draft GGUF from z-lab/Qwen3.8-27B-DFlash2-GGUF
+       (~1.06 GiB). Enable with --dflash when running the Qwen base model.
+
+  qwen-q4 / qwen-base
+       Qwen 3.8 27B Q4_K_M base model GGUF from ggml-org/Qwen3.8-27B-GGUF
+       (~17.7 GiB). Links ./ds4flash.gguf and ./qwen38.gguf.
+
+  qwen-q8
+       Qwen 3.8 27B Q8_0 base model GGUF from ggml-org/Qwen3.8-27B-GGUF
+       (~26.6 GiB). Links ./ds4flash.gguf and ./qwen38.gguf.
+
+  qwen-dflash-q8
+       DFlash2 Q8_0 draft GGUF from z-lab/Qwen3.8-27B-DFlash2-GGUF (~1.92 GiB).
+
+  qwen-dflash-bf16
+       DFlash2 BF16 draft GGUF from z-lab/Qwen3.8-27B-DFlash2-GGUF (~3.60 GiB).
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -122,6 +156,12 @@ Then the default commands work:
 After downloading DSpark support, enable it explicitly in greedy mode:
   ./ds4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
 
+After downloading Qwen with DFlash2 draft support, run speculative decoding:
+  ./ds4 -m ./ds4flash.gguf --dflash <download directory>/$QWEN38_DFLASH_Q4_FILE -p "Hello"
+
+Or run Qwen server with DFlash2:
+  ./ds4-server -m ./ds4flash.gguf --dflash <download directory>/$QWEN38_DFLASH_Q4_FILE --ctx 32768
+
 PRO and GLM files are downloaded with the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
@@ -136,17 +176,16 @@ fi
 MODEL=$1
 shift
 MODEL_FILES=
+DOWNLOAD_ITEMS=
 LINK_MODEL=1
 FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
-
 case "$MODEL" in
     ds4f-q2) MODEL_FILE=$DS4F_Q2_FILE ;;
     ds4f-q2-q4) MODEL_FILE=$DS4F_Q2_Q4_FILE ;;
     ds4f-q4) MODEL_FILE=$DS4F_Q4_FILE ;;
     ds4f-mxfp4) MODEL_FILE=$DS4F_MXFP4_FILE; FORCE_HF_DOWNLOAD=1 ;;
     ds4f-dspark) MODEL_FILE=$DS4F_DSPARK_FILE; LINK_MODEL=0 ;;
-    pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
     pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
     pro-q4-split)
@@ -177,6 +216,39 @@ case "$MODEL" in
         REPO=$GLM_ANTIREZ_REPO
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
+        ;;
+    qwen-dflash|qwen3.8|qwen-3.8|qwen38|qwen|qwen-combo|qwen38-combo|qwen-dflash2|qwen38-dflash)
+        DOWNLOAD_ITEMS="$QWEN_GGML_REPO:$QWEN38_Q4_FILE $QWEN_DFLASH_REPO:$QWEN38_DFLASH_Q4_FILE"
+        MODEL_FILE=$QWEN38_Q4_FILE
+        MODEL=qwen-dflash
+        ;;
+    qwen-dflash-support|qwen38-dflash-support|qwen-dflash2-support|dflash2|dflash|qwen-dflash-q4|qwen38-dflash-q4)
+        REPO=$QWEN_DFLASH_REPO
+        MODEL_FILE=$QWEN38_DFLASH_Q4_FILE
+        LINK_MODEL=0
+        MODEL=qwen-dflash-support
+        ;;
+    qwen-dflash-q8|qwen38-dflash-q8)
+        REPO=$QWEN_DFLASH_REPO
+        MODEL_FILE=$QWEN38_DFLASH_Q8_FILE
+        LINK_MODEL=0
+        MODEL=qwen-dflash-q8
+        ;;
+    qwen-dflash-bf16|qwen38-dflash-bf16)
+        REPO=$QWEN_DFLASH_REPO
+        MODEL_FILE=$QWEN38_DFLASH_BF16_FILE
+        LINK_MODEL=0
+        MODEL=qwen-dflash-bf16
+        ;;
+    qwen-q4|qwen38-q4|qwen-base|qwen38-base)
+        REPO=$QWEN_GGML_REPO
+        MODEL_FILE=$QWEN38_Q4_FILE
+        MODEL=qwen-q4
+        ;;
+    qwen-q8|qwen38-q8)
+        REPO=$QWEN_GGML_REPO
+        MODEL_FILE=$QWEN38_Q8_FILE
+        MODEL=qwen-q8
         ;;
     -h|--help|help)
         usage
@@ -249,7 +321,8 @@ local_download_name() {
 }
 
 download_one_hf() {
-    file=$1
+    repo=$1
+    file=$2
     local_file=$(local_download_name "$file")
     out="$OUT_DIR/$local_file"
     hf_out="$OUT_DIR/$file"
@@ -278,14 +351,14 @@ download_one_hf() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$repo"
     echo "using $HF_CMD download"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
+        "$HF_CMD" download "$repo" "$file" --repo-type model --local-dir "$OUT_DIR" --token "$TOKEN"
     else
-        "$HF_CMD" download "$REPO" "$file" --repo-type model --local-dir "$OUT_DIR"
+        "$HF_CMD" download "$repo" "$file" --repo-type model --local-dir "$OUT_DIR"
     fi
 
     if [ "$hf_out" != "$out" ] && [ -s "$hf_out" ]; then
@@ -300,15 +373,16 @@ download_one_hf() {
 }
 
 download_one() {
-    file=$1
+    repo=$1
+    file=$2
     local_file=$(local_download_name "$file")
     out="$OUT_DIR/$local_file"
     part="$out.part"
     aria2_part="$out.aria2"
-    url="https://huggingface.co/$REPO/resolve/main/$file"
+    url="https://huggingface.co/$repo/resolve/main/$file"
 
     if needs_hf_download "$file"; then
-        download_one_hf "$file"
+        download_one_hf "$repo" "$file"
         return
     fi
 
@@ -326,7 +400,7 @@ download_one() {
     fi
 
     echo "Downloading $file"
-    echo "from https://huggingface.co/$REPO"
+    echo "from https://huggingface.co/$repo"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
@@ -338,18 +412,50 @@ download_one() {
     mv "$part" "$out"
 }
 
-if [ -n "$MODEL_FILES" ]; then
+if [ -n "$DOWNLOAD_ITEMS" ]; then
+    for item in $DOWNLOAD_ITEMS; do
+        item_repo=${item%%:*}
+        item_file=${item#*:}
+        download_one "$item_repo" "$item_file"
+    done
+elif [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do
-        download_one "$file"
+        download_one "$REPO" "$file"
     done
 else
-    download_one "$MODEL_FILE"
+    download_one "$REPO" "$MODEL_FILE"
 fi
 
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
     echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
+elif [ "$MODEL" = "qwen-dflash" ]; then
+    echo
+    echo "Qwen 3.8 combination with DFlash2 draft model downloaded."
+    echo "Run with DFlash2 block-diffusion speculative decoding:"
+    echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_Q4_FILE -p \"Hello\""
+    echo
+    echo "Or start the server:"
+    echo "  ./ds4-server -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_Q4_FILE --ctx 32768"
+elif [ "$MODEL" = "qwen-dflash-support" ]; then
+    echo
+    echo "DFlash2 draft model downloaded. Run speculative decoding with:"
+    echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_Q4_FILE -p \"Hello\""
+elif [ "$MODEL" = "qwen-dflash-q8" ]; then
+    echo
+    echo "DFlash2 Q8_0 draft model downloaded. Run speculative decoding with:"
+    echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_Q8_FILE -p \"Hello\""
+elif [ "$MODEL" = "qwen-dflash-bf16" ]; then
+    echo
+    echo "DFlash2 BF16 draft model downloaded. Run speculative decoding with:"
+    echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_BF16_FILE -p \"Hello\""
+elif [ "$MODEL" = "qwen-q4" ] || [ "$MODEL" = "qwen-q8" ]; then
+    echo
+    echo "Qwen base model downloaded. For speculative decoding, download the matching DFlash2 draft model with:"
+    echo "  ./download_model.sh qwen-dflash-support"
+    echo "Then run:"
+    echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_Q4_FILE -p \"Hello\""
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
@@ -358,6 +464,12 @@ elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" ds4flash.gguf
     echo "Linked ./ds4flash.gguf -> $OUT_DIR/$MODEL_FILE"
+    case "$MODEL" in
+        qwen*)
+            ln -sfn "$OUT_DIR/$MODEL_FILE" qwen38.gguf
+            echo "Linked ./qwen38.gguf -> $OUT_DIR/$MODEL_FILE"
+            ;;
+    esac
 fi
 
 echo

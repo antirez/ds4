@@ -364,6 +364,9 @@ static bool is_rendered_chat_prompt(const char *prompt) {
         "<|user|>",
         "<|assistant|>",
         "<|observation|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
     };
     if (!prompt) return false;
     for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
@@ -511,11 +514,17 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
-
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!engine || !gen) return;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.95f;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        return;
+    }
+    if (ds4_engine_is_qwen(engine)) {
+        if (!gen->temperature_set) gen->temperature = 0.0f;
+        return;
+    }
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -597,7 +606,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+             ds4_engine_dflash_ready(engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -1505,7 +1516,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+             ds4_engine_dflash_ready(engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -1843,6 +1856,17 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
+            c.engine.dflash_path = need_arg(&i, argc, argv, arg);
+            if (c.engine.dflash_draft_n_max == 0) c.engine.dflash_draft_n_max = 7;
+        } else if (!strcmp(arg, "--spec-type") || !strcmp(arg, "--spec-draft-type")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (strcmp(v, "draft-dflash") && strcmp(v, "dflash") && strcmp(v, "dflash2")) {
+                fprintf(stderr, "ds4: --spec-type only supports draft-dflash/dflash/dflash2 for QWEN\n");
+                exit(1);
+            }
+        } else if (!strcmp(arg, "--spec-draft-n-max") || !strcmp(arg, "--dflash-n-max")) {
+            c.engine.dflash_draft_n_max = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--glm-mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--glm-mtp-timing")) {
