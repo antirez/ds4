@@ -11,7 +11,9 @@
 #include <unistd.h>
 
 #define MXFP4_TYPE 39u
+#define IQ2_XXS_TYPE 16u
 #define QK_MXFP4 32u
+#define QK_IQ2_XXS 256u
 #define N_TOTAL_EXPERT 8u
 #define N_EXPERT 6u
 #define DIM 256u
@@ -21,6 +23,14 @@ typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2u];
 } block_mxfp4;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[QK_IQ2_XXS / 8u];
+} block_iq2_xxs;
+
+typedef char block_iq2_xxs_must_be_66_bytes[
+    sizeof(block_iq2_xxs) == 66u ? 1 : -1];
 
 static const float mxfp4_values[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -81,6 +91,27 @@ static void fill_matrix(block_mxfp4 *matrix, uint32_t salt) {
     }
 }
 
+static void fill_positive_matrix(block_mxfp4 *matrix, uint32_t salt) {
+    const uint32_t blocks_per_row = DIM / QK_MXFP4;
+    for (uint32_t expert = 0; expert < N_TOTAL_EXPERT; expert++) {
+        for (uint32_t row = 0; row < DIM; row++) {
+            block_mxfp4 *blocks = matrix +
+                ((uint64_t)expert * DIM + row) * blocks_per_row;
+            for (uint32_t block = 0; block < blocks_per_row; block++) {
+                blocks[block].e = (uint8_t)(121u +
+                    ((salt + expert + row + block) % 5u));
+                for (uint32_t i = 0; i < QK_MXFP4 / 2u; i++) {
+                    const uint8_t lo = (uint8_t)(
+                        ((salt + expert + row + block + i) % 7u) + 1u);
+                    const uint8_t hi = (uint8_t)(
+                        ((salt + expert + row + block + i + 3u) % 7u) + 1u);
+                    blocks[block].qs[i] = (uint8_t)(lo | (hi << 4u));
+                }
+            }
+        }
+    }
+}
+
 static int compare_values(const char *name, const float *actual,
                           const float *expected, uint64_t count,
                           float tolerance) {
@@ -107,7 +138,14 @@ static int compare_values(const char *name, const float *actual,
     return max_abs <= tolerance;
 }
 
-int main(void) {
+static int values_have_signal(const float *values, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        if (fabsf(values[i]) > 1.0e-8f) return 1;
+    }
+    return 0;
+}
+
+static int test_all_mxfp4(void) {
     const uint64_t page = (uint64_t)getpagesize();
     const uint64_t row_bytes =
         (DIM / QK_MXFP4) * sizeof(block_mxfp4);
@@ -793,4 +831,217 @@ int main(void) {
 
     fprintf(stderr, "MXFP4 Metal fused MoE: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+
+static float test_f16_to_f32(uint16_t value) {
+    switch (value) {
+    case 0x3400u: return 0.25f;
+    case 0x3800u: return 0.5f;
+    case 0x3c00u: return 1.0f;
+    case 0x4000u: return 2.0f;
+    default: return 0.0f;
+    }
+}
+
+static void fill_iq2_matrix(block_iq2_xxs *matrix, uint32_t salt) {
+    static const uint16_t scales[] = { 0x3400u, 0x3800u, 0x3c00u, 0x4000u };
+    for (uint32_t expert = 0; expert < N_TOTAL_EXPERT; expert++) {
+        for (uint32_t row = 0; row < DIM; row++) {
+            block_iq2_xxs *block = matrix + (uint64_t)expert * DIM + row;
+            block->d = scales[(salt + expert * 3u + row) % 4u];
+            memset(block->qs, 0, sizeof(block->qs));
+        }
+    }
+}
+
+/* Grid index zero with zero sign/scale bits is the constant +1 IQ2_XXS grid.
+ * This keeps the reference compact while still testing the production fused
+ * IQ2 gate/up kernels and their row/expert addressing. */
+static float dot_iq2_constant(const block_iq2_xxs *row, const float *x) {
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < DIM; i++) sum += x[i];
+    return test_f16_to_f32(row->d) * sum;
+}
+
+static int test_mixed_iq2_mxfp4(void) {
+    enum { MAX_TOKENS = 5 };
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t gate_row_bytes = sizeof(block_iq2_xxs);
+    const uint64_t gate_expert_bytes = DIM * gate_row_bytes;
+    const uint64_t down_row_bytes =
+        (DIM / QK_MXFP4) * sizeof(block_mxfp4);
+    const uint64_t down_expert_bytes = DIM * down_row_bytes;
+    const uint64_t gate_tensor_bytes = N_TOTAL_EXPERT * gate_expert_bytes;
+    const uint64_t down_tensor_bytes = N_TOTAL_EXPERT * down_expert_bytes;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = align_up(gate_tensor_bytes, page);
+    const uint64_t down_offset = align_up(up_offset + gate_tensor_bytes, page);
+    const uint64_t model_size = align_up(down_offset + down_tensor_bytes, page);
+
+    void *model = NULL;
+    if (posix_memalign(&model, (size_t)page, (size_t)model_size) != 0) {
+        fprintf(stderr, "mixed IQ2/MXFP4 Metal model allocation failed\n");
+        return 0;
+    }
+    memset(model, 0, (size_t)model_size);
+    fill_iq2_matrix((block_iq2_xxs *)((uint8_t *)model + gate_offset), 1u);
+    fill_iq2_matrix((block_iq2_xxs *)((uint8_t *)model + up_offset), 3u);
+    fill_positive_matrix((block_mxfp4 *)((uint8_t *)model + down_offset), 13u);
+
+    float x[MAX_TOKENS * DIM];
+    int32_t selected[MAX_TOKENS * N_EXPERT];
+    float weights[MAX_TOKENS * N_EXPERT];
+    for (uint32_t token = 0; token < MAX_TOKENS; token++) {
+        for (uint32_t i = 0; i < DIM; i++) {
+            x[(uint64_t)token * DIM + i] =
+                (float)((int32_t)((i * 11u + token * 7u) % 37u) - 18) / 96.0f;
+        }
+        for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+            selected[(uint64_t)token * N_EXPERT + slot] =
+                (int32_t)((slot * 3u + token) % N_TOTAL_EXPERT);
+            weights[(uint64_t)token * N_EXPERT + slot] =
+                (float)(N_EXPERT - slot + token) / 32.0f;
+        }
+    }
+
+    int ok = ds4_gpu_init() && ds4_gpu_set_model_map(model, model_size);
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+    const block_iq2_xxs *gate_matrix =
+        (const block_iq2_xxs *)((const uint8_t *)model + gate_offset);
+    const block_iq2_xxs *up_matrix =
+        (const block_iq2_xxs *)((const uint8_t *)model + up_offset);
+    const block_mxfp4 *down_matrix =
+        (const block_mxfp4 *)((const uint8_t *)model + down_offset);
+    const uint64_t down_blocks_per_expert =
+        down_expert_bytes / sizeof(block_mxfp4);
+    const uint64_t down_blocks_per_row =
+        down_row_bytes / sizeof(block_mxfp4);
+
+    for (uint32_t n_tokens = 1; ok && n_tokens <= MAX_TOKENS; n_tokens++) {
+        const uint64_t pair_rows = (uint64_t)n_tokens * N_EXPERT;
+        const uint64_t pair_values = pair_rows * DIM;
+        const uint64_t out_values = (uint64_t)n_tokens * DIM;
+        float *gate_ref = calloc((size_t)pair_values, sizeof(float));
+        float *up_ref = calloc((size_t)pair_values, sizeof(float));
+        float *mid_ref = calloc((size_t)pair_values, sizeof(float));
+        float *out_ref = calloc((size_t)out_values, sizeof(float));
+        float *gate_gpu = calloc((size_t)pair_values, sizeof(float));
+        float *up_gpu = calloc((size_t)pair_values, sizeof(float));
+        float *mid_gpu = calloc((size_t)pair_values, sizeof(float));
+        float *out_gpu = calloc((size_t)out_values, sizeof(float));
+        if (!gate_ref || !up_ref || !mid_ref || !out_ref ||
+            !gate_gpu || !up_gpu || !mid_gpu || !out_gpu) {
+            ok = 0;
+        }
+
+        for (uint32_t token = 0; ok && token < n_tokens; token++) {
+            const float *token_x = x + (uint64_t)token * DIM;
+            for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+                const uint64_t pair = (uint64_t)token * N_EXPERT + slot;
+                const uint32_t expert = (uint32_t)selected[pair];
+                for (uint32_t row = 0; row < DIM; row++) {
+                    const uint64_t value = pair * DIM + row;
+                    gate_ref[value] = dot_iq2_constant(
+                        gate_matrix + (uint64_t)expert * DIM + row, token_x);
+                    up_ref[value] = dot_iq2_constant(
+                        up_matrix + (uint64_t)expert * DIM + row, token_x);
+                    const float gate = fminf(gate_ref[value], 7.0f);
+                    const float up = fmaxf(-7.0f, fminf(up_ref[value], 7.0f));
+                    mid_ref[value] = gate / (1.0f + expf(-gate)) * up * weights[pair];
+                }
+            }
+            for (uint32_t row = 0; row < DIM; row++) {
+                float sum = 0.0f;
+                for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+                    const uint64_t pair = (uint64_t)token * N_EXPERT + slot;
+                    const uint32_t expert = (uint32_t)selected[pair];
+                    sum += dot_mxfp4(
+                        down_matrix + (uint64_t)expert * down_blocks_per_expert +
+                            (uint64_t)row * down_blocks_per_row,
+                        mid_ref + pair * DIM);
+                }
+                out_ref[(uint64_t)token * DIM + row] = sum;
+            }
+        }
+        if (ok && (!values_have_signal(gate_ref, pair_values) ||
+                   !values_have_signal(mid_ref, pair_values) ||
+                   !values_have_signal(out_ref, out_values))) {
+            fprintf(stderr, "mixed IQ2/MXFP4 reference unexpectedly has no signal\n");
+            ok = 0;
+        }
+
+        ds4_gpu_tensor *x_tensor = ds4_gpu_tensor_alloc((uint64_t)n_tokens * DIM * sizeof(float));
+        ds4_gpu_tensor *selected_tensor = ds4_gpu_tensor_alloc(pair_rows * sizeof(int32_t));
+        ds4_gpu_tensor *weights_tensor = ds4_gpu_tensor_alloc(pair_rows * sizeof(float));
+        ds4_gpu_tensor *gate_tensor = ds4_gpu_tensor_alloc(pair_values * sizeof(float));
+        ds4_gpu_tensor *up_tensor = ds4_gpu_tensor_alloc(pair_values * sizeof(float));
+        ds4_gpu_tensor *mid_tensor = ds4_gpu_tensor_alloc(pair_values * sizeof(float));
+        ds4_gpu_tensor *experts_tensor = ds4_gpu_tensor_alloc(pair_values * sizeof(float));
+        ds4_gpu_tensor *out_tensor = ds4_gpu_tensor_alloc(out_values * sizeof(float));
+        bool mid_is_f16 = true;
+        ok = ok && x_tensor && selected_tensor && weights_tensor && gate_tensor &&
+             up_tensor && mid_tensor && experts_tensor && out_tensor;
+        ok = ok && ds4_gpu_tensor_write(
+            x_tensor, 0, x, (uint64_t)n_tokens * DIM * sizeof(float));
+        ok = ok && ds4_gpu_tensor_write(
+            selected_tensor, 0, selected, pair_rows * sizeof(int32_t));
+        ok = ok && ds4_gpu_tensor_write(
+            weights_tensor, 0, weights, pair_rows * sizeof(float));
+        ok = ok && ds4_gpu_routed_moe_batch_tensor(
+            out_tensor, gate_tensor, up_tensor, mid_tensor, experts_tensor,
+            model, model_size, gate_offset, up_offset, down_offset,
+            IQ2_XXS_TYPE, MXFP4_TYPE, gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes, DIM, DIM, DIM,
+            selected_tensor, weights_tensor, N_TOTAL_EXPERT, N_EXPERT,
+            7.0f, x_tensor, 0u, n_tokens, &mid_is_f16, true);
+        ok = ok && !mid_is_f16;
+        ok = ok && ds4_gpu_tensor_read(
+            gate_tensor, 0, gate_gpu, pair_values * sizeof(float));
+        ok = ok && ds4_gpu_tensor_read(
+            up_tensor, 0, up_gpu, pair_values * sizeof(float));
+        ok = ok && ds4_gpu_tensor_read(
+            mid_tensor, 0, mid_gpu, pair_values * sizeof(float));
+        ok = ok && ds4_gpu_tensor_read(
+            out_tensor, 0, out_gpu, out_values * sizeof(float));
+        if (ok) {
+            char name[24];
+            snprintf(name, sizeof(name), "mixed%u-gate", n_tokens);
+            ok = compare_values(name, gate_gpu, gate_ref, pair_values, 2.0e-5f);
+            snprintf(name, sizeof(name), "mixed%u-up", n_tokens);
+            ok = ok && compare_values(name, up_gpu, up_ref, pair_values, 2.0e-5f);
+            snprintf(name, sizeof(name), "mixed%u-mid", n_tokens);
+            ok = ok && compare_values(name, mid_gpu, mid_ref, pair_values, 2.0e-5f);
+            snprintf(name, sizeof(name), "mixed%u-out", n_tokens);
+            ok = ok && compare_values(name, out_gpu, out_ref, out_values, 3.0e-4f);
+        }
+
+        ds4_gpu_tensor_free(out_tensor);
+        ds4_gpu_tensor_free(experts_tensor);
+        ds4_gpu_tensor_free(mid_tensor);
+        ds4_gpu_tensor_free(up_tensor);
+        ds4_gpu_tensor_free(gate_tensor);
+        ds4_gpu_tensor_free(weights_tensor);
+        ds4_gpu_tensor_free(selected_tensor);
+        ds4_gpu_tensor_free(x_tensor);
+        free(out_gpu);
+        free(mid_gpu);
+        free(up_gpu);
+        free(gate_gpu);
+        free(out_ref);
+        free(mid_ref);
+        free(up_ref);
+        free(gate_ref);
+    }
+
+    ds4_gpu_cleanup();
+    free(model);
+    fprintf(stderr, "mixed IQ2/MXFP4 Metal tokens 1-5: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+int main(void) {
+    const int all_mxfp4_ok = test_all_mxfp4() == 0;
+    const int mixed_ok = test_mixed_iq2_mxfp4();
+    return all_mxfp4_ok && mixed_ok ? 0 : 1;
 }
