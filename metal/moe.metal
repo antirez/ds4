@@ -3444,6 +3444,98 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
+/* Exact one-token DeepSeek V4 Flash decode shape for the attention-output low
+ * projection.  The generic direct wrapper above has to recover the group and
+ * all tensor strides from runtime arguments, then walks a runtime 4096-wide K
+ * loop.  Decode always uses eight 4096 -> 1024 Q8_0 projections here.  Keep
+ * the established NR0=2 / NSG=4 lane mapping and reduction tree, but make the
+ * group offsets, row stride and four K trips literals so the compiler can
+ * eliminate the generic index arithmetic. */
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUPS 8
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_K 4096
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS 1024
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS 128
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES 4352
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES 4456448
+
+static inline void ds4_attn_out_low_q8_static_impl(
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NSG = 4;
+
+    const uint group = tgpig.z;
+    const int r0 = (int)tgpig.x * NR0;
+    device const char *src0 = src0s +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES;
+    device const float *y = (device const float *)(src1 +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_K * sizeof(float));
+    device float *out = (device float *)(dst +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS * sizeof(float));
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *)(src0 +
+            (uint64_t)(r0 + row) * DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES);
+    }
+
+    float sumf[NR0] = { 0.0f };
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+    float yl[NQ];
+
+    /* Every lane visits ib0 + {0, 32, 64, 96}, exactly as the generic loop. */
+    for (int ib = ib0; ib < DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS;
+         ib += NSG * NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.0f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+        yb += NSG * NQ * QK8_0;
+    }
+
+    helper_mv_reduce_and_write<NR0>(
+        out, sumf, r0, DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS,
+        tiisg, sgitg, shmem);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_flash_decode_static_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    /* This PSO is private to the exact host gate in
+     * ds4_gpu_attention_output_low_q8_tensor.  Avoid repeating that proof in
+     * every shader lane: the point of this specialization is to remove the
+     * dynamic shape arithmetic from this very large dispatch. */
+    ds4_attn_out_low_q8_static_impl(
+        src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)args;
+    (void)tiitg;
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,

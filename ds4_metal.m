@@ -515,6 +515,7 @@ static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads16_dual_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_split_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_split_reduce_pipeline;
+static bool g_attn_out_low_q8_static_unavailable;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_simd_pipeline;
@@ -11637,6 +11638,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexed_attention_heads16_dual_pipeline = nil;
         g_dsv4_indexed_attention_heads8_split_pipeline = nil;
         g_dsv4_indexed_attention_heads8_split_reduce_pipeline = nil;
+        g_attn_out_low_q8_static_unavailable = false;
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
         g_dsv4_router_finalize_one_simd_pipeline = nil;
@@ -26682,8 +26684,37 @@ int ds4_gpu_attention_output_low_q8_tensor(
                 .nb1 = (uint64_t)rank * sizeof(float),
                 .nr0 = 2,
             };
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+            /* The one-token Flash decode shape is invariant: eight independent
+             * 4096 -> 1024 Q8_0 projections.  Its static-trip PSO retains the
+             * generic NR0=2 / NSG=4 arithmetic and reduction tree; only group
+             * offsets and loop bounds become compile-time constants. */
+            const bool force_flash_decode_static_for_test =
+                (g_test_flags & DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC) != 0u;
+            const bool use_pre_m5_flash_decode_static =
+                (ds4_gpu_device_is_pre_m5_apple_silicon() ||
+                 force_flash_decode_static_for_test) &&
+                (!g_attn_out_low_q8_static_unavailable ||
+                 force_flash_decode_static_for_test) &&
+                getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") == NULL &&
+                getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC") == NULL &&
+                group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+                low_dim == 8192u && row_a_bytes == 4352u &&
+                out_a_bytes == 35651584u;
+            id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+                use_pre_m5_flash_decode_static ?
+                    "kernel_dsv4_attn_out_low_q8_0_flash_decode_static_f32" :
+                    "kernel_dsv4_attn_out_low_q8_0_f32",
+                4);
+            if (!pipeline && use_pre_m5_flash_decode_static) {
+                /* A custom/older Metal source may not contain this optional
+                 * kernel. Latch the miss until cleanup so decode does not
+                 * retry PSO creation and log once per layer and token. */
+                g_attn_out_low_q8_static_unavailable = true;
+                if (!force_flash_decode_static_for_test) {
+                    pipeline = ds4_gpu_get_mul_mv_pipeline(
+                        "kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                }
+            }
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -42992,6 +43023,17 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        /* The established resident MXFP4 specializations were originally
+         * promoted only for >=2K-token prefills. Extend the same exact kernels
+         * to the 32..2047 range behind one aggregate rollback so the sparse
+         * expert map and tail tiles do not fall back to the scan-heavy path. */
+        const bool use_pre_m5_mxfp4_small_prefill_defaults =
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            n_tokens >= 32u && n_tokens < 2048u &&
+            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_SMALL_PREFILL") == NULL;
+        const bool use_pre_m5_mxfp4_prefill_defaults =
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            (n_tokens >= 2048u || use_pre_m5_mxfp4_small_prefill_defaults);
         /*
          * The MXFP4 32x32 specialization uses two SIMDgroups and 8 KiB of
          * threadgroup memory, and exactly culls SIMDgroup 1 on at-most-16-row
@@ -42999,9 +43041,8 @@ int ds4_gpu_routed_moe_batch_tensor(
          * it the resident pre-M5 default for large prefill.
          */
         const bool use_pre_m5_mxfp4_mm_id_pair_swiglu_compact_tile_default =
-            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            use_pre_m5_mxfp4_prefill_defaults &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_SWIGLU_COMPACT_TILE") == NULL;
         const bool use_mxfp4_mm_id_pair_swiglu_compact_tile =
             use_mm_id_pair_swiglu &&
@@ -43016,8 +43057,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * by the existing padded direct launches and changes no arithmetic.
          */
         const bool use_pre_m5_mxfp4_mm_id_map_scatter_default =
-            ds4_gpu_device_is_pre_m5_apple_silicon() &&
-            n_tokens >= 2048u &&
+            use_pre_m5_mxfp4_prefill_defaults &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_MAP_SCATTER") == NULL;
         const bool use_mxfp4_mm_id_map_scatter =
             use_mxfp4_mm_id_pair_swiglu_compact_tile &&
@@ -43036,9 +43076,8 @@ int ds4_gpu_routed_moe_batch_tensor(
          * shape and prefixes covered by the full-model A/B gate.
          */
         const bool use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default =
-            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            use_pre_m5_mxfp4_prefill_defaults &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_pair_tail_simdgroup_cull =
             use_mm_id_pair_swiglu &&
@@ -43048,9 +43087,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             (use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL) != 0u);
         const bool use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default =
-            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            use_pre_m5_mxfp4_prefill_defaults &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_down_tail_simdgroup_cull =
             use_mm_id &&
@@ -43066,8 +43104,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * pre-M5 Apple-Silicon default for large prefill.
          */
         const bool use_pre_m5_mxfp4_mm_id_down_half_lut_default =
-            ds4_gpu_device_is_pre_m5_apple_silicon() &&
-            n_tokens >= 2048u &&
+            use_pre_m5_mxfp4_prefill_defaults &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_HALF_LUT") == NULL;
         const bool use_mxfp4_mm_id_down_half_lut =
             use_mm_id &&

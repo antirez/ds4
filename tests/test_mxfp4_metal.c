@@ -16,11 +16,21 @@
 #define N_EXPERT 6u
 #define DIM 256u
 #define BATCH_TOKENS 48u
+#define ATTN_GROUPS 8u
+#define ATTN_GROUP_DIM 4096u
+#define ATTN_RANK 1024u
 
 typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2u];
 } block_mxfp4;
+
+typedef struct {
+    _Float16 d;
+    int8_t qs[32];
+} block_q8_0;
+_Static_assert(sizeof(block_q8_0) == 34u,
+               "Q8_0 test fixture must match the Metal block stride");
 
 static const float mxfp4_values[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -34,6 +44,33 @@ bool ds4_log_is_tty(FILE *fp) {
 
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1u) / alignment * alignment;
+}
+
+typedef struct {
+    const char *name;
+    char *value;
+    bool had_value;
+} saved_env;
+
+static int save_env(saved_env *saved, const char *name) {
+    const char *value = getenv(name);
+    saved->name = name;
+    saved->had_value = value != NULL;
+    saved->value = value ? strdup(value) : NULL;
+    return !value || saved->value != NULL;
+}
+
+static int restore_env(saved_env *saved) {
+    int rc = 0;
+    if (saved->had_value) {
+        if (!saved->value) return 0;
+        rc = setenv(saved->name, saved->value, 1);
+    } else {
+        rc = unsetenv(saved->name);
+    }
+    free(saved->value);
+    saved->value = NULL;
+    return rc == 0;
 }
 
 static float e8m0_to_f32(uint8_t e) {
@@ -116,7 +153,14 @@ int main(void) {
     const uint64_t gate_offset = 0;
     const uint64_t up_offset = align_up(tensor_bytes, page);
     const uint64_t down_offset = align_up(up_offset + tensor_bytes, page);
-    const uint64_t model_size = align_up(down_offset + tensor_bytes, page);
+    const uint64_t attn_row_bytes =
+        (ATTN_GROUP_DIM / 32u) * sizeof(block_q8_0);
+    const uint64_t attn_weight_bytes =
+        (uint64_t)ATTN_GROUPS * ATTN_RANK * attn_row_bytes;
+    const uint64_t attn_offset =
+        align_up(down_offset + tensor_bytes, page);
+    const uint64_t model_size =
+        align_up(attn_offset + attn_weight_bytes, page);
     void *model = NULL;
     if (posix_memalign(&model, (size_t)page, (size_t)model_size) != 0) {
         fprintf(stderr, "MXFP4 Metal test model allocation failed\n");
@@ -126,6 +170,17 @@ int main(void) {
     fill_matrix((block_mxfp4 *)((uint8_t *)model + gate_offset), 1u);
     fill_matrix((block_mxfp4 *)((uint8_t *)model + up_offset), 5u);
     fill_matrix((block_mxfp4 *)((uint8_t *)model + down_offset), 9u);
+    block_q8_0 *attn_matrix =
+        (block_q8_0 *)((uint8_t *)model + attn_offset);
+    const uint64_t attn_blocks =
+        (uint64_t)ATTN_GROUPS * ATTN_RANK * (ATTN_GROUP_DIM / 32u);
+    for (uint64_t block = 0; block < attn_blocks; block++) {
+        attn_matrix[block].d = (_Float16)(1.0f / 128.0f);
+        for (uint32_t i = 0; i < 32u; i++) {
+            attn_matrix[block].qs[i] =
+                (int8_t)((int32_t)((block * 11u + i * 7u) % 31u) - 15);
+        }
+    }
 
     float x[DIM];
     int32_t selected[N_EXPERT] = { 0, 2, 3, 5, 6, 7 };
@@ -347,6 +402,95 @@ int main(void) {
              compare_values("out", out_gpu, out_ref, DIM, 2.0e-4f);
     }
 
+    /* Compare the exact fixed-shape attention-output LOW kernel directly
+     * against its generic rollback. Force the static PSO through the test
+     * flag so this remains coverage on newer Apple GPUs, and poison the full
+     * destination before each run to catch partial writes. */
+    const uint64_t attn_heads_count =
+        (uint64_t)ATTN_GROUPS * ATTN_GROUP_DIM;
+    const uint64_t attn_low_count =
+        (uint64_t)ATTN_GROUPS * ATTN_RANK;
+    const size_t attn_heads_bytes =
+        (size_t)attn_heads_count * sizeof(float);
+    const size_t attn_low_bytes =
+        (size_t)attn_low_count * sizeof(float);
+    float *attn_heads = malloc(attn_heads_bytes);
+    uint8_t *attn_poison = malloc(attn_low_bytes);
+    uint8_t *attn_generic = malloc(attn_low_bytes);
+    uint8_t *attn_static = malloc(attn_low_bytes);
+    ds4_gpu_tensor *attn_heads_tensor =
+        ds4_gpu_tensor_alloc(attn_heads_bytes);
+    ds4_gpu_tensor *attn_low_tensor =
+        ds4_gpu_tensor_alloc(attn_low_bytes);
+    saved_env decode_ports_env = { 0 };
+    saved_env attn_static_env = { 0 };
+    bool attn_env_ok = save_env(
+        &decode_ports_env, "DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") != 0;
+    attn_env_ok = save_env(
+        &attn_static_env,
+        "DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC") != 0 &&
+        attn_env_ok;
+    bool attn_exact = ok && attn_env_ok && attn_heads && attn_poison &&
+        attn_generic && attn_static && attn_heads_tensor && attn_low_tensor;
+    if (attn_heads) {
+        for (uint64_t i = 0; i < attn_heads_count; i++) {
+            attn_heads[i] =
+                (float)((int32_t)((i * 17u) % 257u) - 128) / 256.0f;
+        }
+    }
+    if (attn_poison) memset(attn_poison, 0xa5, attn_low_bytes);
+    attn_exact = attn_exact && ds4_gpu_tensor_write(
+        attn_heads_tensor, 0, attn_heads, attn_heads_bytes);
+
+    if (attn_env_ok &&
+        setenv("DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC", "1", 1) != 0) {
+        attn_exact = false;
+    }
+    ds4_gpu_test_set_flags(0);
+    attn_exact = attn_exact && ds4_gpu_tensor_write(
+        attn_low_tensor, 0, attn_poison, attn_low_bytes);
+    attn_exact = attn_exact && ds4_gpu_attention_output_low_q8_tensor(
+        attn_low_tensor, model, model_size, attn_offset,
+        ATTN_GROUP_DIM, ATTN_RANK, ATTN_GROUPS,
+        attn_heads_tensor);
+    attn_exact = attn_exact && ds4_gpu_tensor_read(
+        attn_low_tensor, 0, attn_generic, attn_low_bytes);
+
+    if (attn_env_ok &&
+        (unsetenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS") != 0 ||
+         unsetenv("DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC") != 0)) {
+        attn_exact = false;
+    }
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC);
+    attn_exact = attn_exact && ds4_gpu_tensor_write(
+        attn_low_tensor, 0, attn_poison, attn_low_bytes);
+    attn_exact = attn_exact && ds4_gpu_attention_output_low_q8_tensor(
+        attn_low_tensor, model, model_size, attn_offset,
+        ATTN_GROUP_DIM, ATTN_RANK, ATTN_GROUPS,
+        attn_heads_tensor);
+    attn_exact = attn_exact && ds4_gpu_tensor_read(
+        attn_low_tensor, 0, attn_static, attn_low_bytes);
+    ds4_gpu_test_set_flags(0);
+
+    if (attn_exact && memcmp(attn_generic, attn_static, attn_low_bytes) != 0) {
+        fprintf(stderr,
+                "MXFP4 Metal attention-output LOW static/generic A/B mismatch\n");
+        attn_exact = false;
+    } else if (attn_exact) {
+        fprintf(stderr,
+                "MXFP4 Metal attention-output LOW static/generic A/B exact\n");
+    }
+    const bool attn_static_env_restored = restore_env(&attn_static_env) != 0;
+    const bool decode_ports_env_restored = restore_env(&decode_ports_env) != 0;
+    ok = ok && attn_exact &&
+        attn_static_env_restored && decode_ports_env_restored;
+    ds4_gpu_tensor_free(attn_low_tensor);
+    ds4_gpu_tensor_free(attn_heads_tensor);
+    free(attn_static);
+    free(attn_generic);
+    free(attn_poison);
+    free(attn_heads);
+
     /* The production large-prefill path stores its fused SwiGLU result as
      * FP16 before the down projection. Compare that independent grouped-MMA
      * path against the same scalar reference with the documented rounding. */
@@ -363,11 +507,15 @@ int main(void) {
         (size_t)batch_pairs, sizeof(_Float16));
     _Float16 *mid_batch_storage = calloc(
         (size_t)batch_pairs, sizeof(_Float16));
+    _Float16 *mid_batch_half_lut_baseline = calloc(
+        (size_t)batch_pairs, sizeof(_Float16));
     float *out_batch_expected = calloc((size_t)batch_out_count, sizeof(float));
     float *out_batch_baseline = calloc(
         (size_t)batch_out_count, sizeof(float));
+    float *out_batch_half_lut_baseline = calloc(
+        (size_t)batch_out_count, sizeof(float));
     float *out_batch_actual = calloc((size_t)batch_out_count, sizeof(float));
-    float *experts_batch_baseline = calloc(
+    float *experts_batch_half_lut_baseline = calloc(
         (size_t)batch_out_count * N_EXPERT, sizeof(float));
     float *experts_batch_actual = calloc(
         (size_t)batch_out_count * N_EXPERT, sizeof(float));
@@ -419,9 +567,11 @@ int main(void) {
     bool mid_is_f16 = false;
     ok = ok && x_batch && selected_batch && weights_batch &&
          mid_batch_expected && mid_batch_actual && mid_batch_baseline &&
-         mid_batch_storage && out_batch_expected && out_batch_baseline &&
-         out_batch_actual && experts_batch_baseline &&
-         experts_batch_actual && batch_poison &&
+         mid_batch_storage && mid_batch_half_lut_baseline &&
+         out_batch_expected && out_batch_baseline &&
+         out_batch_half_lut_baseline && out_batch_actual &&
+         experts_batch_half_lut_baseline && experts_batch_actual &&
+         batch_poison &&
          x_batch_tensor && selected_batch_tensor && weights_batch_tensor &&
          gate_batch_tensor && up_batch_tensor && mid_batch_tensor &&
          experts_batch_tensor && out_batch_tensor;
@@ -437,11 +587,25 @@ int main(void) {
         memset(batch_poison, 0xa5,
                (size_t)batch_out_count * N_EXPERT * sizeof(float));
     }
+    /* Keep the established per-feature A/B checks isolated now that the
+     * production defaults also cover this 48-token shape. The widened
+     * dispatcher gets its own aggregate rollback comparison below. */
+    const char *small_prefill_rollback_name =
+        "DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_SMALL_PREFILL";
+    const char *small_prefill_rollback_previous =
+        getenv(small_prefill_rollback_name);
+    char *small_prefill_rollback_saved = small_prefill_rollback_previous ?
+        strdup(small_prefill_rollback_previous) : NULL;
+    if ((small_prefill_rollback_previous && !small_prefill_rollback_saved) ||
+        setenv(small_prefill_rollback_name, "1", 1) != 0) {
+        fprintf(stderr,
+                "MXFP4 Metal could not isolate short-prefill feature tests\n");
+        ok = 0;
+    }
     /* With 48 identical routes, every occupied expert has a 32-row tile plus
-     * a 16-row tail tile. Run the established, pair-culling, and down-culling
-     * pipelines in the same process and require exact FP16 intermediates and
-     * F32 outputs. */
-    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL);
+     * a 16-row tail tile. First capture the generic rollback as the baseline
+     * for the independent pair, compact-pair, and down-tail checks. */
+    ds4_gpu_test_set_flags(0);
     ok = ok && ds4_gpu_tensor_write(
         mid_batch_tensor, 0, batch_poison,
         batch_pairs * sizeof(_Float16));
@@ -467,8 +631,38 @@ int main(void) {
     ok = ok && ds4_gpu_tensor_read(
         out_batch_tensor, 0, out_batch_baseline,
         batch_out_count * sizeof(float));
+
+    /* The half-LUT candidate retains the down-tail kernel, so give it a
+     * separate down-tail baseline instead of conflating two features. */
+    mid_is_f16 = false;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_MXFP4_DOWN_TAIL_CULL);
+    ok = ok && ds4_gpu_tensor_write(
+        mid_batch_tensor, 0, batch_poison,
+        batch_pairs * sizeof(_Float16));
+    ok = ok && ds4_gpu_tensor_write(
+        experts_batch_tensor, 0, batch_poison,
+        batch_out_count * N_EXPERT * sizeof(float));
+    ok = ok && ds4_gpu_tensor_write(
+        out_batch_tensor, 0, batch_poison,
+        batch_out_count * sizeof(float));
+    ok = ok && ds4_gpu_routed_moe_batch_tensor(
+        out_batch_tensor, gate_batch_tensor, up_batch_tensor,
+        mid_batch_tensor, experts_batch_tensor,
+        model, model_size, gate_offset, up_offset, down_offset,
+        MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
+        expert_bytes, row_bytes, DIM, DIM, DIM,
+        selected_batch_tensor, weights_batch_tensor,
+        N_TOTAL_EXPERT, N_EXPERT, 7.0f, x_batch_tensor,
+        0u, BATCH_TOKENS, &mid_is_f16, true);
+    ok = ok && mid_is_f16;
     ok = ok && ds4_gpu_tensor_read(
-        experts_batch_tensor, 0, experts_batch_baseline,
+        mid_batch_tensor, 0, mid_batch_half_lut_baseline,
+        batch_pairs * sizeof(_Float16));
+    ok = ok && ds4_gpu_tensor_read(
+        out_batch_tensor, 0, out_batch_half_lut_baseline,
+        batch_out_count * sizeof(float));
+    ok = ok && ds4_gpu_tensor_read(
+        experts_batch_tensor, 0, experts_batch_half_lut_baseline,
         batch_out_count * N_EXPERT * sizeof(float));
 
     /* Force the exact half-result dequantization table only for the resident
@@ -510,11 +704,11 @@ int main(void) {
             out_batch_tensor, 0, out_batch_actual,
             batch_out_count * sizeof(float));
         if (ok &&
-            (memcmp(mid_batch_storage, mid_batch_baseline,
+            (memcmp(mid_batch_storage, mid_batch_half_lut_baseline,
                     batch_pairs * sizeof(_Float16)) != 0 ||
-             memcmp(experts_batch_actual, experts_batch_baseline,
+             memcmp(experts_batch_actual, experts_batch_half_lut_baseline,
                     batch_out_count * N_EXPERT * sizeof(float)) != 0 ||
-             memcmp(out_batch_actual, out_batch_baseline,
+             memcmp(out_batch_actual, out_batch_half_lut_baseline,
                     batch_out_count * sizeof(float)) != 0)) {
             fprintf(stderr,
                     "MXFP4 Metal down half-LUT poisoned A/B mismatch on repetition %u\n",
@@ -744,6 +938,101 @@ int main(void) {
     }
     ds4_gpu_test_set_flags(0);
 
+    /* Finally compare the complete automatic 32..2047-token default bundle
+     * with its aggregate rollback. Reuse the uneven routes above so the map
+     * contains full tiles plus 16-, 15-, and 1-row tails. */
+    mid_is_f16 = false;
+    ok = ok && ds4_gpu_tensor_write(
+        mid_batch_tensor, 0, batch_poison,
+        batch_pairs * sizeof(_Float16));
+    ok = ok && ds4_gpu_tensor_write(
+        experts_batch_tensor, 0, batch_poison,
+        batch_out_count * N_EXPERT * sizeof(float));
+    ok = ok && ds4_gpu_tensor_write(
+        out_batch_tensor, 0, batch_poison,
+        batch_out_count * sizeof(float));
+    ok = ok && ds4_gpu_routed_moe_batch_tensor(
+        out_batch_tensor, gate_batch_tensor, up_batch_tensor,
+        mid_batch_tensor, experts_batch_tensor,
+        model, model_size, gate_offset, up_offset, down_offset,
+        MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
+        expert_bytes, row_bytes, DIM, DIM, DIM,
+        selected_batch_tensor, weights_batch_tensor,
+        N_TOTAL_EXPERT, N_EXPERT, 7.0f, x_batch_tensor,
+        0u, BATCH_TOKENS, &mid_is_f16, true);
+    ok = ok && mid_is_f16;
+    ok = ok && ds4_gpu_tensor_read(
+        mid_batch_tensor, 0, mid_batch_baseline,
+        batch_pairs * sizeof(_Float16));
+    ok = ok && ds4_gpu_tensor_read(
+        experts_batch_tensor, 0, experts_batch_half_lut_baseline,
+        batch_out_count * N_EXPERT * sizeof(float));
+    ok = ok && ds4_gpu_tensor_read(
+        out_batch_tensor, 0, out_batch_baseline,
+        batch_out_count * sizeof(float));
+
+    if (unsetenv(small_prefill_rollback_name) != 0) {
+        fprintf(stderr,
+                "MXFP4 Metal could not enable short-prefill defaults\n");
+        ok = 0;
+    }
+    mid_is_f16 = false;
+    ok = ok && ds4_gpu_tensor_write(
+        mid_batch_tensor, 0, batch_poison,
+        batch_pairs * sizeof(_Float16));
+    ok = ok && ds4_gpu_tensor_write(
+        experts_batch_tensor, 0, batch_poison,
+        batch_out_count * N_EXPERT * sizeof(float));
+    ok = ok && ds4_gpu_tensor_write(
+        out_batch_tensor, 0, batch_poison,
+        batch_out_count * sizeof(float));
+    ok = ok && ds4_gpu_routed_moe_batch_tensor(
+        out_batch_tensor, gate_batch_tensor, up_batch_tensor,
+        mid_batch_tensor, experts_batch_tensor,
+        model, model_size, gate_offset, up_offset, down_offset,
+        MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
+        expert_bytes, row_bytes, DIM, DIM, DIM,
+        selected_batch_tensor, weights_batch_tensor,
+        N_TOTAL_EXPERT, N_EXPERT, 7.0f, x_batch_tensor,
+        0u, BATCH_TOKENS, &mid_is_f16, true);
+    ok = ok && mid_is_f16;
+    ok = ok && ds4_gpu_tensor_read(
+        mid_batch_tensor, 0, mid_batch_storage,
+        batch_pairs * sizeof(_Float16));
+    ok = ok && ds4_gpu_tensor_read(
+        experts_batch_tensor, 0, experts_batch_actual,
+        batch_out_count * N_EXPERT * sizeof(float));
+    ok = ok && ds4_gpu_tensor_read(
+        out_batch_tensor, 0, out_batch_actual,
+        batch_out_count * sizeof(float));
+    if (ok && (memcmp(mid_batch_storage, mid_batch_baseline,
+                      batch_pairs * sizeof(_Float16)) != 0 ||
+               memcmp(experts_batch_actual,
+                      experts_batch_half_lut_baseline,
+                      batch_out_count * N_EXPERT * sizeof(float)) != 0 ||
+               memcmp(out_batch_actual, out_batch_baseline,
+                      batch_out_count * sizeof(float)) != 0)) {
+        fprintf(stderr,
+                "MXFP4 Metal short-prefill default bundle A/B mismatch\n");
+        ok = 0;
+    } else if (ok) {
+        fprintf(stderr,
+                "MXFP4 Metal short-prefill default bundle A/B exact\n");
+    }
+    if (small_prefill_rollback_saved) {
+        if (setenv(small_prefill_rollback_name,
+                   small_prefill_rollback_saved, 1) != 0) {
+            fprintf(stderr,
+                    "MXFP4 Metal could not restore short-prefill rollback\n");
+            ok = 0;
+        }
+    } else if (unsetenv(small_prefill_rollback_name) != 0) {
+        fprintf(stderr,
+                "MXFP4 Metal could not restore short-prefill environment\n");
+        ok = 0;
+    }
+    free(small_prefill_rollback_saved);
+
     ds4_gpu_tensor_free(out_batch_tensor);
     ds4_gpu_tensor_free(experts_batch_tensor);
     ds4_gpu_tensor_free(mid_batch_tensor);
@@ -753,12 +1042,14 @@ int main(void) {
     ds4_gpu_tensor_free(selected_batch_tensor);
     ds4_gpu_tensor_free(x_batch_tensor);
     free(out_batch_actual);
+    free(out_batch_half_lut_baseline);
     free(out_batch_baseline);
     free(out_batch_expected);
     free(experts_batch_actual);
-    free(experts_batch_baseline);
+    free(experts_batch_half_lut_baseline);
     free(batch_poison);
     free(mid_batch_storage);
+    free(mid_batch_half_lut_baseline);
     free(mid_batch_baseline);
     free(mid_batch_actual);
     free(mid_batch_expected);
