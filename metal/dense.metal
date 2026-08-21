@@ -1874,11 +1874,19 @@ template [[host_name("kernel_mul_mv_ext_f16_f32_r1_2")]]  kernel mul_mv_ext_q4_f
 template [[host_name("kernel_mul_mv_ext_f16_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, half4,      4,  dequantize_f16_t4>;
 template [[host_name("kernel_mul_mv_ext_f16_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, half4,      4,  dequantize_f16_t4>;
 template [[host_name("kernel_mul_mv_ext_f16_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, half4,      4,  dequantize_f16_t4>;
+/* r1=6..8 keep grid.y at 1 for the 6..8-row speculative verify blocks, so
+ * dense weights are streamed once per block instead of twice. */
+template [[host_name("kernel_mul_mv_ext_f16_f32_r1_6")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<6, half4,      4,  dequantize_f16_t4>;
+template [[host_name("kernel_mul_mv_ext_f16_f32_r1_7")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<7, half4,      4,  dequantize_f16_t4>;
+template [[host_name("kernel_mul_mv_ext_f16_f32_r1_8")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, half4,      4,  dequantize_f16_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_6")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<6, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_7")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<7, block_q8_0, 32, dequantize_q8_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_8")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<8, block_q8_0, 32, dequantize_q8_0_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
