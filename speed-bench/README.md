@@ -27,6 +27,33 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### DSpark speculation on M3 Ultra (measured, not yet profitable)
+
+DSpark non-strict decode was measured end to end on M3 Ultra with the MXFP4
+model and the 0731 support GGUF.  Three systemic costs keep it below plain
+decode (~43.7 t/s) today; scheduler tuning alone cannot fix them:
+
+1. The verify pass runs the speculative suffix through the generic batch
+   prefill kernels (`metal_graph_encode_layer_batch`): ~46-60 ms per verify
+   vs the ~29-33 ms memory floor for two rows (the extra routed-expert reads
+   are inherent).  A commit-only stage decomposition showed a uniform
+   1.5-2.5x per-stage excess (routed MoE 14.3 ms vs 5.9 decode, HC pre
+   7.2 vs 1.7, output projection 7.1 vs 4.8, attention 4.4 vs 2.1).
+   The fix is the N<=6 microbatch verifier on the decode-grade kernels that
+   the verifier's own header comment calls out as "not yet" written.
+2. Plain decode inside a DSpark session costs ~51 ms/token (23 ms decode +
+   per-layer hidden-state capture and session bookkeeping), taxing every
+   non-speculated token.
+3. The draft propose chain costs ~3-8 ms/cycle; with the current
+   confidence gating it proposes on only ~54-85% of cycles.
+
+Scheduler knobs were swept: `DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP=0` (retry
+the draft every cycle) raised proposals from 91/179 to 125/147 cycles and
+accepted drafts to 101 (80.8% accept), but peak measured generation stayed
+at 37.8 t/s because of the three costs above.  Strict mode (`--dspark-strict`)
+measures 43.07 t/s, i.e. no gain, as accepted blocks are re-run through
+one-token decode to stay byte-identical.
+
 ### Metal decode stage GPU counters
 
 The end-and-wait stage profiler (`DS4_METAL_DECODE_STAGE_PROFILE=1`) adds a
