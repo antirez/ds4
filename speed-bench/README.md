@@ -54,7 +54,15 @@ Scheduler and confidence knobs were swept: `DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP=0
 (retry the draft every cycle) raised proposals from 91/179 to 125/147 cycles
 and accepted drafts to 101 (80.8% accept); the best combination measured
 39.5 t/s at `--dspark-confidence 0.75` on a code prompt, still below the
-43.7 t/s plain-decode equilibrium.  Strict mode (`--dspark-strict`)
+43.7 t/s plain-decode equilibrium.
+
+Two dispatch-routing microbatch increments were also built, validated, and
+measured negative before reverting: per-row routed MoE through the
+single-token static-trip kernels (bit-identical output, verify_layer
+unchanged at 1225 vs 1217 ms) and per-row HC pre through the decode fused
+producer kernel (valid non-strict output, 39.3 vs 40.2 t/s).  Both show the
+verify excess lives in the batch kernels' execution, not in dispatch
+routing; the microbatch build must write genuine small-N batched kernels.  Strict mode (`--dspark-strict`)
 measures 43.07 t/s, i.e. no gain, as accepted blocks are re-run through
 one-token decode to stay byte-identical.
 
