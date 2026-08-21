@@ -1,5 +1,10 @@
 ## Benchmarking
 
+Session handoff (Aug 21 decode campaign): see
+`speed-bench/DECODE-CAMPAIGN-HANDOFF.md` for the cold-restart kit — verified
+baselines, the closed-avenue list, tool usage, and the decision required
+before resuming work toward >45 t/s.
+
 Here we collect prefill and generation speed obtained with different hardware.
 
 Run `ds4-bench` as:
