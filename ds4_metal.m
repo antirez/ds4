@@ -19578,9 +19578,7 @@ int ds4_gpu_qwen_gdn_core_tensor(
     if (!core || !conv || !state || !qkv || !z || !alpha || !beta) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> conv_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_conv");
-        id<MTLComputePipelineState> core_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_core_mlx");
-        const bool is_mlx = (core_p != nil);
-        if (!core_p) core_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_core");
+        id<MTLComputePipelineState> core_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_core");
         if (!conv_p || !core_p) return 0;
         uint64_t conv_inner = 0, a_inner = 0, dt_inner = 0, sn_inner = 0;
         id<MTLBuffer> conv_w = ds4_gpu_wrap_model_range(model_map, model_size, conv_w_off,
@@ -19629,11 +19627,7 @@ int ds4_gpu_qwen_gdn_core_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(core) offset:ds4_gpu_tensor_offset(core) atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state)
                offset:ds4_gpu_tensor_offset(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state) atIndex:10];
-        if (is_mlx) {
-            [enc dispatchThreads:MTLSizeMake(32, 128, 48) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        } else {
-            [enc dispatchThreadgroups:MTLSizeMake(48, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        }
+        [enc dispatchThreadgroups:MTLSizeMake(48, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen GDN")) return 0;
@@ -19740,9 +19734,7 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
     if (!core || !conv || !state || !qkv || !z || !alpha || !beta || n_tok == 0) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> conv_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_conv");
-        id<MTLComputePipelineState> core_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_core_mlx");
-        const bool is_mlx = (core_p != nil);
-        if (!core_p) core_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_core");
+        id<MTLComputePipelineState> core_p = ds4_gpu_get_pipeline("kernel_qwen_gdn_core");
         if (!conv_p || !core_p) return 0;
         uint64_t conv_inner = 0, a_inner = 0, dt_inner = 0, sn_inner = 0;
         id<MTLBuffer> conv_w = ds4_gpu_wrap_model_range(model_map, model_size, conv_w_off,
@@ -19786,11 +19778,7 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(core) offset:ds4_gpu_tensor_offset(core) atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state)
                offset:ds4_gpu_tensor_offset(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state) atIndex:10];
-        if (is_mlx) {
-            [enc dispatchThreads:MTLSizeMake(32, 128, 48) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        } else {
-            [enc dispatchThreadgroups:MTLSizeMake(48, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        }
+        [enc dispatchThreadgroups:MTLSizeMake(48, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen GDN rows")) return 0;
 
