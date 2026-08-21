@@ -107,14 +107,15 @@ kernel void kernel_qwen_gqa_attn_decode(
     const uint group = args.n_head / args.n_head_kv;
     const uint kv_h = h / group;
 
-    // Lane 0..31 stores new K and V into KV cache at position pos
+    // Lane 0..31 stores new K and V into KV cache at position pos. The attention
+    // loop below reads the current position directly from k_new/v_new, so no
+    // cross-threadgroup visibility of these writes is required.
     if (h == 0) {
         for (uint i = tiisg; i < kv_dim; i += 32) {
             k_cache[(uint64_t)args.pos * kv_dim + i] = k_new[i];
             v_cache[(uint64_t)args.pos * kv_dim + i] = v_new[i];
         }
     }
-    threadgroup_barrier(mem_flags::mem_device);
 
     device const float * qh = q + (uint64_t)h * args.head_dim;
 
@@ -130,7 +131,12 @@ kernel void kernel_qwen_gqa_attn_decode(
     const float kq_scale = 1.0f / sqrt((float)args.head_dim);
 
     for (uint t = 0; t <= args.pos; t++) {
-        device const float * kt = k_cache + (uint64_t)t * kv_dim + (uint64_t)kv_h * args.head_dim;
+        const bool current = t == args.pos;
+        device const float * kt =
+            current
+                ? k_new + (uint64_t)kv_h * args.head_dim
+                : k_cache + (uint64_t)t * kv_dim +
+                      (uint64_t)kv_h * args.head_dim;
         float dot = 0.0f;
         for (int j = 0; j < 8; j++) {
             dot += q_local[j] * kt[tiisg * 8 + j];
@@ -142,7 +148,11 @@ kernel void kernel_qwen_gqa_attn_decode(
         float beta = exp(dot - m_curr);
         l_prev = l_prev * alpha + beta;
 
-        device const float * vt = v_cache + (uint64_t)t * kv_dim + (uint64_t)kv_h * args.head_dim;
+        device const float * vt =
+            current
+                ? v_new + (uint64_t)kv_h * args.head_dim
+                : v_cache + (uint64_t)t * kv_dim +
+                      (uint64_t)kv_h * args.head_dim;
         for (int j = 0; j < 8; j++) {
             acc[j] = acc[j] * alpha + beta * vt[tiisg * 8 + j];
         }

@@ -1687,10 +1687,9 @@ static inline float4 glm_q4_64a_dequant4(device const char *block_base, uint idx
     const ushort bbits = *((device const ushort *)(block_base + 34));
     const float scale = bf16_to_f32_dsv4(sbits);
     const float bias = bf16_to_f32_dsv4(bbits);
-    ushort packed = *((device const ushort *)(block_base + (idx4 >> 1u) * 2u)); // 2B aligned
-    // For idx4 even/odd, packed holds the right 4 nibbles but we select the correct half
-    // idx4 even -> low 4 nibbles already in place; odd -> shift by 0? Actually each ushort = 4 nibbles,
-    // so direct unpack is correct regardless of idx4 parity because we index by 2B groups.
+    // Each 4-elem chunk is 2 bytes at offset idx4 * 2 within the block.
+    const ushort packed =
+        *((device const ushort *)(block_base + idx4 * 2u));
     return float4(
         float( packed        & 0xF) * scale + bias,
         float((packed >> 4)  & 0xF) * scale + bias,
