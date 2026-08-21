@@ -41,6 +41,13 @@ decode (~43.7 t/s) today; scheduler tuning alone cannot fix them:
    7.2 vs 1.7, output projection 7.1 vs 4.8, attention 4.4 vs 2.1).
    The fix is the N<=6 microbatch verifier on the decode-grade kernels that
    the verifier's own header comment calls out as "not yet" written.
+   Caution for that build: three measured increments (per-row MoE, per-row
+   HC pre, and a strict-oracle-verified dual-row HC-pre kernel) each
+   recovered nothing, and the batch MoE already runs at its distinct-expert
+   floor.  The honest reading is that the ~29-33 ms "perfect sharing"
+   verify floor is not deliverable on this GPU; the N=2 verify near 50 ms
+   is close to its real floor, so speculation is unlikely to beat the
+   43.7 t/s plain decode on M3 Ultra with this model.
 2. The draft propose chain costs ~3-8 ms/cycle and its confidence gate
    (`sigmoid(confidence0) >= threshold`, Metal default 0.6) declines on
    45-75% of cycles; each such cycle still pays the propose before falling
