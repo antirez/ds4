@@ -1367,7 +1367,9 @@ static void ds4_gpu_pf_init_locked(void) {
             return;
         }
         const char *tk = getenv("DS4_PF_TOPK");
-        g_pf_topk = (tk && atoi(tk) > 0) ? (uint32_t)atoi(tk) : 4;
+        /* An explicit 0 keeps the certain hash-layer prefetch but stops
+         * guessing, which is how the two halves get measured apart. */
+        g_pf_topk = (tk && tk[0]) ? (uint32_t)atoi(tk) : 4;
         if (g_pf_topk > 32) g_pf_topk = 32;
         const char *mt = getenv("DS4_PF_MAX_TOK");
         g_pf_max_tok = (mt && atoi(mt) > 0) ? (uint32_t)atoi(mt) : 32;
