@@ -16109,85 +16109,6 @@ static int qwen_metal_ensure_pool(void) {
     return 1;
 }
 
-static int qwen_metal_forward_token(ds4_qwen_session_state *qs, float *logits_out, const ds4_model *model, const ds4_weights *weights, int token, uint32_t pos) {
-    const void *map = model->map;
-    uint64_t map_size = model->size;
-    const uint32_t n_embd = 5120;
-    const uint32_t n_head = 24;
-    const uint32_t n_head_kv = 4;
-    const uint32_t head_dim = 256;
-    const uint32_t ff_dense = 17408;
-    const uint32_t n_vocab = 248320;
-    if (!qwen_metal_ensure_pool()) return 0;
-    pthread_mutex_lock(&g_qwen_pool.mu);
-    const uint32_t max_ctx = (qs && qs->max_ctx) ? qs->max_ctx : g_qwen_pool.max_ctx;
-    ds4_gpu_tensor *cur = g_qwen_pool.cur;
-    ds4_gpu_tensor *next = g_qwen_pool.next;
-    ds4_gpu_tensor *normed = g_qwen_pool.normed;
-    ds4_gpu_tensor *q = g_qwen_pool.q;
-    ds4_gpu_tensor *k = g_qwen_pool.k;
-    ds4_gpu_tensor *v = g_qwen_pool.v;
-    ds4_gpu_tensor *heads = g_qwen_pool.heads;
-    ds4_gpu_tensor *attn_out = g_qwen_pool.attn_out;
-    ds4_gpu_tensor *after_attn = g_qwen_pool.after_attn;
-    ds4_gpu_tensor *ffn_normed = g_qwen_pool.ffn_normed;
-    ds4_gpu_tensor *gate = g_qwen_pool.gate;
-    ds4_gpu_tensor *up = g_qwen_pool.up;
-    ds4_gpu_tensor *mid = g_qwen_pool.mid;
-    ds4_gpu_tensor *ffn_out = g_qwen_pool.ffn_out;
-    ds4_gpu_tensor *logits_gpu = g_qwen_pool.logits_gpu;
-    ds4_gpu_tensor *norm = g_qwen_pool.norm;
-    ds4_gpu_tensor *k_cache = (qs && qs->k_cache) ? qs->k_cache : g_qwen_pool.k_cache;
-    ds4_gpu_tensor *v_cache = (qs && qs->v_cache) ? qs->v_cache : g_qwen_pool.v_cache;
-    int ok = 1;
-    if (!ds4_gpu_begin_commands()) { pthread_mutex_unlock(&g_qwen_pool.mu); return 0; }
-    // embed token
-    if (!ds4_gpu_embed_token_quant_tensor(cur, map, map_size, weights->token_embd->abs_offset, weights->token_embd->type, n_vocab, token, n_embd)) ok = 0;
-    for (uint32_t il = 0; ok && il < 64; il++) {
-        const ds4_layer_weights *lw = &weights->layer[il];
-        bool is_full = true;
-        if (!ds4_gpu_rms_norm_weight_tensor(normed, cur, map, map_size, lw->attn_norm->abs_offset, n_embd, 1e-6f)) { ok = 0; break; }
-        if (is_full && lw->attn_q_b && lw->attn_k_b && lw->attn_v_b && lw->attn_output) {
-            if (!ds4_gpu_matmul_quant_tensor(q, map, map_size, lw->attn_q_b->abs_offset, lw->attn_q_b->type, n_embd, n_head*head_dim, normed, 1)) { ok = 0; break; }
-            if (!ds4_gpu_matmul_quant_tensor(k, map, map_size, lw->attn_k_b->abs_offset, lw->attn_k_b->type, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
-            if (!ds4_gpu_matmul_quant_tensor(v, map, map_size, lw->attn_v_b->abs_offset, lw->attn_v_b->type, n_embd, n_head_kv*head_dim, normed, 1)) { ok = 0; break; }
-            // RoPE (partial 64 of 256) - use qwen rope: n_rot=64, pos, base 10M
-            if (!ds4_gpu_rope_tail_tensor(q, 1, n_head, head_dim, 64, pos, 262144, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)) { ok = 0; break; }
-            if (!ds4_gpu_rope_tail_tensor(k, 1, n_head_kv, head_dim, 64, pos, 262144, false, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f)) { ok = 0; break; }
-
-            // Causal GQA attention decode with online FlashAttention softmax
-            uint64_t layer_kv_offset = (uint64_t)il * max_ctx * n_head_kv * head_dim * sizeof(float);
-            if (!ds4_gpu_qwen_gqa_attn_decode_tensor(heads, q, k, v, k_cache, layer_kv_offset, v_cache, layer_kv_offset, pos, max_ctx, n_head, n_head_kv, head_dim)) {
-                // Fallback: expand V if decode kernel unavailable
-                if (!ds4_gpu_gqa_expand_f32_tensor(heads, v, n_head, n_head_kv, head_dim)) { ok = 0; break; }
-            }
-            if (!ds4_gpu_matmul_quant_tensor(attn_out, map, map_size, lw->attn_output->abs_offset, lw->attn_output->type, n_head*head_dim, n_embd, heads, 1)) { ok = 0; break; }
-        } else {
-            if (!ds4_gpu_fill_f32_tensor(attn_out, 0.0f, n_embd)) { ok = 0; break; }
-        }
-        if (!ds4_gpu_add_tensor(after_attn, cur, attn_out, n_embd)) { ok = 0; break; }
-        if (!ds4_gpu_rms_norm_weight_tensor(ffn_normed, after_attn, map, map_size, lw->ffn_norm->abs_offset, n_embd, 1e-6f)) { ok = 0; break; }
-        if (!ds4_gpu_matmul_quant_tensor(gate, map, map_size, lw->ffn_gate->abs_offset, lw->ffn_gate->type, n_embd, ff_dense, ffn_normed, 1)) { ok = 0; break; }
-        if (!ds4_gpu_matmul_quant_tensor(up, map, map_size, lw->ffn_up->abs_offset, lw->ffn_up->type, n_embd, ff_dense, ffn_normed, 1)) { ok = 0; break; }
-        if (!ds4_gpu_swiglu_tensor(mid, gate, up, ff_dense, 0.0f, 1.0f)) { ok = 0; break; }
-        if (!ds4_gpu_matmul_quant_tensor(ffn_out, map, map_size, lw->ffn_down->abs_offset, lw->ffn_down->type, ff_dense, n_embd, mid, 1)) { ok = 0; break; }
-        if (!ds4_gpu_add_tensor(next, after_attn, ffn_out, n_embd)) { ok = 0; break; }
-        ds4_gpu_tensor *tmp = cur; cur = next; next = tmp;
-    }
-    if (ok && logits_out) {
-        if (!ds4_gpu_rms_norm_weight_tensor(norm, cur, map, map_size, weights->output_norm->abs_offset, n_embd, 1e-6f)) { ok = 0; }
-        else if (!ds4_gpu_matmul_quant_tensor(logits_gpu, map, map_size, weights->output->abs_offset, weights->output->type, n_embd, n_vocab, norm, 1)) { ok = 0; }
-    }
-    if (!ds4_gpu_end_commands()) { ok = 0; }
-    if (ok && logits_out) {
-        if (!ds4_gpu_tensor_read(logits_gpu, 0, logits_out, (uint64_t)n_vocab * sizeof(float))) { ok = 0; }
-    }
-    g_qwen_pool.cur = cur;
-    g_qwen_pool.next = next;
-    pthread_mutex_unlock(&g_qwen_pool.mu);
-    return ok;
-}
-
 
 static int qwen_gdn_inproj_ok(const ds4_tensor *w, uint64_t out_dim, uint32_t type) {
     return w && w->type == type && w->dim[0] == 5120 && w->dim[1] == out_dim;
@@ -17060,7 +16981,7 @@ static int qwen_hybrid_metal_forward_tokens(
 static void qwen_metal_prefill(ds4_qwen_session_state *qs, float *logits, const ds4_model *model, const ds4_weights *weights, const token_vec *prompt) {
     for (int i = 0; i < prompt->len; i++) {
         float *out_logits = (i == prompt->len - 1) ? logits : NULL;
-        if (!qwen_metal_forward_token(qs, out_logits, model, weights, prompt->v[i], (uint32_t)i)) {
+        if (!qwen_hybrid_metal_forward_token(qs, out_logits, model, weights, prompt->v[i], (uint32_t)i)) {
             qwen_forward_token_cpu(out_logits, model, weights, prompt->v[i], (uint32_t)i);
         }
     }
@@ -52623,7 +52544,7 @@ static int generate_metal_graph_raw_swa(
             if (vocab_token_is_generation_stop(vocab, token)) break;
             if (emit) emit(emit_ud, token);
             if (i == n_predict - 1 || pos + 1 >= ctx_size) break;
-            if (!qwen_metal_forward_token(NULL, logits, model, weights, token, (uint32_t)pos)) {
+            if (!qwen_hybrid_metal_forward_token(NULL, logits, model, weights, token, (uint32_t)pos)) {
                 qwen_forward_token_cpu(logits, model, weights, token, (uint32_t)pos);
             }
             pos++;
@@ -64293,7 +64214,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 }
 #ifndef DS4_NO_GPU
                 else if (!is_cpu) {
-                    if (!qwen_metal_forward_token(&s->qwen, s->logits, &e->model, &e->weights, prompt->v[i], (uint32_t)i)) {
+                    if (!qwen_hybrid_metal_forward_token(&s->qwen, s->logits, &e->model, &e->weights, prompt->v[i], (uint32_t)i)) {
                         qwen_forward_token_cpu(s->logits, &e->model, &e->weights, prompt->v[i], (uint32_t)i);
                     }
                 }
@@ -65986,7 +65907,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                        s->qwen.hidden, s->qwen.layers,
                                        token, pos);
         } else if (!is_cpu) {
-            if (!qwen_metal_forward_token(&s->qwen, s->logits, &e->model, &e->weights, token, pos)) {
+            if (!qwen_hybrid_metal_forward_token(&s->qwen, s->logits, &e->model, &e->weights, token, pos)) {
                 qwen_forward_token_cpu(s->logits, &e->model, &e->weights, token, pos);
             }
         } else
