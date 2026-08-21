@@ -15958,7 +15958,19 @@ static int qwen_metal_ensure_pool(void) {
     if (g_qwen_pool.gdn_conv) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_conv, 0.0f, 64ull * QWEN_GDN_QKV * QWEN_GDN_CONV_K);
     if (g_qwen_pool.gdn_state) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_state, 0.0f, 64ull * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM);
 
-    const uint32_t batch_cap = 8;
+    uint32_t batch_cap = 64;
+    {
+        const char *seq = getenv("DS4_QWEN_PREFILL_SEQ");
+        if (seq && seq[0] && seq[0] != '0') batch_cap = 1;
+        else {
+            const char *env = getenv("DS4_QWEN_BATCH");
+            if (env && env[0]) {
+                long v = strtol(env, NULL, 10);
+                if (v <= 1) batch_cap = 1;
+                else batch_cap = (uint32_t)v;
+            }
+        }
+    }
     g_qwen_pool.batch_cap = batch_cap;
     g_qwen_pool.batch_cur = ds4_gpu_tensor_alloc((uint64_t)batch_cap * n_embd * sizeof(float));
     g_qwen_pool.batch_next = ds4_gpu_tensor_alloc((uint64_t)batch_cap * n_embd * sizeof(float));
