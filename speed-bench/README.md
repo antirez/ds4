@@ -41,16 +41,20 @@ decode (~43.7 t/s) today; scheduler tuning alone cannot fix them:
    7.2 vs 1.7, output projection 7.1 vs 4.8, attention 4.4 vs 2.1).
    The fix is the N<=6 microbatch verifier on the decode-grade kernels that
    the verifier's own header comment calls out as "not yet" written.
-2. Plain decode inside a DSpark session costs ~51 ms/token (23 ms decode +
-   per-layer hidden-state capture and session bookkeeping), taxing every
-   non-speculated token.
-3. The draft propose chain costs ~3-8 ms/cycle; with the current
-   confidence gating it proposes on only ~54-85% of cycles.
+2. The draft propose chain costs ~3-8 ms/cycle and its confidence gate
+   (`sigmoid(confidence0) >= threshold`, Metal default 0.6) declines on
+   45-75% of cycles; each such cycle still pays the propose before falling
+   back to one plain decode.  Plain decode inside a DSpark session measures
+   a normal ~23.3 ms (the hidden-state capture is not a decode tax).
+3. Per-cycle bookkeeping (checkpoint, snapshot, commit, propose-fail
+   waste) accounts for a further ~4-5 ms/cycle beyond the measured
+   propose+verify+decode components.
 
-Scheduler knobs were swept: `DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP=0` (retry
-the draft every cycle) raised proposals from 91/179 to 125/147 cycles and
-accepted drafts to 101 (80.8% accept), but peak measured generation stayed
-at 37.8 t/s because of the three costs above.  Strict mode (`--dspark-strict`)
+Scheduler and confidence knobs were swept: `DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP=0`
+(retry the draft every cycle) raised proposals from 91/179 to 125/147 cycles
+and accepted drafts to 101 (80.8% accept); the best combination measured
+39.5 t/s at `--dspark-confidence 0.75` on a code prompt, still below the
+43.7 t/s plain-decode equilibrium.  Strict mode (`--dspark-strict`)
 measures 43.07 t/s, i.e. no gain, as accepted blocks are re-run through
 one-token decode to stay byte-identical.
 
