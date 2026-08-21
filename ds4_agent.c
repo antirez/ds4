@@ -8442,6 +8442,53 @@ static int worker_accept_generated_token(agent_worker *w,
     return 0;
 }
 
+/* Same bookkeeping as worker_accept_generated_token for a token that the
+ * speculative verifier has already evaluated and committed to the live KV:
+ * transcript, trace, stream rendering, and status only — no second eval. */
+static int worker_accept_verified_token(agent_worker *w,
+                                        int token,
+                                        int *generated,
+                                        double t0,
+                                        agent_stream_renderer *stream) {
+    ds4_tokens_push(&w->transcript, token);
+
+    size_t text_len = 0;
+    char *text = ds4_token_text(w->engine, token, &text_len);
+    agent_trace_token(w, token, text, text_len, *generated + 1);
+    agent_stream_text(stream, text, text_len, false);
+    free(text);
+    (*generated)++;
+
+    double dt = now_sec() - t0;
+    pthread_mutex_lock(&w->mu);
+    w->status.generated = *generated;
+    w->status.gen_tps = dt > 0.0 ? (double)*generated / dt : 0.0;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+    return 0;
+}
+
+/* Speculative decoding gate for the agent turn loop. Blocks are used only
+ * for fully greedy turns, only in plain text (never while DSML syntax is
+ * buffered, active, or being parsed, so a block cannot skip the per-token
+ * grammar checks that end the turn), and are capped at 8 drafts so a block
+ * that happens to enter a tool stanza cannot also complete it. Returns the
+ * accepted-token capacity (first token + drafts), or 0 to decode normally. */
+static int agent_speculative_block_cap(const agent_worker *w,
+                                       const agent_config *cfg,
+                                       const agent_stream_renderer *sr,
+                                       const agent_dsml_parser *dsml) {
+    if (cfg->gen.temperature > 0.0f) return 0;
+    if (getenv("DS4_MTP_SPEC_DISABLE") != NULL) return 0;
+    int n = ds4_engine_mtp_draft_tokens(w->engine);
+    if (n <= 1) return 0;
+    if (!sr || !dsml) return 0;
+    if (dsml->state != AGENT_DSML_SEARCH) return 0;
+    if (sr->dsml_active || sr->dsml_start_len > 0) return 0;
+    if (n > 8) n = 8;
+    return n + 1;
+}
+
 static int worker_force_generated_text(agent_worker *w,
                                        const char *text,
                                        int max_tokens,
@@ -8717,8 +8764,31 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
-                                                  &stream, err, sizeof(err)) != 0) {
+                const int spec_cap =
+                    agent_speculative_block_cap(w, cfg, &stream, &dsml);
+                if (spec_cap > 1) {
+                    int spec_toks[9];
+                    int cap = spec_cap;
+                    if (cap > (int)(sizeof(spec_toks) / sizeof(spec_toks[0])))
+                        cap = (int)(sizeof(spec_toks) / sizeof(spec_toks[0]));
+                    int ntok = ds4_session_eval_speculative_argmax(
+                            w->session, token, max_tokens - generated,
+                            ds4_token_eos(w->engine), spec_toks, cap,
+                            err, sizeof(err));
+                    if (ntok < 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err[0] ? err
+                                                  : "speculative decode failed");
+                        return 1;
+                    }
+                    for (int sj = 0; sj < ntok; sj++) {
+                        (void)worker_accept_verified_token(w, spec_toks[sj],
+                                                           &generated, t0,
+                                                           &stream);
+                    }
+                } else if (worker_accept_generated_token(w, token, &generated,
+                                                         t0, &stream, err,
+                                                         sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;

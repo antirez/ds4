@@ -26878,6 +26878,66 @@ static uint32_t metal_graph_token_adaptive_split_after_layers(
     return split_after_layers;
 }
 
+/* Batch-verifier compressor emit fusion (Wave B).
+ *
+ * The non-aligned batch compressor path runs a per-row loop whose emit rows
+ * pay ~12 tiny single-row dispatches per layer (norm, RoPE, FP8, commit, QAT
+ * and two state shifts across the attention and indexer compressors).  The
+ * decode path already fuses all of that into one bit-exact dispatch
+ * (kernel_dsv4_comp_row_finalize_f32).  This predicate gates reusing that
+ * kernel from the batch loops: it needs the same shape/type invariants as
+ * the decode fusion, must not run under prefix-frontier capture (the fused
+ * kernel also performs the ratio-4 state shifts, which capture would have to
+ * snapshot mid-loop), and skips the aligned-chunk path which is already
+ * batched.  Rollback: DS4_METAL_DISABLE_BATCH_COMP_FINALIZE_FUSE. */
+static bool metal_graph_batch_comp_fuse_defer(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer,
+        uint32_t                 ratio,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens,
+        bool                     zero_prefix) {
+#if defined(__APPLE__)
+    if (zero_prefix || ratio != 4u || !DS4_GPU_ATTN_COMP_CACHE_F16) return false;
+    /* Verify-sized blocks only: resumed-prefill chunks also reach this
+     * non-aligned batch path (arbitrary pos0 after a live checkpoint), and
+     * there the per-row fused loop would be both slower than the aligned
+     * replay and larger than the shared staging tensor can offset. */
+    if (n_tokens > (uint32_t)DS4_DSPARK_MAX_BLOCK_SIZE) return false;
+    if (!g || g->spec_capture_prefixes) return false;
+    if (g->ssd_streaming || g->ssd_streaming_cold) return false;
+    const bool aligned_chunk =
+        getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
+        !g->spec_capture_prefixes &&
+        (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+    if (aligned_chunk) return false;
+    if (DS4_N_HEAD_DIM != 512u || DS4_N_INDEXER_HEAD_DIM != 128u) return false;
+    if (!layer || !layer->attn_compressor_norm ||
+        layer->attn_compressor_norm->type != DS4_TENSOR_F32 ||
+        !layer->indexer_compressor_norm ||
+        layer->indexer_compressor_norm->type != DS4_TENSOR_F32 ||
+        !layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
+        !layer->indexer_compressor_ape) {
+        return false;
+    }
+    if (ds4_gpu_kv_rope_fp8_fuse_available() == 0) return false;
+    if (!metal_graph_ported_m5_decode_feature_enabled(
+            "DS4_METAL_DISABLE_PRE_M5_COMP_FINALIZE_FUSE",
+            "DS4_METAL_DISABLE_M5_COMP_FINALIZE_FUSE")) {
+        return false;
+    }
+    return getenv("DS4_METAL_DISABLE_BATCH_COMP_FINALIZE_FUSE") == NULL;
+#else
+    (void)g;
+    (void)layer;
+    (void)ratio;
+    (void)pos0;
+    (void)n_tokens;
+    (void)zero_prefix;
+    return false;
+#endif
+}
+
 static DS4_MAYBE_UNUSED bool metal_graph_decode_pipeline_fast_lookup_eligible(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
@@ -26906,7 +26966,18 @@ static DS4_MAYBE_UNUSED bool metal_graph_decode_pipeline_fast_lookup_eligible(
         layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_down_exps->type == DS4_TENSOR_MXFP4;
-    return mxfp4_routed && ds4_gpu_device_is_pre_m5_apple_silicon() &&
+    /* Experimental A/B: the fast cache mirrors the slow cache key
+     * ("name_nsg=%d"), so it is layout agnostic; let the IQ2_XXS/Q2_K
+     * routed layout opt in to measure the encode-time win. */
+    const bool q2_routed_opt_in =
+        getenv("DS4_METAL_ENABLE_Q2_PIPELINE_FAST_LOOKUP") != NULL &&
+        layer->ffn_gate_exps && layer->ffn_up_exps &&
+        layer->ffn_down_exps &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    return (mxfp4_routed || q2_routed_opt_in) &&
+           ds4_gpu_device_is_pre_m5_apple_silicon() &&
            getenv("DS4_METAL_DISABLE_PRE_M5_DECODE_PIPELINE_FAST_LOOKUP") == NULL;
 #else
     (void)g;
@@ -28855,6 +28926,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
                 metal_graph_attn_comp_prefill_target_free(attn_comp_target);
+            } else if (metal_graph_batch_comp_fuse_defer(g, layer, ratio,
+                                                         pos0, n_tokens,
+                                                         false)) {
+                /* Deferred: the fused per-row loop after the indexer
+                 * projections runs both compressor updates for each row and
+                 * one fused finalize per emit (see the indexer section). */
             } else {
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
@@ -28934,16 +29011,41 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
+            const bool comp_fuse_defer =
+                metal_graph_batch_comp_fuse_defer(g, layer, ratio, pos0,
+                                                  n_tokens, zero_prefix);
+            /* Under the fused per-row loop the attention compressor rows
+             * staged earlier are still unconsumed, so the indexer
+             * projections land past them in the same staging tensors. */
+            const uint64_t idx_stage_off = comp_fuse_defer
+                ? (uint64_t)n_tokens * (uint64_t)coff *
+                  (uint64_t)DS4_N_HEAD_DIM * sizeof(float)
+                : 0u;
             if (ok) {
-                ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                                 model->map,
-                                                 model->size,
-                                                 layer->indexer_compressor_kv->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 index_width,
-                                                 metal_graph_batch_attn_norm(g),
-                                                 n_tokens) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
+                ds4_gpu_tensor *idx_kv_dst = idx_stage_off
+                    ? ds4_gpu_tensor_view(metal_graph_batch_comp_kv(g),
+                                          idx_stage_off,
+                                          (uint64_t)n_tokens * index_width *
+                                              sizeof(float))
+                    : metal_graph_batch_comp_kv(g);
+                ds4_gpu_tensor *idx_sc_dst = idx_stage_off
+                    ? ds4_gpu_tensor_view(metal_graph_batch_comp_sc(g),
+                                          idx_stage_off,
+                                          (uint64_t)n_tokens * index_width *
+                                              sizeof(float))
+                    : metal_graph_batch_comp_sc(g);
+                ok = idx_kv_dst && idx_sc_dst;
+                if (ok) {
+                    ok = ds4_gpu_matmul_f16_tensor(idx_kv_dst,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->indexer_compressor_kv->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     index_width,
+                                                     metal_graph_batch_attn_norm(g),
+                                                     n_tokens) != 0;
+                }
+                if (ok) ok = ds4_gpu_matmul_f16_tensor(idx_sc_dst,
                                                          model->map,
                                                          model->size,
                                                          layer->indexer_compressor_gate->abs_offset,
@@ -28951,17 +29053,21 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          index_width,
                                                          metal_graph_batch_attn_norm(g),
                                                          n_tokens) != 0;
+                if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
+                                                      idx_kv_dst,
+                                                      (uint64_t)index_width * n_tokens,
+                                                      il,
+                                                      pos0);
+                if (ok) metal_graph_debug_dump_tensor("indexer_comp_score_raw",
+                                                      idx_sc_dst,
+                                                      (uint64_t)index_width * n_tokens,
+                                                      il,
+                                                      pos0);
+                if (idx_stage_off) {
+                    ds4_gpu_tensor_free(idx_sc_dst);
+                    ds4_gpu_tensor_free(idx_kv_dst);
+                }
             }
-            if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
-                                                  metal_graph_batch_comp_kv(g),
-                                                  (uint64_t)index_width * n_tokens,
-                                                  il,
-                                                  pos0);
-            if (ok) metal_graph_debug_dump_tensor("indexer_comp_score_raw",
-                                                  metal_graph_batch_comp_sc(g),
-                                                  (uint64_t)index_width * n_tokens,
-                                                  il,
-                                                  pos0);
             if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_indexer_q(g),
                                                           model,
                                                           layer->indexer_attn_q_b,
@@ -29156,6 +29262,137 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       pos0);
                     }
                     ds4_gpu_tensor_free(index_view);
+                } else if (comp_fuse_defer) {
+                    /* Fused per-row loop (Wave B): both compressor updates
+                     * run with deferred finalization, then each emit row is
+                     * finalized by one kernel_dsv4_comp_row_finalize_f32
+                     * dispatch — attention row on staging row 0 (decode
+                     * semantics, safe because the finalize precedes the next
+                     * emit's pool), indexer row in place, plus both ratio-4
+                     * state shifts.  Bit-exact per the kernel's contract. */
+                    const uint32_t attn_comp_width = coff * DS4_N_HEAD_DIM;
+                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                        const uint32_t pos = pos0 + t;
+                        const bool emit = ((pos + 1u) % ratio) == 0u;
+                        if (emit &&
+                            (g->layer_n_comp[il] >= g->layer_comp_cap[il] ||
+                             g->layer_n_index_comp[il] >= g->layer_comp_cap[il])) {
+                            fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
+                            ok = false;
+                            break;
+                        }
+                        const uint32_t comp_row = g->layer_n_comp[il];
+                        const uint32_t index_row = g->layer_n_index_comp[il];
+                        ds4_gpu_tensor *akv = metal_graph_tensor_row_view(
+                                metal_graph_batch_comp_kv(g), t, attn_comp_width);
+                        ds4_gpu_tensor *asc = metal_graph_tensor_row_view(
+                                metal_graph_batch_comp_sc(g), t, attn_comp_width);
+                        ok = akv && asc &&
+                             ds4_gpu_compressor_update_tensor(akv,
+                                                                asc,
+                                                                g->layer_attn_state_kv[il],
+                                                                g->layer_attn_state_score[il],
+                                                                metal_graph_attn_comp_update_target(g, il),
+                                                                model->map,
+                                                                model->size,
+                                                                layer->attn_compressor_ape->abs_offset,
+                                                                layer->attn_compressor_ape->type,
+                                                                layer->attn_compressor_norm->abs_offset,
+                                                                layer->attn_compressor_norm->type,
+                                                                DS4_N_HEAD_DIM,
+                                                                ratio,
+                                                                pos,
+                                                                metal_graph_attn_comp_update_row(comp_row),
+                                                                DS4_N_ROT,
+                                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                                freq_base,
+                                                                freq_scale,
+                                                                ext_factor,
+                                                                attn_factor,
+                                                                DS4_ROPE_YARN_BETA_FAST,
+                                                                DS4_ROPE_YARN_BETA_SLOW,
+                                                                DS4_RMS_EPS,
+                                                                false,
+                                                                false,
+                                                                true) != 0;
+                        ds4_gpu_tensor_free(asc);
+                        ds4_gpu_tensor_free(akv);
+                        if (ok) {
+                            ds4_gpu_tensor *ikv = ds4_gpu_tensor_view(
+                                    metal_graph_batch_comp_kv(g),
+                                    idx_stage_off +
+                                        (uint64_t)t * index_width * sizeof(float),
+                                    (uint64_t)index_width * sizeof(float));
+                            ds4_gpu_tensor *isc = ds4_gpu_tensor_view(
+                                    metal_graph_batch_comp_sc(g),
+                                    idx_stage_off +
+                                        (uint64_t)t * index_width * sizeof(float),
+                                    (uint64_t)index_width * sizeof(float));
+                            ok = ikv && isc &&
+                                 ds4_gpu_compressor_update_tensor(ikv,
+                                                                    isc,
+                                                                    g->layer_index_state_kv[il],
+                                                                    g->layer_index_state_score[il],
+                                                                    g->layer_index_comp_cache[il],
+                                                                    model->map,
+                                                                    model->size,
+                                                                    layer->indexer_compressor_ape->abs_offset,
+                                                                    layer->indexer_compressor_ape->type,
+                                                                    layer->indexer_compressor_norm->abs_offset,
+                                                                    layer->indexer_compressor_norm->type,
+                                                                    DS4_N_INDEXER_HEAD_DIM,
+                                                                    ratio,
+                                                                    pos,
+                                                                    index_row,
+                                                                    DS4_N_ROT,
+                                                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                                    freq_base,
+                                                                    freq_scale,
+                                                                    ext_factor,
+                                                                    attn_factor,
+                                                                    DS4_ROPE_YARN_BETA_FAST,
+                                                                    DS4_ROPE_YARN_BETA_SLOW,
+                                                                    DS4_RMS_EPS,
+                                                                    false,
+                                                                    false,
+                                                                    true) != 0;
+                            ds4_gpu_tensor_free(isc);
+                            ds4_gpu_tensor_free(ikv);
+                        }
+                        if (ok && emit) {
+                            ok = ds4_gpu_dsv4_comp_row_finalize_tensor(
+                                    metal_graph_attn_comp_stage(g),
+                                    g->layer_attn_comp_cache[il],
+                                    comp_row,
+                                    layer->attn_compressor_norm->abs_offset,
+                                    g->layer_index_comp_cache[il],
+                                    index_row,
+                                    layer->indexer_compressor_norm->abs_offset,
+                                    g->layer_attn_state_kv[il],
+                                    g->layer_attn_state_score[il],
+                                    g->layer_index_state_kv[il],
+                                    g->layer_index_state_score[il],
+                                    model->map,
+                                    model->size,
+                                    pos + 1u - ratio,
+                                    DS4_N_ROT,
+                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0u,
+                                    freq_base,
+                                    freq_scale,
+                                    ext_factor,
+                                    attn_factor,
+                                    DS4_ROPE_YARN_BETA_FAST,
+                                    DS4_ROPE_YARN_BETA_SLOW,
+                                    DS4_RMS_EPS) == 1;
+                        }
+                        if (ok && emit) {
+                            g->layer_n_comp[il]++;
+                            g->layer_n_index_comp[il]++;
+                        }
+                        if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
+                        if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
+                    }
+                    n_comp = g->layer_n_comp[il];
                 } else {
                     for (uint32_t t = 0; ok && t < n_tokens; t++) {
                         const uint32_t pos = pos0 + t;
@@ -35336,6 +35573,7 @@ static bool metal_graph_prefill_chunked(
 typedef struct ds4_verify_suffix_timing {
     double upload_ms;
     double layer_ms;
+    double gpu_busy_ms; /* GPU-side share of layer_ms; needs DS4_METAL_GPU_BUSY_PROFILE */
     double head_ms;
     double read_ms;
     bool fused_head;
@@ -35410,6 +35648,10 @@ static bool metal_graph_verify_suffix_tops_impl(
                         n_tokens <= (uint32_t)DS4_TP_BATCH_MAX_ROWS)
                        ? n_tokens : 0;
     const double layer_t0 = timing ? now_sec() : 0.0;
+#if defined(__APPLE__)
+    const double layer_busy_t0 =
+        timing ? ds4_gpu_busy_profile_seconds() : 0.0;
+#endif
     ok = ds4_gpu_begin_commands() != 0;
     const bool dspark_capture_active =
         ok &&
@@ -35457,8 +35699,14 @@ static bool metal_graph_verify_suffix_tops_impl(
 #if defined(__APPLE__)
         /* Tiny DFlash batches are expensive enough to keep Metal busy while
          * the host encodes the next layers. Submit short prefixes to overlap
-         * that work without changing the verifier's kernels or arithmetic. */
-        if (ok && capture_dspark_hidden && !verify_profile &&
+         * that work without changing the verifier's kernels or arithmetic.
+         * Experimental: the same overlap applies to every small verify block
+         * (n-gram speculation runs with capture off), so do not require the
+         * DSpark hidden-state capture; DS4_METAL_DISABLE_SPEC_VERIFY_FLUSH
+         * restores the old capture-only behavior for A/B runs. */
+        if (ok && (capture_dspark_hidden ||
+                   getenv("DS4_METAL_DISABLE_SPEC_VERIFY_FLUSH") == NULL) &&
+            !verify_profile &&
             !selected_profile && g->tp_world != 2 &&
             ((il + 1u) % 4u) == 0u) {
             ok = ds4_gpu_flush_commands() != 0;
@@ -35492,7 +35740,13 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (!ok && dspark_capture_active) {
         metal_graph_dspark_capture_invalidate(g);
     }
-    if (timing) timing->layer_ms += (now_sec() - layer_t0) * 1000.0;
+    if (timing) {
+        timing->layer_ms += (now_sec() - layer_t0) * 1000.0;
+#if defined(__APPLE__)
+        timing->gpu_busy_ms +=
+            (ds4_gpu_busy_profile_seconds() - layer_busy_t0) * 1000.0;
+#endif
+    }
     if (!ok) return false;
     if (selected_profile) {
         metal_graph_selected_profile_summary_impl(
@@ -49260,6 +49514,7 @@ typedef struct ds4_dspark_spec_stats {
     double verify_ms;
     double verify_upload_ms;
     double verify_layer_ms;
+    double verify_gpu_busy_ms;
     double verify_head_ms;
     double verify_read_ms;
     uint64_t verifier_fused_head;
@@ -50982,6 +51237,24 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
         e->dspark &&
         e->dspark_weights.block_size > 1) {
         return (int)e->dspark_weights.block_size;
+    }
+    /* Experimental n-gram (prompt-lookup) speculation drives the same
+     * speculative entry points without any support model.  DS4_NGRAM_SPEC=N
+     * sets the draft block size.  --quality keeps target-only decoding,
+     * matching the DSpark contract. */
+    if (e &&
+        e->backend != DS4_BACKEND_CPU &&
+        e->distributed.role == DS4_DISTRIBUTED_NONE &&
+        e->support_kind == DS4_SUPPORT_NONE &&
+        !e->quality &&
+        !e->ssd_streaming &&
+        !e->tp.active) {
+        const char *env = getenv("DS4_NGRAM_SPEC");
+        if (env && env[0]) {
+            int n = atoi(env);
+            if (n > DS4_DSPARK_MAX_BLOCK_SIZE) n = DS4_DSPARK_MAX_BLOCK_SIZE;
+            if (n > 1) return n;
+        }
     }
 #endif
     return 0;
@@ -58421,7 +58694,8 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "prop_chain=%.3f prop_hidden=%.3f prop_conf0=%.3f "
             "prop_logits=%.3f prop_markov=%.3f prop_confidence=%.3f "
             "snapshot=%.3f verify=%.3f verify_upload=%.3f "
-            "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
+            "verify_layer=%.3f verify_gpu_busy=%.3f "
+            "verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
             "target=%.3f saved=%.3f net_saved=%.3f "
             "draft_len_hist=%s accepted_len_hist=%s\n",
@@ -58458,6 +58732,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             st->verify_ms,
             st->verify_upload_ms,
             st->verify_layer_ms,
+            st->verify_gpu_busy_ms,
             st->verify_head_ms,
             st->verify_read_ms,
             (unsigned long long)st->verifier_fused_head,
@@ -58637,6 +58912,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     const bool need_spec_verifier =
         e->mtp_ready ||
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) ||
+        (e->support_kind == DS4_SUPPORT_NONE &&
+         getenv("DS4_NGRAM_SPEC") != NULL) ||
         e->tp.active; /* TP worker mirrors the leader's verify blocks */
     const int *placement = e->multi_tier ? e->placement : NULL;
     const ds4_gpu_graph *shared_prefill_workspace =
@@ -62745,6 +63022,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
             s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
             s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
             s->dspark_stats.verify_layer_ms += verify_timing.layer_ms;
+            s->dspark_stats.verify_gpu_busy_ms += verify_timing.gpu_busy_ms;
             s->dspark_stats.verify_head_ms += verify_timing.head_ms;
             s->dspark_stats.verify_read_ms += verify_timing.read_ms;
             if (verify_timing.fused_head) {
@@ -63009,6 +63287,375 @@ static int ds4_session_eval_dspark_speculative_argmax(
     DS4_DSPARK_STATS_FINISH();
 #undef DS4_DSPARK_SCHED_EXTRA_MS
 #undef DS4_DSPARK_STATS_FINISH
+    return n_accept;
+}
+
+/* -------------------------------------------------------------------------
+ * Experimental n-gram (prompt-lookup) speculation.
+ *
+ * Drafts come from the session token history instead of a support model:
+ * when the tail of the transcript repeats an earlier n-gram, the tokens
+ * that followed that occurrence are proposed and checked with the same
+ * batched verifier used by DSpark.  A missing draft costs nothing, no
+ * support GGUF is needed, and greedy output is exact by construction:
+ * every committed token equals the target argmax.  Opt-in via
+ * DS4_NGRAM_SPEC=N (block size, 2..16; 5 keeps partial accepts on the
+ * cheap prefix-frontier path).  DS4_NGRAM_MIN_MATCH=M sets the minimum
+ * suffix match (default 3).  Stats reuse the DSpark counters, so run with
+ * DS4_DSPARK_STATS=1 to see acceptance rates. */
+
+static int ds4_ngram_spec_tokens(void) {
+    const char *env = getenv("DS4_NGRAM_SPEC");
+    if (!env || !env[0]) return 0;
+    int n = atoi(env);
+    if (n < 2) return 0;
+    if (n > DS4_DSPARK_MAX_BLOCK_SIZE) n = DS4_DSPARK_MAX_BLOCK_SIZE;
+    return n;
+}
+
+static int ds4_ngram_min_match(void) {
+    const char *env = getenv("DS4_NGRAM_MIN_MATCH");
+    int n = (env && env[0]) ? atoi(env) : 3;
+    if (n < 1) n = 1;
+    if (n > 16) n = 16;
+    return n;
+}
+
+/* Longest-then-most-recent suffix match over the token history; copies up
+ * to draft_cap continuation tokens into drafts.  O(len * max_match) worst
+ * case, sub-millisecond at the context sizes this prototype targets. */
+static int ds4_ngram_propose(const ds4_tokens *tokens, int min_match,
+                             int draft_cap, int *drafts) {
+    if (!tokens || !tokens->v || draft_cap <= 0) return 0;
+    const int len = tokens->len;
+    if (len < min_match + 1) return 0;
+    const int *v = tokens->v;
+    const int max_match = 24;
+    int best_len = 0;
+    int best_pos = -1; /* exclusive end of the earlier occurrence */
+    for (int i = len - 1; i >= min_match; i--) {
+        if (v[i - 1] != v[len - 1]) continue;
+        int k = 1;
+        while (k < max_match && k < i && v[i - 1 - k] == v[len - 1 - k]) k++;
+        if (k >= min_match && k > best_len) {
+            best_len = k;
+            best_pos = i;
+            if (k >= max_match) break;
+        }
+    }
+    if (best_pos < 0) return 0;
+    int n = len - best_pos;
+    if (n > draft_cap) n = draft_cap;
+    /* Measured on M1 Ultra: with the current ~110 ms fixed verify cost the
+     * profitable regime is full-length high-confidence blocks; truncating
+     * weak matches to the prefix-slot window multiplied low-yield verifies
+     * and lost ~13% end-to-end, so drafts always use the full cap. */
+    for (int j = 0; j < n; j++) drafts[j] = v[best_pos + j];
+    return n;
+}
+
+static int ds4_session_eval_ngram_speculative_argmax(
+        ds4_session *s,
+        int          n_accept,
+        int          max_tokens,
+        int          eos_token,
+        int         *accepted,
+        int          accepted_cap,
+        char        *err,
+        size_t       errlen) {
+    const bool spec_log = getenv("DS4_NGRAM_SPEC_LOG") != NULL;
+    const bool stats_enabled = s && ds4_dspark_stats_enabled();
+    const double stats_t0 = stats_enabled ? now_sec() : 0.0;
+#define DS4_NGRAM_STATS_FINISH() do {                                       \
+        if (stats_enabled) {                                                \
+            s->dspark_stats.total_ms += (now_sec() - stats_t0) * 1000.0;    \
+        }                                                                   \
+    } while (0)
+    if (stats_enabled) {
+        s->dspark_stats.cycles++;
+        if (n_accept > 0) s->dspark_stats.first_tokens++;
+    }
+
+    int draft_cap = ds4_ngram_spec_tokens();
+    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
+    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
+    const int room = s->ctx_size - s->checkpoint.len;
+    if (draft_cap > room - 1) draft_cap = room - 1;
+    if (draft_cap < 2) {
+        if (stats_enabled) {
+            s->dspark_stats.no_room++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        DS4_NGRAM_STATS_FINISH();
+        return n_accept;
+    }
+
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    int draft_n;
+    /* Test hook: DS4_NGRAM_FAKE_PROPOSAL forces a verify on every token.
+     * The first draft is the live argmax (always passes the free check) and
+     * the rest are throwaway ids, so exactly one token commits per cycle:
+     * the output stream matches plain greedy decode while the verifier runs
+     * at full block width each step.  This is the harness for benchmarking
+     * and bit-comparing verifier implementations. */
+    if (getenv("DS4_NGRAM_FAKE_PROPOSAL") != NULL) {
+        draft_n = draft_cap;
+        drafts[0] = sample_argmax(s->logits, DS4_N_VOCAB);
+        for (int i = 1; i < draft_n; i++) {
+            drafts[i] = (drafts[0] + i) % (int)DS4_N_VOCAB;
+        }
+    } else {
+        draft_n = ds4_ngram_propose(&s->checkpoint, ds4_ngram_min_match(),
+                                    draft_cap, drafts);
+    }
+    /* Never draft across a stop or thinking-control token: the history the
+     * n-gram copies from contains previous turn boundaries, and committing
+     * one mid-block would leave overshoot tokens in the live KV that
+     * incremental callers (the agent) cannot cheaply retract. The real stop
+     * is left for the caller to sample and handle before any eval. */
+    for (int i = 0; i < draft_n; i++) {
+        if (ds4_token_is_stop(s->engine, drafts[i]) ||
+            ds4_token_is_thinking_control(s->engine, drafts[i])) {
+            draft_n = i;
+            break;
+        }
+    }
+    /* A single-token draft is exactly one ordinary decode; only blocks of
+     * two or more repay the batched verifier. */
+    if (draft_n < 2) {
+        if (stats_enabled) {
+            s->dspark_stats.no_draft++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        if (spec_log) fprintf(stderr, "ds4: ngram spec skip no-draft\n");
+        DS4_NGRAM_STATS_FINISH();
+        return n_accept;
+    }
+    if (stats_enabled) {
+        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
+                                  (uint32_t)draft_n);
+    }
+
+    /* The live logits already score the next position: the first draft is
+     * checked for free, and an EOS continuation is left to the caller. */
+    const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+    if (target_top != drafts[0] || drafts[0] == eos_token) {
+        if (stats_enabled) {
+            s->dspark_stats.first_misses++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        if (spec_log) {
+            fprintf(stderr, "ds4: ngram spec miss first draft=%d base=%d\n",
+                    drafts[0], target_top);
+        }
+        DS4_NGRAM_STATS_FINISH();
+        return n_accept;
+    }
+
+    ds4_engine *e = s->engine;
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    int row_tops_buf[DS4_DSPARK_MAX_BLOCK_SIZE];
+    int *row_tops = row_tops_buf;
+    float *row_logits = s->spec_row_logits;
+    const int start = s->checkpoint.len;
+    bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    bool ok = have_frontier && row_logits != NULL;
+    bool verifier_may_have_mutated = false;
+    if (ok) {
+        for (int i = 0; i < draft_n; i++) {
+            token_vec_push(&s->checkpoint, drafts[i]);
+        }
+        verifier_may_have_mutated = true;
+        ds4_verify_suffix_timing verify_timing;
+        const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+        ok = metal_graph_verify_suffix_tops(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            &s->checkpoint,
+                                            (uint32_t)start,
+                                            (uint32_t)draft_n,
+                                            draft_n <=
+                                                (int)DS4_SPEC_PREFIX_SLOTS + 1,
+                                            false,
+                                            row_tops,
+                                            NULL,
+                                            stats_enabled ? &verify_timing
+                                                          : NULL);
+        if (stats_enabled) {
+            s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
+            s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
+            s->dspark_stats.verify_layer_ms += verify_timing.layer_ms;
+            s->dspark_stats.verify_gpu_busy_ms += verify_timing.gpu_busy_ms;
+            s->dspark_stats.verify_head_ms += verify_timing.head_ms;
+            s->dspark_stats.verify_read_ms += verify_timing.read_ms;
+        }
+    }
+
+    int commit_drafts = 0;
+    if (ok) {
+        commit_drafts = 1;
+        for (int i = 1; i < draft_n; i++) {
+            if (row_tops[i - 1] != drafts[i]) break;
+            commit_drafts++;
+        }
+    }
+
+    bool final_logits_ok = false;
+    if (ok && commit_drafts == draft_n) {
+        final_logits_ok = metal_graph_read_spec_logits_row(
+                &s->graph, (uint32_t)(draft_n - 1), row_logits);
+    }
+    if (ok && commit_drafts == draft_n && final_logits_ok) {
+        memcpy(s->logits, row_logits,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        int emitted = 0;
+        for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+            accepted[n_accept++] = drafts[i];
+            emitted++;
+            if (drafts[i] == eos_token) break;
+        }
+        s->checkpoint_valid = true;
+        if (stats_enabled) {
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.direct_full_commits++;
+            s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                      (uint32_t)emitted);
+        }
+        if (spec_log) {
+            fprintf(stderr, "ds4: ngram spec direct-full drafted=%d accepted=%d\n",
+                    draft_n, n_accept);
+        }
+        spec_frontier_free(&frontier);
+        DS4_NGRAM_STATS_FINISH();
+        return n_accept;
+    }
+
+    if (ok && commit_drafts > 0 && commit_drafts < draft_n &&
+        commit_drafts <= (int)DS4_SPEC_PREFIX_SLOTS) {
+        bool prefix_ok = metal_graph_read_spec_logits_row(
+                &s->graph, (uint32_t)(commit_drafts - 1), row_logits);
+        s->checkpoint.len = start;
+        if (prefix_ok) {
+            prefix_ok = spec_frontier_commit_prefix(s, (uint32_t)commit_drafts);
+        }
+        if (prefix_ok) {
+            memcpy(s->logits, row_logits,
+                   (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+            int emitted = 0;
+            for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+                token_vec_push(&s->checkpoint, drafts[i]);
+                accepted[n_accept++] = drafts[i];
+                emitted++;
+                if (drafts[i] == eos_token) break;
+            }
+            s->checkpoint_valid = true;
+            if (stats_enabled) {
+                s->dspark_stats.partial_accepts++;
+                s->dspark_stats.direct_partial_commits++;
+                s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                          (uint32_t)emitted);
+            }
+            if (spec_log) {
+                fprintf(stderr,
+                        "ds4: ngram spec direct-partial drafted=%d committed=%d accepted=%d\n",
+                        draft_n, emitted, n_accept);
+            }
+            spec_frontier_free(&frontier);
+            DS4_NGRAM_STATS_FINISH();
+            return n_accept;
+        }
+    }
+
+    if (verifier_may_have_mutated) {
+        s->checkpoint.len = start;
+        if (!have_frontier || !spec_frontier_restore(&frontier, s)) {
+            snprintf(err, errlen, "ngram verifier rollback failed");
+            s->checkpoint_valid = false;
+            if (stats_enabled) {
+                s->dspark_stats.verifier_errors++;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            }
+            spec_frontier_free(&frontier);
+            DS4_NGRAM_STATS_FINISH();
+            return -1;
+        }
+    }
+
+    if (!ok) {
+        if (stats_enabled) {
+            s->dspark_stats.verifier_unavailable++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        if (spec_log) fprintf(stderr, "ds4: ngram spec verifier unavailable\n");
+        spec_frontier_free(&frontier);
+        DS4_NGRAM_STATS_FINISH();
+        return n_accept;
+    }
+
+    /* Rollback happened above; replay the verified prefix through ordinary
+     * decode so the committed state matches one-token execution exactly. */
+    int replay_budget = commit_drafts;
+    if (replay_budget > accepted_cap - n_accept) {
+        replay_budget = accepted_cap - n_accept;
+    }
+    if (replay_budget < 0) replay_budget = 0;
+    for (int i = 0; i < replay_budget; i++) {
+        if (drafts[i] == eos_token) { replay_budget = i + 1; break; }
+    }
+    int replayed = 0;
+    if (stats_enabled && replay_budget > 0) {
+        s->dspark_stats.replay_fallbacks++;
+    }
+    for (int i = 0; i < replay_budget; i++) {
+        ok = metal_graph_eval_token_raw_swa(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            drafts[i],
+                                            (uint32_t)s->checkpoint.len,
+                                            row_logits);
+        if (!ok) {
+            snprintf(err, errlen, "%s decode failed",
+                     ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            if (stats_enabled) {
+                s->dspark_stats.verifier_errors++;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            }
+            spec_frontier_free(&frontier);
+            DS4_NGRAM_STATS_FINISH();
+            return -1;
+        }
+        token_vec_push(&s->checkpoint, drafts[i]);
+        accepted[n_accept++] = drafts[i];
+        replayed++;
+        if (drafts[i] == eos_token) break;
+    }
+    if (replayed > 0) {
+        memcpy(s->logits, row_logits,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->checkpoint_valid = true;
+        if (stats_enabled) {
+            if (replayed == draft_n) s->dspark_stats.full_accepts++;
+            else s->dspark_stats.partial_accepts++;
+            s->dspark_stats.accepted_draft_tokens += (uint64_t)replayed;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                      (uint32_t)replayed);
+        }
+    } else if (stats_enabled) {
+        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+    }
+    if (spec_log) {
+        fprintf(stderr,
+                "ds4: ngram spec partial drafted=%d verified=%d accepted=%d\n",
+                draft_n, commit_drafts, n_accept);
+    }
+    spec_frontier_free(&frontier);
+    DS4_NGRAM_STATS_FINISH();
+#undef DS4_NGRAM_STATS_FINISH
     return n_accept;
 }
 #endif
@@ -66055,6 +66702,24 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                           accepted_cap,
                                                           err,
                                                           errlen);
+    }
+
+    if (e->support_kind == DS4_SUPPORT_NONE &&
+        !e->mtp_ready && !e->tp.active && !s->distributed &&
+        !e->quality &&
+        /* The spec verifier machinery is not provisioned under SSD
+         * streaming (measured: every block reports verifier_unavailable),
+         * so skip the proposal work entirely there. */
+        !e->ssd_streaming &&
+        ds4_ngram_spec_tokens() > 1) {
+        return ds4_session_eval_ngram_speculative_argmax(s,
+                                                         n_accept,
+                                                         max_tokens,
+                                                         eos_token,
+                                                         accepted,
+                                                         accepted_cap,
+                                                         err,
+                                                         errlen);
     }
 
     if (metal_graph_cuda_splitkv_spec_requested() &&

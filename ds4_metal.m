@@ -988,6 +988,13 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+/* Cumulative GPU busy seconds recorded by DS4_METAL_GPU_BUSY_PROFILE.
+ * Callers sample it around a section to split CPU-encode time from GPU
+ * execution time; returns 0 deltas when the profile env is unset. */
+double ds4_gpu_busy_profile_seconds(void) {
+    return g_gpu_busy_accum;
+}
+
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
  * buffers that another in-flight command buffer might still reference; bound
@@ -1215,6 +1222,7 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
 }
 
 static int ds4_gpu_device_name_contains(const char *needle);
+static int ds4_gpu_device_is_m3_class(void);
 
 static int ds4_gpu_use_m5_private_scratch(void) {
     static int initialized;
@@ -2012,7 +2020,7 @@ static int ds4_gpu_zero_prefix_prefill_mask_cache_enabled(void) {
         getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL) {
         return 0;
     }
-    return ds4_gpu_device_name_contains("M3");
+    return ds4_gpu_device_is_m3_class();
 }
 
 static ds4_gpu_zero_prefix_prefill_mask_cache_entry *
@@ -2386,6 +2394,50 @@ int ds4_gpu_device_is_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
+/* Experimental A/B switch: treat every pre-M5 device like M3 for the decode
+ * and prefill fusion gates that were only ever validated on M3-class
+ * hardware.  Opt-in via DS4_METAL_WIDEN_M3_GATES=1; each widened fusion
+ * keeps its own DS4_METAL_DISABLE_* rollback so regressions can be bisected
+ * per gate with the bit-exact schedule bench. */
+static int ds4_gpu_device_is_m3_class(void) {
+    /* No caching: the schedule bench flips candidate envs in-process, and
+     * every existing gate re-reads its env on each call for the same reason.
+     * Value-sensitive so DS4_METAL_WIDEN_M3_GATES=0 disables the
+     * device-default applied below on M1/M2. */
+    if (ds4_gpu_env_bool("DS4_METAL_WIDEN_M3_GATES") > 0 &&
+        ds4_gpu_device_is_pre_m5_apple_silicon()) {
+        return 1;
+    }
+    return ds4_gpu_device_name_contains("M3");
+}
+
+/* Per-device default tuning, applied once the Metal device name is known.
+ * setenv(..., overwrite=0) means anything the user exported explicitly
+ * always wins; DS4_NO_DEVICE_DEFAULTS=1 skips the whole block (pure
+ * upstream behavior). Values below were measured on an M1 Ultra (see
+ * EXPERIMENTS_M1_ULTRA.md): the widened fusion tier is bit-exact-verified,
+ * the 2/8 token split beats the M3-tuned adaptive schedule, and n-gram
+ * speculation with min-match 6 is the thinking-safe setting. M3/M4/M5 keep
+ * upstream defaults until someone measures equivalents there. */
+static void ds4_gpu_apply_device_default_env(void) {
+    if (getenv("DS4_NO_DEVICE_DEFAULTS") != NULL) return;
+    const int m1_class =
+        strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
+        (g_metal_device_name[7] == '1' || g_metal_device_name[7] == '2') &&
+        (g_metal_device_name[8] == '\0' || g_metal_device_name[8] == ' ');
+    if (!m1_class) return;
+    setenv("DS4_METAL_WIDEN_M3_GATES", "1", 0);
+    setenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS", "2", 0);
+    setenv("DS4_METAL_GRAPH_TOKEN_SECOND_SPLIT_LAYERS", "8", 0);
+    setenv("DS4_NGRAM_SPEC", "8", 0);
+    setenv("DS4_NGRAM_MIN_MATCH", "6", 0);
+    fprintf(stderr,
+            "ds4: %s defaults applied (widen M3 gates, token split 2/8, "
+            "ngram spec 8/6); explicit env vars win, "
+            "DS4_NO_DEVICE_DEFAULTS=1 disables\n",
+            g_metal_device_name);
+}
+
 static bool ds4_gpu_ported_m5_decode_feature_enabled(
         const char *pre_m5_disable_env,
         const char *m5_disable_env) {
@@ -2466,6 +2518,7 @@ static void ds4_gpu_detect_metal4_features(void) {
     if (name) {
         snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
     }
+    ds4_gpu_apply_device_default_env();
 
     const int metal4_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_METAL4") > 0;
 
@@ -3412,7 +3465,7 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_is_m3_class() && !ds4_gpu_device_name_contains("M5")) return 0;
     return 1;
 }
 
@@ -5055,7 +5108,37 @@ static int16_t ds4_gpu_mv_ext_nxpsg(uint64_t in_dim, uint64_t n_tok) {
     return 4;
 }
 
+/* r1=6..8 variants keep grid.y at 1 for verify-sized blocks so dense weights
+ * stream once. Measured on M1 Ultra they LOSE ~25% verify throughput despite
+ * being bit-identical: the historical two grid.y slices run concurrently
+ * across cores while r1=8 halves the threadgroup count and spills registers
+ * (8 accumulators per thread). Opt-in via DS4_METAL_ENABLE_MV_EXT_WIDE for
+ * re-testing on wider-register devices (cached; not flippable mid-process). */
+static int ds4_gpu_mv_ext_wide_rows_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_ENABLE_MV_EXT_WIDE") != NULL ? 1 : 0;
+    }
+    return enabled;
+}
+
+/* The tiny routed-MoE kernels carry the token index in their grid, so the
+ * historical n<=5 / n<=4 gates were coverage limits, not kernel limits.
+ * Widening them to 8 keeps 6..8-row verify blocks off the generic mv path
+ * (two x reads, split gate/up, separate down reduce).
+ * DS4_METAL_DISABLE_MOE_TINY_WIDE restores the old gates (cached). */
+static int ds4_gpu_moe_tiny_wide_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_DISABLE_MOE_TINY_WIDE") == NULL ? 1 : 0;
+    }
+    return enabled;
+}
+
 static int16_t ds4_gpu_mv_ext_r1ptg(uint64_t n_tok) {
+    if (n_tok >= 6 && n_tok <= 8 && ds4_gpu_mv_ext_wide_rows_enabled()) {
+        return (int16_t)n_tok;
+    }
     switch (n_tok) {
     case 2: return 2;
     case 3:
@@ -5075,6 +5158,9 @@ static const char *ds4_gpu_mv_ext_name(int q8, int16_t r1ptg) {
         case 3: return "kernel_mul_mv_ext_q8_0_f32_r1_3";
         case 4: return "kernel_mul_mv_ext_q8_0_f32_r1_4";
         case 5: return "kernel_mul_mv_ext_q8_0_f32_r1_5";
+        case 6: return "kernel_mul_mv_ext_q8_0_f32_r1_6";
+        case 7: return "kernel_mul_mv_ext_q8_0_f32_r1_7";
+        case 8: return "kernel_mul_mv_ext_q8_0_f32_r1_8";
         default: return NULL;
         }
     }
@@ -5084,6 +5170,9 @@ static const char *ds4_gpu_mv_ext_name(int q8, int16_t r1ptg) {
     case 3: return "kernel_mul_mv_ext_f16_f32_r1_3";
     case 4: return "kernel_mul_mv_ext_f16_f32_r1_4";
     case 5: return "kernel_mul_mv_ext_f16_f32_r1_5";
+    case 6: return "kernel_mul_mv_ext_f16_f32_r1_6";
+    case 7: return "kernel_mul_mv_ext_f16_f32_r1_7";
+    case 8: return "kernel_mul_mv_ext_f16_f32_r1_8";
     default: return NULL;
     }
 }
@@ -5706,7 +5795,7 @@ static int ds4_gpu_encode_rope_tail_inplace(
         getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") == NULL &&
         args->mode == 0 && !args->src2 &&
         lane_compatible &&
-        (ds4_gpu_device_name_contains("M3") ||
+        (ds4_gpu_device_is_m3_class() ||
          (ds4_gpu_device_name_contains("M5") && n_tok == 1u));
     const bool use_shared_coeff =
         use_inplace_pair &&
@@ -5723,7 +5812,7 @@ static int ds4_gpu_encode_rope_tail_inplace(
         g_rope_tail_inplace_pair_affine_pipeline != nil &&
         getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") == NULL &&
         n_tok == 1u &&
-        (ds4_gpu_device_name_contains("M3") ||
+        (ds4_gpu_device_is_m3_class() ||
          ds4_gpu_device_name_contains("M5"));
 
     int32_t pos_stack[256];
@@ -12745,6 +12834,12 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         g_stream_expert_cache_slab_slot_count[slab] = slots;
         g_stream_expert_cache_slab_slots_used[slab] = 0;
         g_stream_expert_cache_slab_total_slots += slots;
+        /* Measured dead end (M1 Ultra, MXFP4 streaming): bulk-mlocking the
+         * whole slab here to avoid the per-slot mlock on handout is
+         * throughput-neutral — the per-slot lock runs on the async loader
+         * threads, off the token critical path — while doubling the total
+         * mlock work (fresh pages pay zero-fill wiring).  Keep the lazy
+         * per-slot locking. */
     }
 
     const uint32_t local_slot = g_stream_expert_cache_slab_slots_used[slab]++;
@@ -14423,6 +14518,16 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
     *up_inner = 0;
     *down_inner = 0;
 
+    /* Diagnostic split of the prepare cost (DS4_METAL_STREAM_PREPARE_SUBPROFILE):
+     * own-entry handling (inflight waits + clears) vs the reusable-slot
+     * search.  Static accumulators are racy across loader threads, which is
+     * acceptable for an attribution profile. */
+    static double g_prep_sub_own_ms, g_prep_sub_take_ms;
+    static uint64_t g_prep_sub_calls;
+    const int prep_subprof =
+        getenv("DS4_METAL_STREAM_PREPARE_SUBPROFILE") != NULL;
+    const double prep_sub_t0 = prep_subprof ? ds4_gpu_now_ms() : 0.0;
+
     ds4_gpu_stream_expert_reusable_buffers reuse = { nil, nil, nil, 0, 0, 0 };
     ds4_gpu_stream_expert_cache_entry *e =
         &g_stream_expert_cache[layer][expert];
@@ -14452,6 +14557,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
 
+    const double prep_sub_t1 = prep_subprof ? ds4_gpu_now_ms() : 0.0;
     if (!reuse.gate_buffer || !reuse.up_buffer || !reuse.down_buffer) {
         if (!ds4_gpu_stream_expert_cache_take_reusable(force_reuse,
                                                        protect_layer,
@@ -14465,6 +14571,24 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             reuse.down_buffer = nil;
         }
     }
+    static double g_prep_sub_reusefound_ms;
+    static uint64_t g_prep_sub_reusefound;
+    if (prep_subprof) {
+        const double prep_sub_t2 = ds4_gpu_now_ms();
+        g_prep_sub_own_ms += prep_sub_t1 - prep_sub_t0;
+        g_prep_sub_take_ms += prep_sub_t2 - prep_sub_t1;
+        if ((++g_prep_sub_calls % 2000ull) == 0) {
+            fprintf(stderr,
+                    "ds4: prepare subprofile calls=%llu own_avg=%.3f ms take_avg=%.3f ms reuse_found=%llu reuse_found_total_avg=%.3f ms\n",
+                    (unsigned long long)g_prep_sub_calls,
+                    g_prep_sub_own_ms / (double)g_prep_sub_calls,
+                    g_prep_sub_take_ms / (double)g_prep_sub_calls,
+                    (unsigned long long)g_prep_sub_reusefound,
+                    g_prep_sub_reusefound ?
+                        g_prep_sub_reusefound_ms /
+                            (double)g_prep_sub_reusefound : 0.0);
+        }
+    }
 
     if (reuse.gate_buffer && reuse.up_buffer && reuse.down_buffer) {
         *gate_buf = reuse.gate_buffer;
@@ -14473,8 +14597,44 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         *gate_inner = reuse.gate_inner;
         *up_inner = reuse.up_inner;
         *down_inner = reuse.down_inner;
+        if (prep_subprof) {
+            g_prep_sub_reusefound++;
+            g_prep_sub_reusefound_ms += ds4_gpu_now_ms() - prep_sub_t0;
+        }
         return 1;
     }
+
+    static uint64_t g_prep_tail_n[5];
+    static double g_prep_tail_ms[5];
+#define DS4_PREP_TAIL_NOTE(idx) do {                                        \
+        if (prep_subprof) {                                                 \
+            g_prep_tail_n[(idx)]++;                                        \
+            g_prep_tail_ms[(idx)] += ds4_gpu_now_ms() - prep_sub_t0;       \
+            if (((g_prep_tail_n[0] + g_prep_tail_n[1] + g_prep_tail_n[2] + \
+                  g_prep_tail_n[3] + g_prep_tail_n[4]) % 2000ull) == 0) {  \
+                fprintf(stderr,                                             \
+                        "ds4: prepare tail capped=%llu/%.3f slab=%llu/%.3f " \
+                        "combined=%llu/%.3f explicit=%llu/%.3f fail=%llu/%.3f (n/avg ms) " \
+                        "mlock_ms=%.1f free_slots=%u total_slots=%u used_last=%u\n", \
+                        (unsigned long long)g_prep_tail_n[0],              \
+                        g_prep_tail_n[0] ? g_prep_tail_ms[0] / g_prep_tail_n[0] : 0.0, \
+                        (unsigned long long)g_prep_tail_n[1],              \
+                        g_prep_tail_n[1] ? g_prep_tail_ms[1] / g_prep_tail_n[1] : 0.0, \
+                        (unsigned long long)g_prep_tail_n[2],              \
+                        g_prep_tail_n[2] ? g_prep_tail_ms[2] / g_prep_tail_n[2] : 0.0, \
+                        (unsigned long long)g_prep_tail_n[3],              \
+                        g_prep_tail_n[3] ? g_prep_tail_ms[3] / g_prep_tail_n[3] : 0.0, \
+                        (unsigned long long)g_prep_tail_n[4],              \
+                        g_prep_tail_n[4] ? g_prep_tail_ms[4] / g_prep_tail_n[4] : 0.0, \
+                        g_stream_expert_cache_mlock_ms,                    \
+                        g_stream_expert_cache_free_slot_count,             \
+                        g_stream_expert_cache_slab_total_slots,            \
+                        g_stream_expert_cache_slab_count ?                 \
+                            g_stream_expert_cache_slab_slots_used[         \
+                                g_stream_expert_cache_slab_count - 1] : 0u); \
+            }                                                               \
+        }                                                                   \
+    } while (0)
 
     if (ds4_gpu_stream_expert_combined_buffer_enabled()) {
         if (gate_expert_bytes > UINT64_MAX - gate_expert_bytes ||
@@ -14483,14 +14643,17 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             gate_expert_bytes * 2ull > (uint64_t)NSUIntegerMax ||
             gate_expert_bytes * 2ull + down_expert_bytes >
                 (uint64_t)NSUIntegerMax) {
+            DS4_PREP_TAIL_NOTE(4);
             return 0;
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
-            return ds4_gpu_stream_expert_cache_take_capped_reusable(
+            const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
+            DS4_PREP_TAIL_NOTE(0);
+            return capped_rc;
         }
         if (ds4_gpu_stream_expert_alloc_slab_slot(gate_expert_bytes,
                                                   down_expert_bytes,
@@ -14500,14 +14663,17 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
                                                   gate_inner,
                                                   up_inner,
                                                   down_inner)) {
+            DS4_PREP_TAIL_NOTE(1);
             return 1;
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
-            return ds4_gpu_stream_expert_cache_take_capped_reusable(
+            const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
+            DS4_PREP_TAIL_NOTE(0);
+            return capped_rc;
         }
         const uint64_t up_off = gate_expert_bytes;
         const uint64_t down_off = gate_expert_bytes * 2ull;
@@ -14516,11 +14682,13 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             ds4_gpu_stream_expert_alloc_buffer(combined_bytes,
                                                @"ds4_stream_expert_combined");
         if (!combined) {
-            return ds4_gpu_stream_expert_cache_take_capped_reusable(
+            const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
                     gate_buf, up_buf, down_buf,
                     gate_inner, up_inner, down_inner);
+            DS4_PREP_TAIL_NOTE(0);
+            return capped_rc;
         }
         *gate_buf = combined;
         *up_buf = combined;
@@ -14528,6 +14696,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         *gate_inner = 0;
         *up_inner = (NSUInteger)up_off;
         *down_inner = (NSUInteger)down_off;
+        DS4_PREP_TAIL_NOTE(2);
         return 1;
     }
 
@@ -14544,16 +14713,20 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_gate);
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_up);
         ds4_gpu_stream_expert_unlock_explicit_buffer(explicit_down);
-        return ds4_gpu_stream_expert_cache_take_capped_reusable(
+        const int capped_rc = ds4_gpu_stream_expert_cache_take_capped_reusable(
                 protect_layer, protect_ids, n_protect,
                 gate_expert_bytes, down_expert_bytes,
                 gate_buf, up_buf, down_buf,
                 gate_inner, up_inner, down_inner);
+        DS4_PREP_TAIL_NOTE(0);
+        return capped_rc;
     }
     *gate_buf = explicit_gate;
     *up_buf = explicit_up;
     *down_buf = explicit_down;
+    DS4_PREP_TAIL_NOTE(3);
     return 1;
+#undef DS4_PREP_TAIL_NOTE
 }
 
 static void ds4_gpu_stream_expert_cache_prune_global(
@@ -19771,7 +19944,7 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                pos) {
     if (!g_initialized && !ds4_gpu_init()) return -1;
     if ((g_quality_mode ||
-         (!ds4_gpu_device_name_contains("M3") &&
+         (!ds4_gpu_device_is_m3_class() &&
           !ds4_gpu_device_name_contains("M5"))) ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ") != NULL ||
         getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE") != NULL) {
@@ -20623,7 +20796,7 @@ static int ds4_gpu_hc_rms_scale_project_mode(
         (in_dim == 16384u || in_dim == 28672u) && out_dim == 24u;
     if (!hard_shape) return 0;
 
-    if ((!ds4_gpu_device_name_contains("M3") &&
+    if ((!ds4_gpu_device_is_m3_class() &&
          (g_test_flags & DS4_GPU_TEST_HC_RMS_SCALE_PROJ) == 0u) ||
         getenv("DS4_METAL_DISABLE_HC_RMS_SCALE_PROJ") != NULL) {
         return 0;
@@ -21649,7 +21822,7 @@ int ds4_gpu_kv_rope_fp8_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    if (!ds4_gpu_device_is_m3_class() && !ds4_gpu_device_name_contains("M5")) return 0;
     return 1;
 }
 
@@ -21869,7 +22042,7 @@ static int ds4_gpu_encode_compressor_score_with_ape(
     const uint32_t total_elems = (uint32_t)total_elems64;
 
     const bool use_fused =
-        ds4_gpu_device_name_contains("M3") &&
+        ds4_gpu_device_is_m3_class() &&
         getenv("DS4_METAL_DISABLE_COMPRESSOR_APE_ADD") == NULL;
     if (use_fused) {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
@@ -22677,7 +22850,7 @@ static int ds4_gpu_encode_concat_f32_dim1(
 static int ds4_gpu_compressor_pack_ratio4_fusion_mode(uint32_t head_dim) {
     const bool default_shape = head_dim == 128u || head_dim == 512u;
     if (getenv("DS4_METAL_DISABLE_COMPRESSOR_RATIO4_PACK_FUSION") != NULL ||
-        !(ds4_gpu_device_name_contains("M3") && default_shape)) {
+        !(ds4_gpu_device_is_m3_class() && default_shape)) {
         return 0;
     }
     if (g_dsv4_compressor_pack_ratio4_pipeline == nil) {
@@ -22723,7 +22896,7 @@ static int ds4_gpu_compressor_ratio4_direct_pool_mode(
 
     const bool default_shape = head_dim == 128u || head_dim == 512u;
     if (getenv("DS4_METAL_DISABLE_COMPRESSOR_RATIO4_DIRECT_POOL") != NULL ||
-        !(ds4_gpu_device_name_contains("M3") && default_shape)) {
+        !(ds4_gpu_device_is_m3_class() && default_shape)) {
         return 0;
     }
     if (g_dsv4_softmax_pool_ratio4_direct_pipeline == nil) {
@@ -25757,7 +25930,7 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         supported_shape && valid_grid && !g_quality_mode &&
         getenv("DS4_METAL_DISABLE_GATHERED_KV_STAGE") == NULL &&
         g_flash_kv_stage_f16_pipeline != nil &&
-        (ds4_gpu_device_name_contains("M3") ||
+        (ds4_gpu_device_is_m3_class() ||
          ds4_gpu_device_name_contains("M5"));
     const bool component_disabled = eligible &&
         (ds4_gpu_env_bool("DS4_METAL_DISABLE_CONTIG_F32_F16_COPY") > 0 ||
@@ -27532,7 +27705,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
          getenv("DS4_METAL_DISABLE_M5_PACKED_ZERO_MASK") == NULL);
     const bool use_persistent_zero_mask =
         use_mask == 0u &&
-        (ds4_gpu_device_name_contains("M3") ||
+        (ds4_gpu_device_is_m3_class() ||
          m5_persistent_zero_mask) &&
         getenv("DS4_METAL_DISABLE_PERSISTENT_ZERO_ATTN_MASK") == NULL;
 
@@ -27563,7 +27736,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     const bool has_kvpad = (n_keys % ncpsg) != 0;
     const bool use_shared_kvpad =
         has_kvpad &&
-        ds4_gpu_device_name_contains("M3") &&
+        ds4_gpu_device_is_m3_class() &&
         getenv("DS4_METAL_DISABLE_SHARED_KV_PAD") == NULL;
     const NSUInteger packed_threads = 8u * 32u;
     const NSUInteger packed_shared_bytes =
@@ -32096,7 +32269,7 @@ static int ds4_gpu_encode_router_select(
     const bool use_batch_weights_fusion =
         flash_router_fast_path && !g_quality_mode && n_tokens > 1u &&
         g_dsv4_router_weights_batch_pipeline != nil &&
-        ds4_gpu_device_name_contains("M3") &&
+        ds4_gpu_device_is_m3_class() &&
         getenv("DS4_METAL_DISABLE_ROUTER_WEIGHTS_BATCH_FUSION") == NULL &&
         getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL;
     if (use_batch_weights_fusion) {
@@ -40663,7 +40836,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
-            n_tokens <= 5u &&
+            n_tokens <= (ds4_gpu_moe_tiny_wide_enabled() ? 8u : 5u) &&
             !use_q4_batch_expert_table &&
             !use_mm_id &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||
@@ -41151,7 +41324,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             !use_q4_batch_expert_table &&
             !use_mm_id &&
             n_expert == 6 &&
-            n_tokens <= 4u &&
+            n_tokens <= (ds4_gpu_moe_tiny_wide_enabled() ? 8u : 4u) &&
             down_sum6_pipeline != nil;
         int ok = 0;
         if (use_iq2_batch_selected_addr) {
@@ -42426,7 +42599,7 @@ int ds4_gpu_output_hc_weights_tensor(
         const bool use_weights4 =
             weights4_shape && !g_quality_mode &&
             g_output_hc_weights4_pipeline != nil &&
-            (ds4_gpu_device_name_contains("M3") ||
+            (ds4_gpu_device_is_m3_class() ||
              (g_test_flags & DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4) != 0u) &&
             g_output_hc_weights4_pipeline.maxTotalThreadsPerThreadgroup >= 2u;
         if (require_weights4 && weights4_shape && !use_weights4) {
