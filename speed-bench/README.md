@@ -56,6 +56,17 @@ and accepted drafts to 101 (80.8% accept); the best combination measured
 39.5 t/s at `--dspark-confidence 0.75` on a code prompt, still below the
 43.7 t/s plain-decode equilibrium.
 
+A genuine dual-row HC-pre producer kernel (one F16 mix-weight fetch serving
+both rows, each row keeping the one-row kernel's exact reduction trees) was
+also built for the N=2 verify.  Correctness was proven with the strict-mode
+oracle — `--dspark-strict` output matched plain decode byte-for-byte — after
+fixing a buffer-index mismatch that silently misbound five kernel arguments
+(the strict oracle is the right validation tool for any verify-kernel work).
+Measured honestly, per-verify cost was unchanged (~52 ms, n=4, vs ~50 ms
+rollback over 57 verifies) and the diverged non-strict token stream made the
+draft decline on 99% of cycles: the serialized hc_pre share had been
+overestimated by the stage decomposition, and the win is not there.
+
 Two dispatch-routing microbatch increments were also built, validated, and
 measured negative before reverting: per-row routed MoE through the
 single-token static-trip kernels (bit-identical output, verify_layer
