@@ -176,6 +176,13 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Diagnostic GPU stage-counter profiler: timestamp samples taken at decode
+ * stage boundaries without ending the batch command buffer. */
+int ds4_gpu_stage_counters_enabled(void);
+int ds4_gpu_stage_counter_sample(const char *label);
+void ds4_gpu_stage_counter_reset(void);
+void ds4_gpu_stage_counter_report(uint32_t pos);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

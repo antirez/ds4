@@ -27,6 +27,34 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### Metal decode stage GPU counters
+
+The end-and-wait stage profiler (`DS4_METAL_DECODE_STAGE_PROFILE=1`) adds a
+synchronization per stage boundary and changes the schedule, so its numbers
+are inflated by per-boundary waits.  The stage-counter diagnostic keeps the
+production token mostly intact: every stage boundary commits the open batch
+command buffer without waiting, so the GPU queue stays fed, and each stage's
+GPU busy span is printed after the token:
+
+```
+DS4_METAL_DECODE_STAGE_PROFILE=1 DS4_METAL_STAGE_COUNTERS=1 ./ds4 -m ds4flash.gguf \
+    -p "Write a short story." -c 8192 -n 24 --temp 0
+```
+
+Both env vars are required: the first arms the boundary macros, the second
+switches them from end-and-wait to commit-only sampling.  The concurrent
+shared-expert/routed-MoE overlap stays armed under counters (only the
+serializing profiler disables it), but the per-stage command buffers queue in
+order, so overlapped stages report their serialized costs.  The per-token
+`total-cb-busy` line matches the production GPU-busy time (about 22.5 ms on
+M3 Ultra at a short context), which is the check that the attribution is
+faithful.  M3 Ultra decode at a short context attributes the token roughly as:
+routed MoE 5.9 ms, attention output projections 4.8 ms, Q lora path 5.1 ms
+(Q-A/KV/compressor quad kernel 41 us + Q-B matvec 59 us per layer), attention
+core plus inverse RoPE 2.1 ms, router/shared gate-up 1.9 ms, and about 3.4 ms
+of per-layer HC pre/post bookkeeping, with the remaining dense Q8_0 matvecs
+streaming at 590-650 GB/s, i.e. at the memory wall.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

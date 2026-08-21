@@ -1339,6 +1339,62 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+/* --- GPU stage-counter profiler -----------------------------------------
+ * Diagnostic only: at decode stage boundaries the open batch command buffer
+ * is committed without waiting, so the GPU queue stays fed and each stage's
+ * GPU busy span (GPUEndTime-GPUStartTime) can be read after the token.
+ * compute-encoder counter sampling is unsupported on Apple Silicon GPUs. */
+enum { DS4_STAGE_COUNTER_CAP = 2048u };
+static id<MTLCommandBuffer> g_stage_cbs[DS4_STAGE_COUNTER_CAP];
+static char g_stage_names[DS4_STAGE_COUNTER_CAP][40];
+static uint32_t g_stage_cb_idx;
+
+int ds4_gpu_stage_counters_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_STAGE_COUNTERS") != NULL;
+    }
+    return enabled;
+}
+
+int ds4_gpu_stage_counter_sample(const char *label) {
+    if (!label || !g_batch_cb) return 1;
+    if (g_stage_cb_idx >= DS4_STAGE_COUNTER_CAP) return 1;
+    if (g_batch_has_work) {
+        ds4_gpu_close_batch_encoder();
+        id<MTLCommandBuffer> cb = g_batch_cb;
+        [cb commit];
+        g_stage_cbs[g_stage_cb_idx] = cb;
+        snprintf(g_stage_names[g_stage_cb_idx],
+                 sizeof(g_stage_names[0]), "%s", label);
+        g_stage_cb_idx++;
+        g_batch_cb = nil;
+        g_batch_has_work = NO;
+        return ds4_gpu_begin_commands() != 0;
+    }
+    /* No dispatches since the last boundary: nothing to attribute. */
+    return 1;
+}
+
+void ds4_gpu_stage_counter_reset(void) {
+    for (uint32_t i = 0; i < g_stage_cb_idx; i++) g_stage_cbs[i] = nil;
+    g_stage_cb_idx = 0;
+}
+
+void ds4_gpu_stage_counter_report(uint32_t pos) {
+    double total_busy = 0.0;
+    for (uint32_t i = 0; i < g_stage_cb_idx; i++) {
+        const double busy =
+            g_stage_cbs[i].GPUEndTime - g_stage_cbs[i].GPUStartTime;
+        total_busy += busy;
+        fprintf(stderr, "ds4: stage-counter pos=%u seq=%u %s=%.4f ms\n",
+                pos, i, g_stage_names[i], busy * 1000.0);
+    }
+    fprintf(stderr, "ds4: stage-counter pos=%u total-cb-busy=%.4f ms n=%u\n",
+            pos, total_busy * 1000.0, g_stage_cb_idx);
+    ds4_gpu_stage_counter_reset();
+}
+
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
  * buffers that another in-flight command buffer might still reference; bound
@@ -1350,7 +1406,7 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
-static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;

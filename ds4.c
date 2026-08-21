@@ -22815,6 +22815,11 @@ static bool metal_graph_encode_decode_layer_phase(
 
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
+    /* Stage counters sample GPU timestamps inside the open encoder, so the
+     * schedule must stay the production one; only the end-and-wait profiler
+     * serializes and therefore disqualifies concurrent dispatch. */
+    const bool decode_stage_serializing =
+        decode_stage_profile && !ds4_gpu_stage_counters_enabled();
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
     const bool fuse_shared_gate_up =
         !g->quality &&
@@ -22837,7 +22842,7 @@ static bool metal_graph_encode_decode_layer_phase(
         !g->quality && g->tp_world < 2 &&
         !g->ssd_streaming && !g->ssd_streaming_cold &&
         !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared &&
-        !decode_stage_profile &&
+        !decode_stage_serializing &&
         !metal_graph_directional_steering_ffn_enabled(g) &&
         metal_graph_debug_get_config()->prefix == NULL &&
         getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
@@ -25366,7 +25371,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool overlap_selected_shared =
         ok &&
         g->tp_world < 2 &&
-        !decode_stage_profile &&
+        !decode_stage_serializing &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
@@ -25385,7 +25390,7 @@ static bool metal_graph_encode_decode_layer_phase(
         ok &&
         g->tp_world < 2 &&
         !overlap_selected_shared &&
-        !decode_stage_profile &&
+        !decode_stage_serializing &&
         metal_graph_use_iq2_selected_readahead_shared_delay(g) &&
         metal_graph_decode_iq2_selected_slots_expected(g, layer) &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
@@ -29232,6 +29237,9 @@ static bool metal_graph_indexer_stage_profile_boundary(
         uint32_t    n_tokens,
         uint32_t    n_comp,
         double     *stage_t0) {
+    if (ds4_gpu_stage_counters_enabled()) {
+        return ds4_gpu_stage_counter_sample(stage) != 0;
+    }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     if (stage != NULL) {
@@ -29358,6 +29366,9 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    pos0,
         uint32_t    n_tokens,
         double     *stage_t0) {
+    if (ds4_gpu_stage_counters_enabled()) {
+        return ds4_gpu_stage_counter_sample(stage) != 0;
+    }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     if (stage != NULL) {
@@ -29380,6 +29391,9 @@ static bool metal_graph_q_stage_profile_boundary(
         uint32_t    pos0,
         uint32_t    n_tokens,
         double     *stage_t0) {
+    if (ds4_gpu_stage_counters_enabled()) {
+        return ds4_gpu_stage_counter_sample(stage) != 0;
+    }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     fprintf(stderr,
@@ -32298,12 +32312,15 @@ static bool metal_graph_eval_token_raw_swa(
                               "DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
+    const bool stage_counters = ds4_gpu_stage_counters_enabled();
 
+    if (stage_counters) ds4_gpu_stage_counter_reset();
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
+    if (ok && stage_counters) ds4_gpu_stage_counter_report(pos);
 
     if (ok && logits && g->tp_world == 2 && g->tp_logits_half) {
         const uint64_t tp_vhalf = (uint64_t)DS4_N_VOCAB / 2u;
