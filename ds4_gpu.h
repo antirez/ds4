@@ -207,6 +207,18 @@ typedef struct ds4_gpu_stream_expert_table {
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+/* Register a layer's router (f16 weight rows into the mmapped model, plus the
+ * optional f32 selection bias) so DS4_PF_LOOKAHEAD can run it a layer early. */
+void ds4_gpu_pf_register_router(uint32_t layer, const void *w_f16,
+                                const void *bias_f32, uint32_t in_dim,
+                                uint32_t n_expert);
+/* Hash-routed layers instead pick experts from an i32 token-id table
+ * (n_used experts per token id), so their experts are known, not guessed. */
+void ds4_gpu_pf_register_hash_router(uint32_t layer, const void *t2e_i32,
+                                     uint32_t n_vocab, uint32_t n_used);
+/* The next token id is known: fetch the hash-routed layers' certain experts
+ * before the forward pass reaches them. */
+void ds4_gpu_pf_note_token_id(uint32_t token_id);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,

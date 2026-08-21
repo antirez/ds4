@@ -5941,6 +5941,28 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
 
     if (il < DS4_N_HASH_LAYER) {
         l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+        if (l->ffn_gate_tid2eid->type == DS4_TENSOR_I32 &&
+            l->ffn_gate_tid2eid->ndim == 2) {
+            ds4_gpu_pf_register_hash_router(
+                    il,
+                    m->map + l->ffn_gate_tid2eid->abs_offset,
+                    (uint32_t)l->ffn_gate_tid2eid->dim[1],
+                    (uint32_t)l->ffn_gate_tid2eid->dim[0]);
+        }
+    } else if (l->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+               l->ffn_gate_inp->ndim == 2 &&
+               (!l->ffn_exp_probs_b ||
+                l->ffn_exp_probs_b->type == DS4_TENSOR_F32)) {
+        /* Hash layers route by token id; only learned routers can be run a
+         * layer early.  Pointers are into the mmapped model. */
+        ds4_gpu_pf_register_router(
+                il,
+                m->map + l->ffn_gate_inp->abs_offset,
+                l->ffn_exp_probs_b
+                    ? (const void *)(m->map + l->ffn_exp_probs_b->abs_offset)
+                    : NULL,
+                (uint32_t)l->ffn_gate_inp->dim[0],
+                (uint32_t)l->ffn_gate_inp->dim[1]);
     }
 }
 
@@ -30732,6 +30754,7 @@ static bool metal_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
     if (g && g->ssd_streaming) {
+        if (token >= 0) ds4_gpu_pf_note_token_id((uint32_t)token);
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
 
