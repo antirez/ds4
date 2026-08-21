@@ -337,6 +337,8 @@ int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
+void ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn);
+void ds4_session_use_engine_directional_steering(ds4_session *s);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
@@ -389,6 +391,13 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+/* Execute a forward pass specifically for greedy decoding (temperature 0).
+ * Only the top token is returned; the session's full logits array is NOT
+ * updated and MUST NOT be read. */
+int ds4_session_eval_argmax(ds4_session *s, int token,
+                            char *err, size_t errlen);
+int ds4_session_eval_no_mtp(ds4_session *s, int token,
+                            char *err, size_t errlen);
 
 typedef struct {
     ds4_session *session;
@@ -400,6 +409,9 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* Same scheduling semantics, but never prepares a speculative support draft. */
+int ds4_sessions_eval_batch_no_mtp(ds4_decode_item *items, int count,
+                                   char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

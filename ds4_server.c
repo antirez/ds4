@@ -11632,6 +11632,8 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
+    bool have_greedy_next = false;
+    int greedy_next = -1;
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -11657,8 +11659,14 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(slot->session, temperature, top_k,
+        int token;
+        if (have_greedy_next) {
+            token = greedy_next;
+            have_greedy_next = false;
+        } else {
+            token = ds4_session_sample(slot->session, temperature, top_k,
                                        top_p, min_p, &rng);
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -11671,8 +11679,7 @@ decode_again:
         if (temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
              ds4_engine_dflash_ready(s->engine)) &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
-            !dynamic_steering)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(slot->session,
                                                        token,
@@ -11687,14 +11694,28 @@ decode_again:
                 break;
             }
         } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+            const bool can_eval_argmax =
+                !s->batched_mode &&
+                temperature <= 0.0f &&
+                ds4_engine_is_qwen(s->engine) &&
+                (completion + 1 < max_tokens);
+            int eval_rc;
+            if (can_eval_argmax) {
+                pthread_mutex_lock(&s->inference_mu);
+                greedy_next = ds4_session_eval_argmax(slot->session, token, err, sizeof(err));
+                pthread_mutex_unlock(&s->inference_mu);
+                eval_rc = (greedy_next < 0) ? 1 : 0;
+                if (eval_rc == 0) have_greedy_next = true;
+            } else {
+                eval_rc = server_eval_token(s, slot, token, err, sizeof(err));
+            }
+            if (eval_rc != 0) {
                 finish = "error";
                 break;
             }
             toks[0] = token;
             ntok = 1;
         }
-
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
