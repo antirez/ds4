@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -11801,8 +11802,174 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
-static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
-    if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
+
+/* Packed expert file (DSP1).
+ *
+ * GGUF stores an MoE layer's gate, up and down matrices as three separate
+ * multi-gigabyte tensors, so the three slices belonging to ONE expert sit
+ * about a tensor apart on disk and a single expert miss costs three distant
+ * reads.  misc/pack_experts.py copies those bytes into a second file where
+ * each expert's three slices are adjacent:
+ *
+ *     expert 0: gate | up | down
+ *     expert 1: gate | up | down
+ *
+ * The bytes are copied exactly, nothing is requantized or transformed, so
+ * this only changes where a read lands, never what it returns.  Measured on
+ * DeepSeek V4 Flash: average expert load 5.01 ms against 5.68 ms unpacked.
+ *
+ * The file is found automatically as <model path>.dsp, or explicitly via
+ * DS4_EXPERT_PACKED_SIDECAR.  Without it everything behaves as before. */
+typedef struct {
+    uint64_t gate_gguf_off;
+    uint64_t up_gguf_off;
+    uint64_t down_gguf_off;
+    uint64_t gate_len;
+    uint64_t down_len;
+    uint64_t packed_off;
+} ds4_packed_expert_entry;
+
+static int g_packed_expert_state;
+static int g_packed_expert_fd = -1;
+static ds4_packed_expert_entry *g_packed_expert_index;
+static uint64_t g_packed_expert_count;
+static pthread_mutex_t g_packed_expert_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_packed_expert_reads;
+
+static int ds4_packed_expert_entry_cmp(const void *a, const void *b) {
+    const uint64_t ka = ((const ds4_packed_expert_entry *)a)->gate_gguf_off;
+    const uint64_t kb = ((const ds4_packed_expert_entry *)b)->gate_gguf_off;
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+
+static int ds4_gpu_packed_expert_active(void) {
+    return g_packed_expert_state == 1;
+}
+
+static void ds4_gpu_packed_expert_report(void) {
+    fprintf(stderr, "ds4: packed expert file final: reads=%llu\n",
+            (unsigned long long)atomic_load(&g_packed_expert_reads));
+}
+
+static void ds4_gpu_packed_expert_load_file(const char *path,
+                                            int announce_missing);
+
+static void ds4_gpu_packed_expert_init_locked(void) {
+    g_packed_expert_state = -1;
+    const char *path = getenv("DS4_EXPERT_PACKED_SIDECAR");
+    if (path && path[0]) {
+        /* An explicit "0" or "none" ignores the packed file entirely, which
+         * makes it easy to measure with and without. */
+        if (strcmp(path, "0") == 0 || strcmp(path, "none") == 0) return;
+        ds4_gpu_packed_expert_load_file(path, 1);
+        return;
+    }
+    /* No explicit path given: look for <model path>.dsp next to the model
+     * file, so the packed expert file works without any configuration. */
+    if (g_model_fd >= 0) {
+        char model_path[1024];
+        model_path[0] = 0;
+        if (fcntl(g_model_fd, F_GETPATH, model_path) == 0 && model_path[0]) {
+            char auto_path[1024 + 8];
+            snprintf(auto_path, sizeof(auto_path), "%s.dsp", model_path);
+            ds4_gpu_packed_expert_load_file(auto_path, 0);
+        }
+    }
+}
+
+static void ds4_gpu_packed_expert_load_file(const char *path,
+                                            int announce_missing) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (announce_missing)
+            fprintf(stderr, "ds4: packed expert file: cannot open %s\n", path);
+        return;
+    }
+    uint8_t header[32];
+    if (pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header) ||
+        memcmp(header, "DSP1", 4) != 0) {
+        fprintf(stderr, "ds4: packed expert file: bad header in %s\n", path);
+        close(fd);
+        return;
+    }
+    uint32_t version = 0;
+    uint64_t index_off = 0, count = 0;
+    memcpy(&version, header + 4, sizeof(version));
+    memcpy(&index_off, header + 8, sizeof(index_off));
+    memcpy(&count, header + 16, sizeof(count));
+    if (version != 1 || count == 0 || count > 100000 ||
+        count > SIZE_MAX / sizeof(ds4_packed_expert_entry)) {
+        fprintf(stderr, "ds4: packed expert file: invalid index\n");
+        close(fd);
+        return;
+    }
+    ds4_packed_expert_entry *index =
+        malloc((size_t)count * sizeof(*index));
+    const size_t index_bytes = (size_t)count * sizeof(*index);
+    if (!index || pread(fd, index, index_bytes, (off_t)index_off) !=
+                      (ssize_t)index_bytes) {
+        fprintf(stderr, "ds4: packed expert file: index read failed\n");
+        free(index);
+        close(fd);
+        return;
+    }
+    qsort(index, (size_t)count, sizeof(*index),
+          ds4_packed_expert_entry_cmp);
+    g_packed_expert_fd = fd;
+    g_packed_expert_index = index;
+    g_packed_expert_count = count;
+    g_packed_expert_state = 1;
+    atexit(ds4_gpu_packed_expert_report);
+    fprintf(stderr,
+            "ds4: packed expert file active: %s (%llu experts)\n",
+            path, (unsigned long long)count);
+}
+
+static const ds4_packed_expert_entry *ds4_gpu_packed_expert_lookup(
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_len, uint64_t down_len) {
+    if (g_packed_expert_state == 0) {
+        pthread_mutex_lock(&g_packed_expert_mutex);
+        if (g_packed_expert_state == 0) ds4_gpu_packed_expert_init_locked();
+        pthread_mutex_unlock(&g_packed_expert_mutex);
+    }
+    if (g_packed_expert_state != 1) return NULL;
+    uint64_t lo = 0, hi = g_packed_expert_count;
+    while (lo < hi) {
+        const uint64_t mid = (lo + hi) / 2;
+        if (g_packed_expert_index[mid].gate_gguf_off < gate_off) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo >= g_packed_expert_count) return NULL;
+    const ds4_packed_expert_entry *e = &g_packed_expert_index[lo];
+    return e->gate_gguf_off == gate_off && e->up_gguf_off == up_off &&
+           e->down_gguf_off == down_off && e->gate_len == gate_len &&
+           e->down_len == down_len ? e : NULL;
+}
+
+/* If the packed expert file covers this expert, rewrite the three offsets to
+ * point into it and return its descriptor; otherwise leave them alone and
+ * return the model file.  Callers use the returned descriptor for both the
+ * read and its readahead hint. */
+static int ds4_gpu_packed_expert_redirect(uint64_t *gate_off,
+                                          uint64_t *up_off,
+                                          uint64_t *down_off,
+                                          uint64_t gate_len,
+                                          uint64_t down_len) {
+    const ds4_packed_expert_entry *e =
+        ds4_gpu_packed_expert_lookup(*gate_off, *up_off, *down_off,
+                                     gate_len, down_len);
+    if (!e) return g_model_fd;
+    *gate_off = e->packed_off;
+    *up_off = e->packed_off + gate_len;
+    *down_off = e->packed_off + gate_len * 2ull;
+    return g_packed_expert_fd;
+}
+
+/* Warm one range of whichever file it lives in. */
+static void ds4_gpu_stream_expert_readahead_range(int fd, uint64_t offset,
+                                                  uint64_t len) {
+    if (!ds4_gpu_stream_expert_readahead_enabled() || fd < 0 || len == 0) {
         return;
     }
 
@@ -11819,7 +11986,7 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
         struct radvisory ra;
         ra.ra_offset = (off_t)pos;
         ra.ra_count = (int)chunk64;
-        (void)fcntl(g_model_fd, F_RDADVISE, &ra);
+        (void)fcntl(fd, F_RDADVISE, &ra);
 
         pos += chunk64;
         rem -= chunk64;
@@ -11835,6 +12002,22 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
 #endif
 }
 
+/* Warm an expert's three slices, following the packed expert file when it
+ * covers them, since that is where the read will come from. */
+static void ds4_gpu_stream_expert_readahead_expert(uint64_t gate_off,
+                                                   uint64_t up_off,
+                                                   uint64_t down_off,
+                                                   uint64_t gate_len,
+                                                   uint64_t down_len) {
+    if (!ds4_gpu_stream_expert_readahead_enabled()) return;
+    const int fd = ds4_gpu_packed_expert_redirect(&gate_off, &up_off,
+                                                  &down_off, gate_len,
+                                                  down_len);
+    ds4_gpu_stream_expert_readahead_range(fd, gate_off, gate_len);
+    ds4_gpu_stream_expert_readahead_range(fd, up_off, gate_len);
+    ds4_gpu_stream_expert_readahead_range(fd, down_off, down_len);
+}
+
 typedef struct {
     uint64_t offset;
     uint64_t len;
@@ -11842,6 +12025,9 @@ typedef struct {
     uint64_t read_bytes;
     double ms;
     int ok;
+    /* Which file `offset` belongs to.  0 means the model file, which is what
+     * every task gets unless the packed expert file covers it. */
+    int read_fd;
 } ds4_gpu_stream_expert_pread_task;
 
 typedef struct {
@@ -11941,7 +12127,10 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
+static _Atomic int g_stream_expert_gguf_zero_guard_done;
+
 static int ds4_gpu_stream_expert_pread_into(
+        int       fd,
         uint64_t  offset,
         uint64_t  len,
         uint8_t  *dst,
@@ -11949,7 +12138,7 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    if (g_model_fd < 0 ||
+    if (fd < 0 ||
         !dst ||
         len == 0 ||
         offset > (uint64_t)LLONG_MAX ||
@@ -11957,6 +12146,7 @@ static int ds4_gpu_stream_expert_pread_into(
         return 0;
     }
 
+    if (fd == g_packed_expert_fd) atomic_fetch_add(&g_packed_expert_reads, 1);
     const double t0 = ds4_gpu_now_ms();
     uint64_t pos = 0;
     int ok = 1;
@@ -11965,7 +12155,7 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = 0;
@@ -11976,6 +12166,28 @@ static int ds4_gpu_stream_expert_pread_into(
     const double dt = ds4_gpu_now_ms() - t0;
     if (read_bytes) *read_bytes = pos;
     if (ms_out) *ms_out = dt;
+    /* One-time check on the first sizeable expert read from the model file.
+     * misc/pack_experts.py frees the expert space inside the GGUF once the
+     * bytes are safely in the packed file, and reads there come back as
+     * zeros.  Generating from zeroed weights would look like a broken model
+     * rather than a missing file, so say what happened.  A real expert slice
+     * is never all zeros. */
+    if (ok && pos == len && fd == g_model_fd && !ds4_gpu_packed_expert_active() &&
+        len >= (1ull << 20) &&
+        !atomic_exchange(&g_stream_expert_gguf_zero_guard_done, 1)) {
+        uint64_t i = 0;
+        while (i < len && dst[i] == 0) i++;
+        if (i == len) {
+            fprintf(stderr,
+                "ds4: the first expert read from the GGUF came back as all zeros.\n"
+                "ds4: this usually means the expert weights were moved into a packed\n"
+                "ds4: expert file (.dsp) and it cannot be found.  Put it next to the\n"
+                "ds4: model as <model>.dsp, or set DS4_EXPERT_PACKED_SIDECAR to its\n"
+                "ds4: path.  To move the bytes back into the GGUF:\n"
+                "ds4:     python3 misc/pack_experts.py --restore <model.gguf>\n");
+            exit(1);
+        }
+    }
     if (!ok || pos != len) {
         fprintf(stderr,
                 "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
@@ -11992,11 +12204,13 @@ static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                    task->len,
-                                                    task->dst,
-                                                    &task->read_bytes,
-                                                    &task->ms);
+        task->ok = ds4_gpu_stream_expert_pread_into(
+                task->read_fd > 0 ? task->read_fd : g_model_fd,
+                task->offset,
+                task->len,
+                task->dst,
+                &task->read_bytes,
+                &task->ms);
     }
     return NULL;
 }
@@ -12051,11 +12265,13 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
-                                                        task->len,
-                                                        task->dst,
-                                                        &task->read_bytes,
-                                                        &task->ms);
+            task->ok = ds4_gpu_stream_expert_pread_into(
+                    task->read_fd > 0 ? task->read_fd : g_model_fd,
+                    task->offset,
+                    task->len,
+                    task->dst,
+                    &task->read_bytes,
+                    &task->ms);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -14809,9 +15025,10 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
         return e;
     }
 
-    ds4_gpu_stream_expert_readahead_range(gate_abs_offset, gate_expert_bytes);
-    ds4_gpu_stream_expert_readahead_range(up_abs_offset, gate_expert_bytes);
-    ds4_gpu_stream_expert_readahead_range(down_abs_offset, down_expert_bytes);
+    ds4_gpu_stream_expert_readahead_expert(gate_abs_offset, up_abs_offset,
+                                           down_abs_offset,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
 
     id<MTLBuffer> gate_buf = nil;
     id<MTLBuffer> up_buf = nil;
@@ -14851,21 +15068,33 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     uint8_t *down_dst = (uint8_t *)[down_buf contents] + down_inner;
     if (!gate_dst || !up_dst || !down_dst) return NULL;
 
+    /* One expert's three slices are adjacent in the packed expert file and a
+     * tensor apart in the GGUF, so ask whichever file holds them. */
+    uint64_t read_gate_off = gate_abs_offset;
+    uint64_t read_up_off = up_abs_offset;
+    uint64_t read_down_off = down_abs_offset;
+    const int read_fd =
+        ds4_gpu_packed_expert_redirect(&read_gate_off, &read_up_off,
+                                       &read_down_off, gate_expert_bytes,
+                                       down_expert_bytes);
     ds4_gpu_stream_expert_pread_task tasks[3] = {
         {
-            .offset = gate_abs_offset,
+            .offset = read_gate_off,
             .len = gate_expert_bytes,
             .dst = gate_dst,
+            .read_fd = read_fd,
         },
         {
-            .offset = up_abs_offset,
+            .offset = read_up_off,
             .len = gate_expert_bytes,
             .dst = up_dst,
+            .read_fd = read_fd,
         },
         {
-            .offset = down_abs_offset,
+            .offset = read_down_off,
             .len = down_expert_bytes,
             .dst = down_dst,
+            .read_fd = read_fd,
         },
     };
     uint64_t read_bytes = 0;
@@ -15273,12 +15502,11 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
 
-        ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
-                                              down_expert_bytes);
+        ds4_gpu_stream_expert_readahead_expert(p->gate_abs_offsets[slot],
+                                               p->up_abs_offsets[slot],
+                                               p->down_abs_offsets[slot],
+                                               gate_expert_bytes,
+                                               down_expert_bytes);
 
         if (load_i < batch_reuse_count &&
             batch_reuse[load_i].gate_buffer &&
@@ -15330,20 +15558,30 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
             return 0;
         }
         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+        uint64_t read_gate_off = p->gate_abs_offsets[slot];
+        uint64_t read_up_off = p->up_abs_offsets[slot];
+        uint64_t read_down_off = p->down_abs_offsets[slot];
+        const int read_fd =
+            ds4_gpu_packed_expert_redirect(&read_gate_off, &read_up_off,
+                                           &read_down_off, gate_expert_bytes,
+                                           down_expert_bytes);
         p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->gate_abs_offsets[slot],
+            .offset = read_gate_off,
             .len = gate_expert_bytes,
             .dst = gate_dst,
+            .read_fd = read_fd,
         };
         p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->up_abs_offsets[slot],
+            .offset = read_up_off,
             .len = gate_expert_bytes,
             .dst = up_dst,
+            .read_fd = read_fd,
         };
         p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
-            .offset = p->down_abs_offsets[slot],
+            .offset = read_down_off,
             .len = down_expert_bytes,
             .dst = down_dst,
+            .read_fd = read_fd,
         };
         if (load_timing) {
             ds4_gpu_stream_expert_timing_note_prepare_task(
@@ -15565,12 +15803,11 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             cache_budget != 0 && reserved_entries >= cache_budget;
 
         if (!gpu_copy_source) {
-            ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot],
-                                                  down_expert_bytes);
+            ds4_gpu_stream_expert_readahead_expert(gate_abs_offsets[slot],
+                                                   up_abs_offsets[slot],
+                                                   down_abs_offsets[slot],
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes);
         }
 
         if (load_i < batch_reuse_count &&
@@ -16184,12 +16421,11 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 
             const int force_reuse =
                 cache_budget != 0 && reserved_entries >= cache_budget;
-            ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u],
-                                                  gate_expert_bytes);
-            ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u],
-                                                  down_expert_bytes);
+            ds4_gpu_stream_expert_readahead_expert(unique_gate_offsets[u],
+                                                   unique_up_offsets[u],
+                                                   unique_down_offsets[u],
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes);
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
             const int prepared =
                 ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,

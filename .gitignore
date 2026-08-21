@@ -34,6 +34,8 @@
 *.dSYM/
 __pycache__/
 *.pyc
-/misc/
+!/misc/
+/misc/*
+!/misc/pack_experts.py
 .*.swp
 .DS_Store
