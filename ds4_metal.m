@@ -18614,8 +18614,14 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             q4_classic_disabled = getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") != NULL;
         }
         if (!q4_classic_disabled) {
-            const int16_t nsg = 4;
-            id<MTLComputePipelineState> pipe = q4_classic_pipe4;
+            static int16_t q4_classic_nsg;
+            if (q4_classic_nsg == 0) {
+                const char *env = getenv("DS4_METAL_Q4_MV_NSG");
+                long parsed = env && env[0] ? strtol(env, NULL, 10) : 4;
+                q4_classic_nsg = (parsed > 0 && parsed <= 32) ? (int16_t)parsed : 4;
+            }
+            const int16_t nsg = q4_classic_nsg;
+            id<MTLComputePipelineState> pipe = nsg == 2 ? q4_classic_pipe2 : q4_classic_pipe4;
             if (!pipe) {
                 pipe = ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8);
                 q4_classic_pipe4 = pipe;
@@ -18885,9 +18891,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         if (!cb) return 0;
 
         if (weight_type == DS4_METAL_TENSOR_Q6_K &&
-            n_tok == 1u &&
-            (in_dim % 256u) == 0 &&
-            getenv("DS4_METAL_DISABLE_Q6_MV") == NULL) {
+            n_tok >= 1u &&
+            (in_dim % 256u) == 0) {
             id<MTLComputePipelineState> fast =
                 ds4_gpu_hot_pipeline(g_glm_q6_k_down_f32_pipeline,
                                      "kernel_glm_q6_K_down_f32");
@@ -18900,7 +18905,9 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                                                length:sizeof(zero)
                                               options:MTLResourceStorageModeShared];
             }
-            const int use_fast = (out_dim > 100000u);
+            const int use_fast = (n_tok == 1u) &&
+                                 getenv("DS4_METAL_DISABLE_Q6_MV") == NULL &&
+                                 fast != nil && exact != nil && q6_sel != nil;
 
             if (use_fast) {
                 ds4_gpu_glm_routed_moe_args q6args = {
@@ -18926,7 +18933,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 3u) / 4u, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                     threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);
                 if (!ds4_gpu_finish_command_buffer(cb, owned, "Q6_K glm down")) return 0;
                 return 1;
@@ -18940,8 +18947,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc dispatchThreads:MTLSizeMake((NSUInteger)out_dim, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 3u) / 4u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
 
 
 
