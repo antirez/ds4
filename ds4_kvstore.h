@@ -214,4 +214,12 @@ char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
 
+/* Optional metrics hook: invoked after a successful cache store with the
+ * stored token count, the tokens trimmed from the original payload, and the
+ * on-disk size in MiB. Used by ds4-server's GET /metrics endpoint; unset by
+ * default, so other kvstore users (agent, tests) are unaffected. */
+typedef void (*ds4_kvstore_metrics_fn)(int stored_tokens, int trimmed_tokens,
+                                       double stored_mib);
+void ds4_kvstore_set_metrics_fn(ds4_kvstore_metrics_fn fn);
+
 #endif
