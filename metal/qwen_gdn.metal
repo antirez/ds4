@@ -932,6 +932,158 @@ kernel void kernel_qwen_attn_decode_rows(
     }
 }
 
+/* Shadow-backed tiled decode attention for qwen full-attn layers. Attends
+ * the persistent F16 KV shadow maintained by ds4_gpu_qwen_attn_flash_rows
+ * (ds4_metal.m) instead of rescanning the F32 cache serially per token.
+ * Layout of one slot's shadow buffer: K region at offset 0, V region right
+ * after; within a region head kv_h lives at kv_h * kv_head_stride half
+ * elements (kv_head_stride = align_up(cap,64) * head_dim), token t at
+ * t * head_dim, dims contiguous. The current token is NOT in the shadow yet:
+ * it arrives via k_new/v_new and is written into the F32 cache here exactly
+ * like the legacy kernel so later steps can convert it incrementally.
+ *
+ * Keys are processed in blocks of 128 tokens: each lane scores whole K rows
+ * for its own tokens (q staged once in threadgroup memory), the block max /
+ * sum come from two simd reductions, the accumulator is rescaled once per
+ * block, and V accumulation reads each lane's 8-dim slice with the weight
+ * broadcast from the owning lane. */
+struct ds4_qwen_gqa_decode_shadow_args {
+    uint32_t pos;             /* current token position; attends [0, pos] */
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint64_t kv_head_stride;  /* half elements per KV head plane */
+};
+
+#define QWEN_DECODE_SHADOW_BT 128u
+
+kernel void kernel_qwen_gqa_attn_decode_shadow(
+        constant ds4_qwen_gqa_decode_shadow_args & args,
+        device const float * q,
+        device const float * k_new,
+        device const float * v_new,
+        device float * k_cache,
+        device float * v_cache,
+        device const half * shadow_k,
+        device const half * shadow_v,
+        device float * heads_out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint ngrp = args.n_head / args.n_head_kv;
+    const uint hd = args.head_dim;
+    if (h >= args.n_head || lane >= 32u || ngrp == 0u || hd != 256u) return;
+    const uint kv_h = h / ngrp;
+    const uint kv_dim = args.n_head_kv * hd;
+
+    /* Persist the new row into the F32 cache exactly like the legacy path. */
+    if (h % ngrp == 0u) {
+        device float *kd = k_cache + (uint64_t)args.pos * kv_dim + (uint64_t)kv_h * hd;
+        device float *vd = v_cache + (uint64_t)args.pos * kv_dim + (uint64_t)kv_h * hd;
+        for (uint i = lane; i < hd; i += 32u) {
+            kd[i] = k_new[i];
+            vd[i] = v_new[i];
+        }
+    }
+
+    threadgroup float tq[256];
+    device const float *qh = q + (uint64_t)h * hd;
+    for (uint i = lane; i < hd; i += 32u) tq[i] = qh[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const half *kh =
+        shadow_k + (uint64_t)kv_h * args.kv_head_stride;
+    device const half *vh =
+        shadow_v + (uint64_t)kv_h * args.kv_head_stride;
+
+    const float scale = rsqrt((float)hd);
+    float m_prev = -1.0e30f;
+    float l_prev = 0.0f;
+    float acc[8];
+    for (uint j = 0; j < 8u; j++) acc[j] = 0.0f;
+
+    for (uint t0 = 0; t0 < args.pos; t0 += QWEN_DECODE_SHADOW_BT) {
+        const uint len = min(QWEN_DECODE_SHADOW_BT, args.pos - t0);
+        float sloc[QWEN_DECODE_SHADOW_BT / 32u];
+        for (uint i = 0; i < QWEN_DECODE_SHADOW_BT / 32u; i++)
+            sloc[i] = -1.0e30f;
+        /* Scores: every lane streams whole K rows for its own tokens. */
+        for (uint i = 0; i < len; i += 32u) {
+            const uint t = t0 + i + lane;   /* tail lanes: t >= pos keeps -1e30f */
+            float dot = 0.0f;
+            if (t < args.pos) {
+                device const half *kt = kh + (uint64_t)t * hd;
+                for (uint d = 0; d < hd; d += 4u) {
+                    const half4 kv4 = *(device const half4 *)(kt + d);
+                    dot += ((float)kv4.x * tq[d] +
+                            (float)kv4.y * tq[d + 1] +
+                            (float)kv4.z * tq[d + 2] +
+                            (float)kv4.w * tq[d + 3]);
+                }
+                sloc[i / 32u] = dot * scale;
+            }
+            /* t >= pos (partial block tail): sloc keeps its -1e30f init,
+             * contributing zero weight after the softmax shift. */
+        }
+        /* Block-wide online softmax update: two simd reductions per block
+         * instead of one per token. */
+        float m_b = sloc[0];
+        for (uint i = 1; i < QWEN_DECODE_SHADOW_BT / 32u; i++)
+            m_b = max(m_b, sloc[i]);
+        m_b = simd_max(m_b);
+        const float m_new = max(m_prev, m_b);
+        const float alpha = exp(m_prev - m_new);
+        float lsum = 0.0f;
+        for (uint i = 0; i < QWEN_DECODE_SHADOW_BT / 32u; i++) {
+            sloc[i] = exp(sloc[i] - m_new);
+            lsum += sloc[i];
+        }
+        l_prev = l_prev * alpha + simd_sum(lsum);
+        for (uint j = 0; j < 8u; j++) acc[j] *= alpha;
+        /* V accumulation: weight broadcast from the owning lane. */
+        for (uint i = 0; i < len; i++) {
+            const float w = simd_shuffle(sloc[i >> 5], i & 31u);
+            device const half *vt = vh + (uint64_t)(t0 + i) * hd;
+            const uint base = lane * 8u;
+            const half4 v0 = *(device const half4 *)(vt + base);
+            const half4 v1 = *(device const half4 *)(vt + base + 4);
+            acc[0] += w * (float)v0.x;
+            acc[1] += w * (float)v0.y;
+            acc[2] += w * (float)v0.z;
+            acc[3] += w * (float)v0.w;
+            acc[4] += w * (float)v1.x;
+            acc[5] += w * (float)v1.y;
+            acc[6] += w * (float)v1.z;
+            acc[7] += w * (float)v1.w;
+        }
+        m_prev = m_new;
+    }
+
+    /* Current token: read directly from the new-K/V buffers. */
+    {
+        device const float *kt = k_new + (uint64_t)kv_h * hd;
+        device const float *vt = v_new + (uint64_t)kv_h * hd;
+        float qreg[8];
+        for (uint j = 0; j < 8u; j++) qreg[j] = tq[lane * 8u + j];
+        float partial = 0.0f;
+        for (uint j = 0; j < 8u; j++)
+            partial += qreg[j] * kt[lane * 8u + j];
+        const float score = simd_sum(partial) * scale;
+        const float m_curr = max(m_prev, score);
+        const float al = exp(m_prev - m_curr);
+        const float be = exp(score - m_curr);
+        l_prev = l_prev * al + be;
+        for (uint j = 0; j < 8u; j++)
+            acc[j] = acc[j] * al + be * vt[lane * 8u + j];
+        m_prev = m_curr;
+    }
+
+    const float inv = 1.0f / (l_prev > 1e-8f ? l_prev : 1.0f);
+    device float *oh = heads_out + (uint64_t)h * hd;
+    for (uint j = 0; j < 8u; j++)
+        oh[lane * 8u + j] = acc[j] * inv;
+}
+
 kernel void kernel_qwen_causal_mask_f16(
         device half * mask,
         constant uint4 & args,

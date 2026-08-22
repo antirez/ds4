@@ -20396,6 +20396,21 @@ static int ds4_gpu_qwen_attn_flash_rows(
         uint32_t        n_tok,
         uint32_t        gated);
 
+static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
+        ds4_gpu_tensor       *heads_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_new,
+        const ds4_gpu_tensor *v_new,
+        ds4_gpu_tensor       *k_cache,
+        uint64_t              k_cache_offset,
+        ds4_gpu_tensor       *v_cache,
+        uint64_t              v_cache_offset,
+        uint32_t              pos,
+        uint32_t              max_ctx,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim);
+
 int ds4_gpu_qwen_rope_rotate_half_rows_tensor(
         ds4_gpu_tensor *x,
         uint32_t n_tok,
@@ -20614,6 +20629,39 @@ int ds4_gpu_qwen_full_attn_tensor(
     const uint64_t kv_off = ((uint64_t)layer * cap + pos) * kv_bytes;
     if (!ds4_gpu_tensor_copy_compute(k_cache, kv_off, k, 0, kv_bytes)) return 0;
     if (!ds4_gpu_tensor_copy_compute(v_cache, kv_off, v, 0, kv_bytes)) return 0;
+    /* Fast path: attend from the persistent F16 KV shadow when it provably
+     * covers [0, pos); falls back to the legacy kernel below otherwise
+     * (see ds4_gpu_qwen_gqa_attn_decode_shadow_tensor). The current token's
+     * k/v were appended to the F32 cache above and stay there; the shadow
+     * kernel reads them as k_new/v_new and re-writes cache row pos with the
+     * same values (idempotent). */
+    if (ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(heads, q, k, v,
+            k_cache, (uint64_t)layer * cap * kv_bytes,
+            v_cache, (uint64_t)layer * cap * kv_bytes,
+            pos, cap, n_head, n_head_kv, head_dim)) {
+        if (gated) {
+            id<MTLComputePipelineState> gate_p =
+                ds4_gpu_get_pipeline("kernel_qwen_attn_apply_gate_rows");
+            if (!gate_p) return 0;
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            const uint32_t gn = n_head * head_dim;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:gate_p];
+            [enc setBuffer:ds4_gpu_tensor_buffer(heads)
+                    offset:ds4_gpu_tensor_offset(heads) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(gate)
+                    offset:ds4_gpu_tensor_offset(gate) atIndex:1];
+            [enc setBytes:&gn length:sizeof(gn) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)gn, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen attn gate"))
+                return 0;
+        }
+        return 1;
+    }
     {
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -22881,6 +22929,213 @@ int ds4_gpu_interleave_rows_f32_tensor(
     return 1;
 }
 
+static int ds4_gpu_encode_cpy_f32_f16_3d(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src,
+        NSUInteger           src_off,
+        id<MTLBuffer>        dst,
+        NSUInteger           dst_off,
+        uint32_t             cols,
+        uint32_t             rows,
+        uint32_t             planes,
+        uint64_t             src_row_stride,
+        uint64_t             src_plane_stride,
+        uint64_t             dst_row_stride,
+        uint64_t             dst_plane_stride);
+
+/* Shadow-backed tiled decode attention for qwen full-attn layers: attends
+ * the persistent F16 KV shadow maintained by ds4_gpu_qwen_attn_flash_rows
+ * instead of rescanning the whole F32 prefix per token. Returns 0 for every
+ * condition the fast path cannot prove safe — the caller then runs the
+ * legacy decode kernel unchanged:
+ *   - env DS4_QWEN_DECODE_SHADOW=0 (kill switch),
+ *   - shape mismatch (head_dim must be 256, GQA group divisibility),
+ *   - k/v offsets do not identify a whole layer of the pooled cache,
+ *   - no shadow slot matches this (layer, cache buffers, cap, dims) and the
+ *     slot table is full (never resets other layers' slots mid-generation),
+ *   - slot->converted > pos (cache rewound without the truncate hook:
+ *     nothing is provably current for [0, pos]).
+ * Rows [converted, pos) are converted incrementally from the F32 cache on
+ * the same command buffer; row pos itself is read from k_new/v_new and is
+ * persisted into the F32 cache by the kernel like the legacy path, so the
+ * next decode step converts it from there. */
+static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
+        ds4_gpu_tensor       *heads_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_new,
+        const ds4_gpu_tensor *v_new,
+        ds4_gpu_tensor       *k_cache,
+        uint64_t              k_cache_offset,
+        ds4_gpu_tensor       *v_cache,
+        uint64_t              v_cache_offset,
+        uint32_t              pos,
+        uint32_t              max_ctx,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim) {
+    const char *sw = getenv("DS4_QWEN_DECODE_SHADOW");
+    if (sw && sw[0] == '0' && sw[1] == '\0') return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads_out || !q || !k_new || !v_new || !k_cache || !v_cache) return 0;
+    if (n_head == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        head_dim != 256u || max_ctx == 0 || pos >= max_ctx) return 0;
+    const uint64_t layer_span =
+        (uint64_t)max_ctx * n_head_kv * head_dim * sizeof(float);
+    if (layer_span == 0 || k_cache_offset % layer_span != 0 ||
+        v_cache_offset != k_cache_offset) return 0;
+    const uint32_t layer = (uint32_t)(k_cache_offset / layer_span);
+    if (layer >= DS4_QWEN_FLASH_KV_MAX_LAYERS) return 0;
+    id<MTLComputePipelineState> pipe =
+        ds4_gpu_get_pipeline("kernel_qwen_gqa_attn_decode_shadow");
+    if (!pipe) return 0;
+    id<MTLBuffer> kc_buf = ds4_gpu_tensor_buffer(k_cache);
+    id<MTLBuffer> vc_buf = ds4_gpu_tensor_buffer(v_cache);
+    if (!kc_buf || !vc_buf) return 0;
+    const uint64_t kc_abs_off = ds4_gpu_tensor_offset(k_cache);
+    const uint64_t vc_abs_off = ds4_gpu_tensor_offset(v_cache);
+
+    /* Same slot identity as ds4_gpu_qwen_attn_flash_rows. */
+    ds4_qwen_flash_kv_f16_slot *slot = NULL;
+    for (uint32_t s = 0; s < DS4_QWEN_FLASH_KV_MAX_SLOTS; s++) {
+        ds4_qwen_flash_kv_f16_slot *cand = &g_qwen_flash_kv_f16.slots[s];
+        if (cand->used &&
+            cand->layer == layer &&
+            cand->k_buf == kc_buf &&
+            cand->v_buf == vc_buf &&
+            cand->k_off == kc_abs_off &&
+            cand->v_off == vc_abs_off &&
+            cand->cap == max_ctx &&
+            cand->n_head_kv == n_head_kv &&
+            cand->head_dim == head_dim) {
+            slot = cand;
+            break;
+        }
+    }
+    if (!slot) {
+        /* Claim a free slot; if the table is full, fall back rather than
+         * dropping every slot mid-generation (flash_rows may do that during
+         * prefill, where it can afford the reconversion). */
+        for (uint32_t s = 0; s < DS4_QWEN_FLASH_KV_MAX_SLOTS && !slot; s++) {
+            if (!g_qwen_flash_kv_f16.slots[s].used)
+                slot = &g_qwen_flash_kv_f16.slots[s];
+        }
+        if (!slot) return 0;
+        slot->used = 1;
+        slot->layer = layer;
+        slot->k_buf = kc_buf;
+        slot->v_buf = vc_buf;
+        slot->k_off = kc_abs_off;
+        slot->v_off = vc_abs_off;
+        slot->cap = max_ctx;
+        slot->n_head_kv = n_head_kv;
+        slot->head_dim = head_dim;
+        slot->converted = 0;
+        g_qwen_flash_kv_f16.valid = 1;
+    }
+    uint32_t conv = slot->converted;
+    if (conv > pos) return 0;
+
+    /* Identical fixed layout as the prefill shadow: cap aligned to the 64
+     * flash block, K region at offset 0, V region right after. */
+    const uint32_t cap_rows = ((max_ctx + 63u) / 64u) * 64u;
+    const uint64_t f16_head_stride = (uint64_t)cap_rows * head_dim * sizeof(uint16_t);
+    const NSUInteger k_region =
+        (NSUInteger)n_head_kv * (NSUInteger)f16_head_stride;
+    const NSUInteger slot_kv_bytes = k_region * 2u;
+    id<MTLBuffer> prev_shadow = slot->shadow;
+    NSUInteger prev_shadow_bytes = slot->shadow_bytes;
+    if (!ds4_gpu_ensure_scratch_buffer(&slot->shadow,
+                                       &slot->shadow_bytes,
+                                       slot_kv_bytes,
+                                       "ds4_qwen_flash_attn_kv_f16")) {
+        return 0;
+    }
+    if (slot->shadow != prev_shadow || slot->shadow_bytes != prev_shadow_bytes) {
+        if (prev_shadow_bytes == 0)
+            g_qwen_flash_kv_f16_bytes += slot->shadow_bytes;
+        else if (slot->shadow_bytes > prev_shadow_bytes)
+            g_qwen_flash_kv_f16_bytes += slot->shadow_bytes - prev_shadow_bytes;
+        conv = 0;
+    }
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        if (conv < pos) {
+            /* Incrementally convert rows [conv, pos) of the F32 cache; row
+             * pos is not in the cache yet, the kernel reads it from
+             * k_new/v_new directly. */
+            const uint64_t src_row =
+                (uint64_t)n_head_kv * head_dim * sizeof(float);
+            const uint64_t src_plane = (uint64_t)head_dim * sizeof(float);
+            const uint64_t dst_row = (uint64_t)head_dim * sizeof(uint16_t);
+            const uint64_t src_conv_off =
+                kc_abs_off + k_cache_offset + (uint64_t)conv * src_row;
+            const NSUInteger dst_conv_off =
+                (NSUInteger)((uint64_t)conv * dst_row);
+            if (!ds4_gpu_encode_cpy_f32_f16_3d(cb,
+                                               kc_buf,
+                                               src_conv_off,
+                                               slot->shadow,
+                                               dst_conv_off,
+                                               head_dim,
+                                               pos - conv,
+                                               n_head_kv,
+                                               src_row,
+                                               src_plane,
+                                               dst_row,
+                                               f16_head_stride) ||
+                !ds4_gpu_encode_cpy_f32_f16_3d(cb,
+                                               vc_buf,
+                                               vc_abs_off + v_cache_offset + (uint64_t)conv * src_row,
+                                               slot->shadow,
+                                               k_region + dst_conv_off,
+                                               head_dim,
+                                               pos - conv,
+                                               n_head_kv,
+                                               src_row,
+                                               src_plane,
+                                               dst_row,
+                                               f16_head_stride)) {
+                return 0;
+            }
+        }
+        struct {
+            uint32_t pos;
+            uint32_t n_head;
+            uint32_t n_head_kv;
+            uint32_t head_dim;
+            uint64_t kv_head_stride;
+        } sargs = { pos, n_head, n_head_kv, head_dim,
+                    (uint64_t)cap_rows * head_dim };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                offset:ds4_gpu_tensor_offset(q) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k_new)
+                offset:ds4_gpu_tensor_offset(k_new) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(v_new)
+                offset:ds4_gpu_tensor_offset(v_new) atIndex:2];
+        [enc setBuffer:kc_buf offset:kc_abs_off + k_cache_offset atIndex:3];
+        [enc setBuffer:vc_buf offset:vc_abs_off + v_cache_offset atIndex:4];
+        [enc setBuffer:slot->shadow offset:0 atIndex:5];
+        [enc setBuffer:slot->shadow offset:k_region atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
+                offset:ds4_gpu_tensor_offset(heads_out) atIndex:7];
+        [enc setBytes:&sargs length:sizeof(sargs) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen gqa decode shadow"))
+            return 0;
+        /* Command buffer completed: rows [0, pos) are durable in the
+         * shadow; row pos lands in the F32 cache for the next step. */
+        slot->converted = pos;
+    }
+    return 1;
+}
+
 int ds4_gpu_qwen_gqa_attn_decode_tensor(
         ds4_gpu_tensor       *heads_out,
         const ds4_gpu_tensor *q,
@@ -22896,6 +23151,12 @@ int ds4_gpu_qwen_gqa_attn_decode_tensor(
         uint32_t              n_head_kv,
         uint32_t              head_dim) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Fast path: attend from the persistent F16 KV shadow when it provably
+     * covers [0, pos); falls back to the legacy kernel below otherwise
+     * (see ds4_gpu_qwen_gqa_attn_decode_shadow_tensor). */
+    if (ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(heads_out, q, k_new, v_new,
+            k_cache, k_cache_offset, v_cache, v_cache_offset,
+            pos, max_ctx, n_head, n_head_kv, head_dim)) return 1;
     if (!heads_out || !q || !k_new || !v_new || !k_cache || !v_cache) return 0;
     if (!g_qwen_gqa_attn_decode_pipeline) return 0;
     @autoreleasepool {
