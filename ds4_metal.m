@@ -22943,12 +22943,23 @@ static int ds4_gpu_encode_cpy_f32_f16_3d(
         uint64_t             dst_row_stride,
         uint64_t             dst_plane_stride);
 
+static int ds4_qwen_decode_shadow_enabled(void) {
+    /* Default OFF: the shadow holds history K/V in F16, so this path is not
+     * bit-identical to the F32 legacy decode kernel. That breaks the
+     * batched-vs-sequential exactness contract asserted by
+     * tests/test_metal_session_batch, where a batched step takes the
+     * row-batched F32 attention while the sequential control takes this
+     * single-token path. Opt in with DS4_QWEN_DECODE_SHADOW=1 for the ~3.5x
+     * single-token decode speedup, same policy as DS4_QWEN_GDN_CHUNK. */
+    return ds4_gpu_env_bool("DS4_QWEN_DECODE_SHADOW") == 1;
+}
+
 /* Shadow-backed tiled decode attention for qwen full-attn layers: attends
  * the persistent F16 KV shadow maintained by ds4_gpu_qwen_attn_flash_rows
  * instead of rescanning the whole F32 prefix per token. Returns 0 for every
  * condition the fast path cannot prove safe — the caller then runs the
  * legacy decode kernel unchanged:
- *   - env DS4_QWEN_DECODE_SHADOW=0 (kill switch),
+ *   - env DS4_QWEN_DECODE_SHADOW is not 1 (opt-in; see above),
  *   - shape mismatch (head_dim must be 256, GQA group divisibility),
  *   - k/v offsets do not identify a whole layer of the pooled cache,
  *   - no shadow slot matches this (layer, cache buffers, cap, dims) and the
@@ -22973,8 +22984,7 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         uint32_t              n_head,
         uint32_t              n_head_kv,
         uint32_t              head_dim) {
-    const char *sw = getenv("DS4_QWEN_DECODE_SHADOW");
-    if (sw && sw[0] == '0' && sw[1] == '\0') return 0;
+    if (!ds4_qwen_decode_shadow_enabled()) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads_out || !q || !k_new || !v_new || !k_cache || !v_cache) return 0;
     if (n_head == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
@@ -23111,19 +23121,25 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
                     (uint64_t)cap_rows * head_dim };
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipe];
+        /* Index order must match the kernel signature, which declares `args`
+         * first: args=0, then q, k_new, v_new, k_cache, v_cache, shadow_k,
+         * shadow_v, heads_out. Binding args last shifts every buffer by one,
+         * which the kernel only observes as a garbage head_dim -- it then
+         * returns from every thread while this function still reports success,
+         * so the caller skips the legacy kernel and leaves heads_out stale. */
+        [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q)
-                offset:ds4_gpu_tensor_offset(q) atIndex:0];
+                offset:ds4_gpu_tensor_offset(q) atIndex:1];
         [enc setBuffer:ds4_gpu_tensor_buffer(k_new)
-                offset:ds4_gpu_tensor_offset(k_new) atIndex:1];
+                offset:ds4_gpu_tensor_offset(k_new) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(v_new)
-                offset:ds4_gpu_tensor_offset(v_new) atIndex:2];
-        [enc setBuffer:kc_buf offset:kc_abs_off + k_cache_offset atIndex:3];
-        [enc setBuffer:vc_buf offset:vc_abs_off + v_cache_offset atIndex:4];
-        [enc setBuffer:slot->shadow offset:0 atIndex:5];
-        [enc setBuffer:slot->shadow offset:k_region atIndex:6];
+                offset:ds4_gpu_tensor_offset(v_new) atIndex:3];
+        [enc setBuffer:kc_buf offset:kc_abs_off + k_cache_offset atIndex:4];
+        [enc setBuffer:vc_buf offset:vc_abs_off + v_cache_offset atIndex:5];
+        [enc setBuffer:slot->shadow offset:0 atIndex:6];
+        [enc setBuffer:slot->shadow offset:k_region atIndex:7];
         [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
-                offset:ds4_gpu_tensor_offset(heads_out) atIndex:7];
-        [enc setBytes:&sargs length:sizeof(sargs) atIndex:8];
+                offset:ds4_gpu_tensor_offset(heads_out) atIndex:8];
         [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);

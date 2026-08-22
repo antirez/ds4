@@ -976,13 +976,18 @@ kernel void kernel_qwen_gqa_attn_decode_shadow(
     const uint kv_h = h / ngrp;
     const uint kv_dim = args.n_head_kv * hd;
 
-    /* Persist the new row into the F32 cache exactly like the legacy path. */
+    /* Persist the new row into the F32 cache exactly like the legacy path.
+     * k_new/v_new hold the whole KV row (n_head_kv * head_dim), so the
+     * source needs the same kv_base offset as the destination: reading
+     * k_new[i] would copy KV head 0 into every head's cache slot and
+     * poison the F16 shadow from the next step onwards. */
     if (h % ngrp == 0u) {
-        device float *kd = k_cache + (uint64_t)args.pos * kv_dim + (uint64_t)kv_h * hd;
-        device float *vd = v_cache + (uint64_t)args.pos * kv_dim + (uint64_t)kv_h * hd;
+        const uint kv_base = kv_h * hd;
+        device float *kd = k_cache + (uint64_t)args.pos * kv_dim + kv_base;
+        device float *vd = v_cache + (uint64_t)args.pos * kv_dim + kv_base;
         for (uint i = lane; i < hd; i += 32u) {
-            kd[i] = k_new[i];
-            vd[i] = v_new[i];
+            kd[i] = k_new[kv_base + i];
+            vd[i] = v_new[kv_base + i];
         }
     }
 
