@@ -47,6 +47,8 @@ typedef enum {
     DS4Q_TYPE_BF16    = 30,
     DS4Q_TYPE_TQ1_0   = 34,
     DS4Q_TYPE_TQ2_0   = 35,
+    DS4Q_TYPE_Q4_64A  = 36,
+    DS4Q_TYPE_Q2_64A  = 37,
     DS4Q_TYPE_MXFP4   = 39,
     DS4Q_TYPE_NVFP4   = 40,
     DS4Q_TYPE_Q1_0    = 41,

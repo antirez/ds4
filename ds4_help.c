@@ -187,6 +187,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: Metal 0.6; CUDA/ROCm 0.7");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         }
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER ||
+            tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--dflash FILE", "Load a compatible Qwen DFlash or DFlash2 draft GGUF.");
+            opt(fp, c, "--dflash-n-max N", "Maximum DFlash draft tokens per round. Default: GGUF block_size-1, capped at 7 by the verify batch width.");
+        }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {

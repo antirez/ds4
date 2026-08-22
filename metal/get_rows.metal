@@ -36,6 +36,20 @@ struct ds4_get_rows_block_q4_K {
     uchar qs[128];
 };
 
+struct ds4_get_rows_block_q4_64a {
+    uchar qs[32];
+    ushort scale;
+    ushort bias;
+};
+
+struct ds4_get_rows_block_q2_64a {
+    uchar qs[16];
+    ushort scale;
+    ushort bias;
+};
+
+inline float ds4_bf16_to_f32_get_rows(ushort b){ return as_type<float>(uint(b)<<16); }
+
 static inline uchar2 ds4_get_rows_q4_K_scale_min(int j, int k, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
                  : uchar2{uchar((q[j + 4 + k] & 0x0f) | ((q[j - 4 + k] & 0xc0) >> 2)),
@@ -181,6 +195,66 @@ kernel void kernel_get_rows_q4_K_f32(
             const uint q = ((uint)qb->qs[byte_off] >> shift) & 0x0fu;
             out[idx] = (float)qb->d * (float)sm.x * (float)q -
                        (float)qb->dmin * (float)sm.y;
+        }
+    }
+}
+
+kernel void kernel_get_rows_q4_64a_f32(
+        constant ds4_metal_args_get_rows_q8_0 & args,
+        device const char    * src0,
+        device const char    * src1,
+        device       char    * dst,
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                ntg [[threads_per_threadgroup]]) {
+    const int32_t block = (int32_t)tgpig.x;
+    const int32_t tok_i = (int32_t)tgpig.y;
+    if (tok_i >= args.n_tokens) return;
+    const int32_t token = ((const device int32_t *)(src1 + (uint64_t)tok_i*args.token_stride))[0];
+    if (token < 0 || token >= args.n_vocab) return;
+    const device ds4_get_rows_block_q4_64a *row =
+        (const device ds4_get_rows_block_q4_64a *)(src0 + (uint64_t)token * args.src_row_bytes);
+    const device ds4_get_rows_block_q4_64a *qb = row + block;
+    device float *out = (device float *)(dst + (uint64_t)tok_i * args.dst_row_bytes);
+    const int32_t i0 = block * 64;
+    const float scale = ds4_bf16_to_f32_get_rows(qb->scale);
+    const float bias = ds4_bf16_to_f32_get_rows(qb->bias);
+    for (int32_t i = (int32_t)tiitg; i < 64; i += (int32_t)ntg.x) {
+        const int32_t idx = i0 + i;
+        if (idx < args.n_embd) {
+            const uchar packed = qb->qs[i >> 1];
+            const uint q = (packed >> ((i & 1) * 4)) & 0x0F;
+            out[idx] = (float)q * scale + bias;
+        }
+    }
+}
+
+kernel void kernel_get_rows_q2_64a_f32(
+        constant ds4_metal_args_get_rows_q8_0 & args,
+        device const char    * src0,
+        device const char    * src1,
+        device       char    * dst,
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                ntg [[threads_per_threadgroup]]) {
+    const int32_t block = (int32_t)tgpig.x;
+    const int32_t tok_i = (int32_t)tgpig.y;
+    if (tok_i >= args.n_tokens) return;
+    const int32_t token = ((const device int32_t *)(src1 + (uint64_t)tok_i*args.token_stride))[0];
+    if (token < 0 || token >= args.n_vocab) return;
+    const device ds4_get_rows_block_q2_64a *row =
+        (const device ds4_get_rows_block_q2_64a *)(src0 + (uint64_t)token * args.src_row_bytes);
+    const device ds4_get_rows_block_q2_64a *qb = row + block;
+    device float *out = (device float *)(dst + (uint64_t)tok_i * args.dst_row_bytes);
+    const int32_t i0 = block * 64;
+    const float scale = ds4_bf16_to_f32_get_rows(qb->scale);
+    const float bias = ds4_bf16_to_f32_get_rows(qb->bias);
+    for (int32_t i = (int32_t)tiitg; i < 64; i += (int32_t)ntg.x) {
+        const int32_t idx = i0 + i;
+        if (idx < args.n_embd) {
+            const uchar packed = qb->qs[i >> 2];
+            const uint q = (packed >> ((i & 3) * 2)) & 0x03;
+            out[idx] = (float)q * scale + bias;
         }
     }
 }

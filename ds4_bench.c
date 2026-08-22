@@ -27,6 +27,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *dflash_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -41,6 +42,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int dflash_draft_n_max;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -236,6 +238,11 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2")) {
+            c.dflash_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash-n-max")) {
+            c.dflash_draft_n_max =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -576,6 +583,8 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .dflash_path = cfg.dflash_path,
+        .dflash_draft_n_max = cfg.dflash_draft_n_max,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -705,7 +714,7 @@ int main(int argc, char **argv) {
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
         bool have_snapshot = false;
-        if (need_restore_after_generation && !distributed &&
+        if (need_restore_after_generation && !distributed && !cfg.dflash_path &&
             getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
             const uint64_t payload_bytes = ds4_session_payload_bytes(session);
             const bool large_snapshot_forced =
@@ -732,12 +741,15 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        /* Tokens delivered by the cycle that produced the first token. One for
+         * ordinary decode; a whole accepted block when speculating. */
+        int gen_first_tokens = 1;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -749,17 +761,40 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            int cycle[64];
+            int cycle_cap = cfg.gen_tokens - gen_done;
+            if (cycle_cap > (int)(sizeof(cycle) / sizeof(cycle[0]))) {
+                cycle_cap = (int)(sizeof(cycle) / sizeof(cycle[0]));
+            }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+            const int produced = ds4_session_eval_speculative_argmax(
+                session, token, cycle_cap, eos, cycle, cycle_cap,
+                err, sizeof(err));
+            const double token_t1 = bench_now_sec();
+            if (produced <= 0) {
+                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n",
+                        frontier, produced < 0 ? err : "no tokens produced");
                 rc = 1;
                 break;
             }
-            const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            const double cycle_sec = token_t1 - token_t0;
+            if (gen_done == 0) {
+                /* Nothing is observable until the cycle completes, so the whole
+                 * cycle is the time to the first token and steady state starts
+                 * with the next one. Splitting it per produced token would
+                 * understate first-token latency and charge steady state for
+                 * tokens it never produced. */
+                gen_first_sec = cycle_sec;
+                gen_first_tokens = produced;
+            } else {
+                gen_steady_sec += cycle_sec;
+            }
+            if (gen_token_buf) {
+                for (int i = 0; i < produced; i++) {
+                    gen_token_buf[gen_token_count++] = cycle[i];
+                }
+            }
+            gen_done += produced;
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,7 +830,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens =
+            gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,

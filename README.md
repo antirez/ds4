@@ -192,6 +192,103 @@ GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
 `--power` below 100, an explicit `--prefill-chunk`, and the external `--mtp`
 file are not supported for GLM yet.
 
+Qwen 3.8 27B support is provided for Q4_K_M GGUF models with optional DFlash2 block-diffusion speculative decoding:
+
+```sh
+./download_model.sh qwen-q4              # preferred default standalone Qwen 3.8 27B Q4_K_M base GGUF (~17.7 GiB)
+./download_model.sh qwen                 # alias for qwen-q4
+./download_model.sh qwen3.8              # alias for qwen-q4
+./download_model.sh qwen-dflash          # optional combo: Qwen 3.8 27B Q4_K_M + DFlash2 Q4_K_M (~18.7 GiB total)
+./download_model.sh qwen-dflash-support  # standalone DFlash2 Q4_K_M draft GGUF (~1.06 GiB)
+```
+
+The base model downloads from [`ggml-org/Qwen3.8-27B-GGUF`](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF) and links `./ds4flash.gguf` and `./qwen38.gguf`. The optional `qwen-dflash` target additionally downloads the matching DFlash2 draft model from [`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF).
+
+Ornith 1.5 35B A3B (`ornith-ai/Ornith-1.5-35B-A3B-GGUF`) is a Qwen 3.5 MoE architecture with hybrid linear attention (GDN) and full attention layers:
+
+```sh
+./download_model.sh ornith-q4            # preferred text-only Q4_K_M GGUF (~20.2 GiB)
+./download_model.sh ornith               # alias for ornith-q4
+./download_model.sh ornith-q6            # Q6_K text-only GGUF (~27.2 GiB)
+./download_model.sh ornith-q8            # Q8_0 text-only GGUF (~35.2 GiB)
+./download_model.sh ornith-mmproj        # optional standalone CLIP vision projector (~0.84 GiB)
+```
+
+Ornith 1.5 9B (`ornith-ai/Ornith-1.5-9B-GGUF`) is a dense Qwen 3.5 architecture with hybrid linear attention (GDN) and full attention layers:
+
+```sh
+./download_model.sh ornith9-q4           # preferred text-only Q4_K_M GGUF (~5.24 GiB / ~5.63 GB)
+./download_model.sh ornith9              # alias for ornith9-q4
+./download_model.sh ornith9-q6           # Q6_K text-only GGUF (~6.85 GiB / ~7.36 GB)
+./download_model.sh ornith9-q8           # Q8_0 text-only GGUF (~8.87 GiB / ~9.53 GB)
+./download_model.sh ornith9-mmproj       # optional standalone CLIP vision projector (~0.86 GiB)
+./download_model.sh ornith9-dflash       # combo: Ornith 9B Q4_K_M + distilled DFlash Q4_K_M draft
+./download_model.sh ornith9-dflash-support  # standalone distilled DFlash Q4_K_M draft (~0.71 GiB)
+```
+
+### Qwen and Ornith Runtime Support
+
+The accelerated Qwen 3.8 and Ornith runtimes currently require **macOS Metal**
+on Apple silicon. `--cpu` remains a slow diagnostic/reference path; CUDA and
+ROCm builds reject these model families rather than falling through unsupported
+GPU entry points.
+
+Attach the matching draft GGUF with `--dflash`:
+
+```sh
+# Qwen 3.8 + DFlash2
+./ds4 -m ./qwen38.gguf \
+  --dflash gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf -p "Hello"
+
+# Ornith 1.5 9B + its classic distilled draft
+./ds4 -m ./ornith9.gguf \
+  --dflash gguf/ornith1.5-9b-dflash-bf16-projection-Q4_K_M.gguf -p "Hello"
+```
+
+`--dflash-n-max N` bounds drafts per round. The drafter's GGUF block size is
+the default, capped at 7 because verification uses 8-row buffers for the
+primary token plus its draft suffix. DFlash is not supported with distributed
+layer slicing. Classic Ornith DFlash requires Metal; CPU is target-only.
+
+### Ornith 1.5 Architecture
+- **Text-Only Scope**: `Ornith-1.5-35B-Q4_K_M.gguf` (753 tensors) and `Ornith-1.5-9B-Q4_K_M.gguf` (427 tensors) provide complete standalone text LLMs. Multimodal vision processing is not implemented; the optional CLIP vision projectors (`mmproj-Ornith-1.5-*-BF16.gguf`) are ignored for text inference.
+- **Ornith 1.5 35B Architecture**: `qwen35moe` with 40 base transformer blocks + 1 MTP (NextN) block (41 total), 2048 hidden dimension, 256 routed experts (top-8) + 1 shared expert, and 248,320-token vocabulary.
+  - **Hybrid Attention**: 3:1 pattern (3 linear-attention GDN layers + 1 full GQA layer).
+  - **Linear Attention (GDN)**: 30 layers (SSM conv kernel 4, 32 value heads, 16 key heads, head dimension 128, QKV projection 8192, Z gate 4096).
+  - **Full Attention (GQA)**: 10 layers (16 query heads, 2 KV heads, head dimension 256, gated Q projection 8192, per-head RMSNorm 256, MRoPE interleaved with rotary dimension 64).
+- **Ornith 1.5 9B Architecture**: `qwen35` dense model with 32 base transformer blocks, 4096 hidden dimension, 12,288 FFN intermediate size, and 248,320-token vocabulary.
+  - **Hybrid Attention**: 3:1 pattern repeating 8 times — 24 linear-attention GDN layers and 8 full GQA attention layers (layers 3, 7, 11, 15, 19, 23, 27, 31).
+  - **Linear Attention (GDN)**: 24 layers (SSM conv kernel 4, 16 SSM groups, state size 128, time step rank 32, inner size 4096).
+  - **Full Attention (GQA)**: 8 layers (16 query heads, 4 KV heads, head dimension 256, rotary dimension 64).
+- **Context Length**: Advertises up to 262,144 tokens (`context_length: 262144`); validated for short-context Metal inference.
+
+**Deterministic Reference Comparison:**
+
+To verify deterministic parity against `llama-cli` or Ollama:
+
+```sh
+# 9B reference (llama-cli):
+llama-cli -m gguf/Ornith-1.5-9B-Q4_K_M.gguf \
+  -p "The capital of France is" \
+  -n 16 --temp 0.0 --top-k 1 --top-p 1.0 -ngl 999 --no-warmup \
+  -no-cnv --no-display-prompt
+
+# 9B ds4:
+./ds4 -m gguf/Ornith-1.5-9B-Q4_K_M.gguf \
+  --raw -p "The capital of France is" \
+  -n 16 --temp 0.0
+
+# 35B reference (llama-cli):
+llama-cli -m gguf/Ornith-1.5-35B-Q4_K_M.gguf \
+  -p "The capital of France is" \
+  -n 32 --temp 0.0 --top-k 1 --top-p 1.0 -ngl 999 --no-warmup \
+  -no-cnv --no-display-prompt
+
+# 35B ds4:
+./ds4 -m gguf/Ornith-1.5-35B-Q4_K_M.gguf \
+  --raw -p "The capital of France is" \
+  -n 32 --temp 0.0
+```
 Then build:
 
 ```sh

@@ -8,7 +8,7 @@
 /ds4_server_test
 /ds4_test
 /tests/test_q4k_dot
-/ds4flash.gguf
+/*.gguf
 /TODO.md
 /gguf/
 /core

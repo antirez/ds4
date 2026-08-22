@@ -233,6 +233,22 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
             in_dim, out0_dim, out1_dim, x, n_rows);
 }
 
+extern "C" int ds4_gpu_matmul_affine2_g64_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w_q_offset,
+        uint64_t              w_scales_offset,
+        uint64_t              w_biases_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_embd,
+        uint32_t              n_out) {
+    (void)out; (void)model_map; (void)model_size;
+    (void)w_q_offset; (void)w_scales_offset; (void)w_biases_offset;
+    (void)x; (void)n_embd; (void)n_out;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows) {
@@ -279,6 +295,167 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
                                             weight_offset, n_vocab, n_tokens,
                                             n_embd);
 }
+extern "C" void ds4_gpu_set_concurrent_encoder(int on) { (void)on; }
+/* Qwen hybrid/DFlash entry points. The runtime is Metal-only, but ds4.c
+ * references these from its non-DS4_NO_GPU paths, so ROCm must define them or
+ * the link fails. Returning 0 makes the caller take its documented failure
+ * path instead of silently producing wrong activations. */
+extern "C" void ds4_gpu_qwen_set_gdn_snapshot(int enable) { (void)enable; }
+extern "C" int ds4_gpu_interleave_rows_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+        uint32_t width, uint32_t rows, uint32_t slots, uint32_t slot) {
+    (void)dst; (void)src; (void)width; (void)rows; (void)slots; (void)slot;
+    return 0;
+}
+extern "C" int ds4_gpu_gqa_expand_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim) {
+    (void)dst; (void)src; (void)n_head; (void)n_head_kv; (void)head_dim;
+    return 0;
+}
+extern "C" int ds4_gpu_fill_f32_tensor(
+        ds4_gpu_tensor *dst, float value, uint32_t n) {
+    (void)dst; (void)value; (void)n;
+    return 0;
+}
+extern "C" int ds4_gpu_qwen_gqa_attn_decode_tensor(
+        ds4_gpu_tensor *heads_out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_new, const ds4_gpu_tensor *v_new,
+        ds4_gpu_tensor *k_cache, uint64_t k_cache_offset,
+        ds4_gpu_tensor *v_cache, uint64_t v_cache_offset,
+        uint32_t pos, uint32_t max_ctx, uint32_t n_head,
+        uint32_t n_head_kv, uint32_t head_dim) {
+    (void)heads_out; (void)q; (void)k_new; (void)v_new;
+    (void)k_cache; (void)k_cache_offset; (void)v_cache; (void)v_cache_offset;
+    (void)pos; (void)max_ctx; (void)n_head; (void)n_head_kv; (void)head_dim;
+    return 0;
+}
+extern "C" int ds4_gpu_matmul_q4_k_pair_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight0_offset, uint64_t weight1_offset, uint32_t weight_type,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size;
+    (void)weight0_offset; (void)weight1_offset; (void)weight_type;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+extern "C" int ds4_gpu_matmul_q4_k_pair_swiglu_tensor(
+        ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)weight_type;
+    (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+extern "C" int ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(
+        ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)mid; (void)model_map; (void)model_size;
+    (void)gate_offset; (void)up_offset; (void)weight_type;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
+extern "C" int ds4_gpu_matmul_q4k_weight_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *weight, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)out; (void)weight; (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+extern "C" int ds4_gpu_matmul_q8_0_weight_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *weight, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    (void)out; (void)weight; (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
+    return 0;
+}
+
+
+
+
+extern "C" int ds4_gpu_qwen_gdn_core_tensor(
+        ds4_gpu_tensor *core, ds4_gpu_tensor *conv, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha, const ds4_gpu_tensor *beta,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_w_off, uint64_t a_off, uint64_t dt_off, uint64_t snorm_off,
+        uint32_t layer) {
+    (void)core; (void)conv; (void)state; (void)qkv; (void)z;
+    (void)alpha; (void)beta; (void)model_map; (void)model_size;
+    (void)conv_w_off; (void)a_off; (void)dt_off; (void)snorm_off; (void)layer;
+    return 0;
+}
+extern "C" int ds4_gpu_qwen_gdn_core_rows_tensor(
+        ds4_gpu_tensor *core, ds4_gpu_tensor *conv, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha, const ds4_gpu_tensor *beta,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_w_off, uint64_t a_off, uint64_t dt_off, uint64_t snorm_off,
+        uint32_t layer, uint32_t n_tok) {
+    (void)core; (void)conv; (void)state; (void)qkv; (void)z; (void)alpha; (void)beta;
+    (void)model_map; (void)model_size; (void)conv_w_off; (void)a_off; (void)dt_off;
+    (void)snorm_off; (void)layer; (void)n_tok;
+    return 0;
+}
+extern "C" void ds4_gpu_qwen_set_shape(uint32_t n_layer, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot) {
+    (void)n_layer; (void)n_head; (void)n_head_kv; (void)head_dim; (void)n_rot;
+}
+extern "C" int ds4_gpu_scale_copy_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, float scale, uint32_t n) {
+    (void)dst; (void)src; (void)scale; (void)n;
+    return 0;
+}
+extern "C" int ds4_gpu_mul_scalar_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, float scale, uint32_t n) {
+    return ds4_gpu_scale_copy_f32_tensor(dst, src, scale, n);
+}
+extern "C" int ds4_gpu_mul_rowwise_scalar_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, const ds4_gpu_tensor *scalar,
+        uint32_t width, uint32_t rows) {
+    (void)dst; (void)src; (void)scalar; (void)width; (void)rows;
+    return 0;
+}
+extern "C" int ds4_gpu_sigmoid_f32_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint32_t n) {
+    (void)dst; (void)src; (void)n;
+    return 0;
+}
+
+
+void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps) {
+    (void)conv_steps; (void)state_steps;
+}
+
+
+extern "C" int ds4_gpu_qwen_full_attn_rows_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_off, uint64_t k_norm_off,
+        uint32_t has_q_norm, uint32_t has_k_norm, uint32_t gated, uint32_t pos0,
+        uint32_t layer, uint32_t cap, uint32_t n_tok) {
+    (void)heads; (void)q; (void)k; (void)v; (void)gate; (void)k_cache; (void)v_cache;
+    (void)model_map; (void)model_size; (void)q_norm_off; (void)k_norm_off;
+    (void)has_q_norm; (void)has_k_norm; (void)gated; (void)pos0; (void)layer; (void)cap; (void)n_tok;
+    return 0;
+}
+
+
+extern "C" int ds4_gpu_qwen_full_attn_tensor(
+        ds4_gpu_tensor *heads, ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_norm_off, uint64_t k_norm_off,
+        uint32_t has_q_norm, uint32_t has_k_norm, uint32_t gated,
+        uint32_t pos, uint32_t layer, uint32_t cap) {
+    (void)heads; (void)q; (void)k; (void)v; (void)gate; (void)k_cache; (void)v_cache;
+    (void)model_map; (void)model_size; (void)q_norm_off; (void)k_norm_off;
+    (void)has_q_norm; (void)has_k_norm; (void)gated; (void)pos; (void)layer; (void)cap;
+    return 0;
+}
+
+
 
 extern "C" int ds4_gpu_matmul_quant_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
