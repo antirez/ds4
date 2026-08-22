@@ -57,12 +57,19 @@ head -n1 "$CSV" | grep -q "prefill_tps" || fail "csv missing prefill"
 lines=$(wc -l < "$CSV" | tr -d ' ')
 [[ "$lines" -ge 2 ]] || fail "csv short"
 ok "ds4-bench cpu smoke ok ($lines lines)"
-echo "testing metal (fallback) ..."
-METAL_CSV="/tmp/qwen38_metal_$$.csv"; rm -f "$METAL_CSV"
-if DS4_BENCH_DISABLE_SNAPSHOT=1 "$ROOT/ds4-bench" --model "$MODEL" --metal --prompt-file "$PROMPT" --ctx-start 32 --ctx-max 64 --step-incr 32 --gen-tokens 4 --csv "$METAL_CSV" > "$LOG" 2>&1; then
-  ok "metal ok (fallback)"
-  grep -q "Qwen family uses CPU backend" "$LOG" && echo "  (Metal->CPU fallback confirmed)" || true
-else echo "warn: metal failed but cpu passed — ok non-Metal" >&2; fi
+METAL_CSV="/tmp/qwen38_metal_$$.csv"
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "skip: Metal section (not macOS)"
+else
+  echo "testing ds4-bench --metal ..."
+  rm -f "$METAL_CSV"
+  DS4_BENCH_DISABLE_SNAPSHOT=1 "$ROOT/ds4-bench" --model "$MODEL" --metal --prompt-file "$PROMPT" --ctx-start 32 --ctx-max 64 --step-incr 32 --gen-tokens 4 --csv "$METAL_CSV" > "$LOG" 2>&1 || { cat "$LOG" >&2; fail "bench metal failed"; }
+  [[ -f "$METAL_CSV" ]] || fail "metal csv missing"
+  head -n1 "$METAL_CSV" | grep -q "prefill_tps" || fail "metal csv missing prefill"
+  mlines=$(wc -l < "$METAL_CSV" | tr -d ' ')
+  [[ "$mlines" -ge 2 ]] || fail "metal csv short"
+  ok "ds4-bench metal smoke ok ($mlines lines)"
+fi
 python3 << PY
 import csv
 with open("$CSV") as f:

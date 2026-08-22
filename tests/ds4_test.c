@@ -4,6 +4,7 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
+#include <sys/wait.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
 
@@ -97,11 +98,16 @@ static ds4_backend test_model_backend(void) {
 #endif
 }
 
+
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
-    /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
-     * verify regression can reuse it; draft=4 hits the multi-row verify path. */
-    const char *mtp = getenv("DS4_TEST_MTP");
+    /* DS4_TEST_MTP loads the legacy MTP head on the fast engine so the speculative
+     * verify regression can reuse it; draft=4 hits the multi-row verify path.
+     * DS4_TEST_DSPARK loads an official DSpark draft GGUF and lets metadata choose
+     * the block size. */
+    const char *dspark = getenv("DS4_TEST_DSPARK");
+    const char *mtp = (dspark && dspark[0]) ? dspark : getenv("DS4_TEST_MTP");
+    const bool use_mtp = mtp && mtp[0] && !quality;
     ds4_engine_options opt = {
         .model_path = test_model_path(),
         .backend = test_model_backend(),
@@ -114,8 +120,8 @@ static ds4_engine *test_open_engine(bool quality) {
             test_env_gib("DS4_TEST_SSD_STREAMING_CACHE_GB"),
         .ssd_streaming_preload_experts =
             test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
-        .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
-        .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
+        .mtp_path = use_mtp ? mtp : NULL,
+        .mtp_draft_tokens = use_mtp && !(dspark && dspark[0]) ? 4 : 0,
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
@@ -6113,7 +6119,7 @@ static void test_tool_call_quality_one(bool quality) {
 
     /* Use the real response-side id assignment and exact sampled-DSML memory.
      * The same id is serialized on both the assistant call and tool result. */
-    assign_tool_call_ids(&s, &first.calls, API_OPENAI);
+    assign_tool_call_ids(&s, NULL, &first.calls, API_OPENAI);
     TEST_ASSERT(first.calls.v[0].id && first.calls.v[0].id[0]);
     if (!first.calls.v[0].id || !first.calls.v[0].id[0]) goto done;
     tool_memory_remember(&s, &first.calls);
@@ -6194,7 +6200,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
         const int ntok = ds4_session_eval_speculative_argmax(
             session, token, max_tokens - n, eos, toks,
             (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
-        if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
+        if (ntok < 0) { fprintf(stderr, "ds4-test speculative error: %s\n", err); ok = false; TEST_ASSERT(false); break; }
         if (ntok > *max_chunk) *max_chunk = ntok;
 
         for (int j = 0; j < ntok; j++) {
@@ -6406,6 +6412,9 @@ static void test_dspark_verify_depth(void) {
 }
 #endif
 
+
+
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -6434,14 +6443,16 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
+
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
+
 
 static void test_print_help(const char *prog) {
     printf("Usage: %s [--all | TEST...]\n\n", prog);
     puts("Tests:");
     puts("  --all");
-    puts("      Run every test. This is the default, ordered from slower to faster.");
+    puts("      Run every default test. This is the default, ordered from slower to faster.");
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         printf("  %-20s %s\n", test_entries[i].flag, test_entries[i].desc);
     }
@@ -6481,6 +6492,7 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
     return NULL;
 }
 
+
 static void test_run_entry(const ds4_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
@@ -6510,12 +6522,13 @@ int main(int argc, char **argv) {
             return 0;
         } else {
             const ds4_test_entry *entry = test_find_entry(argv[i]);
-            if (!entry) {
-                fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
-                test_print_help(argv[0]);
-                return 2;
+            if (entry) {
+                selected[(size_t)(entry - test_entries)] = true;
+                continue;
             }
-            selected[(size_t)(entry - test_entries)] = true;
+            fprintf(stderr, "ds4-test: unknown test switch: %s\n", argv[i]);
+            test_print_help(argv[0]);
+            return 2;
         }
     }
 

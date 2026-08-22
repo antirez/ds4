@@ -166,4 +166,3 @@ kernel void kernel_qwen_gqa_attn_decode(
         oh[tiisg * 8 + j] = acc[j] * inv_l;
     }
 }
-

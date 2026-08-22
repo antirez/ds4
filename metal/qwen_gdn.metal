@@ -1,7 +1,10 @@
+// kernel_qwen_gdn_core_rows4 is derived from llama.cpp's ggml-metal
+// kernel_gated_delta_net_impl.
+// Copyright (c) 2023-2026 The ggml authors. MIT licensed; see ../LICENSE.
+
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint QWEN_GDN_V_HEADS = 48u;
 constant uint QWEN_GDN_K_HEADS = 16u;
 constant uint QWEN_GDN_HEAD_DIM = 128u;
 constant uint QWEN_GDN_CONV_K = 4u;
@@ -10,14 +13,21 @@ struct ds4_qwen_gdn_conv_args {
     uint32_t n_channels;
     uint32_t layer;
     uint32_t n_tok;
+    uint32_t n_layers;
+    uint32_t snapshot;
 };
-
 
 struct ds4_qwen_gdn_core_args {
     uint32_t layer;
     uint32_t n_tok;
+    uint32_t v_heads;
+    uint32_t qkv_dim;
+    uint32_t z_dim;
+    uint32_t n_layers;
+    uint32_t snapshot;
+    uint32_t pre_normalized;
+    uint32_t split_output;
 };
-
 
 kernel void kernel_qwen_gdn_conv(
         constant ds4_qwen_gdn_conv_args & args,
@@ -32,7 +42,8 @@ kernel void kernel_qwen_gdn_conv(
     const device float *w = conv_w + gid * QWEN_GDN_CONV_K;
     const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
     const uint layer_off = ((uint)args.layer * args.n_channels + gid) * QWEN_GDN_CONV_K;
-    const uint step_stride = 64u * args.n_channels * QWEN_GDN_CONV_K;
+    const uint n_layers = args.n_layers == 0u ? 64u : args.n_layers;
+    const uint step_stride = n_layers * args.n_channels * QWEN_GDN_CONV_K;
     for (uint t = 0; t < ntok; t++) {
         const float x = qkv[t * args.n_channels + gid];
         h[0] = h[1];
@@ -41,7 +52,7 @@ kernel void kernel_qwen_gdn_conv(
         h[3] = x;
         float acc = w[0]*h[0] + w[1]*h[1] + w[2]*h[2] + w[3]*h[3];
         mixed[t * args.n_channels + gid] = acc / (1.0f + exp(-acc));
-        if (ntok > 1u) {
+        if (args.snapshot && ntok > 1u) {
             device float *hs = conv_steps + t * step_stride + layer_off;
             hs[0] = h[0]; hs[1] = h[1]; hs[2] = h[2]; hs[3] = h[3];
         }
@@ -66,58 +77,70 @@ kernel void kernel_qwen_gdn_core(
         uint3 tgpig [[threadgroup_position_in_grid]],
         uint  lid   [[thread_index_in_threadgroup]]) {
 
+    const uint v_heads = args.v_heads == 0u ? 48u : args.v_heads;
+    const uint qkv_dim = args.qkv_dim == 0u ? 10240u : args.qkv_dim;
+    const uint z_dim = args.z_dim == 0u ? (v_heads * QWEN_GDN_HEAD_DIM) : args.z_dim;
+    const uint n_layers = args.n_layers == 0u ? 64u : args.n_layers;
+
     const uint vh = tgpig.x;
     const uint j = lid;
-    if (vh >= QWEN_GDN_V_HEADS || j >= QWEN_GDN_HEAD_DIM) return;
+    if (vh >= v_heads || j >= QWEN_GDN_HEAD_DIM) return;
 
     const uint kh = vh % QWEN_GDN_K_HEADS;
     threadgroup float tq[QWEN_GDN_HEAD_DIM];
     threadgroup float tk[QWEN_GDN_HEAD_DIM];
-    threadgroup float toh[QWEN_GDN_HEAD_DIM];
     const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
     const uint sg = lid / 32u;
+    device float *Sj = state + ((uint)args.layer * v_heads + vh) *
+                       QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM + j * QWEN_GDN_HEAD_DIM;
+    float Srow[QWEN_GDN_HEAD_DIM];
+    for (uint i = 0; i < QWEN_GDN_HEAD_DIM; i += 4u) {
+        float4 s = *(device float4 *)(Sj + i);
+        Srow[i] = s.x; Srow[i + 1u] = s.y; Srow[i + 2u] = s.z; Srow[i + 3u] = s.w;
+    }
 
     for (uint t = 0; t < ntok; t++) {
-        const device float *mixed_t = mixed + t * 10240u;
-        const device float *z_t = z + t * 6144u;
-        const device float *alpha_t = alpha + t * 48u;
-        const device float *beta_t = beta + t * 48u;
-        device float *core_t = core + t * 6144u;
+        const device float *mixed_t = mixed + t * qkv_dim;
+        const device float *z_t = z + t * z_dim;
+        const device float *alpha_t = alpha + t * v_heads;
+        const device float *beta_t = beta + t * v_heads;
+        device float *core_t = core + t * z_dim;
 
         const device float *qsrc = mixed_t + kh * QWEN_GDN_HEAD_DIM;
-        const device float *ksrc = mixed_t + 2048u + kh * QWEN_GDN_HEAD_DIM;
+        const device float *ksrc = mixed_t + (QWEN_GDN_K_HEADS * QWEN_GDN_HEAD_DIM) + kh * QWEN_GDN_HEAD_DIM;
         tq[j] = qsrc[j];
         tk[j] = ksrc[j];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float qn = tq[j] * tq[j];
-        float kn = tk[j] * tk[j];
-        qn += simd_shuffle_xor(qn, 1u);
-        qn += simd_shuffle_xor(qn, 2u);
-        qn += simd_shuffle_xor(qn, 4u);
-        qn += simd_shuffle_xor(qn, 8u);
-        qn += simd_shuffle_xor(qn, 16u);
-        kn += simd_shuffle_xor(kn, 1u);
-        kn += simd_shuffle_xor(kn, 2u);
-        kn += simd_shuffle_xor(kn, 4u);
-        kn += simd_shuffle_xor(kn, 8u);
-        kn += simd_shuffle_xor(kn, 16u);
-        threadgroup float qn_sg[4];
-        threadgroup float kn_sg[4];
-        if ((lid & 31u) == 0u) {
-            qn_sg[sg] = qn;
-            kn_sg[sg] = kn;
+        if (args.pre_normalized) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            float qn = tq[j] * tq[j];
+            float kn = tk[j] * tk[j];
+            qn += simd_shuffle_xor(qn, 1u);
+            qn += simd_shuffle_xor(qn, 2u);
+            qn += simd_shuffle_xor(qn, 4u);
+            qn += simd_shuffle_xor(qn, 8u);
+            qn += simd_shuffle_xor(qn, 16u);
+            kn += simd_shuffle_xor(kn, 1u);
+            kn += simd_shuffle_xor(kn, 2u);
+            kn += simd_shuffle_xor(kn, 4u);
+            kn += simd_shuffle_xor(kn, 8u);
+            kn += simd_shuffle_xor(kn, 16u);
+            threadgroup float qn_sg[4];
+            threadgroup float kn_sg[4];
+            if ((lid & 31u) == 0u) {
+                qn_sg[sg] = qn;
+                kn_sg[sg] = kn;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            qn = qn_sg[0] + qn_sg[1] + qn_sg[2] + qn_sg[3];
+            kn = kn_sg[0] + kn_sg[1] + kn_sg[2] + kn_sg[3];
+            tq[j] *= 1.0f / max(sqrt(qn), 1e-6f);
+            tk[j] *= 1.0f / max(sqrt(kn), 1e-6f);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        qn = qn_sg[0] + qn_sg[1] + qn_sg[2] + qn_sg[3];
-        kn = kn_sg[0] + kn_sg[1] + kn_sg[2] + kn_sg[3];
-        qn = 1.0f / max(sqrt(qn), 1e-6f);
-        kn = 1.0f / max(sqrt(kn), 1e-6f);
-        tq[j] *= qn;
-        tk[j] *= kn;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const float vj = mixed_t[4096u + vh * QWEN_GDN_HEAD_DIM + j];
+        const float vj = mixed_t[(2u * QWEN_GDN_K_HEADS * QWEN_GDN_HEAD_DIM) + vh * QWEN_GDN_HEAD_DIM + j];
         float g = alpha_t[vh] + dt_bias[vh];
         if (g > 20.0f) {
         } else if (g < -20.0f) {
@@ -128,57 +151,220 @@ kernel void kernel_qwen_gdn_core(
         const float decay = exp(g * A_log[vh]);
         const float b = 1.0f / (1.0f + exp(-beta_t[vh]));
 
-        device float *Sj = state + ((uint)args.layer * QWEN_GDN_V_HEADS + vh) *
-                           QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM + j * QWEN_GDN_HEAD_DIM;
         float kv = 0.0f;
         for (uint i = 0; i < QWEN_GDN_HEAD_DIM; i += 4u) {
-            float4 s = *(device float4 *)(Sj + i);
-            s *= decay;
-            kv += s.x * tk[i] + s.y * tk[i + 1] + s.z * tk[i + 2] + s.w * tk[i + 3];
-            *(device float4 *)(Sj + i) = s;
+            Srow[i] *= decay;
+            Srow[i + 1u] *= decay;
+            Srow[i + 2u] *= decay;
+            Srow[i + 3u] *= decay;
+            kv += Srow[i] * tk[i] + Srow[i + 1u] * tk[i + 1u] +
+                  Srow[i + 2u] * tk[i + 2u] + Srow[i + 3u] * tk[i + 3u];
         }
         const float delta = (vj - kv) * b;
         float oh = 0.0f;
         const float qscale = 1.0f / sqrt((float)QWEN_GDN_HEAD_DIM);
         for (uint i = 0; i < QWEN_GDN_HEAD_DIM; i += 4u) {
-            float4 s = *(device float4 *)(Sj + i);
-            s.x += tk[i] * delta;
-            s.y += tk[i + 1] * delta;
-            s.z += tk[i + 2] * delta;
-            s.w += tk[i + 3] * delta;
-            *(device float4 *)(Sj + i) = s;
-            oh += s.x * tq[i] + s.y * tq[i + 1] + s.z * tq[i + 2] + s.w * tq[i + 3];
+            Srow[i] += tk[i] * delta;
+            Srow[i + 1u] += tk[i + 1u] * delta;
+            Srow[i + 2u] += tk[i + 2u] * delta;
+            Srow[i + 3u] += tk[i + 3u] * delta;
+            oh += Srow[i] * tq[i] + Srow[i + 1u] * tq[i + 1u] +
+                  Srow[i + 2u] * tq[i + 2u] + Srow[i + 3u] * tq[i + 3u];
         }
         oh *= qscale;
-        toh[j] = oh;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float ss = toh[j] * toh[j];
-        ss += simd_shuffle_xor(ss, 1u);
-        ss += simd_shuffle_xor(ss, 2u);
-        ss += simd_shuffle_xor(ss, 4u);
-        ss += simd_shuffle_xor(ss, 8u);
-        ss += simd_shuffle_xor(ss, 16u);
-        threadgroup float ss_sg[4];
-        if ((lid & 31u) == 0u) ss_sg[sg] = ss;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        ss = (ss_sg[0] + ss_sg[1] + ss_sg[2] + ss_sg[3]) / (float)QWEN_GDN_HEAD_DIM;
-        const float nscale = 1.0f / sqrt(ss + 1e-6f);
-        const float zj = z_t[vh * QWEN_GDN_HEAD_DIM + j];
-        core_t[vh * QWEN_GDN_HEAD_DIM + j] = oh * nscale * snorm[j] * (zj / (1.0f + exp(-zj)));
-        if (ntok > 1u) {
-            const uint state_off = ((uint)args.layer * QWEN_GDN_V_HEADS + vh) *
+        if (args.split_output) {
+            core_t[vh * QWEN_GDN_HEAD_DIM + j] = oh;
+        } else {
+            float ss = oh * oh;
+            ss += simd_shuffle_xor(ss, 1u);
+            ss += simd_shuffle_xor(ss, 2u);
+            ss += simd_shuffle_xor(ss, 4u);
+            ss += simd_shuffle_xor(ss, 8u);
+            ss += simd_shuffle_xor(ss, 16u);
+            threadgroup float ss_sg[4];
+            if ((lid & 31u) == 0u) ss_sg[sg] = ss;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ss = (ss_sg[0] + ss_sg[1] + ss_sg[2] + ss_sg[3]) /
+                 (float)QWEN_GDN_HEAD_DIM;
+            const float nscale = 1.0f / sqrt(ss + 1e-6f);
+            const float zj = z_t[vh * QWEN_GDN_HEAD_DIM + j];
+            core_t[vh * QWEN_GDN_HEAD_DIM + j] =
+                oh * nscale * snorm[j] * (zj / (1.0f + exp(-zj)));
+        }
+        if (args.snapshot && ntok > 1u) {
+            const uint state_off = ((uint)args.layer * v_heads + vh) *
                                    QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM + j * QWEN_GDN_HEAD_DIM;
-            const uint step_stride = 64u * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM;
+            const uint step_stride = n_layers * v_heads * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM;
             device float *dst = state_steps + t * step_stride + state_off;
             for (uint i = 0; i < QWEN_GDN_HEAD_DIM; i += 4u)
-                *(device float4 *)(dst + i) = *(device float4 *)(Sj + i);
+                *(device float4 *)(dst + i) = float4(Srow[i], Srow[i + 1u], Srow[i + 2u], Srow[i + 3u]);
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
+
+        if (t + 1u < ntok) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
+    for (uint i = 0; i < QWEN_GDN_HEAD_DIM; i += 4u)
+        *(device float4 *)(Sj + i) = float4(Srow[i], Srow[i + 1u], Srow[i + 2u], Srow[i + 3u]);
 }
+// llama.cpp-style recurrent geometry: one 4-simdgroup threadgroup owns four
+// state rows, and each lane keeps only four contiguous state columns.
+// Q/K are pre-normalized by kernel_qwen_gdn_qk_l2; output normalization is
+// handled by kernel_qwen_gdn_output_norm.
+kernel void kernel_qwen_gdn_core_rows4(
+        constant ds4_qwen_gdn_core_args & args,
+        device const float * mixed,
+        device const float * z,
+        device const float * alpha,
+        device const float * beta,
+        device const float * A_log,
+        device const float * dt_bias,
+        device const float * snorm,
+        device float * state,
+        device float * core,
+        device float * state_steps,
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 tid [[thread_position_in_threadgroup]]) {
+    (void)z;
+    (void)snorm;
+    const uint v_heads = args.v_heads == 0u ? 48u : args.v_heads;
+    const uint qkv_dim = args.qkv_dim == 0u ? 10240u : args.qkv_dim;
+    const uint z_dim = args.z_dim == 0u
+        ? v_heads * QWEN_GDN_HEAD_DIM : args.z_dim;
+    const uint n_layers = args.n_layers == 0u ? 64u : args.n_layers;
+    const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
+    const uint vh = group.y;
+    const uint j = group.x * 4u + tid.y;
+    const uint lane = tid.x;
+    if (vh >= v_heads || j >= QWEN_GDN_HEAD_DIM || lane >= 32u ||
+        tid.y >= 4u) return;
+
+    const uint kh = vh % QWEN_GDN_K_HEADS;
+    device float *Sj = state + ((uint)args.layer * v_heads + vh) *
+        QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM + j * QWEN_GDN_HEAD_DIM;
+    const uint i = lane * 4u;
+    float4 s = *(device float4 *)(Sj + i);
+    const float A = A_log[vh];
+    const float dt = dt_bias[vh];
+    const float qscale = 1.0f / sqrt((float)QWEN_GDN_HEAD_DIM);
+
+    for (uint t = 0; t < ntok; t++) {
+        const device float *mixed_t = mixed + t * qkv_dim;
+        const device float *q = mixed_t + kh * QWEN_GDN_HEAD_DIM;
+        const device float *k = mixed_t +
+            QWEN_GDN_K_HEADS * QWEN_GDN_HEAD_DIM + kh * QWEN_GDN_HEAD_DIM;
+        const float4 q4 = *(device const float4 *)(q + i);
+        const float4 k4 = *(device const float4 *)(k + i);
+        const float vj = mixed_t[
+            2u * QWEN_GDN_K_HEADS * QWEN_GDN_HEAD_DIM +
+            vh * QWEN_GDN_HEAD_DIM + j];
+
+        float g = alpha[t * v_heads + vh] + dt;
+        if (g > 20.0f) {
+        } else if (g < -20.0f) {
+            g = exp(g);
+        } else {
+            g = log(1.0f + exp(g));
+        }
+        s *= exp(g * A);
+        const float sk = simd_sum(dot(s, k4));
+        const float b = 1.0f /
+            (1.0f + exp(-beta[t * v_heads + vh]));
+        s += k4 * ((vj - sk) * b);
+        const float oh = simd_sum(dot(s, q4)) * qscale;
+        if (lane == 0u) {
+            core[t * z_dim + vh * QWEN_GDN_HEAD_DIM + j] = oh;
+        }
+
+        if (args.snapshot && ntok > 1u) {
+            const uint state_off = ((uint)args.layer * v_heads + vh) *
+                QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM +
+                j * QWEN_GDN_HEAD_DIM;
+            const uint step_stride = n_layers * v_heads *
+                QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM;
+            device float *dst = state_steps + t * step_stride + state_off;
+            *(device float4 *)(dst + i) = s;
+        }
+    }
+    *(device float4 *)(Sj + i) = s;
+}
+
+kernel void kernel_qwen_gdn_qk_l2(
+        constant ds4_qwen_gdn_core_args & args,
+        device float * mixed,
+        uint group [[threadgroup_position_in_grid]],
+        uint lid [[thread_index_in_threadgroup]]) {
+    const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
+    const uint qkv_dim = args.qkv_dim == 0u ? 10240u : args.qkv_dim;
+    const uint t = group / QWEN_GDN_K_HEADS;
+    const uint kh = group % QWEN_GDN_K_HEADS;
+    if (t >= ntok || lid >= QWEN_GDN_HEAD_DIM) return;
+    device float *q = mixed + t * qkv_dim + kh * QWEN_GDN_HEAD_DIM;
+    device float *k = q + QWEN_GDN_K_HEADS * QWEN_GDN_HEAD_DIM;
+    const float qv = q[lid];
+    const float kv = k[lid];
+    float qn = qv * qv;
+    float kn = kv * kv;
+    qn += simd_shuffle_xor(qn, 1u);
+    qn += simd_shuffle_xor(qn, 2u);
+    qn += simd_shuffle_xor(qn, 4u);
+    qn += simd_shuffle_xor(qn, 8u);
+    qn += simd_shuffle_xor(qn, 16u);
+    kn += simd_shuffle_xor(kn, 1u);
+    kn += simd_shuffle_xor(kn, 2u);
+    kn += simd_shuffle_xor(kn, 4u);
+    kn += simd_shuffle_xor(kn, 8u);
+    kn += simd_shuffle_xor(kn, 16u);
+    threadgroup float qsum[4];
+    threadgroup float ksum[4];
+    const uint sg = lid / 32u;
+    if ((lid & 31u) == 0u) {
+        qsum[sg] = qn;
+        ksum[sg] = kn;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qn = qsum[0] + qsum[1] + qsum[2] + qsum[3];
+    kn = ksum[0] + ksum[1] + ksum[2] + ksum[3];
+    q[lid] = qv * (1.0f / max(sqrt(qn), 1e-6f));
+    k[lid] = kv * (1.0f / max(sqrt(kn), 1e-6f));
+}
+kernel void kernel_qwen_gdn_output_norm(
+        constant ds4_qwen_gdn_core_args & args,
+        device float * core,
+        device const float * z,
+        device const float * snorm,
+        uint group [[threadgroup_position_in_grid]],
+        uint lid [[thread_index_in_threadgroup]]) {
+    const uint v_heads = args.v_heads == 0u ? 48u : args.v_heads;
+    const uint z_dim = args.z_dim == 0u
+        ? v_heads * QWEN_GDN_HEAD_DIM : args.z_dim;
+    const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
+    const uint t = group / v_heads;
+    const uint vh = group % v_heads;
+    if (t >= ntok || lid >= QWEN_GDN_HEAD_DIM) return;
+    device float *out = core + t * z_dim + vh * QWEN_GDN_HEAD_DIM;
+    const float oh = out[lid];
+    float ss = oh * oh;
+    ss += simd_shuffle_xor(ss, 1u);
+    ss += simd_shuffle_xor(ss, 2u);
+    ss += simd_shuffle_xor(ss, 4u);
+    ss += simd_shuffle_xor(ss, 8u);
+    ss += simd_shuffle_xor(ss, 16u);
+    threadgroup float sums[4];
+    const uint sg = lid / 32u;
+    if ((lid & 31u) == 0u) sums[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ss = (sums[0] + sums[1] + sums[2] + sums[3]) /
+         (float)QWEN_GDN_HEAD_DIM;
+    const float nscale = 1.0f / sqrt(ss + 1e-6f);
+    const float zj = z[t * z_dim + vh * QWEN_GDN_HEAD_DIM + lid];
+    out[lid] = oh * nscale * snorm[lid] *
+               (zj / (1.0f + exp(-zj)));
+}
+
+
 
 
 struct ds4_qwen_split_q_args {
@@ -214,18 +400,21 @@ kernel void kernel_qwen_rope_rotate_half(
         uint3 tgpig [[threadgroup_position_in_grid]],
         uint lid [[thread_index_in_threadgroup]]) {
     const uint h = tgpig.x;
+    if (h >= args.n_head || args.n_rot == 0u || (args.n_rot & 1u) != 0u ||
+        args.n_rot > args.head_dim) return;
     const uint n_half = args.n_rot / 2u;
-    if (h >= args.n_head || lid >= n_half) return;
     const float theta_scale = pow(args.freq_base, -2.0f / (float)args.n_rot);
-    float theta = (float)args.pos;
-    for (uint i = 0; i < lid; i++) theta *= theta_scale;
     device float *xh = x + h * args.head_dim;
-    const float c = cos(theta);
-    const float s = sin(theta);
-    const float x0 = xh[lid];
-    const float x1 = xh[lid + n_half];
-    xh[lid] = x0 * c - x1 * s;
-    xh[lid + n_half] = x0 * s + x1 * c;
+    for (uint d = lid; d < n_half; d += 32u) {
+        float theta = (float)args.pos;
+        for (uint i = 0; i < d; i++) theta *= theta_scale;
+        const float c = cos(theta);
+        const float s = sin(theta);
+        const float x0 = xh[d];
+        const float x1 = xh[d + n_half];
+        xh[d] = x0 * c - x1 * s;
+        xh[d + n_half] = x0 * s + x1 * c;
+    }
 }
 
 struct ds4_qwen_fullattn_args {
@@ -248,50 +437,58 @@ kernel void kernel_qwen_attn_decode(
         uint3 tgpig [[threadgroup_position_in_grid]],
         uint lid [[thread_index_in_threadgroup]]) {
     const uint h = tgpig.x;
-    const uint d = lid;
-    if (h >= args.n_head || d >= args.head_dim) return;
-    const uint kv_dim = args.n_head_kv * args.head_dim;
+    const uint lane = lid;
+    const uint head_dim = args.head_dim;
+    const uint nvec = (head_dim + 31u) / 32u;
+    if (h >= args.n_head || lane >= 32u || head_dim == 0u || head_dim > 256u ||
+        args.n_head_kv == 0u || (args.n_head % args.n_head_kv) != 0u ||
+        args.pos >= args.cap) return;
+    const uint kv_dim = args.n_head_kv * head_dim;
     const uint kv_h = h / (args.n_head / args.n_head_kv);
     const device float *base_k = k_cache + ((uint)args.layer * args.cap) * kv_dim;
     const device float *base_v = v_cache + ((uint)args.layer * args.cap) * kv_dim;
-    threadgroup float qh[256];
-    qh[d] = q[h * args.head_dim + d];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const float scale = 1.0f / sqrt((float)args.head_dim);
+    const device float *qh = q + h * head_dim;
+    float qreg[8];
+    float acc[8];
+    for (uint i = 0; i < 8u; i++) {
+        const uint d = lane + i * 32u;
+        qreg[i] = (i < nvec && d < head_dim) ? qh[d] : 0.0f;
+        acc[i] = 0.0f;
+    }
+    const float scale = rsqrt((float)head_dim);
     float m_prev = -1.0e30f;
     float l_prev = 0.0f;
-    float acc = 0.0f;
-    const uint sg = lid / 32u;
     for (uint t = 0; t <= args.pos; t++) {
-        const device float *kt = base_k + t * kv_dim + kv_h * args.head_dim;
-        float partial = qh[d] * kt[d];
-        partial += simd_shuffle_xor(partial, 1u);
-        partial += simd_shuffle_xor(partial, 2u);
-        partial += simd_shuffle_xor(partial, 4u);
-        partial += simd_shuffle_xor(partial, 8u);
-        partial += simd_shuffle_xor(partial, 16u);
-        threadgroup float dot_sg[8];
-        if ((lid & 31u) == 0u) dot_sg[sg] = partial;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float score = (dot_sg[0] + dot_sg[1] + dot_sg[2] + dot_sg[3]
-                     + dot_sg[4] + dot_sg[5] + dot_sg[6] + dot_sg[7]) * scale;
+        const device float *kt = base_k + t * kv_dim + kv_h * head_dim;
+        float partial = 0.0f;
+        for (uint i = 0; i < nvec; i++) {
+            const uint d = lane + i * 32u;
+            if (d < head_dim) partial += qreg[i] * kt[d];
+        }
+        const float score = simd_sum(partial) * scale;
         const float m_curr = max(m_prev, score);
         const float al = exp(m_prev - m_curr);
         const float be = exp(score - m_curr);
         l_prev = l_prev * al + be;
-        const device float *vt = base_v + t * kv_dim + kv_h * args.head_dim;
-        acc = acc * al + be * vt[d];
+        const device float *vt = base_v + t * kv_dim + kv_h * head_dim;
+        for (uint i = 0; i < nvec; i++) {
+            const uint d = lane + i * 32u;
+            if (d < head_dim) acc[i] = acc[i] * al + be * vt[d];
+        }
         m_prev = m_curr;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float out = acc / (l_prev > 1e-8f ? l_prev : 1.0f);
-    if (args.gated) {
-        const float g = gate[h * args.head_dim + d];
-        out *= 1.0f / (1.0f + exp(-g));
+    const float inv = 1.0f / (l_prev > 1e-8f ? l_prev : 1.0f);
+    device float *outp = heads + h * head_dim;
+    for (uint i = 0; i < nvec; i++) {
+        const uint d = lane + i * 32u;
+        if (d >= head_dim) continue;
+        float out = acc[i] * inv;
+        if (args.gated) {
+            const float g = gate[h * head_dim + d];
+            out *= 1.0f / (1.0f + exp(-g));
+        }
+        outp[d] = out;
     }
-
-    heads[h * args.head_dim + d] = out;
 }
 
 /* Row-batched twins of the decode path: a speculative round verifies several
@@ -335,18 +532,21 @@ kernel void kernel_qwen_rope_rotate_half_rows(
         uint lid [[thread_index_in_threadgroup]]) {
     const uint h = tgpig.x;
     const uint t = tgpig.y;
+    if (h >= args.n_head || t >= args.n_tok || args.n_rot == 0u ||
+        (args.n_rot & 1u) != 0u || args.n_rot > args.head_dim) return;
     const uint n_half = args.n_rot / 2u;
-    if (h >= args.n_head || t >= args.n_tok || lid >= n_half) return;
     const float theta_scale = pow(args.freq_base, -2.0f / (float)args.n_rot);
-    float theta = (float)(args.pos0 + t);
-    for (uint i = 0; i < lid; i++) theta *= theta_scale;
     device float *xh = x + (uint64_t)t * args.n_head * args.head_dim + h * args.head_dim;
-    const float c = cos(theta);
-    const float s = sin(theta);
-    const float x0 = xh[lid];
-    const float x1 = xh[lid + n_half];
-    xh[lid] = x0 * c - x1 * s;
-    xh[lid + n_half] = x0 * s + x1 * c;
+    for (uint d = lid; d < n_half; d += 32u) {
+        float theta = (float)(args.pos0 + t);
+        for (uint i = 0; i < d; i++) theta *= theta_scale;
+        const float c = cos(theta);
+        const float s = sin(theta);
+        const float x0 = xh[d];
+        const float x1 = xh[d + n_half];
+        xh[d] = x0 * c - x1 * s;
+        xh[d + n_half] = x0 * s + x1 * c;
+    }
 }
 
 struct ds4_qwen_fullattn_rows_args {
@@ -371,51 +571,84 @@ kernel void kernel_qwen_attn_decode_rows(
         uint lid [[thread_index_in_threadgroup]]) {
     const uint h = tgpig.x;
     const uint t = tgpig.y;
-    const uint d = lid;
-    if (h >= args.n_head || t >= args.n_tok || d >= args.head_dim) return;
-    const uint kv_dim = args.n_head_kv * args.head_dim;
+    const uint lane = lid;
+    const uint head_dim = args.head_dim;
+    const uint nvec = (head_dim + 31u) / 32u;
+    if (h >= args.n_head || t >= args.n_tok || lane >= 32u ||
+        head_dim == 0u || head_dim > 256u || args.n_head_kv == 0u ||
+        (args.n_head % args.n_head_kv) != 0u || args.pos0 >= args.cap ||
+        args.n_tok > args.cap - args.pos0) return;
+    const uint kv_dim = args.n_head_kv * head_dim;
     const uint kv_h = h / (args.n_head / args.n_head_kv);
-    const uint row_off = t * args.n_head * args.head_dim;
+    const uint row_off = t * args.n_head * head_dim;
     const device float *base_k = k_cache + ((uint)args.layer * args.cap) * kv_dim;
     const device float *base_v = v_cache + ((uint)args.layer * args.cap) * kv_dim;
-    threadgroup float qh[256];
-    qh[d] = q[row_off + h * args.head_dim + d];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const float scale = 1.0f / sqrt((float)args.head_dim);
+    const device float *qh = q + row_off + h * head_dim;
+    float qreg[8];
+    float acc[8];
+    for (uint i = 0; i < 8u; i++) {
+        const uint d = lane + i * 32u;
+        qreg[i] = (i < nvec && d < head_dim) ? qh[d] : 0.0f;
+        acc[i] = 0.0f;
+    }
+    const float scale = rsqrt((float)head_dim);
     const uint last = args.pos0 + t;
     float m_prev = -1.0e30f;
     float l_prev = 0.0f;
-    float acc = 0.0f;
-    const uint sg = lid / 32u;
     for (uint p = 0; p <= last; p++) {
-        const device float *kt = base_k + p * kv_dim + kv_h * args.head_dim;
-        float partial = qh[d] * kt[d];
-        partial += simd_shuffle_xor(partial, 1u);
-        partial += simd_shuffle_xor(partial, 2u);
-        partial += simd_shuffle_xor(partial, 4u);
-        partial += simd_shuffle_xor(partial, 8u);
-        partial += simd_shuffle_xor(partial, 16u);
-        threadgroup float dot_sg[8];
-        if ((lid & 31u) == 0u) dot_sg[sg] = partial;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float score = (dot_sg[0] + dot_sg[1] + dot_sg[2] + dot_sg[3]
-                     + dot_sg[4] + dot_sg[5] + dot_sg[6] + dot_sg[7]) * scale;
+        const device float *kt = base_k + p * kv_dim + kv_h * head_dim;
+        float partial = 0.0f;
+        for (uint i = 0; i < nvec; i++) {
+            const uint d = lane + i * 32u;
+            if (d < head_dim) partial += qreg[i] * kt[d];
+        }
+        const float score = simd_sum(partial) * scale;
         const float m_curr = max(m_prev, score);
         const float al = exp(m_prev - m_curr);
         const float be = exp(score - m_curr);
         l_prev = l_prev * al + be;
-        const device float *vt = base_v + p * kv_dim + kv_h * args.head_dim;
-        acc = acc * al + be * vt[d];
+        const device float *vt = base_v + p * kv_dim + kv_h * head_dim;
+        for (uint i = 0; i < nvec; i++) {
+            const uint d = lane + i * 32u;
+            if (d < head_dim) acc[i] = acc[i] * al + be * vt[d];
+        }
         m_prev = m_curr;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float out = acc / (l_prev > 1e-8f ? l_prev : 1.0f);
-    if (args.gated) {
-        const float g = gate[row_off + h * args.head_dim + d];
-        out *= 1.0f / (1.0f + exp(-g));
+    const float inv = 1.0f / (l_prev > 1e-8f ? l_prev : 1.0f);
+    device float *outp = heads + row_off + h * head_dim;
+    for (uint i = 0; i < nvec; i++) {
+        const uint d = lane + i * 32u;
+        if (d >= head_dim) continue;
+        float out = acc[i] * inv;
+        if (args.gated) {
+            const float g = gate[row_off + h * head_dim + d];
+            out *= 1.0f / (1.0f + exp(-g));
+        }
+        outp[d] = out;
     }
-    heads[row_off + h * args.head_dim + d] = out;
+}
+
+kernel void kernel_qwen_causal_mask_f16(
+        device half * mask,
+        constant uint4 & args,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint cache_len = args.x;
+    const uint n_tok = args.y;
+    const uint pos0 = args.z;
+    const uint q = gid.y;
+    const uint k = gid.x;
+    if (q >= n_tok || k >= cache_len) return;
+    mask[(ulong)q * cache_len + k] = (k <= pos0 + q) ? half(0.0f) : half(-65504.0f);
+}
+
+kernel void kernel_qwen_attn_apply_gate_rows(
+        device float * heads,
+        device const float * gate,
+        constant uint32_t & n,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const float g = gate[gid];
+    heads[gid] *= 1.0f / (1.0f + exp(-g));
 }
 
 struct ds4_qwen_q6k_args {
@@ -458,6 +691,65 @@ kernel void kernel_qwen_q6k_matvec(
         }
     }
     out[gid] = sumf;
+}
+
+struct ds4_qwen_q6k_gemm_args {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tok;
+    uint32_t _pad;
+    uint64_t row_bytes;
+};
+
+/* Shared-weight Q6_K GEMM: dequant one output row once, dot all tokens. */
+kernel void kernel_qwen_q6k_gemm(
+        constant ds4_qwen_q6k_gemm_args & args,
+        device const char * w,
+        device const float * x,
+        device float * out,
+        uint tg [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (tg >= args.out_dim) return;
+    const uint n_tok = args.n_tok;
+    if (n_tok == 0u || n_tok > 64u || lane >= 32u) return;
+    threadgroup float dq[256];
+    threadgroup float acc[64];
+    for (uint tok = lane; tok < n_tok; tok += 32u) acc[tok] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const char *row = w + (uint64_t)tg * args.row_bytes;
+    const int nb = (int)args.in_dim / 256;
+    const uint l = lane;
+    for (int i = 0; i < nb; i++) {
+        device const uchar *ql = (device const uchar *)(row + (uint)i * 210u);
+        device const uchar *qh = ql + 128;
+        device const char *scales = (device const char *)(qh + 64);
+        const float d = float(*((device const half *)(scales + 16)));
+        for (int n128 = 0; n128 < 256; n128 += 128) {
+            const int is = (int)(l / 16u);
+            const int q1 = ((int)(ql[l + 0]  & 0x0F) | (((int)qh[l] << 4) & 0x30)) - 32;
+            const int q2 = ((int)(ql[l + 32] & 0x0F) | (((int)qh[l] << 2) & 0x30)) - 32;
+            const int q3 = ((int)(ql[l + 0]  >> 4)    | (((int)qh[l] << 0) & 0x30)) - 32;
+            const int q4 = ((int)(ql[l + 32] >> 4)    | (((int)qh[l] >> 2) & 0x30)) - 32;
+            dq[n128 + l + 0]  = d * (float)scales[is + 0] * (float)q1;
+            dq[n128 + l + 32] = d * (float)scales[is + 2] * (float)q2;
+            dq[n128 + l + 64] = d * (float)scales[is + 4] * (float)q3;
+            dq[n128 + l + 96] = d * (float)scales[is + 6] * (float)q4;
+            ql += 64;
+            qh += 32;
+            scales += 8;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint tok = lane; tok < n_tok; tok += 32u) {
+            device const float *yb = x + (uint64_t)tok * args.in_dim + (uint)i * 256u;
+            float s = 0.0f;
+            for (int k = 0; k < 256; k++) s += dq[k] * yb[k];
+            acc[tok] += s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint tok = lane; tok < n_tok; tok += 32u)
+        out[(uint64_t)tok * args.out_dim + tg] = acc[tok];
 }
 
 kernel void kernel_qwen_copy_f32(
@@ -530,4 +822,3 @@ kernel void kernel_affine2_g64_matvec(
         out[row] = total;
     }
 }
-

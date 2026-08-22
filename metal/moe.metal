@@ -3342,6 +3342,9 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+
+
+
 // Classic Q4_64A decode matvec. Affine g64 (36B/64) is cheaper to dequant
 // than Q4_K; the ext family still tops out ~220 GB/s on M5. Same nsg/nr0
 // occupancy as kernel_mul_mv_q4_K_dense_f32.
@@ -3766,7 +3769,8 @@ kernel void kernel_mul_mv_q4_K_dense_f32_pair_swiglu(
     const short NSG = FC_mul_mv_nsg;
     const int first_row = (int)((tgpig.x * (uint)NSG + sgitg) * N_R0_Q4_K);
     threadgroup float saved_gate[16];
-    device float *mid = (device float *)dst_mid;
+    device float *mid =
+        (device float *)dst_mid + (uint64_t)tgpig.y * args.ne0;
     if (tiisg == 0) {
         for (int row = 0; row < N_R0_Q4_K; row++) {
             const int r = first_row + row;
@@ -3786,6 +3790,8 @@ kernel void kernel_mul_mv_q4_K_dense_f32_pair_swiglu(
         }
     }
 }
+
+
 
 
 

@@ -103,6 +103,7 @@ typedef struct {
     uint8_t quant_bits;
     uint8_t ext_flags;
     double load_ms;
+    bool consumed;
     char *path;
 } ds4_kvstore_load_result;
 

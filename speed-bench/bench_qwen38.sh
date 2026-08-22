@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # bench_qwen38.sh - Report tok/s for qwen38.gguf (prefill and decode) on CPU and Metal.
+# When Metal Qwen path is CPU-only (ds4.c forces CPU for QWEN family), Metal run falls
+# back to CPU and is reported as such.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -18,6 +20,7 @@ Usage: $0 [--quick] [--full] [--model FILE] [--prompt FILE] [--out DIR] [--gen N
   --out       Output dir for CSVs (default: temp)
   --gen       Tokens per frontier (default: $GEN_TOKENS)
 Reports prefill tok/s and decode tok/s (steady-state) for both CPU and Metal.
+On Apple Silicon, Qwen Metal currently falls back to CPU (ds4.c: "Qwen family uses CPU backend").
 EOF
 }
 CTX_START=512
@@ -105,6 +108,8 @@ if metal:
     print(f"Metal CSV: {metal['path']}")
     try:
         with open(metal["path"].replace("metal.csv","metal.stderr.log")) as f:
+            if "Qwen family uses CPU backend" in f.read():
+                print("Note: Metal Qwen executes on CPU (fallback) — numbers reflect CPU path.")
     except: pass
 print("="*78)
 out_dir=os.path.dirname(sys.argv[1]) if len(sys.argv)>1 and sys.argv[1] else "/tmp"

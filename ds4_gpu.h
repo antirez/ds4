@@ -112,6 +112,8 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
         uint32_t              layer,
         uint32_t              n_tok);
 void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps);
+void ds4_gpu_qwen_set_gdn_snapshot(int enable);
+void ds4_gpu_qwen_set_shape(uint32_t n_layer, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot);
 
 
 int ds4_gpu_qwen_full_attn_rows_tensor(
@@ -2984,6 +2986,30 @@ int ds4_gpu_fill_f32_tensor(
         ds4_gpu_tensor *dst,
         float            value,
         uint32_t         n);
+
+int ds4_gpu_scale_copy_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        float                 scale,
+        uint32_t              n);
+
+int ds4_gpu_mul_scalar_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        float                 scale,
+        uint32_t              n);
+
+int ds4_gpu_mul_rowwise_scalar_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        const ds4_gpu_tensor *scalar,
+        uint32_t              width,
+        uint32_t              rows);
+
+int ds4_gpu_sigmoid_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              n);
 
 int ds4_gpu_qwen_gqa_attn_decode_tensor(
         ds4_gpu_tensor       *heads_out,

@@ -36,9 +36,12 @@ kernel void kernel_dflash2_grouped_conv(
 
 struct ds4_dflash2_sdpa_args {
     uint32_t n_tok;
+    uint32_t n_ctx;
     uint32_t n_head;
     uint32_t n_kv;
     uint32_t head_dim;
+    uint32_t causal;
+    uint32_t window;
 };
 
 kernel void kernel_dflash2_sdpa(
@@ -63,16 +66,19 @@ kernel void kernel_dflash2_sdpa(
     float l_prev = 0.0f;
     float acc[128];
     for (uint32_t d = 0; d < args.head_dim && d < 128u; d++) acc[d] = 0.0f;
-    const uint32_t n_key = 1u + args.n_tok;
-    for (uint32_t s = 0; s < n_key; s++) {
+    const uint32_t all_keys = args.n_ctx + args.n_tok;
+    const uint32_t max_key = args.causal ? args.n_ctx + t + 1u : all_keys;
+    const uint32_t min_key =
+        args.window != 0u && max_key > args.window ? max_key - args.window : 0u;
+    for (uint32_t s = min_key; s < max_key; s++) {
         device const float *kh;
         device const float *vh;
-        if (s == 0u) {
-            kh = k_ctx + (ulong)kv_h * args.head_dim;
-            vh = v_ctx + (ulong)kv_h * args.head_dim;
+        if (s < args.n_ctx) {
+            kh = k_ctx + ((ulong)s * args.n_kv + kv_h) * args.head_dim;
+            vh = v_ctx + ((ulong)s * args.n_kv + kv_h) * args.head_dim;
         } else {
-            kh = k_prop + ((ulong)(s - 1u) * args.n_kv + kv_h) * args.head_dim;
-            vh = v_prop + ((ulong)(s - 1u) * args.n_kv + kv_h) * args.head_dim;
+            kh = k_prop + ((ulong)(s - args.n_ctx) * args.n_kv + kv_h) * args.head_dim;
+            vh = v_prop + ((ulong)(s - args.n_ctx) * args.n_kv + kv_h) * args.head_dim;
         }
         float dot = 0.0f;
         for (uint32_t d = 0; d < args.head_dim; d++) dot += qh[d] * kh[d];

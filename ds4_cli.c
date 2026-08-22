@@ -70,6 +70,7 @@ typedef struct {
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool system_set;
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logits_path;
@@ -384,6 +385,7 @@ typedef struct {
     bool color_open;
     bool use_color;
     bool last_output_newline;
+    bool think_banner_printed;
     char pending[16];
     size_t pending_len;
 } token_printer;
@@ -434,6 +436,11 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
         const size_t rem = total - i;
         if (bytes_has_prefix(cur, rem, think_open)) {
             p->in_think = true;
+            if (!p->think_banner_printed) {
+                fputs("[Start thinking]\n", p->fp);
+                p->last_output_newline = true;
+                p->think_banner_printed = true;
+            }
             i += strlen(think_open);
             continue;
         }
@@ -444,6 +451,8 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
                 fputc('\n', p->fp);
                 p->last_output_newline = true;
             }
+            fputs("[End thinking]\n", p->fp);
+            p->last_output_newline = true;
             i += strlen(think_close);
             continue;
         }
@@ -493,6 +502,11 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
 
 static void print_generated_token(void *ud, int token) {
     token_printer *p = ud;
+    if (p->format_thinking && p->in_think && !p->think_banner_printed) {
+        fputs("[Start thinking]\n", p->fp);
+        p->last_output_newline = true;
+        p->think_banner_printed = true;
+    }
     size_t len = 0;
     char *text = ds4_token_text(p->engine, token, &len);
     token_printer_write_text(p, text, len);
@@ -523,6 +537,12 @@ static void cli_apply_model_sampling_defaults(
     }
     if (ds4_engine_is_qwen(engine)) {
         if (!gen->temperature_set) gen->temperature = 0.0f;
+        /* ChatML / llama.cpp / Ollama default is no extra system turn. */
+        if (!gen->system_set &&
+            gen->system &&
+            strcmp(gen->system, "You are a helpful assistant") == 0) {
+            gen->system = "";
+        }
         return;
     }
 }
@@ -606,9 +626,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f &&
-            (ds4_engine_mtp_draft_tokens(engine) > 1 ||
-             ds4_engine_dflash_ready(engine)) &&
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -1516,9 +1534,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f &&
-            (ds4_engine_mtp_draft_tokens(engine) > 1 ||
-             ds4_engine_dflash_ready(engine)) &&
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -1846,6 +1862,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.prompt = c.prompt_owned;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
+            c.gen.system_set = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
@@ -1858,7 +1875,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
             c.engine.dflash_path = need_arg(&i, argc, argv, arg);
-            if (c.engine.dflash_draft_n_max == 0) c.engine.dflash_draft_n_max = 7;
         } else if (!strcmp(arg, "--spec-type") || !strcmp(arg, "--spec-draft-type")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (strcmp(v, "draft-dflash") && strcmp(v, "dflash") && strcmp(v, "dflash2")) {
@@ -2087,9 +2103,15 @@ int main(int argc, char **argv) {
             free(cfg.prompt_owned);
             return 2;
         }
+        const char *dump_system = cfg.gen.system;
+        if (!cfg.gen.system_set)
+            dump_system = "";
         int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
-                                            stdout);
+                                            stdout,
+                                            dump_system,
+                                            cli_effective_think_mode(&cfg.gen),
+                                            cfg.gen.raw_prompt);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;

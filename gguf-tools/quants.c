@@ -1077,14 +1077,6 @@ static size_t ds4q_quantize_q4_64a(const float *src, void *dst, int64_t start,
             float bias = mn;
             if (mx == mn) scale = 0.0f;
             else scale = (mx - mn) / 15.0f;
-            /* Only the bf16 truncation of scale/bias is stored, and every
-             * decoder reconstructs from that, so pick the codes that minimize
-             * error against those values -- not against the f32 originals.
-             * Mirrors gguf-tools/gguf_requant_q4_64a.py. */
-            const uint16_t scale_bf16 = (uint16_t)(ds4q_f32_to_bits(scale) >> 16);
-            const uint16_t bias_bf16 = (uint16_t)(ds4q_f32_to_bits(bias) >> 16);
-            scale = ds4q_f32_from_bits((uint32_t)scale_bf16 << 16);
-            bias = ds4q_f32_from_bits((uint32_t)bias_bf16 << 16);
             uint8_t qs[32] = {0};
             for (int j = 0; j < 64; j++) {
                 int q = 0;
@@ -1099,8 +1091,12 @@ static size_t ds4q_quantize_q4_64a(const float *src, void *dst, int64_t start,
             }
             uint8_t *block = row_out + (size_t)b * 36;
             memcpy(block, qs, 32);
-            memcpy(block + 32, &scale_bf16, 2);
-            memcpy(block + 34, &bias_bf16, 2);
+            uint32_t s_bits = ds4q_f32_to_bits(scale);
+            uint32_t b_bits = ds4q_f32_to_bits(bias);
+            uint16_t sbits = (uint16_t)(s_bits >> 16);
+            uint16_t bbits = (uint16_t)(b_bits >> 16);
+            memcpy(block + 32, &sbits, 2);
+            memcpy(block + 34, &bbits, 2);
         }
     }
     return (size_t)nrows * row_size;
@@ -1129,14 +1125,6 @@ static size_t ds4q_quantize_q2_64a(const float *src, void *dst, int64_t start,
             float bias = mn;
             if (mx == mn) scale = 0.0f;
             else scale = (mx - mn) / 3.0f;
-            /* Only the bf16 truncation of scale/bias is stored, and every
-             * decoder reconstructs from that, so pick the codes that minimize
-             * error against those values -- not against the f32 originals.
-             * Mirrors gguf-tools/gguf_requant_q4_64a.py. */
-            const uint16_t scale_bf16 = (uint16_t)(ds4q_f32_to_bits(scale) >> 16);
-            const uint16_t bias_bf16 = (uint16_t)(ds4q_f32_to_bits(bias) >> 16);
-            scale = ds4q_f32_from_bits((uint32_t)scale_bf16 << 16);
-            bias = ds4q_f32_from_bits((uint32_t)bias_bf16 << 16);
             uint8_t qs[16] = {0};
             for (int j = 0; j < 64; j++) {
                 int q = 0;
@@ -1150,8 +1138,12 @@ static size_t ds4q_quantize_q2_64a(const float *src, void *dst, int64_t start,
             }
             uint8_t *block = row_out + (size_t)b * 20;
             memcpy(block, qs, 16);
-            memcpy(block + 16, &scale_bf16, 2);
-            memcpy(block + 18, &bias_bf16, 2);
+            uint32_t s_bits = ds4q_f32_to_bits(scale);
+            uint32_t b_bits = ds4q_f32_to_bits(bias);
+            uint16_t sbits = (uint16_t)(s_bits >> 16);
+            uint16_t bbits = (uint16_t)(b_bits >> 16);
+            memcpy(block + 16, &sbits, 2);
+            memcpy(block + 18, &bbits, 2);
         }
     }
     return (size_t)nrows * row_size;
