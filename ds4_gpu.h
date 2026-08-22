@@ -264,14 +264,12 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
 void ds4_gpu_print_memory_report(const char *label);
 
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
- * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial
- * block output in the TP slab: it closes the current encoder, makes the GPU
- * signal a shared event, queues the exchange on a service thread, and makes
- * the GPU wait for the CPU-signaled release before the combine kernel runs.
- * Sequence values are assigned internally and increase monotonically; both
- * ranks encode the identical gate sequence so values pair up by
- * construction.  The exchange callback runs on the service thread and must
- * return nonzero on success. */
+ * ds4_gpu_tp_gate_encode() after the kernels that produce a partial block.
+ * Split mode commits that local work, lets the service thread exchange on
+ * the CPU, then reopens the batch for the combine; fused mode keeps the
+ * legacy GPU event wait.  Sequence values increase monotonically and both
+ * ranks encode the same gate sequence.  The callback runs on the service
+ * thread and returns nonzero on success. */
 typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, uint64_t seq);
 /* Bind one rank of the two-way split. slab is the transport slab tensor and
  * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
@@ -283,6 +281,8 @@ void ds4_gpu_tp_shutdown(void);
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
+/* Boot-time resident-session hint used to select the TP gate packaging. */
+void ds4_gpu_tp_set_resident_session_count(int count);
 /* The coordinator-only DSpark support model does not participate in TP.
  * Suspend ownership only while encoding it; base-model verification remains
  * split across both ranks. */
@@ -305,12 +305,10 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                const ds4_gpu_tensor *out_t,
                                ds4_gpu_tensor *in_t,
                                uint64_t bytes);
-/* Split big gate: kick publishes the GPU arrival marker (batch shared
- * event, whose completion semantics make the bounce payload visible to
- * the exchange thread) and queues the exchange, returning the gate seq
- * (0 on failure); wait encodes the release.  Multiple kicks may be in
- * flight; waiting on the last seq covers all earlier kicks (monotonic
- * release event, in-order service thread). */
+/* Split big gate: kick publishes the GPU arrival marker and queues the
+ * exchange; wait commits the local buffer and waits for CPU completion before
+ * reopening it in split mode.  Fused mode encodes the legacy release wait.
+ * Multiple kicks may be in flight; the last seq covers earlier kicks. */
 uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,

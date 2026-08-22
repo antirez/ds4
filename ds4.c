@@ -58290,6 +58290,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             return 0;
         }
     }
+    ds4_gpu_tp_set_resident_session_count(e->placement_session_count_hint);
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
                          ds4_engine_tp_exchange, tp)) {
