@@ -25957,7 +25957,20 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t layer_index,
-        bool force_resident) {
+        bool force_resident,
+        const ds4_gpu_tensor *hc_shared_out,
+        const ds4_gpu_tensor *hc_residual,
+        const ds4_gpu_tensor *hc_split,
+        ds4_gpu_tensor *hc_out,
+        int *hc_fused_out) {
+    /* The decode MoE+HC tail fusion is Metal-only; CUDA callers always pass
+     * NULL hc tensors. */
+    (void)hc_shared_out; (void)hc_residual; (void)hc_split;
+    if (hc_fused_out) *hc_fused_out = 0;
+    if (hc_out) {
+        fprintf(stderr, "ds4: routed MoE HC tail fusion is Metal-only\n");
+        return 0;
+    }
     if (add_in) {
         if (!ds4_gpu_add_tensor(out, out, add_in,
                                 (uint32_t)(out->bytes / sizeof(float)))) return 0;

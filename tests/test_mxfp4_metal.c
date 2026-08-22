@@ -318,7 +318,7 @@ int main(void) {
         MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
         expert_bytes, row_bytes, DIM, DIM, DIM,
         selected_tensor, weights_tensor, N_TOTAL_EXPERT, N_EXPERT,
-        7.0f, x_tensor, NULL, 0u, true);
+        7.0f, x_tensor, NULL, 0u, true, NULL, NULL, NULL, NULL, NULL);
     ok = ok && ds4_gpu_tensor_read(
         gate_tensor, 0, gate_gpu, pair_count * sizeof(float));
     ok = ok && ds4_gpu_tensor_read(
@@ -354,7 +354,7 @@ int main(void) {
                 MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
                 expert_bytes, row_bytes, DIM, DIM, DIM,
                 selected_tensor, weights_tensor, N_TOTAL_EXPERT, N_EXPERT,
-                7.0f, x_tensor, NULL, 0u, true) &&
+                7.0f, x_tensor, NULL, 0u, true, NULL, NULL, NULL, NULL, NULL) &&
             ds4_gpu_tensor_read(
                 gate_tensor, 0, gate_fast, pair_count * sizeof(float)) &&
             ds4_gpu_tensor_read(

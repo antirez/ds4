@@ -981,3 +981,64 @@ kernel void kernel_dsv4_flash_attn_vec_packed32_reduce_rope_f16_dk512_dv512(
                                   tiitg,
                                   32u * 32u);
 }
+
+// Direct-KV sibling of the packed32 reduce+RoPE decode kernel above: reads
+// the F32 raw ring and F16 compressed cache in place (see
+// ds4_flash_attn_vec_packed8_reduce_f16_512_direct_kv in flash_attn.metal)
+// so the gathered KV staging dispatch is skipped entirely.
+kernel void kernel_dsv4_flash_attn_vec_packed32_reduce_rope_f16_dk512_dv512_direct_kv(
+        constant ds4_metal_args_flash_attn_ext_vec & args [[buffer(0)]],
+        device const char * q                         [[buffer(1)]],
+        device const char * raw_kv                    [[buffer(2)]],
+        device const char * comp_kv                   [[buffer(3)]],
+        device const char * mask                      [[buffer(4)]],
+        device const char * sinks                     [[buffer(5)]],
+        constant ds4_metal_args_flash_kv_direct & kv  [[buffer(6)]],
+        device       char * dst                       [[buffer(7)]],
+        constant ds4_metal_args_dsv4_rope_affine_pair & rope
+                                                        [[buffer(8)]],
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint head       [[threadgroup_position_in_grid]],
+        ushort tiitg    [[thread_index_in_threadgroup]],
+        ushort tiisg    [[thread_index_in_simdgroup]],
+        ushort sgitg    [[simdgroup_index_in_threadgroup]]) {
+    /* Same uniform specialization guard as the staged packed32 kernel; nb11
+     * / nb21 remain the F16 compressed row stride (raw rows are a fixed
+     * 2048-byte F32 stride inside the helper). */
+    if (!FC_flash_attn_ext_vec_has_mask ||
+        !FC_flash_attn_ext_vec_has_sinks ||
+         FC_flash_attn_ext_vec_has_bias ||
+         FC_flash_attn_ext_vec_has_scap ||
+         FC_flash_attn_ext_vec_nsg != 1 ||
+         FC_flash_attn_ext_vec_nwg != 32 ||
+         FC_flash_attn_ext_vec_ns10 != 512 ||
+         FC_flash_attn_ext_vec_ns20 != 512 ||
+         args.ne01 != 1 || args.ne02 != 64 || args.ne03 != 1 ||
+         args.ne_12_2 != 1 || args.ne_12_3 != 1 ||
+         args.ne31 != 1 || args.ne32 != 1 || args.ne33 != 1 ||
+         args.ne11 <= 0 || args.ne11 > 1024 || head >= (uint)args.ne02 ||
+         args.nb02 != 2048 || args.nb11 != 1024 || args.nb21 != 1024 ||
+         kv.n_raw == 0 || kv.n_raw > (uint)args.ne11 ||
+         kv.raw_cap < kv.n_raw || kv.raw_start >= kv.raw_cap ||
+         rope.head_dim != 512 || rope.n_dims != 64 ||
+         rope.row_bytes != 2048 || rope.inverse == 0) {
+        return;
+    }
+
+    ds4_flash_attn_vec_packed8_reduce_f16_512_direct_kv(
+        args, q, raw_kv, comp_kv, mask, sinks, kv, dst, shmem,
+        head, tiisg, sgitg);
+
+    /* Same producer/consumer boundary as the current reduce+RoPE kernel. */
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const int n_nope = rope.head_dim - rope.n_dims;
+    device char * row = dst + (uint64_t)head * rope.row_bytes;
+    ds4_rope_tail_pair_affine_row(rope,
+                                  (device const char *)row,
+                                  row,
+                                  n_nope,
+                                  rope.pos0,
+                                  tiitg,
+                                  32u * 32u);
+}

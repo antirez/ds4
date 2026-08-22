@@ -2511,6 +2511,27 @@ int ds4_gpu_router_select_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits);
 
+/* One-token router select with the token id read from a device buffer
+ * (greedy chain decode); identical kernels to ds4_gpu_router_select_tensor. */
+int ds4_gpu_router_select_tensor_devtoken(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        const ds4_gpu_tensor *token_dev,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_gpu_tensor *logits);
+
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
@@ -2813,7 +2834,12 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t                layer_index,
-        bool                    force_resident);
+        bool                    force_resident,
+        const ds4_gpu_tensor *hc_shared_out,
+        const ds4_gpu_tensor *hc_residual,
+        const ds4_gpu_tensor *hc_split,
+        ds4_gpu_tensor       *hc_out,
+        int                    *hc_fused_out);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,

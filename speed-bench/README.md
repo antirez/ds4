@@ -117,6 +117,119 @@ core plus inverse RoPE 2.1 ms, router/shared gate-up 1.9 ms, and about 3.4 ms
 of per-layer HC pre/post bookkeeping, with the remaining dense Q8_0 matvecs
 streaming at 590-650 GB/s, i.e. at the memory wall.
 
+### Metal decode raw-layer gathered attention A/B (45 t/s round, part 1)
+
+Decode attention has two schedules with a per-layer-parity split: ratio-4
+layers use the gathered path (fused KV staging with pad fusion + packed32
+attention with fused inverse RoPE, two dispatches), while ratio-0/128 layers
+with `n_comp == 0` used a five-dispatch raw path (ring copy, standalone pad,
+vec, plain reduce, standalone RoPE tail).  Commit-only stage counters showed
+the raw layers at ~65 µs versus ~32 µs — about 0.7 ms/token, hidden in the
+averaged ledger.  Decode now routes `n_comp == 0` layers through the gathered
+path (the staging kernel already handles `n_comp == 0`; the packed32 gate's
+`n_comp != 0` term is relaxed) whenever `use_mask == 0`.  Same kernels, same
+reduction topology; the routing change is packaging only.  Rollbacks:
+`DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN` (raw path) and
+`DS4_METAL_DISABLE_DECODE_RAW_PACKED32` (staged vec+reduce instead of
+packed32 on raw layers).
+
+```
+./speed-bench/metal_decode_schedule_bench \
+  --candidate-env DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN \
+  --include-selection --tokens 512
+```
+
+Balanced M3 Ultra A/B at the harness's 2048-token prefix: 43.18/43.10 t/s
+(+0.16%; only layers 0–1 qualify once odd layers hold compressed rows), all
+529 frontier rows / 68,389,120 logits / 528 selected ids bit-identical.  In
+the campaign CLI regime (short prompt, `-n 128`), interleaved runs gave
+44.59/44.67 t/s new versus 43.52/43.40 t/s rollback (+2.7%), transcripts
+md5-identical (`db0c504c…`).
+
+### Metal greedy chain decode A/B (45 t/s round, part 2)
+
+The classic one-shot decode loop serialized every token through the host:
+`waitUntilCompleted`, a 517 KiB logits readback, a CPU argmax, then the next
+token's encode — about 0.5 ms/token of GPU idle at the boundary.  Chained
+greedy decode (`metal_graph_greedy_chain`, engaged by
+`generate_metal_graph_raw_swa` when resident, non-quality, non-streaming,
+greedy) keeps the token id on-device: each token's graph ends with the GPU
+argmax writing the next id into a device ring, and the next token's embedding
+gathers it from the ring.  Encoding runs two tokens ahead of the host's
+confirm cursor, so command buffers are always committed before the GPU drains
+the previous token; the host lags only to print and check stop tokens (one
+shared-event wait per token, hidden by the encode-ahead).  The hash-layer
+router select reads the id from the ring through the existing
+`use_token_buffer` kernel argument; the host-side hash override is skipped
+(the resident fixed-route MoE never consumes it).  Bit-exactness: all kernels
+and inputs are unchanged, and the GPU argsort top-1 reproduces the CPU argmax
+including lowest-index ties, so the transcript is identical.
+`DS4_DISABLE_GREEDY_CHAIN=1` restores the classic loop;
+`DS4_GREEDY_CHAIN_DEBUG` / `DS4_GREEDY_CHAIN_DUMP_IDS` are diagnostics.
+Interleaved M3 Ultra CLI runs: 45.47/45.55 t/s chained versus 44.73/44.73
+classic (+1.75%), transcripts md5-identical; at a 2K-token prefix 44.12/43.40
+(+1.7%); a 1024-token run and an early-stop prompt matched md5 exactly.
+
+Combined round state: 43.46 → 45.51 t/s (+4.7%), bit-exact, `make test`
+44/44.
+
+### Session greedy chain (ds4-eval) + two headroom probes (Aug 22, round 3)
+
+**Session chain decode** brings the round-2 chain to the session API used by
+`ds4-eval`.  `ds4_session_chain_greedy_supported` /
+`ds4_session_eval_chain_greedy` (ds4.c, next to `ds4_session_eval`) drive
+`metal_graph_greedy_chain` on an existing session graph: seed = CPU argmax of
+`s->logits` (identical to the classic temp-0 sample), pos0 =
+`checkpoint.len`, approved tokens pushed into `s->checkpoint` by a trampoline
+only after the caller's callback approves them; on full completion
+`logits_out = s->logits` preserves the session logits invariant (on early
+stop the logits are stale — eval only stops early on stop-token/quit/switch,
+where they are never read).  Guards mirror the CLI set plus session state:
+no GLM/CPU/distributed/TP/multi-tier, `support_kind == DS4_SUPPORT_NONE`, no
+ssd-streaming/quality/CPU-router/steering, same env kill switch
+(`DS4_DISABLE_GREEDY_CHAIN=1` forces the classic loop everywhere).
+
+`ds4-eval` decodes in bursts (eval_chain_on_token carries the classic loop's
+per-token bookkeeping verbatim).  Bursts are capped to stay out of the
+think-close controller window (`remaining - soft_limit` while thinking, len>1
+closes use the hard window) — inside the window the classic step runs, so
+forced (non-argmax) closes behave identically.  Verified bit-exact: 3-case
+traces (`--questions 3 -n 4096`, think and `--nothink`) identical except
+volatile timestamp/seed/elapsed fields; per-case answers, token counts, and
+think_close records match.  Speed: **45.22–45.24 t/s chained vs
+44.44–44.59 classic** (+1.5%) on the eval cases; CLI oracle unchanged
+(`db0c504c…`, 45.90 t/s), `make test` 44/44.
+
+**Probe 1 — MoE down-sum6+HC4 tail fusion** (landed, default ON; rollback
+`DS4_METAL_DISABLE_DECODE_MOE_HC_FUSION`): layer tail reordered to
+pair-SwiGLU → plain shared-down matvec → new
+`kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_hc4_f32`
+(metal/moe.metal) doing the down-sum6 + `shared_out` add + HC4 expand in one
+dispatch, eliminating the `routed_out` f32 materialization and one kernel
+boundary per layer.  Bit-exact (md5 n=128/512, harness bit-identical,
+wrap-safe); **speed-neutral** — the old path already fused HC into the
+shared-down kernel, so only a 16 KiB round trip was removed against the
+26 MB expert stream.  Kept: one less dispatch and a simpler tail.
+
+**Probe 2 — KV-staging direct read** (landed, default OFF; opt-in
+`DS4_METAL_ENABLE_DECODE_RAW_DIRECT_KV`, hard-off
+`DS4_METAL_DISABLE_DECODE_RAW_DIRECT_KV`, loud
+`DS4_METAL_REQUIRE_DECODE_RAW_DIRECT_KV`): packed32 attention variant reading
+the raw F32 ring and comp F16 caches directly (per-row source selection in
+QK and PV loops, in-place tail, wrap-safe).  Bit-exact everywhere including a
+probe-verified ring-wrap run — **but ~7% slower** (42.1 vs 45.3 t/s): the F32
+raw rows (2048 B) are re-read and re-converted by all 64 head threadgroups
+every token, ~2× raw-region traffic versus the one-time staging conversion
+that amortizes across heads (+30 µs/layer on `attn_inv_rope`).  Confirms the
+round-1 lesson: more parallel traffic throttles this GPU.  May still win on
+devices with different L2/ALU balance.
+
+Round-3 verdict: the handoff's remaining-headroom list is exhausted — HC
+fusion neutral, direct-KV negative, and the concurrent shared-expert stream
+(IQ2-gated) is contraindicated by the same throttling evidence.  The
+remaining wall−GPU gap is ~0.1 ms/token; further gains need a cheaper MoE or
+attention core, not packaging.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

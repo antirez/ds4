@@ -1,129 +1,117 @@
-# Decode >45 t/s campaign — handoff (session of Aug 21, M3 Ultra)
+# Decode campaign — handoff (session of Aug 21, M3 Ultra, round 2)
 
-Goal: push greedy decode past **45 tokens/s** (towards 50) on the MXFP4
-`ds4flash.gguf` model, bit-exact. Final verified state: **43.2–44.0 t/s**,
-all paths in agreement. Goal not reached; every in-session path was built,
-measured, and closed. This file is the cold-restart kit: state, evidence,
-tools, closed avenues, and the decision the next session must make first.
+Goal: push greedy decode past **45 tokens/s** on the MXFP4 `ds4flash.gguf`
+model, bit-exact. **Reached: 45.5 t/s interleaved (45.47/45.55), all
+transcripts md5 `db0c504c…`, `make test` 44/44, harness bit-identical.**
+Round-1 state was 43.2–44.0 t/s; round 2 added +2.7% (attention parity) and
++1.75% (greedy chain decode), both validated per the campaign protocol.
 
-## Where everything is
+## Round-2 changes (working tree; commit state at bottom)
 
-- Working tree: clean at `814a933`; tests `make test` PASS 44/44; bit-exact
-  output md5 for the standard prompt unchanged (`db0c504c…`).
-- Campaign commits (this session): `11689e1` (commit-only GPU stage profiler
-  + docs), `b40f33c`/`5f9da0a`/`06ca424`/`c2084a1`/`814a933` (DSpark
-  measurements, corrections, negative-result records, floor recalibration).
-- `speed-bench/README.md` holds the full measurement record: per-stage decode
-  ledger, every A/B protocol, and the DSpark-on-Metal work order. Read the
-  sections "Metal decode stage GPU counters" and "DSpark speculation on M3
-  Ultra" before doing anything.
+1. **Raw-layer gathered attention** — `n_comp == 0` decode layers (ratio 0/128)
+   now use the gathered path (fused staging + packed32 reduce + fused inverse
+   RoPE) instead of the five-dispatch raw path. Found via commit-only stage
+   counters: the raw path cost ~65 µs vs ~32 µs per layer, invisible in the
+   averaged ledger ("attention core 44.3 µs flat"). ~0.7 ms/token at short
+   context. Rollback envs: `DS4_METAL_DISABLE_DECODE_RAW_GATHERED_ATTN`,
+   `DS4_METAL_DISABLE_DECODE_RAW_PACKED32`. Also fixed the staging wrapper's
+   `n_comp == 0` guard in `ds4_gpu_encode_flash_kv_stage_f16`.
+2. **Greedy chain decode** — `metal_graph_greedy_chain` (ds4.c, engaged from
+   `generate_metal_graph_raw_swa` only): GPU argmax writes the next token id
+   into a device ring; the next token's embedding gathers it from the ring
+   (the by-value embed and the batched embed use the same get_rows/repeat
+   kernels — bit-identical). Encode runs two tokens ahead of the host's
+   confirm cursor; the host only lags (one MTLSharedEvent wait per token) to
+   print and stop-check. Removes the per-token `waitUntilCompleted` + 517 KiB
+   logits readback + CPU argmax boundary (~0.5 ms/token). Kill switch:
+   `DS4_DISABLE_GREEDY_CHAIN=1`. Diagnostics: `DS4_GREEDY_CHAIN_DEBUG`,
+   `DS4_GREEDY_CHAIN_DUMP_IDS`, `DS4_GREEDY_CHAIN_VERIFY`.
+   **Hash-layer gotcha that cost an hour**: the first `DS4_N_HASH_LAYER`
+   layers route experts by token id (`ffn_gate_tid2eid`); the select kernel
+   already supports a device-resident token (`use_token_buffer` in
+   `kernel_dsv4_router_finalize_one`), plumbed via
+   `ds4_gpu_router_select_tensor_devtoken` + `g->chain_token_view`. The
+   host-side `metal_graph_decode_set_hash_selected_override` is skipped in
+   chain mode — the resident fixed-route MoE never consumes it (the override/
+   readback blocks live under `use_selected_slots`, all gated on
+   `g_ssd_streaming_mode`). Feeding token=0 instead was the one divergence:
+   deterministic drift from layer 0, tipping an argmax 33 tokens in.
+   Symptom signature if it regresses: transcripts match for N tokens then
+   diverge deterministically.
 
-## Verified numbers to trust (and how to reproduce)
+## Verified numbers (interleaved CLI, `-c 8192 -n 128 --temp 0`, lighthouse prompt)
 
-| metric | value | command |
+| variant | t/s | md5 |
 |---|---|---|
-| CLI decode | 43.2–43.9 t/s | `./ds4 -m ds4flash.gguf -p "Write a short story about a lighthouse keeper." -c 8192 -n 128 --temp 0` |
-| repo bench | 43.77 steady @ctx2048 | `./ds4-bench -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt --ctx-start 2048 --ctx-max 2048 --gen-tokens 96` |
-| balanced harness | 43.38 t/s | `make metal-decode-schedule-bench && ./speed-bench/metal_decode_schedule_bench -m ds4flash.gguf --include-selection --tokens 512` |
-| best DSpark | 39.5–40.2 t/s | `./ds4 -m ds4flash.gguf --mtp gguf/DeepSeek-V4-Flash-DSpark-support.gguf --dspark --dspark-confidence 0.75` (+`DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP=0`) |
+| round-1 baseline | 43.40–43.52 | `db0c504c…` |
+| + attention parity only | 44.59–44.67 | `db0c504c…` |
+| + greedy chain (current) | **45.47–45.55** | `db0c504c…` |
 
-Thermal envelope is ±2%: sustained runs sit ~43.2–43.5, first run on a cool
-machine reaches 43.9–44.01. Always compare via the interleaved harness, and
-let the machine idle ~60s after heavy runs (a transient 2–10× slowdown right
-after sustained benching was observed repeatedly; it recovers by itself).
+Long-context (2K prompt): 44.12 chained vs 43.40 classic. 1024-token run and
+an early-stop prompt: md5-identical. Harness (prefix 2048): 529 rows /
+68,389,120 logits / 528 ids bit-identical, 43.18 vs 43.10 t/s (only layers
+0–1 qualify at long prefix). SSD streaming decode smoke: OK (chain declines,
+classic path taken).
 
-## The token ledger (22.6 ms GPU busy; encode 0.7 ms hidden by split-flush)
+## Remaining headroom (re-estimated)
 
-Per layer (µs, commit-only counters, short ctx): routed MoE 139 (~floor for
-6×12.6 MB experts at ~550 GB/s effective), attention core 44.3 (flat vs
-context; latency floor), attn output A+B 111 (645 GB/s ≈ wall), Q-lora path
-120 (quad kernel 41 + q_b 59 + norm/rope 21), HC pre 2×19.4 (structural
-floor), shared/router overlapped 44, KV staging 7.8. Weights memory floor
-≈11.6 ms/token; the ~10 ms above it is distributed latency that resists
-every single-kernel fix tried (see "Closed avenues"). Boundary tail:
-CPU argmax 35.7 µs, loop ~0.05 ms recoverable, remainder wake/launch
-latency. Bit-exact recoverable stack sums to ~0.55 ms < the ~0.7 ms needed
-for 45 t/s.
+GPU busy ≈ 21.85 ms/token now; wall ≈ 21.96 ms. The boundary is ~0.1–0.15 ms
+(argmax→embed dependency + drain). Still open, expectations lowered by the
+round-1 evidence: HC epilogue tail fusions (~0.3 ms), KV-staging direct read
+(~0.25 ms; a prior attempt diverged — the addressing facts are in README's
+stage-counter section and the code comments at cpy.metal:147), MXFP4
+concurrent shared-expert stream (machinery exists hard-gated to IQ2,
+ds4_metal.m:9286; medium confidence, and the "more parallelism throttles this
+GPU" lesson applies). Each could add ~0.2–0.6 t/s; none is needed for 45.
 
-## Closed avenues — do not redo (details + numbers in README)
+## Watch item
 
-1. Eight bit-exact kernel variants, all validated bit-exact, all ≤0.03%:
-   HC tgstash, HC rows12 (10-TG sibling), quad NR1, packed attention sg16
-   and sg32 (both +8 ms/token systemically — more parallelism throttles the
-   whole token on this GPU), FP8 block one-pass amax, down r4 (slots6 and
-   static paths), plus an earlier q8 nr0 tune (warm-cache artifact only).
-2. DSpark strict: 43.07 t/s (no gain by design). Non-strict: peaks 40.2;
-   knob space fully swept (confidence 0.75 optimal, scheduler pauses off).
-3. Three microbatch increments: per-row routed MoE (bit-identical,
-   verify_layer unchanged), per-row HC pre (slower), and a genuine dual-row
-   HC-pre kernel — proven bit-exact via the strict oracle, no per-verify
-   gain. Conclusion: the N=2 verify near 50 ms is close to its real floor;
-   the "perfect sharing" 29–33 ms floor is likely undeliverable here, so
-   speculation probably never beats plain decode on M3 Ultra.
-4. Split schedule (`DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS`): default 4 optimal.
-5. Readback-bubble premise: disproved — MXFP4 static-trip reads expert ids
-   on-device; there is no CPU readback in decode.
-6. Stale CSVs in speed-bench/ predate current code; regenerate before
-   comparing historical numbers.
+The balanced harness failed twice at `step=0 variant=control` ("metal decode
+failed") with an early round-2 binary, then passed 9+ consecutive runs with
+semantically identical code. Unexplained; both failures immediately followed
+sustained benching (the documented thermal-transient window). If it recurs,
+reproduce with `--warmup 1 --tokens 2` and capture full stderr.
 
-## Tools built this session (reuse them)
+## Tools (unchanged from round 1)
 
-- **Commit-only stage profiler** (committed): 
-  `DS4_METAL_DECODE_STAGE_PROFILE=1 DS4_METAL_STAGE_COUNTERS=1 ./ds4 …`
-  prints per-stage GPU busy spans whose sum matches production GPU-busy
-  (~22.5 ms/token) — trustworthy, unlike the end-and-wait profiler which
-  inflates stages ~6× and serializes the schedule. For the batch/verify
-  path also export `DS4_METAL_LAYER_STAGE_PROFILE=1` (and see the reset/
-  report wrap pattern used around the verify call in the session log).
-- **Strict-mode oracle** for any verify-kernel work: `--dspark-strict`
-  output must match plain decode md5 exactly. It caught a real 5-argument
-  kernel misbinding that ordinary testing missed.
-- **Balanced A/B harness** (`speed-bench/metal_decode_schedule_bench`) with
-  `--candidate-env NAME --include-selection`: interleaved, bit-exactness
-  enforced over full-vocab logits. Acceptance threshold the project used:
-  ≥0.3%.
-- Microbench pattern (cold-cycling 6 weight buffers to defeat L2) for any
-  standalone kernel work — note the lesson: warm-cache microbench wins
-  (e.g. q8 nr0=8) evaporate in production cold streaming.
+- Commit-only stage profiler: `DS4_METAL_DECODE_STAGE_PROFILE=1
+  DS4_METAL_STAGE_COUNTERS=1 ./ds4 …` (trustworthy; end-and-wait inflates).
+- Balanced A/B harness: `make metal-decode-schedule-bench && ./speed-bench/
+  metal_decode_schedule_bench -m ds4flash.gguf --candidate-env NAME
+  --include-selection --tokens 512` (aborts unless bit-identical).
+- Transcript md5 oracle: `./ds4 -m ds4flash.gguf -p "Write a short story
+  about a lighthouse keeper." -c 8192 -n 128 --temp 0 | md5` → `db0c504c…`.
+- Tensor dump bisect: `DS4_METAL_GRAPH_DUMP_PREFIX=/tmp/x
+  DS4_METAL_GRAPH_DUMP_NAME=<stage> DS4_METAL_GRAPH_DUMP_LAYER=N
+  DS4_METAL_GRAPH_DUMP_POS=P ./ds4 …` (synchronizes and dumps; comparing
+  classic vs chain dumps located the hash-router divergence in one pass).
+- One `ds4` instance at a time; idle ~60 s after heavy runs (transient
+  2–10× slowdown recovers by itself).
 
-## Gotchas learned the hard way
+## Round-1 closed avenues still stand
 
-- Adding Metal kernel parameters: insert new buffer args **after** existing
-  ones or renumber the host bindings to match — a mid-signature insertion
-  silently misbinds everything downstream (caught only by the strict oracle).
-- The end-and-wait stage profiler changes the schedule (it disables the
-  concurrent shared-expert overlap); the commit-only mode does not.
-- `misc/` is gitignored; anything that must survive belongs in a tracked
-  path like speed-bench/.
-- One `ds4` instance at a time (instance lock is intentional; 145 GB
-  resident model).
-- DSpark stats: per-verify averages = verify_layer/(full+partial), not
-  per-cycle; the two disagree wildly when no_draft is high.
+Eight bit-exact kernel variants (all ≤0.03%), DSpark strict/non-strict
+(43.07 / peaks 40.2), three microbatch increments, split-schedule sweep
+(default 4 optimal), readback-bubble premise (disproved). Details in
+speed-bench/README.md. The round-1 verdict "bit-exact and >45 t/s are
+jointly infeasible" was wrong: the ledger's averaged `attn_inv_rope` line
+hid the 65/32 µs parity alternation, and the boundary's "wake/launch
+latency" was recoverable by keeping the token id on-device.
 
-## Decision needed before any work resumes
+## Round-3 addendum (Aug 22): session chain + headroom list exhausted
 
-The session's two objectives — "bit exact" (first message) and ">45 t/s"
-(goal) — are jointly infeasible on this hardware per the committed
-arithmetic. Next session must pick first:
-
-1. **go** — multi-day small-N batched-kernel DSpark verifier build, dropping
-   bit-exactness. Fair warning: triple-confirmed evidence says it likely
-   tops out below 45 on M3 Ultra anyway. If attempted, start from the
-   per-stage work order in README's DSpark section; batched output
-   projection and N≤2 KV-sharing attention are the only stages left
-   untried, and expectations should be low.
-2. **grind** — bit-exact persistent-kernel work (HC epilogue tail-fusions
-   ~0.3 ms + KV-staging elimination ~0.25 ms + boundary ~0.05 ms ≈ 0.6 ms
-   best case → ~44.5 t/s). The KV-staging direct-read kernel was started
-   once (raw-rows-first layout, zero-mask semantics worked out) but
-   diverged bit-wise and was cut; the addressing notes are in the session
-   history — the layout facts in README are verified.
-3. **accept** — 43.3–44.0 t/s is the M3 Ultra equilibrium; the campaign
-   artifacts stand as the deliverable.
-4. **different hardware** — M5-class parts change the latency-floor math
-   (more L2, different power behavior); the profiler + ledger apply
-   as-is there.
-
-Quick first command next session:
-`make && ./ds4 -m ds4flash.gguf -p "Write a short story about a lighthouse keeper." -c 8192 -n 128 --temp 0`
-→ expect ~43.3–43.9 t/s on a cool machine; then decide.
+- **Session chain decode**: `ds4_session_eval_chain_greedy` (ds4.c) reuses
+  `metal_graph_greedy_chain` for session API callers; `ds4-eval` decodes in
+  bursts capped to stay out of the think-close controller window. Bit-exact
+  (traces identical), eval decode **44.5 → 45.2 t/s**. Kill switch
+  `DS4_DISABLE_GREEDY_CHAIN=1` covers both CLI and session paths.
+- **MoE down-sum6+HC4 tail fusion**: landed bit-exact, speed-neutral,
+  default on (rollback `DS4_METAL_DISABLE_DECODE_MOE_HC_FUSION`).
+- **KV-staging direct read**: implemented bit-exact (wrap-safe) but −7%
+  (per-head F32 re-read/re-convert amplification); landed gated OFF
+  (opt-in `DS4_METAL_ENABLE_DECODE_RAW_DIRECT_KV`).
+- The round-2 "remaining headroom" list is now closed out: both quantified
+  items measured (neutral / negative), the concurrent shared-expert stream
+  stays contraindicated by the throttling evidence. Wall−GPU gap is ~0.1
+  ms/token; the next real gain must come from the MoE or attention core
+  itself.

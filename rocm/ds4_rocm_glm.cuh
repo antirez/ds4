@@ -5179,7 +5179,8 @@ static int glm_rocm_routed_moe_wrap(
                                              expert_mid_dim, out_dim, selected,
                                              weights, n_total_expert, n_expert,
                                              swiglu_clamp, x, NULL, layer_index,
-                                             force_resident);
+                                             force_resident,
+                                             NULL, NULL, NULL, NULL, NULL);
     }
     return ds4_gpu_routed_moe_batch_tensor(out, &gate_tmp, &up_tmp, mid, &down_tmp,
                                            model_map, model_size, gate_offset,

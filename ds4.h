@@ -488,6 +488,20 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 
+/* Greedy chain decode for sessions (Metal, greedy only): keeps the next token
+ * id on-device and encodes ahead, removing the per-token host sync.
+ * on_token receives the seed first, then every confirmed id in order; a false
+ * return stops the burst early without committing that token.  Returns the
+ * number of approved tokens (>= 0) or -1 with err set.  When *completed is
+ * false the burst stopped early and s->logits is stale; when true, s->logits
+ * holds the logits after the last approved token, as after ds4_session_eval. */
+bool ds4_session_chain_greedy_supported(const ds4_session *s);
+int ds4_session_eval_chain_greedy(ds4_session *s, int max_tokens,
+                                  bool (*on_token)(void *ctx, int token),
+                                  void *on_token_ctx,
+                                  bool *completed,
+                                  char *err, size_t errlen);
+
 typedef struct {
     ds4_session *session;
     int token;
