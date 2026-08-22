@@ -33,6 +33,12 @@ def positive_int(value):
         raise argparse.ArgumentTypeError("must be a positive integer")
     return value
 
+def positive_float(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return value
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -65,7 +71,7 @@ def parse_args():
     train.add_argument("--weight-decay", type=float, default=0.01)
     train.add_argument("--warmup-ratio", type=float, default=0.04)
     train.add_argument("--clip-grad", type=float, default=1.0)
-    train.add_argument("--loss-gamma", type=float, default=4.0)
+    train.add_argument("--loss-gamma", type=positive_float, default=4.0)
     train.add_argument("--eval-every", type=positive_int, default=96)
     train.add_argument("--save-every", type=positive_int, default=192)
     train.add_argument(

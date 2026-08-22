@@ -2646,7 +2646,6 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
                                           const char *tool_schemas,
                                           const tool_schema_orders *tool_orders,
                                           ds4_think_mode think_mode) {
-    (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
 

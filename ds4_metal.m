@@ -73,6 +73,7 @@ static id<MTLComputePipelineState> g_get_rows_q4_K_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_gqa_expand_f32_pipeline;
 static id<MTLComputePipelineState> g_fill_f32_pipeline;
+static id<MTLComputePipelineState> g_interleave_rows_f32_pipeline;
 static id<MTLComputePipelineState> g_qwen_gqa_attn_decode_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
@@ -6659,6 +6660,21 @@ int ds4_gpu_init(void) {
             }
         }
 
+        fn = [library newFunctionWithName:@"kernel_interleave_rows_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_interleave_rows_f32 function not found\n");
+        } else {
+            g_interleave_rows_f32_pipeline =
+                [g_device newComputePipelineStateWithFunction:fn error:&error];
+            if (!g_interleave_rows_f32_pipeline) {
+                fprintf(stderr, "ds4: Metal kernel_interleave_rows_f32 pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+                g_queue = nil;
+                g_device = nil;
+                return 0;
+            }
+        }
+
         fn = [library newFunctionWithName:@"kernel_qwen_gqa_attn_decode"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_qwen_gqa_attn_decode function not found\n");
@@ -10284,6 +10300,7 @@ void ds4_gpu_cleanup(void) {
         g_repeat_f32_pipeline = nil;
         g_gqa_expand_f32_pipeline = nil;
         g_fill_f32_pipeline = nil;
+        g_interleave_rows_f32_pipeline = nil;
         g_qwen_gqa_attn_decode_pipeline = nil;
         g_concat_pipeline = nil;
         g_cpy_f32_f32_pipeline = nil;
@@ -22602,6 +22619,58 @@ int ds4_gpu_fill_f32_tensor(
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "fill f32")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_interleave_rows_f32_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              width,
+        uint32_t              rows,
+        uint32_t              slots,
+        uint32_t              slot) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dst || !src || !g_interleave_rows_f32_pipeline ||
+        width == 0 || rows == 0 || slots == 0 || slot >= slots) {
+        return 0;
+    }
+    const uint64_t src_count = (uint64_t)rows * width;
+    if (src_count > UINT32_MAX || src_count > UINT64_MAX / slots) return 0;
+    const uint64_t dst_count = src_count * slots;
+    if (src_count > UINT64_MAX / sizeof(float) ||
+        dst_count > UINT64_MAX / sizeof(float) ||
+        ds4_gpu_tensor_bytes(src) < src_count * sizeof(float) ||
+        ds4_gpu_tensor_bytes(dst) < dst_count * sizeof(float)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(src);
+        id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(dst);
+        if (!sbuf || !dbuf) return 0;
+        struct {
+            uint32_t width;
+            uint32_t rows;
+            uint32_t slots;
+            uint32_t slot;
+        } args = { width, rows, slots, slot };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_interleave_rows_f32_pipeline];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(dst) atIndex:1];
+        [enc setBytes:&args length:sizeof(args) atIndex:2];
+        NSUInteger nth = g_interleave_rows_f32_pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256) nth = 256;
+        if (nth == 0) nth = 1;
+        const NSUInteger groups =
+            (NSUInteger)((src_count + (uint64_t)nth - 1u) / (uint64_t)nth);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "interleave rows f32")) return 0;
     }
     return 1;
 }

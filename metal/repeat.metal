@@ -82,6 +82,28 @@ kernel void kernel_fill_f32(
     dst[gid] = value;
 }
 
+// Interleave contiguous source rows into one slot of a packed row-major
+// [row][slot][width] destination. Qwen target-layer capture invokes this once
+// for each requested layer, avoiding one blit encoder per token row.
+struct ds4_interleave_rows_args {
+    uint32_t width;
+    uint32_t rows;
+    uint32_t slots;
+    uint32_t slot;
+};
+
+kernel void kernel_interleave_rows_f32(
+        device const float * src [[buffer(0)]],
+        device       float * dst [[buffer(1)]],
+        constant ds4_interleave_rows_args & args [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    const ulong total = (ulong)args.rows * args.width;
+    if ((ulong)gid >= total) return;
+    const uint row = gid / args.width;
+    const uint col = gid - row * args.width;
+    dst[((ulong)row * args.slots + args.slot) * args.width + col] = src[gid];
+}
+
 // Qwen GQA causal attention decode with online FlashAttention softmax
 struct ds4_qwen_attn_args {
     uint32_t pos;

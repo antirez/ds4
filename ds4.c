@@ -16578,7 +16578,6 @@ static int qwen_metal_ensure_pool(void) {
     g_qwen_pool.batch_gdn_core = ds4_gpu_tensor_alloc((uint64_t)batch_cap * QWEN_GDN_Z * sizeof(float));
     g_qwen_pool.gdn_conv_snap = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
     g_qwen_pool.gdn_state_snap = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
-    g_qwen_pool.layer_stash = ds4_gpu_tensor_alloc(8ull * 8ull * (uint64_t)n_embd * sizeof(float));
     g_qwen_pool.gdn_conv_steps = NULL;
     g_qwen_pool.gdn_state_steps = NULL;
     if (DS4_N_EXPERT) {
@@ -16603,7 +16602,28 @@ static int qwen_metal_ensure_pool(void) {
         g_qwen_pool.batch_moe_probs && g_qwen_pool.batch_moe_selected && g_qwen_pool.batch_moe_weights &&
         g_qwen_pool.batch_moe_routed && g_qwen_pool.batch_moe_shared && g_qwen_pool.batch_moe_gate &&
         g_qwen_pool.batch_moe_up && g_qwen_pool.batch_moe_mid && g_qwen_pool.batch_moe_down);
-int ok = moe_ok && g_qwen_pool.cur && g_qwen_pool.next && g_qwen_pool.normed && g_qwen_pool.q && g_qwen_pool.k && g_qwen_pool.v && g_qwen_pool.heads && g_qwen_pool.attn_out && g_qwen_pool.after_attn && g_qwen_pool.ffn_normed && g_qwen_pool.gate && g_qwen_pool.up && g_qwen_pool.mid && g_qwen_pool.ffn_out && g_qwen_pool.logits_gpu && g_qwen_pool.norm && g_qwen_pool.argmax_gpu && g_qwen_pool.gdn_alpha && g_qwen_pool.gdn_beta && g_qwen_pool.gdn_core && g_qwen_pool.k_cache && g_qwen_pool.v_cache && g_qwen_pool.gdn_conv && g_qwen_pool.gdn_state && g_qwen_pool.batch_cur && g_qwen_pool.batch_next && g_qwen_pool.batch_normed && g_qwen_pool.batch_q && g_qwen_pool.batch_k && g_qwen_pool.batch_v && g_qwen_pool.batch_heads && g_qwen_pool.batch_attn_out && g_qwen_pool.batch_after_attn && g_qwen_pool.batch_ffn_normed && g_qwen_pool.batch_gate && g_qwen_pool.batch_up && g_qwen_pool.batch_mid && g_qwen_pool.batch_ffn_out && g_qwen_pool.batch_logits && g_qwen_pool.batch_norm && g_qwen_pool.batch_tokens && g_qwen_pool.batch_argmax && g_qwen_pool.batch_gdn_core && g_qwen_pool.gdn_conv_snap && g_qwen_pool.gdn_state_snap && g_qwen_pool.layer_stash;
+    int ok = moe_ok &&
+        g_qwen_pool.cur && g_qwen_pool.next && g_qwen_pool.normed &&
+        g_qwen_pool.q && g_qwen_pool.k && g_qwen_pool.v &&
+        g_qwen_pool.heads && g_qwen_pool.attn_out &&
+        g_qwen_pool.after_attn && g_qwen_pool.ffn_normed &&
+        g_qwen_pool.gate && g_qwen_pool.up && g_qwen_pool.mid &&
+        g_qwen_pool.ffn_out && g_qwen_pool.logits_gpu &&
+        g_qwen_pool.norm && g_qwen_pool.argmax_gpu &&
+        g_qwen_pool.gdn_alpha && g_qwen_pool.gdn_beta &&
+        g_qwen_pool.gdn_core && g_qwen_pool.k_cache &&
+        g_qwen_pool.v_cache && g_qwen_pool.gdn_conv &&
+        g_qwen_pool.gdn_state && g_qwen_pool.batch_cur &&
+        g_qwen_pool.batch_next && g_qwen_pool.batch_normed &&
+        g_qwen_pool.batch_q && g_qwen_pool.batch_k &&
+        g_qwen_pool.batch_v && g_qwen_pool.batch_heads &&
+        g_qwen_pool.batch_attn_out && g_qwen_pool.batch_after_attn &&
+        g_qwen_pool.batch_ffn_normed && g_qwen_pool.batch_gate &&
+        g_qwen_pool.batch_up && g_qwen_pool.batch_mid &&
+        g_qwen_pool.batch_ffn_out && g_qwen_pool.batch_logits &&
+        g_qwen_pool.batch_norm && g_qwen_pool.batch_tokens &&
+        g_qwen_pool.batch_argmax && g_qwen_pool.batch_gdn_core &&
+        g_qwen_pool.gdn_conv_snap && g_qwen_pool.gdn_state_snap;
 
     if (!ok) {
         qwen_metal_pool_free_all();
@@ -17297,6 +17317,24 @@ static int qwen_metal_ensure_gdn_steps(void) {
     return 1;
 }
 
+/* Target-layer capture is rare outside DFlash, so pay for its largest buffer
+ * only on first use. The layout is packed by the number of requested layers:
+ * [token][capture_slot][embedding]. */
+static int qwen_metal_ensure_layer_stash(void) {
+    if (g_qwen_pool.layer_stash) return 1;
+    const uint64_t rows = g_qwen_pool.batch_cap;
+    const uint64_t slots = DS4_DFLASH2_MAX_TARGET;
+    const uint64_t width = DS4_N_EMBD;
+    if (rows == 0 || rows > UINT64_MAX / slots ||
+        rows * slots > UINT64_MAX / width ||
+        rows * slots * width > UINT64_MAX / sizeof(float)) {
+        return 0;
+    }
+    g_qwen_pool.layer_stash = ds4_gpu_tensor_alloc(
+        rows * slots * width * sizeof(float));
+    return g_qwen_pool.layer_stash != NULL;
+}
+
 static int qwen_hybrid_restore_gdn_prefix(ds4_qwen_session_state *qs, uint32_t t) {
     if (!g_qwen_pool.inited || !g_qwen_pool.gdn_conv_steps || !g_qwen_pool.gdn_state_steps) return 0;
     if (t >= (g_qwen_pool.spec_cap ? g_qwen_pool.spec_cap : 8u)) return 0;
@@ -17343,6 +17381,12 @@ static int qwen_hybrid_metal_forward_tokens(
         return ok1;
     }
     if (!qwen_metal_ensure_pool() || n_tok > g_qwen_pool.batch_cap) return 0;
+    if (layer_out) {
+        if (!layer_ids || n_ids == 0 || n_ids > DS4_DFLASH2_MAX_TARGET) return 0;
+        for (uint32_t j = 0; j < n_ids; j++) {
+            if (layer_ids[j] >= DS4_N_LAYER) return 0;
+        }
+    }
     const int skip_full = getenv("DS4_QWEN_SKIP_FULL") != NULL;
     const int skip_gdn = getenv("DS4_QWEN_SKIP_GDN") != NULL;
     const int skip_ffn = getenv("DS4_QWEN_SKIP_FFN") != NULL;
@@ -17354,6 +17398,10 @@ static int qwen_hybrid_metal_forward_tokens(
         if (!qwen_metal_ensure_gdn_steps()) return 0;
     }
     pthread_mutex_lock(&g_qwen_pool.mu);
+    if (layer_out && !qwen_metal_ensure_layer_stash()) {
+        pthread_mutex_unlock(&g_qwen_pool.mu);
+        return 0;
+    }
     ds4_gpu_qwen_set_gdn_snapshot(capture_gdn_steps);
     int32_t ids[1024];
     if (n_tok > g_qwen_pool.batch_cap || n_tok > (uint32_t)(sizeof(ids) / sizeof(ids[0]))) {
@@ -17735,16 +17783,18 @@ static int qwen_hybrid_metal_forward_tokens(
         if (ok && !ds4_gpu_add_tensor(next, g_qwen_pool.batch_after_attn, g_qwen_pool.batch_ffn_out,
                                       n_embd * n_tok)) { ok = 0; }
 
-        if (layer_out && layer_ids && g_qwen_pool.layer_stash && ok) {
-            for (uint32_t j = 0; ok && j < n_ids && j < 8u; j++) {
-                if (layer_ids[j] == il) {
-                    for (uint32_t t = 0; ok && t < n_tok && t < 8u; t++) {
-                        if (!ds4_gpu_tensor_copy(g_qwen_pool.layer_stash,
-                                                 ((uint64_t)t * 8u + j) * n_embd * sizeof(float),
-                                                 next,
-                                                 (uint64_t)t * n_embd * sizeof(float),
-                                                 (uint64_t)n_embd * sizeof(float))) ok = 0;
+        if (layer_out && ok) {
+            for (uint32_t j = 0; ok && j < n_ids; j++) {
+                if (layer_ids[j] == il &&
+                    !ds4_gpu_interleave_rows_f32_tensor(
+                        g_qwen_pool.layer_stash, next,
+                        n_embd, n_tok, n_ids, j)) {
+                    if (getenv("DS4_DFLASH_STATS")) {
+                        fprintf(stderr,
+                                "ds4: target capture interleave failed layer=%u slot=%u rows=%u\n",
+                                il, j, n_tok);
                     }
+                    ok = 0;
                 }
             }
         }
@@ -17811,16 +17861,23 @@ static int qwen_hybrid_metal_forward_tokens(
     if (ok && hidden_out &&
         !ds4_gpu_tensor_read(cur, 0, hidden_out,
                              (uint64_t)n_tok * n_embd * sizeof(float))) ok = 0;
-    if (ok && layer_out && layer_ids && g_qwen_pool.layer_stash) {
-        uint32_t nt = n_tok < 8u ? n_tok : 8u;
-        if (!ds4_gpu_tensor_read(g_qwen_pool.layer_stash, 0, layer_out,
-                                 (uint64_t)nt * 8u * n_embd * sizeof(float))) ok = 0;
+    if (ok && layer_out) {
+        const uint64_t captured =
+            (uint64_t)n_tok * n_ids * n_embd * sizeof(float);
+        if (!ds4_gpu_tensor_read(
+                g_qwen_pool.layer_stash, 0, layer_out, captured)) {
+            ok = 0;
+        }
     }
 
 
 
     ds4_gpu_qwen_set_gdn_snapshot(0);
     pthread_mutex_unlock(&g_qwen_pool.mu);
+    if (!ok && layer_out && getenv("DS4_DFLASH_STATS")) {
+        fprintf(stderr, "ds4: target capture batch failed rows=%u slots=%u\n",
+                n_tok, n_ids);
+    }
     return ok;
 }
 
@@ -41429,15 +41486,17 @@ static int qwen_target_forward_layers(
 #else
     if (e->backend != DS4_BACKEND_CPU) {
         if (qwen_engine_is_hybrid(e)) {
-            if (qwen_hybrid_metal_forward_token_ex(qs, logits, NULL, hidden, layer_out,
-                                                   dw->target_layers, dw->n_target,
-                                                   &e->model, &e->weights, token, pos)) {
-
-                return 1;
-            }
-        } else if (qwen_metal_forward_token_capture(qs, logits, hidden, layer_out,
-                                                    dw->target_layers, dw->n_target,
-                                                    &e->model, &e->weights, token, pos)) {
+            /* A failed Metal forward may already have advanced recurrent GDN
+             * state. Falling through to CPU would mix two target states. */
+            return qwen_hybrid_metal_forward_token_ex(
+                qs, logits, NULL, hidden, layer_out,
+                dw->target_layers, dw->n_target,
+                &e->model, &e->weights, token, pos);
+        }
+        if (qwen_metal_forward_token_capture(
+                qs, logits, hidden, layer_out,
+                dw->target_layers, dw->n_target,
+                &e->model, &e->weights, token, pos)) {
             return 1;
         }
     }
@@ -41459,11 +41518,14 @@ static int qwen_target_forward_layers_batch(
         uint32_t pos) {
     const ds4_dflash2_weights *dw = &e->dflash2;
 #ifndef DS4_NO_GPU
-    if (e->backend != DS4_BACKEND_CPU && qwen_engine_is_hybrid(e) && n_tok > 1 &&
-        qwen_hybrid_metal_forward_tokens(qs, logits, argmax_out, hidden, layer_out,
-                                         dw->target_layers, dw->n_target,
-                                         &e->model, &e->weights, tokens, n_tok, pos)) {
-        return 1;
+    if (e->backend != DS4_BACKEND_CPU &&
+        qwen_engine_is_hybrid(e) && n_tok > 1) {
+        /* Do not fall through after a partially executed Metal batch: recurrent
+         * state and host-visible features must come from the same target path. */
+        return qwen_hybrid_metal_forward_tokens(
+            qs, logits, argmax_out, hidden, layer_out,
+            dw->target_layers, dw->n_target,
+            &e->model, &e->weights, tokens, n_tok, pos);
     }
 #endif
     float *scratch = NULL;
@@ -41475,10 +41537,27 @@ static int qwen_target_forward_layers_batch(
         float *hid = hidden ? hidden + (size_t)t * DS4_N_EMBD : NULL;
         float *lout = layer_out
             ? layer_out + (size_t)t * dw->n_target * DS4_N_EMBD : NULL;
-        qwen_target_forward_layers(qs, e, row, hid, lout, tokens[t], pos + t);
+        if (!qwen_target_forward_layers(
+                qs, e, row, hid, lout, tokens[t], pos + t)) {
+            free(scratch);
+            return 0;
+        }
         if (argmax_out && row) argmax_out[t] = sample_argmax(row, DS4_N_VOCAB);
     }
     free(scratch);
+    return 1;
+}
+
+static uint32_t qwen_target_capture_batch_cap(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    const bool hybrid = qwen_engine_is_hybrid(e);
+    if (e && e->backend != DS4_BACKEND_CPU && hybrid) {
+        if (!qwen_metal_ensure_pool()) return 0;
+        return g_qwen_pool.batch_cap;
+    }
+#else
+    (void)e;
+#endif
     return 1;
 }
 static int qwen_session_dflash_capture_span(
@@ -41493,11 +41572,13 @@ static int qwen_session_dflash_capture_span(
     const ds4_dflash2_weights *dw = &e->dflash2;
     const uint32_t base = append ? qs->dflash_pending_len : 0u;
     if (!dflash_pending_reserve(qs, base + n_tok, dw->n_target, DS4_N_EMBD)) return 0;
+    const uint32_t capture_cap = qwen_target_capture_batch_cap(e);
+    if (capture_cap == 0) return 0;
     float *hidden_rows = xmalloc(
-        (size_t)DS4_DFLASH2_MAX_TARGET * DS4_N_EMBD * sizeof(float));
+        (size_t)capture_cap * DS4_N_EMBD * sizeof(float));
     for (uint32_t off = 0; off < n_tok;) {
         uint32_t n = n_tok - off;
-        if (n > DS4_DFLASH2_MAX_TARGET) n = DS4_DFLASH2_MAX_TARGET;
+        if (n > capture_cap) n = capture_cap;
         if (!qwen_target_forward_layers_batch(
                 qs, e, off + n == n_tok ? logits : NULL, hidden_rows,
                 qs->dflash_pending +
@@ -41552,10 +41633,11 @@ static int qwen_generate_dflash2(
 
 
 #ifndef DS4_NO_GPU
-    if (e->backend != DS4_BACKEND_CPU) {
-        if (!qwen_metal_ensure_pool()) {
-            fprintf(stderr, "ds4: Qwen Metal pool warm failed\n");
-        }
+    if (e->backend != DS4_BACKEND_CPU &&
+        qwen_engine_is_hybrid(e) &&
+        !qwen_metal_ensure_pool()) {
+        fprintf(stderr, "ds4: Qwen Metal pool warm failed\n");
+        return 1;
     }
 #endif
 
@@ -41571,16 +41653,29 @@ static int qwen_generate_dflash2(
         if (!dflash_cache_init(&draft_cache, dw, (uint32_t)ctx_size)) {
             ds4_die("failed to allocate classic DFlash KV cache");
         }
+        const uint32_t capture_cap = qwen_target_capture_batch_cap(e);
+        if (capture_cap == 0) {
+            fprintf(stderr, "ds4: DFlash target capture unavailable\n");
+            dflash_cache_free(&draft_cache);
+            free(layers); free(hidden); free(logits);
+            return 1;
+        }
         float *prefill_hidden = xmalloc(
-            (size_t)DS4_DFLASH2_MAX_TARGET * DS4_N_EMBD * sizeof(float));
+            (size_t)capture_cap * DS4_N_EMBD * sizeof(float));
         for (int i = 0; i < prompt->len;) {
             uint32_t n = (uint32_t)(prompt->len - i);
-            if (n > DS4_DFLASH2_MAX_TARGET) n = DS4_DFLASH2_MAX_TARGET;
-            qwen_target_forward_layers_batch(
-                NULL, e, i + (int)n == prompt->len ? logits : NULL,
-                prefill_hidden,
-                layers + (size_t)i * dw->n_target * DS4_N_EMBD,
-                NULL, prompt->v + i, n, (uint32_t)i);
+            if (n > capture_cap) n = capture_cap;
+            if (!qwen_target_forward_layers_batch(
+                    NULL, e, i + (int)n == prompt->len ? logits : NULL,
+                    prefill_hidden,
+                    layers + (size_t)i * dw->n_target * DS4_N_EMBD,
+                    NULL, prompt->v + i, n, (uint32_t)i)) {
+                fprintf(stderr, "ds4: DFlash target prefill capture failed\n");
+                free(prefill_hidden);
+                dflash_cache_free(&draft_cache);
+                free(layers); free(hidden); free(logits);
+                return 1;
+            }
             if (i + (int)n == prompt->len) {
                 memcpy(hidden, prefill_hidden + (size_t)(n - 1u) * DS4_N_EMBD,
                        (size_t)DS4_N_EMBD * sizeof(float));
@@ -41593,8 +41688,13 @@ static int qwen_generate_dflash2(
         for (int i = 0; i < prompt->len; i++) {
             float *out_logits = (i == prompt->len - 1) ? logits : NULL;
             float *out_layers = (i == prompt->len - 1) ? layers : NULL;
-            qwen_target_forward_layers(NULL, e, out_logits, hidden, out_layers,
-                                       prompt->v[i], (uint32_t)i);
+            if (!qwen_target_forward_layers(
+                    NULL, e, out_logits, hidden, out_layers,
+                    prompt->v[i], (uint32_t)i)) {
+                fprintf(stderr, "ds4: DFlash2 target prefill capture failed\n");
+                free(layers); free(hidden); free(logits);
+                return 1;
+            }
         }
     }
 
@@ -41649,8 +41749,16 @@ static int qwen_generate_dflash2(
         float *tmp_layers = xmalloc((size_t)n_verify * dw->n_target * DS4_N_EMBD * sizeof(float));
         memset(preds, 0xff, sizeof(preds));
         const double tv0 = now_sec();
-        qwen_target_forward_layers_batch(NULL, e, NULL, tmp_hidden, tmp_layers, preds,
-                                         verify, n_verify, (uint32_t)pos);
+        if (!qwen_target_forward_layers_batch(
+                NULL, e, NULL, tmp_hidden, tmp_layers, preds,
+                verify, n_verify, (uint32_t)pos)) {
+            fprintf(stderr, "ds4: DFlash target verify failed\n");
+            free(tmp_hidden);
+            free(tmp_layers);
+            dflash_cache_free(&draft_cache);
+            free(layers); free(hidden); free(logits);
+            return 1;
+        }
         const double tv1 = now_sec();
         const double verify_ms = 1e3 * (tv1 - tv0);
         int accepted = 0;
@@ -71713,8 +71821,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             float *tmp_hidden = xmalloc((size_t)n_verify * DS4_N_EMBD * sizeof(float));
             float *tmp_layers = xmalloc((size_t)n_verify * dw->n_target * DS4_N_EMBD * sizeof(float));
             memset(preds, 0xff, sizeof(preds));
-            qwen_target_forward_layers_batch(&s->qwen, e, NULL, tmp_hidden, tmp_layers, preds,
-                                             verify, n_verify, (uint32_t)pos);
+            if (!qwen_target_forward_layers_batch(
+                    &s->qwen, e, NULL, tmp_hidden, tmp_layers, preds,
+                    verify, n_verify, (uint32_t)pos)) {
+                free(tmp_hidden);
+                free(tmp_layers);
+                s->checkpoint_valid = false;
+                snprintf(err, errlen, "DFlash target verify failed");
+                return -1;
+            }
 
             int acc = 0;
             for (int d = 0; d < drafted; d++) {
