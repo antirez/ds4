@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
@@ -14073,30 +14074,45 @@ done:
 }
 
 static int listen_on(const char *host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
     if (!strcmp(host, "localhost")) host = "127.0.0.1";
-    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
-        close(fd);
+
+    char service[16];
+    snprintf(service, sizeof(service), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+
+    struct addrinfo *addresses = NULL;
+    if (getaddrinfo(host, service, &hints, &addresses) != 0) {
         errno = EINVAL;
         return -1;
     }
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        close(fd);
-        return -1;
+
+    int listen_fd = -1;
+    int last_errno = EADDRNOTAVAIL;
+    for (const struct addrinfo *address = addresses; address; address = address->ai_next) {
+        int fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        if (bind(fd, address->ai_addr, address->ai_addrlen) != 0 ||
+            listen(fd, 128) != 0)
+        {
+            last_errno = errno;
+            close(fd);
+            continue;
+        }
+        listen_fd = fd;
+        break;
     }
-    if (listen(fd, 128) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
+    freeaddrinfo(addresses);
+    if (listen_fd < 0) errno = last_errno;
+    return listen_fd;
 }
 
 static void configure_client_socket(int fd) {
@@ -14849,6 +14865,28 @@ static void test_assert(bool cond, const char *file, int line, const char *expr)
 }
 
 #define TEST_ASSERT(expr) test_assert((expr), __FILE__, __LINE__, #expr)
+
+static void test_listen_on_ipv4_and_ipv6(void) {
+    int fd4 = listen_on("127.0.0.1", 0);
+    TEST_ASSERT(fd4 >= 0);
+    if (fd4 >= 0) {
+        struct sockaddr_storage bound = {0};
+        socklen_t len = sizeof(bound);
+        TEST_ASSERT(getsockname(fd4, (struct sockaddr *)&bound, &len) == 0);
+        TEST_ASSERT(bound.ss_family == AF_INET);
+        close(fd4);
+    }
+
+    int fd6 = listen_on("::1", 0);
+    TEST_ASSERT(fd6 >= 0);
+    if (fd6 >= 0) {
+        struct sockaddr_storage bound = {0};
+        socklen_t len = sizeof(bound);
+        TEST_ASSERT(getsockname(fd6, (struct sockaddr *)&bound, &len) == 0);
+        TEST_ASSERT(bound.ss_family == AF_INET6);
+        close(fd6);
+    }
+}
 
 static void test_server_bind_slot(server *s, server_slot *slot) {
     memset(slot, 0, sizeof(*slot));
@@ -20123,6 +20161,7 @@ static void test_server_idle_expired_predicate_policy(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_listen_on_ipv4_and_ipv6();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();
