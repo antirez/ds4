@@ -536,10 +536,10 @@ kernel void kernel_qwen_rope_rotate_half_rows(
         (args.n_rot & 1u) != 0u || args.n_rot > args.head_dim) return;
     const uint n_half = args.n_rot / 2u;
     const float theta_scale = pow(args.freq_base, -2.0f / (float)args.n_rot);
+    const float log2_theta_scale = log2(theta_scale);
     device float *xh = x + (uint64_t)t * args.n_head * args.head_dim + h * args.head_dim;
     for (uint d = lid; d < n_half; d += 32u) {
-        float theta = (float)(args.pos0 + t);
-        for (uint i = 0; i < d; i++) theta *= theta_scale;
+        const float theta = (float)(args.pos0 + t) * exp2((float)d * log2_theta_scale);
         const float c = cos(theta);
         const float s = sin(theta);
         const float x0 = xh[d];

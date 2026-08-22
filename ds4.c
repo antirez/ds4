@@ -16362,8 +16362,18 @@ typedef struct ds4_qwen_session_state {
 #endif
 } ds4_qwen_session_state;
 
+#ifndef DS4_NO_GPU
+/* ds4_metal.m: clamps the persistent F16 KV-cache shadow used by
+ * ds4_gpu_qwen_attn_flash_rows; truncate(0) fully invalidates. */
+extern void ds4_gpu_qwen_flash_kv_f16_truncate(uint32_t max_len);
+#endif
+
 static void qwen_session_state_free(ds4_qwen_session_state *qs) {
     if (!qs) return;
+#ifndef DS4_NO_GPU
+    /* Session KV tensors are going away: the F16 flash shadow is stale. */
+    ds4_gpu_qwen_flash_kv_f16_truncate(0);
+#endif
     free(qs->layers);
     free(qs->hidden);
     free(qs->dflash_pending);
@@ -16405,11 +16415,17 @@ static int qwen_session_state_init_gpu(ds4_qwen_session_state *qs,
         qwen_session_state_free(qs);
         return 0;
     }
+    /* Fresh per-session KV tensors: drop any converted F16 prefix (the
+     * allocator could hand back a previously-seen buffer address). */
+    ds4_gpu_qwen_flash_kv_f16_truncate(0);
     return 1;
 }
 
 static int qwen_session_state_reset_recurrent(
         ds4_qwen_session_state *qs) {
+    /* Recurrent-state reset marks a fresh generation: the KV cache will be
+     * rewritten from pos 0, so any converted F16 prefix is stale. */
+    ds4_gpu_qwen_flash_kv_f16_truncate(0);
     return qs && qs->gdn_conv && qs->gdn_state &&
            ds4_gpu_tensor_fill_f32(
                qs->gdn_conv, 0.0f,
@@ -16454,6 +16470,9 @@ static struct {
 } g_qwen_pool = {0};
 
 static void qwen_metal_pool_free_all(void) {
+#ifndef DS4_NO_GPU
+    ds4_gpu_qwen_flash_kv_f16_truncate(0);
+#endif
     ds4_gpu_tensor **const tensors[] = {
         &g_qwen_pool.cur, &g_qwen_pool.next, &g_qwen_pool.normed,
         &g_qwen_pool.q, &g_qwen_pool.k, &g_qwen_pool.v, &g_qwen_pool.heads,
@@ -17936,6 +17955,11 @@ static int qwen_metal_prefill_span(
 }
 
 static void qwen_metal_prefill(ds4_qwen_session_state *qs, float *logits, const ds4_model *model, const ds4_weights *weights, const token_vec *prompt) {
+    /* Fresh prompt from pos 0 on the pooled-cache path: any converted F16
+     * prefix belongs to a previous generation. */
+#ifndef DS4_NO_GPU
+    ds4_gpu_qwen_flash_kv_f16_truncate(0);
+#endif
     if (qwen_metal_prefill_span(qs, logits, NULL, model, weights, prompt->v, prompt->len, 0,
                                 NULL, NULL, NULL) != 1) {
         if (DS4_FAMILY_IS_QWEN35)
@@ -18649,6 +18673,11 @@ static int qwen_mtp_metal_ensure_pool(void) {
 
 static void qwen_mtp_metal_reset_kv(void) {
     qwen_mtp_reset_conv();
+    /* Generation (re)start on the MTP path also rewrites the target KV
+     * cache from pos 0. */
+#ifndef DS4_NO_GPU
+    ds4_gpu_qwen_flash_kv_f16_truncate(0);
+#endif
     if (!qwen_mtp_metal_ensure_pool()) return;
     pthread_mutex_lock(&g_mtp_pool.mu);
     if (g_mtp_pool.k_cache && g_mtp_pool.v_cache && g_mtp_pool.kv_cap > 0) {
@@ -72700,6 +72729,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
+#ifndef DS4_NO_GPU
+    /* Rewinding drops KV rows beyond the new position: clamp the converted
+     * F16 prefix so stale rows are never reused. */
+    if (ds4_session_is_qwen(s)) ds4_gpu_qwen_flash_kv_f16_truncate((uint32_t)pos);
+#endif
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
