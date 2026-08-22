@@ -626,7 +626,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+             ds4_engine_dflash_ready(engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -1534,7 +1536,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(engine) > 1 ||
+             ds4_engine_dflash_ready(engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -2103,15 +2107,9 @@ int main(int argc, char **argv) {
             free(cfg.prompt_owned);
             return 2;
         }
-        const char *dump_system = cfg.gen.system;
-        if (!cfg.gen.system_set)
-            dump_system = "";
         int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
-                                            stdout,
-                                            dump_system,
-                                            cli_effective_think_mode(&cfg.gen),
-                                            cfg.gen.raw_prompt);
+                                            stdout);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;

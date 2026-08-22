@@ -364,6 +364,7 @@ def train_draft(args):
     )
     print(f"baseline {json.dumps(baseline, sort_keys=True)}", flush=True)
     best = baseline
+    metrics = baseline
     started = time.perf_counter()
 
     for step in range(args.steps):
@@ -386,19 +387,22 @@ def train_draft(args):
             print(f"step={step + 1}/{args.steps} loss={loss.item():.5f} "
                   f"grad={grad_norm.item():.3f} lr={rate:.3e} "
                   f"steps_s={(step + 1) / elapsed:.3f}", flush=True)
-        if (step + 1) % args.eval_every == 0 or step + 1 == args.steps:
+        eval_due = (step + 1) % args.eval_every == 0 or step + 1 == args.steps
+        save_due = (step + 1) % args.save_every == 0
+        if eval_due or save_due:
             metrics = evaluate_draft(
                 draft, args.data, eval_rows, args.block_size,
                 min(64, len(eval_rows) * 4), args.seed,
             )
-            print(f"eval step={step + 1} {json.dumps(metrics, sort_keys=True)}", flush=True)
+            if eval_due:
+                print(f"eval step={step + 1} {json.dumps(metrics, sort_keys=True)}", flush=True)
             if metrics["mean_accepted_drafts"] > best["mean_accepted_drafts"]:
                 best = metrics
                 save_draft(draft, args.draft, args.output / "best", metrics, json_safe_args(args))
-        if (step + 1) % args.save_every == 0:
+        if save_due:
             save_draft(
                 draft, args.draft, args.output / f"step-{step + 1:06d}",
-                metrics if "metrics" in locals() else baseline, json_safe_args(args),
+                metrics, json_safe_args(args),
             )
         mx.clear_cache()
 

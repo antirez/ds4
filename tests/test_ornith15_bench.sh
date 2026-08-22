@@ -140,11 +140,19 @@ llama_cmd = [
     "--temp", "0.0", "--top-k", "1", "--top-p", "1.0", "-ngl", "999", "--no-warmup"
 ]
 try:
-    p = subprocess.Popen(llama_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    llama_out, _ = p.communicate(input="\n/exit\n", timeout=30)
+    result = subprocess.run(
+        llama_cmd,
+        input="\n/exit\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    llama_out = result.stdout
     with open(llama_log_path, "w") as f:
         f.write(llama_out)
-except Exception as e:
+except (subprocess.SubprocessError, OSError) as e:
     print(f"FAIL: llama-cli execution failed: {e}", file=sys.stderr)
     sys.exit(1)
 

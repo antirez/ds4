@@ -176,19 +176,19 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
         if (tool != DS4_HELP_BENCH) {
-            opt(fp, c, "--mtp FILE", "Optional speculative draft GGUF: legacy MTP or experimental converted DSpark/DeepSpec on Metal.");
+            opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum speculative draft tokens. Legacy default: 1; DSpark uses GGUF block size.");
-            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for legacy fast MTP acceptance. Default: 3");
+            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
+            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
-            opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp. Immediate no-draft skip is off; scheduler window=8 min-avg=2.0. One-token proposals use ordinary decode.");
+            opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: Metal 0.6; CUDA/ROCm 0.7");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
-            tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER ||
+            tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dflash FILE", "Load a compatible Qwen DFlash or DFlash2 draft GGUF.");
             opt(fp, c, "--dflash-n-max N", "Maximum DFlash draft tokens per round. Default: GGUF block_size-1, capped at 7 by the verify batch width.");
         }
@@ -226,7 +226,6 @@ static void print_steering(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
-    opt(fp, c, "--dir-steering-policy MODE", "Server policy: final-answer, decoding, always, off. Default: final-answer");
     fputc('\n', fp);
 }
 
@@ -337,14 +336,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
-    opt(fp, c, "--max-queue N", "Reject requests with 429 when N jobs are already waiting. 0 disables. Default: 0");
-    opt(fp, c, "--idle-timeout N", "Free GPU and engine after N idle seconds, reloading on the next request. 0 disables. Default: 0");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "GET /health and GET /stats report liveness and operational counters even mid-generation.");
-    para(fp, c, "With --idle-timeout the listening socket stays bound while unloaded, so a cold request waits for the reload instead of being refused; /health, /stats and /v1/models answer without reloading.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
 }

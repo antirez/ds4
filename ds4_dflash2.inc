@@ -286,12 +286,13 @@ static void dflash2_rms_head(float *x, const float *w, uint32_t n_head, uint32_t
     }
 }
 
-static void dflash2_rope_rows(float *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
-                              uint32_t pos0, float freq_base) {
+static void dflash2_rope_rows(float *x, uint32_t n_tok, uint32_t n_head,
+                              uint32_t head_dim, uint32_t pos0,
+                              float freq_base) {
     for (uint32_t t = 0; t < n_tok; t++) {
-        rope_tail_ext_inplace(x + (uint64_t)t * n_head * head_dim,
-                              n_head, head_dim, head_dim,
-                              pos0 + t, 0, freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false);
+        qwen_rope_rotate_half_inplace(
+            x + (uint64_t)t * n_head * head_dim,
+            n_head, head_dim, head_dim, pos0 + t, freq_base);
     }
 }
 
@@ -357,6 +358,28 @@ static bool dflash2_shape(const ds4_tensor *t, uint32_t ndim,
            (ndim < 2 || t->dim[1] == d1);
 }
 
+static bool dflash2_shape3(const ds4_tensor *t, uint64_t d0,
+                           uint64_t d1, uint64_t d2) {
+    return t && t->ndim == 3 && t->dim[0] == d0 &&
+           t->dim[1] == d1 && t->dim[2] == d2;
+}
+
+static bool dflash2_f32_vector(const ds4_tensor *t, uint64_t n) {
+    return dflash2_shape(t, 1, n, 0) && t->type == DS4_TENSOR_F32;
+}
+
+static bool dflash2_attention_shape_valid(
+        uint32_t n_head, uint32_t n_kv, uint32_t head_dim) {
+    if (n_head == 0 || n_kv == 0 || n_kv > n_head ||
+        (n_head % n_kv) != 0 || head_dim == 0 ||
+        head_dim > DS4_DFLASH2_MAX_HEAD_DIM || (head_dim & 1u) != 0u) {
+        return false;
+    }
+    /* q_dim/kv_dim are stored in uint32_t by the runtime. */
+    return (uint64_t)n_head * head_dim <= UINT32_MAX &&
+           (uint64_t)n_kv * head_dim <= UINT32_MAX;
+}
+
 static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     if (!m) return 0;
@@ -391,12 +414,20 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     }
     if (n_layer == 0 || n_layer > DS4_DFLASH2_MAX_LAYERS) return 0;
     if (block == 0 || block > DS4_DFLASH2_MAX_BLOCK) return 0;
-    if (n_embd == 0 || n_embd != DS4_N_EMBD ||
-        n_head == 0 || n_kv == 0 || head_dim == 0 ||
+    if (n_embd == 0 || n_embd != DS4_N_EMBD || n_ff == 0 ||
+        !dflash2_attention_shape_valid(n_head, n_kv, head_dim) ||
         (classic && (uint64_t)n_head * head_dim != n_embd)) {
         return 0;
     }
-    if (!classic && (conv_g == 0 || (n_embd % conv_g) != 0)) return 0;
+    uint64_t conv_dyn_dim = 0;
+    if (!classic) {
+        if (conv_k == 0 || conv_g == 0 || (n_embd % conv_g) != 0 ||
+            rank == 0 || topk == 0 || topk > DS4_N_VOCAB) {
+            return 0;
+        }
+        conv_dyn_dim = 2ull * conv_k * (n_embd / conv_g);
+        if (conv_dyn_dim > UINT32_MAX) return 0;
+    }
     if (classic && full_layer == UINT32_MAX) full_layer = n_layer - 1u;
     if (classic && full_layer >= n_layer) return 0;
 
@@ -442,13 +473,15 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     w->selector_hidden = model_find_tensor(m, "selector_hidden.weight");
     w->selector_predecessor = model_find_tensor(m, "selector_predecessor.weight");
     w->selector_successor = model_find_tensor(m, "selector_successor.weight");
-    if (!dflash2_shape(w->enc_output_norm, 1, n_embd, 0) ||
+    if (!dflash2_f32_vector(w->enc_output_norm, n_embd) ||
         !dflash2_shape(w->fc, 2, (uint64_t)n_target * n_embd, n_embd) ||
-        !dflash2_shape(w->output_norm, 1, n_embd, 0)) {
+        !dflash2_f32_vector(w->output_norm, n_embd)) {
         return 0;
     }
-    if (!classic && (!w->selector_hidden || !w->selector_predecessor ||
-                     !w->selector_successor)) {
+    if (!classic &&
+        (!dflash2_shape(w->selector_hidden, 2, n_embd, rank) ||
+         !dflash2_shape(w->selector_predecessor, 2, rank, DS4_N_VOCAB) ||
+         !dflash2_shape(w->selector_successor, 2, rank, DS4_N_VOCAB))) {
         return 0;
     }
 
@@ -478,17 +511,26 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
             l->ffn_conv_base = dflash2_tensorf(m, "blk.%u.ffn_conv_base", il);
             l->ffn_conv_proj = dflash2_tensorf(m, "blk.%u.ffn_conv_proj.weight", il);
         }
-        if (!dflash2_shape(l->attn_norm, 1, n_embd, 0) ||
+        if (!dflash2_f32_vector(l->attn_norm, n_embd) ||
             !dflash2_shape(l->attn_q, 2, n_embd, q_dim) ||
             !dflash2_shape(l->attn_k, 2, n_embd, kv_dim) ||
             !dflash2_shape(l->attn_v, 2, n_embd, kv_dim) ||
             !dflash2_shape(l->attn_output, 2, q_dim, n_embd) ||
-            !dflash2_shape(l->attn_q_norm, 1, head_dim, 0) ||
-            !dflash2_shape(l->attn_k_norm, 1, head_dim, 0) ||
-            !dflash2_shape(l->ffn_norm, 1, n_embd, 0) ||
+            !dflash2_f32_vector(l->attn_q_norm, head_dim) ||
+            !dflash2_f32_vector(l->attn_k_norm, head_dim) ||
+            !dflash2_f32_vector(l->ffn_norm, n_embd) ||
             !dflash2_shape(l->ffn_gate, 2, n_embd, n_ff) ||
             !dflash2_shape(l->ffn_up, 2, n_embd, n_ff) ||
             !dflash2_shape(l->ffn_down, 2, n_ff, n_embd)) {
+            return 0;
+        }
+        if (!classic &&
+            (!dflash2_shape3(l->attn_conv_base, n_embd, conv_k, 2) ||
+             l->attn_conv_base->type != DS4_TENSOR_F32 ||
+             !dflash2_shape(l->attn_conv_proj, 2, n_embd, conv_dyn_dim) ||
+             !dflash2_shape3(l->ffn_conv_base, n_embd, conv_k, 2) ||
+             l->ffn_conv_base->type != DS4_TENSOR_F32 ||
+             !dflash2_shape(l->ffn_conv_proj, 2, n_embd, conv_dyn_dim))) {
             return 0;
         }
     }
@@ -926,7 +968,8 @@ static void dflash2_layer_forward(
     dflash2_rms_head(k_ctx, tensor_data(m, l->attn_k_norm), n_kv, hd, eps);
     dflash2_rope_rows(q, L, n_head, hd, ctx_pos + 1u, 10000000.0f);
     dflash2_rope_rows(k_prop, L, n_kv, hd, ctx_pos + 1u, 10000000.0f);
-    rope_tail_ext_inplace(k_ctx, n_kv, hd, hd, ctx_pos, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false);
+    qwen_rope_rotate_half_inplace(
+        k_ctx, n_kv, hd, hd, ctx_pos, 10000000.0f);
     dflash2_sdpa(heads, q, k_ctx, v_ctx, k_prop, v_prop, L, n_head, n_kv, hd);
     dflash2_matvecs(attn, m, l->attn_output, heads, L);
     if (cfg->classic) {

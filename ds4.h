@@ -289,8 +289,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_prompts,
                                int max_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
-int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp,
-                               const char *system, ds4_think_mode think_mode, bool raw);
+int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_dflash_ready(const ds4_engine *e);
@@ -340,8 +339,6 @@ int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
-void ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn);
-void ds4_session_use_engine_directional_steering(ds4_session *s);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
@@ -385,6 +382,8 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+int ds4_test_dflash_attention_shape_valid(
+        uint32_t n_head, uint32_t n_kv, uint32_t head_dim);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
@@ -399,8 +398,6 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
  * updated and MUST NOT be read. */
 int ds4_session_eval_argmax(ds4_session *s, int token,
                             char *err, size_t errlen);
-int ds4_session_eval_no_mtp(ds4_session *s, int token,
-                            char *err, size_t errlen);
 
 typedef struct {
     ds4_session *session;
@@ -412,9 +409,6 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
-/* Same scheduling semantics, but never prepares a speculative support draft. */
-int ds4_sessions_eval_batch_no_mtp(ds4_decode_item *items, int count,
-                                   char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

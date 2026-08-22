@@ -908,6 +908,8 @@ static int g_ds4_lock_fd = -1;
 #define DS4_DFLASH2_MAX_LAYERS 8
 #define DS4_DFLASH2_MAX_TARGET 8
 #define DS4_DFLASH2_MAX_BLOCK 16
+/* CPU and Metal DFlash SDPA use a fixed 128-float accumulator. */
+#define DS4_DFLASH2_MAX_HEAD_DIM 128
 /* Speculative verify runs the primary plus its drafts through one batched
  * forward whose per-round buffers are 8 rows wide (ver_tokens/ver_argmax/preds,
  * and the 8-row Metal layer stash behind them), so a round can carry at most
@@ -41116,6 +41118,13 @@ struct ds4_engine {
 
 #include "ds4_dflash2.inc"
 
+#ifdef DS4_TEST_HOOKS
+int ds4_test_dflash_attention_shape_valid(
+        uint32_t n_head, uint32_t n_kv, uint32_t head_dim) {
+    return dflash2_attention_shape_valid(n_head, n_kv, head_dim) ? 1 : 0;
+}
+#endif
+
 static int sample_argmax(const float *logits, uint32_t n_vocab);
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token);
 
@@ -54556,9 +54565,6 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
-    bool directional_steering_override;
-    float directional_steering_attn_scale;
-    float directional_steering_ffn_scale;
 };
 
 #ifndef DS4_NO_GPU
@@ -54587,7 +54593,7 @@ static bool ds4_dspark_scheduler_enabled(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_window(void) {
-    uint32_t v = ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_WINDOW", 8);
+    uint32_t v = ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_WINDOW", 4);
     return v ? v : 4;
 }
 
@@ -54600,7 +54606,7 @@ static uint32_t ds4_dspark_scheduler_slow_skip_cycles(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_min_avg_milli(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", 2000);
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", 1500);
 }
 
 static uint32_t ds4_dspark_scheduler_max_ms_per_accept_milli(void) {
@@ -54618,7 +54624,7 @@ static uint32_t ds4_dspark_scheduler_break_even_window(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 0);
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
 }
 
 static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
@@ -57431,8 +57437,7 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
 
-int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp,
-                               const char *system, ds4_think_mode think_mode, bool raw) {
+int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
     ds4_model model;
     ds4_vocab vocab;
     token_vec tokens = {0};
@@ -57441,11 +57446,8 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     model_open(&model, model_path, false, false);
     config_validate_model(&model);
     vocab_load(&vocab, &model);
-    if (raw) {
-        tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
-    } else {
-        encode_chat_prompt(&vocab, system, text ? text : "", think_mode, &tokens);
-    }
+    /* Diagnostic contract: literal text with protocol specials. */
+    tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
     dump_tokens_fp(fp, &vocab, &tokens);
     token_vec_free(&tokens);
@@ -64268,71 +64270,6 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     return 0;
 }
 
-static void ds4_session_directional_steering_scales(const ds4_session *s,
-                                                    float *attn,
-                                                    float *ffn) {
-    float a = 0.0f;
-    float f = 0.0f;
-    if (s && s->engine) {
-        if (s->directional_steering_override) {
-            a = s->directional_steering_attn_scale;
-            f = s->directional_steering_ffn_scale;
-        } else {
-            a = s->engine->directional_steering_attn_scale;
-            f = s->engine->directional_steering_ffn_scale;
-        }
-    }
-    if (attn) *attn = a;
-    if (ffn) *ffn = f;
-}
-
-static void ds4_session_apply_directional_steering_to_backend(ds4_session *s) {
-    if (!s) return;
-#ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s) && !ds4_session_is_glm(s)) {
-        float attn = 0.0f;
-        float ffn = 0.0f;
-        ds4_session_directional_steering_scales(s, &attn, &ffn);
-        s->graph.directional_steering_attn_scale = attn;
-        s->graph.directional_steering_ffn_scale = ffn;
-    }
-#endif
-}
-
-static void ds4_session_set_directional_steering_state(ds4_session *s,
-                                                       bool override,
-                                                       float attn,
-                                                       float ffn) {
-    if (!s) return;
-    float old_attn = 0.0f;
-    float old_ffn = 0.0f;
-    ds4_session_directional_steering_scales(s, &old_attn, &old_ffn);
-
-    s->directional_steering_override = override;
-    s->directional_steering_attn_scale = attn;
-    s->directional_steering_ffn_scale = ffn;
-
-    float new_attn = 0.0f;
-    float new_ffn = 0.0f;
-    ds4_session_directional_steering_scales(s, &new_attn, &new_ffn);
-    if (old_attn != new_attn || old_ffn != new_ffn) {
-        s->mtp_draft_valid = false;
-        s->greedy_splitkv_anchor_valid = false;
-#ifndef DS4_NO_GPU
-        s->dspark_draft_valid = false;
-#endif
-    }
-    ds4_session_apply_directional_steering_to_backend(s);
-}
-
-void ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn) {
-    ds4_session_set_directional_steering_state(s, true, attn, ffn);
-}
-
-void ds4_session_use_engine_directional_steering(ds4_session *s) {
-    ds4_session_set_directional_steering_state(s, false, 0.0f, 0.0f);
-}
-
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
@@ -65499,9 +65436,6 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        float steering_attn = 0.0f;
-        float steering_ffn = 0.0f;
-        ds4_session_directional_steering_scales(s, &steering_attn, &steering_ffn);
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -65521,8 +65455,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                          prompt->v[i],
                                                          (uint32_t)s->checkpoint.len,
                                                          e->directional_steering_dirs,
-                                                         steering_attn,
-                                                         steering_ffn,
+                                                         e->directional_steering_attn_scale,
+                                                         e->directional_steering_ffn_scale,
                                                          &s->cpu_scratch);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -65540,8 +65474,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 &s->cpu_cache,
                                 prompt,
                                 e->directional_steering_dirs,
-                                steering_attn,
-                                steering_ffn);
+                                e->directional_steering_attn_scale,
+                                e->directional_steering_ffn_scale);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -67168,9 +67102,6 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        float steering_attn = 0.0f;
-        float steering_ffn = 0.0f;
-        ds4_session_directional_steering_scales(s, &steering_attn, &steering_ffn);
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,
@@ -67178,8 +67109,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  token,
                                                  (uint32_t)s->checkpoint.len,
                                                  e->directional_steering_dirs,
-                                                 steering_attn,
-                                                 steering_ffn,
+                                                 e->directional_steering_attn_scale,
+                                                 e->directional_steering_ffn_scale,
                                                  &s->cpu_scratch);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
@@ -67369,10 +67300,6 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     }
 #endif
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
-}
-int ds4_session_eval_no_mtp(ds4_session *s, int token,
-                            char *err, size_t errlen) {
-    return ds4_session_eval_probe_tp(s, token, false, err, errlen);
 }
 
 #ifndef DS4_NO_GPU
@@ -68138,18 +68065,14 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         char *err,
         size_t errlen);
 
-static int ds4_sessions_eval_batch_internal(ds4_decode_item *items, int count,
-                                            bool probe_mtp,
-                                            char *err, size_t errlen) {
+int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
+                            char *err, size_t errlen) {
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
     }
     if (count == 1) {
-        return probe_mtp
-            ? ds4_session_eval(items[0].session, items[0].token, err, errlen)
-            : ds4_session_eval_no_mtp(items[0].session, items[0].token,
-                                      err, errlen);
+        return ds4_session_eval(items[0].session, items[0].token, err, errlen);
     }
 
     ds4_session *first = items[0].session;
@@ -68205,11 +68128,8 @@ static int ds4_sessions_eval_batch_internal(ds4_decode_item *items, int count,
      * A failure can leave earlier members advanced, so force every member to
      * rebuild before it is used again. */
     for (int i = 0; i < count; i++) {
-        int rc = probe_mtp
-            ? ds4_session_eval(items[i].session, items[i].token, err, errlen)
-            : ds4_session_eval_no_mtp(items[i].session, items[i].token,
-                                      err, errlen);
-        if (rc != 0) {
+        if (ds4_session_eval(items[i].session, items[i].token,
+                             err, errlen) != 0) {
             for (int j = 0; j < count; j++) {
                 ds4_session_invalidate(items[j].session);
             }
@@ -68218,16 +68138,6 @@ static int ds4_sessions_eval_batch_internal(ds4_decode_item *items, int count,
     }
     return 0;
 }
-int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
-                            char *err, size_t errlen) {
-    return ds4_sessions_eval_batch_internal(items, count, true, err, errlen);
-}
-
-int ds4_sessions_eval_batch_no_mtp(ds4_decode_item *items, int count,
-                                   char *err, size_t errlen) {
-    return ds4_sessions_eval_batch_internal(items, count, false, err, errlen);
-}
-
 
 int ds4_sessions_eval_batch_with_prefill(
         ds4_decode_item *items,
@@ -68412,25 +68322,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
         return n_accept;
     }
     if (drafts[0] == eos_token) draft_n = 1;
-    if (draft_n == 1) {
-        if (ds4_session_eval_probe_tp(s, drafts[0], true, err, errlen) != 0) {
-            return -1;
-        }
-        if (n_accept < accepted_cap) accepted[n_accept++] = drafts[0];
-        if (stats_enabled) {
-            s->dspark_stats.full_accepts++;
-            s->dspark_stats.accepted_draft_tokens += 1;
-            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 1);
-        }
-        ds4_session_dspark_scheduler_note(s, 1, false, DS4_DSPARK_SCHED_EXTRA_MS());
-        if (spec_log) {
-            fprintf(stderr, "ds4: DSpark spec one-token decode accepted=%d\n",
-                    n_accept);
-        }
-        DS4_DSPARK_STATS_FINISH();
-        return n_accept;
-    }
-
 
     ds4_engine *e = s->engine;
     ds4_spec_frontier frontier;

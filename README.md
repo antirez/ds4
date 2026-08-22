@@ -108,25 +108,15 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-Download one main model. **Prefer Headroom128 on this fork.**
-The Flash targets below select the final `0731` weights rather than the earlier
-preview checkpoint.
+Download one main model. **Prefer the imatrix versions.**
 
 ```sh
-./download_model.sh headroom128   # preferred: apetersson Headroom128 (~81 GiB / ~87 GB)
-./download_model.sh preferred     # alias for headroom128
-./download_model.sh ds4f-q2      # alternative stock antirez 0731 imatrix (~81 GB)
-./download_model.sh ds4f-q2-q4   # alternative mixed last-6-layers q4 (~98 GB)
-./download_model.sh ds4f-q4      # >= 256 GB RAM machines, imatrix-tuned q4
+./download_model.sh ds4f-q2      # 96/128 GB RAM machines
+./download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
+./download_model.sh ds4f-q4      # >= 256 GB RAM machines
 ./download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
-
-Preferred weights:
-
-- Repo: [`apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128`](https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128)
-- Main GGUF: `DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf`
-- Matching DSpark support: `DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf`
 
 The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
 than requantizing them. It runs on Metal and CUDA; Blackwell CUDA devices use
@@ -140,12 +130,9 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-`headroom128` / `preferred` download from
-`https://huggingface.co/apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128`.
-The other Flash/PRO targets download from
-`https://huggingface.co/antirez/deepseek-v4-gguf`. Both paths store files under
-`./gguf/`, resume partial downloads with `curl -C -`, and (for main-model
-targets) update `./ds4flash.gguf` to point at the selected main model.
+The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
+stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
+updates `./ds4flash.gguf` to point at the selected main model.
 The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
 download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
@@ -302,35 +289,22 @@ precision or approximate-model mode; use ordinary decoding, `--quality`, or
 `--dspark-strict` when byte-for-byte reproducibility with one-token decode is
 required.
 
-The released DSpark checkpoint is packaged as a separate support GGUF of about
-5.6–6 GiB. It is not a standalone model. Prefer the matching Headroom128
-support file with the preferred main model:
-
-```sh
-./download_model.sh headroom128
-./download_model.sh headroom128-dspark-support
-
-./ds4 -m ds4flash.gguf \
-  --mtp gguf/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf \
-  --dspark --temp 0
-```
-
-For stock antirez Flash quants (`ds4f-q2`, `ds4f-q2-q4`, `ds4f-q4`),
-download the official support file once:
+The DSpark checkpoint for Flash 0731 is packaged here as a separate support
+GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 
 ```sh
 ./download_model.sh ds4f-dspark
 ```
 
-That official support file pairs with the 0731 Flash `ds4f-q2`,
-`ds4f-q2-q4`, and `ds4f-q4` models listed above. It is checkpoint-specific
-and must not be paired with an older Flash model. For now **DeepSeek
-V4 PRO** is not supported. On Metal, the main model may be resident or use
+The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
+`ds4f-q4` models listed above. It is checkpoint-specific
+and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
+is not supported. On Metal, the main model may be resident or use
 `--ssd-streaming`; the support model still adds its own weights and runtime
 state to the memory requirement. DSpark replaces the legacy one-stage MTP
 support model for that run rather than stacking with it.
 
-Stock antirez greedy example:
+Run it with greedy decoding:
 
 ```sh
 ./ds4 -m ds4flash.gguf \
@@ -345,58 +319,6 @@ it prunes suffixes that are unlikely to repay their verification cost.
 diagnostics. Sampled decoding does not use DSpark proposals. `--quality` and
 `--dspark-strict` also keep target-only decoding, which is useful for
 reproducibility checks.
-
-
-## DFlash Speculative Decoding (Qwen and Ornith)
-
-DFlash is a block-diffusion drafter for speculative decoding. It predicts a
-block of draft tokens in parallel; the target model verifies them in one batched
-forward pass, so the output distribution is exactly the target model's.
-Run speculative decoding by passing `--dflash`:
-
-```sh
-./ds4 -m ds4flash.gguf \
-  --dflash gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-  -p "Hello"
-```
-
-Or run the server:
-
-```sh
-./ds4-server -m ds4flash.gguf \
-  --dflash gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-  --ctx 32768
-```
-
-You can optionally configure maximum draft tokens with `--dflash-n-max N`. The
-default is the drafter's GGUF `block_size - 1`, and any value is capped at 7
-because one verify round batches the primary token plus its drafts through
-8-row buffers.
-
-### Ornith 1.5 9B classic DFlash
-
-Ornith 1.5 9B uses a classic DFlash draft (no dynamic conv or candidate
-selector) distilled specifically against Ornith 1.5, published at
-[`audreyt/Ornith-1.5-9B-DFlash-GGUF`](https://huggingface.co/audreyt/Ornith-1.5-9B-DFlash-GGUF):
-
-```sh
-./download_model.sh ornith9-dflash
-./ds4 -m ./ornith9.gguf --metal \
-  --dflash gguf/ornith1.5-9b-dflash-bf16-projection-Q4_K_M.gguf \
-  -p "Hello"
-```
-
-Classic DFlash requires the Metal backend. The draft keeps a persistent
-per-layer KV cache across rounds, so accepted and rejected rows are handled
-internally; no extra flags are needed.
-
-Speculation only pays when drafts are accepted often enough to amortize the
-draft plus verification cost. An adaptive scheduler is enabled by default: it
-calibrates target-only speed, probes with cheap draft depths first, escalates
-to deeper blocks while measured acceptance stays high (EMA >= 80%), and falls
-back to plain target-only decoding permanently once a workload shows low yield.
-Set `DS4_DFLASH_ADAPTIVE=0` to disable it and always speculate at
-`--dflash-n-max`.
 
 ## Speed
 

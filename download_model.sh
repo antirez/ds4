@@ -6,9 +6,6 @@ GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 QWEN_GGML_REPO="ggml-org/Qwen3.8-27B-GGUF"
 QWEN_DFLASH_REPO="z-lab/Qwen3.8-27B-DFlash2-GGUF"
 REPO="antirez/deepseek-v4-gguf"
-HEADROOM128_REPO="apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128"
-HEADROOM128_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128.gguf"
-HEADROOM128_DSPARK_SUPPORT_FILE="DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128-DSpark-support.gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
@@ -57,17 +54,11 @@ usage() {
 DwarfStar GGUF downloader
 
 Usage:
-  ./download_model.sh headroom128 [--token TOKEN]
-  ./download_model.sh preferred [--token TOKEN]
-  ./download_model.sh headroom128-dspark-support [--token TOKEN]
   ./download_model.sh ds4f-q2 [--token TOKEN]
   ./download_model.sh ds4f-q2-q4 [--token TOKEN]
   ./download_model.sh ds4f-q4 [--token TOKEN]
   ./download_model.sh ds4f-mxfp4 [--token TOKEN]
   ./download_model.sh ds4f-dspark [--token TOKEN]
-  ./download_model.sh q2-imatrix [--token TOKEN]
-  ./download_model.sh q2-q4-imatrix [--token TOKEN]
-  ./download_model.sh q4-imatrix [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -97,28 +88,17 @@ Usage:
   ./download_model.sh ornith9-dflash-support [--token TOKEN]
 Targets:
 
-  headroom128 / preferred
-       Preferred Flash GGUF for 96/128 GB machines on this fork.
-       apetersson/DeepSeek-V4-Flash-0731-Abliterated-DS4-Headroom128
-       (~81 GiB / ~87 GB). Abliterated 0731 DS4 headroom build; links
-       ./ds4flash.gguf.
-
-  headroom128-dspark-support
-       Matching DSpark support GGUF for headroom128 from the same
-       apetersson Headroom128 repo, about 5.6 GiB. Enable with --dspark and
-       --mtp when running the Headroom128 main model.
-
-  ds4f-q2 / q2-imatrix
+  ds4f-q2
        2-bit routed experts, about 81 GB on disk.
-       Official antirez stock 0731 imatrix for 96 and 128 GB RAM machines.
+       Recommended model for 96 and 128 GB RAM machines.
 
-  ds4f-q2-q4 / q2-q4-imatrix
+  ds4f-q2-q4
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
        using q4 routed experts. About 98 GB on disk. Good for higher
        quality inference for 128 GB MacBooks. Works on DGX Spark but loading
        may struggle compared to ds4f-q2.
 
-  ds4f-q4 / q4-imatrix
+  ds4f-q4
        4-bit routed experts, about 153 GB on disk.
        Recommended model for machines with 256 GB RAM or more.
 
@@ -244,9 +224,6 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
-After downloading Headroom128 DSpark support, enable it explicitly in greedy mode:
-  ./ds4 --dspark -m ./ds4flash.gguf --mtp <download directory>/$HEADROOM128_DSPARK_SUPPORT_FILE --temp 0
-
 After downloading the official antirez DSpark support, enable it explicitly in greedy mode:
   ./ds4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
 
@@ -275,19 +252,9 @@ LINK_MODEL=1
 FORCE_HF_DOWNLOAD=0
 FLATTEN_DOWNLOADS=0
 case "$MODEL" in
-    headroom128|preferred)
-        REPO=$HEADROOM128_REPO
-        MODEL_FILE=$HEADROOM128_FILE
-        MODEL=headroom128
-        ;;
-    headroom128-dspark-support)
-        REPO=$HEADROOM128_REPO
-        MODEL_FILE=$HEADROOM128_DSPARK_SUPPORT_FILE
-        LINK_MODEL=0
-        ;;
-    ds4f-q2|q2-imatrix) MODEL_FILE=$DS4F_Q2_FILE; MODEL=ds4f-q2 ;;
-    ds4f-q2-q4|q2-q4-imatrix) MODEL_FILE=$DS4F_Q2_Q4_FILE; MODEL=ds4f-q2-q4 ;;
-    ds4f-q4|q4-imatrix) MODEL_FILE=$DS4F_Q4_FILE; MODEL=ds4f-q4 ;;
+    ds4f-q2) MODEL_FILE=$DS4F_Q2_FILE ;;
+    ds4f-q2-q4) MODEL_FILE=$DS4F_Q2_Q4_FILE ;;
+    ds4f-q4) MODEL_FILE=$DS4F_Q4_FILE ;;
     ds4f-mxfp4) MODEL_FILE=$DS4F_MXFP4_FILE; FORCE_HF_DOWNLOAD=1 ;;
     ds4f-dspark) MODEL_FILE=$DS4F_DSPARK_FILE; LINK_MODEL=0 ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
@@ -598,14 +565,10 @@ else
     download_one "$REPO" "$MODEL_FILE"
 fi
 
-if [ "$MODEL" = "ds4f-dspark" ] || [ "$MODEL" = "headroom128-dspark-support" ]; then
+if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
-    if [ "$MODEL" = "headroom128-dspark-support" ]; then
-        echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$HEADROOM128_DSPARK_SUPPORT_FILE --temp 0"
-    else
-        echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
-    fi
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"
@@ -630,13 +593,7 @@ elif [ "$LINK_MODEL" -eq 1 ]; then
     esac
 fi
 
-if [ "$MODEL" = "headroom128" ]; then
-    echo
-    echo "Headroom128 has a matching DSpark support GGUF. Download it with:"
-    echo "  ./download_model.sh headroom128-dspark-support"
-    echo "Then enable DSpark explicitly in greedy mode:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$HEADROOM128_DSPARK_SUPPORT_FILE --temp 0"
-elif [ "$MODEL" = "qwen-dflash" ]; then
+if [ "$MODEL" = "qwen-dflash" ]; then
     echo
     echo "Qwen 3.8 combination with DFlash2 draft model downloaded."
     echo "Run with DFlash2 block-diffusion speculative decoding:"
