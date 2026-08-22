@@ -16291,6 +16291,13 @@ static bool dflash_adaptive_enabled(void) {
                       strcasecmp(value, "off") != 0);
 }
 
+static bool dflash2_adaptive_enabled(void) {
+    const char *value = getenv("DS4_DFLASH2_ADAPTIVE");
+    return !value || (strcmp(value, "0") != 0 &&
+                      strcasecmp(value, "false") != 0 &&
+                      strcasecmp(value, "off") != 0);
+}
+
 static double dflash_ema(double previous, double sample) {
     return previous > 0.0 ? previous * 0.75 + sample * 0.25 : sample;
 }
@@ -41796,7 +41803,9 @@ static int qwen_generate_dflash2(
     int n_generated = 0;
     int proposed = 0, accepted_n = 0;
     ds4_dflash_scheduler scheduler = {0};
-    const bool adaptive = dw->classic && dflash_adaptive_enabled();
+    const bool adaptive =
+        dflash_adaptive_enabled() &&
+        (dw->classic || dflash2_adaptive_enabled());
 
     while (n_generated < n_predict && pos < ctx_size) {
         const int primary = sample_argmax(logits, DS4_N_VOCAB);
@@ -71894,7 +71903,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (max_draft > accepted_cap - 1) max_draft = accepted_cap - 1;
             if (max_draft < 0) max_draft = 0;
             ds4_dflash_scheduler *scheduler = &s->qwen.dflash_scheduler;
-            const bool adaptive = dw->classic && dflash_adaptive_enabled();
+            const bool adaptive =
+                dflash_adaptive_enabled() &&
+                (dw->classic || dflash2_adaptive_enabled());
             const bool calibrating = adaptive && !scheduler->calibrated;
             if (adaptive && (scheduler->disabled || calibrating)) max_draft = 0;
             if (adaptive && scheduler->calibrated) {

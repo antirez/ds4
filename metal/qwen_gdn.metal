@@ -364,6 +364,310 @@ kernel void kernel_qwen_gdn_output_norm(
                (zj / (1.0f + exp(-zj)));
 }
 
+/* Chunked parallel prefill for the recurrent core (FLA/mamba2-style UT
+ * transform).  The serial recurrence
+ *     S_t = d_t*S_{t-1} + khat_t (x) delta_t,
+ *     delta_t = b_t*(v_t - d_t*S_{t-1} khat_t)
+ * is affine in the incoming state, so within a chunk of B tokens the
+ * strictly-lower-triangular system
+ *     delta_r + sum_{t<r} T[r][t]*delta_t = b_r*v_r - b_r*p_r*(S0 k_r),
+ *     T[r][t] = b_r * (p_r/p_t) * <k_t, k_r>   (t < r),
+ *     p_r = prod_{m<=r} d_m   (within-chunk cumulative decay, p_{-1} = 1),
+ * solved by forward substitution yields both the chunk outputs and the
+ * chunk-end state:
+ *     oh_r  = (p_r*(S0 q_r) + sum_{t<=r} (p_r/p_t)*delta_t*<k_t,q_r>) / sqrt(D),
+ *     S_end = p_R*S0 - sum_r (p_R/p_r)*z_r k_r^T + H_c,
+ *     z     = (I+T)^{-1} ((b*p) (x) (S0 k)),
+ *     H_c   = sum_r (p_R/p_r)*delta^0_r k_r^T   (zero-initial-state chunk end),
+ * where delta^0 solves the same system with the S0-independent rhs b (x) v.
+ * Three passes replace the serial token loop for long prefills:
+ *   A  kernel_qwen_gdn_chunk_prep: per-(chunk,head) pairwise key dots, T
+ *      build, delta^0 solve, H_c and per-token meta (p, b, p_R/p).
+ *   B  kernel_qwen_gdn_state_scan: one threadgroup per head walks chunks
+ *      sequentially, applying the inter-chunk transition and recording the
+ *      state entering every chunk (S0) plus the final state.
+ *   C  kernel_qwen_gdn_chunk_out: fully parallel per-token outputs from S0;
+ *      writes raw oh (split_output layout) consumed by
+ *      kernel_qwen_gdn_output_norm exactly like the serial kernel.
+ * Numerics: fp32 accumulation throughout; the cumulative log-decay is
+ * clamped at -80 so within-chunk decay ratios stay finite.  Relative to the
+ * serial kernel this reassociates the dot/sum tree (expected relative drift
+ * < 1e-3 on realistic gate distributions; grows only in the strong-decay
+ * regime where magnitudes are negligible).  The softplus clamp branches
+ * intentionally mirror kernel_qwen_gdn_core_rows4. */
+struct ds4_qwen_gdn_chunk_args {
+    uint32_t layer;
+    uint32_t n_tok;
+    uint32_t v_heads;
+    uint32_t qkv_dim;
+    uint32_t n_chunks;
+    uint32_t _pad;
+};
+
+constant uint QWEN_GDN_CHUNK_TOK = 64u;
+
+static inline void qwen_gdn_tri_decode(uint idx, thread uint & r, thread uint & t) {
+    r = 0u;
+    while (((r + 1u) * (r + 2u)) / 2u <= idx) r++;
+    t = idx - (r * (r + 1u)) / 2u;
+}
+
+kernel void kernel_qwen_gdn_chunk_prep(
+        constant ds4_qwen_gdn_chunk_args & args,
+        device const float * mixed,
+        device const float * alpha,
+        device const float * beta,
+        device const float * A_log,
+        device const float * dt_bias,
+        device float * chunk_H,
+        device float * chunk_T,
+        device float * chunk_meta,
+        uint3 group [[threadgroup_position_in_grid]],
+        uint  lid   [[thread_index_in_threadgroup]]) {
+    const uint B = QWEN_GDN_CHUNK_TOK;
+    const uint D = QWEN_GDN_HEAD_DIM;
+    const uint v_heads = args.v_heads == 0u ? 48u : args.v_heads;
+    const uint qkv_dim = args.qkv_dim == 0u ? 10240u : args.qkv_dim;
+    const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
+    const uint c = group.x;
+    const uint vh = group.y;
+    if (c >= args.n_chunks || vh >= v_heads || lid >= D) return;
+
+    const uint kh = vh % QWEN_GDN_K_HEADS;
+    const uint a = c * B;
+    const uint len = min(B, ntok - a);
+    const uint koff = QWEN_GDN_K_HEADS * D + kh * D;
+    const float A = A_log[vh];
+    const float dtb = dt_bias[vh];
+    const ulong ch = (ulong)c * v_heads + vh;
+
+    threadgroup float lgd[QWEN_GDN_CHUNK_TOK];
+    threadgroup float p[QWEN_GDN_CHUNK_TOK];
+    threadgroup float bb[QWEN_GDN_CHUNK_TOK];
+    /* packed lower triangle including the diagonal: <k_t, k_r>, t <= r */
+    threadgroup float gg[QWEN_GDN_CHUNK_TOK * (QWEN_GDN_CHUNK_TOK + 1u) / 2u];
+
+    for (uint r = lid; r < B; r += D) {
+        if (r < len) {
+            const uint t = a + r;
+            float g = alpha[t * v_heads + vh] + dtb;
+            if (g > 20.0f) {
+            } else if (g < -20.0f) {
+                g = exp(g);
+            } else {
+                g = log(1.0f + exp(g));
+            }
+            lgd[r] = g * A;
+            bb[r] = 1.0f / (1.0f + exp(-beta[t * v_heads + vh]));
+        } else {
+            lgd[r] = 0.0f;
+            bb[r] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float acc = 0.0f;
+        for (uint r = 0; r < B; r++) {
+            acc += lgd[r];
+            if (acc < -80.0f) acc = -80.0f;
+            p[r] = exp(acc);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float pR = p[len - 1u];
+
+    const uint npairs = B * (B + 1u) / 2u;
+    for (uint idx = lid; idx < npairs; idx += D) {
+        uint r, t;
+        qwen_gdn_tri_decode(idx, r, t);
+        float acc = 0.0f;
+        if (r < len) {
+            const device float *kr = mixed + (a + r) * qkv_dim + koff;
+            const device float *kt = mixed + (a + t) * qkv_dim + koff;
+            for (uint i = 0; i < D; i++) acc += kr[i] * kt[i];
+        }
+        gg[idx] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#define QWEN_GDN_G_AT(r_, t_) \
+    gg[((t_) <= (r_) ? ((t_) * ((t_) + 1u)) / 2u + (r_) \
+                     : ((r_) * ((r_) + 1u)) / 2u + (t_))]
+
+    device float *mb = chunk_meta + ch * (3ul * B);
+    for (uint r = lid; r < B; r += D) {
+        mb[r] = p[r];
+        mb[B + r] = bb[r];
+        mb[2u * B + r] = r < len ? pR / p[r] : 0.0f;
+    }
+
+    device float *tb = chunk_T + ch * (ulong)B * B;
+    const uint nstrict = B * (B - 1u) / 2u;
+    for (uint idx = lid; idx < nstrict; idx += D) {
+        uint r, t;
+        qwen_gdn_tri_decode(idx + 1u, r, t);
+        tb[r * B + t] = bb[r] * (p[r] / p[t]) * QWEN_GDN_G_AT(t, r);
+    }
+
+    /* forward substitution for delta^0 (S0-independent rhs) and the
+       zero-state chunk-end state row H_c[lid][:] */
+    device float *hb = chunk_H + (ch * D + lid) * D;
+    float dz[QWEN_GDN_CHUNK_TOK];
+    for (uint r = 0; r < len; r++) {
+        const float vr = mixed[(a + r) * qkv_dim +
+            2u * QWEN_GDN_K_HEADS * D + vh * D + lid];
+        float d = bb[r] * vr;
+        for (uint t = 0; t < r; t++)
+            d -= bb[r] * (p[r] / p[t]) * QWEN_GDN_G_AT(t, r) * dz[t];
+        dz[r] = d;
+    }
+    for (uint i = 0; i < D; i++) {
+        float acc = 0.0f;
+        for (uint r = 0; r < len; r++)
+            acc += (pR / p[r]) * dz[r] *
+                   mixed[(a + r) * qkv_dim + koff + i];
+        hb[i] = acc;
+    }
+#undef QWEN_GDN_G_AT
+}
+
+kernel void kernel_qwen_gdn_state_scan(
+        constant ds4_qwen_gdn_chunk_args & args,
+        device const float * mixed,
+        device float * state,
+        device const float * chunk_H,
+        device const float * chunk_T,
+        device const float * chunk_meta,
+        device float * chunk_s0,
+        uint group [[threadgroup_position_in_grid]],
+        uint  lid  [[thread_index_in_threadgroup]]) {
+    const uint B = QWEN_GDN_CHUNK_TOK;
+    const uint D = QWEN_GDN_HEAD_DIM;
+    const uint v_heads = args.v_heads == 0u ? 48u : args.v_heads;
+    const uint qkv_dim = args.qkv_dim == 0u ? 10240u : args.qkv_dim;
+    const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
+    const uint vh = group;
+    if (vh >= v_heads || lid >= D) return;
+    const uint kh = vh % QWEN_GDN_K_HEADS;
+    const uint koff = QWEN_GDN_K_HEADS * D + kh * D;
+
+    device float *srow = state +
+        (((ulong)args.layer * v_heads + vh) * D + lid) * D;
+    float s[QWEN_GDN_HEAD_DIM];
+    for (uint i = 0; i < D; i += 4u) {
+        const float4 v = *(device float4 *)(srow + i);
+        s[i] = v.x; s[i + 1u] = v.y; s[i + 2u] = v.z; s[i + 3u] = v.w;
+    }
+
+    float z[QWEN_GDN_CHUNK_TOK];
+    for (uint c = 0; c < args.n_chunks; c++) {
+        const ulong ch = (ulong)c * v_heads + vh;
+        const device float *mb = chunk_meta + ch * (3ul * B);
+        const device float *tb = chunk_T + ch * (ulong)B * B;
+        const device float *hb = chunk_H + (ch * D + lid) * D;
+        const uint a = c * B;
+        const uint len = min(B, ntok - a);
+        const float pR = mb[len - 1u];
+
+        /* record the state entering this chunk */
+        device float *s0dst = chunk_s0 + (ch * D + lid) * D;
+        for (uint i = 0; i < D; i += 4u)
+            *(device float4 *)(s0dst + i) =
+                float4(s[i], s[i + 1u], s[i + 2u], s[i + 3u]);
+
+        /* z = (I+T)^{-1} ((b*p) (x) (S0 k)), one row per lane */
+        for (uint r = 0; r < len; r++) {
+            const device float *kr = mixed + (a + r) * qkv_dim + koff;
+            float y = 0.0f;
+            for (uint i = 0; i < D; i++) y += s[i] * kr[i];
+            float zr = mb[r] * mb[B + r] * y;
+            for (uint t = 0; t < r; t++) zr -= tb[r * B + t] * z[t];
+            z[r] = zr;
+        }
+
+        /* S_end = p_R*S0 - sum_r (p_R/p_r) z_r k_r^T + H_c */
+        for (uint i = 0; i < D; i++) {
+            float acc = pR * s[i] + hb[i];
+            for (uint r = 0; r < len; r++)
+                acc -= mb[2u * B + r] * z[r] *
+                       mixed[(a + r) * qkv_dim + koff + i];
+            s[i] = acc;
+        }
+    }
+    for (uint i = 0; i < D; i += 4u)
+        *(device float4 *)(srow + i) =
+            float4(s[i], s[i + 1u], s[i + 2u], s[i + 3u]);
+}
+
+kernel void kernel_qwen_gdn_chunk_out(
+        constant ds4_qwen_gdn_chunk_args & args,
+        device const float * mixed,
+        device const float * chunk_s0,
+        device const float * chunk_T,
+        device const float * chunk_meta,
+        device float * core,
+        uint3 group [[threadgroup_position_in_grid]],
+        uint  lid   [[thread_index_in_threadgroup]]) {
+    const uint B = QWEN_GDN_CHUNK_TOK;
+    const uint D = QWEN_GDN_HEAD_DIM;
+    const uint v_heads = args.v_heads == 0u ? 48u : args.v_heads;
+    const uint qkv_dim = args.qkv_dim == 0u ? 10240u : args.qkv_dim;
+    const uint z_dim = v_heads * QWEN_GDN_HEAD_DIM;
+    const uint ntok = args.n_tok == 0u ? 1u : args.n_tok;
+    const uint c = group.x;
+    const uint vh = group.y;
+    if (c >= args.n_chunks || vh >= v_heads || lid >= D) return;
+
+    const uint kh = vh % QWEN_GDN_K_HEADS;
+    const uint a = c * B;
+    const uint len = min(B, ntok - a);
+    const uint qoff = kh * D;
+    const uint koff = QWEN_GDN_K_HEADS * D + kh * D;
+    const uint voff = 2u * QWEN_GDN_K_HEADS * D + vh * D;
+    const ulong ch = (ulong)c * v_heads + vh;
+    const device float *mb = chunk_meta + ch * (3ul * B);
+    const device float *tb = chunk_T + ch * (ulong)B * B;
+    const device float *s0 = chunk_s0 + (ch * D + lid) * D;
+    const float qscale = 1.0f / sqrt((float)D);
+
+    /* <k_t, q_r> for t <= r, packed lower triangle, shared per (chunk,head) */
+    threadgroup float qg[QWEN_GDN_CHUNK_TOK * (QWEN_GDN_CHUNK_TOK + 1u) / 2u];
+    const uint npairs = B * (B + 1u) / 2u;
+    for (uint idx = lid; idx < npairs; idx += D) {
+        uint r, t;
+        qwen_gdn_tri_decode(idx, r, t);
+        float acc = 0.0f;
+        if (r < len) {
+            const device float *kt = mixed + (a + t) * qkv_dim + koff;
+            const device float *qr = mixed + (a + r) * qkv_dim + qoff;
+            for (uint i = 0; i < D; i++) acc += kt[i] * qr[i];
+        }
+        qg[idx] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* per-lane (value column j = lid): delta solve + outputs */
+    float dl[QWEN_GDN_CHUNK_TOK];
+    for (uint r = 0; r < len; r++) {
+        const device float *kr = mixed + (a + r) * qkv_dim + koff;
+        const device float *qr = mixed + (a + r) * qkv_dim + qoff;
+        float y = 0.0f;
+        float av = 0.0f;
+        for (uint i = 0; i < D; i++) {
+            y += s0[i] * kr[i];
+            av += s0[i] * qr[i];
+        }
+        float d = mb[B + r] * mixed[(a + r) * qkv_dim + voff + lid] -
+                  mb[r] * mb[B + r] * y;
+        for (uint t = 0; t < r; t++) d -= tb[r * B + t] * dl[t];
+        dl[r] = d;
+        float e = 0.0f;
+        for (uint t = 0; t <= r; t++)
+            e += dl[t] * qg[(t * (t + 1u)) / 2u + r] / mb[t];
+        core[(a + r) * z_dim + vh * D + lid] =
+            mb[r] * (av + e) * qscale;
+    }
+}
+
 
 
 

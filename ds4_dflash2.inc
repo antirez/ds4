@@ -1025,6 +1025,24 @@ static void dflash2_layer_forward(
     free(dyn); free(prep); free(xn);
 }
 
+/* Opt-in draft-confidence floor: drop trailing drafts whose top1-top2 logit
+ * margin falls below DS4_DFLASH_MIN_MARGIN. Absent or negative = disabled
+ * (default), so no logits readback or behavior change unless opted in. */
+static float dflash2_min_margin(void) {
+    static int cached;
+    static float margin = -1.0f;
+    if (!cached) {
+        cached = 1;
+        const char *value = getenv("DS4_DFLASH_MIN_MARGIN");
+        if (value && value[0]) {
+            char *end = NULL;
+            const double parsed = strtod(value, &end);
+            if (end != value && parsed >= 0.0) margin = (float)parsed;
+        }
+    }
+    return margin;
+}
+
 static int dflash2_propose(
         int *drafts,
         int n_draft,
@@ -1041,6 +1059,9 @@ static int dflash2_propose(
     if (dw->classic && (!cache || noise_pos < target_rows)) return 0;
     const uint32_t H = dw->n_embd;
     const uint32_t L = (uint32_t)n_draft + 1u;
+    /* Per-row top1-top2 logit margin; INFINITY = unknown (no truncation). */
+    float margins[DS4_DFLASH2_MAX_BLOCK];
+    for (int t = 0; t < DS4_DFLASH2_MAX_BLOCK; t++) margins[t] = 1e30f;
     float *h_ctx = xmalloc((size_t)target_rows * H * sizeof(float));
     float *fc_out = xmalloc((size_t)target_rows * H * sizeof(float));
     dflash2_matvecs(fc_out, dm, dw->fc, target_concat, target_rows);
@@ -1142,6 +1163,28 @@ static int dflash2_propose(
             }
             if (ok) n_out = n_draft;
         }
+        if (ok && n_out == n_draft && dflash2_min_margin() >= 0.0f) {
+            const size_t nrows = (size_t)n_draft * DS4_N_VOCAB;
+            float *lrows = xmalloc(nrows * sizeof(float));
+            if (ds4_gpu_tensor_read(
+                    g_qwen_pool.batch_logits, 0, lrows,
+                    (uint64_t)nrows * sizeof(float))) {
+                for (int t = 0; t < n_draft; t++) {
+                    float best = -1e30f, second = -1e30f;
+                    const float *row = lrows + (size_t)t * DS4_N_VOCAB;
+                    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                        if (row[i] > best) {
+                            second = best;
+                            best = row[i];
+                        } else if (row[i] > second) {
+                            second = row[i];
+                        }
+                    }
+                    margins[t] = best - second;
+                }
+            }
+            free(lrows);
+        }
     } else {
         (void)ds4_gpu_end_commands();
     }
@@ -1151,13 +1194,25 @@ static int dflash2_propose(
         for (uint32_t t = 1; t < L && n_out < n_draft; t++) {
             dflash2_matvec(logits, tm, tw->output, normed + (size_t)t * H);
             int best = 0;
-            float best_v = logits[0];
+            float best_v = logits[0], second_v = -1e30f;
             for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
-                if (logits[i] > best_v) { best_v = logits[i]; best = (int)i; }
+                if (logits[i] > best_v) {
+                    second_v = best_v;
+                    best_v = logits[i];
+                    best = (int)i;
+                } else if (logits[i] > second_v) {
+                    second_v = logits[i];
+                }
             }
-            drafts[n_out++] = best;
+            drafts[n_out] = best;
+            margins[n_out] = best_v - second_v;
+            n_out++;
         }
         free(logits);
+    }
+    const float min_margin = dflash2_min_margin();
+    if (min_margin >= 0.0f) {
+        while (n_out > 0 && margins[n_out - 1] < min_margin) n_out--;
     }
     free(normed); free(h); free(fc_out); free(h_ctx);
     return n_out;
