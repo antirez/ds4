@@ -2900,25 +2900,41 @@ static void model_summary(const ds4_model *m) {
 
     model_get_string(m, "general.name", &name);
     model_get_string(m, "general.architecture", &arch);
-    if (!model_get_u32(m, "deepseek4.block_count", &layers)) {
-        if (!model_get_u32(m, "glm-dsa.block_count", &layers)) {
-            if (!model_get_u32(m, "qwen35moe.block_count", &layers))
-                model_get_u32(m, "qwen3.block_count", &layers);
-        }
+    if (!model_get_u32(m, "deepseek4.block_count", &layers) &&
+        !model_get_u32(m, "glm-dsa.block_count", &layers) &&
+        !model_get_u32(m, "qwen35moe.block_count", &layers) &&
+        !model_get_u32(m, "qwen35.block_count", &layers)) {
+        model_get_u32(m, "qwen3.block_count", &layers);
     }
-    if (!model_get_u64_compat(m, "deepseek4.context_length", &ctx_train)) {
-        model_get_u64_compat(m, "glm-dsa.context_length", &ctx_train);
+    if (!model_get_u64_compat(m, "deepseek4.context_length", &ctx_train) &&
+        !model_get_u64_compat(m, "glm-dsa.context_length", &ctx_train) &&
+        !model_get_u64_compat(m, "qwen35moe.context_length", &ctx_train) &&
+        !model_get_u64_compat(m, "qwen35.context_length", &ctx_train)) {
+        model_get_u64_compat(m, "qwen3.context_length", &ctx_train);
     }
-    if (!model_get_u32(m, "deepseek4.attention.head_count", &n_head)) {
-        model_get_u32(m, "glm-dsa.attention.head_count", &n_head);
+    if (!model_get_u32(m, "deepseek4.attention.head_count", &n_head) &&
+        !model_get_u32(m, "glm-dsa.attention.head_count", &n_head) &&
+        !model_get_u32(m, "qwen35moe.attention.head_count", &n_head) &&
+        !model_get_u32(m, "qwen35.attention.head_count", &n_head)) {
+        model_get_u32(m, "qwen3.attention.head_count", &n_head);
     }
-    if (!model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv)) {
-        model_get_u32(m, "glm-dsa.attention.head_count_kv", &n_head_kv);
+    if (!model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv) &&
+        !model_get_u32(m, "glm-dsa.attention.head_count_kv", &n_head_kv) &&
+        !model_get_u32(m, "qwen35moe.attention.head_count_kv", &n_head_kv) &&
+        !model_get_u32(m, "qwen35.attention.head_count_kv", &n_head_kv)) {
+        model_get_u32(m, "qwen3.attention.head_count_kv", &n_head_kv);
     }
-    if (!model_get_u32(m, "deepseek4.attention.key_length", &head_dim)) {
-        model_get_u32(m, "glm-dsa.attention.key_length", &head_dim);
+    if (!model_get_u32(m, "deepseek4.attention.key_length", &head_dim) &&
+        !model_get_u32(m, "glm-dsa.attention.key_length", &head_dim) &&
+        !model_get_u32(m, "qwen35moe.attention.key_length", &head_dim) &&
+        !model_get_u32(m, "qwen35.attention.key_length", &head_dim)) {
+        model_get_u32(m, "qwen3.attention.key_length", &head_dim);
     }
-    model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa);
+    if (!model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa) &&
+        !model_get_u32(m, "qwen35moe.attention.sliding_window", &n_swa) &&
+        !model_get_u32(m, "qwen35.attention.sliding_window", &n_swa)) {
+        model_get_u32(m, "qwen3.attention.sliding_window", &n_swa);
+    }
     if (!model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads)) {
         model_get_u32(m, "glm-dsa.attention.indexer.head_count", &indexer_heads);
     }
@@ -17968,7 +17984,7 @@ static int qwen_mtp_rerank_winner(const ds4_model *head, const ds4_tensor *draft
     int best_id = candidate_ids[0];
     float best_score = -1e30f;
     const uint16_t *data_f16 = (draft_rerank->type == DS4_TENSOR_F16) ? tensor_data(head, draft_rerank) : NULL;
-    const float *data_f32 = (draft_rerank->type == 0) ? tensor_data(head, draft_rerank) : NULL;
+    const float *data_f32 = (draft_rerank->type == DS4_TENSOR_F32) ? tensor_data(head, draft_rerank) : NULL;
 
     float lambda = 0.05f;
     const char *lam_env = getenv("DS4_QWEN_MTP_SELECTOR_LAMBDA");
@@ -41644,8 +41660,19 @@ static int qwen_generate_dflash2(
         }
         const uint32_t committed = 1u + (uint32_t)accepted;
 #ifndef DS4_NO_GPU
-        if (accepted < drafted) {
-            (void)qwen_hybrid_restore_gdn_prefix(NULL, committed - 1u);
+        if (accepted < drafted &&
+            !qwen_hybrid_restore_gdn_prefix(NULL, committed - 1u)) {
+            /* Verification advanced recurrent GDN state through rejected rows.
+             * Continuing would make every later token depend on that rejected
+             * suffix, so fail rather than silently corrupt the target stream. */
+            fprintf(stderr, "ds4: failed to restore DFlash target state\n");
+            free(tmp_hidden);
+            free(tmp_layers);
+            dflash_cache_free(&draft_cache);
+            free(layers);
+            free(hidden);
+            free(logits);
+            return 1;
         }
 #endif
         static int nprof;
@@ -62472,6 +62499,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+    if (opt->dflash_path && opt->dflash_path[0] &&
+        opt->distributed.role != DS4_DISTRIBUTED_NONE) {
+        fprintf(stderr, "ds4: --dflash is not supported with distributed layer slicing\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -62523,6 +62557,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (DS4_FAMILY_IS_QWEN && e->backend == DS4_BACKEND_CUDA) {
+#ifdef DS4_ROCM_BUILD
+        const char *qwen_backend = "ROCm";
+#else
+        const char *qwen_backend = "CUDA";
+#endif
+        fprintf(stderr,
+                "ds4: Qwen/Ornith GPU inference is not implemented for %s; "
+                "use --cpu for diagnostics or a Metal build for acceleration\n",
+                qwen_backend);
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+#endif
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
         if (normal_layers == 0) {
@@ -62897,8 +62947,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
-    if (opt->dflash_path && opt->dflash_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+    if (opt->dflash_path && opt->dflash_path[0]) {
         if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN &&
             DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35) {
             fprintf(stderr, "ds4: --dflash requires a dense Qwen target\n");
@@ -71567,9 +71616,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
-    if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (!s || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
-        if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -71577,13 +71625,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (ds4_session_is_cpu(s)) {
         (void)max_tokens;
         (void)eos_token;
-        if (!accepted || accepted_cap <= 0) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
     if (ds4_session_is_qwen(s)) {
-        if (!accepted || accepted_cap <= 0) return 0;
         ds4_engine *e = s->engine;
         const ds4_dflash2_weights *dw = &e->dflash2;
         if (e->dflash_ready && s->qwen.layers && s->qwen.hidden &&
@@ -71683,8 +71729,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         pos, drafted, acc);
             }
 #ifndef DS4_NO_GPU
-            if (acc < drafted) {
-                (void)qwen_hybrid_restore_gdn_prefix(&s->qwen, committed - 1u);
+            if (acc < drafted &&
+                !qwen_hybrid_restore_gdn_prefix(&s->qwen, committed - 1u)) {
+                free(tmp_hidden);
+                free(tmp_layers);
+                s->checkpoint_valid = false;
+                snprintf(err, errlen, "failed to restore DFlash target state");
+                return -1;
             }
 #endif
 

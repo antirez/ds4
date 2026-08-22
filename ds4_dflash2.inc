@@ -238,7 +238,7 @@ static void dflash2_embed_row(float *out, const ds4_model *m, const ds4_tensor *
     if (!w || w->ndim != 2) ds4_die("expected a 2D embedding tensor");
     const uint64_t dim = w->dim[0];
     if (token < 0 || (uint64_t)token >= w->dim[1]) ds4_die("DFlash2 embed token out of range");
-    if (w->type == 0) {
+    if (w->type == DS4_TENSOR_F32) {
         memcpy(out, (const float *)tensor_data(m, w) + (uint64_t)token * dim, (size_t)dim * sizeof(float));
         return;
     }
@@ -489,22 +489,26 @@ static int dflash2_bind(ds4_dflash2_weights *w, const ds4_model *m) {
     const uint64_t kv_dim = (uint64_t)n_kv * head_dim;
     for (uint32_t il = 0; il < n_layer; il++) {
         ds4_dflash2_layer *l = &w->layer[il];
-        l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
-        l->attn_q = required_tensorf(m, "blk.%u.attn_q.weight", il);
-        l->attn_k = required_tensorf(m, "blk.%u.attn_k.weight", il);
-        l->attn_v = required_tensorf(m, "blk.%u.attn_v.weight", il);
-        l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
-        l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
-        l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
-        l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
-        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
-        l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
-        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        /* Binding a support model is a recoverable operation: malformed or
+         * incomplete draft GGUFs must make dflash2_bind() return false, not
+         * terminate the process through required_tensorf(). Shape checks below
+         * provide the single failure path for both absent and malformed tensors. */
+        l->attn_norm = dflash2_tensorf(m, "blk.%u.attn_norm.weight", il);
+        l->attn_q = dflash2_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->attn_k = dflash2_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->attn_v = dflash2_tensorf(m, "blk.%u.attn_v.weight", il);
+        l->attn_output = dflash2_tensorf(m, "blk.%u.attn_output.weight", il);
+        l->attn_q_norm = dflash2_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->attn_k_norm = dflash2_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+        l->ffn_norm = dflash2_tensorf(m, "blk.%u.ffn_norm.weight", il);
+        l->ffn_gate = dflash2_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up = dflash2_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = dflash2_tensorf(m, "blk.%u.ffn_down.weight", il);
         if (!classic) {
-            l->attn_conv_base = required_tensorf(m, "blk.%u.attn_conv_base", il);
-            l->attn_conv_proj = required_tensorf(m, "blk.%u.attn_conv_proj.weight", il);
-            l->ffn_conv_base = required_tensorf(m, "blk.%u.ffn_conv_base", il);
-            l->ffn_conv_proj = required_tensorf(m, "blk.%u.ffn_conv_proj.weight", il);
+            l->attn_conv_base = dflash2_tensorf(m, "blk.%u.attn_conv_base", il);
+            l->attn_conv_proj = dflash2_tensorf(m, "blk.%u.attn_conv_proj.weight", il);
+            l->ffn_conv_base = dflash2_tensorf(m, "blk.%u.ffn_conv_base", il);
+            l->ffn_conv_proj = dflash2_tensorf(m, "blk.%u.ffn_conv_proj.weight", il);
         } else {
             l->attn_conv_base = dflash2_tensorf(m, "blk.%u.attn_conv_base", il);
             l->attn_conv_proj = dflash2_tensorf(m, "blk.%u.attn_conv_proj.weight", il);

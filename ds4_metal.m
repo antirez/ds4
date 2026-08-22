@@ -19705,17 +19705,6 @@ int ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(
     return ds4_gpu_finish_command_buffer(cb, owned, "NVFP4 pair swiglu n");
 }
 
-
-
-int ds4_gpu_model_is_mapped(const void *model_map) {
-    if (!g_initialized || !model_map) return 0;
-    if (model_map == g_model_map_ptr) return 1;
-    for (uint32_t i = 0; i < g_model_view_count; i++) {
-        if (g_model_views[i].model_map == model_map) return 1;
-    }
-    return 0;
-}
-
 static int ds4_gpu_tensor_copy_compute(
         ds4_gpu_tensor *dst, uint64_t dst_offset,
         const ds4_gpu_tensor *src, uint64_t src_offset,

@@ -10,6 +10,7 @@ metal/dense.metal ds4_dense_block_q4_64a.
 import argparse
 import struct
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -244,6 +245,8 @@ def main():
     ap.add_argument("--from-types", default="q4_K,q5_K,q6_K,q8_0",
                     help="comma-separated source type names eligible for conversion")
     args = ap.parse_args()
+    if args.dst and Path(args.src).resolve() == Path(args.dst).resolve():
+        ap.error("source and destination must be different files")
 
     version, kv, tensors, align, data_start = parse(args.src)
     print(f"gguf v{version} tensors={len(tensors)} kv={len(kv)} align={align} data@{data_start}")

@@ -964,7 +964,10 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "ornith-1.5-35b-chat") ||
             !strcmp(model, "ornith-1.5-9b-chat") ||
             !strcmp(model, "ornith-9b-chat") ||
-            !strcmp(model, "ornith-no-think"));
+            !strcmp(model, "ornith-no-think") ||
+            !strcmp(model, "qwen-chat") ||
+            !strcmp(model, "qwen-3.8-chat") ||
+            !strcmp(model, "qwen-3.8-27b-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
@@ -15266,6 +15269,9 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(server_model_alias_known("qwen3.8"));
     TEST_ASSERT(server_model_alias_known("qwen"));
     TEST_ASSERT(server_model_alias_known("qwen-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen-3.8-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen-3.8-27b-chat"));
 }
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;

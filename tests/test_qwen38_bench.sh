@@ -43,11 +43,13 @@ with open("$MODEL","rb") as f:
     ver=struct.unpack('<I',f.read(4))[0]
     nt=struct.unpack('<Q',f.read(8))[0]
     print(f"ok GGUF header ver={ver} tensors={nt}")
-    data=f.read(4096)
-    if b'qwen' in data.lower(): print("ok arch qwen")
 PY
 echo "testing ds4 --inspect -m $MODEL ..."
 "$ROOT/ds4" -m "$MODEL" --inspect > "$LOG" 2>&1 || { cat "$LOG" >&2; fail "inspect failed"; }
+grep -Eq '^arch:[[:space:]]+qwen' "$LOG" || fail "inspect architecture is not Qwen"
+grep -q '^layers:' "$LOG" || fail "inspect missing layer count"
+grep -q '^train context:' "$LOG" || fail "inspect missing train context"
+grep -q '^attention:' "$LOG" || fail "inspect missing attention shape"
 ok "ds4 --inspect ok"
 echo "testing ds4-bench --model qwen38.gguf --cpu ..."
 rm -f "$CSV"

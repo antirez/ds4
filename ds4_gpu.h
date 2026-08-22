@@ -686,8 +686,6 @@ int ds4_gpu_matmul_quant_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-int ds4_gpu_model_is_mapped(const void *model_map);
-
 
 int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(
         ds4_gpu_tensor       *out,

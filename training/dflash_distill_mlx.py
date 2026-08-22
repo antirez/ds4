@@ -27,6 +27,13 @@ from mlx_lm.sample_utils import make_sampler
 from dflash.model_mlx import _patch_model, load_draft
 
 
+def positive_int(value):
+    value = int(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -35,10 +42,10 @@ def parse_args():
     prepare.add_argument("--target", default="ornith-ai/Ornith-1.5-9B-MLX-4bit")
     prepare.add_argument("--draft", default="z-lab/Qwen3.5-9B-DFlash")
     prepare.add_argument("--output", type=Path, required=True)
-    prepare.add_argument("--samples", type=int, default=128)
-    prepare.add_argument("--eval-samples", type=int, default=16)
-    prepare.add_argument("--max-new-tokens", type=int, default=192)
-    prepare.add_argument("--max-sequence-tokens", type=int, default=384)
+    prepare.add_argument("--samples", type=positive_int, default=128)
+    prepare.add_argument("--eval-samples", type=positive_int, default=16)
+    prepare.add_argument("--max-new-tokens", type=positive_int, default=192)
+    prepare.add_argument("--max-sequence-tokens", type=positive_int, default=384)
     prepare.add_argument("--dataset", default="tatsu-lab/alpaca")
     prepare.add_argument("--seed", type=int, default=20260821)
     recache = sub.add_parser("recache")
@@ -52,15 +59,15 @@ def parse_args():
     train.add_argument("--draft", default="z-lab/Qwen3.5-9B-DFlash")
     train.add_argument("--data", type=Path, required=True)
     train.add_argument("--output", type=Path, required=True)
-    train.add_argument("--steps", type=int, default=768)
-    train.add_argument("--block-size", type=int, default=8)
+    train.add_argument("--steps", type=positive_int, default=768)
+    train.add_argument("--block-size", type=positive_int, default=8)
     train.add_argument("--learning-rate", type=float, default=2e-5)
     train.add_argument("--weight-decay", type=float, default=0.01)
     train.add_argument("--warmup-ratio", type=float, default=0.04)
     train.add_argument("--clip-grad", type=float, default=1.0)
     train.add_argument("--loss-gamma", type=float, default=4.0)
-    train.add_argument("--eval-every", type=int, default=96)
-    train.add_argument("--save-every", type=int, default=192)
+    train.add_argument("--eval-every", type=positive_int, default=96)
+    train.add_argument("--save-every", type=positive_int, default=192)
     train.add_argument(
         "--train-scope", choices=("all", "projection"), default="all"
     )
@@ -70,8 +77,8 @@ def parse_args():
     evaluate.add_argument("--target", default="ornith-ai/Ornith-1.5-9B-MLX-4bit")
     evaluate.add_argument("--draft", required=True)
     evaluate.add_argument("--data", type=Path, required=True)
-    evaluate.add_argument("--block-size", type=int, default=8)
-    evaluate.add_argument("--anchors", type=int, default=64)
+    evaluate.add_argument("--block-size", type=positive_int, default=8)
+    evaluate.add_argument("--anchors", type=positive_int, default=64)
     evaluate.add_argument("--seed", type=int, default=20260821)
     return parser.parse_args()
 
@@ -349,6 +356,10 @@ def train_draft(args):
     mx.random.seed(args.seed)
     train_rows = read_manifest(args.data, "train")
     eval_rows = read_manifest(args.data, "eval")
+    if not train_rows:
+        raise RuntimeError("training manifest has no train samples")
+    if not eval_rows:
+        raise RuntimeError("training manifest has no eval samples")
     target, _ = load_target(args.target)
     draft = load_draft(args.draft)
     bind_and_freeze(draft, target, args.train_scope)
@@ -406,10 +417,10 @@ def train_draft(args):
             )
         mx.clear_cache()
 
-    final_metrics = evaluate_draft(
-        draft, args.data, eval_rows, args.block_size,
-        min(64, len(eval_rows) * 4), args.seed,
-    )
+    # The last step is always an evaluation boundary, so `metrics` already
+    # describes the final weights. Re-running the full evaluation here doubled
+    # the most expensive part of the final checkpoint without changing it.
+    final_metrics = metrics
     save_draft(draft, args.draft, args.output / "final", final_metrics, json_safe_args(args))
     summary = {"baseline": baseline, "best": best, "final": final_metrics}
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -418,6 +429,8 @@ def train_draft(args):
 
 def evaluate_command(args):
     rows = read_manifest(args.data, "eval")
+    if not rows:
+        raise RuntimeError("evaluation manifest has no eval samples")
     target, _ = load_target(args.target)
     draft = load_draft(args.draft)
     bind_and_freeze(draft, target)

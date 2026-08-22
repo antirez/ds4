@@ -213,8 +213,31 @@ Ornith 1.5 9B (`ornith-ai/Ornith-1.5-9B-GGUF`) is a dense Qwen 3.5 architecture 
 ./download_model.sh ornith9-dflash-support  # standalone distilled DFlash Q4_K_M draft (~0.71 GiB)
 ```
 
-### Ornith 1.5 Architecture & Platform Support
-- **Platform Support**: Ornith 1.5 (35B and 9B) is currently verified and supported on **macOS Metal** (Apple Silicon). GPU acceleration on Linux CUDA and ROCm is not implemented for Ornith, and CPU is a diagnostic path not part of the model-backed support gate.
+### Qwen and Ornith Runtime Support
+
+The accelerated Qwen 3.8 and Ornith runtimes currently require **macOS Metal**
+on Apple silicon. `--cpu` remains a slow diagnostic/reference path; CUDA and
+ROCm builds reject these model families rather than falling through unsupported
+GPU entry points.
+
+Attach the matching draft GGUF with `--dflash`:
+
+```sh
+# Qwen 3.8 + DFlash2
+./ds4 -m ./qwen38.gguf \
+  --dflash gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf -p "Hello"
+
+# Ornith 1.5 9B + its classic distilled draft
+./ds4 -m ./ornith9.gguf \
+  --dflash gguf/ornith1.5-9b-dflash-bf16-projection-Q4_K_M.gguf -p "Hello"
+```
+
+`--dflash-n-max N` bounds drafts per round. The drafter's GGUF block size is
+the default, capped at 7 because verification uses 8-row buffers for the
+primary token plus its draft suffix. DFlash is not supported with distributed
+layer slicing. Classic Ornith DFlash requires Metal; CPU is target-only.
+
+### Ornith 1.5 Architecture
 - **Text-Only Scope**: `Ornith-1.5-35B-Q4_K_M.gguf` (753 tensors) and `Ornith-1.5-9B-Q4_K_M.gguf` (427 tensors) provide complete standalone text LLMs. Multimodal vision processing is not implemented; the optional CLIP vision projectors (`mmproj-Ornith-1.5-*-BF16.gguf`) are ignored for text inference.
 - **Ornith 1.5 35B Architecture**: `qwen35moe` with 40 base transformer blocks + 1 MTP (NextN) block (41 total), 2048 hidden dimension, 256 routed experts (top-8) + 1 shared expert, and 248,320-token vocabulary.
   - **Hybrid Attention**: 3:1 pattern (3 linear-attention GDN layers + 1 full GQA layer).
@@ -234,21 +257,23 @@ To verify deterministic parity against `llama-cli` or Ollama:
 # 9B reference (llama-cli):
 llama-cli -m gguf/Ornith-1.5-9B-Q4_K_M.gguf \
   -p "The capital of France is" \
-  -n 16 --temp 0.0 --top-k 1 --top-p 1.0 -ngl 999 --no-warmup
+  -n 16 --temp 0.0 --top-k 1 --top-p 1.0 -ngl 999 --no-warmup \
+  -no-cnv --no-display-prompt
 
 # 9B ds4:
 ./ds4 -m gguf/Ornith-1.5-9B-Q4_K_M.gguf \
-  -p "The capital of France is" \
+  --raw -p "The capital of France is" \
   -n 16 --temp 0.0
 
 # 35B reference (llama-cli):
 llama-cli -m gguf/Ornith-1.5-35B-Q4_K_M.gguf \
   -p "The capital of France is" \
-  -n 32 --temp 0.0 --top-k 1 --top-p 1.0 -ngl 999 --no-warmup
+  -n 32 --temp 0.0 --top-k 1 --top-p 1.0 -ngl 999 --no-warmup \
+  -no-cnv --no-display-prompt
 
 # 35B ds4:
 ./ds4 -m gguf/Ornith-1.5-35B-Q4_K_M.gguf \
-  -p "The capital of France is" \
+  --raw -p "The capital of France is" \
   -n 32 --temp 0.0
 ```
 Then build:
@@ -617,7 +642,7 @@ Useful tuning and diagnostics:
 
 ```sh
 ./ds4-bench \
-  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 32768 \
   --ctx-max 65536 \

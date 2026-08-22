@@ -6,7 +6,6 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL="${QWEN38_MODEL:-$ROOT/qwen38.gguf}"
 PROMPT_FILE="${QWEN38_PROMPT:-$ROOT/speed-bench/promessi_sposi.txt}"
 OUT_DIR="${QWEN38_OUT_DIR:-/tmp/qwen38-bench-$$}"
-QUICK=1
 GEN_TOKENS=32
 usage() {
   cat <<EOF
@@ -26,8 +25,8 @@ STEP_INCR=512
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --quick) QUICK=1; CTX_START=512; CTX_MAX=2048; STEP_INCR=512; GEN_TOKENS=32; shift ;;
-    --full) QUICK=0; CTX_START=2048; CTX_MAX=16384; STEP_INCR=2048; GEN_TOKENS=128; shift ;;
+    --quick) CTX_START=512; CTX_MAX=2048; STEP_INCR=512; GEN_TOKENS=32; shift ;;
+    --full) CTX_START=2048; CTX_MAX=16384; STEP_INCR=2048; GEN_TOKENS=128; shift ;;
     --model) MODEL="$2"; shift 2 ;;
     --prompt) PROMPT_FILE="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
@@ -67,13 +66,30 @@ run_one() {
     cat "$OUT_DIR/${backend}.stderr.log" >&2 || true
     return $rc
   fi
+  if [[ ! -s "$csv" ]]; then
+    echo "bench_qwen38: $backend produced no CSV: $csv" >&2
+    return 1
+  fi
+  if ! head -n1 "$csv" | grep -q "prefill_tps"; then
+    echo "bench_qwen38: $backend CSV is missing the prefill_tps header" >&2
+    return 1
+  fi
+  local lines
+  lines=$(wc -l < "$csv" | tr -d ' ')
+  if [[ "$lines" -lt 2 ]]; then
+    echo "bench_qwen38: $backend CSV has no data rows" >&2
+    return 1
+  fi
   echo "bench_qwen38: $backend csv: $csv" >&2
 }
 run_one cpu "$CPU_CSV"
-if uname -s | grep -q Darwin; then
-  run_one metal "$METAL_CSV" || { echo "bench_qwen38: metal failed, continuing cpu only" >&2; METAL_CSV=""; }
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # Qwen has a native Metal path. A failed Metal run is a benchmark failure,
+  # not a CPU-only result to summarize as if the requested comparison passed.
+  run_one metal "$METAL_CSV"
 else
-  echo "bench_qwen38: non-Darwin skip Metal" >&2; METAL_CSV=""
+  echo "bench_qwen38: non-Darwin skip Metal" >&2
+  METAL_CSV=""
 fi
 python3 - "$CPU_CSV" "$METAL_CSV" << 'PYEOF'
 import csv, sys, json, os
@@ -101,18 +117,12 @@ for lbl, d in [("CPU",cpu),("Metal",metal)]:
     else: print(f"{lbl:<12} {d['frontiers']:<10} {fmt(d['prefill']):<14} {fmt(d['gen']):<14} {fmt(d['steady']):<14}")
 print("-"*78)
 if cpu: print(f"CPU  CSV: {cpu['path']}")
-if metal:
-    print(f"Metal CSV: {metal['path']}")
-    try:
-        with open(metal["path"].replace("metal.csv","metal.stderr.log")) as f:
-    except: pass
-print("="*78)
+if metal: print(f"Metal CSV: {metal['path']}")
 out_dir=os.path.dirname(sys.argv[1]) if len(sys.argv)>1 and sys.argv[1] else "/tmp"
-try:
-    j=os.path.join(out_dir,"summary.json")
-    with open(j,"w") as o: json.dump({"cpu":cpu,"metal":metal},o,indent=2)
-    print(f"JSON: {j}")
-except: pass
+j=os.path.join(out_dir,"summary.json")
+with open(j,"w") as o:
+    json.dump({"cpu":cpu,"metal":metal},o,indent=2)
+print(f"JSON: {j}")
 PYEOF
 echo ""
 echo "CSVs: $OUT_DIR"

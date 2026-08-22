@@ -295,11 +295,6 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
                                             weight_offset, n_vocab, n_tokens,
                                             n_embd);
 }
-
-extern "C" int ds4_gpu_model_is_mapped(const void *model_map) {
-    (void)model_map;
-    return 1;
-}
 extern "C" void ds4_gpu_set_concurrent_encoder(int on) { (void)on; }
 /* Qwen hybrid/DFlash entry points. The runtime is Metal-only, but ds4.c
  * references these from its non-DS4_NO_GPU paths, so ROCm must define them or

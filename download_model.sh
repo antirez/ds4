@@ -24,20 +24,15 @@ QWEN38_Q4_FILE="Qwen3.8-27B-Q4_K_M.gguf"
 QWEN38_Q8_FILE="Qwen3.8-27B-Q8_0.gguf"
 QWEN38_DFLASH_Q4_FILE="Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 QWEN38_DFLASH_Q8_FILE="Qwen3.8-27B-DFlash2-Q8_0.gguf"
-QWEN38_DFLASH_BF16_FILE="Qwen3.8-27B-DFlash2-BF16.gguf"
 ORNITH_REPO="ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 ORNITH_Q4_FILE="Ornith-1.5-35B-Q4_K_M.gguf"
-ORNITH_Q5_FILE="Ornith-1.5-35B-Q5_K_M.gguf"
 ORNITH_Q6_FILE="Ornith-1.5-35B-Q6_K.gguf"
 ORNITH_Q8_FILE="Ornith-1.5-35B-Q8_0.gguf"
-ORNITH_BF16_FILE="Ornith-1.5-35B-BF16.gguf"
 ORNITH_MMPROJ_FILE="mmproj-Ornith-1.5-35B-BF16.gguf"
 ORNITH9_REPO="ornith-ai/Ornith-1.5-9B-GGUF"
 ORNITH9_Q4_FILE="Ornith-1.5-9B-Q4_K_M.gguf"
-ORNITH9_Q5_FILE="Ornith-1.5-9B-Q5_K_M.gguf"
 ORNITH9_Q6_FILE="Ornith-1.5-9B-Q6_K.gguf"
 ORNITH9_Q8_FILE="Ornith-1.5-9B-Q8_0.gguf"
-ORNITH9_BF16_FILE="Ornith-1.5-9B-BF16.gguf"
 ORNITH9_MMPROJ_FILE="mmproj-Ornith-1.5-9B-BF16.gguf"
 ORNITH9_DFLASH_REPO="audreyt/Ornith-1.5-9B-DFlash-GGUF"
 ORNITH9_DFLASH_Q4_FILE="ornith1.5-9b-dflash-bf16-projection-Q4_K_M.gguf"
@@ -609,10 +604,6 @@ elif [ "$MODEL" = "qwen-dflash-q8" ]; then
     echo
     echo "DFlash2 Q8_0 draft model downloaded. Run speculative decoding with:"
     echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_Q8_FILE -p \"Hello\""
-elif [ "$MODEL" = "qwen-dflash-bf16" ]; then
-    echo
-    echo "DFlash2 BF16 draft model downloaded. Run speculative decoding with:"
-    echo "  ./ds4 -m ./ds4flash.gguf --dflash $OUT_DIR/$QWEN38_DFLASH_BF16_FILE -p \"Hello\""
 elif [ "$MODEL" = "qwen-q4" ] || [ "$MODEL" = "qwen-q8" ]; then
     echo
     echo "Qwen base model downloaded. For speculative decoding, download the matching DFlash2 draft model with:"

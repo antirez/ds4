@@ -30045,11 +30045,6 @@ extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
     fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_matmul_quant_rows_scalar_tensor\n");
     return 0;
 }
-
-extern "C" int ds4_gpu_model_is_mapped(const void *model_map) {
-    (void)model_map;
-    return 1;
-}
 extern "C" void ds4_gpu_set_concurrent_encoder(int on) { (void)on; }
 /* Qwen hybrid/DFlash entry points. The runtime is Metal-only, but ds4.c
  * references these from its non-DS4_NO_GPU paths, so CUDA must define them or

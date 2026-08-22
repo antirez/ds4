@@ -41,9 +41,9 @@ with open(sys.argv[1], "rb") as f:
     _ = f.read(8) # nt
     _ = struct.unpack("<Q", f.read(8))[0] # kvc
     data = f.read(16384)
-    if b"qwen35" in data or b"Ornith" in data:
-        sys.exit(0)
-    sys.exit(1)
+    is_dense_qwen35 = b"qwen35" in data and b"qwen35moe" not in data
+    is_ornith9 = b"Ornith-1.5-9B" in data
+    sys.exit(0 if is_dense_qwen35 or is_ornith9 else 1)
 ' "$ROOT/ds4flash.gguf" 2>/dev/null; then
     MODEL="$ROOT/ds4flash.gguf"
   fi
@@ -164,23 +164,26 @@ if llama_bin:
         "--no-warmup", "-no-cnv", "--no-display-prompt"
     ]
     try:
-        p = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=30)
-        if p.returncode == 0:
-            llama_clean = clean_llama_raw(p.stdout)
-            print(f"  {llama_bin} output: {repr(llama_clean)}")
-            with open(ref_log_path, "w") as f:
-                f.write(p.stdout)
-            if ds4_clean != llama_clean:
-                print(f"FAIL: mismatch between ds4 --raw and {llama_bin}!", file=sys.stderr)
-                print(f"  ds4:   {repr(ds4_clean)}", file=sys.stderr)
-                print(f"  llama: {repr(llama_clean)}", file=sys.stderr)
-                sys.exit(1)
-            compared = True
-            print(f"ok exact match verified against {llama_bin}")
-        else:
-            print(f"warning: {llama_bin} exited with code {p.returncode}")
-    except Exception as e:
-        print(f"warning: {llama_bin} execution error: {e}")
+        p = subprocess.run(
+            cmd, input="", capture_output=True, text=True,
+            timeout=30, check=True,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
+        print(f"FAIL: installed reference {llama_bin} could not run: {e}", file=sys.stderr)
+        if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+            print(e.stderr[-2000:], file=sys.stderr)
+        sys.exit(1)
+    llama_clean = clean_llama_raw(p.stdout)
+    print(f"  {llama_bin} output: {repr(llama_clean)}")
+    with open(ref_log_path, "w") as f:
+        f.write(p.stdout)
+    if ds4_clean != llama_clean:
+        print(f"FAIL: mismatch between ds4 --raw and {llama_bin}!", file=sys.stderr)
+        print(f"  ds4:   {repr(ds4_clean)}", file=sys.stderr)
+        print(f"  llama: {repr(llama_clean)}", file=sys.stderr)
+        sys.exit(1)
+    compared = True
+    print(f"ok exact match verified against {llama_bin}")
 
 # Try Ollama API raw:true
 if not compared:
