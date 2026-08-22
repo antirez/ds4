@@ -16469,6 +16469,45 @@ static struct {
     int inited;
 } g_qwen_pool = {0};
 
+/* Requested context size recorded by generation entry points / session
+ * creation BEFORE the pool is initialized (the pool is sized once per
+ * process).  Takes the max of all requests seen pre-init; calls after the
+ * pool is inited have no effect on its sizing. */
+static uint32_t g_qwen_pool_req_ctx;
+
+static void qwen_metal_pool_note_requested_ctx(uint32_t req_ctx) {
+    if (!req_ctx || g_qwen_pool.inited) return;
+    if (req_ctx > g_qwen_pool_req_ctx) g_qwen_pool_req_ctx = req_ctx;
+}
+
+/* Effective pooled KV context:
+ *   max(8192, min(requested_ctx, ceiling))
+ * where the ceiling defaults to 32768 and can be overridden with
+ * DS4_QWEN_MAX_CTX (1..262144).  With no recorded request the pool keeps
+ * the legacy 8192 rows so low-memory machines never grow unprompted. */
+static uint32_t qwen_metal_pool_effective_max_ctx(void) {
+    uint64_t ceiling = 32768ull;
+    const char *env = getenv("DS4_QWEN_MAX_CTX");
+    if (env && env[0]) {
+        errno = 0;
+        char *end = NULL;
+        const unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && errno == 0 && v > 0 && v <= 262144ull) {
+            ceiling = v;
+        } else {
+            fprintf(stderr,
+                    "ds4: ignoring invalid DS4_QWEN_MAX_CTX='%s' "
+                    "(expected integer 1..262144)\n",
+                    env);
+        }
+    }
+    uint64_t want = g_qwen_pool_req_ctx;
+    if (!want) return 8192u;
+    if (want > ceiling) want = ceiling;
+    if (want < 8192ull) want = 8192ull;
+    return want > 0xffffffffull ? 0xffffffffu : (uint32_t)want;
+}
+
 static void qwen_metal_pool_free_all(void) {
 #ifndef DS4_NO_GPU
     ds4_gpu_qwen_flash_kv_f16_truncate(0);
@@ -16517,8 +16556,7 @@ static int qwen_metal_ensure_pool(void) {
     if (g_qwen_pool.inited) { pthread_mutex_unlock(&init_mu); return 1; }
     pthread_mutex_init(&g_qwen_pool.mu, NULL);
     const uint32_t n_embd = DS4_N_EMBD, n_head=DS4_N_HEAD, head_dim=DS4_N_HEAD_DIM, n_head_kv=DS4_N_HEAD_KV, ff_dense=qwen_ff_scratch_dim(), n_vocab=DS4_N_VOCAB;
-    const uint32_t max_ctx = 8192;
-    g_qwen_pool.max_ctx = max_ctx;
+    const uint32_t max_ctx = qwen_metal_pool_effective_max_ctx();
     g_qwen_pool.cur = ds4_gpu_tensor_alloc((uint64_t)n_embd * sizeof(float));
     g_qwen_pool.next = ds4_gpu_tensor_alloc((uint64_t)n_embd * sizeof(float));
     g_qwen_pool.normed = ds4_gpu_tensor_alloc((uint64_t)n_embd * sizeof(float));
@@ -16549,11 +16587,32 @@ static int qwen_metal_ensure_pool(void) {
     g_qwen_pool.gdn_alpha = ds4_gpu_tensor_alloc((uint64_t)QWEN_GDN_V_HEADS * sizeof(float));
     g_qwen_pool.gdn_beta = ds4_gpu_tensor_alloc((uint64_t)QWEN_GDN_V_HEADS * sizeof(float));
     g_qwen_pool.gdn_core = ds4_gpu_tensor_alloc((uint64_t)QWEN_GDN_Z * sizeof(float));
-
     const uint32_t n_layer = DS4_N_LAYER;
-    const uint64_t kv_floats = (uint64_t)n_layer * max_ctx * n_head_kv * head_dim;
-    g_qwen_pool.k_cache = ds4_gpu_tensor_alloc(kv_floats * sizeof(float));
-    g_qwen_pool.v_cache = ds4_gpu_tensor_alloc(kv_floats * sizeof(float));
+    uint32_t kv_ctx = max_ctx;
+    for (;;) {
+        const uint64_t kv_floats =
+            (uint64_t)n_layer * kv_ctx * n_head_kv * head_dim;
+        g_qwen_pool.k_cache =
+            ds4_gpu_tensor_alloc(kv_floats * sizeof(float));
+        g_qwen_pool.v_cache =
+            ds4_gpu_tensor_alloc(kv_floats * sizeof(float));
+        if ((g_qwen_pool.k_cache && g_qwen_pool.v_cache) ||
+            kv_ctx <= 8192u) break;
+        /* Pooled KV too large for this machine: retry once at the legacy
+         * 8192 capacity and warn once.  Consumers that pass the smaller
+         * g_qwen_pool.max_ctx to attention simply fall off the flash path
+         * beyond 8192 tokens, as before. */
+        fprintf(stderr,
+                "ds4: Qwen pooled KV alloc failed at ctx=%u; "
+                "falling back to 8192\n",
+                kv_ctx);
+        ds4_gpu_tensor_free(g_qwen_pool.k_cache);
+        ds4_gpu_tensor_free(g_qwen_pool.v_cache);
+        g_qwen_pool.k_cache = NULL;
+        g_qwen_pool.v_cache = NULL;
+        kv_ctx = 8192u;
+    }
+    g_qwen_pool.max_ctx = kv_ctx;
     g_qwen_pool.gdn_conv = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
     g_qwen_pool.gdn_state = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
     if (g_qwen_pool.gdn_conv) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_conv, 0.0f, (uint64_t)qwen_gdn_n_layer() * QWEN_GDN_QKV * QWEN_GDN_CONV_K);
@@ -41245,6 +41304,9 @@ static int qwen_generate_hybrid(
         ds4_token_emit_fn emit,
         ds4_generation_done_fn done,
         void *emit_ud) {
+#ifndef DS4_NO_GPU
+    qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
+#endif
     qwen_mtp_weights_t mtp_w;
     qwen_mtp_bind(&mtp_w, model);
     const int use_mtp = qwen_mtp_is_valid(&mtp_w);
@@ -41643,6 +41705,9 @@ static int qwen_generate_dflash2(
         ds4_token_emit_fn emit,
         ds4_generation_done_fn done,
         void *emit_ud) {
+#ifndef DS4_NO_GPU
+    qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
+#endif
     const ds4_dflash2_weights *dw = &e->dflash2;
     const ds4_vocab *vocab = &e->vocab;
     int max_draft = e->dflash_draft_n_max > 0
@@ -53630,6 +53695,9 @@ static int generate_metal_graph_raw_swa(
         void              * emit_ud,
         ds4_session_progress_fn progress,
         void              * progress_ud) {
+#ifndef DS4_NO_GPU
+    qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
+#endif
     fprintf(stderr, "ds4: using GPU graph generation with graph prefill\n");
 
     if (prompt->len <= 0 || prompt->len > ctx_size) {
@@ -64187,6 +64255,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         s->prefill_cap = (uint32_t)ctx_size;
 #ifndef DS4_NO_GPU
+        qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
         if (e->backend != DS4_BACKEND_CPU &&
             !qwen_session_state_init_gpu(&s->qwen, (uint32_t)ctx_size)) {
             fprintf(stderr, "ds4: failed to allocate Qwen session state\n");

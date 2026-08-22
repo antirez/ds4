@@ -35524,7 +35524,11 @@ static int ds4_gpu_qwen_attn_flash_rows(
     const uint32_t cache_len = pos0 + n_tok;
     if (n_tok < 2u || head_dim != 256u || n_head == 0u || n_head_kv == 0u) return 0;
     if ((n_head % n_head_kv) != 0u) return 0;
-    if (cache_len == 0u || cache_len > cap || cache_len > ds4_gpu_glm_flash_attention_max_cache_len()) return 0;
+    /* The staged flash path is bounded by `cap` (the caller's pooled KV row
+     * capacity), not by the GLM full-attention threadgroup envelope; the
+     * former 8192 ceiling here silently disabled qwen flash prefill beyond
+     * 8k tokens. */
+    if (cache_len == 0u || cache_len > cap) return 0;
     if (!g_cpy_f32_f16_pipeline) return 0;
     if (layer >= DS4_QWEN_FLASH_KV_MAX_LAYERS) return 0;
 
