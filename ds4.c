@@ -65422,6 +65422,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     if (!qwen_session_dflash_capture_span(
                             &s->qwen, e, s->logits, prompt->v + start,
                             (uint32_t)count, (uint32_t)start, true)) {
+                        s->checkpoint_valid = false;
+                        s->mtp_draft_valid = false;
                         snprintf(err, errlen, "Metal DFlash feature capture failed");
                         return 1;
                     }
@@ -65452,14 +65454,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 &s->qwen, NULL, NULL, &e->model, &e->weights,
                                 prompt->v + start, last - start, (uint32_t)start,
                                 NULL, NULL, NULL) != 1) {
+                            s->checkpoint_valid = false;
+                            s->mtp_draft_valid = false;
                             snprintf(err, errlen, "Metal hybrid forward failed");
                             return 1;
                         } else
 #endif
                         if (is_cpu) {
                             for (int j = start; j < last; j++) {
-                                qwen_target_forward_layers(&s->qwen, e, NULL, s->qwen.hidden, NULL,
-                                                           prompt->v[j], (uint32_t)j);
+                                if (!qwen_target_forward_layers(&s->qwen, e, NULL, s->qwen.hidden, NULL,
+                                                                prompt->v[j], (uint32_t)j)) {
+                                    s->checkpoint_valid = false;
+                                    s->mtp_draft_valid = false;
+                                    snprintf(err, errlen, "Qwen target prefill forward failed");
+                                    return 1;
+                                }
                                 token_vec_push(&s->checkpoint, prompt->v[j]);
                             }
                             i = last;
@@ -65468,11 +65477,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                             i = last;
                         }
                     }
-                    qwen_target_forward_layers(&s->qwen, e,
-                                               (i == prompt->len - 1) ? s->logits : NULL,
-                                               s->qwen.hidden,
-                                               (i == prompt->len - 1) ? s->qwen.layers : NULL,
-                                               prompt->v[i], (uint32_t)i);
+                    if (!qwen_target_forward_layers(&s->qwen, e,
+                                                    (i == prompt->len - 1) ? s->logits : NULL,
+                                                    s->qwen.hidden,
+                                                    (i == prompt->len - 1) ? s->qwen.layers : NULL,
+                                                    prompt->v[i], (uint32_t)i)) {
+                        s->checkpoint_valid = false;
+                        s->mtp_draft_valid = false;
+                        snprintf(err, errlen, "Qwen target prefill forward failed");
+                        return 1;
+                    }
                 }
 #ifndef DS4_NO_GPU
                 else if (!is_cpu) {
@@ -65497,8 +65511,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                         return DS4_SESSION_SYNC_INTERRUPTED;
                     }
                     if (prefill_rc != 1) {
-                        snprintf(err, errlen, "Metal hybrid forward failed");
                         s->checkpoint_valid = false;
+                        s->mtp_draft_valid = false;
+                        snprintf(err, errlen, "Metal hybrid forward failed");
                         return 1;
                     }
                     break;
@@ -65521,6 +65536,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                sizeof(s->qwen.dflash_scheduler));
 #ifndef DS4_NO_GPU
         if (!is_cpu && !qwen_session_state_reset_recurrent(&s->qwen)) {
+            s->checkpoint_valid = false;
+            s->mtp_draft_valid = false;
             snprintf(err, errlen, "failed to reset Qwen recurrent state");
             return 1;
         }
@@ -65532,6 +65549,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     !qwen_session_dflash_capture_span(
                         &s->qwen, e, s->logits, prompt->v,
                         (uint32_t)prompt->len, 0u, false)) {
+                    s->checkpoint_valid = false;
+                    s->mtp_draft_valid = false;
                     snprintf(err, errlen, "Metal DFlash prefill capture failed");
                     return 1;
                 }
@@ -65541,20 +65560,32 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     if (!is_cpu && qwen_metal_prefill_span(
                             &s->qwen, NULL, NULL, &e->model, &e->weights,
                             prompt->v, prompt->len - 1, 0, NULL, NULL, NULL) != 1) {
+                        s->checkpoint_valid = false;
+                        s->mtp_draft_valid = false;
                         snprintf(err, errlen, "Metal hybrid forward failed");
                         return 1;
                     } else
 #endif
                     if (is_cpu) {
                         for (int i = 0; i < prompt->len - 1; i++) {
-                            qwen_target_forward_layers(&s->qwen, e, NULL, s->qwen.hidden, NULL,
-                                                       prompt->v[i], (uint32_t)i);
+                            if (!qwen_target_forward_layers(&s->qwen, e, NULL, s->qwen.hidden, NULL,
+                                                            prompt->v[i], (uint32_t)i)) {
+                                s->checkpoint_valid = false;
+                                s->mtp_draft_valid = false;
+                                snprintf(err, errlen, "Qwen target prefill forward failed");
+                                return 1;
+                            }
                         }
-                    }
                 }
-                qwen_target_forward_layers(
-                    &s->qwen, e, s->logits, s->qwen.hidden, s->qwen.layers,
-                    prompt->v[prompt->len - 1], (uint32_t)(prompt->len - 1));
+                }
+                if (!qwen_target_forward_layers(
+                        &s->qwen, e, s->logits, s->qwen.hidden, s->qwen.layers,
+                        prompt->v[prompt->len - 1], (uint32_t)(prompt->len - 1))) {
+                    s->checkpoint_valid = false;
+                    s->mtp_draft_valid = false;
+                    snprintf(err, errlen, "Qwen target prefill forward failed");
+                    return 1;
+                }
             }
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
         }
@@ -65576,6 +65607,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (prefill_rc != 1) {
+                s->checkpoint_valid = false;
+                s->mtp_draft_valid = false;
                 snprintf(err, errlen, "Metal hybrid forward failed");
                 return 1;
             }
@@ -67230,17 +67263,26 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (e->dflash2.classic) {
                 if (!qwen_session_dflash_capture_span(
                         &s->qwen, e, s->logits, &token, 1u, pos, true)) {
+                    s->checkpoint_valid = false;
+                    s->mtp_draft_valid = false;
                     snprintf(err, errlen, "Metal DFlash feature capture failed");
                     return 1;
                 }
             } else {
-                qwen_target_forward_layers(&s->qwen, e, s->logits,
-                                           s->qwen.hidden, s->qwen.layers,
-                                           token, pos);
+                if (!qwen_target_forward_layers(&s->qwen, e, s->logits,
+                                                s->qwen.hidden, s->qwen.layers,
+                                                token, pos)) {
+                    s->checkpoint_valid = false;
+                    s->mtp_draft_valid = false;
+                    snprintf(err, errlen, "DFlash2 target forward failed");
+                    return 1;
+                }
             }
         } else if (!is_cpu) {
             if (!qwen_hybrid_metal_forward_token_ex(&s->qwen, s->logits, NULL, NULL, NULL, NULL, 0, &e->model, &e->weights, token, pos)) {
-                if (DS4_FAMILY_IS_QWEN35) {
+                if (qwen_engine_is_hybrid(e)) {
+                    s->checkpoint_valid = false;
+                    s->mtp_draft_valid = false;
                     snprintf(err, errlen, "Metal hybrid forward failed");
                     return 1;
                 }
@@ -71784,13 +71826,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                             &s->qwen, e, s->logits, &primary, 1u,
                             (uint32_t)pos,
                             !(adaptive && scheduler->disabled))) {
+                        s->checkpoint_valid = false;
+                        s->mtp_draft_valid = false;
                         snprintf(err, errlen, "Metal DFlash feature capture failed");
                         return -1;
                     }
                 } else {
-                    qwen_target_forward_layers(&s->qwen, e, s->logits,
-                                               s->qwen.hidden, s->qwen.layers,
-                                               primary, (uint32_t)pos);
+                    if (!qwen_target_forward_layers(&s->qwen, e, s->logits,
+                                                    s->qwen.hidden, s->qwen.layers,
+                                                    primary, (uint32_t)pos)) {
+                        s->checkpoint_valid = false;
+                        s->mtp_draft_valid = false;
+                        snprintf(err, errlen, "DFlash2 target forward failed");
+                        return -1;
+                    }
                 }
                 if (calibrating) {
                     const bool was_disabled = scheduler->disabled;
@@ -71827,6 +71876,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 free(tmp_hidden);
                 free(tmp_layers);
                 s->checkpoint_valid = false;
+                s->mtp_draft_valid = false;
                 snprintf(err, errlen, "DFlash target verify failed");
                 return -1;
             }
@@ -71849,6 +71899,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 free(tmp_hidden);
                 free(tmp_layers);
                 s->checkpoint_valid = false;
+                s->mtp_draft_valid = false;
                 snprintf(err, errlen, "failed to restore DFlash target state");
                 return -1;
             }

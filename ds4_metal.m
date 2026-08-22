@@ -6669,9 +6669,6 @@ int ds4_gpu_init(void) {
             if (!g_interleave_rows_f32_pipeline) {
                 fprintf(stderr, "ds4: Metal kernel_interleave_rows_f32 pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
-                g_queue = nil;
-                g_device = nil;
-                return 0;
             }
         }
 

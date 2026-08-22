@@ -39,6 +39,18 @@ def positive_float(value):
         raise argparse.ArgumentTypeError("must be a positive finite number")
     return value
 
+def nonnegative_float(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError("must be a non-negative finite number")
+    return value
+
+def unit_float(value):
+    value = float(value)
+    if not math.isfinite(value) or not (0.0 <= value <= 1.0):
+        raise argparse.ArgumentTypeError("must be in the range [0.0, 1.0]")
+    return value
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -67,10 +79,10 @@ def parse_args():
     train.add_argument("--output", type=Path, required=True)
     train.add_argument("--steps", type=positive_int, default=768)
     train.add_argument("--block-size", type=positive_int, default=8)
-    train.add_argument("--learning-rate", type=float, default=2e-5)
-    train.add_argument("--weight-decay", type=float, default=0.01)
-    train.add_argument("--warmup-ratio", type=float, default=0.04)
-    train.add_argument("--clip-grad", type=float, default=1.0)
+    train.add_argument("--learning-rate", type=positive_float, default=2e-5)
+    train.add_argument("--weight-decay", type=nonnegative_float, default=0.01)
+    train.add_argument("--warmup-ratio", type=unit_float, default=0.04)
+    train.add_argument("--clip-grad", type=positive_float, default=1.0)
     train.add_argument("--loss-gamma", type=positive_float, default=4.0)
     train.add_argument("--eval-every", type=positive_int, default=96)
     train.add_argument("--save-every", type=positive_int, default=192)
