@@ -120,6 +120,15 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
         uint64_t              snorm_off,
         uint32_t              layer,
         uint32_t              n_tok);
+int ds4_gpu_qwen_gdn_to_mlx_order_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src);
+int ds4_gpu_qwen_gdn_mlx_output_norm_tensor(
+        ds4_gpu_tensor       *core,
+        const ds4_gpu_tensor *z,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              snorm_off);
 void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *state_steps);
 void ds4_gpu_qwen_set_gdn_snapshot(int enable);
 void ds4_gpu_qwen_set_shape(uint32_t n_layer, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot);
@@ -145,6 +154,13 @@ int ds4_gpu_qwen_full_attn_rows_tensor(
         uint32_t              cap,
         uint32_t              n_tok);
 
+int ds4_gpu_round_bf16_f32_tensor(ds4_gpu_tensor *tensor, uint32_t n);
+int ds4_gpu_mlx_swiglu_bf16_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t              n);
+
 /* Nonzero when the batched routed-MoE path can verify this gate/down type
  * pair without falling back mid-round. */
 int ds4_gpu_qwen_routed_batch_pair_supported(uint32_t gate_type, uint32_t down_type);
@@ -161,6 +177,8 @@ int ds4_gpu_qwen_full_attn_tensor(
         uint64_t              model_size,
         uint64_t              q_norm_off,
         uint64_t              k_norm_off,
+        uint32_t              q_norm_type,
+        uint32_t              k_norm_type,
         uint32_t              has_q_norm,
         uint32_t              has_k_norm,
         uint32_t              gated,
@@ -944,6 +962,16 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 
 int ds4_gpu_matmul_affine2_g64_tensor(
         ds4_gpu_tensor       *out,
@@ -1154,6 +1182,16 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
+int ds4_gpu_rms_norm_bf16_weight_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              rows,
+        float                 eps);
+
 
 int ds4_gpu_add_rms_norm_weight_tensor(
         ds4_gpu_tensor       *norm_out,

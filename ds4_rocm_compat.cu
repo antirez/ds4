@@ -447,10 +447,12 @@ extern "C" int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const void *model_map, uint64_t model_size,
         uint64_t q_norm_off, uint64_t k_norm_off,
+        uint32_t q_norm_type, uint32_t k_norm_type,
         uint32_t has_q_norm, uint32_t has_k_norm, uint32_t gated,
         uint32_t pos, uint32_t layer, uint32_t cap) {
     (void)heads; (void)q; (void)k; (void)v; (void)gate; (void)k_cache; (void)v_cache;
     (void)model_map; (void)model_size; (void)q_norm_off; (void)k_norm_off;
+    (void)q_norm_type; (void)k_norm_type;
     (void)has_q_norm; (void)has_k_norm; (void)gated; (void)pos; (void)layer; (void)cap;
     return 0;
 }

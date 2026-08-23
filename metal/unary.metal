@@ -310,3 +310,126 @@ kernel void kernel_dsv4_softplus_sqrt_f32_4(
 template [[host_name("kernel_unary_f32_f32")]]   kernel kernel_unary_t kernel_unary_impl<float,  float,  float>;
 template [[host_name("kernel_unary_f32_f32_4")]] kernel kernel_unary_t kernel_unary_impl<float4, float4, float4>;
 template [[host_name("kernel_unary_f16_f16")]]   kernel kernel_unary_t kernel_unary_impl<half,   half,   float>;
+
+/* MLX parity mode: round an F32 activation to nearest-even BF16 and store it
+ * back as F32. This preserves ds4's tensor ABI while matching MLX's BF16
+ * activation boundaries. */
+kernel void kernel_round_bf16_f32(
+        device float *x,
+        constant uint32_t &n,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    uint bits = as_type<uint>(x[gid]);
+    const uint lsb = (bits >> 16u) & 1u;
+    bits += 0x7fffu + lsb;
+    x[gid] = as_type<float>(bits & 0xffff0000u);
+}
+
+struct ds4_mlx_rms_args {
+    float eps;
+    uint axis_size;
+};
+
+kernel void kernel_mlx_rms_bf16_frame_f32(
+        constant ds4_mlx_rms_args &args,
+        device const float *x,
+        device const float *w,
+        device float *out,
+        uint row [[threadgroup_position_in_grid]],
+        uint lid [[thread_position_in_threadgroup]],
+        uint lsize [[threads_per_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float inv_mean[1];
+    threadgroup float sums[32];
+    float acc = 0.f;
+    device const float *xr = x + (uint64_t)row * args.axis_size;
+    device float *yr = out + (uint64_t)row * args.axis_size;
+    for (uint r = lid * 4u; r < args.axis_size; r += lsize * 4u) {
+        for (uint i = 0; i < 4u && r + i < args.axis_size; ++i) {
+            const float v = xr[r+i];
+            acc += v * v;
+        }
+    }
+    acc = simd_sum(acc);
+    if (sg == 0) sums[lane] = 0.f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) sums[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        acc = simd_sum(sums[lane]);
+        if (lane == 0) inv_mean[0] = precise::rsqrt(acc / args.axis_size + args.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = lid * 4u; r < args.axis_size; r += lsize * 4u) {
+        for (uint i = 0; i < 4u && r + i < args.axis_size; ++i) {
+            float v = xr[r+i] * inv_mean[0];
+            uint bits = as_type<uint>(v);
+            bits += 0x7fffu + ((bits >> 16u) & 1u);
+            v = as_type<float>(bits & 0xffff0000u);
+            v *= w[r+i];
+            bits = as_type<uint>(v);
+            bits += 0x7fffu + ((bits >> 16u) & 1u);
+            yr[r+i] = as_type<float>(bits & 0xffff0000u);
+        }
+    }
+}
+kernel void kernel_mlx_swiglu_bf16_frame_f32(
+        device const float *gate,
+        device const float *up,
+        device float *out,
+        constant uint32_t &n,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const float g = ds4_q4_64a_runtime_value(gate[gid]);
+    const float u = ds4_q4_64a_runtime_value(up[gid]);
+    const float exp_abs = ds4_q4_64a_runtime_value(precise::exp(fabs(g)));
+    const float denom = ds4_q4_64a_runtime_value(1.0f + exp_abs);
+    float sigmoid = ds4_q4_64a_runtime_value(1.0f / denom);
+    if (g >= 0.0f) sigmoid = ds4_q4_64a_runtime_value(1.0f - sigmoid);
+    const float silu = ds4_q4_64a_runtime_value(g * sigmoid);
+    out[gid] = ds4_q4_64a_runtime_value(silu * u);
+}
+kernel void kernel_mlx_rms_bf16_weight_frame_f32(
+        constant ds4_mlx_rms_args &args,
+        device const float *x,
+        device const ushort *w,
+        device float *out,
+        uint row [[threadgroup_position_in_grid]],
+        uint lid [[thread_position_in_threadgroup]],
+        uint lsize [[threads_per_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float inv_mean[1];
+    threadgroup float sums[32];
+    float acc = 0.0f;
+    device const float *xr = x + (uint64_t)row * args.axis_size;
+    device float *yr = out + (uint64_t)row * args.axis_size;
+    for (uint r = lid * 4u; r < args.axis_size; r += lsize * 4u) {
+        for (uint i = 0; i < 4u && r + i < args.axis_size; i++) {
+            const float v = xr[r + i];
+            acc += v * v;
+        }
+    }
+    acc = simd_sum(acc);
+    if (sg == 0u) sums[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) sums[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        acc = simd_sum(sums[lane]);
+        if (lane == 0u) {
+            inv_mean[0] = precise::rsqrt(
+                acc / (float)args.axis_size + args.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = lid * 4u; r < args.axis_size; r += lsize * 4u) {
+        for (uint i = 0; i < 4u && r + i < args.axis_size; i++) {
+            const uint d = r + i;
+            const float rms = ds4_q4_64a_runtime_value(xr[d] * inv_mean[0]);
+            const float wf = as_type<float>((uint)w[d] << 16u);
+            yr[d] = ds4_q4_64a_runtime_value(wf * rms);
+        }
+    }
+}

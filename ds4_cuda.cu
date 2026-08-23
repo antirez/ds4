@@ -15479,6 +15479,15 @@ extern "C" int ds4_gpu_matmul_affine2_g64_tensor(
     return 0;
 }
 
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
 extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
@@ -16158,6 +16167,15 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     rms_norm_weight_kernel<<<1, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
+extern "C" int ds4_gpu_rms_norm_bf16_weight_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n, uint32_t rows, float eps) {
+    (void)out; (void)x; (void)model_map; (void)model_size;
+    (void)weight_offset; (void)n; (void)rows; (void)eps;
+    return 0;
+}
+
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
@@ -30197,10 +30215,12 @@ extern "C" int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const void *model_map, uint64_t model_size,
         uint64_t q_norm_off, uint64_t k_norm_off,
+        uint32_t q_norm_type, uint32_t k_norm_type,
         uint32_t has_q_norm, uint32_t has_k_norm, uint32_t gated,
         uint32_t pos, uint32_t layer, uint32_t cap) {
     (void)heads; (void)q; (void)k; (void)v; (void)gate; (void)k_cache; (void)v_cache;
     (void)model_map; (void)model_size; (void)q_norm_off; (void)k_norm_off;
+    (void)q_norm_type; (void)k_norm_type;
     (void)has_q_norm; (void)has_k_norm; (void)gated; (void)pos; (void)layer; (void)cap;
     return 0;
 }
