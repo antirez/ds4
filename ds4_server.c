@@ -8325,19 +8325,31 @@ typedef struct {
     uint64_t count;
 } metrics_reason;
 
+#define METRICS_BUCKETS 9
+/* Upper bounds (seconds) for the prompt/request latency histograms; the
+ * implicit +Inf bucket is the total count. */
+static const double metrics_prompt_bounds[METRICS_BUCKETS] =
+    {0.5, 1, 2, 5, 10, 30, 60, 120, 300};
+static const double metrics_request_bounds[METRICS_BUCKETS] =
+    {1, 2, 5, 10, 30, 60, 120, 300, 600};
+
 typedef struct {
     pthread_mutex_t mu;
     uint64_t prompt_tokens_total;
+    uint64_t reused_tokens_total;
     uint64_t gen_thinking_total, gen_response_total;
     double prefill_tps_chunk, prefill_tps_avg;
     double decode_tps_chunk, decode_tps_avg;
     metrics_reason finish[METRICS_REASONS_MAX];
     double request_seconds_sum;
     uint64_t request_seconds_count;
+    uint64_t request_seconds_bucket[METRICS_BUCKETS];
     double prompt_seconds_sum;
     uint64_t prompt_seconds_count;
+    uint64_t prompt_seconds_bucket[METRICS_BUCKETS];
     uint64_t kv_stored_total, kv_trimmed_tokens_total;
     double kv_stored_bytes_total;
+    metrics_reason kv_hit[METRICS_REASONS_MAX];
     metrics_reason kv_miss[METRICS_REASONS_MAX];
 } server_metrics;
 
@@ -8378,12 +8390,31 @@ static void metrics_prefill_progress(double chunk_tps, double avg_tps) {
     pthread_mutex_unlock(&g_server_metrics.mu);
 }
 
-static void metrics_prompt_done(int tokens, double seconds) {
-    if (tokens < 0) tokens = 0;
+static void metrics_bucket_add(uint64_t *buckets, const double *bounds,
+                               double v) {
+    for (int i = 0; i < METRICS_BUCKETS; i++) {
+        if (v <= bounds[i]) {
+            buckets[i]++;
+            return;
+        }
+    }
+    /* Above the last bound: lands only in the implicit +Inf bucket (the
+     * total count), which render derives from _count. */
+}
+
+static void metrics_prompt_done(int evaluated_tokens, int reused_tokens,
+                                const char *cache_source, double seconds) {
+    if (evaluated_tokens < 0) evaluated_tokens = 0;
+    if (reused_tokens < 0) reused_tokens = 0;
     pthread_mutex_lock(&g_server_metrics.mu);
-    g_server_metrics.prompt_tokens_total += (uint64_t)tokens;
+    g_server_metrics.prompt_tokens_total += (uint64_t)evaluated_tokens;
+    g_server_metrics.reused_tokens_total += (uint64_t)reused_tokens;
+    if (reused_tokens > 0)
+        metrics_reason_add(g_server_metrics.kv_hit, cache_source);
     g_server_metrics.prompt_seconds_sum += seconds;
     g_server_metrics.prompt_seconds_count++;
+    metrics_bucket_add(g_server_metrics.prompt_seconds_bucket,
+                       metrics_prompt_bounds, seconds);
     pthread_mutex_unlock(&g_server_metrics.mu);
 }
 
@@ -8392,6 +8423,8 @@ static void metrics_request_finish(const char *reason, double seconds) {
     metrics_reason_add(g_server_metrics.finish, reason);
     g_server_metrics.request_seconds_sum += seconds;
     g_server_metrics.request_seconds_count++;
+    metrics_bucket_add(g_server_metrics.request_seconds_bucket,
+                       metrics_request_bounds, seconds);
     pthread_mutex_unlock(&g_server_metrics.mu);
 }
 
@@ -11607,7 +11640,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, slot);
-    metrics_prompt_done(prompt_tokens - cached, now_sec() - t0);
+    metrics_prompt_done(prompt_tokens - cached, cached, cache_source,
+                        now_sec() - t0);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -12797,13 +12831,40 @@ static void append_metrics_text(buf *b, server *s) {
         buf_printf(b, "ds4_requests_total{finish=\"%s\"} %llu\n",
                    snap.finish[i].name, (unsigned long long)snap.finish[i].count);
     }
+    buf_puts(b, "# HELP ds4_reused_tokens_total Prompt tokens served from KV cache reuse\n"
+                "# TYPE ds4_reused_tokens_total counter\n");
+    buf_printf(b, "ds4_reused_tokens_total %llu\n",
+               (unsigned long long)snap.reused_tokens_total);
+    buf_puts(b, "# HELP ds4_kv_cache_hit_total Prompts that reused cached KV, by source\n"
+                "# TYPE ds4_kv_cache_hit_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.kv_hit[i].name[0]) break;
+        buf_printf(b, "ds4_kv_cache_hit_total{source=\"%s\"} %llu\n",
+                   snap.kv_hit[i].name, (unsigned long long)snap.kv_hit[i].count);
+    }
     buf_puts(b, "# HELP ds4_request_duration_seconds Wall time per request\n"
-                "# TYPE ds4_request_duration_seconds summary\n");
+                "# TYPE ds4_request_duration_seconds histogram\n");
+    uint64_t cum = 0;
+    for (int i = 0; i < METRICS_BUCKETS; i++) {
+        cum += snap.request_seconds_bucket[i];
+        buf_printf(b, "ds4_request_duration_seconds_bucket{le=\"%g\"} %llu\n",
+                   metrics_request_bounds[i], (unsigned long long)cum);
+    }
+    buf_printf(b, "ds4_request_duration_seconds_bucket{le=\"+Inf\"} %llu\n",
+               (unsigned long long)snap.request_seconds_count);
     buf_printf(b, "ds4_request_duration_seconds_sum %.3f\n", snap.request_seconds_sum);
     buf_printf(b, "ds4_request_duration_seconds_count %llu\n",
                (unsigned long long)snap.request_seconds_count);
     buf_puts(b, "# HELP ds4_prompt_duration_seconds Wall time per prompt prefill\n"
-                "# TYPE ds4_prompt_duration_seconds summary\n");
+                "# TYPE ds4_prompt_duration_seconds histogram\n");
+    cum = 0;
+    for (int i = 0; i < METRICS_BUCKETS; i++) {
+        cum += snap.prompt_seconds_bucket[i];
+        buf_printf(b, "ds4_prompt_duration_seconds_bucket{le=\"%g\"} %llu\n",
+                   metrics_prompt_bounds[i], (unsigned long long)cum);
+    }
+    buf_printf(b, "ds4_prompt_duration_seconds_bucket{le=\"+Inf\"} %llu\n",
+               (unsigned long long)snap.prompt_seconds_count);
     buf_printf(b, "ds4_prompt_duration_seconds_sum %.3f\n", snap.prompt_seconds_sum);
     buf_printf(b, "ds4_prompt_duration_seconds_count %llu\n",
                (unsigned long long)snap.prompt_seconds_count);
@@ -18519,7 +18580,8 @@ static void test_metrics_text(void) {
     memset(&g_server_metrics, 0, sizeof(g_server_metrics));
     pthread_mutex_init(&g_server_metrics.mu, NULL);
 
-    metrics_prompt_done(2739, 60.872);
+    metrics_prompt_done(2739, 0, "none", 60.872);
+    metrics_prompt_done(100, 1900, "memory-rewind", 0.4);
     metrics_prefill_progress(31.51, 45.00);
     metrics_decode_progress(50, true, 5.41, 5.41);
     metrics_decode_progress(39, false, 5.48, 5.46);
@@ -18532,7 +18594,9 @@ static void test_metrics_text(void) {
     buf b = {0};
     append_metrics_text(&b, NULL);
     TEST_ASSERT(b.ptr != NULL);
-    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_tokens_total 2739\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_tokens_total 2839\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_reused_tokens_total 1900\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_hit_total{source=\"memory-rewind\"} 1\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_generated_tokens_total{phase=\"thinking\"} 50\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_generated_tokens_total{phase=\"response\"} 39\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_prefill_tps{window=\"chunk\"} 31.51\n"));
@@ -18541,7 +18605,17 @@ static void test_metrics_text(void) {
     TEST_ASSERT(strstr(b.ptr, "ds4_requests_total{finish=\"stop\"} 2\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_requests_total{finish=\"length\"} 1\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_count 3\n"));
-    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_sum 60.872\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_sum 61.272\n"));
+    /* Histogram buckets are cumulative: the 0.4 s prompt lands in le=0.5,
+     * the 60.872 s prompt first appears at le=120. */
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"0.5\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"60\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"120\"} 2\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_prompt_duration_seconds_bucket{le=\"+Inf\"} 2\n"));
+    /* Request histogram: 129.107 -> le=300, 10.0 -> le=10, 5.0 -> le=5. */
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_bucket{le=\"5\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_bucket{le=\"10\"} 2\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_request_duration_seconds_bucket{le=\"300\"} 3\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_stored_total 1\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_trimmed_tokens_total 12\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_miss_total{reason=\"token-mismatch\"} 1\n"));
