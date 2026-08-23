@@ -1087,6 +1087,28 @@ void ds4_gpu_set_concurrent_encoder(int on) {
 
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
+static uint64_t g_gpu_cb_profile_count;
+static double g_gpu_cb_profile_sum;
+static double g_gpu_cb_profile_max;
+
+/* Per-command-buffer GPU-time print, hoisted from ds4_gpu_wait_command_buffer.
+ * DS4_QWEN_PROFILE prints it every buffer; DS4_QWEN_PROFILE_ALWAYS (any value
+ * that is non-empty and not "0") ungates it the same way and additionally
+ * appends running count/avg/max aggregates. */
+static void ds4_gpu_print_command_buffer_time(id<MTLCommandBuffer> cb,
+                                              const char *label, double busy) {
+    const char *always = getenv("DS4_QWEN_PROFILE_ALWAYS");
+    char agg[64] = "";
+    if (always && always[0] && strcmp(always, "0") != 0) {
+        snprintf(agg, sizeof(agg), " n=%llu avg=%.2f max=%.2f",
+                 (unsigned long long)g_gpu_cb_profile_count,
+                 g_gpu_cb_profile_count > 0 ?
+                     g_gpu_cb_profile_sum / (double)g_gpu_cb_profile_count : 0.0,
+                 g_gpu_cb_profile_max);
+    }
+    fprintf(stderr, "ds4: gpu-cb %.2f ms status=%ld %s%s\n",
+            busy * 1000.0, (long)cb.status, label ? label : "?", agg);
+}
 
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
@@ -1101,13 +1123,18 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
-    if (getenv("DS4_METAL_GPU_BUSY_PROFILE") || getenv("DS4_QWEN_PROFILE")) {
+    const int qwen_profile = getenv("DS4_QWEN_PROFILE") != NULL;
+    const char *qwen_always = getenv("DS4_QWEN_PROFILE_ALWAYS");
+    const int qwen_always_on =
+        qwen_always && qwen_always[0] && strcmp(qwen_always, "0") != 0;
+    if (getenv("DS4_METAL_GPU_BUSY_PROFILE") || qwen_profile || qwen_always_on) {
         const double busy = cb.GPUEndTime - cb.GPUStartTime;
         if (busy > 0) g_gpu_busy_accum += busy;
-        if (getenv("DS4_QWEN_PROFILE")) {
-            fprintf(stderr, "ds4: gpu-cb %.2f ms status=%ld %s\n",
-                    busy * 1000.0, (long)cb.status, label ? label : "?");
-
+        if (qwen_profile || qwen_always_on) {
+            ++g_gpu_cb_profile_count;
+            g_gpu_cb_profile_sum += busy;
+            if (busy > g_gpu_cb_profile_max) g_gpu_cb_profile_max = busy;
+            ds4_gpu_print_command_buffer_time(cb, label, busy);
         } else if ((++g_gpu_busy_cbs % 64u) == 0u) {
             fprintf(stderr, "ds4: gpu busy accum %.1f ms over %llu cbs\n",
                     g_gpu_busy_accum * 1000.0,
@@ -23170,6 +23197,19 @@ static int ds4_qwen_decode_shadow_enabled(void) {
     return !(sw && sw[0] == '0' && sw[1] == '\0');
 }
 
+static int ds4_qwen_decode_shadow_grp_enabled(void) {
+    /* Default ON: selects kernel_qwen_gqa_attn_decode_shadow_grp (one
+     * threadgroup per KV head, 16 simdgroups = one per grouped query head)
+     * so the F16 shadow K/V planes are streamed once per decode step
+     * instead of ngrp times; removes the L2-capacity decode cliff at large
+     * pos. DS4_QWEN_SHADOW_GRP=0 restores the per-query-head shadow
+     * kernel. Only ever selected when n_head/n_head_kv == 16, which the
+     * grouped kernel requires; any other GQA ratio keeps the legacy
+     * dispatch. */
+    const char *sw = getenv("DS4_QWEN_SHADOW_GRP");
+    return !(sw && sw[0] == '0' && sw[1] == '\0');
+}
+
 
 /* Shadow-backed tiled decode attention for qwen full-attn layers: attends
  * the persistent F16 KV shadow maintained by ds4_gpu_qwen_attn_flash_rows
@@ -23212,8 +23252,20 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         v_cache_offset != k_cache_offset) return 0;
     const uint32_t layer = (uint32_t)(k_cache_offset / layer_span);
     if (layer >= DS4_QWEN_FLASH_KV_MAX_LAYERS) return 0;
-    id<MTLComputePipelineState> pipe =
-        ds4_gpu_get_pipeline("kernel_qwen_gqa_attn_decode_shadow");
+    /* Grouped fast path: only when enabled and the GQA group is exactly
+     * 16 (divisibility and non-zero n_head_kv proven above), matching the
+     * kernel_qwen_gqa_attn_decode_shadow_grp layout contract. */
+    int grp = ds4_qwen_decode_shadow_grp_enabled() &&
+              n_head / n_head_kv == 16u;
+    id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline(
+        grp ? "kernel_qwen_gqa_attn_decode_shadow_grp"
+            : "kernel_qwen_gqa_attn_decode_shadow");
+    if (!pipe && grp) {
+        /* Compiled library lacks the grouped kernel: fall back to the
+         * legacy per-query-head shadow pipeline. */
+        grp = 0;
+        pipe = ds4_gpu_get_pipeline("kernel_qwen_gqa_attn_decode_shadow");
+    }
     if (!pipe) return 0;
     id<MTLBuffer> kc_buf = ds4_gpu_tensor_buffer(k_cache);
     id<MTLBuffer> vc_buf = ds4_gpu_tensor_buffer(v_cache);
@@ -23357,8 +23409,16 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         [enc setBuffer:slot->shadow offset:k_region atIndex:7];
         [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
                 offset:ds4_gpu_tensor_offset(heads_out) atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (grp) {
+            /* One threadgroup per KV head; 16 simdgroups per threadgroup,
+             * one per grouped query head (see
+             * kernel_qwen_gqa_attn_decode_shadow_grp). */
+            [enc dispatchThreadgroups:MTLSizeMake(n_head_kv, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(16u * 32u, 1, 1)];
+        } else {
+            [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen gqa decode shadow"))
             return 0;

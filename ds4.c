@@ -16701,7 +16701,7 @@ static void qwen_metal_pool_note_requested_ctx(uint32_t req_ctx) {
  * where the ceiling defaults to 32768 and can be overridden with
  * DS4_QWEN_MAX_CTX (1..262144).  With no recorded request the pool keeps
  * the legacy 8192 rows so low-memory machines never grow unprompted. */
-static uint32_t qwen_metal_pool_effective_max_ctx(void) {
+static uint64_t qwen_metal_pool_ceiling(void) {
     uint64_t ceiling = 32768ull;
     const char *env = getenv("DS4_QWEN_MAX_CTX");
     if (env && env[0]) {
@@ -16717,6 +16717,11 @@ static uint32_t qwen_metal_pool_effective_max_ctx(void) {
                     env);
         }
     }
+    return ceiling;
+}
+
+static uint32_t qwen_metal_pool_effective_max_ctx(void) {
+    const uint64_t ceiling = qwen_metal_pool_ceiling();
     uint64_t want = g_qwen_pool_req_ctx;
     if (!want) return 8192u;
     if (want > ceiling) want = ceiling;
@@ -16829,6 +16834,15 @@ static int qwen_metal_ensure_pool(void) {
         kv_ctx = 8192u;
     }
     g_qwen_pool.max_ctx = kv_ctx;
+    {
+        const char *dbg = getenv("DS4_QWEN_POOL_DEBUG");
+        if (dbg && dbg[0] && strcmp(dbg, "0") != 0) {
+            fprintf(stderr,
+                    "ds4: qwen pool: req=%u ceiling=%u -> max_ctx=%u\n",
+                    g_qwen_pool_req_ctx, (unsigned)qwen_metal_pool_ceiling(),
+                    kv_ctx);
+        }
+    }
     g_qwen_pool.gdn_conv = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
     g_qwen_pool.gdn_state = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
     if (g_qwen_pool.gdn_conv) ds4_gpu_tensor_fill_f32(g_qwen_pool.gdn_conv, 0.0f, (uint64_t)qwen_gdn_n_layer() * QWEN_GDN_QKV * QWEN_GDN_CONV_K);
@@ -17363,6 +17377,50 @@ static int qwen_gpu_moe_ffn(
 
 
 
+/* Host-attention fallback tallies for the Qwen hybrid layer loop. The
+ * counters increment unconditionally (cheap increments only); when
+ * DS4_QWEN_FALLBACK_TALLY is set, an atexit handler registered on the first
+ * increment prints per-kind totals and nonzero per-layer counts. */
+static uint64_t g_qwen_fallback_gdn_total;
+static uint64_t g_qwen_fallback_gdn_layer[DS4_MAX_LAYER];
+static uint64_t g_qwen_fallback_full_total;
+static uint64_t g_qwen_fallback_full_layer[DS4_MAX_LAYER];
+
+static void qwen_fallback_tally_report(void) {
+    fprintf(stderr,
+            "ds4: qwen host fallback tally: gdn_core=%llu full_attn=%llu\n",
+            (unsigned long long)g_qwen_fallback_gdn_total,
+            (unsigned long long)g_qwen_fallback_full_total);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g_qwen_fallback_gdn_layer[il]) {
+            fprintf(stderr,
+                    "ds4: qwen host fallback layer %u: gdn_core=%llu\n",
+                    il, (unsigned long long)g_qwen_fallback_gdn_layer[il]);
+        }
+        if (g_qwen_fallback_full_layer[il]) {
+            fprintf(stderr,
+                    "ds4: qwen host fallback layer %u: full_attn=%llu\n",
+                    il, (unsigned long long)g_qwen_fallback_full_layer[il]);
+        }
+    }
+}
+
+static void qwen_fallback_tally_note(int full_attn, uint32_t il) {
+    static int report_registered = -1;
+    if (report_registered < 0) {
+        const char *env = getenv("DS4_QWEN_FALLBACK_TALLY");
+        report_registered = (env && env[0] && strcmp(env, "0") != 0);
+        if (report_registered) atexit(qwen_fallback_tally_report);
+    }
+    if (full_attn) {
+        g_qwen_fallback_full_total++;
+        if (il < DS4_N_LAYER) g_qwen_fallback_full_layer[il]++;
+    } else {
+        g_qwen_fallback_gdn_total++;
+        if (il < DS4_N_LAYER) g_qwen_fallback_gdn_layer[il]++;
+    }
+}
+
 static int qwen_hybrid_metal_forward_token_ex(
         ds4_qwen_session_state *qs,
         float *logits_out,
@@ -17494,6 +17552,7 @@ static int qwen_hybrid_metal_forward_token_ex(
                                              lw->ssm_norm->abs_offset, il)) {
                 if (!qwen_gpu_matmul(attn_out, model, lw->ssm_out, QWEN_GDN_Z, n_embd, g_qwen_pool.gdn_core ? g_qwen_pool.gdn_core : mid, 1)) { ok = 0; break; }
             } else {
+                qwen_fallback_tally_note(0, il);
                 if (!ds4_gpu_end_commands()) { ok = 0; break; }
 
 
@@ -17546,6 +17605,7 @@ static int qwen_hybrid_metal_forward_token_ex(
                 if (!qwen_gpu_matmul(attn_out, model, lw->attn_output,
                                      n_head * head_dim, n_embd, mid, 1)) { ok = 0; break; }
             } else {
+                qwen_fallback_tally_note(1, il);
                 if (!ds4_gpu_end_commands()) { ok = 0; break; }
                 float *host_q = xmalloc((size_t)q_out * sizeof(float));
                 float host_k[DS4_N_HEAD_KV * DS4_N_HEAD_DIM], host_v[DS4_N_HEAD_KV * DS4_N_HEAD_DIM], host_attn[DS4_N_EMBD];
@@ -19199,14 +19259,22 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
 #ifndef DS4_NO_GPU
 /* MTP single-layer scratch pool and persistent private KV cache. */
 #define QWEN_MTP_KV_CAP 4096u
+/* Row capacity of the batched-priming scratch window (see
+ * qwen_mtp_priming_batched). Kept well under the 512-run alloc ladder so the
+ * retry path only ever has to shrink the KV caches. */
+#define QWEN_MTP_PRIMING_CAP 256u
 static struct {
     int inited;
     pthread_mutex_t mu;
     uint32_t kv_cap;
+    uint32_t b_cap;
     ds4_gpu_tensor *hidden, *e_emb, *enorm, *hnorm, *eproj, *hproj, *fused, *concat;
     ds4_gpu_tensor *normed, *logits, *argmax, *topk32;
     ds4_gpu_tensor *q, *k, *v, *gate, *heads, *attn_out, *after, *ffn_normed;
     ds4_gpu_tensor *ffn_gate, *ffn_up, *ffn_mid, *ffn_out, *block_out;
+    ds4_gpu_tensor *b_hidden, *b_e_emb, *b_enorm, *b_concat, *b_hnorm, *b_eproj;
+    ds4_gpu_tensor *b_hproj, *b_htgt, *b_fused, *b_normed, *b_q, *b_k, *b_v;
+    ds4_gpu_tensor *b_gate, *b_heads;
     ds4_gpu_tensor *k_cache, *v_cache;
 } g_mtp_pool = {0};
 
@@ -19228,6 +19296,10 @@ static int qwen_mtp_metal_ensure_pool(void) {
                               ? (uint64_t)g_qwen_pool.max_ctx
                               : (uint64_t)qwen_metal_pool_effective_max_ctx();
     if (mtp_kv_cap < (uint64_t)QWEN_MTP_KV_CAP) mtp_kv_cap = (uint64_t)QWEN_MTP_KV_CAP;
+    /* Batched-priming scratch is a small fixed-row window, independent of
+     * the KV ladder below: only the two k_cache entries shrink on pressure. */
+    uint64_t prime_cap = mtp_kv_cap;
+    if (prime_cap > (uint64_t)QWEN_MTP_PRIMING_CAP) prime_cap = (uint64_t)QWEN_MTP_PRIMING_CAP;
     struct { ds4_gpu_tensor **slot; uint64_t bytes; } want[] = {
         { &g_mtp_pool.hidden,     n_embd * f },
         { &g_mtp_pool.e_emb,      n_embd * f },
@@ -19254,6 +19326,21 @@ static int qwen_mtp_metal_ensure_pool(void) {
         { &g_mtp_pool.ffn_mid,    ff * f },
         { &g_mtp_pool.ffn_out,    n_embd * f },
         { &g_mtp_pool.block_out,  n_embd * f },
+        { &g_mtp_pool.b_hidden,   prime_cap * n_embd * f },
+        { &g_mtp_pool.b_e_emb,    prime_cap * n_embd * f },
+        { &g_mtp_pool.b_enorm,    prime_cap * n_embd * f },
+        { &g_mtp_pool.b_concat,   prime_cap * 2u * n_embd * f },
+        { &g_mtp_pool.b_hnorm,    prime_cap * n_embd * f },
+        { &g_mtp_pool.b_eproj,    prime_cap * n_embd * f },
+        { &g_mtp_pool.b_hproj,    prime_cap * n_embd * f },
+        { &g_mtp_pool.b_htgt,     prime_cap * n_embd * f },
+        { &g_mtp_pool.b_fused,    prime_cap * n_embd * f },
+        { &g_mtp_pool.b_normed,   prime_cap * n_embd * f },
+        { &g_mtp_pool.b_q,        prime_cap * q_full * f },
+        { &g_mtp_pool.b_k,        prime_cap * kv * f },
+        { &g_mtp_pool.b_v,        prime_cap * kv * f },
+        { &g_mtp_pool.b_gate,     prime_cap * heads * f },
+        { &g_mtp_pool.b_heads,    prime_cap * heads * f },
         { &g_mtp_pool.k_cache,    mtp_kv_cap * kv * f },
         { &g_mtp_pool.v_cache,    mtp_kv_cap * kv * f },
     };
@@ -19277,6 +19364,7 @@ static int qwen_mtp_metal_ensure_pool(void) {
     }
     if (ok) {
         g_mtp_pool.kv_cap = (uint32_t)mtp_kv_cap;
+        g_mtp_pool.b_cap = (uint32_t)prime_cap;
         g_mtp_pool.inited = 1;
     }
     pthread_mutex_unlock(&init_mu);
@@ -19635,6 +19723,175 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     return ok;
 }
 
+/* Batched MTP-head KV priming.
+ *
+ * Priming only needs the live prefix of qwen_mtp_draft_one_metal's work:
+ * embed -> enorm/hnorm -> eh fusion -> head attention with its K/V cache
+ * write. Everything past the cache write (attn_out projection, FFN, tail
+ * norms, lm heads) feeds outputs the priming caller discards, so it is
+ * skipped here. The elementwise/norm/projection steps run once per chunk of
+ * rows with the same row-parameterized kernels the target prefill batches
+ * with (qwen_hybrid_metal_forward_tokens); the attention stays a per-row
+ * decode-kernel call so every cache row is produced by exactly the
+ * sequential path's kernel sequence. All rows of a chunk enqueue inside one
+ * begin/end command-buffer region -- helpers join the open region instead of
+ * committing their own command buffers -- so a chunk costs O(1) GPU syncs
+ * instead of one per prompt token.
+ *
+ * Returns 1 when every cache row [0, n_rows) was written; 0 makes the caller
+ * fall back to the sequential per-token loop, which rewrites each row in
+ * order before any later row reads it, so a partially filled cache from a
+ * failed attempt is harmless. */
+static int qwen_mtp_priming_batched(const ds4_model *model, const ds4_weights *base_weights,
+                                    const qwen_mtp_weights_t *mtp, const float *hidden_stash,
+                                    const int *tokens, int start_i, int n_rows, int target_hidden) {
+    if (!qwen_mtp_is_valid(mtp)) return 0;
+    if (!qwen_mtp_metal_ensure_pool()) return 0;
+    if (n_rows <= 0) return 1;
+    if ((uint32_t)n_rows > g_mtp_pool.kv_cap) return 0;
+    /* Host-side conv mixing reads fused back between the fusion matmul and
+     * the attention input; that round trip defeats region batching. */
+    if (qwen_mtp_conv_on()) return 0;
+    const bool is_moe_block = mtp->ffn_gate_exps && mtp->ffn_up_exps && mtp->ffn_down_exps;
+    /* Without the draft block no K/V row is ever written, so there is
+     * nothing to batch; let the sequential path mirror this exactly. */
+    const bool has_block = !(getenv("DS4_QWEN_MTP_NO_BLOCK") && getenv("DS4_QWEN_MTP_NO_BLOCK")[0] != '0') &&
+                           mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v &&
+                           mtp->attn_out && mtp->ffn_norm &&
+                           ((mtp->ffn_gate && mtp->ffn_up && mtp->ffn_down) || is_moe_block);
+    if (!has_block) return 0;
+    const ds4_model *head = qwen_mtp_src(mtp, model);
+    const void *map = head->map;
+    const uint64_t map_size = head->size;
+    const void *base_map = model->map;
+    const uint64_t base_size = model->size;
+    const uint32_t n_embd = DS4_N_EMBD, n_vocab = DS4_N_VOCAB;
+    const uint32_t n_head = DS4_N_HEAD, n_head_kv = DS4_N_HEAD_KV, head_dim = DS4_N_HEAD_DIM;
+    const uint64_t q_out = mtp->attn_q ? mtp->attn_q->dim[1] : 0;
+    const uint32_t gated_q = (q_out == (uint64_t)n_head * head_dim * 2u) ? 1u : 0u;
+    const uint32_t kv_dim = n_head_kv * head_dim;
+    const uint32_t chunk_cap = g_mtp_pool.b_cap ? g_mtp_pool.b_cap : QWEN_MTP_PRIMING_CAP;
+
+    pthread_mutex_lock(&g_mtp_pool.mu);
+    int ok = 1;
+    for (int base = 0; ok && base < n_rows; base += (int)chunk_cap) {
+        const int nr = (n_rows - base < (int)chunk_cap) ? (n_rows - base) : (int)chunk_cap;
+        /* Stage this chunk's trunk hidden rows before any GPU work. */
+        for (int r = 0; ok && r < nr; r++) {
+            if (!ds4_gpu_tensor_write(g_mtp_pool.b_hidden,
+                                      (uint64_t)r * n_embd * sizeof(float),
+                                      hidden_stash + (size_t)(start_i + base + r) * n_embd,
+                                      (uint64_t)n_embd * sizeof(float))) ok = 0;
+        }
+        if (ok && !ds4_gpu_begin_commands()) {
+            pthread_mutex_unlock(&g_mtp_pool.mu);
+            return 0;
+        }
+        /* Same single-row embedding dispatch as the sequential path. */
+        for (int r = 0; ok && r < nr; r++) {
+            ds4_gpu_tensor *row_e = ds4_gpu_tensor_view(g_mtp_pool.b_e_emb,
+                (uint64_t)r * n_embd * sizeof(float), (uint64_t)n_embd * sizeof(float));
+            if (!row_e ||
+                !ds4_gpu_embed_token_quant_tensor(row_e, base_map, base_size,
+                                                  base_weights->token_embd->abs_offset,
+                                                  base_weights->token_embd->type,
+                                                  n_vocab, tokens[start_i + base + r + 1],
+                                                  n_embd)) ok = 0;
+            if (row_e) ds4_gpu_tensor_free(row_e);
+        }
+        if (ok && !qwen_gpu_rms_norm(
+                g_mtp_pool.b_enorm, g_mtp_pool.b_e_emb, head, mtp->enorm,
+                n_embd, (uint32_t)nr)) ok = 0;
+        if (ok && target_hidden && qwen_mtp_target_norm_on() &&
+            base_weights && base_weights->output_norm) {
+            if (!qwen_gpu_rms_norm(
+                    g_mtp_pool.b_htgt, g_mtp_pool.b_hidden, model,
+                    base_weights->output_norm, n_embd, (uint32_t)nr)) ok = 0;
+            if (ok && !qwen_gpu_rms_norm(
+                    g_mtp_pool.b_hnorm, g_mtp_pool.b_htgt, head, mtp->hnorm,
+                    n_embd, (uint32_t)nr)) ok = 0;
+        } else if (ok && !qwen_gpu_rms_norm(
+                g_mtp_pool.b_hnorm, g_mtp_pool.b_hidden, head, mtp->hnorm,
+                n_embd, (uint32_t)nr)) ok = 0;
+        if (ok && mtp->eh_proj) {
+            /* Fused nextn projection over [enormed; hnormed], one
+             * interleaved concat row per window row. */
+            for (int r = 0; ok && r < nr; r++) {
+                if (!ds4_gpu_tensor_copy(g_mtp_pool.b_concat,
+                                         (uint64_t)r * 2u * n_embd * sizeof(float),
+                                         g_mtp_pool.b_enorm,
+                                         (uint64_t)r * n_embd * sizeof(float),
+                                         (uint64_t)n_embd * sizeof(float)) ||
+                    !ds4_gpu_tensor_copy(g_mtp_pool.b_concat,
+                                         ((uint64_t)r * 2u + 1u) * n_embd * sizeof(float),
+                                         g_mtp_pool.b_hnorm,
+                                         (uint64_t)r * n_embd * sizeof(float),
+                                         (uint64_t)n_embd * sizeof(float))) ok = 0;
+            }
+            if (ok && !qwen_gpu_matmul(g_mtp_pool.b_fused, head, mtp->eh_proj,
+                                       2u * n_embd, n_embd, g_mtp_pool.b_concat,
+                                       (uint64_t)nr)) ok = 0;
+        } else {
+            if (ok && !qwen_gpu_matmul(g_mtp_pool.b_eproj, head, mtp->e_proj,
+                                       n_embd, n_embd, g_mtp_pool.b_enorm,
+                                       (uint64_t)nr)) ok = 0;
+            if (ok && !qwen_gpu_matmul(g_mtp_pool.b_hproj, head, mtp->h_proj,
+                                       n_embd, n_embd, g_mtp_pool.b_hnorm,
+                                       (uint64_t)nr)) ok = 0;
+            if (ok && !ds4_gpu_add_tensor(g_mtp_pool.b_fused, g_mtp_pool.b_eproj,
+                                          g_mtp_pool.b_hproj,
+                                          (uint32_t)((uint64_t)n_embd * nr))) ok = 0;
+        }
+        if (ok && !qwen_gpu_rms_norm(
+                g_mtp_pool.b_normed, g_mtp_pool.b_fused, head, mtp->attn_norm,
+                n_embd, (uint32_t)nr)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.b_q, head, mtp->attn_q, n_embd, q_out,
+                                   g_mtp_pool.b_normed, (uint64_t)nr)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.b_k, head, mtp->attn_k, n_embd,
+                                   n_head_kv * head_dim, g_mtp_pool.b_normed,
+                                   (uint64_t)nr)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.b_v, head, mtp->attn_v, n_embd,
+                                   n_head_kv * head_dim, g_mtp_pool.b_normed,
+                                   (uint64_t)nr)) ok = 0;
+        /* Per-row decode attention: identical kernel sequence to the
+         * sequential path (split-gated q, q/k norms, rope, F32 cache append,
+         * GQA decode), enqueued into the open region so rows cost dispatches,
+         * not syncs. */
+        for (int r = 0; ok && r < nr; r++) {
+            const uint64_t qb = q_out * sizeof(float);
+            const uint64_t kb = (uint64_t)kv_dim * sizeof(float);
+            const uint64_t hb = (uint64_t)n_head * head_dim * sizeof(float);
+            ds4_gpu_tensor *row_q = ds4_gpu_tensor_view(g_mtp_pool.b_q, (uint64_t)r * qb, qb);
+            ds4_gpu_tensor *row_k = ds4_gpu_tensor_view(g_mtp_pool.b_k, (uint64_t)r * kb, kb);
+            ds4_gpu_tensor *row_v = ds4_gpu_tensor_view(g_mtp_pool.b_v, (uint64_t)r * kb, kb);
+            ds4_gpu_tensor *row_g = ds4_gpu_tensor_view(g_mtp_pool.b_gate, (uint64_t)r * hb, hb);
+            ds4_gpu_tensor *row_h = ds4_gpu_tensor_view(g_mtp_pool.b_heads, (uint64_t)r * hb, hb);
+            if (row_q && row_k && row_v && row_g && row_h) {
+                if (!ds4_gpu_qwen_full_attn_tensor(row_h, row_q, row_k, row_v, row_g,
+                                                   g_mtp_pool.k_cache, g_mtp_pool.v_cache,
+                                                   map, map_size,
+                                                   mtp->attn_q_norm ? mtp->attn_q_norm->abs_offset : 0,
+                                                   mtp->attn_k_norm ? mtp->attn_k_norm->abs_offset : 0,
+                                                   mtp->attn_q_norm ? mtp->attn_q_norm->type : 0,
+                                                   mtp->attn_k_norm ? mtp->attn_k_norm->type : 0,
+                                                   mtp->attn_q_norm != NULL, mtp->attn_k_norm != NULL,
+                                                   gated_q, (uint32_t)(base + r), 0,
+                                                   g_mtp_pool.kv_cap)) ok = 0;
+            } else {
+                ok = 0;
+            }
+            if (row_q) ds4_gpu_tensor_free(row_q);
+            if (row_k) ds4_gpu_tensor_free(row_k);
+            if (row_v) ds4_gpu_tensor_free(row_v);
+            if (row_g) ds4_gpu_tensor_free(row_g);
+            if (row_h) ds4_gpu_tensor_free(row_h);
+        }
+        if (!ds4_gpu_end_commands()) ok = 0;
+    }
+    pthread_mutex_unlock(&g_mtp_pool.mu);
+    return ok;
+}
+
 __attribute__((unused))
 static int qwen_mtp_draft_one_metal_legacy(float *logits_out, float *hidden_out, const ds4_model *model, const ds4_weights *base_weights, const qwen_mtp_weights_t *mtp, const float *hidden_in, int next_token, uint32_t pos) {
     if (!qwen_mtp_is_valid(mtp) || !hidden_in) return 0;
@@ -19745,11 +20002,27 @@ static int qwen_mtp_draft_one_metal_legacy(float *logits_out, float *hidden_out,
 }
 #endif
 
-// ---- adaptive K (0..8) ----
+// ---- adaptive K (0..7, segmentedVerifyDepthCap) ----
+/* Uniform marginal price of the mlx.fast cost model. DS4_QWEN_MTP_H lets an
+ * orchestrator install a measured value; unset or <=0 keeps the built-in
+ * default. Parsed once per process. */
+static double qwen_mtp_price_h(void) {
+    static double h = -1.0; /* <0 until first parse */
+    if (h < 0.0) {
+        const char *s = getenv("DS4_QWEN_MTP_H");
+        const double v = s ? atof(s) : 0.0;
+        h = (v > 0.0) ? v : 0.18;
+    }
+    return h;
+}
 static int qwen_mtp_choose_k(int offered, double *ema) {
-    const double h = 0.18;
+    const double h = qwen_mtp_price_h();
+    /* Cap mirrors segmentedVerifyDepthCap (7), not the raw offer. The
+     * optional top-2 clamp at depths 0/1 from the reference cost model is
+     * omitted pending top-k plumbing in the verify pass, which currently
+     * exposes only a top-1 argmax. */
     int cap = offered;
-    if (cap > 8) cap = 8;
+    if (cap > 7) cap = 7;
     if (cap <= 0) return 0;
     double reach = 1.0;
     double expected = 0.0;
@@ -19766,13 +20039,19 @@ static int qwen_mtp_choose_k(int offered, double *ema) {
     }
     return depth;
 }
-static void qwen_mtp_update_ema(double *ema, int accepted, int drafted) {
+static void qwen_mtp_update_ema(double *ema, int accepted, int drafted,
+                                int last_draft_is_stop) {
     const double alpha = 0.15;
+    /* mlx.fast recordAcceptOutcome stoppedEarly: the round ended on a
+     * generation-stop draft token, so position [accepted] carries no
+     * evidence about draft quality -- suppress both the failure write and
+     * the fully-accepted optimism transfer toward 0.95. */
+    const int stopped_early =
+        accepted > 0 && accepted <= drafted && last_draft_is_stop;
     for (int i=0;i<accepted && i<8;i++) ema[i] += alpha*(1.0 - ema[i]);
-    if (accepted < drafted && accepted < 8) {
-        // check stop? ignore stop for now
+    if (!stopped_early && accepted < drafted && accepted < 8) {
         ema[accepted] += alpha*(0.0 - ema[accepted]);
-    } else if (accepted==drafted && drafted>0 && drafted<8) {
+    } else if (!stopped_early && accepted==drafted && drafted>0 && drafted<8) {
         if (ema[drafted] < 0.95) ema[drafted] += alpha*(0.95 - ema[drafted]);
     }
 }
@@ -41994,11 +42273,23 @@ static int qwen_generate_hybrid(
         if (prompt->len > (int)mtp_cap) {
             start_i = prompt->len - (int)mtp_cap;
         }
-        for (int i = start_i; i < prompt->len - 1; i++) {
-            uint32_t p = (uint32_t)(i - start_i);
-            qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
-                                     hidden_stash + (size_t)i * DS4_N_EMBD,
-                                     prompt->v[i + 1], p, 0, 1);
+        /* Batched priming is the default; DS4_QWEN_MTP_PRIMING_SEQ (non-empty,
+         * not "0") forces the original one-forward-per-token loop below. */
+        const char *seq_env = getenv("DS4_QWEN_MTP_PRIMING_SEQ");
+        const int force_seq = (seq_env && seq_env[0] && strcmp(seq_env, "0") != 0);
+        int primed = 0;
+        if (!force_seq) {
+            primed = qwen_mtp_priming_batched(model, weights, &mtp_w, hidden_stash,
+                                              prompt->v, start_i,
+                                              prompt->len - 1 - start_i, 1);
+        }
+        if (!primed) {
+            for (int i = start_i; i < prompt->len - 1; i++) {
+                uint32_t p = (uint32_t)(i - start_i);
+                qwen_mtp_draft_one_metal(NULL, NULL, NULL, model, weights, &mtp_w,
+                                         hidden_stash + (size_t)i * DS4_N_EMBD,
+                                         prompt->v[i + 1], p, 0, 1);
+            }
         }
         memcpy(g_mtp_verified_fused, g_mtp_prev_fused, sizeof(g_mtp_verified_fused));
     }
@@ -42113,7 +42404,7 @@ static int qwen_generate_hybrid(
             else qwen_forward_token_cpu(v_logits, model, weights, token, (uint32_t)pos);
 #endif
             pos++;
-            if (use_mtp) qwen_mtp_update_ema(ema, 0, drafted);
+            if (use_mtp) qwen_mtp_update_ema(ema, 0, drafted, 0);
             token = sample_argmax(v_logits, DS4_N_VOCAB);
             if (hidden) memcpy(hidden, v_hidden, (size_t)DS4_N_EMBD * sizeof(float));
             memcpy(logits, v_logits, (size_t)DS4_N_VOCAB * sizeof(float));
@@ -42123,7 +42414,9 @@ static int qwen_generate_hybrid(
         int accepted = 0;
         while (accepted < drafted && ver_argmax[accepted] == drafts[accepted]) accepted++;
         n_accepted += (uint64_t)accepted;
-        if (use_mtp) qwen_mtp_update_ema(ema, accepted, drafted);
+        if (use_mtp) qwen_mtp_update_ema(ema, accepted, drafted,
+                                         accepted > 0 && accepted <= drafted &&
+                                         vocab_token_is_generation_stop(vocab, drafts[accepted-1]));
 
         int done_now = 0;
         for (int d = 0; d < accepted; d++) {
@@ -42370,6 +42663,7 @@ static int qwen_generate_dflash2(
 
 
 #ifndef DS4_NO_GPU
+    qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
     if (e->backend != DS4_BACKEND_CPU &&
         qwen_engine_is_hybrid(e) &&
         !qwen_metal_ensure_pool()) {
@@ -44598,7 +44892,7 @@ static int generate_raw_swa_cpu(
                         memcpy(logits, tmp_logits_v, (size_t)DS4_N_VOCAB*sizeof(float));
                         if (vocab_token_is_generation_stop(vocab, primary)) break;
                         if (n_generated >= n_predict || pos >= ctx_size) break;
-                        qwen_mtp_update_ema(ema, 0, 0);
+                        qwen_mtp_update_ema(ema, 0, 0, 0);
                         continue;
                     }
                     bool need_bonus = true;
@@ -44662,7 +44956,9 @@ static int generate_raw_swa_cpu(
                     memcpy(hidden, next_hidden, (size_t)5120*sizeof(float));
                     memcpy(logits, next_logits, (size_t)DS4_N_VOCAB*sizeof(float));
                     (void)need_bonus;
-                    qwen_mtp_update_ema(ema, accepted, drafted);
+                    qwen_mtp_update_ema(ema, accepted, drafted,
+                                        accepted > 0 && accepted <= drafted &&
+                                        vocab_token_is_generation_stop(vocab, drafts[accepted-1]));
                     // stop if last emitted was stop
                     if (accepted>0 && vocab_token_is_generation_stop(vocab, drafts[accepted-1])) break;
                 }
@@ -54358,6 +54654,7 @@ static int generate_metal_graph_raw_swa(
                 fprintf(stderr, "ds4: using Qwen Metal MTP speculative (adaptive 0..8)\n");
                 qwen_mtp_metal_reset_kv();
                 // warm pools and pipelines (as in SOTA warmAllDepths)
+                qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
                 if (!qwen_metal_ensure_pool()) {
                     fprintf(stderr, "ds4: Qwen Metal pool warm failed\n");
                 } else {
@@ -54443,7 +54740,7 @@ static int generate_metal_graph_raw_swa(
                         memcpy(logits, tmp_logits_v, (size_t)DS4_N_VOCAB*sizeof(float));
                         if (vocab_token_is_generation_stop(vocab, primary)) break;
                         if (n_generated >= n_predict || pos >= ctx_size) break;
-                        qwen_mtp_update_ema(ema, 0, 0);
+                        qwen_mtp_update_ema(ema, 0, 0, 0);
                         continue;
                     }
                     bool need_bonus=true;
@@ -54496,7 +54793,9 @@ static int generate_metal_graph_raw_swa(
                     memcpy(hidden, next_hidden, (size_t)5120*sizeof(float));
                     memcpy(logits, next_logits, (size_t)DS4_N_VOCAB*sizeof(float));
                     (void)need_bonus;
-                    qwen_mtp_update_ema(ema, accepted, drafted);
+                    qwen_mtp_update_ema(ema, accepted, drafted,
+                                        accepted > 0 && accepted <= drafted &&
+                                        vocab_token_is_generation_stop(vocab, drafts[accepted-1]));
                     if (accepted>0 && vocab_token_is_generation_stop(vocab, drafts[accepted-1])) break;
                 }
             qwen_metal_done:
@@ -54509,6 +54808,7 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: using Qwen Metal generation (Q4_64A)\n");
         {
             for (int extra = 0; extra <= 8; extra++) { (void)extra; }
+            qwen_metal_pool_note_requested_ctx(ctx_size > 0 ? (uint32_t)ctx_size : 0u);
             if (!qwen_metal_ensure_pool()) { fprintf(stderr, "ds4: Qwen Metal pool warm failed\n"); }
         }
         float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
