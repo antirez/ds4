@@ -4680,13 +4680,18 @@ static void tensor_expect_layout(
 static bool tensor_type_is_glm_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
+           /* APEX-style mixed-precision files put the always-active tensors
+            * (token_embd, attn, output) on a per-layer precision gradient, so
+            * Q5_K shows up alongside the Q6_K already accepted here. Both have
+            * a CPU matvec via dflash2_matvec_kquant, a gathered-row dequant via
+            * dflash2_embed_row, and Metal dense kernels. */
+           type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
            type == DS4_TENSOR_Q4_0 ||
            type == DS4_TENSOR_Q4_64A ||
            type == DS4_TENSOR_Q2_64A ||
            type == DS4_TENSOR_NVFP4;
 }
-
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
@@ -7438,6 +7443,8 @@ static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token,
         embed_token_q2_64a(m, w, token, out);
         break;
     case DS4_TENSOR_Q4_K:
+    case DS4_TENSOR_Q5_K:
+    case DS4_TENSOR_Q6_K:
         dflash2_embed_row(out, m, w->token_embd, token);
         break;
 
@@ -17024,8 +17031,14 @@ static int qwen_gpu_moe_ffn(
          * n_embd for every routed Qwen MoE shape). The qwen hybrid path has no
          * TP expert split, so the expert-range rebasing inside both fused
          * entry points is the identity here, exactly as for the call above. */
+        static int glm_fused_disabled = -1;
+        if (glm_fused_disabled < 0) {
+            glm_fused_disabled =
+                getenv("DS4_QWEN_MOE_DISABLE_GLM_FUSED") ? 1 : 0;
+        }
         uint64_t uin = 0, uout = 0, urow = 0;
         (void)tensor_expert_bytes(model, lw->ffn_up_exps, 0, &uin, &uout, &urow);
+        if (glm_fused_disabled) { uin = 0; }
         if (uin == n_embd && uout == n_ff && urow != 0 && n_ff <= n_embd &&
             lw->ffn_gate_exps->type == lw->ffn_up_exps->type) {
             fused = ds4_gpu_glm_routed_moe_one_tensor(
