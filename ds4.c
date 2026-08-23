@@ -7564,6 +7564,57 @@ static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *
     }
 }
 
+static inline float dot_bf16_row(const uint16_t *row, const float *x, uint64_t n) {
+#if defined(__ARM_NEON)
+    uint64_t i = 0;
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t bv = vld1q_u16(row + i);
+        const float32x4_t h0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bv), 16));
+        const float32x4_t h1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bv), 16));
+        acc0 = vfmaq_f32(acc0, h0, vld1q_f32(x + i));
+        acc1 = vfmaq_f32(acc1, h1, vld1q_f32(x + i + 4));
+    }
+
+    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) acc += ds4_bf16_to_f32(row[i]) * x[i];
+    return acc;
+#else
+    float acc = 0.0f;
+    for (uint64_t i = 0; i < n; i++) acc += ds4_bf16_to_f32(row[i]) * x[i];
+    return acc;
+#endif
+}
+
+static void matvec_bf16_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_f16_ctx *ctx = vctx;
+
+    for (uint64_t o = row0; o < row1; o++) {
+        const uint16_t *row = ctx->data + o * ctx->in_dim;
+        ctx->out[o] = dot_bf16_row(row, ctx->x, ctx->in_dim);
+    }
+}
+
+/* Dense BF16 matvec: bundled and sidecar MTP heads ship bf16 weights, so the
+ * CPU draft path has to evaluate them instead of dying on an unknown type. */
+static void matvec_bf16(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+    if (w->type != DS4_TENSOR_BF16 || w->ndim != 2) ds4_die("expected a 2D BF16 tensor");
+
+    const uint64_t in_dim = w->dim[0];
+    const uint64_t out_dim = w->dim[1];
+    matvec_f16_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .x = x,
+        .in_dim = in_dim,
+    };
+
+    const uint64_t ops = in_dim * out_dim;
+    const uint64_t min_rows = ops >= 262144 ? 1 : 512;
+    ds4_parallel_for_min_rows(out_dim, matvec_bf16_worker, &ctx, min_rows);
+}
+
 typedef struct {
     float *out;
     const uint8_t *data;
@@ -8630,6 +8681,7 @@ static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, cons
     case DS4_TENSOR_Q4_64A: matvec_q4_64a(out, m, w, x); break;
     case DS4_TENSOR_Q2_64A: matvec_q2_64a(out, m, w, x); break;
     case DS4_TENSOR_NVFP4: matvec_nvfp4(out, m, w, x); break;
+    case DS4_TENSOR_BF16: matvec_bf16(out, m, w, x); break;
     default:
         ds4_die("unsupported tensor type for dense matvec");
     }
@@ -19169,7 +19221,13 @@ static int qwen_mtp_metal_ensure_pool(void) {
     const uint64_t q_full = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * 2ull;
     const uint64_t heads = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-    uint64_t mtp_kv_cap = (uint64_t)QWEN_MTP_KV_CAP;
+    /* The nextn head is a full-attention layer with no sliding window, so its
+     * private KV has to span the whole session context: a short cap stops
+     * drafting (and drops to the per-token CPU head) once decode passes it. */
+    uint64_t mtp_kv_cap = g_qwen_pool.inited
+                              ? (uint64_t)g_qwen_pool.max_ctx
+                              : (uint64_t)qwen_metal_pool_effective_max_ctx();
+    if (mtp_kv_cap < (uint64_t)QWEN_MTP_KV_CAP) mtp_kv_cap = (uint64_t)QWEN_MTP_KV_CAP;
     struct { ds4_gpu_tensor **slot; uint64_t bytes; } want[] = {
         { &g_mtp_pool.hidden,     n_embd * f },
         { &g_mtp_pool.e_emb,      n_embd * f },
@@ -19200,16 +19258,11 @@ static int qwen_mtp_metal_ensure_pool(void) {
         { &g_mtp_pool.v_cache,    mtp_kv_cap * kv * f },
     };
     const size_t n_want = sizeof(want) / sizeof(want[0]);
-    int ok = 1;
-    for (size_t i = 0; i < n_want; i++) {
-        *want[i].slot = ds4_gpu_tensor_alloc(want[i].bytes);
-        if (!*want[i].slot) ok = 0;
-    }
-    if (!ok) {
-        for (size_t i = 0; i < n_want; i++) {
-            if (*want[i].slot) { ds4_gpu_tensor_free(*want[i].slot); *want[i].slot = NULL; }
-        }
-        mtp_kv_cap = 512ull;
+    const uint64_t cap_ladder[] = { mtp_kv_cap, (uint64_t)QWEN_MTP_KV_CAP, 512ull };
+    int ok = 0;
+    for (size_t c = 0; !ok && c < sizeof(cap_ladder) / sizeof(cap_ladder[0]); c++) {
+        if (c && cap_ladder[c] >= mtp_kv_cap) continue;
+        mtp_kv_cap = cap_ladder[c];
         want[n_want - 2].bytes = mtp_kv_cap * kv * f;
         want[n_want - 1].bytes = mtp_kv_cap * kv * f;
         ok = 1;
@@ -19217,10 +19270,9 @@ static int qwen_mtp_metal_ensure_pool(void) {
             *want[i].slot = ds4_gpu_tensor_alloc(want[i].bytes);
             if (!*want[i].slot) ok = 0;
         }
-        if (!ok) {
-            for (size_t i = 0; i < n_want; i++) {
-                if (*want[i].slot) { ds4_gpu_tensor_free(*want[i].slot); *want[i].slot = NULL; }
-            }
+        if (ok) break;
+        for (size_t i = 0; i < n_want; i++) {
+            if (*want[i].slot) { ds4_gpu_tensor_free(*want[i].slot); *want[i].slot = NULL; }
         }
     }
     if (ok) {
