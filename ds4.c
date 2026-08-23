@@ -4680,13 +4680,18 @@ static void tensor_expect_layout(
 static bool tensor_type_is_glm_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
+           /* APEX-style mixed-precision files put the always-active tensors
+            * (token_embd, attn, output) on a per-layer precision gradient, so
+            * Q5_K shows up alongside the Q6_K already accepted here. Both have
+            * a CPU matvec via dflash2_matvec_kquant, a gathered-row dequant via
+            * dflash2_embed_row, and Metal dense kernels. */
+           type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
            type == DS4_TENSOR_Q4_0 ||
            type == DS4_TENSOR_Q4_64A ||
            type == DS4_TENSOR_Q2_64A ||
            type == DS4_TENSOR_NVFP4;
 }
-
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
@@ -7438,6 +7443,8 @@ static void embed_token_any(const ds4_model *m, const ds4_weights *w, int token,
         embed_token_q2_64a(m, w, token, out);
         break;
     case DS4_TENSOR_Q4_K:
+    case DS4_TENSOR_Q5_K:
+    case DS4_TENSOR_Q6_K:
         dflash2_embed_row(out, m, w->token_embd, token);
         break;
 
@@ -17006,6 +17013,71 @@ static int qwen_gpu_moe_ffn(
             DS4_N_EXPERT, DS4_N_EXPERT_USED,
             DS4_SWIGLU_CLAMP_EXP,
             ffn_normed, NULL, il, false);
+    }
+    if (!fused) {
+        /* The generic mul_mv_id family has no Q5_K/Q6_K expert kernels, but the
+         * GLM routed-MoE family does (Q2_K/Q4_K/Q5_K gate+up pair, and
+         * Q2_K/Q4_K/Q5_K/Q6_K down). Its SwiGLU is unclamped and it folds the
+         * route weight into mid, which matches this shape exactly
+         * (swiglu_clamp_exp = 0, expert_weight_scale = 1), and its down kernel
+         * overwrites out with the full routed sum. Without this, APEX-style
+         * mixed-precision Ornith files put every MoE layer on the per-expert
+         * path below: 3 matmuls + swiglu + scale + add per selected expert,
+         * i.e. 24 dispatches per layer instead of 2. It returns 0 for any
+         * combination it cannot prove safe, leaving that path intact.
+         *
+         * moe_experts is DS4_N_EXPERT_USED * n_embd floats, which covers the
+         * DS4_N_EXPERT_USED * n_ff mid buffer the GLM kernels want (n_ff <=
+         * n_embd for every routed Qwen MoE shape). The qwen hybrid path has no
+         * TP expert split, so the expert-range rebasing inside both fused
+         * entry points is the identity here, exactly as for the call above. */
+        static int glm_fused_disabled = -1;
+        if (glm_fused_disabled < 0) {
+            glm_fused_disabled =
+                getenv("DS4_QWEN_MOE_DISABLE_GLM_FUSED") ? 1 : 0;
+        }
+        uint64_t uin = 0, uout = 0, urow = 0;
+        (void)tensor_expert_bytes(model, lw->ffn_up_exps, 0, &uin, &uout, &urow);
+        if (glm_fused_disabled) { uin = 0; }
+        if (uin == n_embd && uout == n_ff && urow != 0 && n_ff <= n_embd &&
+            lw->ffn_gate_exps->type == lw->ffn_up_exps->type) {
+            fused = ds4_gpu_glm_routed_moe_one_tensor(
+                g_qwen_pool.moe_routed,
+                g_qwen_pool.moe_experts,
+                model->map, model->size,
+                lw->ffn_gate_exps->abs_offset,
+                lw->ffn_up_exps->abs_offset,
+                lw->ffn_down_exps->abs_offset,
+                lw->ffn_gate_exps->type,
+                lw->ffn_up_exps->type,
+                lw->ffn_down_exps->type,
+                gout * grow, grow,
+                uout * urow, urow,
+                dout * drow, drow,
+                n_embd, n_ff, n_embd,
+                g_qwen_pool.moe_selected, g_qwen_pool.moe_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                il, ffn_normed, false);
+        }
+    }
+    /* Reports the routed-MoE path taken per layer once per process. Mixed
+     * per-tensor precision (APEX-style files) makes the choice vary layer to
+     * layer, so "why is this model slow" needs an answer that does not require
+     * a debugger. Callers hold g_qwen_pool.mu, so the latch is race-free. */
+    static int moe_path_debug = -1;
+    if (moe_path_debug < 0) {
+        moe_path_debug = getenv("DS4_QWEN_MOE_PATH_DEBUG") ? 1 : 0;
+    }
+    if (moe_path_debug) {
+        static int dbg_seen[DS4_MAX_LAYER];
+        if (il < DS4_MAX_LAYER && !dbg_seen[il]) {
+            dbg_seen[il] = 1;
+            fprintf(stderr,
+                    "ds4-moe-path: layer %2u gate=%u up=%u down=%u -> %s\n",
+                    il, lw->ffn_gate_exps->type, lw->ffn_up_exps->type,
+                    lw->ffn_down_exps->type,
+                    fused ? "fused" : "per-expert");
+        }
     }
     if (!fused) {
         if (!ds4_gpu_fill_f32_tensor(g_qwen_pool.moe_routed, 0.0f, n_embd)) return 0;

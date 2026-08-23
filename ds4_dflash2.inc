@@ -234,6 +234,63 @@ static void dflash2_q4k_dequant_row(float *out, const block_q4_K *x, int n) {
     }
 }
 
+/* Q5_K/Q6_K row dequantizers, mirroring ds4_vec_dot_q5_K_f32 and
+ * ds4_vec_dot_q6_K_f32 element for element so a gathered embedding row agrees
+ * with what the matvec paths would compute from the same bytes. APEX-style
+ * mixed-precision files put token_embd at Q5_K or Q6_K. */
+static void dflash2_q5k_dequant_row(float *out, const block_q5_K *x, int n) {
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float dmin = f16_to_f32(x[i].dmin);
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *scales = x[i].scales;
+        float *ob = out + (uint64_t)i * QK_K;
+        for (int group = 0; group < QK_K / 32; group++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(group, scales, &sc_val, &m_val);
+            const int ql_base = (group >> 1) * 32;
+            const int shift = (group & 1) * 4;
+            const uint8_t hmask = (uint8_t)(1u << group);
+            const float scale = d * (float)sc_val;
+            const float minv = dmin * (float)m_val;
+            for (int l = 0; l < 32; l++) {
+                const int q = ((ql[ql_base + l] >> shift) & 0x0F) +
+                              ((qh[l] & hmask) ? 16 : 0);
+                ob[group * 32 + l] = scale * (float)q - minv;
+            }
+        }
+    }
+}
+
+static void dflash2_q6k_dequant_row(float *out, const block_q6_K *x, int n) {
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *scales = x[i].scales;
+        float *ob = out + (uint64_t)i * QK_K;
+        for (int n128 = 0; n128 < QK_K; n128 += 128) {
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                const int q1 = ((int)(ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = ((int)(ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = ((int)(ql[l +  0] >>   4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = ((int)(ql[l + 32] >>   4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                ob[n128 + l +  0] = d * (float)scales[is + 0] * (float)q1;
+                ob[n128 + l + 32] = d * (float)scales[is + 2] * (float)q2;
+                ob[n128 + l + 64] = d * (float)scales[is + 4] * (float)q3;
+                ob[n128 + l + 96] = d * (float)scales[is + 6] * (float)q4;
+            }
+            ql += 64;
+            qh += 32;
+            scales += 8;
+        }
+    }
+}
+
 static void dflash2_embed_row(float *out, const ds4_model *m, const ds4_tensor *w, int token) {
     if (!w || w->ndim != 2) ds4_die("expected a 2D embedding tensor");
     const uint64_t dim = w->dim[0];
@@ -247,6 +304,20 @@ static void dflash2_embed_row(float *out, const ds4_model *m, const ds4_tensor *
         const uint64_t row_bytes = (dim / QK_K) * sizeof(block_q4_K);
         const block_q4_K *row = (const block_q4_K *)((const uint8_t *)tensor_data(m, w) + (uint64_t)token * row_bytes);
         dflash2_q4k_dequant_row(out, row, (int)dim);
+        return;
+    }
+    if (w->type == DS4_TENSOR_Q5_K) {
+        if (dim % QK_K != 0) ds4_die("Q5_K embed row is not aligned");
+        const uint64_t row_bytes = (dim / QK_K) * sizeof(block_q5_K);
+        const block_q5_K *row = (const block_q5_K *)((const uint8_t *)tensor_data(m, w) + (uint64_t)token * row_bytes);
+        dflash2_q5k_dequant_row(out, row, (int)dim);
+        return;
+    }
+    if (w->type == DS4_TENSOR_Q6_K) {
+        if (dim % QK_K != 0) ds4_die("Q6_K embed row is not aligned");
+        const uint64_t row_bytes = (dim / QK_K) * sizeof(block_q6_K);
+        const block_q6_K *row = (const block_q6_K *)((const uint8_t *)tensor_data(m, w) + (uint64_t)token * row_bytes);
+        dflash2_q6k_dequant_row(out, row, (int)dim);
         return;
     }
     ds4_die("unsupported DFlash2 embedding type");

@@ -11168,9 +11168,16 @@ int ds4_gpu_embed_token_quant_tensor(
 
         uint64_t weight_bytes = 0;
         uint64_t row_bytes = 0;
-        if (!ds4_gpu_quant_table_bytes(weight_type, n_vocab, n_embd, &weight_bytes) ||
-            !ds4_gpu_quant_row_bytes(weight_type, n_embd, &row_bytes) ||
-            weight_offset > model_size ||
+        if (!ds4_gpu_quant_row_bytes(weight_type, n_embd, &row_bytes) ||
+            !ds4_gpu_quant_table_bytes(weight_type, n_vocab, n_embd, &weight_bytes)) {
+            /* No get_rows path for this quant (e.g. Q5_K token_embd in
+             * APEX-style files): the caller gathers the row on the host, which
+             * is one row per token against 40 layers of matmuls. Returning 0 is
+             * the documented "not supported" answer, so do not report it as a
+             * range error once per token. */
+            return 0;
+        }
+        if (weight_offset > model_size ||
             weight_bytes > model_size - weight_offset) {
             fprintf(stderr, "ds4: Metal quant embedding range is outside the mapped model\n");
             return 0;
@@ -11255,8 +11262,11 @@ int ds4_gpu_embed_tokens_quant_tensor(
         }
 
         uint64_t weight_bytes = 0;
-        if (!ds4_gpu_quant_table_bytes(weight_type, n_vocab, n_embd, &weight_bytes) ||
-            weight_offset > model_size ||
+        if (!ds4_gpu_quant_table_bytes(weight_type, n_vocab, n_embd, &weight_bytes)) {
+            /* Unsupported quant for get_rows: the caller embeds on the host. */
+            return 0;
+        }
+        if (weight_offset > model_size ||
             weight_bytes > model_size - weight_offset) {
             static int warned;
             if (!warned++) {
