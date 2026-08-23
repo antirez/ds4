@@ -58251,12 +58251,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool support_model_runtime_ready =
             e->mtp_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+        /* The support model rides a SECONDARY mapping: the primary
+         * set_model_map path is single-model and would release the main
+         * model's cached ranges + dequant caches and unregister its host
+         * mapping, poisoning every later main-weight resolution. */
         if (support_model_runtime_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
+            !ds4_gpu_set_secondary_model_map(e->mtp_model.map,
+                                             e->mtp_model.size,
+                                             e->mtp_model.tensor_data_pos,
+                                             e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                             e->mtp_model.max_tensor_bytes))
         {
             fprintf(stderr,
                     "ds4: %s failed to map support model views; aborting startup. "
