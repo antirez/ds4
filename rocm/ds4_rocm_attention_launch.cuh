@@ -258,6 +258,19 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    head_dim);
         return cuda_ok(cudaGetLastError(), "attention raw window launch");
     }
+    /* Tiled fused online-prefill for larger windows (head_dim=512).
+     * Single-pass variant: online softmax with double-precision correction.
+     * Loads KV once, no separate score/softmax/value passes. */
+    if (n_tokens > 1 && head_dim == 512 && !g_quality_mode) {
+        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+        attention_prefill_sp_online_kernel<<<grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_tokens, window, n_head, head_dim);
+        return cuda_ok(cudaGetLastError(), "attention sp online launch");
+    }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
         const uint32_t n_keys = n_tokens;
         const uint64_t score_count = (uint64_t)n_head * n_tokens * n_keys;
@@ -271,48 +284,76 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         float *out_tmp = (float *)((char *)tmp + out_offset);
         const float alpha = 1.0f / sqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
-                                                      CUBLAS_OP_T,
-                                                      CUBLAS_OP_N,
-                                                      (int)n_keys,
-                                                      (int)n_tokens,
-                                                      (int)head_dim,
-                                                      &alpha,
-                                                      (const float *)raw_kv->ptr,
-                                                      (int)head_dim,
-                                                      0,
-                                                      (const float *)q->ptr,
-                                                      (int)(n_head * head_dim),
-                                                      (long long)head_dim,
-                                                      &beta,
-                                                      scores,
-                                                      (int)n_keys,
-                                                      (long long)n_keys * n_tokens,
-                                                      (int)n_head);
-        if (!cublas_ok(st, "attention raw score gemm")) return 0;
+        int gemm_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_hipblaslt_ready)
+            gemm_ok = hipblaslt_gemm_strided_batched_f32(
+                    scores,
+                    (const float *)raw_kv->ptr,
+                    (const float *)q->ptr,
+                    HIPBLAS_OP_T, HIPBLAS_OP_N,
+                    n_keys, n_tokens, head_dim,
+                    0, (int64_t)head_dim, (int64_t)n_keys * n_tokens,
+                    n_head, alpha, beta, "raw_score");
+#endif
+        if (!gemm_ok) {
+            cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+                                                          CUBLAS_OP_T,
+                                                          CUBLAS_OP_N,
+                                                          (int)n_keys,
+                                                          (int)n_tokens,
+                                                          (int)head_dim,
+                                                          &alpha,
+                                                          (const float *)raw_kv->ptr,
+                                                          (int)head_dim,
+                                                          0,
+                                                          (const float *)q->ptr,
+                                                          (int)(n_head * head_dim),
+                                                          (long long)head_dim,
+                                                          &beta,
+                                                          scores,
+                                                          (int)n_keys,
+                                                          (long long)n_keys * n_tokens,
+                                                          (int)n_head);
+            if (!cublas_ok(st, "attention raw score gemm")) return 0;
+        }
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_raw_softmax_kernel<<<sgrid, 256>>>(scores, sinks, n_tokens, window, n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention raw softmax launch")) return 0;
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
-                                       CUBLAS_OP_N,
-                                       CUBLAS_OP_N,
-                                       (int)head_dim,
-                                       (int)n_tokens,
-                                       (int)n_keys,
-                                       &one,
-                                       (const float *)raw_kv->ptr,
-                                       (int)head_dim,
-                                       0,
-                                       scores,
-                                       (int)n_keys,
-                                       (long long)n_keys * n_tokens,
-                                       &beta,
-                                       out_tmp,
-                                       (int)head_dim,
-                                       (long long)head_dim * n_tokens,
-                                       (int)n_head);
-        if (!cublas_ok(st, "attention raw value gemm")) return 0;
+        gemm_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_hipblaslt_ready)
+            gemm_ok = hipblaslt_gemm_strided_batched_f32(
+                    out_tmp,
+                    (const float *)raw_kv->ptr,
+                    scores,
+                    HIPBLAS_OP_N, HIPBLAS_OP_N,
+                    head_dim, n_tokens, n_keys,
+                    0, (int64_t)n_keys * n_tokens, (int64_t)head_dim * n_tokens,
+                    n_head, one, beta, "raw_value");
+#endif
+        if (!gemm_ok) {
+            cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+                                                           CUBLAS_OP_N,
+                                                           CUBLAS_OP_N,
+                                                           (int)head_dim,
+                                                           (int)n_tokens,
+                                                           (int)n_keys,
+                                                           &one,
+                                                           (const float *)raw_kv->ptr,
+                                                           (int)head_dim,
+                                                           0,
+                                                           scores,
+                                                           (int)n_keys,
+                                                           (long long)n_keys * n_tokens,
+                                                           &beta,
+                                                           out_tmp,
+                                                           (int)head_dim,
+                                                           (long long)head_dim * n_tokens,
+                                                           (int)n_head);
+            if (!cublas_ok(st, "attention raw value gemm")) return 0;
+        }
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
         attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
                                                                         out_tmp,
@@ -836,25 +877,39 @@ static int attention_prefill_mixed_launch(
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = 1.0f / sqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
-                                                      CUBLAS_OP_T,
-                                                      CUBLAS_OP_N,
-                                                      (int)n_keys,
-                                                      (int)n_tokens,
-                                                      (int)head_dim,
-                                                      &alpha,
-                                                      kv,
-                                                      (int)head_dim,
-                                                      0,
-                                                      (const float *)q->ptr,
-                                                      (int)(n_head * head_dim),
-                                                      (long long)head_dim,
-                                                      &beta,
-                                                      scores,
-                                                      (int)n_keys,
-                                                      (long long)n_keys * n_tokens,
-                                                      (int)n_head);
-        if (!cublas_ok(st, "attention mixed score gemm")) return 0;
+        int gemm_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_hipblaslt_ready)
+            gemm_ok = hipblaslt_gemm_strided_batched_f32(
+                    scores,
+                    kv,
+                    (const float *)q->ptr,
+                    HIPBLAS_OP_T, HIPBLAS_OP_N,
+                    n_keys, n_tokens, head_dim,
+                    0, (int64_t)head_dim, (int64_t)n_keys * n_tokens,
+                    n_head, alpha, beta, "mixed_score");
+#endif
+        if (!gemm_ok) {
+            cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+                                                          CUBLAS_OP_T,
+                                                          CUBLAS_OP_N,
+                                                          (int)n_keys,
+                                                          (int)n_tokens,
+                                                          (int)head_dim,
+                                                          &alpha,
+                                                          kv,
+                                                          (int)head_dim,
+                                                          0,
+                                                          (const float *)q->ptr,
+                                                          (int)(n_head * head_dim),
+                                                          (long long)head_dim,
+                                                          &beta,
+                                                          scores,
+                                                          (int)n_keys,
+                                                          (long long)n_keys * n_tokens,
+                                                          (int)n_head);
+            if (!cublas_ok(st, "attention mixed score gemm")) return 0;
+        }
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
                 scores,
@@ -868,25 +923,39 @@ static int attention_prefill_mixed_launch(
                 n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
-                                       CUBLAS_OP_N,
-                                       CUBLAS_OP_N,
-                                       (int)head_dim,
-                                       (int)n_tokens,
-                                       (int)n_keys,
-                                       &one,
-                                       kv,
-                                       (int)head_dim,
-                                       0,
-                                       scores,
-                                       (int)n_keys,
-                                       (long long)n_keys * n_tokens,
-                                       &beta,
-                                       out_tmp,
-                                       (int)head_dim,
-                                       (long long)head_dim * n_tokens,
-                                       (int)n_head);
-        if (!cublas_ok(st, "attention mixed value gemm")) return 0;
+        gemm_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (g_hipblaslt_ready)
+            gemm_ok = hipblaslt_gemm_strided_batched_f32(
+                    out_tmp,
+                    kv,
+                    scores,
+                    HIPBLAS_OP_N, HIPBLAS_OP_N,
+                    head_dim, n_tokens, n_keys,
+                    0, (int64_t)n_keys * n_tokens, (int64_t)head_dim * n_tokens,
+                    n_head, one, beta, "mixed_value");
+#endif
+        if (!gemm_ok) {
+            cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
+                                                           CUBLAS_OP_N,
+                                                           CUBLAS_OP_N,
+                                                           (int)head_dim,
+                                                           (int)n_tokens,
+                                                           (int)n_keys,
+                                                           &one,
+                                                           kv,
+                                                           (int)head_dim,
+                                                           0,
+                                                           scores,
+                                                           (int)n_keys,
+                                                           (long long)n_keys * n_tokens,
+                                                           &beta,
+                                                           out_tmp,
+                                                           (int)head_dim,
+                                                           (long long)head_dim * n_tokens,
+                                                           (int)n_head);
+            if (!cublas_ok(st, "attention mixed value gemm")) return 0;
+        }
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
         attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
                                                                         out_tmp,
