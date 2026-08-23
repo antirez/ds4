@@ -8383,8 +8383,16 @@ static void metrics_decode_progress(int tokens, bool thinking,
     pthread_mutex_unlock(&g_server_metrics.mu);
 }
 
-static void metrics_prefill_progress(double chunk_tps, double avg_tps) {
+/* Prompt tokens are accumulated per prefill chunk rather than in one jump
+ * at prompt completion: a whole prompt landing on the counter between two
+ * scrapes renders as an impossible rate() spike (a 27k-token prompt over a
+ * 30 s scrape interval reads as 900 tokens/s). metrics_prompt_done() adds
+ * only the remainder the chunk callbacks have not seen. */
+static void metrics_prefill_progress(int interval_tokens, double chunk_tps,
+                                     double avg_tps) {
+    if (interval_tokens < 0) interval_tokens = 0;
     pthread_mutex_lock(&g_server_metrics.mu);
+    g_server_metrics.prompt_tokens_total += (uint64_t)interval_tokens;
     g_server_metrics.prefill_tps_chunk = chunk_tps;
     g_server_metrics.prefill_tps_avg = avg_tps;
     pthread_mutex_unlock(&g_server_metrics.mu);
@@ -8402,8 +8410,9 @@ static void metrics_bucket_add(uint64_t *buckets, const double *bounds,
      * total count), which render derives from _count. */
 }
 
-static void metrics_prompt_done(int evaluated_tokens, int reused_tokens,
+static void metrics_prompt_done(int remainder_tokens, int reused_tokens,
                                 const char *cache_source, double seconds) {
+    int evaluated_tokens = remainder_tokens;
     if (evaluated_tokens < 0) evaluated_tokens = 0;
     if (reused_tokens < 0) reused_tokens = 0;
     pthread_mutex_lock(&g_server_metrics.mu);
@@ -10320,6 +10329,7 @@ typedef struct {
     double t0;
     double last_t;
     int last_current;
+    int metrics_counted; /* evaluated tokens already added to the metrics counter */
     bool seen;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
@@ -10785,7 +10795,18 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
-    metrics_prefill_progress(chunk_tps, avg_tps);
+    int metrics_add = interval_tokens;
+    {
+        /* Never let display-window resets count cached tokens as evaluated:
+         * cap the per-request total at prompt_tokens - cached_tokens. */
+        const int evaluated_total = p->prompt_tokens - p->cached_tokens;
+        if (evaluated_total <= 0) metrics_add = 0;
+        else if (p->metrics_counted + metrics_add > evaluated_total)
+            metrics_add = evaluated_total - p->metrics_counted;
+        if (metrics_add < 0) metrics_add = 0;
+    }
+    p->metrics_counted += metrics_add;
+    metrics_prefill_progress(metrics_add, chunk_tps, avg_tps);
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
@@ -11640,8 +11661,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, slot);
-    metrics_prompt_done(prompt_tokens - cached, cached, cache_source,
-                        now_sec() - t0);
+    /* Chunk callbacks already accumulated progress.metrics_counted evaluated
+     * tokens; add only what they have not seen (small prompts may produce no
+     * chunk callbacks at all). */
+    metrics_prompt_done((prompt_tokens - cached) - progress.metrics_counted,
+                        cached, cache_source, now_sec() - t0);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -18580,9 +18604,11 @@ static void test_metrics_text(void) {
     memset(&g_server_metrics, 0, sizeof(g_server_metrics));
     pthread_mutex_init(&g_server_metrics.mu, NULL);
 
-    metrics_prompt_done(2739, 0, "none", 60.872);
+    /* Chunk-incremental prompt accounting: two chunks then the remainder. */
+    metrics_prefill_progress(2048, 33.60, 33.60);
+    metrics_prefill_progress(600, 31.51, 45.00);
+    metrics_prompt_done(91, 0, "none", 60.872);
     metrics_prompt_done(100, 1900, "memory-rewind", 0.4);
-    metrics_prefill_progress(31.51, 45.00);
     metrics_decode_progress(50, true, 5.41, 5.41);
     metrics_decode_progress(39, false, 5.48, 5.46);
     metrics_request_finish("stop", 129.107);
