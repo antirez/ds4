@@ -11,6 +11,7 @@
 /*.gguf
 /TODO.md
 /gguf/
+/qwen38-mtp-fixtures/
 /core
 /core.*
 /tests/test_engine_mgpu_placement

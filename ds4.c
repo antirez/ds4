@@ -16670,6 +16670,9 @@ static struct {
     ds4_gpu_tensor *batch_cur, *batch_next, *batch_normed, *batch_q, *batch_k, *batch_v, *batch_heads;
     ds4_gpu_tensor *batch_attn_out, *batch_after_attn, *batch_ffn_normed, *batch_gate, *batch_up, *batch_mid, *batch_ffn_out;
     ds4_gpu_tensor *batch_logits, *batch_norm, *batch_tokens, *batch_argmax, *batch_gdn_core;
+    /* [8][2] int32 top-2 indices for the opt-in DS4_QWEN_MTP_TOP2 clamp.
+     * Pooled (not function-static) so pool teardown cannot leave a dangle. */
+    ds4_gpu_tensor *batch_top2;
     ds4_gpu_tensor *gdn_conv_snap, *gdn_state_snap;
     ds4_gpu_tensor *gdn_conv_step[8], *gdn_state_step[8];
     ds4_gpu_tensor *layer_stash;
@@ -16753,6 +16756,7 @@ static void qwen_metal_pool_free_all(void) {
         &g_qwen_pool.batch_gate, &g_qwen_pool.batch_up, &g_qwen_pool.batch_mid,
         &g_qwen_pool.batch_ffn_out, &g_qwen_pool.batch_logits, &g_qwen_pool.batch_norm,
         &g_qwen_pool.batch_tokens, &g_qwen_pool.batch_argmax, &g_qwen_pool.batch_gdn_core,
+        &g_qwen_pool.batch_top2,
         &g_qwen_pool.gdn_conv_snap, &g_qwen_pool.gdn_state_snap,
         &g_qwen_pool.layer_stash, &g_qwen_pool.gdn_conv_steps, &g_qwen_pool.gdn_state_steps,
         &g_qwen_pool.batch_moe_logits, &g_qwen_pool.batch_moe_probs, &g_qwen_pool.batch_moe_selected,
@@ -16884,6 +16888,9 @@ static int qwen_metal_ensure_pool(void) {
     g_qwen_pool.batch_norm = ds4_gpu_tensor_alloc((uint64_t)batch_cap * n_embd * sizeof(float));
     g_qwen_pool.batch_tokens = ds4_gpu_tensor_alloc((uint64_t)batch_cap * sizeof(int32_t));
     g_qwen_pool.batch_argmax = ds4_gpu_tensor_alloc((uint64_t)batch_cap * sizeof(int32_t));
+    /* 64 B; not in the pool-ok predicate so a failure cannot break the
+     * default path -- the opt-in top-2 reader null-checks it. */
+    g_qwen_pool.batch_top2 = ds4_gpu_tensor_alloc(8u * 2u * sizeof(int32_t));
     g_qwen_pool.batch_gdn_core = ds4_gpu_tensor_alloc((uint64_t)batch_cap * QWEN_GDN_Z * sizeof(float));
     g_qwen_pool.gdn_conv_snap = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_QKV * QWEN_GDN_CONV_K * sizeof(float));
     g_qwen_pool.gdn_state_snap = ds4_gpu_tensor_alloc((uint64_t)n_layer * QWEN_GDN_V_HEADS * QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM * sizeof(float));
@@ -17841,6 +17848,59 @@ static int qwen_metal_ensure_layer_stash(void) {
     return g_qwen_pool.layer_stash != NULL;
 }
 
+/* Per-position target top-2 index buffer: [n_tok][2] int32, descending.
+ * Sized for the MTP verify cap (8). Lives in g_qwen_pool so pool teardown
+ * frees and nulls it -- a function-static would dangle after cleanup. */
+static ds4_gpu_tensor *qwen_mtp_top2_idx_tensor(void) {
+    return g_qwen_pool.batch_top2;
+}
+
+/* Read back [n_tok][2] indices (already reduced) and two 4-byte logit
+ * values per row. margin = logit[top1] - logit[top2]. Does not encode. */
+static int qwen_mtp_read_top2_margins(ds4_gpu_tensor *logits,
+                                      ds4_gpu_tensor *sel,
+                                      uint32_t n_vocab,
+                                      uint32_t n_tok,
+                                      float *margin_out,
+                                      int *argmax_out) {
+    int32_t idx[16];
+    if (!logits || !sel || n_tok == 0 || n_tok > 8u) return 0;
+    if (!ds4_gpu_tensor_read(sel, 0, idx, (uint64_t)n_tok * 2u * sizeof(int32_t))) return 0;
+    for (uint32_t i = 0; i < n_tok; i++) {
+        const int32_t t1 = idx[(size_t)i * 2u];
+        const int32_t t2 = idx[(size_t)i * 2u + 1u];
+        if (argmax_out) argmax_out[i] = (int)t1;
+        if (!margin_out) continue;
+        if (t1 < 0 || t2 < 0 || (uint32_t)t1 >= n_vocab || (uint32_t)t2 >= n_vocab) {
+            margin_out[i] = -1.0f;
+            continue;
+        }
+        float v1 = 0.0f, v2 = 0.0f;
+        if (!ds4_gpu_tensor_read(logits,
+                                 ((uint64_t)i * n_vocab + (uint32_t)t1) * sizeof(float),
+                                 &v1, sizeof(float)) ||
+            !ds4_gpu_tensor_read(logits,
+                                 ((uint64_t)i * n_vocab + (uint32_t)t2) * sizeof(float),
+                                 &v2, sizeof(float))) {
+            margin_out[i] = -1.0f;
+            continue;
+        }
+        margin_out[i] = v1 - v2;
+    }
+    return 1;
+}
+
+/* Own-buffer top-2 after the producer has already finished (n_tok==1/2 paths). */
+static void qwen_mtp_fill_margins_from_logits(ds4_gpu_tensor *logits,
+                                             uint32_t n_vocab,
+                                             uint32_t n_tok,
+                                             float *margin_out) {
+    ds4_gpu_tensor *sel = qwen_mtp_top2_idx_tensor();
+    if (!sel) return;
+    if (!ds4_gpu_indexer_topk_tensor(sel, logits, n_vocab, n_tok, 2)) return;
+    (void)qwen_mtp_read_top2_margins(logits, sel, n_vocab, n_tok, margin_out, NULL);
+}
+
 static int qwen_hybrid_restore_gdn_prefix(ds4_qwen_session_state *qs, uint32_t t) {
     if (qwen_mlx_bf16_runtime()) return t == 0u && qwen_mlx_restore_gdn();
     if (!g_qwen_pool.inited || !g_qwen_pool.gdn_conv_steps || !g_qwen_pool.gdn_state_steps) return 0;
@@ -17873,19 +17933,28 @@ static int qwen_hybrid_metal_forward_tokens(
         const ds4_weights *weights,
         const int *tokens,
         uint32_t n_tok,
-        uint32_t pos0) {
+        uint32_t pos0,
+        float *margin_out) {
     const uint32_t n_embd = DS4_N_EMBD;
     const uint32_t n_head = DS4_N_HEAD;
     const uint32_t n_head_kv = DS4_N_HEAD_KV;
     const uint32_t head_dim = DS4_N_HEAD_DIM;
     const uint32_t ff_dense = DS4_N_FF_DENSE ? DS4_N_FF_DENSE : qwen_ff_scratch_dim();
     const uint32_t n_vocab = DS4_N_VOCAB;
+    if (margin_out) {
+        uint32_t nm = n_tok < 8u ? n_tok : 8u;
+        for (uint32_t i = 0; i < nm; i++) margin_out[i] = -1.0f;
+    }
     if (n_tok == 1) {
         int one = 0;
+        const int need_head = (argmax_out != NULL || margin_out != NULL);
         int ok1 = qwen_hybrid_metal_forward_token_ex(
-            qs, logits_out, argmax_out ? &one : NULL, hidden_out, layer_out,
+            qs, logits_out, need_head ? &one : NULL, hidden_out, layer_out,
             layer_ids, n_ids, model, weights, tokens[0], pos0);
         if (ok1 && argmax_out) argmax_out[0] = one;
+        if (ok1 && margin_out) {
+            qwen_mtp_fill_margins_from_logits(g_qwen_pool.logits_gpu, n_vocab, 1u, margin_out);
+        }
         return ok1;
     }
     if (qwen_mlx_bf16_runtime() && n_tok == 2u && argmax_out) {
@@ -17901,6 +17970,9 @@ static int qwen_hybrid_metal_forward_tokens(
                 return 0;
             }
             argmax_out[t] = one;
+            if (margin_out) {
+                qwen_mtp_fill_margins_from_logits(g_qwen_pool.logits_gpu, n_vocab, 1u, &margin_out[t]);
+            }
             if (t == 0u && !qwen_mlx_snapshot_gdn()) return 0;
         }
         return 1;
@@ -18414,8 +18486,8 @@ static int qwen_hybrid_metal_forward_tokens(
         ds4_gpu_tensor *tmp = cur; cur = next; next = tmp;
     }
 
-    const int last_logits_only = (logits_out != NULL && argmax_out == NULL);
-    if (ok && (logits_out || argmax_out) && !skip_head) {
+    const int last_logits_only = (logits_out != NULL && argmax_out == NULL && margin_out == NULL);
+    if (ok && (logits_out || argmax_out || margin_out) && !skip_head) {
         if (last_logits_only) {
             ds4_gpu_tensor *row_cur = ds4_gpu_tensor_view(cur,
                 (uint64_t)(n_tok - 1u) * n_embd * sizeof(float), (uint64_t)n_embd * sizeof(float));
@@ -18451,7 +18523,17 @@ static int qwen_hybrid_metal_forward_tokens(
     if (ok && qwen_mlx_bf16_runtime() &&
         !ds4_gpu_round_bf16_f32_tensor(
             g_qwen_pool.batch_logits, n_vocab * n_tok)) ok = 0;
-    if (ok && argmax_out && g_qwen_pool.batch_argmax &&
+    int used_top2 = 0;
+    ds4_gpu_tensor *top2_sel = NULL;
+    if (ok && margin_out && n_tok > 0 && n_tok <= 8u) {
+        top2_sel = qwen_mtp_top2_idx_tensor();
+        if (top2_sel &&
+            ds4_gpu_indexer_topk_tensor(top2_sel, g_qwen_pool.batch_logits,
+                                        n_vocab, n_tok, 2)) {
+            used_top2 = 1;
+        }
+    }
+    if (ok && argmax_out && g_qwen_pool.batch_argmax && !used_top2 &&
         !ds4_gpu_indexer_topk_tensor(g_qwen_pool.batch_argmax, g_qwen_pool.batch_logits,
                                      n_vocab, n_tok, 1)) ok = 0;
     if (ok) {
@@ -18459,7 +18541,12 @@ static int qwen_hybrid_metal_forward_tokens(
     } else {
         (void)ds4_gpu_end_commands();
     }
-    if (ok && argmax_out && g_qwen_pool.batch_argmax) {
+    if (ok && used_top2) {
+        if (!qwen_mtp_read_top2_margins(g_qwen_pool.batch_logits, top2_sel,
+                                        n_vocab, n_tok, margin_out, argmax_out)) {
+            if (argmax_out) ok = 0;
+        }
+    } else if (ok && argmax_out && g_qwen_pool.batch_argmax) {
         int32_t idx[8];
         uint32_t nt = n_tok < 8u ? n_tok : 8u;
         if (!ds4_gpu_tensor_read(g_qwen_pool.batch_argmax, 0, idx, (uint64_t)nt * sizeof(int32_t))) ok = 0;
@@ -18527,7 +18614,7 @@ static int qwen_metal_prefill_span(
             float *chunk_logits = last ? logits : NULL;
             float *hid = hidden_rows ? hidden_rows + (size_t)i * DS4_N_EMBD : NULL;
             if (!qwen_hybrid_metal_forward_tokens(qs, chunk_logits, NULL, hid, NULL, NULL, 0,
-                                                  model, weights, tokens + i, n, pos0 + (uint32_t)i)) {
+                                                  model, weights, tokens + i, n, pos0 + (uint32_t)i, NULL)) {
                 return 0;
             }
             i += (int)n;
@@ -20015,15 +20102,44 @@ static double qwen_mtp_price_h(void) {
     }
     return h;
 }
-static int qwen_mtp_choose_k(int offered, double *ema) {
+/* Opt-in. Unset is off. Cached once, like qwen_mtp_price_h.
+ * ds4_gpu_env_bool is file-local to ds4_metal.m; this matches
+ * `ds4_gpu_env_bool("DS4_QWEN_MTP_TOP2") == 1` for the true tokens. */
+static int qwen_mtp_top2_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_QWEN_MTP_TOP2");
+        int on = 0;
+        if (v) {
+            while (isspace((unsigned char)*v)) v++;
+            size_t n = strlen(v);
+            while (n > 0 && isspace((unsigned char)v[n - 1])) n--;
+            if (n == 0) {
+                on = 1;
+            } else if ((n == 1 && v[0] == '1') ||
+                       (n == 4 && strncasecmp(v, "true", 4) == 0) ||
+                       (n == 3 && strncasecmp(v, "yes", 3) == 0) ||
+                       (n == 2 && strncasecmp(v, "on", 2) == 0)) {
+                on = 1;
+            }
+        }
+        cached = on;
+    }
+    return cached;
+}
+static int qwen_mtp_choose_k(int offered, double *ema, double margin) {
     const double h = qwen_mtp_price_h();
-    /* Cap mirrors segmentedVerifyDepthCap (7), not the raw offer. The
-     * optional top-2 clamp at depths 0/1 from the reference cost model is
-     * omitted pending top-k plumbing in the verify pass, which currently
-     * exposes only a top-1 argmax. */
+    /* Cap mirrors segmentedVerifyDepthCap (7), not the raw offer.
+     * DS4_QWEN_MTP_TOP2=1 clamps depths 0 and 1 by the previous verify's
+     * pending-primary top-1/top-2 logit gap: p = min(p, sigmoid(margin/2))
+     * at depth 0 and sigmoid(margin/3) at depth 1. margin < 0 is unknown
+     * (no clamp). Depths >= 2 are unchanged. Off: bit-identical to e5ce86d. */
     int cap = offered;
     if (cap > 7) cap = 7;
     if (cap <= 0) return 0;
+    const int clamp = qwen_mtp_top2_on() && margin >= 0.0;
+    const double c0 = clamp ? (double)sigmoid_stable((float)(margin * 0.5)) : 1.0;
+    const double c1 = clamp ? (double)sigmoid_stable((float)(margin / 3.0)) : 1.0;
     double reach = 1.0;
     double expected = 0.0;
     int depth = 0;
@@ -20031,6 +20147,10 @@ static int qwen_mtp_choose_k(int offered, double *ema) {
         double p = ema[depth];
         if (p < 0) p = 0;
         if (p > 1) p = 1;
+        if (clamp) {
+            if (depth == 0 && p > c0) p = c0;
+            else if (depth == 1 && p > c1) p = c1;
+        }
         reach *= p;
         double thresh = h * (1.0 + expected) / (1.0 + (double)depth * h);
         if (reach <= thresh) break;
@@ -42303,7 +42423,11 @@ static int qwen_generate_hybrid(
     uint64_t n_drafted = 0, n_accepted = 0;
     double t_draft = 0.0, t_verify = 0.0, t_repair = 0.0, t_round = 0.0;
     uint64_t n_rounds = 0;
+    double t_verify_w[9] = {0};
+    uint64_t n_verify_w[9] = {0};
+    double pending_margin = -1.0;
     const int mtp_prof = getenv("DS4_QWEN_MTP_PROFILE") && getenv("DS4_QWEN_MTP_PROFILE")[0] != '0';
+    const int mtp_top2 = qwen_mtp_top2_on();
     static float ver_hidden[8 * 8192];
     const char *env_k = getenv("DS4_QWEN_MTP_K");
     const char *env_auto = getenv("DS4_QWEN_MTP_AUTO");
@@ -42326,7 +42450,7 @@ static int qwen_generate_hybrid(
         if (offered < 0) offered = 0;
         int K = 0;
         if (use_mtp && hidden && offered > 0) {
-            K = (fixed_k >= 0) ? fixed_k : qwen_mtp_choose_k(offered, ema);
+            K = (fixed_k >= 0) ? fixed_k : qwen_mtp_choose_k(offered, ema, pending_margin);
             if (K > offered) K = offered;
             if (K < 0) K = 0;
         }
@@ -42376,16 +42500,26 @@ static int qwen_generate_hybrid(
         int ver_argmax[8] = {0};
         ver_tokens[0] = token;
         for (int d = 0; d < drafted; d++) ver_tokens[d + 1] = drafts[d];
+        float ver_margin[8];
+        for (int i = 0; i < 8; i++) ver_margin[i] = -1.0f;
         const double tv0 = mtp_prof ? now_sec() : 0.0;
 #ifndef DS4_NO_GPU
         int ver_ok = qwen_hybrid_metal_forward_tokens(NULL, NULL, ver_argmax, use_mtp ? ver_hidden : NULL,
                                                       NULL, NULL, 0, model, weights,
-                                                      ver_tokens, n_ver, (uint32_t)pos);
+                                                      ver_tokens, n_ver, (uint32_t)pos,
+                                                      mtp_top2 ? ver_margin : NULL);
 #else
         int ver_ok = 0;
         (void)n_ver;
 #endif
-        if (mtp_prof) t_verify += now_sec() - tv0;
+        if (mtp_prof) {
+            const double dt = now_sec() - tv0;
+            t_verify += dt;
+            unsigned w = (unsigned)n_ver;
+            if (w > 8u) w = 8u;
+            t_verify_w[w] += dt;
+            n_verify_w[w] += 1;
+        }
         if (!ver_ok) {
             float v_logits[248320];
             float v_hidden[8192];
@@ -42408,6 +42542,7 @@ static int qwen_generate_hybrid(
             token = sample_argmax(v_logits, DS4_N_VOCAB);
             if (hidden) memcpy(hidden, v_hidden, (size_t)DS4_N_EMBD * sizeof(float));
             memcpy(logits, v_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+            pending_margin = -1.0;
             continue;
         }
 
@@ -42458,6 +42593,9 @@ static int qwen_generate_hybrid(
 
         token = ver_argmax[accepted];
         if (hidden) memcpy(hidden, ver_hidden + (size_t)accepted * DS4_N_EMBD, (size_t)DS4_N_EMBD * sizeof(float));
+        if (mtp_top2 && accepted >= 0 && accepted < (int)n_ver) {
+            pending_margin = (double)ver_margin[accepted];
+        }
         if (mtp_prof) { t_round += now_sec() - trd0; n_rounds++; }
     }
     goto hybrid_done;
@@ -42487,6 +42625,15 @@ hybrid_done:
                         (unsigned long long)n_rounds);
             }
             fprintf(stderr, "\n");
+            if (mtp_prof) {
+                for (unsigned w = 0; w < 9; w++) {
+                    if (n_verify_w[w] > 0) {
+                        fprintf(stderr, "ds4: mtp verify-width w=%u n=%llu mean=%0.3fms\n",
+                                w, (unsigned long long)n_verify_w[w],
+                                1e3 * t_verify_w[w] / (double)n_verify_w[w]);
+                    }
+                }
+            }
         } else {
             fprintf(stderr, "\n");
         }
@@ -42552,7 +42699,7 @@ static int qwen_target_forward_layers_batch(
         return qwen_hybrid_metal_forward_tokens(
             qs, logits, argmax_out, hidden, layer_out,
             dw->target_layers, dw->n_target,
-            &e->model, &e->weights, tokens, n_tok, pos);
+            &e->model, &e->weights, tokens, n_tok, pos, NULL);
     }
 #endif
     float *scratch = NULL;
@@ -44850,7 +44997,7 @@ static int generate_raw_swa_cpu(
                     if (offered > remaining-1) offered = remaining-1;
                     if (offered > ctx_size - pos -1) offered = ctx_size - pos -1;
                     if (offered < 0) offered = 0;
-                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema);
+                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema, -1.0);
                     if (K > offered) K = offered;
                     if (K < 0) K = 0;
                     int drafts[8] = {0};
@@ -54692,7 +54839,7 @@ static int generate_metal_graph_raw_swa(
                     if (offered > remaining-1) offered = remaining-1;
                     if (offered > ctx_size - pos -1) offered = ctx_size - pos -1;
                     if (offered < 0) offered = 0;
-                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema);
+                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema, -1.0);
                     if (K > offered) K = offered;
                     if (K < 0) K = 0;
                     int drafts[8]={0};

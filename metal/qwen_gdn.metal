@@ -1187,9 +1187,13 @@ kernel void kernel_qwen_gqa_attn_decode_shadow_grp(
     const uint kv_h = tgpig.x;
     const uint ngrp = args.n_head / args.n_head_kv;
     const uint hd = args.head_dim;
-    /* ngrp pinned to 16 keeps all 16 simdgroups active (barrier-safe) and
-     * bounds tqg; dispatch falls back to the legacy kernel otherwise. */
-    if (kv_h >= args.n_head_kv || lane >= 32u || ngrp != 16u || hd != 256u)
+    /* The host dispatches exactly ngrp simdgroups (ngrp*32 threads), so
+     * every simdgroup is active and the barrier below is safe; tqg is sized
+     * for the largest supported group (16). Qwen3.8's full-attention layers
+     * are 24 q-heads / 4 kv-heads => ngrp 6, so pinning this to 16 kept the
+     * grouped path dead on that model. Legacy kernel handles ngrp > 16. */
+    if (kv_h >= args.n_head_kv || lane >= 32u ||
+        ngrp == 0u || ngrp > 16u || sgid >= ngrp || hd != 256u)
         return;
     const uint h = kv_h * ngrp + sgid;
     const uint kv_dim = args.n_head_kv * hd;
@@ -1288,6 +1292,235 @@ kernel void kernel_qwen_gqa_attn_decode_shadow_grp(
         device const float *vt = v_new + (uint64_t)kv_h * hd;
         float qreg[8];
         for (uint j = 0; j < 8u; j++) qreg[j] = tqg[sgid][lane * 8u + j];
+        float partial = 0.0f;
+        for (uint j = 0; j < 8u; j++)
+            partial += qreg[j] * kt[lane * 8u + j];
+        const float score = simd_sum(partial) * scale;
+        const float m_curr = max(m_prev, score);
+        const float al = exp(m_prev - m_curr);
+        const float be = exp(score - m_curr);
+        l_prev = l_prev * al + be;
+        for (uint j = 0; j < 8u; j++)
+            acc[j] = acc[j] * al + be * vt[lane * 8u + j];
+        m_prev = m_curr;
+    }
+
+    const float inv = 1.0f / (l_prev > 1e-8f ? l_prev : 1.0f);
+    device float *oh = heads_out + (uint64_t)h * hd;
+    for (uint j = 0; j < 8u; j++)
+        oh[lane * 8u + j] = acc[j] * inv;
+}
+
+/* Flash-decoding split-K along position for the grouped shadow kernel
+ * above. Prefix of ds4_qwen_gqa_decode_shadow_args so the first five
+ * fields stay layout-compatible; nsplit / blocks_per_split select the
+ * [t_begin, t_end) cache range for this (kv_head, split) threadgroup.
+ * The current token is NOT folded here -- the merge kernel applies it
+ * after combining partials in ascending split order, matching the
+ * single-pass "cache blocks, then k_new/v_new" sequence. */
+struct ds4_qwen_gqa_decode_shadow_split_args {
+    uint32_t pos;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint64_t kv_head_stride;
+    uint32_t nsplit;
+    uint32_t blocks_per_split;
+};
+
+kernel void kernel_qwen_gqa_attn_decode_shadow_grp_split(
+        constant ds4_qwen_gqa_decode_shadow_split_args & args,
+        device const float * q,
+        device const float * k_new,
+        device const float * v_new,
+        device float * k_cache,
+        device float * v_cache,
+        device const half * shadow_k,
+        device const half * shadow_v,
+        device float * partial_acc,
+        device float * partial_m,
+        device float * partial_l,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgid [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint kv_h = tgpig.x;
+    const uint sp = tgpig.y;
+    const uint ngrp = args.n_head / args.n_head_kv;
+    const uint hd = args.head_dim;
+    /* Same ngrp contract as kernel_qwen_gqa_attn_decode_shadow_grp: the
+     * host dispatches exactly ngrp simdgroups, so no simdgroup takes this
+     * early return and the staging barrier stays uniform. */
+    if (kv_h >= args.n_head_kv || lane >= 32u ||
+        ngrp == 0u || ngrp > 16u || sgid >= ngrp || hd != 256u)
+        return;
+    const uint h = kv_h * ngrp + sgid;
+    const uint kv_dim = args.n_head_kv * hd;
+    const uint t_begin = sp * args.blocks_per_split * QWEN_DECODE_SHADOW_BT;
+    const uint t_end = min(args.pos, t_begin + args.blocks_per_split * QWEN_DECODE_SHADOW_BT);
+
+    /* Persist once per KV head: only split 0, simdgroup 0. Same writes as
+     * kernel_qwen_gqa_attn_decode_shadow_grp (sgid == 0). */
+    if (sp == 0u && sgid == 0u) {
+        const uint kv_base = kv_h * hd;
+        device float *kd = k_cache + (uint64_t)args.pos * kv_dim + kv_base;
+        device float *vd = v_cache + (uint64_t)args.pos * kv_dim + kv_base;
+        for (uint i = lane; i < hd; i += 32u) {
+            kd[i] = k_new[kv_base + i];
+            vd[i] = v_new[kv_base + i];
+        }
+    }
+
+    threadgroup float tqg[16][256];
+
+    if (t_begin >= args.pos) {
+        /* Softmax identity so the merge has a well-defined empty slot. */
+        const uint64_t acc_base =
+            ((uint64_t)sp * args.n_head + h) * args.head_dim + (uint64_t)lane * 8u;
+        for (uint j = 0; j < 8u; j++)
+            partial_acc[acc_base + j] = 0.0f;
+        if (lane == 0u) {
+            partial_m[sp * args.n_head + h] = -1.0e30f;
+            partial_l[sp * args.n_head + h] = 0.0f;
+        }
+        return;
+    }
+
+    device const float *qh = q + (uint64_t)h * hd;
+    for (uint i = lane; i < hd; i += 32u) tqg[sgid][i] = qh[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const half *kh =
+        shadow_k + (uint64_t)kv_h * args.kv_head_stride;
+    device const half *vh =
+        shadow_v + (uint64_t)kv_h * args.kv_head_stride;
+
+    const float scale = rsqrt((float)hd);
+    float m_prev = -1.0e30f;
+    float l_prev = 0.0f;
+    float acc[8];
+    for (uint j = 0; j < 8u; j++) acc[j] = 0.0f;
+
+    for (uint t0 = t_begin; t0 < t_end; t0 += QWEN_DECODE_SHADOW_BT) {
+        const uint len = min(QWEN_DECODE_SHADOW_BT, args.pos - t0);
+        float sloc[QWEN_DECODE_SHADOW_BT / 32u];
+        for (uint i = 0; i < QWEN_DECODE_SHADOW_BT / 32u; i++)
+            sloc[i] = -1.0e30f;
+        /* Scores: every lane streams whole K rows for its own tokens. */
+        for (uint i = 0; i < len; i += 32u) {
+            const uint t = t0 + i + lane;   /* tail lanes: t >= pos keeps -1e30f */
+            float dot = 0.0f;
+            if (t < args.pos) {
+                device const half *kt = kh + (uint64_t)t * hd;
+                for (uint d = 0; d < hd; d += 4u) {
+                    const half4 kv4 = *(device const half4 *)(kt + d);
+                    dot += ((float)kv4.x * tqg[sgid][d] +
+                            (float)kv4.y * tqg[sgid][d + 1] +
+                            (float)kv4.z * tqg[sgid][d + 2] +
+                            (float)kv4.w * tqg[sgid][d + 3]);
+                }
+                sloc[i / 32u] = dot * scale;
+            }
+            /* t >= pos (partial block tail): sloc keeps its -1e30f init,
+             * contributing zero weight after the softmax shift. */
+        }
+        /* Block-wide online softmax update: two simd reductions per block
+         * instead of one per token. */
+        float m_b = sloc[0];
+        for (uint i = 1; i < QWEN_DECODE_SHADOW_BT / 32u; i++)
+            m_b = max(m_b, sloc[i]);
+        m_b = simd_max(m_b);
+        const float m_new = max(m_prev, m_b);
+        const float alpha = exp(m_prev - m_new);
+        float lsum = 0.0f;
+        for (uint i = 0; i < QWEN_DECODE_SHADOW_BT / 32u; i++) {
+            sloc[i] = exp(sloc[i] - m_new);
+            lsum += sloc[i];
+        }
+        l_prev = l_prev * alpha + simd_sum(lsum);
+        for (uint j = 0; j < 8u; j++) acc[j] *= alpha;
+        /* V accumulation: weight broadcast from the owning lane. */
+        for (uint i = 0; i < len; i++) {
+            const float w = simd_shuffle(sloc[i >> 5], i & 31u);
+            device const half *vt = vh + (uint64_t)(t0 + i) * hd;
+            const uint base = lane * 8u;
+            const half4 v0 = *(device const half4 *)(vt + base);
+            const half4 v1 = *(device const half4 *)(vt + base + 4);
+            acc[0] += w * (float)v0.x;
+            acc[1] += w * (float)v0.y;
+            acc[2] += w * (float)v0.z;
+            acc[3] += w * (float)v0.w;
+            acc[4] += w * (float)v1.x;
+            acc[5] += w * (float)v1.y;
+            acc[6] += w * (float)v1.z;
+            acc[7] += w * (float)v1.w;
+        }
+        m_prev = m_new;
+    }
+
+    /* Unnormalized partials: merge rescales across splits. */
+    {
+        const uint64_t acc_base =
+            ((uint64_t)sp * args.n_head + h) * args.head_dim + (uint64_t)lane * 8u;
+        for (uint j = 0; j < 8u; j++)
+            partial_acc[acc_base + j] = acc[j];
+        if (lane == 0u) {
+            partial_m[sp * args.n_head + h] = m_prev;
+            partial_l[sp * args.n_head + h] = l_prev;
+        }
+    }
+}
+
+/* Combines split-K partials in ascending sp order (online-softmax
+ * rescale, same combine as a sequential flash-attn split reduce), then
+ * folds the current token with the grouped kernel's tail arithmetic. */
+kernel void kernel_qwen_gqa_attn_decode_shadow_merge(
+        constant ds4_qwen_gqa_decode_shadow_split_args & args,
+        device const float * q,
+        device const float * k_new,
+        device const float * v_new,
+        device const float * partial_acc,
+        device const float * partial_m,
+        device const float * partial_l,
+        device float * heads_out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint ngrp = args.n_head / args.n_head_kv;
+    const uint hd = args.head_dim;
+    if (h >= args.n_head || lane >= 32u || ngrp == 0u || hd != 256u) return;
+    const uint kv_h = h / ngrp;
+
+    float m_run = -1.0e30f;
+    float l_run = 0.0f;
+    float acc[8];
+    for (uint j = 0; j < 8u; j++) acc[j] = 0.0f;
+
+    for (uint sp = 0; sp < args.nsplit; sp++) {
+        const float l_c = partial_l[sp * args.n_head + h];
+        if (l_c == 0.0f) continue;
+        const float m_c = partial_m[sp * args.n_head + h];
+        const float m_new = max(m_run, m_c);
+        const float a = exp(m_run - m_new);
+        const float b = exp(m_c - m_new);
+        l_run = l_run * a + l_c * b;
+        const uint64_t acc_base =
+            ((uint64_t)sp * args.n_head + h) * args.head_dim + (uint64_t)lane * 8u;
+        for (uint j = 0; j < 8u; j++)
+            acc[j] = acc[j] * a + partial_acc[acc_base + j] * b;
+        m_run = m_new;
+    }
+
+    float m_prev = m_run;
+    float l_prev = l_run;
+    const float scale = rsqrt((float)hd);
+    device const float *qh = q + (uint64_t)h * hd;
+
+    /* Current token: same expressions as kernel_qwen_gqa_attn_decode_shadow_grp. */
+    {
+        device const float *kt = k_new + (uint64_t)kv_h * hd;
+        device const float *vt = v_new + (uint64_t)kv_h * hd;
+        float qreg[8];
+        for (uint j = 0; j < 8u; j++) qreg[j] = qh[lane * 8u + j];
         float partial = 0.0f;
         for (uint j = 0; j < 8u; j++)
             partial += qreg[j] * kt[lane * 8u + j];

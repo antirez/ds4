@@ -23210,6 +23210,37 @@ static int ds4_qwen_decode_shadow_grp_enabled(void) {
     return !(sw && sw[0] == '0' && sw[1] == '\0');
 }
 
+/* Must match QWEN_DECODE_SHADOW_BT in metal/qwen_gdn.metal. */
+enum { QWEN_DECODE_SHADOW_BT = 128u };
+
+static id<MTLBuffer> __strong g_qwen_shadow_split_acc;
+static NSUInteger g_qwen_shadow_split_acc_bytes;
+static id<MTLBuffer> __strong g_qwen_shadow_split_m;
+static NSUInteger g_qwen_shadow_split_m_bytes;
+static id<MTLBuffer> __strong g_qwen_shadow_split_l;
+static NSUInteger g_qwen_shadow_split_l_bytes;
+
+static int ds4_qwen_decode_shadow_splitk_setting(void) {
+    /* Default ON (auto). Split-K along position is what makes Qwen3.8
+     * decode flat in context on M5 Max: 9.7 -> 25.4 t/s at 10295 tokens,
+     * byte-identical output at every nsplit (the merge replays the same
+     * online-softmax combine the single-pass kernel performs inline).
+     * DS4_QWEN_SHADOW_SPLITK=0 restores the single-pass grouped dispatch;
+     * a decimal 2..256 forces that many splits for sweeps (the host then
+     * shrinks it to ceil(blocks_total/blocks_per_split) so no wholly-empty
+     * tail threadgroup is dispatched). */
+    const char *sw = getenv("DS4_QWEN_SHADOW_SPLITK");
+    if (!sw || !sw[0]) return -1;
+    if (sw[0] == '0' && sw[1] == '\0') return 0;
+    if (sw[0] == '1' && sw[1] == '\0') return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long n = strtoul(sw, &end, 10);
+    if (end == sw || *end != '\0' || errno == ERANGE) return -1;
+    if (n < 2ul || n > 256ul) return -1;
+    return (int)n;
+}
+
 
 /* Shadow-backed tiled decode attention for qwen full-attn layers: attends
  * the persistent F16 KV shadow maintained by ds4_gpu_qwen_attn_flash_rows
@@ -23252,11 +23283,12 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         v_cache_offset != k_cache_offset) return 0;
     const uint32_t layer = (uint32_t)(k_cache_offset / layer_span);
     if (layer >= DS4_QWEN_FLASH_KV_MAX_LAYERS) return 0;
-    /* Grouped fast path: only when enabled and the GQA group is exactly
-     * 16 (divisibility and non-zero n_head_kv proven above), matching the
-     * kernel_qwen_gqa_attn_decode_shadow_grp layout contract. */
+    /* Grouped path needs one simdgroup per grouped query head, so it covers
+     * any ngrp in 2..16 (Qwen3.8 full-attn: 24/4 => 6; Ornith/APEX: 16).
+     * ngrp 1 has nothing to share and ngrp > 16 exceeds the tqg staging. */
+    const uint32_t ngrp = n_head / n_head_kv;
     int grp = ds4_qwen_decode_shadow_grp_enabled() &&
-              n_head / n_head_kv == 16u;
+              ngrp >= 2u && ngrp <= 16u;
     id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline(
         grp ? "kernel_qwen_gqa_attn_decode_shadow_grp"
             : "kernel_qwen_gqa_attn_decode_shadow");
@@ -23388,36 +23420,169 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
             uint64_t kv_head_stride;
         } sargs = { pos, n_head, n_head_kv, head_dim,
                     (uint64_t)cap_rows * head_dim };
+        int splitk = 0;
+        uint32_t nsplit = 1u;
+        uint32_t blocks_per_split = 0u;
+        id<MTLComputePipelineState> split_pipe = nil;
+        id<MTLComputePipelineState> merge_pipe = nil;
+        /* Split-K needs the partial dispatch to complete before the merge
+         * reads the shared scratch, which only holds on a serial encoder.
+         * ds4_gpu_compute_encoder returns a concurrent encoder while a
+         * parallel-FFN batch encoder is open; decode never arms that mode,
+         * but refuse split-K there rather than rely on it. */
+        if (grp && !(g_batch_cb && g_batch_encoder_concurrent)) {
+            const int sk = ds4_qwen_decode_shadow_splitk_setting();
+            if (sk != 0) {
+                const uint32_t blocks_total =
+                    (pos + (uint32_t)QWEN_DECODE_SHADOW_BT - 1u) /
+                    (uint32_t)QWEN_DECODE_SHADOW_BT;
+                if (sk < 0) {
+                    /* One BT block per split maximises threadgroup count,
+                     * which is what the decode is bound by: measured on
+                     * M5 Max at pos 10295, nsplit 2/4/8/16/32/41/81 gave
+                     * 14.6/18.4/21.3/22.9/24.1/24.8/25.9 t/s against 9.7
+                     * single-pass. The merge loop is O(nsplit) scalar work
+                     * per head, negligible against the block scan. */
+                    nsplit = blocks_total;
+                    if (nsplit > 256u) nsplit = 256u;
+                } else {
+                    nsplit = (uint32_t)sk;
+                }
+                if (nsplit < 1u) nsplit = 1u;
+                if (nsplit >= 2u) {
+                    blocks_per_split =
+                        (blocks_total + nsplit - 1u) / nsplit;
+                    if (blocks_per_split > 0u) {
+                        nsplit = (blocks_total + blocks_per_split - 1u) /
+                                 blocks_per_split;
+                        if (nsplit < 1u) nsplit = 1u;
+                    }
+                }
+                if (nsplit >= 2u && blocks_per_split > 0u) {
+                    split_pipe = ds4_gpu_get_pipeline(
+                        "kernel_qwen_gqa_attn_decode_shadow_grp_split");
+                    merge_pipe = ds4_gpu_get_pipeline(
+                        "kernel_qwen_gqa_attn_decode_shadow_merge");
+                    if (split_pipe && merge_pipe) {
+                        const NSUInteger acc_bytes =
+                            (NSUInteger)nsplit * (NSUInteger)n_head *
+                            (NSUInteger)head_dim * sizeof(float);
+                        const NSUInteger ml_bytes =
+                            (NSUInteger)nsplit * (NSUInteger)n_head *
+                            sizeof(float);
+                        if (ds4_gpu_ensure_scratch_buffer(
+                                &g_qwen_shadow_split_acc,
+                                &g_qwen_shadow_split_acc_bytes,
+                                acc_bytes,
+                                "ds4_qwen_shadow_splitk_acc") &&
+                            ds4_gpu_ensure_scratch_buffer(
+                                &g_qwen_shadow_split_m,
+                                &g_qwen_shadow_split_m_bytes,
+                                ml_bytes,
+                                "ds4_qwen_shadow_splitk_m") &&
+                            ds4_gpu_ensure_scratch_buffer(
+                                &g_qwen_shadow_split_l,
+                                &g_qwen_shadow_split_l_bytes,
+                                ml_bytes,
+                                "ds4_qwen_shadow_splitk_l")) {
+                            splitk = 1;
+                        }
+                    }
+                }
+            }
+        }
+        /* Warn-once: which shadow decode geometry actually ran. Per-call
+         * stderr would shred the exact-match harnesses, so print one line
+         * per process (see DS4_QWEN_POOL_DEBUG for the same idiom). */
+        {
+            static int shadow_dbg_done = 0;
+            const char *dbg = getenv("DS4_QWEN_SHADOW_DEBUG");
+            if (!shadow_dbg_done && dbg && dbg[0] && strcmp(dbg, "0") != 0) {
+                shadow_dbg_done = 1;
+                fprintf(stderr,
+                        "ds4: qwen shadow decode: path=%s nsplit=%u pos=%u "
+                        "n_head=%u n_head_kv=%u head_dim=%u cap_rows=%llu\n",
+                        splitk ? "split" : (grp ? "grp" : "legacy"),
+                        splitk ? nsplit : 1u, pos, n_head, n_head_kv, head_dim,
+                        (unsigned long long)cap_rows);
+            }
+        }
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipe];
-        /* Index order must match the kernel signature, which declares `args`
-         * first: args=0, then q, k_new, v_new, k_cache, v_cache, shadow_k,
-         * shadow_v, heads_out. Binding args last shifts every buffer by one,
-         * which the kernel only observes as a garbage head_dim -- it then
-         * returns from every thread while this function still reports success,
-         * so the caller skips the legacy kernel and leaves heads_out stale. */
-        [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(q)
-                offset:ds4_gpu_tensor_offset(q) atIndex:1];
-        [enc setBuffer:ds4_gpu_tensor_buffer(k_new)
-                offset:ds4_gpu_tensor_offset(k_new) atIndex:2];
-        [enc setBuffer:ds4_gpu_tensor_buffer(v_new)
-                offset:ds4_gpu_tensor_offset(v_new) atIndex:3];
-        [enc setBuffer:kc_buf offset:kc_abs_off + k_cache_offset atIndex:4];
-        [enc setBuffer:vc_buf offset:vc_abs_off + v_cache_offset atIndex:5];
-        [enc setBuffer:slot->shadow offset:0 atIndex:6];
-        [enc setBuffer:slot->shadow offset:k_region atIndex:7];
-        [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
-                offset:ds4_gpu_tensor_offset(heads_out) atIndex:8];
-        if (grp) {
-            /* One threadgroup per KV head; 16 simdgroups per threadgroup,
-             * one per grouped query head (see
-             * kernel_qwen_gqa_attn_decode_shadow_grp). */
-            [enc dispatchThreadgroups:MTLSizeMake(n_head_kv, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(16u * 32u, 1, 1)];
-        } else {
+        if (splitk) {
+            struct {
+                uint32_t pos;
+                uint32_t n_head;
+                uint32_t n_head_kv;
+                uint32_t head_dim;
+                uint64_t kv_head_stride;
+                uint32_t nsplit;
+                uint32_t blocks_per_split;
+            } split_args = { pos, n_head, n_head_kv, head_dim,
+                             (uint64_t)cap_rows * head_dim,
+                             nsplit, blocks_per_split };
+            [enc setComputePipelineState:split_pipe];
+            [enc setBytes:&split_args length:sizeof(split_args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k_new)
+                    offset:ds4_gpu_tensor_offset(k_new) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v_new)
+                    offset:ds4_gpu_tensor_offset(v_new) atIndex:3];
+            [enc setBuffer:kc_buf offset:kc_abs_off + k_cache_offset atIndex:4];
+            [enc setBuffer:vc_buf offset:vc_abs_off + v_cache_offset atIndex:5];
+            [enc setBuffer:slot->shadow offset:0 atIndex:6];
+            [enc setBuffer:slot->shadow offset:k_region atIndex:7];
+            [enc setBuffer:g_qwen_shadow_split_acc offset:0 atIndex:8];
+            [enc setBuffer:g_qwen_shadow_split_m offset:0 atIndex:9];
+            [enc setBuffer:g_qwen_shadow_split_l offset:0 atIndex:10];
+            [enc dispatchThreadgroups:MTLSizeMake(n_head_kv, nsplit, 1)
+               threadsPerThreadgroup:MTLSizeMake(ngrp * 32u, 1, 1)];
+            [enc setComputePipelineState:merge_pipe];
+            [enc setBytes:&split_args length:sizeof(split_args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k_new)
+                    offset:ds4_gpu_tensor_offset(k_new) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v_new)
+                    offset:ds4_gpu_tensor_offset(v_new) atIndex:3];
+            [enc setBuffer:g_qwen_shadow_split_acc offset:0 atIndex:4];
+            [enc setBuffer:g_qwen_shadow_split_m offset:0 atIndex:5];
+            [enc setBuffer:g_qwen_shadow_split_l offset:0 atIndex:6];
+            [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
+                    offset:ds4_gpu_tensor_offset(heads_out) atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            [enc setComputePipelineState:pipe];
+            /* Index order must match the kernel signature, which declares `args`
+             * first: args=0, then q, k_new, v_new, k_cache, v_cache, shadow_k,
+             * shadow_v, heads_out. Binding args last shifts every buffer by one,
+             * which the kernel only observes as a garbage head_dim -- it then
+             * returns from every thread while this function still reports success,
+             * so the caller skips the legacy kernel and leaves heads_out stale. */
+            [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k_new)
+                    offset:ds4_gpu_tensor_offset(k_new) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v_new)
+                    offset:ds4_gpu_tensor_offset(v_new) atIndex:3];
+            [enc setBuffer:kc_buf offset:kc_abs_off + k_cache_offset atIndex:4];
+            [enc setBuffer:vc_buf offset:vc_abs_off + v_cache_offset atIndex:5];
+            [enc setBuffer:slot->shadow offset:0 atIndex:6];
+            [enc setBuffer:slot->shadow offset:k_region atIndex:7];
+            [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
+                    offset:ds4_gpu_tensor_offset(heads_out) atIndex:8];
+            if (grp) {
+                /* One threadgroup per KV head; ngrp simdgroups per
+                 * threadgroup, one per grouped query head (see
+                 * kernel_qwen_gqa_attn_decode_shadow_grp). */
+                [enc dispatchThreadgroups:MTLSizeMake(n_head_kv, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(ngrp * 32u, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen gqa decode shadow"))
