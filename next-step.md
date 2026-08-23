@@ -378,3 +378,61 @@ looks like the same artifact — fresh Min hits 26.67.
   forced-depth sweep on Max using the profile counters, not wall-clock.
 - Optional: port the top-2 confidence clamp once the verify pass exposes
   top-k (protects hard prompts; easy prompts unaffected).
+
+## Ornith speed results — 2026-08-24 (Min, fresh-state discipline)
+
+Follow-up session: applied the Qwen levers to both Ornith models and measured.
+Commit `e5ce86d` + the ngrp generalization on top (uncommitted at this note's
+time unless later committed).
+
+### Shapes / routing facts
+
+- Ornith-1.5-35B: arch `qwen35moe`, 40 blocks = 39 executable + 1 bundled
+  nextn MoE head; heads=16 kv_heads=2 (**GQA group 8**), head_dim 256. Routes
+  through the Qwen hybrid path; bundled nextn binds via `qwen_mtp_bind` and
+  engages automatically (`DS4_QWEN_NEXTN_DRAFT=0` disables).
+- Ornith-1.5-9B: arch `qwen35` dense 32L; heads=16 kv_heads=4 (**group 4**).
+  DFlash sidecar pairs via `--dflash` (layers=6 block=16 draft_n<=7).
+- The e5ce86d grouped shadow kernel gated on ngrp==16 → both Ornith models
+  silently used the old kernel. Generalized to runtime ngrp 1..16
+  (`metal/qwen_gdn.metal` + gate/dispatch in `ds4_metal.m`). Verified
+  bitwise: grouped-serial ≡ legacy-serial across the full comparable span at
+  ngrp=8, and the Qwen3.8 golden still matches byte-for-byte after the
+  generalization rebuild.
+
+### Measured (523-tok fixture, greedy, warmed + measured reps)
+
+| leg | t/s | vs serial |
+|---|---|---|
+| 35B serial | **87.9–90.5 decode / ~1140 prefill** | — (Max doc said 269/88.2 — prefill was soaked there) |
+| 35B nextn K=1 | **99.5 / 99.8** | **+13 % — the sweet spot** |
+| 35B nextn K=3 | 57.7 | 0.64× — loses |
+| 35B AUTO h=0.34 | 86.1 | over-drafted |
+| 35B AUTO h=0.7 | 86.6 | collapses to ~no drafting (correct instinct) |
+| 35B with-head prefill batched priming @10k | 263–275 vs 98–127 sequential | **2.1–2.8×**, text-identical |
+| 9B serial | **75.9–77.7 / ~750** | matches Max 734/72.7 |
+| 9B DFlash (warmed, -n256) | 53.1 (acc 220/230 = 95.6 %) | **0.70× — heavy draft can't win** |
+| long ctx @10k both models | ON ≡ OFF, ≥18 t/s | no cliff: per-layer KV fits L2 at these shapes |
+
+### Why speculation economics differ from Qwen3.8 here
+
+Ornith35's head is a full MoE layer and every verified row re-routes experts:
+marginal verify row ≈ +0.345 serial-token-times and each draft step ≈ 0.34
+(h≈0.34 measured from profile counters) — so a round costs ≈ 1+0.69·d serial
+times against yield Σp^i with p≈0.86. Break-even sits just past depth 1:
+**fixed K=1 is optimal** (+13 %); deeper drafting always loses. The 9B DFlash
+draft is target-class expensive (~9 ms/draft-token), so even 96 % acceptance
+pays nothing. If you want more than +13 % on the 35B: cheaper verify rows
+(batched-MoE-row kernel work) or a lighter draft head — not policy tuning.
+
+### Correctness notes
+
+- `tests/test_ornith15_bench.sh` and `test_ornith9_bench.sh` (exact vs
+  llama-cli) pass through the generalized kernel.
+- Ornith35 spec-vs-serial text diverges early EVEN UNDER THE OLD KERNEL
+  (legacy K1 ≠ legacy serial @char 34): pre-existing MoE batched-verify
+  near-tie behavior, not this change; outputs stay coherent. Same class as
+  the Qwen3.8 @10k divergence recorded above.
+- Watch out when scripting: `run(){ shift; ...$1... }` names output files
+  after the first env assignment, not your tag — cost an hour of phantom
+  diffs (fixed pattern in /tmp/orn3.sh).

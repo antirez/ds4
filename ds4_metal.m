@@ -23199,13 +23199,14 @@ static int ds4_qwen_decode_shadow_enabled(void) {
 
 static int ds4_qwen_decode_shadow_grp_enabled(void) {
     /* Default ON: selects kernel_qwen_gqa_attn_decode_shadow_grp (one
-     * threadgroup per KV head, 16 simdgroups = one per grouped query head)
+     * threadgroup per KV head, ngrp simdgroups = one per grouped query
+     * head)
      * so the F16 shadow K/V planes are streamed once per decode step
      * instead of ngrp times; removes the L2-capacity decode cliff at large
      * pos. DS4_QWEN_SHADOW_GRP=0 restores the per-query-head shadow
-     * kernel. Only ever selected when n_head/n_head_kv == 16, which the
-     * grouped kernel requires; any other GQA ratio keeps the legacy
-     * dispatch. */
+     * pos. Selected whenever the GQA ratio is within the grouped kernel's
+     * runtime bound ngrp in [1..16] with head_dim == 256; anything else
+     * keeps the legacy dispatch. */
     const char *sw = getenv("DS4_QWEN_SHADOW_GRP");
     return !(sw && sw[0] == '0' && sw[1] == '\0');
 }
@@ -23252,11 +23253,13 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         v_cache_offset != k_cache_offset) return 0;
     const uint32_t layer = (uint32_t)(k_cache_offset / layer_span);
     if (layer >= DS4_QWEN_FLASH_KV_MAX_LAYERS) return 0;
-    /* Grouped fast path: only when enabled and the GQA group is exactly
-     * 16 (divisibility and non-zero n_head_kv proven above), matching the
-     * kernel_qwen_gqa_attn_decode_shadow_grp layout contract. */
+    /* Grouped fast path: only when enabled and the GQA group fits the
+     * kernel_qwen_gqa_attn_decode_shadow_grp layout contract: runtime
+     * ngrp in [1..16] (divisibility and non-zero n_head_kv proven above)
+     * and head_dim == 256. */
+    const uint32_t ngrp = n_head / n_head_kv;
     int grp = ds4_qwen_decode_shadow_grp_enabled() &&
-              n_head / n_head_kv == 16u;
+              ngrp >= 1u && ngrp <= 16u && head_dim == 256u;
     id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline(
         grp ? "kernel_qwen_gqa_attn_decode_shadow_grp"
             : "kernel_qwen_gqa_attn_decode_shadow");
@@ -23410,11 +23413,11 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(heads_out)
                 offset:ds4_gpu_tensor_offset(heads_out) atIndex:8];
         if (grp) {
-            /* One threadgroup per KV head; 16 simdgroups per threadgroup,
-             * one per grouped query head (see
+            /* One threadgroup per KV head; one simdgroup per grouped
+             * query head, ngrp simdgroups total (see
              * kernel_qwen_gqa_attn_decode_shadow_grp). */
             [enc dispatchThreadgroups:MTLSizeMake(n_head_kv, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(16u * 32u, 1, 1)];
+               threadsPerThreadgroup:MTLSizeMake(ngrp * 32u, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
