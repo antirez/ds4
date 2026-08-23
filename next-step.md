@@ -1,380 +1,253 @@
-# next-step.md — Qwen3.8-27B MTP speed work, handed off to Min
+# next-step.md — Qwen3.8-27B MTP speed work
 
-Written 2026-08-23 from Max (M5 Max, 128 GB). Everything below was measured on
-Max unless stated. Code is already on GitHub; artifacts are rsynced into this
-directory (see **Artifacts**).
+Rewritten 2026-08-24 on **Max** (M5 Max, 128 GB) after taking the Min handoff
+back. Every number below is measured on Max unless stated. The previous
+revision of this file is commit `e5ce86d`; read the **Correction** section
+before trusting anything you remember from it.
 
 ## Where the code stands
 
 | branch | commit | contents |
 |---|---|---|
-| `main` | `582a7b7` | exact MLX Q4_64A parity runtime (merged from ornith15) **+** MTP head KV sized by session ctx, BF16 CPU matvec |
-| `ornith15` | `5edda49` | the parity runtime alone |
+| `ornith15` | `d6eb25f` | split-K shadow decode + ngrp gate fix + MTP verify-width counters + opt-in top-2 clamp |
+| `main` | merge of the above | same tree |
+| `e5ce86d` | previous tip | grouped shadow kernel (dead on Qwen3.8), adaptive depth, batched MTP priming |
 
-`main` is the branch to work on. Both are pushed to `origin` (audreyt/ds4) and
-`git branch -f main origin/main` has already been run here, so `main` is
-current. Build with the usual forced build; `.metal` files load from disk at
-runtime relative to cwd.
+Build and gates unchanged:
 
 ```sh
 cd ~/w/ds4 && make -B ds4 ds4-server ds4-bench ds4-eval ds4-agent -j8
 ```
 
-## The objective that is still open
+## The objective, and where it now stands
 
 > do all levers and match mlx.fast speed, and carry what you can learn to ornith
 
-Two of the levers are already implemented and measured (parity runtime, head-KV
-sizing). The rest are identified, located in the source, and **not yet written**.
-Nothing below is speculative about *where* the cost is — each item has a
-measurement attached.
+**Serial decode now matches or beats pure MLX at every length measured, and is
+flat in context** — which was the single largest gap on the board.
 
-## Baselines you must reproduce before changing anything
-
-Cold runs read ~30 % low. Run ≥3 reps, discard rep 1, take the median.
-`accepted/round` is deterministic per config — if it matches across reps and
-t/s moves, that is thermal noise, not your change.
-
-### ds4 @ `582a7b7`, greedy, decode-only t/s
-
-| prompt | no draft | `DS4_QWEN_MTP_K=3` | accepted/round |
+| prompt | ds4 @`e5ce86d` | ds4 @`d6eb25f` | pure MLX |
 |---|---|---|---|
-| 523 tok, copy-style English | **23.9** | **53.5** (2.23×) | 1.46 |
-| 2554 tok, Italian prose | 18.4 | 17.7 (0.96×) | 0.54 |
-| 10295 tok | 9.7 | 14.8 (1.52×) | 0.70 |
+| 523 tok | 24.07 | **26.03** | 26.5 |
+| 2554 tok | 18.40 | **25.52** | 29.7 |
+| 10295 tok | 9.69 | **25.63** | 24.8 / 23.5 |
 
-Prefill, no draft: 226 t/s @523 tok, ~450 @2554, ~510 @10295.
-Prefill with the MTP head loaded: **150–170 t/s at every length** — that is
-lever 3 below.
+Medians of 3, greedy, decode-only t/s, `-n 256` (`-n 128` at 10295). The
+`e5ce86d` column is the same binary with `DS4_QWEN_SHADOW_SPLITK=0`, measured in
+the same thermal window, so it is a true A/B and not a cross-window comparison.
 
-Depth sweep at 523 tok (K=4/6/8 were single cold runs — **re-measure warm**):
-K=2 48.0, K=3 53.5, K=4 37.7?, K=6 36.8?, K=8 34.8?.
+Prefill is unchanged: ~230 t/s @523, ~440 @2554, ~510 @10295, and with the MTP
+head loaded ~205 @523 — Min's batched priming (lever 3) does hold up on Max, the
+old 150–170 t/s ceiling is gone.
 
-### Pure MLX on the same weights (this is the real bar)
+## Correction: the grouped kernel never ran on Qwen3.8
 
-`mlx_lm.generate`, `EigenLabs-Qwen3.8-27B-4bit`, warm:
+The previous revision claimed a **3.3× long-context win** from
+`kernel_qwen_gqa_attn_decode_shadow_grp`. That is wrong, and the way it was
+wrong is worth keeping.
 
-| prompt | MLX prefill | MLX decode |
-|---|---|---|
-| 523 tok | 679 t/s | 26.5 t/s |
-| 2554 tok | 604 t/s | 29.7 t/s |
-| 10295 tok | 610 / 469 t/s | 24.8 / 23.5 t/s |
+The grouped dispatch was gated on `n_head / n_head_kv == 16`. Qwen3.8's
+full-attention layers are **24 query heads over 4 kv heads**, so `ngrp` is 6 and
+the gate was false on every single decode. The model never executed the new
+kernel. Evidence, all on Max:
 
-**MLX decode is flat in context; ds4 collapses.** 9.7 vs 24.2 t/s at 10 k is the
-single largest gap on the board. Short-context ds4 is 10 % behind (23.9 vs 26.5).
+- `DS4_QWEN_SHADOW_GRP=0` vs default: 9.82 vs 9.79 t/s at 10295, **byte-identical
+  generated text**. Toggling a kernel that is genuinely running does not produce
+  a character-identical result.
+- Serial @10295 was 9.7 t/s at `582a7b7` and 10.0 t/s at `e5ce86d` — the
+  "3.3× win" left Max exactly where it started.
+- With split-K forced at every nsplit from 2 to 32, the output sha never moved,
+  because split-K is gated behind the same `grp` flag.
 
-### mlx.fast (the Swift harness) on the identical 523-token seed, 256 tokens
+Min's 2.84 → 9.89 t/s pair was its documented sustain collapse (Min runs any
+framework 5–10× slow after ~60–90 s of GPU load), not the kernel. Min's own
+Machine-caveat section predicted this failure mode; the same-window A/B was not
+enough to escape it because *both* legs of that A/B ran the same kernel.
 
-| depth | seconds/token | t/s | accepted rate | mean draft |
+`DS4_QWEN_SHADOW_DEBUG=1` now prints, once per process, which geometry actually
+ran. That one line would have caught this on day one:
+
+```
+ds4: qwen shadow decode: path=split nsplit=81 pos=10310 n_head=24 n_head_kv=4 head_dim=256 cap_rows=32768
+```
+
+Also corrected: the pool *was* sized properly all along on Max
+(`DS4_QWEN_POOL_DEBUG=1` reports `req=32768 ceiling=32768 -> max_ctx=32768`).
+The `raw_kv_rows=4352` in the memory line is the planner's GDN split, not the
+attention pool, and was never the 10 k cliff. Host fallback tallies are zero.
+
+## What actually fixed it
+
+1. **ngrp gate generalised** to any group in 2..16, with the host dispatching
+   `ngrp*32` threads rather than a hardcoded 512 so exactly `ngrp` simdgroups
+   are live and the query-staging barrier stays uniform.
+2. **Split-K along position.** Grouping by itself is worth nothing here — 9.75
+   vs 9.69 t/s — because the decode is **occupancy-bound, not
+   DRAM-amplification-bound**. One threadgroup per kv head is 4 threadgroups per
+   layer per token on a 40-core GPU. `kernel_qwen_gqa_attn_decode_shadow_grp_split`
+   runs one threadgroup per `(kv_head, split)` and
+   `kernel_qwen_gqa_attn_decode_shadow_merge` recombines the partials with the
+   same online-softmax rescale the single-pass kernel applies inline.
+
+   nsplit sweep at 10295 (medians of 3):
+
+   | nsplit | 2 | 4 | 8 | 16 | 24 | 32 | 41 | 81 |
+   |---|---|---|---|---|---|---|---|---|
+   | t/s | 14.6 | 18.4 | 21.3 | 22.9 | 23.6 | 24.1 | 24.8 | 25.9 |
+
+   Monotone in threadgroup count, which is the proof that occupancy was the
+   binding constraint. The auto rule therefore takes **one BT=128 block per
+   split** (`nsplit = blocks_total`, capped 256): 5 splits @523, 20 @2554,
+   81 @10295.
+
+Split-K is **on by default**; `DS4_QWEN_SHADOW_SPLITK=0` restores the
+single-pass dispatch and `2..256` forces a count for sweeps.
+
+### Why defaulting it on is safe
+
+- Generated text byte-identical to single-pass at 523, 2554 and 10295 for every
+  nsplit tested.
+- `--dump-logits` at 2554, `DS4_QWEN_SHADOW_SPLITK=0` vs default: **bit-identical**
+  (md5 `272d8aa6070c725fe974c882fa5e27af` both ways). The reassociation is exact
+  here because chunk boundaries are whole BT blocks, so each chunk replays the
+  single-pass block order and the merge only re-applies scale factors the
+  single-pass kernel would have applied anyway.
+- MLX-exact parity unchanged: **0/248320 diffs, max_abs 0.0**.
+- Full gate ladder green, including `exact_logits=1` metal-session-batch and
+  both Ornith exact-match harnesses (the ngrp change is live for Ornith too).
+
+## Speculation economics inverted — read before quoting any MTP number
+
+Split-K made the target forward ~2.6× cheaper at long context. The draft head
+did not get cheaper, so **speculative decode is now a net loss beyond short
+prompts**. With the head loaded, medians of 3:
+
+| prompt | serial | K=1 | K=3 | AUTO |
 |---|---|---|---|---|
-| 0 (serial control) | 0.0712 / 0.0618 | 14.0 / **16.2** | — | 0 |
-| 8 (its adaptive policy) | 0.0329 / 0.0300 | 30.4 / **33.3** | 0.843 | **5.28** (max 7, zero non-drafting rounds) |
+| 523 | 25.45 | — | **51.81** (2.04×) | **52.49** (2.06×) |
+| 2554 | 26.73 | **32.52** (1.22×) | 19.69 (0.74×) | 26.61 (1.00×) |
+| 10295 | 25.67 | — | 16.85 (0.66×) | 21.98 (0.86×) |
 
-So: **ds4 already beats mlx.fast's own harness** — 23.9 vs 16.2 serial, 53.5 vs
-33.3 speculative — but mlx.fast extracts 5.45 tokens per round against ds4's
-3.92, while ds4's round is ~2.2× cheaper. The remaining wins are (a) close the
-pure-MLX decode gaps, (b) take mlx.fast's per-round yield with ds4's round cost.
+At 523 speculation is still a 2× win and is **exactly lossless** — K=3 and AUTO
+both reproduce the serial golden sha. At 2554 only depth 1 pays. At 10295
+nothing pays. This is not a regression: MTP requires `DS4_QWEN_MTP_HEAD`, so the
+default path never speculates.
 
-## The levers, in expected-payoff order
+## Default h stays 0.18
 
-### 1. Long-context decode cliff — host attention per token (biggest)
+Fitted from the new per-width counters rather than wall clock. At 2554,
+`verify(w) = 30.6 + 8.74·w` ms against a 37.4 ms plain step, and full-round cost
+relative to plain decode is 1.30 / 1.90 / 2.50 / 4.02 / 5.27 at depth
+1 / 2 / 3 / 5 / 7 — a least-squares `1 + d·h` fit gives h ≈ 0.59, but the
+*marginal* price at depth 1 is only 0.30 and the average is dragged up by deep
+rounds the policy should never choose.
 
-`ds4.c:17536-17561`. When `ds4_gpu_qwen_full_attn_tensor()` returns 0 the layer
-falls back to `qwen_full_attn_from_qkv()` on the **host**: `ds4_gpu_end_commands()`,
-readback of q/k/v, CPU attention over the whole context, writeback — per
-full-attention layer, per token. Qwen3.8 has 16 full-attention layers, so a
-single token pays 16 GPU syncs plus 16 CPU attentions.
+Measured end to end with `DS4_QWEN_MTP_AUTO=1`:
 
-It declines because the pooled KV is sized by `qwen_metal_pool_effective_max_ctx()`
-(`ds4.c:16652-16673`), which returns **8192** unless something called
-`qwen_metal_pool_note_requested_ctx()` before pool init. The CLI reports
-`ctx=32768 … raw_kv_rows=4352`, so the request is not reaching the pool.
+| h | 523 | 2554 | 10295 |
+|---|---|---|---|
+| **0.18** | 49.56 | **30.89** | 21.37 |
+| 0.35 | 51.39 | 26.59 | 20.44 |
+| 0.59 | **52.58** | 24.88 | 21.38 |
+| 0.90 | 25.89 (never drafts) | 25.08 | 24.07 |
 
-Do this: record the session ctx before the pool initialises (or size the pool
-from it directly), exactly the way `582a7b7` now sizes the MTP head's private KV
-from `g_qwen_pool.max_ctx` with a fallback ladder (`ds4.c:19224-19277`). Then
-verify at 10 k that no layer takes the host path — the cheapest check is that
-decode t/s stops collapsing (target ≥ 20 t/s at 10295 tokens).
+0.18 wins on the mean across 523/2554 and is the shipped default. Min's 0.10 fit
+would be strictly worse. `DS4_QWEN_MTP_H` still overrides per machine.
 
-Watch the memory: 64 layers × 32768 rows × 4 kv-heads × 256 dim × 4 B is far too
-much if you allocate for every layer. Only the full-attention layers need rows.
+## Open items, in expected-payoff order
 
-### 2. Adaptive per-round draft depth (port mlx.fast's cost model)
+1. **The adaptive policy latches off and cannot recover.** This is the biggest
+   remaining defect and it is why the h table above has a cliff between 0.35 and
+   0.18 rather than a smooth optimum. When `qwen_mtp_choose_k` returns 0,
+   `qwen_mtp_update_ema` is called with `drafted == 0`, which matches none of its
+   update branches — so the EMA freezes at whatever value stopped the drafting
+   and the policy never drafts again. Reproduce: `DS4_QWEN_MTP_AUTO=1
+   DS4_QWEN_MTP_H=0.35` at 2554 accepts 13 tokens in a whole 256-token run
+   (0.07/round) versus 113 (0.63/round) at h=0.18. The fix is an exploration
+   probe — force depth 1 every N consecutive zero rounds so the EMA keeps
+   observing — after which h should be re-fitted, since 0.18 is currently
+   partly chosen for latch-avoidance rather than for price.
+2. **2554 is the only length still short of MLX** (25.5 vs 29.7). 523 and 10295
+   are at or past the bar. Worth a `DS4_QWEN_PROFILE_ALWAYS=1` pass: decode is
+   one command buffer per token, so the per-buffer aggregate localises it
+   directly. At 2554 that buffer was 50.1 ms before split-K against 100.0 ms at
+   10295, i.e. ~34 ms fixed + ~6.4 µs per context token; the fixed term is now
+   the dominant cost at every length and nothing has profiled it yet.
+3. **Carry split-K to Ornith.** The ngrp fix is already live for any model with
+   a group of 2..16 and both Ornith exact-match gates pass, but no Ornith
+   long-context A/B has been run. Baselines to beat, 523-tok prompt, n=128, no
+   speculation: 35B 269 t/s prefill / 88.2 decode; 9B 734 / 72.7.
+4. **Top-2 confidence clamp** is implemented and off by default
+   (`DS4_QWEN_MTP_TOP2=1`). It uses a real k=2 indexer reduction plus two 4-byte
+   reads per position — no full-logits copy. Measured neutral at 523 (+1.8 %,
+   identical text) and negative at 2554 (24.59 vs 26.61), so it stays opt-in
+   until item 1 is fixed; the clamp only matters when the policy is actually
+   free to choose depth.
 
-ds4 drafts a fixed `DS4_QWEN_MTP_K` every round (`ds4.c:42003-42017`), which is
-why the 2554-token prose case *loses* 4 %: it pays 4 forwards for 1.54 tokens.
-mlx.fast ships a marginal-value rule and gets mean draft 5.28 with zero
-non-drafting rounds on the easy prompt while collapsing to 0 on hard stretches.
+## Reproduction
 
-Port it from `/Users/au/w/qwen38-challenge/Sources/MLXFastModel/Qwen36MTPBlockSession.swift`
-(clone the repo on Min, it is absent here):
-
-- `costModelDepth(offeredDepth:)` at **1072-1144** — the whole rule.
-  `reach = Π p[j]`; extend while `reach > marginal[d] * (1 + expected) / cumulative[d]`;
-  `expected += reach`.
-- `positionAcceptEMA` init `0.85 * 0.98^d`, α = 0.15 — **837-839**;
-  update rule `recordAcceptOutcome` — **1175-1181** (positions below the accept
-  count observe a success, the position *at* it observes a failure unless the
-  round stopped on a committed stop token, deeper positions observe nothing).
-- `headStepCostRatio h = 0.18` — **873**, with the full fitting history at
-  841-872. Uniform price: `marginal[d] = h`, `cumulative[d] = 1 + d*h` (**904-911**).
-- Caps: `sdpaWidthWallDepthCap = 5` (**1034**), `segmentedVerifyDepthCap = 7`
-  (**1041**), hard max 8.
-- Top-2 confidence clamp at depths 0 and 1: `p = min(p, sigmoid(margin/2))` and
-  `sigmoid(margin/3)` where `margin` is the pending primary's target top-2 logit
-  gap (**1123-1131**). ds4 has those logits at verify time.
-
-ds4's own h is measurable and close: verify at width 4 costs 72 ms against 42 ms
-at width 1 → h ≈ 0.24. Fit it from a forced-depth sweep, do not inherit 0.18
-blindly. Keep `DS4_QWEN_MTP_K` as the *offered* ceiling and let the policy pick
-0..K; a returned 0 must cost exactly what plain decode costs.
-
-### 3. MTP prefill priming is sequential per prompt token
-
-`ds4.c:41939-41950` primes the head's KV by calling `qwen_mtp_draft_one_metal()`
-once per prompt token. That is why prefill drops to 150–170 t/s whenever a head
-is loaded (from 510 t/s at 10 k). Batch the priming the way the target's batched
-prefill works — the head is one layer plus a vocab projection, so a batched
-forward over the prompt window should cost a small fraction of the target's.
-
-### 4. Short-context serial decode: 23.9 vs MLX 26.5, and prefill 226 vs 679
-
-Not yet root-caused. `DS4_QWEN_PROFILE=1` prints per-command-buffer GPU time but
-the print is gated to every 64th buffer, so it is nearly useless as-is; either
-ungate it behind a second env var or use `/usr/bin/sample` on the running pid
-(it exists; my one attempt raced the process). Suspect host round-trips per
-token in the hybrid path and the fixed per-prefill overhead that amortises away
-by 2 k tokens.
-
-### 5. Then Ornith
-
-`Ornith-1.5-35B` ships a **bundled nextn draft head** (`./ds4 --inspect` prints
-`layers: 40 (+1 bundled nextn draft head, executed separately)`), and the
-sidecar/APEX variants are synced. Everything above transfers:
-
-- Levers 1–3 are model-independent code paths (pooled KV sizing, draft policy,
-  head priming). Lever 2 especially: implement the policy once, keyed off the
-  same profile counters, and both Qwen3.8 and Ornith get it.
-- The head/trunk pairing discipline is the trap that already cost a day on
-  qwen38 — read the `ds4-apex-mtp-head-pairing` skill before touching the APEX
-  MTP artifacts, and never trust a t/s number without reading the generated text.
-- Ornith baselines on Max today (523-tok prompt, n=128, no speculation):
-  35B **269 t/s prefill / 88.2 t/s decode**; 9B **734 / 72.7**.
-
-## Reproduction commands
+Prompts live in `qwen38-mtp-fixtures/` (gitignored; 523-token copy-style English
+in `correctness_prompts/`, `p2k.txt` = 2554 tok, `p8k.txt` = 10295 tok). On Max
+they were reconstructed from `~/w/qwen38-challenge/correctness_prompts/` and
+`/tmp`; on Min they are already in place.
 
 ```sh
 cd ~/w/ds4
 A=$PWD/qwen38-q4_64a-full.gguf                    # ds4-native Q4_64A scales
-B=$PWD/gguf/Qwen3.8-27B-EigenLabs-Q4_64A.gguf     # MLX bf16 scales
+B=$PWD/gguf/Qwen3.8-27B-EigenLabs-Q4_64A.gguf     # MLX bf16 scales, parity only
 H=$PWD/gguf/Qwen3.8-27B-MTP-bf16.gguf             # norm-corrected MTP head
 F=$PWD/qwen38-mtp-fixtures/correctness_prompts/public_longcopy_gate_english_512.txt
 
-# serial baseline
+# serial, and the split-K A/B in one window
 ./ds4 -m "$A" --prompt-file "$F" -n 256 --temp 0 --raw
+DS4_QWEN_SHADOW_SPLITK=0 ./ds4 -m "$A" --prompt-file "$F" -n 256 --temp 0 --raw
 
-# speculative, fixed depth 3
-DS4_QWEN_MTP_HEAD=$H DS4_QWEN_MTP_K=3 DS4_QWEN_MTP_PROFILE=1 \
+# which geometry actually ran (print this before believing any number)
+DS4_QWEN_SHADOW_DEBUG=1 ./ds4 -m "$A" --prompt-file "$F" -n 8 --temp 0 --raw
+
+# speculative + the per-width verify counters that fit h
+DS4_QWEN_MTP_HEAD=$H DS4_QWEN_MTP_AUTO=1 DS4_QWEN_MTP_PROFILE=1 \
   ./ds4 -m "$A" --prompt-file "$F" -n 256 --temp 0 --raw
 
-# MLX-exact parity mode (bit-exact logits, ~half the decode, 1-row prefill)
+# MLX-exact parity (must stay 0/248320 after ANY ds4.c change)
 DS4_Q4_64A_MLX_BF16=1 ./ds4 -m "$B" -p Hello --raw --dump-logits /tmp/l.json
-# compare against mlx_lm.load('gguf/EigenLabs-Qwen3.8-27B-4bit') -> expect 0/248320 diffs
-
-# long-context legs
-./ds4 -m "$A" --prompt-file qwen38-mtp-fixtures/p8k.txt -n 128 --temp 0 --raw
 ```
 
-**Artifact/mode pairing is a silent-garbage trap.** `$A` runs in the default mode
-and emits `)[)[)[…` under `DS4_Q4_64A_MLX_BF16=1`; `$B` is the exact opposite.
-Neither errors. `accepted=0 (0.00/round)` with a matched head is the tell. Always
-read the text before quoting a number.
+MLX 0.31.3 is not installed system-wide on Max; create it on demand with
+`python3 -m venv /tmp/mlxq && /tmp/mlxq/bin/pip install mlx-lm==0.31.3`, then
+compare `/tmp/l.json` against `mlx_lm.load('gguf/EigenLabs-Qwen3.8-27B-4bit')`.
 
-### mlx.fast side (needs a clone + build on Min)
+**Artifact/mode pairing is still a silent-garbage trap.** `$A` runs in the
+default mode and emits `)[)[)[…` under `DS4_Q4_64A_MLX_BF16=1`; `$B` is the exact
+opposite. Neither errors. Always read the text before quoting a number.
 
-```sh
-git clone <qwen38-challenge remote> ~/w/qwen38-challenge   # absent on Min
-cd ~/w/qwen38-challenge && swift build -c release
-export MLXFAST_QWEN_MTP_TARGET_DIR=~/w/ds4/gguf/EigenLabs-Qwen3.8-27B-4bit
-# fixtures already synced: ~/w/ds4/qwen38-mtp-fixtures/ab-{plan,reference}.json
-./.build/release/mlxfast-swift mtp-timed \
-  --weights ~/w/ds4/gguf/EigenLabs-Qwen3.8-27B-4bit \
-  --mtp-head ~/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head \
-  --golden ~/w/ds4/qwen38-mtp-fixtures/ab-reference.json \
-  --tokens 256 --mtp-depth 8        # --mtp-depth 0 is the serial control
-# read parent_measured_seconds_per_token; t/s = 1/spt
-```
+**`DS4_QWEN_MTP_K` overrides `DS4_QWEN_MTP_AUTO`** (`ds4.c:42434`). Setting both
+runs a fixed depth and silently produces a fake "AUTO" measurement — this cost a
+whole matrix here. For true adaptive depth, set `DS4_QWEN_MTP_AUTO=1` alone.
 
-Regenerate the golden if you change the seed prompt (needs `tokens + 4` rows):
+## Measurement discipline that held up
 
-```sh
-./.build/release/mlxfast-swift mtp-verify --weights … --mtp-head … \
-  --emitted ab-plan.json --generate 260 --mtp-depth 1 --output ab-reference.json
-```
+Max does **not** show Min's sustain collapse: within one matrix, reps land
+inside 1–2 %. Across matrices separated by tens of minutes the same config can
+move ~15 % (h=0.18 @2554 read 26.61 in one window and 30.89 in another), so any
+claim must come from a same-window A/B. Discard rep 1; acceptance counts are
+deterministic per config, so if `accepted/round` matches across reps and t/s
+moves, that is machine state, not your change.
 
 ## Gates before any commit
 
 ```sh
 make -B ds4 ds4-server ds4-bench ds4-eval ds4-agent -j8
-./ds4_test --server
-./ds4_agent_test; ./ds4-eval --self-test-extractors
+./ds4_test --server; ./ds4_agent_test; ./ds4-eval --self-test-extractors
 ./tests/test_layer_pack; ./tests/test_engine_mgpu_placement; ./tests/test_dflash_shape
 ./tests/test_q64a_quant; ./tests/test_gpu_args; ./tests/test_layer_stash; ./tests/test_gpu_args_cli.sh
-make test-metal-session-batch DS4_TEST_MODEL=$PWD/qwen38-q4_64a-full.gguf   # exact_logits=1
-DS4_TEST_MODEL=$PWD/ornith35.gguf ./tests/test_ornith15_bench.sh            # exact vs llama-cli
-DS4_TEST_MODEL=$PWD/ornith9.gguf  ./tests/test_ornith9_bench.sh             # exact vs llama-completion
+make q4k-dot-test; make mxfp4-dot-test
+DS4_TEST_MODEL=$PWD/qwen38-q4_64a-full.gguf ./tests/test_metal_session_batch
+DS4_TEST_MODEL=$PWD/gguf/Ornith-1.5-35B-Q4_K_M.gguf ./tests/test_ornith15_bench.sh
+DS4_TEST_MODEL=$PWD/gguf/Ornith-1.5-9B-Q4_K_M.gguf  ./tests/test_ornith9_bench.sh
 ```
 
-Serialize the 35 B runs (`sleep 5-10` between model loads); ds4 refuses to start
-while another ds4/ds4-server holds the single-instance lock. Bare `./ds4_test`
-(no `--server`) reports **20 pre-existing failures** against Ornith-9B — those
-fixtures belong to the flash model; prove pre-existence by diffing suite
-verdicts, do not chase them.
-
-Also re-verify parity after *any* ds4.c change: `DS4_Q4_64A_MLX_BF16=1` +
-`--dump-logits` against MLX must stay 0/248320 diffs.
-
-## Artifacts synced into this directory
-
-| path | size | what |
-|---|---|---|
-| `qwen38-q4_64a-full.gguf` | 14 G | Qwen3.8-27B, ds4-native Q4_64A scales — the fast path. **Not transferred**: the file already on Min as `Qwen3.8-27B-Q4_K_M.gguf` is byte-identical to it (`sha256 17cc0346cd373b4913c04975f624ac3fc456a5a3fbd08f99be82e7cb4aba439b`), so this name is a hardlink to it. That existing name is a **misnomer** — the file is Q4_64A, not Q4_K_M |
-| `gguf/Qwen3.8-27B-EigenLabs-Q4_64A.gguf` | 14 G | same weights, MLX bf16 scales — parity mode only |
-| `gguf/Qwen3.8-27B-MTP-bf16.gguf` | 821 M | **the norm-corrected MTP head** (llama.cpp's Qwen `+1` norm transform was wrongly applied to 7 tensors; this file is the fix) |
-| `gguf/Qwen3.8-27B-MTP-f16.gguf` | 821 M | earlier F16 head, superseded — loses fidelity through BF16→F16 |
-| `gguf/EigenLabs-Qwen3.8-27B-4bit/` | 14 G | MLX reference checkpoint (parity target, tokenizer.json, mlx.fast weights) |
-| `~/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head/` | 810 M | MLX MTP head checkpoint mlx.fast pins |
-| `gguf/Ornith-1.5-9B-Q4_K_M.gguf` | 5.2 G | Ornith 9B target |
-| `gguf/ornith1.5-9b-dflash-bf16-projection-Q4_K_M.gguf` | 730 M | Ornith 9B DFlash draft |
-| `gguf/Ornith-1.5-35B-Q4_K_M.gguf` | 20 G | Ornith 35B target (bundled nextn head) |
-| `gguf/mtp-Ornith-1.5-35B-A3B-NVFP4-frspec-owngen32768.gguf` | 901 M | Ornith 35B MTP sidecar |
-| `gguf/Ornith-1.5-35B-A3B-APEX-MTP-Balanced.gguf` | 24 G | APEX mixed-precision + MTP |
-| `gguf/Ornith-1.5-35B-A3B-APEX-Balanced.gguf` | 24 G | APEX mixed-precision, gate-ladder model |
-| `qwen38-mtp-fixtures/` | small | `ab-plan.json`, `ab-reference.json` (260 mlx.fast golden rows), `p2k.txt` (2554 tok), `p8k.txt` (10295 tok), `correctness_prompts/` |
-
-Symlinks `qwen38.gguf`, `ornith35.gguf`, `ornith9.gguf`, `ds4flash.gguf` are
-created in this directory for the harnesses.
-
-**The transfer is complete** (2026-08-23, ~23:05 CST). It ran over the **Thunderbolt 5
-link at `audreyt@169.254.101.109` (`en2`)**, not `Min.local` — TB5 moved these
-files at 200-390 MB/s against 14-21 MB/s over Wi-Fi/WARP, so use that address for
-any future artifact push. Two openrsync notes that cost real time: this macOS
-ships **openrsync** (protocol 29), so `--info=progress2` is rejected, and
-`--partial` on a multi-GiB file stalls for minutes in the delta phase writing
-nothing — use `rsync -aW` (whole-file). The driver is `/tmp/sync-min.sh` **on
-Max**, log `/tmp/sync-min.log`; re-running it is idempotent.
-
-Verified after transfer: all nine GGUFs byte-size-identical to Max,
-`gguf/EigenLabs-Qwen3.8-27B-4bit/` 25 files / 14798168 KiB, and
-`~/.cache/mlxfast/qwen3.8-27b-mtp-v1/mtp-head/` 5 files / 829512 KiB — both
-matching Max exactly. Re-check any time with:
-
-```sh
-ls -l ~/w/ds4/*.gguf ~/w/ds4/gguf/*.gguf | awk '{print $5, $9}'
-du -sh ~/w/ds4/gguf/EigenLabs-Qwen3.8-27B-4bit ~/.cache/mlxfast/qwen3.8-27b-mtp-v1
-```
-
-Sizes must match: `qwen38-q4_64a-full.gguf` and
-`Qwen3.8-27B-EigenLabs-Q4_64A.gguf` are both exactly **15149087072** bytes and
-are **byte-different** — that identical size is the pairing trap, not a copy
-error. Verify with `cmp -s` if in doubt; anything still `.<name>.<random>` in the
-directory is an in-flight rsync temp file.
-
-## Min run results — 2026-08-24 (this machine)
-
-All levers implemented on `main` (+ uncommitted working tree), gates green,
-parity held. Numbers below are Min's; see **Machine caveat** before comparing.
-
-### What the code changes are
-
-1. **Grouped shadow attention kernel** (`metal/qwen_gdn.metal` +
-   `ds4_metal.m`): the real long-context fix. The old
-   `kernel_qwen_gqa_attn_decode_shadow` gave each of the 64 query heads its own
-   threadgroup and made every one of them stream its kv-head's whole F16
-   history — a 16× (`ngrp`) DRAM read amplification once the working set
-   exceeds L2 (empirically pos ≳ 4 k). That, **not** pool sizing, was the
-   10 k cliff: decode command buffers measured 7–8 s of pure GPU time per
-   token at pos ~10.3 k while the pooled KV was correctly sized at 32768 rows
-   and host-fallback tallies stayed zero. New kernel
-   `kernel_qwen_gqa_attn_decode_shadow_grp`: one threadgroup per kv head, 512
-   threads = one simdgroup per grouped q-head, per-head scalar op order
-   provably identical (same BT=128 blocks, same online softmax). Greedy text
-   is byte-identical to the old kernel at both 523 and 10295 tokens.
-   `DS4_QWEN_SHADOW_GRP=0` restores the old dispatch; auto-falls back when
-   `n_head/n_head_kv != 16`.
-2. **Adaptive draft depth** upgraded to mlx.fast semantics:
-   `DS4_QWEN_MTP_H` overrides h (default still 0.18), chooser cap flattened to
-   7 like `segmentedVerifyDepthCap`, stop-token suppression in
-   `qwen_mtp_update_ema` across all six call sites (hybrid, CPU, second Metal
-   loop), optimism-transfer branch kept. Top-2 clamp NOT ported (verify passes
-   expose top-1 only). `DS4_QWEN_MTP_AUTO` remains opt-in; its output is
-   byte-identical to serial at 523.
-3. **Batched MTP priming** (`qwen_mtp_priming_batched`, 256-row window):
-   replaces the per-prompt-token head forwards. Byte-identical output;
-   with-head prefill now equals no-head prefill (~209–217 t/s vs Max's
-   sequential 150–170); under thermal load the A/B is 45.6 vs 17.8 t/s
-   (2.6×). `DS4_QWEN_MTP_PRIMING_SEQ=1` restores the old loop.
-4. **Instrumentation**: `DS4_QWEN_POOL_DEBUG=1` prints
-   `req/ceiling -> max_ctx`; `DS4_QWEN_FALLBACK_TALLY=1` counts GDN/full-attn
-   host fallbacks per layer via atexit; `DS4_QWEN_PROFILE_ALWAYS=1` prints
-   every command buffer's GPU time with n/avg/max aggregates.
-5. Early `note_requested_ctx` calls before all pre-generation `ensure_pool`
-   warm sites (defensive; sizing was already correct on main).
-
-### Measurements (Min, Apple M5 Max 128 GB, greedy)
-
-| leg | old tree | new tree | note |
-|---|---|---|---|
-| serial @523 | — | **24.4 / 26.7** t/s (two fresh windows) | matches Max's 23.9 and the MLX bar 26.5 |
-| K=3 spec @523 | — | **57.8** t/s, accepted 1.46/round | beats mlx.fast harness's 33.3 |
-| AUTO @523 | — | lossless text, 210 acc / 45 rounds | drafted ~5/round |
-| serial @10295 | 2.84–3.55 t/s | **9.89 / 9.91** t/s (reproducible) | **3.3× kernel win**, same-window ON/OFF pair 9.89 vs 2.70 |
-| K=3 @10295 | 4.25 t/s (soaked) | accepted 0.70/round deterministic | counter cross-checks with Max exactly |
-| prefill @10295 no head | — | 545 t/s fresh | Max saw ~510 |
-| MLX reference (soaked Min) | 2.4–2.6 t/s @10k | ds4 new kernel 9.91 → **3.8× faster than pure MLX** | mlx_lm 0.31.3 in `~/.venvs/mlxq` |
-
-h measured from the fresh K=3 leg: verify/round 54.4 ms vs serial 41.8 ms →
-**h ≈ 0.10** for width 4 on fresh hardware (Max's 72-vs-42 ms fit gave 0.24;
-treat 0.18 default as conservative middle; re-fit per machine with
-`DS4_QWEN_MTP_H`). Depth sweep K∈{2,4,6,8} came back thermally confounded
-(within-config reps perfectly consistent — same accept counts — but legs ran
-in different thermal windows); do not quote it.
-
-### Correctness matrix
-
-- Goldens byte-match through every path: serial 523 & 10295, grouped kernel
-  ON and OFF, batched priming, AUTO policy, post-rebuild binaries.
-- Full gate suite green: unit tests, `exact_logits=1` Metal session batch,
-  tiered parity (0 diffs > 1e-6, max 5e-10 — the strict-zero gate now needs
-  mlx_lm 0.31.3, which itself shifted last-ulp; use `~/.venvs/mlxq/bin/python`),
-  Ornith 35B and 9B exact-match regressions.
-- Spec-vs-serial text at 10295 diverges at near-tie tokens ("po'" vs "poco")
-  with BOTH kernels — pre-existing property of batched verify at long ctx, not
-  this change; both outputs are coherent continuations. At 523 spec is exactly
-  lossless (AUTO and fixed-K3 both match golden).
-
-### Machine caveat (cost us half a day — read first)
-
-Min soaks in ~60–90 s of sustained GPU load and then runs ANY framework
-5–10× slow until minutes of idle: llama.cpp tg128 collapsed to 10.8 t/s on the
-9B here (vs ~70 expected), mlx_lm to 2.4 t/s @10k. GPU clocks read 1620 MHz
-100% residency throughout; powermode/battery/thermal warnings are clean — it
-just loses sustain. Consequences: (a) never compare absolute numbers across
-thermal windows; use same-window A/B or deep-cooled single shots (~10 min
-idle); (b) the ≥20 t/s @10k target could not be certified on Min — 9.9 t/s is
-the thermally-capped plateau and llama.cpp lands in the same zone, so the cap
-is the machine, not the kernel; re-measure the absolute on Max (expect ~3×
-over its documented 9.7); (c) Max's "short-context gap" (23.9 vs MLX 26.5)
-looks like the same artifact — fresh Min hits 26.67.
-
-### Next steps handed back
-
-- Re-baseline absolutes on Max with the new kernel (serial + K=3 + AUTO at
-  523/2554/10295; expect ~30 t/s class at 10k serial if sustain holds).
-- Split-K along position for the grouped kernel (only 4 threadgroups/token/
-  layer today → occupancy-bound beyond L2; flash-decoding style partial
-  attention + merge would target the remaining 26.7→9.9 decay). Tune on Max.
-- Decide default h (0.18 shipped; fresh-Min fit says 0.10) from a clean
-  forced-depth sweep on Max using the profile counters, not wall-clock.
-- Optional: port the top-2 confidence clamp once the verify pass exposes
-  top-k (protects hard prompts; easy prompts unaffected).
+Serialize the model-loaded harnesses (`sleep 5-10` between); ds4 refuses to
+start while another ds4/ds4-server holds the single-instance lock. Bare
+`./ds4_test` without `--server` reports 20 pre-existing Ornith-9B fixture
+failures — prove pre-existence by diffing suite verdicts, do not chase them.
