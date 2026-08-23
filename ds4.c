@@ -41602,7 +41602,9 @@ static int qwen_generate_hybrid(
     const int mtp_prof = getenv("DS4_QWEN_MTP_PROFILE") && getenv("DS4_QWEN_MTP_PROFILE")[0] != '0';
     static float ver_hidden[8 * 8192];
     const char *env_k = getenv("DS4_QWEN_MTP_K");
-    int fixed_k = (env_k && env_k[0]) ? atoi(env_k) : -1;
+    const char *env_auto = getenv("DS4_QWEN_MTP_AUTO");
+    int fixed_k = (env_k && env_k[0]) ? atoi(env_k)
+                : ((env_auto && env_auto[0] && strcmp(env_auto, "0") != 0) ? -1 : 0);
 
     while (n_generated < n_predict && pos < ctx_size) {
         if (vocab_token_is_generation_stop(vocab, token)) break;
