@@ -547,7 +547,7 @@ static NSUInteger g_qwen_flash_kv_f16_bytes;
  * overlap, a layer's previously converted prefix rows cannot be overwritten
  * by another layer. Bookkeeping tracks how many rows have been converted per
  * slot and is dropped whenever the source cache cannot be proven identical. */
-#define DS4_QWEN_FLASH_KV_MAX_SLOTS 24u
+#define DS4_QWEN_FLASH_KV_MAX_SLOTS 64u
 /* Sanity bound on the layer index used in source-cache offset math. */
 #define DS4_QWEN_FLASH_KV_MAX_LAYERS 256u
 typedef struct {
@@ -572,19 +572,20 @@ typedef struct {
 
 static ds4_qwen_flash_kv_f16_state g_qwen_flash_kv_f16;
 
-/* ARC-safe reset: never memset slots that hold strong ObjC references. */
+/* ARC-safe reset. Slots that hold a strong ObjC reference are never memset;
+ * more importantly, reset RETAINS the shadow buffers instead of releasing
+ * them: a reset can fire (table full, or truncate at generation start) while
+ * dispatches referencing those buffers are still encoded into a shared,
+ * not-yet-committed command buffer, and dropping the last reference there is
+ * a use-after-free whose symptom is exactly the intermittent 6e-4 logit
+ * spread tests/test_metal_session_batch caught between a batched decode row
+ * and its sequential control. The buffers are scratch reused by whoever
+ * claims the slot next; only ds4_qwen_flash_kv_f16_shutdown releases them. */
 static void ds4_qwen_flash_kv_f16_reset(void) {
     for (uint32_t s = 0; s < DS4_QWEN_FLASH_KV_MAX_SLOTS; s++) {
         ds4_qwen_flash_kv_f16_slot *slot = &g_qwen_flash_kv_f16.slots[s];
         slot->used = 0;
         slot->layer = 0;
-        slot->shadow = nil;
-        if (slot->shadow_bytes) {
-            g_qwen_flash_kv_f16_bytes =
-                (g_qwen_flash_kv_f16_bytes > slot->shadow_bytes)
-                    ? g_qwen_flash_kv_f16_bytes - slot->shadow_bytes : 0;
-            slot->shadow_bytes = 0;
-        }
         slot->k_buf = nil;
         slot->v_buf = nil;
         slot->k_off = 0;
@@ -22954,24 +22955,20 @@ static int ds4_gpu_encode_cpy_f32_f16_3d(
         uint64_t             dst_plane_stride);
 
 static int ds4_qwen_decode_shadow_enabled(void) {
-    /* Default OFF, opt-in with DS4_QWEN_DECODE_SHADOW=1 (3.5x decode at 1k
-     * ctx, 7x at 4k). Two reasons it cannot be the default yet, both found by
-     * tests/test_metal_session_batch's mixed prefill-vs-control comparison:
-     *
-     * 1. The slot table's incremental converted-counter drifts under
-     *    interleaved multi-session execution.
-     * 2. Even forcing a full F32->F16 reconversion per call (no counter), the
-     *    comparison still fails intermittently -- a state race between the
-     *    shadow path and the pooled command-buffer/slot machinery when
-     *    several sessions interleave with a prefill chunk. Single-session
-     *    use (the CLI generation driver) is unaffected; every exact-match
-     *    harness passes with =1 there.
-     *
-     * Making this the default needs per-session shadow isolation (or moving
-     * draft attention into the session graph like GLM's mtp step).
-     * =0 keeps the legacy F32 scan bit-exact with llama.cpp. */
-    return ds4_gpu_env_bool("DS4_QWEN_DECODE_SHADOW") == 1;
+    /* Default ON: single-token decode attends the persistent F16 KV shadow
+     * (3.5x decode at 1k ctx, 7x at 4k on Ornith/APEX 35B). Safe for
+     * multi-session use now that the shared slot table never releases shadow
+     * buffers mid-flight (a reset used to drop the last reference while
+     * dispatches referencing them were still encoded into a shared,
+     * uncommitted command buffer -- an intermittent use-after-free) and has
+     * capacity for every session's full-attn layers. Verified against the F32
+     * cache by tests/test_metal_session_batch's batched-vs-sequential memcmp.
+     * DS4_QWEN_DECODE_SHADOW=0 restores the legacy F32 scan bit-exact with
+     * llama.cpp. */
+    const char *sw = getenv("DS4_QWEN_DECODE_SHADOW");
+    return !(sw && sw[0] == '0' && sw[1] == '\0');
 }
+
 
 /* Shadow-backed tiled decode attention for qwen full-attn layers: attends
  * the persistent F16 KV shadow maintained by ds4_gpu_qwen_attn_flash_rows
