@@ -22954,13 +22954,22 @@ static int ds4_gpu_encode_cpy_f32_f16_3d(
         uint64_t             dst_plane_stride);
 
 static int ds4_qwen_decode_shadow_enabled(void) {
-    /* Default OFF: the shadow holds history K/V in F16, so this path is not
-     * bit-identical to the F32 legacy decode kernel. That breaks the
-     * batched-vs-sequential exactness contract asserted by
-     * tests/test_metal_session_batch, where a batched step takes the
-     * row-batched F32 attention while the sequential control takes this
-     * single-token path. Opt in with DS4_QWEN_DECODE_SHADOW=1 for the ~3.5x
-     * single-token decode speedup, same policy as DS4_QWEN_GDN_CHUNK. */
+    /* Default OFF, opt-in with DS4_QWEN_DECODE_SHADOW=1 (3.5x decode at 1k
+     * ctx, 7x at 4k). Two reasons it cannot be the default yet, both found by
+     * tests/test_metal_session_batch's mixed prefill-vs-control comparison:
+     *
+     * 1. The slot table's incremental converted-counter drifts under
+     *    interleaved multi-session execution.
+     * 2. Even forcing a full F32->F16 reconversion per call (no counter), the
+     *    comparison still fails intermittently -- a state race between the
+     *    shadow path and the pooled command-buffer/slot machinery when
+     *    several sessions interleave with a prefill chunk. Single-session
+     *    use (the CLI generation driver) is unaffected; every exact-match
+     *    harness passes with =1 there.
+     *
+     * Making this the default needs per-session shadow isolation (or moving
+     * draft attention into the session graph like GLM's mtp step).
+     * =0 keeps the legacy F32 scan bit-exact with llama.cpp. */
     return ds4_gpu_env_bool("DS4_QWEN_DECODE_SHADOW") == 1;
 }
 
@@ -32304,6 +32313,18 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_MXFP4:   return g_moe_mul_mv_id_mxfp4_pipeline;
     default:                       return nil;
     }
+}
+
+int ds4_gpu_qwen_routed_batch_pair_supported(uint32_t gate_type, uint32_t down_type) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Mirrors the acceptance check of the batched routed-MoE entry (the
+     * generic mul_mm_id family has no Q5_K/Q6_K kernels). The speculative
+     * driver must not offer drafts it cannot verify without mutating
+     * recurrent state mid-round. */
+    return ds4_gpu_routed_mv_nr0(gate_type) != 0 &&
+           ds4_gpu_routed_mv_nr0(down_type) != 0 &&
+           ds4_gpu_routed_mv_pipeline(gate_type) != nil &&
+           ds4_gpu_routed_mv_pipeline(down_type) != nil;
 }
 
 /* TensorOps routed-MoE prefill uses bits 0/1/2 for gate/up/down. Unsupported
@@ -43687,8 +43708,16 @@ int ds4_gpu_routed_moe_batch_tensor(
             gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
             down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
             if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
-                fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
-                        gate_type, down_type);
+                /* Mixed per-tensor precision (APEX-style files) makes this a
+                 * per-layer property, and the caller falls back to the exact
+                 * single-token path, so say it once rather than once per
+                 * verify round. */
+                static bool warned_batch_moe_types;
+                if (!warned_batch_moe_types) {
+                    warned_batch_moe_types = true;
+                    fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u; using single-token fallback\n",
+                            gate_type, down_type);
+                }
                 return 0;
             }
         }

@@ -145,6 +145,10 @@ int ds4_gpu_qwen_full_attn_rows_tensor(
         uint32_t              cap,
         uint32_t              n_tok);
 
+/* Nonzero when the batched routed-MoE path can verify this gate/down type
+ * pair without falling back mid-round. */
+int ds4_gpu_qwen_routed_batch_pair_supported(uint32_t gate_type, uint32_t down_type);
+
 int ds4_gpu_qwen_full_attn_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *q,
