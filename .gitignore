@@ -7,7 +7,8 @@
 /ds4_agent_test
 /ds4_server_test
 /ds4_test
-/ds4flash.gguf
+/tests/test_q4k_dot
+/*.gguf
 /TODO.md
 /gguf/
 /core
@@ -23,6 +24,9 @@
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
 /tests/cuda_long_context_smoke
+/tests/test_dflash_shape
+/tests/test_layer_stash
+/tests/test_q64a_quant
 /tests/test_layer_pack
 /tests/test_metal_session_batch
 /tests/test_mxfp4_cuda

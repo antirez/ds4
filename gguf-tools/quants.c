@@ -68,6 +68,8 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_BF16]    = { "bf16",        1,   2, false, false },
     [DS4Q_TYPE_TQ1_0]   = { "tq1_0",   QK_K,  54, false, false },
     [DS4Q_TYPE_TQ2_0]   = { "tq2_0",   QK_K,  66, false, false },
+    [DS4Q_TYPE_Q4_64A]  = { "q4_64a",     64,  36, true,  false },
+    [DS4Q_TYPE_Q2_64A]  = { "q2_64a",     64,  20, true,  false },
     [DS4Q_TYPE_MXFP4]   = { "mxfp4",      32,  17, false, false },
     [DS4Q_TYPE_NVFP4]   = { "nvfp4",      64,  36, false, false },
     [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
@@ -1051,6 +1053,104 @@ static void ds4q_write_iq2_xxs_block(const float *x, uint8_t *y, const float *qu
     memcpy(y + qs_off, q2, QK_K / 4);
 }
 
+static size_t ds4q_quantize_q4_64a(const float *src, void *dst, int64_t start,
+                                   int64_t nrows, int64_t ncols,
+                                   const float *imatrix) {
+    (void)imatrix;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q4_64A, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t n_blocks = ncols / 64;
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        uint8_t *row_out = out + (size_t)row * row_size;
+        for (int64_t b = 0; b < n_blocks; b++) {
+            const float *g = xrow + (size_t)b * 64;
+            float mn = g[0];
+            float mx = g[0];
+            for (int j = 1; j < 64; j++) {
+                if (g[j] < mn) mn = g[j];
+                if (g[j] > mx) mx = g[j];
+            }
+            float scale;
+            float bias = mn;
+            if (mx == mn) scale = 0.0f;
+            else scale = (mx - mn) / 15.0f;
+            /* Quantize against the bf16 values decoders reconstruct. */
+            const uint16_t scale_bf16 = (uint16_t)(ds4q_f32_to_bits(scale) >> 16);
+            const uint16_t bias_bf16 = (uint16_t)(ds4q_f32_to_bits(bias) >> 16);
+            scale = ds4q_f32_from_bits((uint32_t)scale_bf16 << 16);
+            bias = ds4q_f32_from_bits((uint32_t)bias_bf16 << 16);
+            uint8_t qs[32] = {0};
+            for (int j = 0; j < 64; j++) {
+                int q = 0;
+                if (scale != 0.0f) {
+                    float v = (g[j] - bias) / scale;
+                    q = (int)roundf(v);
+                    if (q < 0) q = 0;
+                    else if (q > 15) q = 15;
+                }
+                if ((j & 1) == 0) qs[j >> 1] = (uint8_t)(q & 0x0F);
+                else qs[j >> 1] |= (uint8_t)((q & 0x0F) << 4);
+            }
+            uint8_t *block = row_out + (size_t)b * 36;
+            memcpy(block, qs, 32);
+            memcpy(block + 32, &scale_bf16, 2);
+            memcpy(block + 34, &bias_bf16, 2);
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
+static size_t ds4q_quantize_q2_64a(const float *src, void *dst, int64_t start,
+                                   int64_t nrows, int64_t ncols,
+                                   const float *imatrix) {
+    (void)imatrix;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q2_64A, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t n_blocks = ncols / 64;
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        uint8_t *row_out = out + (size_t)row * row_size;
+        for (int64_t b = 0; b < n_blocks; b++) {
+            const float *g = xrow + (size_t)b * 64;
+            float mn = g[0];
+            float mx = g[0];
+            for (int j = 1; j < 64; j++) {
+                if (g[j] < mn) mn = g[j];
+                if (g[j] > mx) mx = g[j];
+            }
+            float scale;
+            float bias = mn;
+            if (mx == mn) scale = 0.0f;
+            else scale = (mx - mn) / 3.0f;
+            /* Quantize against the bf16 values decoders reconstruct. */
+            const uint16_t scale_bf16 = (uint16_t)(ds4q_f32_to_bits(scale) >> 16);
+            const uint16_t bias_bf16 = (uint16_t)(ds4q_f32_to_bits(bias) >> 16);
+            scale = ds4q_f32_from_bits((uint32_t)scale_bf16 << 16);
+            bias = ds4q_f32_from_bits((uint32_t)bias_bf16 << 16);
+            uint8_t qs[16] = {0};
+            for (int j = 0; j < 64; j++) {
+                int q = 0;
+                if (scale != 0.0f) {
+                    float v = (g[j] - bias) / scale;
+                    q = (int)roundf(v);
+                    if (q < 0) q = 0;
+                    else if (q > 3) q = 3;
+                }
+                qs[j >> 2] |= (uint8_t)((q & 0x03) << ((j & 3) * 2));
+            }
+            uint8_t *block = row_out + (size_t)b * 20;
+            memcpy(block, qs, 16);
+            memcpy(block + 16, &scale_bf16, 2);
+            memcpy(block + 18, &bias_bf16, 2);
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
 static size_t ds4q_quantize_iq2_xxs(const float *src, void *dst, int64_t start,
                                     int64_t nrows, int64_t ncols, const float *quant_weights) {
     assert(quant_weights);
@@ -1120,6 +1220,14 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_Q4_K) {
         return ds4q_quantize_q4_k(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q4_64A) {
+        (void)imatrix;
+        return ds4q_quantize_q4_64a(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q2_64A) {
+        (void)imatrix;
+        return ds4q_quantize_q2_64a(src, dst, start, nrows, ncols, imatrix);
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);

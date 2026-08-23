@@ -540,6 +540,7 @@ typedef enum {
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
+    SERVER_MODEL_SYNTAX_QWEN,
 } server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -958,23 +959,39 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
-            !strcmp(model, "zai/glm-5.2-chat"));
+            !strcmp(model, "zai/glm-5.2-chat") ||
+            !strcmp(model, "ornith-chat") ||
+            !strcmp(model, "ornith-1.5-35b-chat") ||
+            !strcmp(model, "ornith-1.5-9b-chat") ||
+            !strcmp(model, "ornith-9b-chat") ||
+            !strcmp(model, "ornith-no-think") ||
+            !strcmp(model, "qwen-chat") ||
+            !strcmp(model, "qwen-3.8-chat") ||
+            !strcmp(model, "qwen-3.8-27b-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-reasoner") ||
             !strcmp(model, "glm-5.2-reasoner") ||
-            !strcmp(model, "zai/glm-5.2-reasoner"));
+            !strcmp(model, "zai/glm-5.2-reasoner") ||
+            !strcmp(model, "ornith-reasoner") ||
+            !strcmp(model, "ornith-1.5-35b-reasoner") ||
+            !strcmp(model, "ornith-1.5-9b-reasoner") ||
+            !strcmp(model, "ornith-9b-reasoner"));
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    if (ds4_engine_is_glm_dsa(engine)) return SERVER_MODEL_SYNTAX_GLM;
+    if (ds4_engine_is_qwen(engine)) return SERVER_MODEL_SYNTAX_QWEN;
+    return SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
+    if (ds4_engine_is_ornith9(engine)) return "ornith-1.5-9b";
+    if (ds4_engine_is_ornith(engine)) return "ornith-1.5-35b";
+    if (ds4_engine_is_qwen(engine)) return "qwen-3.8-27b";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
@@ -990,7 +1007,29 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "glm-5.2-reasoner") ||
             !strcmp(id, "zai/glm-5.2") ||
             !strcmp(id, "zai/glm-5.2-chat") ||
-            !strcmp(id, "zai/glm-5.2-reasoner"));
+            !strcmp(id, "zai/glm-5.2-reasoner") ||
+            !strcmp(id, "ornith-1.5-35b") ||
+            !strcmp(id, "ornith") ||
+            !strcmp(id, "ornith-35b") ||
+            !strcmp(id, "ornith-chat") ||
+            !strcmp(id, "ornith-1.5-35b-chat") ||
+            !strcmp(id, "ornith-no-think") ||
+            !strcmp(id, "ornith-reasoner") ||
+            !strcmp(id, "ornith-1.5-35b-reasoner") ||
+            !strcmp(id, "ornith-1.5-9b") ||
+            !strcmp(id, "ornith-9b") ||
+            !strcmp(id, "ornith-1.5:9b") ||
+            !strcmp(id, "ornith-1.5-9b-chat") ||
+            !strcmp(id, "ornith-9b-chat") ||
+            !strcmp(id, "ornith-1.5-9b-reasoner") ||
+            !strcmp(id, "ornith-9b-reasoner") ||
+            !strcmp(id, "qwen-3.8-27b") ||
+            !strcmp(id, "qwen-3.8") ||
+            !strcmp(id, "qwen3.8") ||
+            !strcmp(id, "qwen") ||
+            !strcmp(id, "qwen-chat") ||
+            !strcmp(id, "qwen-3.8-chat") ||
+            !strcmp(id, "qwen-3.8-27b-chat"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2603,6 +2642,122 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
 
     return buf_take(&out);
 }
+static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
+                                          const char *tool_schemas,
+                                          const tool_schema_orders *tool_orders,
+                                          ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+
+    buf system = {0};
+    if (tool_schemas && tool_schemas[0]) {
+        append_glm_tools_prompt_text(&system, tool_schemas);
+    }
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!role_is_system(m->role)) continue;
+        if (system.len) buf_puts(&system, "\n\n");
+        buf_puts(&system, m->content ? m->content : "");
+    }
+    if (system.len) {
+        buf_puts(&out, "<|im_start|>system\n");
+        buf_puts(&out, system.ptr);
+        buf_puts(&out, "<|im_end|>\n");
+    }
+    buf_free(&system);
+
+    bool pending_assistant = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf_puts(&out, "<|im_start|>user\n<tool_response>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "\n</tool_response><|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<|im_start|>assistant\n");
+            if (m->reasoning && m->reasoning[0]) {
+                buf_puts(&out, "<think>\n");
+                buf_puts(&out, m->reasoning);
+                buf_puts(&out, "\n</think>\n\n");
+            } else if (text_starts_with_think_tag(m->content)) {
+            } else if (!think) {
+                buf_puts(&out, "<think>\n\n</think>\n\n");
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
+                                              &m->calls, tool_orders);
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = false;
+        }
+    }
+
+    if (pending_assistant) {
+        buf_puts(&out, "<|im_start|>assistant\n");
+        if (think) {
+            buf_puts(&out, "<think>\n");
+        } else {
+            buf_puts(&out, "<think>\n\n</think>\n\n");
+        }
+    }
+    return buf_take(&out);
+}
+
+static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
+                                        const tool_schema_orders *tool_orders,
+                                        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    bool pending_assistant = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            buf_puts(&out, "<|im_start|>user\n<tool_response>\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "\n</tool_response><|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, "<|im_start|>assistant\n");
+            if (m->reasoning && m->reasoning[0]) {
+                buf_puts(&out, "<think>\n");
+                buf_puts(&out, m->reasoning);
+                buf_puts(&out, "\n</think>\n\n");
+            } else if (!think) {
+                buf_puts(&out, "<think>\n\n</think>\n\n");
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
+                                              &m->calls, tool_orders);
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = false;
+        }
+    }
+
+    if (pending_assistant) {
+        buf_puts(&out, "<|im_start|>assistant\n");
+        if (think) {
+            buf_puts(&out, "<think>\n");
+        } else {
+            buf_puts(&out, "<think>\n\n</think>\n\n");
+        }
+    }
+    return buf_take(&out);
+}
+
 
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
@@ -2613,10 +2768,13 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return render_qwen_chat_prompt_text(msgs, tool_schemas,
+                                            tool_orders, think_mode);
+    }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
 }
-
 static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
         const chat_msgs *msgs,
         const char *tool_schemas,
@@ -2736,9 +2894,11 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
+    }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
-
 static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
         const chat_msgs *msgs, int start,
         ds4_think_mode think_mode) {
@@ -4464,10 +4624,12 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     chat_msgs msgs = {0};
-    chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are a helpful assistant");
-    chat_msgs_push(&msgs, sys);
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) {
+        chat_msg sys = {0};
+        sys.role = xstrdup("system");
+        sys.content = xstrdup("You are a helpful assistant");
+        chat_msgs_push(&msgs, sys);
+    }
     chat_msg user_msg = {0};
     user_msg.role = xstrdup("user");
     user_msg.content = prompt;
@@ -5186,7 +5348,7 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   char **content_out,
                                                   char **reasoning_out,
                                                   tool_calls *calls) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_GLM || syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
                                               calls);
@@ -10398,7 +10560,7 @@ static char *build_invalid_glm_tool_error_suffix(const request *r,
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
-    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+    if (r && (r->model_syntax == SERVER_MODEL_SYNTAX_GLM || r->model_syntax == SERVER_MODEL_SYNTAX_QWEN)) {
         return build_invalid_glm_tool_error_suffix(r, thinking, detail);
     }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
@@ -10704,12 +10866,18 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
+        if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+            buf_puts(&suffix, "\n</think>\n\n");
+        } else {
+            buf_puts(&suffix, "</think>");
+        }
     }
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(&suffix, "<|im_end|>\n");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -10734,12 +10902,18 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
         }
-        buf_puts(&suffix, "</think>");
+        if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+            buf_puts(&suffix, "\n</think>\n\n");
+        } else {
+            buf_puts(&suffix, "</think>");
+        }
     }
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(&suffix, "<|im_end|>\n");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -11630,6 +11804,8 @@ decode_again:
     size_t think_recovery_scan_from = 0;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    bool have_greedy_next = false;
+    int greedy_next = -1;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -11657,8 +11833,14 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(slot->session, temperature, top_k,
+        int token;
+        if (have_greedy_next) {
+            token = greedy_next;
+            have_greedy_next = false;
+        } else {
+            token = ds4_session_sample(slot->session, temperature, top_k,
                                        top_p, min_p, &rng);
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -11668,27 +11850,29 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode && temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+        bool toks_evaluated = false;
+        if (temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
+             ds4_engine_dflash_ready(s->engine)) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            ntok = ds4_session_eval_speculative_argmax(slot->session,
-                                                       token,
-                                                       max_tokens - completion,
-                                                       ds4_token_eos(s->engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            if (s->batched_mode) pthread_mutex_lock(&s->inference_mu);
+            ntok = ds4_session_eval_speculative_argmax(
+                slot->session,
+                token,
+                max_tokens - completion,
+                ds4_token_eos(s->engine),
+                toks,
+                (int)(sizeof(toks) / sizeof(toks[0])),
+                err,
+                sizeof(err));
+            if (s->batched_mode) pthread_mutex_unlock(&s->inference_mu);
             if (ntok < 0) {
                 finish = "error";
                 break;
             }
+            toks_evaluated = true;
         } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
-                finish = "error";
-                break;
-            }
             toks[0] = token;
             ntok = 1;
         }
@@ -11710,6 +11894,31 @@ decode_again:
 
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
+            if (!toks_evaluated) {
+                int eval_rc;
+                const bool can_eval_argmax =
+                    !s->batched_mode &&
+                    temperature <= 0.0f &&
+                    ds4_engine_is_qwen(s->engine) &&
+                    (completion + 1 < max_tokens);
+                if (can_eval_argmax) {
+                    pthread_mutex_lock(&s->inference_mu);
+                    greedy_next = ds4_session_eval_argmax(
+                        slot->session, token, err, sizeof(err));
+                    pthread_mutex_unlock(&s->inference_mu);
+                    eval_rc = greedy_next < 0 ? 1 : 0;
+                    if (eval_rc == 0) have_greedy_next = true;
+                } else {
+                    eval_rc = server_eval_token(
+                        s, slot, token, err, sizeof(err));
+                }
+                if (eval_rc != 0) {
+                    finish = "error";
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+            }
             completion++;
 
             trace_piece(s, trace_id, piece, piece_len);
@@ -12670,7 +12879,27 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (ds4_engine_is_ornith9(s->engine)) {
+        append_model_json(&b, s, "ornith-1.5-9b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "ornith-9b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "ornith-1.5:9b");
+    } else if (ds4_engine_is_ornith(s->engine)) {
+        append_model_json(&b, s, "ornith-1.5-35b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "ornith");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "ornith-35b");
+    } else if (ds4_engine_is_qwen(s->engine)) {
+        append_model_json(&b, s, "qwen-3.8-27b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen-3.8");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen3.8");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen");
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
@@ -13140,6 +13369,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--dflash") || !strcmp(arg, "--dflash2") || !strcmp(arg, "--draft-model") || !strcmp(arg, "-hfd")) {
+            c.engine.dflash_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dflash-n-max") || !strcmp(arg, "--spec-draft-n-max")) {
+            c.engine.dflash_draft_n_max = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -14470,6 +14703,63 @@ static void test_responses_usage_reports_cache_details(void) {
     close(sv[1]);
     request_free(&r);
 }
+static void test_openai_qwen_tool_stream_suppresses_raw_tool_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_qwen_tool", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "Before.\n\n"
+        "<tool_call>bash"
+        "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                         raw, strlen(raw), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw, false,
+        &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+
+    TEST_ASSERT(strstr(out, "data: {\"id\":\"chatcmpl_qwen_tool\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"role\":\"assistant\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"Before.\"") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "finish_reason\":\"tool_calls\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"pwd\\\"") != NULL);
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
 
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     int sv[2];
@@ -14959,8 +15249,29 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_alias_known("ornith-1.5-35b"));
+    TEST_ASSERT(server_model_alias_known("ornith"));
+    TEST_ASSERT(server_model_alias_known("ornith-35b"));
+    TEST_ASSERT(server_model_alias_known("ornith-1.5-9b"));
+    TEST_ASSERT(server_model_alias_known("ornith-9b"));
+    TEST_ASSERT(server_model_alias_known("ornith-1.5:9b"));
+    TEST_ASSERT(server_model_alias_known("ornith-no-think"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-1.5-35b-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-1.5-9b-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("ornith-no-think"));
+    TEST_ASSERT(model_alias_enables_thinking("ornith-reasoner"));
+    TEST_ASSERT(model_alias_enables_thinking("ornith-1.5-35b-reasoner"));
+    TEST_ASSERT(model_alias_enables_thinking("ornith-1.5-9b-reasoner"));
+    TEST_ASSERT(server_model_alias_known("qwen-3.8-27b"));
+    TEST_ASSERT(server_model_alias_known("qwen-3.8"));
+    TEST_ASSERT(server_model_alias_known("qwen3.8"));
+    TEST_ASSERT(server_model_alias_known("qwen"));
+    TEST_ASSERT(server_model_alias_known("qwen-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen-3.8-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen-3.8-27b-chat"));
 }
-
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
@@ -15138,6 +15449,30 @@ static void test_render_glm_chat_prompt_text(void) {
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
 }
+static void test_render_qwen_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
+
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>system\nYou are terse.<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>user\nHello<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n<think>\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 
 static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
@@ -15664,6 +15999,82 @@ static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_qwen_tool_checkpoint_suffix_is_canonical(void) {
+    tool_schema_orders orders = make_bash_order();
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{},\"description\":{}}}}";
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("inspect");
+    chat_msgs_push(&prefix_msgs, user);
+    char *prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &prefix_msgs, tool_schemas,
+        &orders, DS4_THINK_HIGH);
+
+    const char *generated =
+        "need bash</think>done\n\n"
+        "<tool_call>bash"
+        "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call>";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, generated, false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.think_mode = DS4_THINK_HIGH;
+    r.tool_orders = orders;
+    memset(&orders, 0, sizeof(orders));
+
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(suffix, "<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
+
+    buf canonical = {0};
+    buf_puts(&canonical, prompt_text);
+    buf_puts(&canonical, suffix);
+
+    chat_msgs history_msgs = {0};
+    chat_msg history_user = {0};
+    history_user.role = xstrdup("user");
+    history_user.content = xstrdup("inspect");
+    chat_msgs_push(&history_msgs, history_user);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup(content ? content : "");
+    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+    assistant.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&history_msgs, assistant);
+
+    char *future_prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &history_msgs, tool_schemas,
+        &r.tool_orders, DS4_THINK_HIGH);
+    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
+
+    free(future_prompt);
+    buf_free(&canonical);
+    free(suffix);
+    chat_msgs_free(&history_msgs);
+    free(content);
+    free(reasoning);
+    chat_msgs_free(&prefix_msgs);
+    free(prompt_text);
+    request_free(&r);
 }
 
 static void test_thinking_dsml_after_think_close_is_executable(void) {
@@ -18324,6 +18735,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
+    test_render_qwen_chat_prompt_text();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
@@ -18432,6 +18844,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
+    test_openai_qwen_tool_stream_suppresses_raw_tool_call();
+    test_qwen_tool_checkpoint_suffix_is_canonical();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 

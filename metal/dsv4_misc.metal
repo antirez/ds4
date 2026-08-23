@@ -1622,6 +1622,7 @@ static inline float glm_q8_0_dot_row_dev_f32(
 #define DS4_METAL_GGUF_Q4_0 2u
 #define DS4_METAL_GGUF_Q8_0 8u
 #define DS4_METAL_GGUF_Q4_K 12u
+#define DS4_METAL_GGUF_Q4_64A 36u
 
 static inline uchar2 glm_q4_K_scale_min(int j, int k, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
@@ -1658,12 +1659,50 @@ static inline float glm_q4_K_weight_at(device const char *row, uint col) {
     return d * (float)sm.x * (float)q - dmin * (float)sm.y;
 }
 
+static inline float bf16_to_f32_dsv4(ushort b) { return as_type<float>(uint(b) << 16); }
+
+static inline float glm_q4_64a_weight_at(device const char *row, uint col) {
+    // M5: scalar path kept for correctness; hot loops use vectorized bulk dequant below.
+    const uint block = col >> 6u;
+    const uint idx = col & 63u;
+    device const char *block_base = row + (uint64_t)block * 36u;
+    const ushort sbits = *((device const ushort *)(block_base + 32));
+    const ushort bbits = *((device const ushort *)(block_base + 34));
+    const float scale = bf16_to_f32_dsv4(sbits);
+    const float bias = bf16_to_f32_dsv4(bbits);
+    device const uchar *qs = (device const uchar *)block_base;
+    const uchar qb = qs[idx >> 1u];
+    const uint q = (qb >> ((idx & 1u) * 4u)) & 0x0Fu;
+    return (float)q * scale + bias;
+}
+
+// M5: vectorized Q4_64A bulk dequant for 4-wide float4 chunks (16B = 32 nibbles = half block).
+// Loads 8B as ushort4 (aligned) and unpacks 8 nibbles per lane with 4b shifts; scale/bias are
+// BF16->F32 broadcast. Matches dense.metal's 64-elem g64 affine group: one scale/bias per 64 elems.
+// Steel-gather style: coalesced 64B loads for GQA shapes (5120->6144/1024, 6144->5120, 5120->17408)
+// ensure weight tiles are read once per threadgroup and reused across simdgroups.
+static inline float4 glm_q4_64a_dequant4(device const char *block_base, uint idx4) {
+    // idx4 is 4-elem chunk index (0..15 for 64 elems); each chunk = 2B = 4 nibbles
+    const ushort sbits = *((device const ushort *)(block_base + 32));
+    const ushort bbits = *((device const ushort *)(block_base + 34));
+    const float scale = bf16_to_f32_dsv4(sbits);
+    const float bias = bf16_to_f32_dsv4(bbits);
+    const ushort packed =
+        *((device const ushort *)(block_base + idx4 * 2u));
+    return float4(
+        float( packed        & 0xF) * scale + bias,
+        float((packed >> 4)  & 0xF) * scale + bias,
+        float((packed >> 8)  & 0xF) * scale + bias,
+        float((packed >> 12) & 0xF) * scale + bias);
+}
+
 static inline float glm_quant_weight_at(
         uint weight_type,
         device const char *row,
         uint col) {
     if (weight_type == DS4_METAL_GGUF_Q4_0) return glm_q4_0_weight_at(row, col);
     if (weight_type == DS4_METAL_GGUF_Q4_K) return glm_q4_K_weight_at(row, col);
+    if (weight_type == DS4_METAL_GGUF_Q4_64A) return glm_q4_64a_weight_at(row, col);
     return glm_q8_0_weight_at(row, col);
 }
 
@@ -1689,6 +1728,64 @@ static inline float glm_q4_K_dot_row_tg_f32(
     return acc;
 }
 
+static inline float glm_q4_64a_dot_row_tg_f32(
+        device const char *row,
+        threadgroup const float *x,
+        uint n_cols) {
+    // M5: threadgroup dot with coalesced 4-wide dequant + FMA. Processes 64-elem groups as 16x float4,
+    // matching steel_gemm_gather 64B coalescing. One BF16 scale/bias per group broadcast across 16 chunks.
+    float acc = 0.0f;
+    const uint n_blocks = n_cols >> 6u;
+    for (uint b = 0; b < n_blocks; b++) {
+        device const char *bl = row + (uint64_t)b * 36u;
+        const float scale = bf16_to_f32_dsv4(*((device const ushort *)(bl + 32)));
+        const float bias  = bf16_to_f32_dsv4(*((device const ushort *)(bl + 34)));
+        device const ushort *qs16 = (device const ushort *)bl; // 32B qs as 16x ushort (2B per 4 nibbles)
+        threadgroup const float4 *x4 = (threadgroup const float4 *)(x + (b << 6u));
+        // 16 chunks of 4 elems = 64
+#pragma clang loop unroll(full)
+        for (uint c = 0; c < 16u; c++) {
+            ushort packed = qs16[c];
+            float4 w = float4(
+                float( packed        & 0xF) * scale + bias,
+                float((packed >> 4)  & 0xF) * scale + bias,
+                float((packed >> 8)  & 0xF) * scale + bias,
+                float((packed >> 12) & 0xF) * scale + bias);
+            acc += dot(w, x4[c]);
+        }
+    }
+    // Tail <64 (should not happen for GQA: 5120,6144,1024,17408 all multiples of 64)
+    for (uint col = n_blocks << 6u; col < n_cols; col++) acc += glm_q4_64a_weight_at(row, col) * x[col];
+    return acc;
+}
+
+static inline float glm_q4_64a_dot_row_dev_f32(
+        device const char *row,
+        device const float *x,
+        uint n_cols) {
+    // M5: device dot with coalesced 4-wide vectorized BF16 dequant (same as tg variant). Keeps CPU path untouched.
+    float acc = 0.0f;
+    const uint n_blocks = n_cols >> 6u;
+    for (uint b = 0; b < n_blocks; b++) {
+        device const char *bl = row + (uint64_t)b * 36u;
+        const float scale = bf16_to_f32_dsv4(*((device const ushort *)(bl + 32)));
+        const float bias  = bf16_to_f32_dsv4(*((device const ushort *)(bl + 34)));
+        device const ushort *qs16 = (device const ushort *)bl;
+        device const float4 *x4 = (device const float4 *)(x + (b << 6u));
+        for (uint c = 0; c < 16u; c++) {
+            ushort packed = qs16[c];
+            float4 w = float4(
+                float( packed        & 0xF) * scale + bias,
+                float((packed >> 4)  & 0xF) * scale + bias,
+                float((packed >> 8)  & 0xF) * scale + bias,
+                float((packed >> 12) & 0xF) * scale + bias);
+            acc += dot(w, x4[c]);
+        }
+    }
+    for (uint col = n_blocks << 6u; col < n_cols; col++) acc += glm_q4_64a_weight_at(row, col) * x[col];
+    return acc;
+}
+
 static inline float glm_quant_dot_row_tg_f32(
         uint weight_type,
         device const char *row,
@@ -1696,6 +1793,7 @@ static inline float glm_quant_dot_row_tg_f32(
         uint n_cols) {
     if (weight_type == DS4_METAL_GGUF_Q4_0) return glm_q4_0_dot_row_tg_f32(row, x, n_cols);
     if (weight_type == DS4_METAL_GGUF_Q4_K) return glm_q4_K_dot_row_tg_f32(row, x, n_cols);
+    if (weight_type == DS4_METAL_GGUF_Q4_64A) return glm_q4_64a_dot_row_tg_f32(row, x, n_cols);
     return glm_q8_0_dot_row_tg_f32_fast(row, x, n_cols);
 }
 
@@ -1734,6 +1832,7 @@ static inline float glm_quant_dot_row_dev_f32(
         device const float *x,
         uint n_cols) {
     if (weight_type == DS4_METAL_GGUF_Q8_0) return glm_q8_0_dot_row_dev_f32(row, x, n_cols);
+    if (weight_type == DS4_METAL_GGUF_Q4_64A) return glm_q4_64a_dot_row_dev_f32(row, x, n_cols);
     float acc = 0.0f;
     for (uint col = 0; col < n_cols; col++) {
         acc += glm_quant_weight_at(weight_type, row, col) * x[col];

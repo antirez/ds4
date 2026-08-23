@@ -2788,8 +2788,24 @@ static int dist_coordinator_eval_span(
  * ========================================================================= */
 
 static bool dist_prompt_is_rendered_chat(const char *prompt) {
-    const char *bos = "<｜begin▁of▁sentence｜>";
-    return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
+    if (!prompt) return false;
+    static const char *prefixes[] = {
+        "<｜begin▁of▁sentence｜>",
+        "<｜User｜>",
+        "[gMASK]",
+        "<sop>",
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|observation|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+    };
+    for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+        if (strncmp(prompt, prefixes[i], strlen(prefixes[i])) == 0) return true;
+    }
+    return false;
 }
 
 static bool dist_json_utf8_valid(const char *s, size_t n) {
