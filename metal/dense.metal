@@ -1657,6 +1657,63 @@ void dequantize_dense_q4_K_t4(device const ds4_dense_block_q4_K *xb, short il, t
     }
 }
 
+static inline float ds4_q4_64a_runtime_value(float v) {
+#if defined(DS4_Q4_64A_MLX_BF16)
+    uint bits = as_type<uint>(v);
+    const uint lsb = (bits >> 16u) & 1u;
+    bits += 0x7fffu + lsb;
+    return as_type<float>(bits & 0xffff0000u);
+#else
+    return v;
+#endif
+}
+struct ds4_bf16_mv_args {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+};
+
+kernel void kernel_mul_mv_bf16_f32(
+        constant ds4_bf16_mv_args &args,
+        device const ushort *w,
+        device const float *x,
+        device float *out,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint first_row = group.x * 32u + (uint)sg * 4u;
+    const uint token = group.y;
+    if (token >= args.n_tok) return;
+    const device float *xt = x + (uint64_t)token * args.in_dim;
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k0 = 0; k0 < args.in_dim; k0 += 128u) {
+        const uint col = k0 + (uint)lane * 4u;
+        float xv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint i = 0; i < 4u; i++) {
+            if (col + i < args.in_dim) xv[i] = xt[col + i];
+        }
+        for (uint r = 0; r < 4u; r++) {
+            const uint row = first_row + r;
+            if (row >= args.out_dim) continue;
+            device const ushort *wr = w + (uint64_t)row * args.in_dim + col;
+            for (uint i = 0; i < 4u && col + i < args.in_dim; i++) {
+                const float wf = as_type<float>((uint)wr[i] << 16u);
+                result[r] += wf * xv[i];
+            }
+        }
+    }
+    for (uint r = 0; r < 4u; r++) {
+        for (ushort offset = 16u; offset >= 1u; offset >>= 1u) {
+            result[r] += simd_shuffle_down(result[r], offset);
+        }
+        const uint row = first_row + r;
+        if (lane == 0u && row < args.out_dim) {
+            out[(uint64_t)token * args.out_dim + row] = result[r];
+        }
+    }
+}
+
+
 template <typename type4x4>
 void dequantize_dense_q4_64a(device const ds4_dense_block_q4_64a *xb, short il, thread type4x4 &reg) {
     float4x4 reg_f;
@@ -1667,7 +1724,7 @@ void dequantize_dense_q4_64a(device const ds4_dense_block_q4_64a *xb, short il, 
         const int k = base + i;
         const uchar packed = xb->qs[k >> 1];
         const uint q = (packed >> ((k & 1) * 4)) & 0x0F;
-        reg_f[i / 4][i % 4] = (float)q * scale + bias;
+        reg_f[i / 4][i % 4] = ds4_q4_64a_runtime_value((float)q * scale + bias);
     }
     reg = (type4x4)reg_f;
 }
@@ -1681,7 +1738,7 @@ void dequantize_dense_q4_64a_t4(device const ds4_dense_block_q4_64a *xb, short i
         const int k = base + i;
         const uchar packed = xb->qs[k >> 1];
         const uint q = (packed >> ((k & 1) * 4)) & 0x0F;
-        reg[i] = (float)q * scale + bias;
+        reg[i] = ds4_q4_64a_runtime_value((float)q * scale + bias);
     }
 }
 

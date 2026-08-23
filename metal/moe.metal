@@ -3535,8 +3535,8 @@ kernel void kernel_mul_mv_q4_64a_dense_f32(
             const float scale = as_type<float>((uint)*((device const ushort *)(bl + 32)) << 16);
             const float bias  = as_type<float>((uint)*((device const ushort *)(bl + 34)) << 16);
             const uchar qb = ((device const uchar *)bl)[tiisg];
-            sumf[row] += (float(qb & 0x0Fu) * scale + bias) * y0
-                       + (float(qb >> 4)    * scale + bias) * y1;
+            sumf[row] += ds4_q4_64a_runtime_value(float(qb & 0x0Fu) * scale + bias) * y0
+                       + ds4_q4_64a_runtime_value(float(qb >> 4)    * scale + bias) * y1;
         }
     }
     device float *dst_f32 = (device float *)dst;
@@ -3545,6 +3545,74 @@ kernel void kernel_mul_mv_q4_64a_dense_f32(
         if (r >= args.ne0) continue;
         const float s = simd_sum(sumf[row]);
         if (tiisg == 0) dst_f32[r] = s;
+    }
+    (void)shmem;
+}
+
+/* MLX affine4/g64 QMV numerical frame: two simdgroups, four output rows each.
+ * Each lane owns 16 inputs, computes the packed-nibble dot in the exact MLX
+ * expression order, applies scale*accum + bias*sum once per 64-value group,
+ * accumulates in F32, then stores BF16-rounded output back in ds4's F32 ABI. */
+#define N_R0_Q4_64A_MLX 4
+kernel void kernel_mul_mv_q4_64a_mlx_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const int first_row = (int)((tgpig.x * (uint)NSG + sgitg) * N_R0_Q4_64A_MLX);
+    const int groups = args.ne00 / 64;
+    float result[N_R0_Q4_64A_MLX] = {0.f, 0.f, 0.f, 0.f};
+    device const float *x = (device const float *)src1;
+    const int lane_group = (int)tiisg / 4;
+    const int lane_sub = (int)tiisg & 3;
+
+    for (int g0 = 0; g0 < groups; g0 += 8) {
+        const int group = g0 + lane_group;
+        const int x0 = group * 64 + lane_sub * 16;
+        bfloat xb[16];
+        float xv[16], sum = 0.f;
+        for (int i = 0; i < 16; ++i) xb[i] = (bfloat)x[x0 + i];
+        for (int i = 0; i < 16; i += 4) {
+            sum += xb[i] + xb[i+1] + xb[i+2] + xb[i+3];
+            xv[i] = xb[i];
+            xv[i+1] = xb[i+1] / 16.0f;
+            xv[i+2] = xb[i+2] / 256.0f;
+            xv[i+3] = xb[i+3] / 4096.0f;
+        }
+        for (int row = 0; row < N_R0_Q4_64A_MLX; ++row) {
+            const int r = first_row + row;
+            if (r >= args.ne0) continue;
+            device const char *bl = src0 + (uint64_t)r * args.nb01 + (uint64_t)group * 36u;
+            device const ushort *ws = (device const ushort *)(bl + lane_sub * 8);
+            float accum = 0.f;
+            for (int i = 0; i < 4; ++i) {
+                const uint p = (uint)ws[i];
+                accum += xv[4*i+0] * (float)(p & 0x000fu)
+                       + xv[4*i+1] * (float)(p & 0x00f0u)
+                       + xv[4*i+2] * (float)(p & 0x0f00u)
+                       + xv[4*i+3] * (float)(p & 0xf000u);
+            }
+            const float scale = as_type<float>((uint)*((device const ushort *)(bl + 32)) << 16);
+            const float bias  = as_type<float>((uint)*((device const ushort *)(bl + 34)) << 16);
+            result[row] += scale * accum + sum * bias;
+        }
+    }
+    device float *out = (device float *)dst;
+    for (int row = 0; row < N_R0_Q4_64A_MLX; ++row) {
+        const int r = first_row + row;
+        if (r >= args.ne0) continue;
+        float v = result[row];
+        v += simd_shuffle_xor(v, 1u);
+        v += simd_shuffle_xor(v, 2u);
+        v += simd_shuffle_xor(v, 4u);
+        v += simd_shuffle_xor(v, 8u);
+        v += simd_shuffle_xor(v, 16u);
+        if (tiisg == 0) out[r] = v;
     }
     (void)shmem;
 }

@@ -224,7 +224,7 @@ kernel void kernel_get_rows_q4_64a_f32(
         if (idx < args.n_embd) {
             const uchar packed = qb->qs[i >> 1];
             const uint q = (packed >> ((i & 1) * 4)) & 0x0F;
-            out[idx] = (float)q * scale + bias;
+            out[idx] = ds4_q4_64a_runtime_value((float)q * scale + bias);
         }
     }
 }

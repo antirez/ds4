@@ -363,6 +363,51 @@ kernel void kernel_qwen_gdn_output_norm(
     out[lid] = oh * nscale * snorm[lid] *
                (zj / (1.0f + exp(-zj)));
 }
+/* ds4 keeps recurrent V heads grouped by their shared K head:
+ * [v-slot][k-head][dim]. MLX's projection consumes [k-head][v-slot][dim].
+ * Restore that original order before the unmodified MLX out_proj QMV so its
+ * 64-value group accumulation order remains byte-identical. */
+kernel void kernel_qwen_gdn_to_mlx_order(
+        device const float *src,
+        device float *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= 48u * QWEN_GDN_HEAD_DIM) return;
+    const uint new_head = gid / QWEN_GDN_HEAD_DIM;
+    const uint d = gid % QWEN_GDN_HEAD_DIM;
+    const uint v_slot = new_head / QWEN_GDN_K_HEADS;
+    const uint k_head = new_head % QWEN_GDN_K_HEADS;
+    const uint mlx_head = k_head * 3u + v_slot;
+    dst[mlx_head * QWEN_GDN_HEAD_DIM + d] = src[gid];
+}
+kernel void kernel_qwen_gdn_mlx_output_norm(
+        device float *core,
+        device const float *z,
+        device const float *snorm,
+        uint vh [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (vh >= 48u || lane >= 32u) return;
+    device float *x = core + vh * QWEN_GDN_HEAD_DIM;
+    threadgroup float inv[1];
+    float acc = 0.0f;
+    for (uint i = 0; i < 4u; i++) {
+        const float v = x[lane * 4u + i];
+        acc += v * v;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) inv[0] = precise::rsqrt(acc / 128.0f + 1e-6f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 4u; i++) {
+        const uint d = lane * 4u + i;
+        const float rms = ds4_q4_64a_runtime_value(x[d] * inv[0]);
+        const float normed = ds4_q4_64a_runtime_value(snorm[d] * rms);
+        const float gate = z[vh * QWEN_GDN_HEAD_DIM + d];
+        const float sigmoid_base = 1.0f /
+            (1.0f + precise::exp(fabs(gate)));
+        const float sigmoid = gate < 0.0f ? sigmoid_base : 1.0f - sigmoid_base;
+        x[d] = ds4_q4_64a_runtime_value(normed * (gate * sigmoid));
+    }
+}
+
 
 /* Chunked parallel prefill for the recurrent core (FLA/mamba2-style UT
  * transform).  The serial recurrence
@@ -731,6 +776,20 @@ struct ds4_qwen_fullattn_args {
     uint32_t gated;
 };
 
+static inline float qwen_attn_gate(float out, float gate) {
+#if defined(DS4_Q4_64A_MLX_BF16)
+    const float o = ds4_q4_64a_runtime_value(out);
+    const float g = ds4_q4_64a_runtime_value(gate);
+    const float exp_abs = ds4_q4_64a_runtime_value(precise::exp(fabs(g)));
+    const float denom = ds4_q4_64a_runtime_value(1.0f + exp_abs);
+    float sigmoid = ds4_q4_64a_runtime_value(1.0f / denom);
+    if (g >= 0.0f) sigmoid = ds4_q4_64a_runtime_value(1.0f - sigmoid);
+    return ds4_q4_64a_runtime_value(o * sigmoid);
+#else
+    return out * (1.0f / (1.0f + exp(-gate)));
+#endif
+}
+
 kernel void kernel_qwen_attn_decode(
         constant ds4_qwen_fullattn_args & args,
         device const float * q,
@@ -787,10 +846,7 @@ kernel void kernel_qwen_attn_decode(
         const uint d = lane + i * 32u;
         if (d >= head_dim) continue;
         float out = acc[i] * inv;
-        if (args.gated) {
-            const float g = gate[h * head_dim + d];
-            out *= 1.0f / (1.0f + exp(-g));
-        }
+        if (args.gated) out = qwen_attn_gate(out, gate[h * head_dim + d]);
         outp[d] = out;
     }
 }
@@ -924,10 +980,7 @@ kernel void kernel_qwen_attn_decode_rows(
         const uint d = lane + i * 32u;
         if (d >= head_dim) continue;
         float out = acc[i] * inv;
-        if (args.gated) {
-            const float g = gate[row_off + h * head_dim + d];
-            out *= 1.0f / (1.0f + exp(-g));
-        }
+        if (args.gated) out = qwen_attn_gate(out, gate[row_off + h * head_dim + d]);
         outp[d] = out;
     }
 }
@@ -1108,8 +1161,7 @@ kernel void kernel_qwen_attn_apply_gate_rows(
         constant uint32_t & n,
         uint gid [[thread_position_in_grid]]) {
     if (gid >= n) return;
-    const float g = gate[gid];
-    heads[gid] *= 1.0f / (1.0f + exp(-g));
+    heads[gid] = qwen_attn_gate(heads[gid], gate[gid]);
 }
 
 struct ds4_qwen_q6k_args {
