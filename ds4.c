@@ -2968,7 +2968,19 @@ static void model_summary(const ds4_model *m) {
     printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
     printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
         m->version, m->n_kv, m->n_tensors);
-    if (layers) printf("layers: %u\n", layers);
+    if (layers) {
+        uint32_t nextn_layers = 0;
+        model_get_u32(m, "deepseek4.nextn_predict_layers", &nextn_layers);
+        model_get_u32(m, "glm-dsa.nextn_predict_layers", &nextn_layers);
+        model_get_u32(m, "qwen35moe.nextn_predict_layers", &nextn_layers);
+        model_get_u32(m, "qwen35.nextn_predict_layers", &nextn_layers);
+        if (nextn_layers && layers >= nextn_layers) {
+            printf("layers: %u (+%u bundled nextn draft head, executed separately)\n",
+                   layers - nextn_layers, nextn_layers);
+        } else {
+            printf("layers: %u\n", layers);
+        }
+    }
     if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
     if (n_head || n_head_kv || head_dim || n_swa) {
         printf("attention: heads=%u kv_heads=%u head_dim=%u swa=%u\n",
@@ -4711,7 +4723,7 @@ static void tensor_expect_glm_dense_quant_layout(
     if (!t) ds4_die("internal error: missing tensor while validating GLM dense layout");
     if (!tensor_type_is_glm_dense_quant(t->type)) {
         fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",
+                "ds4: tensor %.*s has type %s, not a supported dense quant\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -4729,7 +4741,7 @@ static void tensor_expect_dense_quant_layout(
     if (!t) ds4_die("internal error: missing tensor while validating dense quant layout");
     if (!tensor_type_is_dense_quant(t->type)) {
         fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected q8_0, q4_K, or q4_0\n",
+                "ds4: tensor %.*s has type %s, not a supported dense quant\n",
                 (int)t->name.len,
                 t->name.ptr,
                 tensor_type_name(t->type));
@@ -41504,6 +41516,7 @@ static int qwen_generate_hybrid(
     const char *nextn_env = getenv("DS4_QWEN_NEXTN_DRAFT");
     int use_mtp = qwen_mtp_is_valid(&mtp_w) &&
                   !(nextn_env && nextn_env[0] && strcmp(nextn_env, "0") == 0);
+#ifndef DS4_NO_GPU
     if (use_mtp && DS4_N_EXPERT > 0) {
         /* The batched verifier rejects unsupported routed types only after
          * earlier layers have already advanced KV/GDN state, so a mid-round
@@ -41524,6 +41537,7 @@ static int qwen_generate_hybrid(
             }
         }
     }
+#endif
     fprintf(stderr, "ds4: using Qwen hybrid Metal+CPU generation%s\n",
             use_mtp ? " + MTP draft/verify" : "");
 #ifndef DS4_NO_GPU
