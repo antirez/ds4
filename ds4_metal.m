@@ -32306,6 +32306,18 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     }
 }
 
+int ds4_gpu_qwen_routed_batch_pair_supported(uint32_t gate_type, uint32_t down_type) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Mirrors the acceptance check of the batched routed-MoE entry (the
+     * generic mul_mm_id family has no Q5_K/Q6_K kernels). The speculative
+     * driver must not offer drafts it cannot verify without mutating
+     * recurrent state mid-round. */
+    return ds4_gpu_routed_mv_nr0(gate_type) != 0 &&
+           ds4_gpu_routed_mv_nr0(down_type) != 0 &&
+           ds4_gpu_routed_mv_pipeline(gate_type) != nil &&
+           ds4_gpu_routed_mv_pipeline(down_type) != nil;
+}
+
 /* TensorOps routed-MoE prefill uses bits 0/1/2 for gate/up/down. Unsupported
  * tensor types keep their established kernels. --quality and the global
  * Metal4 comparison switch retain the reference path. */
@@ -43687,8 +43699,16 @@ int ds4_gpu_routed_moe_batch_tensor(
             gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
             down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
             if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
-                fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
-                        gate_type, down_type);
+                /* Mixed per-tensor precision (APEX-style files) makes this a
+                 * per-layer property, and the caller falls back to the exact
+                 * single-token path, so say it once rather than once per
+                 * verify round. */
+                static bool warned_batch_moe_types;
+                if (!warned_batch_moe_types) {
+                    warned_batch_moe_types = true;
+                    fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u; using single-token fallback\n",
+                            gate_type, down_type);
+                }
                 return 0;
             }
         }

@@ -18122,6 +18122,9 @@ typedef struct {
     const ds4_model *src;
     ds4_tensor *e_proj;
     ds4_tensor *h_proj;
+    /* Bundled-nextn heads (qwen35moe "blk.N.nextn") fuse the two
+     * projections into one matrix applied to [enormed; hnormed]. */
+    ds4_tensor *eh_proj;
     ds4_tensor *enorm;
     ds4_tensor *hnorm;
     ds4_tensor *norm;
@@ -18136,6 +18139,17 @@ typedef struct {
     ds4_tensor *ffn_gate;
     ds4_tensor *ffn_up;
     ds4_tensor *ffn_down;
+    /* MoE draft block (the nextn head of a qwen35moe model is a full MoE
+     * layer). When these are bound the dense ffn_* fields stay NULL and the
+     * draft step routes through the shared-expert machinery instead. */
+    ds4_tensor *ffn_gate_inp;
+    ds4_tensor *ffn_gate_exps;
+    ds4_tensor *ffn_up_exps;
+    ds4_tensor *ffn_down_exps;
+    ds4_tensor *ffn_gate_shexp;
+    ds4_tensor *ffn_up_shexp;
+    ds4_tensor *ffn_down_shexp;
+    ds4_tensor *ffn_gate_inp_shexp;
     ds4_tensor *draft_lm_head;
     ds4_tensor *draft_lm_head_q;
     ds4_tensor *draft_lm_head_scales;
@@ -18323,21 +18337,47 @@ static void qwen_mtp_bind_from(qwen_mtp_weights_t *w, const ds4_model *m) {
     w->norm = model_find_tensor(m, "mtp.0.norm.weight");
     w->attn_norm = model_find_tensor(m, "mtp.0.attn_norm.weight");
     w->attn_q = model_find_tensor(m, "mtp.0.attn_q.weight");
-    w->attn_k = model_find_tensor(m, "mtp.0.attn_k.weight");
-    w->attn_v = model_find_tensor(m, "mtp.0.attn_v.weight");
-    w->attn_out = model_find_tensor(m, "mtp.0.attn_output.weight");
-    w->attn_q_norm = model_find_tensor(m, "mtp.0.attn_q_norm.weight");
-    w->attn_k_norm = model_find_tensor(m, "mtp.0.attn_k_norm.weight");
-    w->ffn_norm = model_find_tensor(m, "mtp.0.ffn_norm.weight");
-    w->ffn_gate = model_find_tensor(m, "mtp.0.ffn_gate.weight");
-    w->ffn_up = model_find_tensor(m, "mtp.0.ffn_up.weight");
-    w->ffn_down = model_find_tensor(m, "mtp.0.ffn_down.weight");
-    w->draft_lm_head = model_find_tensor(m, "mtp.0.draft_lm_head.weight");
-    w->draft_lm_head_q = model_find_tensor(m, "mtp.0.draft_lm_head.q");
-    w->draft_lm_head_scales = model_find_tensor(m, "mtp.0.draft_lm_head.scales");
-    w->draft_lm_head_biases = model_find_tensor(m, "mtp.0.draft_lm_head.biases");
-    w->draft_rerank = model_find_tensor(m, "mtp.0.draft_rerank.weight");
     if (!w->e_proj) w->e_proj = model_find_tensor(m, "mtp.0.fc.weight");
+    if (!w->enorm) {
+        /* Bundled-nextn format (qwen35moe APEX-MTP and friends): the draft
+         * head ships inside the target file as the trailing block
+         * blk.<n_layer>.nextn.*, with a full MoE layer at blk.<n_layer>.*.
+         * llama.cpp's convert writes block_count including the head, which
+         * config validation clamps back to DS4_N_LAYER, so the head index is
+         * exactly DS4_N_LAYER. */
+        char p[128];
+        const uint32_t n_blk = DS4_N_LAYER;
+        ds4_tensor *t;
+        if ((t = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.nextn.enorm.weight", n_blk), p))) != NULL)
+            w->enorm = t;
+        else if ((t = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.enorm.weight", n_blk), p))) != NULL)
+            w->enorm = t;
+        w->hnorm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.nextn.hnorm.weight", n_blk), p));
+        w->eh_proj = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.nextn.eh_proj.weight", n_blk), p));
+        w->norm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.nextn.shared_head_norm.weight", n_blk), p));
+        w->attn_norm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_norm.weight", n_blk), p));
+        /* The second residual norm of the block feeds the FFN. */
+        w->ffn_norm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.post_attention_norm.weight", n_blk), p));
+        if (!w->ffn_norm)
+            w->ffn_norm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_norm.weight", n_blk), p));
+        w->attn_q = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_q.weight", n_blk), p));
+        w->attn_k = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_k.weight", n_blk), p));
+        w->attn_v = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_v.weight", n_blk), p));
+        w->attn_out = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_output.weight", n_blk), p));
+        w->attn_q_norm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_q_norm.weight", n_blk), p));
+        w->attn_k_norm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.attn_k_norm.weight", n_blk), p));
+        w->ffn_gate_inp = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_gate_inp.weight", n_blk), p));
+        w->ffn_gate_exps = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_gate_exps.weight", n_blk), p));
+        w->ffn_up_exps = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_up_exps.weight", n_blk), p));
+        w->ffn_down_exps = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_down_exps.weight", n_blk), p));
+        w->ffn_gate_shexp = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_gate_shexp.weight", n_blk), p));
+        w->ffn_up_shexp = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_up_shexp.weight", n_blk), p));
+        w->ffn_down_shexp = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_down_shexp.weight", n_blk), p));
+        w->ffn_gate_inp_shexp = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.ffn_gate_inp_shexp.weight", n_blk), p));
+        if (w->enorm && !w->hnorm)
+            w->hnorm = model_find_tensor(m, (snprintf(p, sizeof(p), "blk.%u.hnorm.weight", n_blk), p));
+#undef QWEN_NEXTN_FIND
+    }
 }
 
 static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
@@ -18390,7 +18430,11 @@ static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
 }
 
 static bool qwen_mtp_is_valid(const qwen_mtp_weights_t *w) {
-    return w && w->e_proj && w->h_proj && w->enorm && w->hnorm;
+    if (!w || !w->enorm || !w->hnorm) return false;
+    /* Legacy sidecars carry separate e_proj/h_proj; bundled nextn heads fuse
+     * them into one eh_proj over the concatenation. Either is sufficient. */
+    if (w->eh_proj) return true;
+    return w->e_proj && w->h_proj;
 }
 
 // ---- hidden capture helpers (CPU) ----
@@ -18620,6 +18664,22 @@ static void qwen_mtp_layer_forward_cpu(float *out, const ds4_model *fallback, co
             mid[i] = (g / (1.0f + expf(-g))) * up[i];
         }
         matvec_any(ffn_out, m, mtp->ffn_down, mid);
+    } else if (mtp->ffn_gate_exps && mtp->ffn_up_exps && mtp->ffn_down_exps) {
+        /* Bundled nextn heads of MoE targets carry a full routed layer.
+         * Route through the base model's own CPU expert machinery by
+         * presenting the bound tensors as a regular layer: identical router,
+         * top-k, weighting and shared-expert semantics by construction. */
+        ds4_layer_weights dlw;
+        memset(&dlw, 0, sizeof(dlw));
+        dlw.ffn_gate_inp = mtp->ffn_gate_inp;
+        dlw.ffn_gate_exps = mtp->ffn_gate_exps;
+        dlw.ffn_up_exps = mtp->ffn_up_exps;
+        dlw.ffn_down_exps = mtp->ffn_down_exps;
+        dlw.ffn_gate_shexp = mtp->ffn_gate_shexp;
+        dlw.ffn_up_shexp = mtp->ffn_up_shexp;
+        dlw.ffn_down_shexp = mtp->ffn_down_shexp;
+        dlw.ffn_gate_inp_shexp = mtp->ffn_gate_inp_shexp;
+        qwen_compute_routed_experts_cpu(ffn_out, m, &dlw, ffn_normed);
     } else {
         memset(ffn_out, 0, (size_t)n_embd * sizeof(float));
     }
@@ -18647,13 +18707,26 @@ static int qwen_mtp_draft_one_cpu(float *logits_out, float *hidden_out, const ds
         h_in = h_final;
     }
     rms_norm_weight(hnormed, h_in, tensor_data(head, mtp->hnorm), n_embd, 1e-6f);
-    matvec_any(eproj, head, mtp->e_proj, enormed);
-    matvec_any(hproj, head, mtp->h_proj, hnormed);
-    for (uint32_t i=0;i<n_embd;i++) fused[i]=eproj[i]+hproj[i];
+    if (mtp->eh_proj) {
+        /* Fused nextn projection over [enormed; hnormed]. */
+        float *concat = xmalloc((size_t)n_embd * 2u * sizeof(float));
+        memcpy(concat, enormed, (size_t)n_embd * sizeof(float));
+        memcpy(concat + n_embd, hnormed, (size_t)n_embd * sizeof(float));
+        matvec_any(fused, head, mtp->eh_proj, concat);
+        free(concat);
+    } else {
+        matvec_any(eproj, head, mtp->e_proj, enormed);
+        matvec_any(hproj, head, mtp->h_proj, hnormed);
+        for (uint32_t i=0;i<n_embd;i++) fused[i]=eproj[i]+hproj[i];
+    }
     free(e_emb); free(enormed); free(hnormed); free(eproj); free(hproj);
     // optionally run mtp block
     float *block_out = xmalloc((size_t)n_embd * sizeof(float));
-    bool has_block = mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v && mtp->attn_out && mtp->ffn_norm && mtp->ffn_gate;
+    const bool has_moe_block = mtp->ffn_gate_inp && mtp->ffn_gate_exps &&
+                               mtp->ffn_up_exps && mtp->ffn_down_exps;
+    bool has_block = mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v &&
+                     mtp->attn_out && mtp->ffn_norm &&
+                     (mtp->ffn_gate || has_moe_block);
     float *to_norm = fused;
     float *tmp_block = NULL;
     float mixed[DS4_N_EMBD];
@@ -18730,7 +18803,7 @@ static struct {
     int inited;
     pthread_mutex_t mu;
     uint32_t kv_cap;
-    ds4_gpu_tensor *hidden, *e_emb, *enorm, *hnorm, *eproj, *hproj, *fused;
+    ds4_gpu_tensor *hidden, *e_emb, *enorm, *hnorm, *eproj, *hproj, *fused, *concat;
     ds4_gpu_tensor *normed, *logits, *argmax, *topk32;
     ds4_gpu_tensor *q, *k, *v, *gate, *heads, *attn_out, *after, *ffn_normed;
     ds4_gpu_tensor *ffn_gate, *ffn_up, *ffn_mid, *ffn_out, *block_out;
@@ -18753,6 +18826,7 @@ static int qwen_mtp_metal_ensure_pool(void) {
         { &g_mtp_pool.hidden,     n_embd * f },
         { &g_mtp_pool.e_emb,      n_embd * f },
         { &g_mtp_pool.enorm,      n_embd * f },
+        { &g_mtp_pool.concat,     2u * n_embd * f },
         { &g_mtp_pool.hnorm,      n_embd * f },
         { &g_mtp_pool.eproj,      n_embd * f },
         { &g_mtp_pool.hproj,      n_embd * f },
@@ -18847,9 +18921,11 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
     const uint32_t n_head = DS4_N_HEAD, n_head_kv = DS4_N_HEAD_KV, head_dim = DS4_N_HEAD_DIM;
     const uint64_t q_out = mtp->attn_q ? mtp->attn_q->dim[1] : 0;
     const uint32_t gated_q = (q_out == (uint64_t)n_head * head_dim * 2u) ? 1u : 0u;
+    const bool is_moe_block = mtp->ffn_gate_exps && mtp->ffn_up_exps && mtp->ffn_down_exps;
     const int has_block = !(getenv("DS4_QWEN_MTP_NO_BLOCK") && getenv("DS4_QWEN_MTP_NO_BLOCK")[0] != '0') &&
                           mtp->attn_norm && mtp->attn_q && mtp->attn_k && mtp->attn_v &&
-                          mtp->attn_out && mtp->ffn_norm && mtp->ffn_gate && mtp->ffn_up && mtp->ffn_down;
+                          mtp->attn_out && mtp->ffn_norm &&
+                          ((mtp->ffn_gate && mtp->ffn_up && mtp->ffn_down) || is_moe_block);
     const bool has_packed_head = mtp->draft_lm_head_q &&
                                  mtp->draft_lm_head_scales &&
                                  mtp->draft_lm_head_biases &&
@@ -18888,9 +18964,21 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
                                                   mtp->hnorm->abs_offset, n_embd, 1e-6f)) ok = 0;
     } else if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.hnorm, g_mtp_pool.hidden, map, map_size,
                                               mtp->hnorm->abs_offset, n_embd, 1e-6f)) ok = 0;
-    if (ok && !qwen_gpu_matmul(g_mtp_pool.eproj, head, mtp->e_proj, n_embd, n_embd, g_mtp_pool.enorm, 1)) ok = 0;
-    if (ok && !qwen_gpu_matmul(g_mtp_pool.hproj, head, mtp->h_proj, n_embd, n_embd, g_mtp_pool.hnorm, 1)) ok = 0;
-    if (ok && !ds4_gpu_add_tensor(g_mtp_pool.fused, g_mtp_pool.eproj, g_mtp_pool.hproj, n_embd)) ok = 0;
+    if (ok && mtp->eh_proj) {
+        /* Fused nextn projection over [enormed; hnormed]. */
+        if (ok && !ds4_gpu_tensor_copy(g_mtp_pool.concat, 0,
+                                       g_mtp_pool.enorm, 0,
+                                       (uint64_t)n_embd * sizeof(float))) ok = 0;
+        if (ok && !ds4_gpu_tensor_copy(g_mtp_pool.concat, (uint64_t)n_embd * sizeof(float),
+                                       g_mtp_pool.hnorm, 0,
+                                       (uint64_t)n_embd * sizeof(float))) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.fused, head, mtp->eh_proj, 2u * n_embd, n_embd,
+                                   g_mtp_pool.concat, 1)) ok = 0;
+    } else {
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.eproj, head, mtp->e_proj, n_embd, n_embd, g_mtp_pool.enorm, 1)) ok = 0;
+        if (ok && !qwen_gpu_matmul(g_mtp_pool.hproj, head, mtp->h_proj, n_embd, n_embd, g_mtp_pool.hnorm, 1)) ok = 0;
+        if (ok && !ds4_gpu_add_tensor(g_mtp_pool.fused, g_mtp_pool.eproj, g_mtp_pool.hproj, n_embd)) ok = 0;
+    }
 
     ds4_gpu_tensor *attn_in = g_mtp_pool.fused;
     if (ok && has_block && qwen_mtp_conv_on()) {
@@ -18928,14 +19016,38 @@ static int qwen_mtp_draft_one_metal(float *logits_out, int *tok_out, float *hidd
         if (ok && !ds4_gpu_add_tensor(g_mtp_pool.after, g_mtp_pool.fused, g_mtp_pool.attn_out, n_embd)) ok = 0;
         if (ok && !ds4_gpu_rms_norm_weight_tensor(g_mtp_pool.ffn_normed, g_mtp_pool.after, map, map_size,
                                                   mtp->ffn_norm->abs_offset, n_embd, 1e-6f)) ok = 0;
-        if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_gate, head, mtp->ffn_gate, n_embd, ff_dense,
-                                   g_mtp_pool.ffn_normed, 1)) ok = 0;
-        if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_up, head, mtp->ffn_up, n_embd, ff_dense,
-                                   g_mtp_pool.ffn_normed, 1)) ok = 0;
-        if (ok && !ds4_gpu_swiglu_tensor(g_mtp_pool.ffn_mid, g_mtp_pool.ffn_gate, g_mtp_pool.ffn_up,
-                                         ff_dense, 0.0f, 1.0f)) ok = 0;
-        if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_out, head, mtp->ffn_down, ff_dense, n_embd,
-                                   g_mtp_pool.ffn_mid, 1)) ok = 0;
+        if (is_moe_block) {
+            /* Routed draft FFN: reuse the base model's pooled MoE machinery
+             * by presenting the bound head tensors as a regular layer. It
+             * manages its own command-buffer transitions, so close the one
+             * this step opened and reopen afterwards for the tail. */
+            if (!ds4_gpu_end_commands()) ok = 0;
+            if (ok) {
+                ds4_layer_weights dlw;
+                memset(&dlw, 0, sizeof(dlw));
+                dlw.ffn_gate_inp = mtp->ffn_gate_inp;
+                dlw.ffn_gate_exps = mtp->ffn_gate_exps;
+                dlw.ffn_up_exps = mtp->ffn_up_exps;
+                dlw.ffn_down_exps = mtp->ffn_down_exps;
+                dlw.ffn_gate_shexp = mtp->ffn_gate_shexp;
+                dlw.ffn_up_shexp = mtp->ffn_up_shexp;
+                dlw.ffn_down_shexp = mtp->ffn_down_shexp;
+                dlw.ffn_gate_inp_shexp = mtp->ffn_gate_inp_shexp;
+                ok = qwen_gpu_moe_ffn(g_mtp_pool.ffn_out, g_mtp_pool.ffn_normed,
+                                      g_qwen_pool.gate, g_qwen_pool.up, g_qwen_pool.mid,
+                                      model, &dlw, pos < DS4_N_LAYER ? pos : 0);
+            }
+            if (ok && !ds4_gpu_begin_commands()) ok = 0;
+        } else {
+            if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_gate, head, mtp->ffn_gate, n_embd, ff_dense,
+                                       g_mtp_pool.ffn_normed, 1)) ok = 0;
+            if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_up, head, mtp->ffn_up, n_embd, ff_dense,
+                                       g_mtp_pool.ffn_normed, 1)) ok = 0;
+            if (ok && !ds4_gpu_swiglu_tensor(g_mtp_pool.ffn_mid, g_mtp_pool.ffn_gate, g_mtp_pool.ffn_up,
+                                             ff_dense, 0.0f, 1.0f)) ok = 0;
+            if (ok && !qwen_gpu_matmul(g_mtp_pool.ffn_out, head, mtp->ffn_down, ff_dense, n_embd,
+                                       g_mtp_pool.ffn_mid, 1)) ok = 0;
+        }
         if (ok && !ds4_gpu_add_tensor(g_mtp_pool.block_out, g_mtp_pool.after, g_mtp_pool.ffn_out, n_embd)) ok = 0;
         if (ok) tail = g_mtp_pool.block_out;
     }
@@ -41349,8 +41461,9 @@ struct ds4_engine {
     float         *qwen_cpu_kv_v;
     uint32_t       qwen_cpu_kv_cap;
     pthread_mutex_t qwen_cpu_kv_mu;
-    bool           qwen_cpu_kv_inited;
-    float         *qwen_gdn_state;
+    /* Bundled nextn heads engage automatically in qwen_generate_hybrid once
+     * the binding validates; DS4_QWEN_NEXTN_DRAFT=0 disables drafting. */
+    int           qwen_nextn_draft_disabled;
     float         *qwen_gdn_conv;
     bool           qwen_gdn_inited;
     pthread_mutex_t qwen_gdn_mu;
@@ -41388,7 +41501,29 @@ static int qwen_generate_hybrid(
 #endif
     qwen_mtp_weights_t mtp_w;
     qwen_mtp_bind(&mtp_w, model);
-    const int use_mtp = qwen_mtp_is_valid(&mtp_w);
+    const char *nextn_env = getenv("DS4_QWEN_NEXTN_DRAFT");
+    int use_mtp = qwen_mtp_is_valid(&mtp_w) &&
+                  !(nextn_env && nextn_env[0] && strcmp(nextn_env, "0") == 0);
+    if (use_mtp && DS4_N_EXPERT > 0) {
+        /* The batched verifier rejects unsupported routed types only after
+         * earlier layers have already advanced KV/GDN state, so a mid-round
+         * fallback is not state-clean. Probe every distinct expert pair up
+         * front and fall back to plain greedy for this generation instead. */
+        for (uint32_t il = 0; use_mtp && il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *lw = &weights->layer[il];
+            if (!lw->ffn_gate_exps || !lw->ffn_down_exps) continue;
+            if (!ds4_gpu_qwen_routed_batch_pair_supported(lw->ffn_gate_exps->type,
+                                                          lw->ffn_down_exps->type)) {
+                fprintf(stderr,
+                        "ds4: nextn drafting disabled for this model: batched verify "
+                        "lacks kernels for routed types gate=%s down=%s (layer %u)\n",
+                        tensor_type_name(lw->ffn_gate_exps->type),
+                        tensor_type_name(lw->ffn_down_exps->type),
+                        il);
+                use_mtp = 0;
+            }
+        }
+    }
     fprintf(stderr, "ds4: using Qwen hybrid Metal+CPU generation%s\n",
             use_mtp ? " + MTP draft/verify" : "");
 #ifndef DS4_NO_GPU
