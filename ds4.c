@@ -51824,6 +51824,33 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+/* Save the engine-owned payload and report how many bytes were appended.
+ * This intentionally delegates to the single payload serializer so the on-disk
+ * format has only one implementation. */
+int ds4_session_save_payload_counted(ds4_session *s, FILE *fp,
+                                     uint64_t *bytes_written,
+                                     char *err, size_t errlen) {
+    if (!fp || !bytes_written) {
+        payload_set_err(err, errlen, "invalid session payload write request");
+        return 1;
+    }
+    *bytes_written = 0;
+
+    const off_t start = ftello(fp);
+    if (start < 0) {
+        payload_set_err(err, errlen, "failed to get file position before payload write");
+        return 1;
+    }
+    if (ds4_session_save_payload(s, fp, err, errlen) != 0) return 1;
+    const off_t end = ftello(fp);
+    if (end < 0 || end < start) {
+        payload_set_err(err, errlen, "failed to measure session payload write");
+        return 1;
+    }
+    *bytes_written = (uint64_t)(end - start);
+    return 0;
+}
+
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
