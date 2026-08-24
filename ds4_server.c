@@ -433,6 +433,20 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
+/* True when text is, in its entirety (ignoring surrounding whitespace), a
+ * single valid JSON value -- a number, boolean, null, array, or object.  Used
+ * to recover type information for untyped wire formats: GLM's <arg_value>
+ * carries no type attribute, unlike DSML's string="true|false", so a value
+ * that round-trips as JSON is passed through raw instead of being quoted. */
+static bool json_text_is_whole_value(const char *text) {
+    if (!text) return false;
+    const char *p = text;
+    json_ws(&p);
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
 static bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
@@ -5143,7 +5157,11 @@ static bool parse_glm_generated_message_ex(const char *text,
             }
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = dsml_unescape_text(raw_value);
-            tool_call_json_args_add(&args, key, value, "true");
+            /* GLM's wire format carries no type attribute (unlike DSML's
+             * string="true|false"), so a value that fully parses as JSON is
+             * passed through raw; anything else is a string. */
+            const char *value_type = json_text_is_whole_value(value) ? "false" : "true";
+            tool_call_json_args_add(&args, key, value, value_type);
             free(key);
             free(raw_value);
             free(value);
@@ -15317,10 +15335,66 @@ static void test_parse_glm_tool_call_message(void) {
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\"") != NULL);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": \"10\"") != NULL);
+    /* "10" fully parses as a JSON number, so it is passed through raw rather
+     * than quoted -- GLM's wire format carries no type attribute to tell us
+     * this was meant as a number, unlike DSML's string="false". */
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": 10") != NULL);
     TEST_ASSERT(calls.raw_tool_text &&
                 !strncmp(calls.raw_tool_text, "\n\n<tool_call>bash",
                          strlen("\n\n<tool_call>bash")));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_json_text_is_whole_value(void) {
+    TEST_ASSERT(json_text_is_whole_value("10"));
+    TEST_ASSERT(json_text_is_whole_value("-3.5"));
+    TEST_ASSERT(json_text_is_whole_value("true"));
+    TEST_ASSERT(json_text_is_whole_value("false"));
+    TEST_ASSERT(json_text_is_whole_value("null"));
+    TEST_ASSERT(json_text_is_whole_value("[]"));
+    TEST_ASSERT(json_text_is_whole_value("[\"a\", \"b\"]"));
+    TEST_ASSERT(json_text_is_whole_value("{\"a\": 1}"));
+    TEST_ASSERT(json_text_is_whole_value("  42  "));
+
+    /* Plain strings, and anything with trailing garbage after one JSON
+     * value, are not whole values -- they must stay quoted. */
+    TEST_ASSERT(!json_text_is_whole_value(""));
+    TEST_ASSERT(!json_text_is_whole_value("Rome"));
+    TEST_ASSERT(!json_text_is_whole_value("echo hi"));
+    TEST_ASSERT(!json_text_is_whole_value("10 apples"));
+    TEST_ASSERT(!json_text_is_whole_value("007-not-json"));
+    TEST_ASSERT(!json_text_is_whole_value(NULL));
+}
+
+static void test_parse_glm_tool_call_infers_json_value_types(void) {
+    /* The exact shape from the field report (issue #569): a string, a
+     * number, and an array parameter in the same call, none of them
+     * type-annotated by GLM's wire format. */
+    const char *generated =
+        "<tool_call>WebSearch"
+        "<arg_key>query</arg_key><arg_value>ByteDance inference chips</arg_value>"
+        "<arg_key>max_results</arg_key><arg_value>10</arg_value>"
+        "<arg_key>exclude_domains</arg_key><arg_value>[]</arg_value>"
+        "</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, generated, false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments,
+                       "\"query\": \"ByteDance inference chips\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"max_results\": 10") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"exclude_domains\": []") != NULL);
+    /* Never emit a quoted number or array: the client's schema validator
+     * would reject it exactly as reported. */
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"max_results\": \"10\"") == NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"exclude_domains\": \"[]\"") == NULL);
 
     free(content);
     free(reasoning);
@@ -18360,6 +18434,8 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
+    test_json_text_is_whole_value();
+    test_parse_glm_tool_call_infers_json_value_types();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
