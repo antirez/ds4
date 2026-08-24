@@ -6209,14 +6209,54 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
     return ok;
 }
 
-/* Replay toks[] through plain decode and return the largest gap between a
- * position's argmax logit and the committed token's logit.  Correct speculation
- * commits (near-)argmax tokens (gap ~0); a mis-committed token gives a big gap. */
-static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prompt,
-                                      const int *toks, int n,
-                                      float *worst_gap, int *worst_at) {
-    *worst_gap = 0.0f;
-    *worst_at = -1;
+/*
+ * Divergence characterization for the Metal batched speculative verifier.
+ *
+ * ds4.c documents that the non-quality Metal verify path "may pick a different
+ * greedy token when batched reductions perturb nearly tied logits".  This
+ * teacher-forces every committed token through ordinary autoregressive decode
+ * and, at each position, compares the committed token against the exact argmax.
+ * A mismatch is a divergence; best.logit - committed.logit measures its
+ * severity, bucketed so a run of harmless near-ties is visibly distinct from a
+ * material greedy change.  worst_gap keeps the existing verify invariant; the
+ * rate and histogram turn the qualitative "may diverge" into a tracked number.
+ */
+#define TEST_ARGMAX_GAP_BUCKETS 4  /* (0,0.1], (0.1,0.5], (0.5,2.0], (2.0,inf) */
+
+typedef struct {
+    int total;             /* positions teacher-forced */
+    int divergences;       /* committed token != autoregressive argmax */
+    int gap_hist[TEST_ARGMAX_GAP_BUCKETS]; /* severity of divergences */
+    double sum_div_gap;    /* sum of gap over divergences, for the mean */
+    float worst_gap;       /* max(best.logit - committed.logit) */
+    int worst_at;          /* position of the worst gap, -1 if none */
+} test_argmax_div_stats;
+
+static void test_argmax_div_bucket(test_argmax_div_stats *st, float gap) {
+    int b;
+    if (gap <= 0.1f)      b = 0;
+    else if (gap <= 0.5f) b = 1;
+    else if (gap <= 2.0f) b = 2;
+    else                  b = 3;
+    st->gap_hist[b]++;
+}
+
+static void test_argmax_div_report(const char *label, const test_argmax_div_stats *st) {
+    const double pct = st->total ? 100.0 * st->divergences / st->total : 0.0;
+    const double mean = st->divergences ? st->sum_div_gap / st->divergences : 0.0;
+    fprintf(stderr,
+            "ds4-test: %s divergence=%d/%d (%.2f%%) mean_gap=%.3f worst_gap=%.3f at=%d "
+            "gap_hist[<=0.1:%d <=0.5:%d <=2.0:%d >2.0:%d]\n",
+            label, st->divergences, st->total, pct, mean,
+            st->worst_gap, st->worst_at,
+            st->gap_hist[0], st->gap_hist[1], st->gap_hist[2], st->gap_hist[3]);
+}
+
+static bool test_mtp_argmax_divergence(ds4_engine *engine, const ds4_tokens *prompt,
+                                       const int *toks, int n,
+                                       test_argmax_div_stats *st) {
+    memset(st, 0, sizeof(*st));
+    st->worst_at = -1;
     ds4_session *session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
     if (!session) return false;
@@ -6233,7 +6273,13 @@ static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prom
         if (!ok) break;
 
         const float gap = best.logit - cur.logit;
-        if (gap > *worst_gap) { *worst_gap = gap; *worst_at = i; }
+        st->total++;
+        if (best.id != toks[i]) {
+            st->divergences++;
+            st->sum_div_gap += (double)gap;
+            test_argmax_div_bucket(st, gap);
+        }
+        if (gap > st->worst_gap) { st->worst_gap = gap; st->worst_at = i; }
         if (ds4_session_eval(session, toks[i], err, sizeof(err)) != 0) { ok = false; TEST_ASSERT(false); break; }
     }
 
@@ -6332,14 +6378,13 @@ static void test_mtp_verify_depth(void) {
         TEST_ASSERT(max_chunk > 1);  /* multi-token chunks committed: the multi-row path ran */
         TEST_ASSERT(nspec > 128);    /* enough output to surface the bug, incl. a spurious-EOS truncation */
 
-        float worst_gap = 0.0f;
-        int worst_at = -1;
-        const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt, spec, nspec,
-                                                        &worst_gap, &worst_at);
+        test_argmax_div_stats st;
+        const bool ok_check = test_mtp_argmax_divergence(engine, &prompt, spec, nspec, &st);
         TEST_ASSERT(ok_check);
         fprintf(stderr, "ds4-test: mtp-verify-depth nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
-                nspec, max_chunk, worst_gap, worst_at);
-        TEST_ASSERT(worst_gap <= 2.0f);  /* correct: ~0; bug: ~21 on the reference model */
+                nspec, max_chunk, st.worst_gap, st.worst_at);
+        test_argmax_div_report("mtp-verify-depth", &st);
+        TEST_ASSERT(st.worst_gap <= 2.0f);  /* correct: ~0; bug: ~21 on the reference model */
     }
 
     free(spec);
@@ -6385,17 +6430,15 @@ static void test_dspark_verify_depth(void) {
             TEST_ASSERT(max_chunk > 1);
             TEST_ASSERT(nspec > 64);
 
-            float worst_gap = 0.0f;
-            int worst_at = -1;
-            const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt,
-                                                            spec, nspec,
-                                                            &worst_gap,
-                                                            &worst_at);
+            test_argmax_div_stats st;
+            const bool ok_check = test_mtp_argmax_divergence(engine, &prompt,
+                                                             spec, nspec, &st);
             TEST_ASSERT(ok_check);
             fprintf(stderr,
                     "ds4-test: dspark-verify-depth nspec=%d max_chunk=%d draft_depth=%d worst_argmax_gap=%.3f at=%d\n",
-                    nspec, max_chunk, draft_depth, worst_gap, worst_at);
-            TEST_ASSERT(worst_gap <= 2.0f);
+                    nspec, max_chunk, draft_depth, st.worst_gap, st.worst_at);
+            test_argmax_div_report("dspark-verify-depth", &st);
+            TEST_ASSERT(st.worst_gap <= 2.0f);
         }
     }
 
@@ -6403,6 +6446,97 @@ static void test_dspark_verify_depth(void) {
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
     test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
+}
+
+/* Higher-entropy stimulus for --verify-divergence: an open-ended writing task
+ * produces the nearly tied logits that the confident copy fixture never does. */
+static const char *test_divergence_default_prompt(void) {
+    return
+        "Write an imaginative short story of several paragraphs about a "
+        "lighthouse keeper who finds a locked door at the bottom of the sea. "
+        "Use vivid, varied language and let the story take surprising turns.";
+}
+
+#define TEST_DIVERGENCE_MAXGEN 256
+
+/*
+ * Diagnostic, not a gated regression: quantify how often the batched Metal
+ * verifier commits a non-argmax token during realistic, higher-entropy
+ * generation, where nearly tied logits actually occur.  The verify-depth
+ * regressions deliberately use a confident copy task, so their divergence rate
+ * is structurally ~0; this points the same teacher-forced instrument at an
+ * open-ended prompt to characterize the compromise ds4.c documents.  It reports
+ * only (no worst_gap gate) because near-tie greedy flips are expected here and
+ * are not defects.  A DSpark support model (DS4_TEST_DSPARK) or a legacy MTP
+ * head (DS4_TEST_MTP) supplies speculation; override the prompt with
+ * DS4_TEST_DIVERGENCE_PROMPT=FILE and the sample size with
+ * DS4_TEST_DIVERGENCE_MAXGEN=N.
+ */
+static void test_verify_divergence(void) {
+    const char *dspark = getenv("DS4_TEST_DSPARK");
+    const bool use_dspark = dspark && dspark[0];
+    ds4_engine *engine = NULL;
+    char *saved_scheduler = NULL;
+
+    if (use_dspark) {
+        saved_scheduler = test_save_env("DS4_DSPARK_SCHEDULER");
+        setenv("DS4_DSPARK_SCHEDULER", "0", 1);
+        engine = test_open_dspark_engine(dspark);
+    } else {
+        engine = test_get_engine(false);
+        if (!engine || !ds4_engine_has_mtp(engine)) {
+            fprintf(stderr, "ds4-test: verify-divergence skipped (set DS4_TEST_DSPARK or DS4_TEST_MTP)\n");
+            return;
+        }
+    }
+
+    char *prompt_file = NULL;
+    const char *prompt_path = getenv("DS4_TEST_DIVERGENCE_PROMPT");
+    const char *prompt_src = test_divergence_default_prompt();
+    if (prompt_path && prompt_path[0]) {
+        prompt_file = test_read_file(prompt_path);
+        TEST_ASSERT(prompt_file != NULL);
+        if (prompt_file) prompt_src = prompt_file;
+    }
+
+    ds4_tokens prompt = {0};
+    int *spec = NULL;
+    if (engine) {
+        ds4_chat_begin(engine, &prompt);
+        ds4_chat_append_message(engine, &prompt, "user", prompt_src);
+        ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+        TEST_ASSERT(prompt.len > 0);
+
+        unsigned env_maxgen = test_env_u32("DS4_TEST_DIVERGENCE_MAXGEN");
+        int maxgen = env_maxgen ? (int)env_maxgen : TEST_DIVERGENCE_MAXGEN;
+        if (maxgen < 1) maxgen = TEST_DIVERGENCE_MAXGEN;
+        if (maxgen > 8192) maxgen = 8192;  /* bound the sample buffer */
+
+        spec = malloc((size_t)maxgen * sizeof(*spec));
+        TEST_ASSERT(spec != NULL);
+        if (spec && prompt.len > 0) {
+            int nspec = 0, max_chunk = 0;
+            const bool ok_spec = test_mtp_capture_speculative(engine, &prompt,
+                                                              maxgen,
+                                                              spec, &nspec, &max_chunk);
+            TEST_ASSERT(ok_spec);
+            test_argmax_div_stats st;
+            const bool ok_check = test_mtp_argmax_divergence(engine, &prompt,
+                                                             spec, nspec, &st);
+            TEST_ASSERT(ok_check);
+            fprintf(stderr, "ds4-test: verify-divergence backend=%s nspec=%d max_chunk=%d\n",
+                    use_dspark ? "dspark" : "mtp", nspec, max_chunk);
+            test_argmax_div_report("verify-divergence", &st);
+        }
+    }
+
+    free(spec);
+    free(prompt_file);
+    ds4_tokens_free(&prompt);
+    if (use_dspark) {
+        ds4_engine_close(engine);
+        test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
+    }
 }
 #endif
 
@@ -6433,6 +6567,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
+    {"--verify-divergence", "verify-divergence", "diagnostic: batched-verify greedy divergence rate on an open-ended prompt (no gate)", test_verify_divergence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -6467,6 +6602,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
+    puts("  DS4_TEST_DIVERGENCE_PROMPT=FILE  Prompt for --verify-divergence. Default: built-in open-ended prompt.");
+    puts("  DS4_TEST_DIVERGENCE_MAXGEN=N  Tokens to generate for --verify-divergence. Default: 256, max 8192.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {
