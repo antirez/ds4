@@ -711,6 +711,30 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
+    /* DS4_EMBD_MMAP=1 (default OFF): serve token-embedding row lookups
+     * straight from the read-only host mapping of the GGUF region instead
+     * of promoting the ~1 GiB table to a resident device copy. Per-token
+     * decode touches one row (n_embd x element bytes); on unified-memory
+     * targets (GB10/Grace) the GPU reaches the file-backed pages via
+     * ATS/HMM, and hot rows stay in page cache. The startup span
+     * preparation in ds4.c skips the tensor under the same env, so this
+     * is the only resolution path for it. */
+    static int embd_mmap_mode = -1;
+    if (embd_mmap_mode < 0) {
+        embd_mmap_mode = getenv("DS4_EMBD_MMAP") != NULL ? 1 : 0;
+    }
+    if (embd_mmap_mode && what && strstr(what, "token_embd") != NULL) {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr,
+                    "ds4: DS4_EMBD_MMAP=1: serving %s (%.2f MiB) from the "
+                    "host model mapping (no resident copy)\n",
+                    what, (double)bytes / 1048576.0);
+        }
+        return cuda_model_ptr(model_map, offset);
+    }
+
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {

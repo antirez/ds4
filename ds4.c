@@ -2923,6 +2923,19 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         if (ds4_gpu_model_range_replaced(m->map, t->abs_offset, t->bytes)) {
             continue;
         }
+        /* DS4_EMBD_MMAP=1 (default OFF): leave the token embedding table out
+         * of the resident device spans; the CUDA embed path serves the rows
+         * from the read-only host mapping instead (see cuda_model_range_ptr).
+         * Saves ~1 GiB of residency on DeepSeek V4 Flash Q8_0. */
+        if (getenv("DS4_EMBD_MMAP") != NULL &&
+            t->name.len == strlen("token_embd.weight") &&
+            memcmp(t->name.ptr, "token_embd.weight", t->name.len) == 0) {
+            fprintf(stderr,
+                    "ds4: DS4_EMBD_MMAP=1: token_embd.weight (%.2f MiB) left "
+                    "unprepared, served from the host model mapping\n",
+                    (double)t->bytes / 1048576.0);
+            continue;
+        }
 #endif
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
