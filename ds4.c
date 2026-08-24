@@ -18993,10 +18993,37 @@ static bool qwen_mtp_is_valid(const qwen_mtp_weights_t *w) {
 }
 
 
+/* True when the model carries only nextn-head tensors (blk.<n_layer>.*) and
+ * no execution-layer tensors: a full-model file would otherwise be armed as a
+ * draft head. Non-"blk." names (token_embd, output, ...) are ignored. */
+static bool qwen_nextn_head_only(const ds4_model *m) {
+    const char prefix[] = "blk.";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_str *name = &m->tensors[i].name;
+        if (name->len <= prefix_len ||
+            memcmp(name->ptr, prefix, prefix_len) != 0)
+            continue;
+        uint32_t index = 0;
+        size_t j = prefix_len;
+        while (j < name->len && name->ptr[j] >= '0' && name->ptr[j] <= '9') {
+            index = index * 10 + (uint32_t)(name->ptr[j] - '0');
+            j++;
+        }
+        if (j == prefix_len || j >= name->len || name->ptr[j] != '.')
+            continue;
+        if (index != DS4_N_LAYER) return false;
+    }
+    return true;
+}
+
 /* Install a standalone Qwen nextn MTP head sidecar: a qwen35moe-style GGUF
  * carrying the draft head as blk.<n_layer>.nextn.* tensors (with a full MoE
  * block) instead of dflash draft tensors. Returns 1 and arms qwen_mtp_bind()
  * when the file binds; 0 otherwise, leaving dflash/--mtp handling untouched.
+ * Full-model files (which bundle exec layers blk.0..blk.<N>-1) are rejected
+ * here because GPU placement would otherwise try to fit those layers and
+ * corrupt drafting.
  * The model must outlive generation — callers pass an engine-owned ds4_model
  * and ds4_engine_close() disarms the pointer before closing it. */
 static int qwen_nextn_sidecar_install(ds4_model *m, const char *path) {
@@ -19005,6 +19032,11 @@ static int qwen_nextn_sidecar_install(ds4_model *m, const char *path) {
     memset(&probe, 0, sizeof(probe));
     qwen_mtp_bind_from(&probe, m);
     if (!qwen_mtp_is_valid(&probe)) return 0;
+    if (!qwen_nextn_head_only(m)) {
+        fprintf(stderr, "ds4: nextn sidecar %s carries tensors outside blk.%u; not a standalone head\n",
+                path, DS4_N_LAYER);
+        return 0;
+    }
     g_qwen_mtp_sidecar_model = m;
     fprintf(stderr, "ds4: Qwen nextn MTP sidecar loaded: %s\n", path);
     return 1;
