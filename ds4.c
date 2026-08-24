@@ -20351,6 +20351,17 @@ static bool metal_graph_use_iq2_selected_async_early_commit(
 #endif
 }
 
+static bool metal_graph_streaming_async_load_requires_flush(void) {
+#if defined(DS4_ROCM_BUILD) || defined(__APPLE__) || defined(DS4_NO_GPU)
+    return true;
+#else
+    /* CUDA launches are already submitted to the decode stream. The ready
+     * event orders the upload stream, so a device-wide flush here would
+     * serialize the shared expert with the selected upload. */
+    return false;
+#endif
+}
+
 static bool metal_graph_use_pro_q4_expert_table_auto(const ds4_gpu_graph *g) {
     if (getenv("DS4_METAL_DISABLE_PRO_Q4_EXPERT_TABLE_AUTO") != NULL ||
         getenv("DS4_METAL_DISABLE_Q4_EXPERT_TABLE") != NULL) {
@@ -24527,7 +24538,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                        down_expert_bytes);
             async_load_started = ok;
         }
-        if (ok && async_early_commit) {
+        if (ok && async_early_commit &&
+            metal_graph_streaming_async_load_requires_flush()) {
             ok = ds4_gpu_flush_commands() != 0;
         }
         if (ok && fuse_shared_gate_up) {
@@ -24572,7 +24584,9 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
         if (async_load_started) {
-            const bool flush_ok = ds4_gpu_flush_commands() != 0;
+            const bool flush_ok =
+                !metal_graph_streaming_async_load_requires_flush() ||
+                ds4_gpu_flush_commands() != 0;
             bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
             if (!finish_ok && async_load.ids_ok) {
@@ -42099,7 +42113,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                 stream_t0 = glm_graph_streaming_async_profile_ms();
             }
 #ifndef DS4_ROCM_BUILD
-            if (ok && async_load_started) {
+            if (ok && async_load_started &&
+                metal_graph_streaming_async_load_requires_flush()) {
                 ok = ds4_gpu_flush_commands() != 0;
             }
 #endif
@@ -42172,7 +42187,9 @@ static bool glm_graph_encode_sparse_ffn_one(
     if (async_load_started) {
         bool flush_ok = true;
 #ifndef DS4_ROCM_BUILD
-        flush_ok = ds4_gpu_flush_commands() != 0;
+        if (metal_graph_streaming_async_load_requires_flush()) {
+            flush_ok = ds4_gpu_flush_commands() != 0;
+        }
 #endif
         if (async_profile) {
             g_glm_streaming_async_profile.async_flush_shared_ms +=
