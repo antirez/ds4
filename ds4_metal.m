@@ -23199,13 +23199,14 @@ static int ds4_qwen_decode_shadow_enabled(void) {
 
 static int ds4_qwen_decode_shadow_grp_enabled(void) {
     /* Default ON: selects kernel_qwen_gqa_attn_decode_shadow_grp (one
-     * threadgroup per KV head, 16 simdgroups = one per grouped query head)
+     * threadgroup per KV head, ngrp simdgroups = one per grouped query
+     * head)
      * so the F16 shadow K/V planes are streamed once per decode step
      * instead of ngrp times; removes the L2-capacity decode cliff at large
      * pos. DS4_QWEN_SHADOW_GRP=0 restores the per-query-head shadow
-     * kernel. Only ever selected when n_head/n_head_kv == 16, which the
-     * grouped kernel requires; any other GQA ratio keeps the legacy
-     * dispatch. */
+     * pos. Selected whenever the GQA ratio is within the grouped kernel's
+     * runtime bound ngrp in [1..16] with head_dim == 256; anything else
+     * keeps the legacy dispatch. */
     const char *sw = getenv("DS4_QWEN_SHADOW_GRP");
     return !(sw && sw[0] == '0' && sw[1] == '\0');
 }
@@ -23283,12 +23284,16 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
         v_cache_offset != k_cache_offset) return 0;
     const uint32_t layer = (uint32_t)(k_cache_offset / layer_span);
     if (layer >= DS4_QWEN_FLASH_KV_MAX_LAYERS) return 0;
-    /* Grouped path needs one simdgroup per grouped query head, so it covers
-     * any ngrp in 2..16 (Qwen3.8 full-attn: 24/4 => 6; Ornith/APEX: 16).
-     * ngrp 1 has nothing to share and ngrp > 16 exceeds the tqg staging. */
+    /* Grouped fast path: only when enabled and the GQA group fits the
+     * kernel_qwen_gqa_attn_decode_shadow_grp layout contract: runtime
+     * ngrp in [1..16] (divisibility and non-zero n_head_kv proven above)
+     * and head_dim == 256. Real shapes this admits: Qwen3.8 full-attn
+     * 24/4 => 6, Ornith-1.5-35B 16/2 => 8, Ornith-1.5-9B 16/4 => 4.
+     * The old ngrp == 16 gate matched none of them, so the grouped kernel
+     * was dead on every model that ships here. */
     const uint32_t ngrp = n_head / n_head_kv;
     int grp = ds4_qwen_decode_shadow_grp_enabled() &&
-              ngrp >= 2u && ngrp <= 16u;
+              ngrp >= 1u && ngrp <= 16u && head_dim == 256u;
     id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline(
         grp ? "kernel_qwen_gqa_attn_decode_shadow_grp"
             : "kernel_qwen_gqa_attn_decode_shadow");
@@ -23491,20 +23496,34 @@ static int ds4_gpu_qwen_gqa_attn_decode_shadow_tensor(
                 }
             }
         }
-        /* Warn-once: which shadow decode geometry actually ran. Per-call
-         * stderr would shred the exact-match harnesses, so print one line
-         * per process (see DS4_QWEN_POOL_DEBUG for the same idiom). */
+        /* Report each distinct (path, nsplit) once, bounded. A plain
+         * warn-once is actively misleading here: the first shadow decode of
+         * a run happens at a tiny pos (priming), where nsplit is always 1,
+         * so it reports "grp nsplit=1" for a run that then spends every
+         * steady-state token in the split path. Per-call stderr would shred
+         * the exact-match harnesses, so cap the distinct lines instead. */
         {
-            static int shadow_dbg_done = 0;
+            enum { SHADOW_DBG_MAX = 8 };
+            static uint32_t shadow_dbg_seen[SHADOW_DBG_MAX];
+            static int shadow_dbg_n = 0;
             const char *dbg = getenv("DS4_QWEN_SHADOW_DEBUG");
-            if (!shadow_dbg_done && dbg && dbg[0] && strcmp(dbg, "0") != 0) {
-                shadow_dbg_done = 1;
-                fprintf(stderr,
-                        "ds4: qwen shadow decode: path=%s nsplit=%u pos=%u "
-                        "n_head=%u n_head_kv=%u head_dim=%u cap_rows=%llu\n",
-                        splitk ? "split" : (grp ? "grp" : "legacy"),
-                        splitk ? nsplit : 1u, pos, n_head, n_head_kv, head_dim,
-                        (unsigned long long)cap_rows);
+            if (dbg && dbg[0] && strcmp(dbg, "0") != 0 &&
+                shadow_dbg_n < SHADOW_DBG_MAX) {
+                const uint32_t path_id = splitk ? 2u : (grp ? 1u : 0u);
+                const uint32_t key = path_id * 1024u +
+                                     (splitk ? nsplit : 1u);
+                int seen = 0;
+                for (int i = 0; i < shadow_dbg_n; i++)
+                    if (shadow_dbg_seen[i] == key) { seen = 1; break; }
+                if (!seen) {
+                    shadow_dbg_seen[shadow_dbg_n++] = key;
+                    fprintf(stderr,
+                            "ds4: qwen shadow decode: path=%s nsplit=%u pos=%u "
+                            "n_head=%u n_head_kv=%u head_dim=%u cap_rows=%llu\n",
+                            splitk ? "split" : (grp ? "grp" : "legacy"),
+                            splitk ? nsplit : 1u, pos, n_head, n_head_kv,
+                            head_dim, (unsigned long long)cap_rows);
+                }
             }
         }
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);

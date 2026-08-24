@@ -9,9 +9,15 @@ before trusting anything you remember from it.
 
 | branch | commit | contents |
 |---|---|---|
-| `ornith15` | `d6eb25f` | split-K shadow decode + ngrp gate fix + MTP verify-width counters + opt-in top-2 clamp |
+| `ornith15` | merge of `d6eb25f` + Min `5ee5427` | split-K shadow decode, ngrp gate fix (1..16), MTP verify-width counters, opt-in top-2 clamp, Min's Ornith measurements |
 | `main` | merge of the above | same tree |
-| `e5ce86d` | previous tip | grouped shadow kernel (dead on Qwen3.8), adaptive depth, batched MTP priming |
+| Min `5ee5427` | parallel work, merged in | independent ngrp 1..16 generalisation + full Ornith 35B/9B measurement |
+| `e5ce86d` | common ancestor | grouped shadow kernel (dead on every shipped model), adaptive depth, batched MTP priming |
+
+Min's `main` was fetched from `ssh://audreyt@192.168.1.77/Users/audreyt/w/ds4/`
+(**not** `Min.local` as `au@`, and not `audreyt@Min.local` — only that exact
+user+IP form authenticates from here). Min's `ornith15` branch is stale at
+`5edda49`; Min commits to `main`, so fetch `main`.
 
 Build and gates unchanged:
 
@@ -173,10 +179,12 @@ would be strictly worse. `DS4_QWEN_MTP_H` still overrides per machine.
    directly. At 2554 that buffer was 50.1 ms before split-K against 100.0 ms at
    10295, i.e. ~34 ms fixed + ~6.4 µs per context token; the fixed term is now
    the dominant cost at every length and nothing has profiled it yet.
-3. **Carry split-K to Ornith.** The ngrp fix is already live for any model with
-   a group of 2..16 and both Ornith exact-match gates pass, but no Ornith
-   long-context A/B has been run. Baselines to beat, 523-tok prompt, n=128, no
-   speculation: 35B 269 t/s prefill / 88.2 decode; 9B 734 / 72.7.
+3. **Ornith long-context split-K.** Short-context Ornith is already measured
+   and wins (see below: 9B +11.3 %, 35B +22.4 % at 523 tokens, byte-identical).
+   What is still unmeasured is Ornith at 10 k *with* split-K. Min's "no cliff
+   at 10 k, grouped ON ≡ OFF" was about the grouped kernel, not split-K, so it
+   does not settle this — and given split-K pays at 523 where there is no
+   cliff at all, it plausibly pays at 10 k too.
 4. **Top-2 confidence clamp** is implemented and off by default
    (`DS4_QWEN_MTP_TOP2=1`). It uses a real k=2 indexer reduction plus two 4-byte
    reads per position — no full-logits copy. Measured neutral at 523 (+1.8 %,
@@ -251,3 +259,89 @@ Serialize the model-loaded harnesses (`sleep 5-10` between); ds4 refuses to
 start while another ds4/ds4-server holds the single-instance lock. Bare
 `./ds4_test` without `--server` reports 20 pre-existing Ornith-9B fixture
 failures — prove pre-existence by diffing suite verdicts, do not chase them.
+
+## Ornith results — Min, 2026-08-24 (`5ee5427`, merged here)
+
+Min worked this in parallel on the same day and reached the **same dead-gate
+conclusion independently**, from the Ornith side rather than the Qwen side.
+Its commit generalised the grouped kernel to runtime ngrp 1..16; this tree
+takes that bound (wider than the 2..16 arrived at here) and layers split-K on
+top. Min's numbers below are Min's own and were not re-measured on Max.
+
+### Shapes — the old `ngrp == 16` gate excluded every model that ships here
+
+| model | arch | heads / kv | ngrp | draft path |
+|---|---|---|---|---|
+| Ornith-1.5-35B | `qwen35moe`, 39 exec + 1 bundled nextn | 16 / 2 | **8** | bundled nextn, auto (`DS4_QWEN_NEXTN_DRAFT=0` disables) |
+| Ornith-1.5-9B | `qwen35` dense 32L | 16 / 4 | **4** | DFlash sidecar via `--dflash` |
+| Qwen3.8-27B | hybrid, 16 full-attn layers | 24 / 4 | **6** | MTP head sidecar |
+
+head_dim is 256 on all three. Min verified the generalisation bitwise:
+grouped-serial ≡ legacy-serial across the full comparable span at ngrp=8, and
+the Qwen3.8 golden still matched byte-for-byte after the rebuild.
+
+### Measured on Min (523-tok fixture, greedy, warmed)
+
+| leg | t/s | vs serial |
+|---|---|---|
+| 35B serial | 87.9–90.5 decode / ~1140 prefill | — |
+| 35B nextn K=1 | **99.5 / 99.8** | **+13 %, the sweet spot** |
+| 35B nextn K=3 | 57.7 | 0.64× |
+| 35B AUTO h=0.34 | 86.1 | over-drafts |
+| 35B AUTO h=0.7 | 86.6 | collapses to no drafting |
+| 35B batched priming @10k | 263–275 vs 98–127 sequential | **2.1–2.8×**, text-identical |
+| 9B serial | 75.9–77.7 / ~750 | matches the old Max figure 734 / 72.7 |
+| 9B DFlash warmed `-n 256` | 53.1 (acc 220/230 = 95.6 %) | **0.70×** |
+| both models @10k | grouped ON ≡ OFF, ≥18 t/s | **no cliff at these shapes** |
+
+The old Max figure of "35B 269 t/s prefill" was measured on a soaked machine;
+Min's ~1140 fresh is the honest number.
+
+### Split-K on Ornith — measured on Max after the merge
+
+Min's ngrp 1..16 bound admits both Ornith models, so split-K now defaults on
+for them too. That was worth checking rather than assuming, since Min had
+found no long-context cliff on these shapes. It is a clear win at 523 tokens,
+`-n 128`, two reps, byte-identical output on every leg:
+
+| model | ngrp | split-K default | `SPLITK=0` | gain |
+|---|---|---|---|---|
+| Ornith-1.5-9B | 16/4 = 4 | 84.30 / 84.86 | 75.60 / 76.37 | **+11.3 %** |
+| Ornith-1.5-35B | 16/2 = 8 | 110.61 / 109.69 | 89.76 / 89.63 | **+22.4 %** |
+
+Both beat Min's own serial figures (9B 75.9–77.7, 35B 87.9–90.5) by exactly
+the split-K margin, which is a useful cross-machine consistency check.
+
+`DS4_QWEN_SHADOW_DEBUG=1` now prints **each distinct (path, nsplit)** rather
+than one warn-once line, because a warn-once here is actively misleading: the
+first shadow decode of a run happens during priming at a tiny `pos`, where
+nsplit is always 1. The 35B run reports `grp:1 split:2 split:3 split:4
+split:5 split:6` — the leading `grp:1` is priming, and every steady-state
+token is in the split path. Reading only the first line had me briefly
+conclude 35B was not using split-K at all.
+
+### Why Ornith's speculation economics differ from Qwen3.8's
+
+Ornith35's draft head is a full MoE layer and every verified row re-routes
+experts, so a marginal verify row costs ≈0.345 serial-token-times and each
+draft step ≈0.34 (h ≈ 0.34 measured from the profile counters). A round costs
+≈ 1 + 0.69·d against a yield of Σpⁱ with p ≈ 0.86, so break-even sits just past
+depth 1: **fixed K=1 is optimal and deeper always loses.** The 9B DFlash draft
+is target-class expensive (~9 ms per draft token), so even 96 % acceptance pays
+nothing. Getting past +13 % on the 35B needs cheaper verify rows (a batched
+MoE-row kernel) or a lighter head — not policy tuning.
+
+Note this is the same shape of finding as the Qwen3.8 result above: once the
+target step is cheap, speculation stops paying. Two models, two paths, one
+conclusion.
+
+### Correctness notes from Min
+
+- Both Ornith exact-match harnesses pass through the generalised kernel.
+- Ornith35 spec-vs-serial text diverges early **even under the old kernel**
+  (legacy K=1 ≠ legacy serial at char 34): pre-existing MoE batched-verify
+  near-tie behaviour, not this change, and both outputs stay coherent. Same
+  class as the Qwen3.8 @10k divergence.
+- Scripting trap that cost Min an hour: `run(){ shift; ...$1... }` names output
+  files after the first env assignment rather than the intended tag, producing
+  phantom diffs.

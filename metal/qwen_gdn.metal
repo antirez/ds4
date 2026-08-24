@@ -1151,14 +1151,14 @@ kernel void kernel_qwen_gqa_attn_decode_shadow(
  * Qwen3.8: 64 query heads / 4 KV heads), which measured as seconds of GPU
  * time per decode token at pos ~10300 while pos ~550 stayed L2-resident.
  *
- * Layout: 512 threads per threadgroup = 16 simdgroups, one simdgroup per
- * grouped query head (dispatch bails to the legacy kernel unless
- * n_head / n_head_kv == 16, and the kernel itself returns when ngrp != 16,
- * so every simdgroup is always active). Each simdgroup runs the exact
+ * Layout: ngrp*32 threads per threadgroup = ngrp simdgroups (runtime
+ * 1..16), one simdgroup per grouped query head; both the host gate and
+ * the kernel's own bail require 1 <= ngrp <= 16 and head_dim == 256, so
+ * every dispatched simdgroup is always active. Each simdgroup runs the
  * scalar sequence of the original kernel -- same QWEN_DECODE_SHADOW_BT
  * blocking, same per-token lane assignment, same d+=4 half4 dot order,
  * same two-step online softmax and alpha rescale -- so per-head results
- * are bit-identical. Only the LOAD pattern differs: the 16 simdgroups
+ * are bit-identical. Only the LOAD pattern differs: the ngrp simdgroups
  * traverse the same K/V blocks nearly in lockstep (identical, purely
  * pos-dependent control flow, started together) and share each K/V row
  * through the cache hierarchy; inter-simdgroup drift is bounded by
@@ -1187,13 +1187,16 @@ kernel void kernel_qwen_gqa_attn_decode_shadow_grp(
     const uint kv_h = tgpig.x;
     const uint ngrp = args.n_head / args.n_head_kv;
     const uint hd = args.head_dim;
-    /* The host dispatches exactly ngrp simdgroups (ngrp*32 threads), so
-     * every simdgroup is active and the barrier below is safe; tqg is sized
-     * for the largest supported group (16). Qwen3.8's full-attention layers
-     * are 24 q-heads / 4 kv-heads => ngrp 6, so pinning this to 16 kept the
-     * grouped path dead on that model. Legacy kernel handles ngrp > 16. */
+    /* Runtime group bound [1..16] keeps every dispatched simdgroup active
+     * (nothing here depends on a simdgroup early-returning, which is why
+     * there is deliberately no `sgid >= ngrp` test: that return would be
+     * non-uniform and the barrier below must be reached by every thread)
+     * and bounds the tqg[16][...] staging below; the host gate applies the
+     * same test and dispatches exactly ngrp*32 threads. Real shapes:
+     * Qwen3.8 full-attn 24/4 => 6, Ornith-35B 16/2 => 8, Ornith-9B
+     * 16/4 => 4 -- the old `ngrp != 16` test excluded all three. */
     if (kv_h >= args.n_head_kv || lane >= 32u ||
-        ngrp == 0u || ngrp > 16u || sgid >= ngrp || hd != 256u)
+        ngrp == 0u || ngrp > 16u || hd != 256u)
         return;
     const uint h = kv_h * ngrp + sgid;
     const uint kv_dim = args.n_head_kv * hd;
@@ -1347,11 +1350,14 @@ kernel void kernel_qwen_gqa_attn_decode_shadow_grp_split(
     const uint sp = tgpig.y;
     const uint ngrp = args.n_head / args.n_head_kv;
     const uint hd = args.head_dim;
-    /* Same ngrp contract as kernel_qwen_gqa_attn_decode_shadow_grp: the
-     * host dispatches exactly ngrp simdgroups, so no simdgroup takes this
-     * early return and the staging barrier stays uniform. */
+    /* Same ngrp contract as kernel_qwen_gqa_attn_decode_shadow_grp, and
+     * likewise no `sgid >= ngrp` test: the host dispatches exactly ngrp
+     * simdgroups, and a non-uniform return here would strand the rest of
+     * the threadgroup at the staging barrier below. The empty-split return
+     * further down is safe because it keys off sp, which is uniform across
+     * the whole threadgroup. */
     if (kv_h >= args.n_head_kv || lane >= 32u ||
-        ngrp == 0u || ngrp > 16u || sgid >= ngrp || hd != 256u)
+        ngrp == 0u || ngrp > 16u || hd != 256u)
         return;
     const uint h = kv_h * ngrp + sgid;
     const uint kv_dim = args.n_head_kv * hd;
