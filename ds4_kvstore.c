@@ -533,6 +533,7 @@ double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_entry *e,
         const ds4_tokens *live,
         uint64_t now,
+        uint64_t fixed_overhead_bytes,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
@@ -545,8 +546,22 @@ double ds4_kvstore_entry_eviction_score(
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    double score = (effective_hits + 1.0) *
-                   (double)e->tokens / (double)e->file_size;
+    /* tokens/file_size alone double-penalizes short checkpoints: every saved
+     * payload pays roughly the same fixed_overhead_bytes regardless of token
+     * count (e.g. the engine's raw SWA cache persists a checkpoint-length-
+     * independent row count once past a small threshold), so that shared
+     * fixed cost dilutes a short checkpoint's density far more than a long
+     * one's -- even at equal hit counts, the earliest checkpoints in a
+     * growing conversation would always look cheapest to evict, and are
+     * evicted first purely because they are short, not because they are less
+     * useful. Score on the marginal (variable) bytes instead, so density
+     * reflects what this checkpoint's own token range actually costs beyond
+     * the fixed cost every checkpoint pays once. */
+    double denom = (double)e->file_size;
+    if (fixed_overhead_bytes > 0 && (double)fixed_overhead_bytes < denom) {
+        denom -= (double)fixed_overhead_bytes;
+    }
+    double score = (effective_hits + 1.0) * (double)e->tokens / denom;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
@@ -572,11 +587,11 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
         int victim = 0;
         double victim_score =
             ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
+                                             kc->fixed_overhead_bytes, incoming);
         for (int i = 1; i < kc->len; i++) {
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
-                                                 incoming);
+                                                 kc->fixed_overhead_bytes, incoming);
             if (score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
