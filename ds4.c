@@ -2063,6 +2063,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_MXFP4    = 39,
 };
@@ -2445,6 +2446,17 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+/* Some community GGUF conversions store dense (non-routed-expert) tensor
+ * families -- token embeddings, the output head, and a handful of small
+ * attention/FFN projections -- as GGUF BF16 or Q6_K rather than the
+ * F16/F32/Q8_0/Q4_K/Q4_0 dense types ds4 natively binds. Converts those to
+ * F16 in place at load time by growing the model mapping; see the
+ * definition (after the BF16/Q6_K CPU dequant helpers) for the mechanism.
+ * `mmap_flags` must match the flags used for the model's own file mapping
+ * (MAP_SHARED for the graph/no-copy-buffer backends, MAP_PRIVATE otherwise)
+ * so the re-mapped file portion behaves identically to the original. */
+static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags);
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -2493,6 +2505,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    model_convert_dense_bf16_q6k(m, mmap_flags);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -3790,6 +3803,351 @@ static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
     return sumf;
 }
 
+/* CPU dequant: block_q6_K -> contiguous float row of length k (k % 256 == 0).
+ * Same accumulation as ds4_vec_dot_q6_K_f32 below, just storing instead of
+ * summing against activations.
+ * ported from llama.cpp (MIT) ggml-quants.c dequantize_row_q6_K @5f55650 */
+static DS4_MAYBE_UNUSED void dequantize_row_q6_K(const block_q6_K *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        /* Bug fixed here: every block's 256 output values were being
+         * written to y[0..255] regardless of block index i, silently
+         * discarding every block but the last one for any multi-block
+         * call (k > QK_K). Harmless for the pre-existing per-row routed-
+         * expert caller (which only ever passes a single-block k == QK_K
+         * row), but this port's new load-time dense-tensor conversion
+         * calls it once per WHOLE flattened 2D tensor (k up to millions
+         * of elements, thousands of blocks) -- exactly the shape that
+         * exposes it: only the last block survives, everything else stays
+         * at the destination buffer's zero-initialized default. Restore
+         * the per-block y-offset so every block lands in its own slot. */
+        const int64_t y0 = i * QK_K;
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *sc = x[i].scales;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                const int q1 = ((int)(ql[l + 0]  & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int q2 = ((int)(ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int q3 = ((int)(ql[l + 0]  >> 4)    | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int q4 = ((int)(ql[l + 32] >> 4)    | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                y[y0 + n + l + 0]  = d * (float)sc[is + 0] * (float)q1;
+                y[y0 + n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                y[y0 + n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                y[y0 + n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+/* Widen an OCP BF16 value to a plain float: BF16 is exactly the high 16 bits
+ * of an IEEE-754 binary32, so this is a zero-extend + bit-copy, no rounding.
+ * ported from llama.cpp (MIT) ggml-impl.h ggml_bf16_to_fp32 @5f55650 */
+static inline float bf16_to_f32(uint16_t h) {
+    uint32_t bits = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* f32 -> f16 with an explicit clamp to +-65504 (F16_MAX) instead of the
+ * IEEE-754 overflow-to-infinity f32_to_f16() produces: weights should never
+ * exceed F16 range, so a clamp firing is a correctness red flag worth
+ * counting and surfacing, not silently turning into inf downstream. */
+static inline uint16_t f32_to_f16_clamped(float f, uint64_t *clamp_count) {
+    if (f > 65504.0f) {
+        if (clamp_count) (*clamp_count)++;
+        f = 65504.0f;
+    } else if (f < -65504.0f) {
+        if (clamp_count) (*clamp_count)++;
+        f = -65504.0f;
+    }
+    return f32_to_f16(f);
+}
+
+/* Load-time Q6_K -> F16 row conversion for dense (non-routed-expert)
+ * tensors. Reuses dequantize_row_q6_K above (also used, unchanged, by the
+ * pre-existing Q6_K routed-expert dequant path) through a transient float
+ * scratch buffer sized to this one tensor -- the Q6_K dense families this
+ * feeds (attn_q_a/q_b, attn_output_a/b, indexer.attn_q_b) are LoRA-rank
+ * sized, small relative to the model, so the extra float-sized scratch
+ * copy here is not a full-model memory concern. */
+static void convert_row_q6_K_to_f16(const block_q6_K *src, uint16_t *dst,
+                                    uint64_t k, uint64_t *clamp_count) {
+    float *tmp = (float *)malloc((size_t)k * sizeof(float));
+    if (!tmp) ds4_die("out of memory converting a Q6_K dense tensor to F16");
+    dequantize_row_q6_K(src, tmp, (int64_t)k);
+    for (uint64_t i = 0; i < k; i++) {
+        dst[i] = f32_to_f16_clamped(tmp[i], clamp_count);
+    }
+    free(tmp);
+}
+
+/* Fold a per-layer "blk.<N>." index out of a tensor name so every layer of
+ * the same tensor role shares one dialect-compat notice line instead of
+ * spamming once per layer (e.g. 43x for a 43-layer model). Tensors outside
+ * the "blk.<N>." naming convention (top-level tensors like token_embd or
+ * output) key on their own full name unchanged. */
+static void tensor_family_key(ds4_str name, char *buf, size_t bufsz) {
+    static const char prefix[] = "blk.";
+    const size_t plen = sizeof(prefix) - 1;
+    if (name.len > plen && memcmp(name.ptr, prefix, plen) == 0 &&
+        isdigit((unsigned char)name.ptr[plen])) {
+        size_t p = plen;
+        while (p < name.len && isdigit((unsigned char)name.ptr[p])) p++;
+        if (p < name.len && name.ptr[p] == '.') {
+            int n = snprintf(buf, bufsz, "blk.N%.*s",
+                             (int)(name.len - p), name.ptr + p);
+            if (n > 0 && (size_t)n < bufsz) return;
+        }
+    }
+    size_t n = name.len < bufsz - 1 ? name.len : bufsz - 1;
+    memcpy(buf, name.ptr, n);
+    buf[n] = '\0';
+}
+
+/* Structural test for "this tensor is a load-time dense F16-conversion
+ * candidate", shared by both scan passes in model_convert_dense_bf16_q6k()
+ * below.
+ *
+ * BF16/Q6_K: always eligible for ndim <= 2 (see that function's own
+ * comment for why ndim<=2 safely excludes routed experts in every model
+ * family, including GLM's genuine Q6_K routed experts).
+ *
+ * F32: eligible only for ndim == 2 (never ndim == 1 -- every 1D F32
+ * tensor in every validate path, deepseek4 FLASH/PRO, GLM, MTP, and
+ * DSpark alike, is a norm/bias/scale vector that must stay F32) and only
+ * when compiled for the DeepSeek4 (non-GLM) family. Checked directly
+ * against source: in `weights_validate_layout()` (deepseek4, non-GLM)
+ * every 2D tensor is either hardcoded DS4_TENSOR_F16 or
+ * dense-quant/routed-expert -- never F32 -- so converting any 2D F32
+ * tensor there to F16 is exhaustively safe. `weights_validate_glm_dsa_layout()`
+ * (GLM) is the opposite: `ffn_gate_inp` and `indexer_proj` are *required*
+ * as literal 2D F32 there, so this must not run for GLM builds. MTP's
+ * validator (`mtp_weights_validate_layout()`) uses `tensor_expect_plain_layout()`
+ * (F16-or-F32, so F32->F16 is harmless) for its 2D hc tensors and Q8_0 for
+ * its dense weights -- never a hard 2D F32 requirement either, so a
+ * DeepSeek4-family build converting an MTP support GGUF is also safe. */
+static bool tensor_is_dense_conversion_candidate(uint32_t type, uint32_t ndim) {
+    if (ndim > 2) return false;
+    if (type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q6_K) return true;
+    if (type == DS4_TENSOR_F32 && ndim == 2 &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return true;
+    }
+    return false;
+}
+
+/* Dialect compat: convert dense (non-routed-expert) GGUF BF16/Q6_K tensors,
+ * and (DeepSeek4-family builds only) 2D F32 tensors bound as F16, to F16 in
+ * place at load time, so the rest of ds4 -- which only binds F16/F32/
+ * Q8_0/Q4_K/Q4_0 for dense tensors -- never has to know this file used
+ * BF16/Q6_K/F32 for them.
+ *
+ * Scope: see tensor_is_dense_conversion_candidate() above for the exact,
+ * source-checked eligibility rule per type. Routed MoE expert tensors are
+ * always 3D (in, mid, n_expert), so the ndim<=2 half of that rule alone
+ * already keeps every routed-expert family (including GLM's genuine Q6_K
+ * *routed* experts, which must stay quantized/streamed, not blown up to
+ * F16) untouched with no name matching needed.
+ *
+ * Mechanism: the model file is mapped once in model_open before this runs,
+ * so tensor bytes normally live at model_map + tensor->abs_offset with no
+ * separate "converted" storage the rest of ds4 would need to know about.
+ * To keep that invariant (every consumer, CPU and GPU, just does
+ * model_map + offset) while still being able to store newly-converted F16
+ * bytes somewhere, this grows the SAME mapping: reserve an anonymous
+ * address range sized to the original file plus the total conversion
+ * output, remap the file at the front of that reservation (MAP_FIXED into
+ * space we just reserved, so it cannot collide with anything), then map a
+ * writable anonymous extension right after it for the converted tensors.
+ * Every converted ds4_tensor then just gets a new (type=F16, abs_offset,
+ * bytes) inside that same extension -- no other code path changes. */
+static void model_convert_dense_bf16_q6k(ds4_model *m, int mmap_flags) {
+    uint64_t extra_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (tensor_is_dense_conversion_candidate(t->type, t->ndim)) {
+            extra_bytes += t->elements * 2u;
+        }
+    }
+    if (extra_bytes == 0) return;
+
+    const long page_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_l > 0 ? (uint64_t)page_l : 4096u;
+    const uint64_t old_len = align_up(m->size, page_sz);
+    const uint64_t extra_len = align_up(extra_bytes, page_sz);
+    const uint64_t total_len = old_len + extra_len;
+
+    void *reserved = mmap(NULL, (size_t)total_len, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserved == MAP_FAILED) {
+        fprintf(stderr,
+                "ds4: cannot reserve address space for dense BF16/Q6_K "
+                "load-time conversion: %s\n", strerror(errno));
+        exit(1);
+    }
+    if (mmap(reserved, (size_t)old_len, PROT_READ,
+            mmap_flags | MAP_FIXED, m->fd, 0) == MAP_FAILED) {
+        fprintf(stderr,
+                "ds4: cannot remap model file for dense-tensor conversion: "
+                "%s\n", strerror(errno));
+        exit(1);
+    }
+    if (mmap((char *)reserved + old_len, (size_t)extra_len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+        fprintf(stderr,
+                "ds4: cannot map dense-tensor conversion arena: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+
+    /* Deliberately does NOT munmap the original mapping here: every
+     * ds4_tensor's `name` (a ds4_str) is a raw pointer into it, captured by
+     * parse_tensors() above, and tensor_family_key() below (and anything
+     * else that later prints a tensor name) dereferences those pointers.
+     * Leaking the original mapping is a pure virtual-address-space cost
+     * (no extra physical memory beyond the handful of header/name pages
+     * already touched), not a real leak in practice. */
+    m->map = reserved;
+    m->size = total_len;
+
+    uint64_t cursor = old_len;
+
+    typedef struct {
+        char        key[128];
+        const char *type_name;
+        uint32_t    count;
+        uint64_t    clamp;
+    } conv_family;
+    conv_family fam[64];
+    uint32_t n_fam = 0;
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[i];
+        if (!tensor_is_dense_conversion_candidate(t->type, t->ndim)) continue;
+
+        const uint32_t orig_type = t->type;
+        const char *orig_type_name = tensor_type_name(orig_type);
+        uint16_t *dst = (uint16_t *)((char *)m->map + cursor);
+        uint64_t clamp_here = 0;
+
+        if (orig_type == DS4_TENSOR_BF16) {
+            const uint16_t *src =
+                (const uint16_t *)((const char *)m->map + t->abs_offset);
+            for (uint64_t e = 0; e < t->elements; e++) {
+                dst[e] = f32_to_f16_clamped(bf16_to_f32(src[e]), &clamp_here);
+            }
+        } else if (orig_type == DS4_TENSOR_Q6_K) {
+            const block_q6_K *src =
+                (const block_q6_K *)((const char *)m->map + t->abs_offset);
+            convert_row_q6_K_to_f16(src, dst, t->elements, &clamp_here);
+        } else {
+            /* DS4_TENSOR_F32, 2D, DeepSeek4-family only (see
+             * tensor_is_dense_conversion_candidate()). These are small
+             * hyper-connection routing tensors near unity scale, so
+             * narrowing to F16 is expected to be loss-free in practice;
+             * the clamp guard and count below still apply, and a nonzero
+             * count here is reported loudly since it would mean an actual
+             * out-of-F16-range value was truncated, not just narrowed. */
+            const float *src =
+                (const float *)((const char *)m->map + t->abs_offset);
+            for (uint64_t e = 0; e < t->elements; e++) {
+                dst[e] = f32_to_f16_clamped(src[e], &clamp_here);
+            }
+        }
+
+        t->type = DS4_TENSOR_F16;
+        t->abs_offset = cursor;
+        t->bytes = t->elements * 2u;
+        cursor += t->bytes;
+
+        {
+            const char *dbg_name = glm_graph_env_value("DS4_ROCM_DEBUG_DENSE_CONVERT",
+                                                        "DS4_METAL_DEBUG_DENSE_CONVERT");
+            char dbg_namebuf[256];
+            if (dbg_name && dbg_name[0] && t->name.len < sizeof(dbg_namebuf)) {
+                memcpy(dbg_namebuf, t->name.ptr, t->name.len);
+                dbg_namebuf[t->name.len] = 0;
+            } else {
+                dbg_namebuf[0] = 0;
+            }
+            if (dbg_name && dbg_name[0] && strstr(dbg_namebuf, dbg_name) != NULL) {
+                double sum = 0.0, absmax = 0.0;
+                uint64_t nshow = t->elements < 4 ? t->elements : 4;
+                for (uint64_t e = 0; e < t->elements; e++) {
+                    float v = f16_to_f32(dst[e]);
+                    sum += v;
+                    float av = v < 0 ? -v : v;
+                    if (av > absmax) absmax = av;
+                }
+                fprintf(stderr,
+                        "ds4: [dbgconvert] tensor=%.*s orig_type=%s elements=%llu "
+                        "abs_offset=%llu sum=%g absmax=%g first%llu=",
+                        (int)t->name.len, t->name.ptr, orig_type_name,
+                        (unsigned long long)t->elements,
+                        (unsigned long long)t->abs_offset, sum, absmax,
+                        (unsigned long long)nshow);
+                for (uint64_t e = 0; e < nshow; e++) {
+                    fprintf(stderr, "%g ", f16_to_f32(dst[e]));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+
+        char key[128];
+        tensor_family_key(t->name, key, sizeof(key));
+
+        uint32_t fi = 0;
+        for (; fi < n_fam; fi++) {
+            if (fam[fi].type_name == orig_type_name &&
+                strcmp(fam[fi].key, key) == 0) {
+                break;
+            }
+        }
+        if (fi == n_fam && n_fam < (sizeof(fam) / sizeof(fam[0]))) {
+            snprintf(fam[fi].key, sizeof(fam[fi].key), "%s", key);
+            fam[fi].type_name = orig_type_name;
+            fam[fi].count = 0;
+            fam[fi].clamp = 0;
+            n_fam++;
+        }
+        if (fi < (sizeof(fam) / sizeof(fam[0]))) {
+            fam[fi].count++;
+            fam[fi].clamp += clamp_here;
+        }
+    }
+
+    for (uint32_t fi = 0; fi < n_fam; fi++) {
+        if (fam[fi].clamp != 0) {
+            fprintf(stderr,
+                "ds4: *** WARNING *** tensor family %s (%s, %u tensor%s) "
+                "dialect compat: dequantized to f16 at load -- %" PRIu64
+                " value%s clamped to +-65504 -- weights should NEVER hit "
+                "the F16 clamp; this is a correctness red flag, investigate "
+                "before trusting this model's output\n",
+                fam[fi].key, fam[fi].type_name, fam[fi].count,
+                fam[fi].count == 1 ? "" : "s",
+                fam[fi].clamp, fam[fi].clamp == 1 ? "" : "s");
+        } else {
+            fprintf(stderr,
+                "ds4: tensor family %s (%s, %u tensor%s) dialect compat: "
+                "dequantized to f16 at load\n",
+                fam[fi].key, fam[fi].type_name, fam[fi].count,
+                fam[fi].count == 1 ? "" : "s");
+        }
+    }
+}
+
 static float ds4_vec_dot_q6_K_f32(int n, const block_q6_K *x, const float *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;
@@ -4260,6 +4618,51 @@ static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
     return t;
 }
 
+/* Tensor-name dialect compat, same spirit as the metadata-key compat layer
+ * above (deepseek4_compat_u32 & co.): some community GGUF conversions name
+ * a tensor after llama.cpp's internal C++ member name rather than the GGUF
+ * tensor-name convention llama.cpp's own arch table
+ * (src/llama-arch.cpp @5f55650, LLM_TENSOR_* -> string) and its
+ * corresponding create_tensor()/tn() calls actually emit and expect back.
+ * find_tensor_alias() tries the canonical (ds4-expected, llama.cpp-dialect)
+ * name first and only falls back to a documented alias if that's absent,
+ * printing a one-line notice so a run stays honest about the alias being
+ * active. Every alias used here has been verified against both (1) the
+ * donor's own tensor-creation code, to confirm the alias name really is
+ * the same tensor under a different name and not a different tensor that
+ * happens to share a prefix, and (2) the real artifact's header (dims +
+ * gguf type), to confirm the aliased tensor's on-disk shape matches what
+ * ds4 requires at the binding site -- nothing is aliased blind. */
+static ds4_tensor *find_tensor_alias(
+        const ds4_model *m,
+        const char      *canonical_name,
+        const char      *alias_name) {
+    ds4_tensor *t = model_find_tensor(m, canonical_name);
+    if (t) return t;
+    t = model_find_tensor(m, alias_name);
+    if (t) {
+        fprintf(stderr,
+                "ds4: tensor %s missing, found %s -- dialect compat, "
+                "using it as %s\n",
+                canonical_name, alias_name, canonical_name);
+    }
+    return t;
+}
+
+static ds4_tensor *required_tensor_alias(
+        const ds4_model *m,
+        const char      *canonical_name,
+        const char      *alias_name) {
+    ds4_tensor *t = find_tensor_alias(m, canonical_name, alias_name);
+    if (!t) {
+        fprintf(stderr,
+                "ds4: required tensor is missing: %s (also tried alias %s)\n",
+                canonical_name, alias_name);
+        exit(1);
+    }
+    return t;
+}
+
 static ds4_tensor *tensor_by_namef(const ds4_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
@@ -4272,6 +4675,41 @@ static ds4_tensor *required_tensorf(const ds4_model *m, const char *fmt, uint32_
     int n = snprintf(name, sizeof(name), fmt, layer);
     if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("tensor name is too long");
     return required_tensor(m, name);
+}
+
+/* Formatted (per-layer, "blk.%u...") analogs of find_tensor_alias() /
+ * required_tensor_alias() above -- same dialect-compat mechanism, just
+ * applied once per layer rather than once at the top level. */
+static ds4_tensor *tensor_by_namef_alias(
+        const ds4_model *m,
+        const char      *fmt_canonical,
+        const char      *fmt_alias,
+        uint32_t         layer) {
+    char canonical[128];
+    char alias[128];
+    int nc = snprintf(canonical, sizeof(canonical), fmt_canonical, layer);
+    int na = snprintf(alias, sizeof(alias), fmt_alias, layer);
+    if (nc < 0 || (size_t)nc >= sizeof(canonical) ||
+        na < 0 || (size_t)na >= sizeof(alias)) {
+        ds4_die("tensor name is too long");
+    }
+    return find_tensor_alias(m, canonical, alias);
+}
+
+static ds4_tensor *required_tensorf_alias(
+        const ds4_model *m,
+        const char      *fmt_canonical,
+        const char      *fmt_alias,
+        uint32_t         layer) {
+    char canonical[128];
+    char alias[128];
+    int nc = snprintf(canonical, sizeof(canonical), fmt_canonical, layer);
+    int na = snprintf(alias, sizeof(alias), fmt_alias, layer);
+    if (nc < 0 || (size_t)nc >= sizeof(canonical) ||
+        na < 0 || (size_t)na >= sizeof(alias)) {
+        ds4_die("tensor name is too long");
+    }
+    return required_tensor_alias(m, canonical, alias);
 }
 
 static ds4_tensor *tensor_by_mtp_stage_suffix(
@@ -4332,9 +4770,15 @@ static bool tensor_type_is_glm_dense_quant(uint32_t type) {
 }
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
+    /* F16 included alongside the native quant types because
+     * model_convert_dense_bf16_q6k() (ds4_model load time) converts BF16/
+     * Q6_K dense tensors in these same roles to F16 before this ever runs;
+     * without it, a converted tensor would fail validation here even
+     * though it is now a perfectly ordinary F16 tensor. */
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_Q4_0 ||
+           type == DS4_TENSOR_F16;
 }
 
 static void tensor_expect_glm_dense_quant_layout(
@@ -5532,8 +5976,21 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
-        fprintf(stderr, "ds4: required int32/uint32 array metadata key is missing: %s\n", key);
-        exit(1);
+        /* Dialect compat: ds4_expected_layer_compress_ratio() below is already
+         * the exact per-layer pattern every present compress_ratios array is
+         * validated against -- when the array itself is missing, use that
+         * expected pattern directly rather than dying. This isn't a guess, it's
+         * literally the ground truth this function otherwise checks the file
+         * against. */
+        fprintf(stderr,
+                "ds4: metadata key %s missing -- dialect compat, using compiled "
+                "per-layer compress ratio pattern for %s\n",
+                key, DS4_MODEL_SHAPE_NAME);
+        memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g_ds4_compress_ratios[il] = ds4_expected_layer_compress_ratio(il);
+        }
+        return;
     }
     if (arr.len < DS4_N_LAYER) {
         ds4_die("deepseek4.attention.compress_ratios is shorter than the layer count");
@@ -5624,25 +6081,191 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
 }
 
+/* =========================================================================
+ * deepseek4 GGUF dialect compat.
+ * =========================================================================
+ *
+ * Some community DeepSeek-V4 GGUF conversions omit metadata keys that
+ * antirez's reference converter (and llama.cpp's own, @5f55650
+ * src/models/deepseek4.cpp::load_arch_hparams -- which requires exactly the
+ * same keys via ml.get_key(..., required=true) with no fallback of its own)
+ * both write unconditionally. For every deepseek4 shape ds4 currently
+ * supports (DS4_SHAPE_FLASH / DS4_SHAPE_PRO above) these are architecture
+ * constants, not per-checkpoint choices, so when a key is missing we recover
+ * it -- in order of preference -- from (1) tensor shapes/presence already in
+ * the file, which llama.cpp's own tensor-creation code ties directly to the
+ * hparam, or (2), only where no tensor encodes the value at all, the exact
+ * constant ds4 already hardcodes and validates every present key against for
+ * the identified shape. Every fallback prints a one-line notice so a run is
+ * honest about dialect compat being active; if the file's shape can't be
+ * identified from its own (present, required) keys, this falls straight
+ * through to the ordinary required-key die below -- nothing is guessed.
+ */
+
+static bool deepseek4_tensor_dim0(const ds4_model *m, const char *name, uint64_t *out) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    if (!t || t->ndim < 1) return false;
+    *out = t->dim[0];
+    return true;
+}
+
+static bool deepseek4_tensor_dim1(const ds4_model *m, const char *name, uint64_t *out) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    if (!t || t->ndim < 2) return false;
+    *out = t->dim[1];
+    return true;
+}
+
+/* llama.cpp creates token_embd.weight/output.weight as {n_embd, n_vocab}
+ * (dim1 is the vocab-sized axis) and the tokenizer's own token list has
+ * exactly n_vocab entries, so when deepseek4.vocab_size itself is missing
+ * from the header (GA's converter drops it, unlike the preview conversion),
+ * derive it from tokenizer.ggml.tokens' array length -- the authoritative
+ * source, since it is the raw token list, not a shape inference -- and
+ * cross-check against token_embd.weight/output.weight's vocab dimension.
+ * Disagreement means the file itself is inconsistent, so this dies with a
+ * clear message rather than silently guessing which source to trust. */
+static bool deepseek4_compat_vocab_size(const ds4_model *m, uint32_t *out) {
+    ds4_array_ref tokens;
+    if (!model_get_array(m, "tokenizer.ggml.tokens", &tokens)) return false;
+
+    uint64_t tensor_vocab = 0;
+    bool have_tensor_vocab = deepseek4_tensor_dim1(m, "token_embd.weight", &tensor_vocab);
+    if (!have_tensor_vocab) have_tensor_vocab = deepseek4_tensor_dim1(m, "output.weight", &tensor_vocab);
+
+    if (have_tensor_vocab && tensor_vocab != tokens.len) {
+        fprintf(stderr,
+                "ds4: deepseek4.vocab_size is missing and its tensor-derived fallbacks "
+                "disagree -- tokenizer.ggml.tokens has %" PRIu64 " entries but "
+                "token_embd.weight/output.weight's vocab dimension is %" PRIu64
+                "; refusing to guess\n",
+                tokens.len, tensor_vocab);
+        exit(1);
+    }
+
+    *out = (uint32_t)tokens.len;
+    return true;
+}
+
+/* llama.cpp creates (src/models/deepseek4.cpp):
+ *   wo_a (attn_output_a) = {n_head * n_embd_head / o_groups, o_lora_rank * o_groups}
+ *   wo_b (attn_output_b) = {o_groups * o_lora_rank,          n_embd}
+ * so both output_group_count and output_lora_rank are exactly recoverable from
+ * the two tensors' dim0 given n_head/n_embd_head (already-required keys). */
+static bool deepseek4_compat_output_lora(const ds4_model *m, uint32_t n_head, uint32_t n_head_dim,
+                                          uint32_t *out_group, uint32_t *out_lora_o) {
+    uint64_t dim_a = 0, dim_b = 0;
+    if (!deepseek4_tensor_dim0(m, "blk.0.attn_output_a.weight", &dim_a)) return false;
+    if (!deepseek4_tensor_dim0(m, "blk.0.attn_output_b.weight", &dim_b)) return false;
+    uint64_t prod = (uint64_t)n_head * n_head_dim;
+    if (dim_a == 0 || prod % dim_a != 0) return false;
+    uint64_t groups = prod / dim_a;
+    if (groups == 0 || dim_b % groups != 0) return false;
+    *out_group = (uint32_t)groups;
+    *out_lora_o = (uint32_t)(dim_b / groups);
+    return true;
+}
+
+/* llama.cpp creates hc_attn_fn = {hc_mult * n_embd, (2 + hc_mult) * hc_mult},
+ * so hyper_connection.count == hc_mult == dim0(hc_attn_fn) / n_embd. */
+static bool deepseek4_compat_hc_count(const ds4_model *m, uint32_t n_embd, uint32_t *out_hc) {
+    uint64_t dim0 = 0;
+    if (!deepseek4_tensor_dim0(m, "blk.0.hc_attn_fn", &dim0)) return false;
+    if (n_embd == 0 || dim0 % n_embd != 0) return false;
+    *out_hc = (uint32_t)(dim0 / n_embd);
+    return true;
+}
+
+/* llama.cpp only creates blk.<i>.ffn_gate_tid2eid for i < hash_layer_count
+ * ("if ((uint32_t) i < hparams.dsv4_hash_layer_count)"), so the count of
+ * present tensors in the contiguous run starting at layer 0 recovers the
+ * exact hash_layer_count. */
+static bool deepseek4_compat_hash_layer_count(const ds4_model *m, uint32_t n_layer, uint32_t *out) {
+    uint32_t count = 0;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (!tensor_by_namef(m, "blk.%u.ffn_gate_tid2eid", il)) break;
+        count++;
+    }
+    *out = count;
+    return true;
+}
+
+/* No tensor shape encodes the Sinkhorn iteration count -- it is a pure
+ * algorithm hyperparameter -- so guess the shape from block_count alone (it
+ * is currently unique across every deepseek4 profile ds4 supports) and use
+ * that shape's own compiled n_hc_sinkhorn_iter as the only traceable source
+ * left, per the "documented architecture constant" fallback tier. */
+static const ds4_shape *deepseek4_shape_guess(uint32_t n_layer) {
+    if (n_layer == DS4_SHAPE_FLASH.n_layer) return &DS4_SHAPE_FLASH;
+    if (n_layer == DS4_SHAPE_PRO.n_layer)   return &DS4_SHAPE_PRO;
+    return NULL;
+}
+
+static uint32_t deepseek4_compat_u32(const ds4_model *m, const char *key, uint32_t fallback,
+                                      bool have_fallback, const char *note) {
+    uint32_t v = 0;
+    if (model_get_u32(m, key, &v)) return v;
+    if (!have_fallback) {
+        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    fprintf(stderr, "ds4: metadata key %s missing -- dialect compat, using %s = %u\n", key, note, fallback);
+    return fallback;
+}
+
+/* Float analog of deepseek4_compat_u32, used only for keys read after the
+ * model shape has already been selected (so DS4_* macros below already name
+ * the shape's own compiled value -- always a valid fallback at that point). */
+static float deepseek4_compat_f32_shape_default(const ds4_model *m, const char *key, float fallback,
+                                                  const char *note) {
+    float v = 0.0f;
+    if (model_get_f32_compat(m, key, &v)) return v;
+    fprintf(stderr, "ds4: metadata key %s missing -- dialect compat, using %s = %.9g\n",
+            key, note, (double)fallback);
+    return fallback;
+}
+
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
 static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
+
+    uint32_t compat_vocab = 0;
+    bool have_vocab_compat = deepseek4_compat_vocab_size(m, &compat_vocab);
+    const uint32_t n_vocab = deepseek4_compat_u32(m, "deepseek4.vocab_size",
+                                                    compat_vocab, have_vocab_compat,
+                                                    "tokenizer.ggml.tokens array length "
+                                                    "(cross-checked against token_embd.weight/"
+                                                    "output.weight's vocab dimension)");
     const uint32_t n_head = required_u32(m, "deepseek4.attention.head_count");
     const uint32_t n_head_kv = required_u32(m, "deepseek4.attention.head_count_kv");
     const uint32_t n_head_dim = required_u32(m, "deepseek4.attention.key_length");
     const uint32_t n_value_dim = required_u32(m, "deepseek4.attention.value_length");
     const uint32_t n_rot = required_u32(m, "deepseek4.rope.dimension_count");
     const uint32_t n_lora_q = required_u32(m, "deepseek4.attention.q_lora_rank");
-    const uint32_t n_lora_o = required_u32(m, "deepseek4.attention.output_lora_rank");
-    const uint32_t n_out_group = required_u32(m, "deepseek4.attention.output_group_count");
+
+    uint32_t compat_out_group = 0, compat_lora_o = 0;
+    bool have_output_lora_compat =
+        deepseek4_compat_output_lora(m, n_head, n_head_dim, &compat_out_group, &compat_lora_o);
+    const uint32_t n_lora_o = deepseek4_compat_u32(m, "deepseek4.attention.output_lora_rank",
+                                                    compat_lora_o, have_output_lora_compat,
+                                                    "dim0(blk.0.attn_output_b.weight) / output_group_count");
+    const uint32_t n_out_group = deepseek4_compat_u32(m, "deepseek4.attention.output_group_count",
+                                                        compat_out_group, have_output_lora_compat,
+                                                        "n_head*key_length / dim0(blk.0.attn_output_a.weight)");
+
     const uint32_t n_expert = required_u32(m, "deepseek4.expert_count");
     const uint32_t n_expert_used = required_u32(m, "deepseek4.expert_used_count");
     const uint32_t n_ff_exp = required_u32(m, "deepseek4.expert_feed_forward_length");
     const uint32_t n_expert_shared = required_u32(m, "deepseek4.expert_shared_count");
-    const uint32_t n_hash_layer = required_u32(m, "deepseek4.hash_layer_count");
+
+    uint32_t compat_hash_layer = 0;
+    bool have_hash_layer_compat = deepseek4_compat_hash_layer_count(m, n_layer, &compat_hash_layer);
+    const uint32_t n_hash_layer = deepseek4_compat_u32(m, "deepseek4.hash_layer_count",
+                                                          compat_hash_layer, have_hash_layer_compat,
+                                                          "count of present blk.<i>.ffn_gate_tid2eid tensors");
+
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
     model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
@@ -5651,8 +6274,18 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     const uint32_t n_indexer_head = required_u32(m, "deepseek4.attention.indexer.head_count");
     const uint32_t n_indexer_head_dim = required_u32(m, "deepseek4.attention.indexer.key_length");
     const uint32_t n_indexer_top_k = required_u32(m, "deepseek4.attention.indexer.top_k");
-    const uint32_t n_hc = required_u32(m, "deepseek4.hyper_connection.count");
-    const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek4.hyper_connection.sinkhorn_iterations");
+    uint32_t compat_hc = 0;
+    bool have_hc_compat = deepseek4_compat_hc_count(m, n_embd, &compat_hc);
+    const uint32_t n_hc = deepseek4_compat_u32(m, "deepseek4.hyper_connection.count",
+                                                 compat_hc, have_hc_compat,
+                                                 "dim0(blk.0.hc_attn_fn) / embedding_length");
+
+    const ds4_shape *deepseek4_shape_hint = deepseek4_shape_guess(n_layer);
+    const uint32_t n_hc_sinkhorn_iter = deepseek4_compat_u32(
+        m, "deepseek4.hyper_connection.sinkhorn_iterations",
+        deepseek4_shape_hint ? deepseek4_shape_hint->n_hc_sinkhorn_iter : 0,
+        deepseek4_shape_hint != NULL,
+        deepseek4_shape_hint ? deepseek4_shape_hint->name : "(unidentified shape)");
 
     ds4_select_shape_from_metadata(n_layer,
                                    n_embd,
@@ -5726,13 +6359,24 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     float rope_yarn_beta_slow = DS4_ROPE_YARN_BETA_SLOW;
     model_get_f32_compat(m, "deepseek4.rope.scaling.yarn_beta_slow", &rope_yarn_beta_slow);
     config_expect_f32("rope.scaling.yarn_beta_slow", rope_yarn_beta_slow, DS4_ROPE_YARN_BETA_SLOW);
-    const float compress_rope_freq_base = required_f32(m, "deepseek4.attention.compress_rope_freq_base");
+    /* Not tensor-derivable (a RoPE base float, not a shape); shape is already
+     * selected above, so DS4_COMPRESS_ROPE_FREQ_BASE below names the compiled
+     * ground-truth value for this exact shape. Where the file also carries
+     * deepseek4.rope.freq_base_swa (unused elsewhere by ds4), it independently
+     * equals this same compiled constant for DeepSeek V4 Flash -- corroboration,
+     * not proof, but not a blind guess either. */
+    const float compress_rope_freq_base = deepseek4_compat_f32_shape_default(
+        m, "deepseek4.attention.compress_rope_freq_base", DS4_COMPRESS_ROPE_FREQ_BASE,
+        "compiled DS4_SHAPE compress_rope_freq_base");
     config_expect_f32("attention.compress_rope_freq_base", compress_rope_freq_base, DS4_COMPRESS_ROPE_FREQ_BASE);
     const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
     const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
-    const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
+    /* Not tensor-derivable (a pure epsilon constant); same compiled-shape
+     * fallback tier as compress_rope_freq_base above. */
+    const float hc_eps = deepseek4_compat_f32_shape_default(
+        m, "deepseek4.hyper_connection.epsilon", DS4_HC_EPS, "compiled DS4_SHAPE hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
@@ -5830,15 +6474,25 @@ static void weights_bind_output(
             w->output      = model_find_tensor(m, "output.weight");
         }
     } else if (required) {
-        w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-        w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-        w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
+        /* Community deepseek4 conversions sometimes name these three
+         * top-level hyper-connection head tensors after llama.cpp's
+         * internal C++ member names (hc_head_base/hc_head_fn/hc_head_scale,
+         * no "output_" prefix, no ".weight" suffix) instead of llama.cpp's
+         * own GGUF tensor-name convention (src/llama-arch.cpp @5f55650:
+         * LLM_TENSOR_HC_HEAD_{BASE,FN,SCALE} -> "output_hc_{base,fn,scale}")
+         * that ds4 expects. Verified against the real MXFP4_MOE artifact's
+         * header: hc_head_base {4}, hc_head_fn {16384,4}, hc_head_scale {1}
+         * -- exactly DS4_N_HC / (DS4_N_EMBD*DS4_N_HC) x DS4_N_HC / 1, the
+         * shapes weights_validate_layout() below requires. */
+        w->output_hc_base   = required_tensor_alias(m, "output_hc_base.weight", "hc_head_base");
+        w->output_hc_fn     = required_tensor_alias(m, "output_hc_fn.weight", "hc_head_fn");
+        w->output_hc_scale  = required_tensor_alias(m, "output_hc_scale.weight", "hc_head_scale");
         w->output_norm      = required_tensor(m, "output_norm.weight");
         w->output           = required_tensor(m, "output.weight");
     } else if (optional) {
-        w->output_hc_base   = model_find_tensor(m, "output_hc_base.weight");
-        w->output_hc_fn     = model_find_tensor(m, "output_hc_fn.weight");
-        w->output_hc_scale  = model_find_tensor(m, "output_hc_scale.weight");
+        w->output_hc_base   = find_tensor_alias(m, "output_hc_base.weight", "hc_head_base");
+        w->output_hc_fn     = find_tensor_alias(m, "output_hc_fn.weight", "hc_head_fn");
+        w->output_hc_scale  = find_tensor_alias(m, "output_hc_scale.weight", "hc_head_scale");
         w->output_norm      = model_find_tensor(m, "output_norm.weight");
         w->output           = model_find_tensor(m, "output.weight");
     }
@@ -5900,38 +6554,85 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
 
     const uint32_t compress_ratio = ds4_layer_compress_ratio(il);
 
-    l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
-    l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
-    l->hc_attn_base    = required_tensorf(m, "blk.%u.hc_attn_base.weight", il);
+    /* Per-layer hyper-connection tensors and attn_sinks: the same community
+     * deepseek4 conversion that drops the "output_" prefix + ".weight"
+     * suffix from the top-level hc_head_* tensors (weights_bind_output()
+     * above) also drops the ".weight" suffix from these per-layer names,
+     * confirmed by the donor's own tensor-creation code
+     * (src/models/deepseek4.cpp @5f55650: tn(LLM_TENSOR_HC_ATTN_FN,
+     * "weight", i) etc. and tn(LLM_TENSOR_ATTN_SINKS, "weight", i) --
+     * same tensors, GGUF convention just appends "weight" where this file
+     * doesn't) and by the real artifact's header: blk.0.hc_attn_fn
+     * {16384,24} F32, blk.0.hc_attn_base {24} F32, blk.0.hc_attn_scale {3}
+     * F32, blk.0.attn_sinks {64} F32 -- exactly the shapes/types
+     * weights_validate_layout() below requires. */
+    l->hc_attn_fn      = required_tensorf_alias(m, "blk.%u.hc_attn_fn.weight", "blk.%u.hc_attn_fn", il);
+    l->hc_attn_scale   = required_tensorf_alias(m, "blk.%u.hc_attn_scale.weight", "blk.%u.hc_attn_scale", il);
+    l->hc_attn_base    = required_tensorf_alias(m, "blk.%u.hc_attn_base.weight", "blk.%u.hc_attn_base", il);
     l->attn_norm       = required_tensorf(m, "blk.%u.attn_norm.weight", il);
     l->attn_q_a        = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
     l->attn_q_a_norm   = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
     l->attn_q_b        = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
-    l->attn_kv         = required_tensorf(m, "blk.%u.attn_kv.weight", il);
+    /* Same file also renames the MLA latent-KV projection: donor calls it
+     * "blk.%d.attn_kv" (src/llama-arch.cpp @5f55650, LLM_TENSOR_ATTN_KV,
+     * created as wkv = {n_embd, n_embd_head} in models/deepseek4.cpp:95);
+     * this conversion instead writes "blk.%u.attn_kv_latent.weight" -- a
+     * more descriptive alternate name for the same tensor, not a llama.cpp
+     * name at all, but shape-verified: file's blk.0.attn_kv_latent.weight
+     * is {4096,512} == {DS4_N_EMBD, DS4_N_HEAD_DIM (key_length=512)},
+     * exactly what tensor_expect_dense_quant_layout() below requires. */
+    l->attn_kv         = required_tensorf_alias(m, "blk.%u.attn_kv.weight", "blk.%u.attn_kv_latent.weight", il);
     l->attn_kv_a_norm  = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
-    l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
+    l->attn_sinks      = required_tensorf_alias(m, "blk.%u.attn_sinks.weight", "blk.%u.attn_sinks", il);
     l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
     l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
     if (compress_ratio != 0) {
-        l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
-        l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-        l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
-        l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
+        /* Donor names these "attn_compressor_{ape,kv,gate,norm}"
+         * (src/llama-arch.cpp @5f55650: LLM_TENSOR_ATTN_COMPRESSOR_*, all
+         * created via tn(..., "weight", i) in models/deepseek4.cpp:113-116)
+         * -- this file shortens "compressor" to "compress" throughout, and
+         * additionally drops the ".weight" suffix on the get_rows-indexed
+         * "ape" tensor specifically (the same pattern as ffn_gate_tid2eid
+         * above). Header-verified: blk.2.attn_compress_gate.weight /
+         * attn_compress_kv.weight / attn_compress_norm.weight all present
+         * with matching dims; attn_compress_ape present with dims (1024,4)
+         * (bare name, no suffix). Note: the gate/kv tensors are GGUF type
+         * BF16 in this file while weights_validate_layout() below requires
+         * F16 -- a separate, non-naming dtype gap documented in
+         * FP4_PORT_SCOPE.md, not addressed by this alias. */
+        l->attn_compressor_ape  = required_tensorf_alias(m, "blk.%u.attn_compressor_ape.weight", "blk.%u.attn_compress_ape", il);
+        l->attn_compressor_kv   = required_tensorf_alias(m, "blk.%u.attn_compressor_kv.weight", "blk.%u.attn_compress_kv.weight", il);
+        l->attn_compressor_gate = required_tensorf_alias(m, "blk.%u.attn_compressor_gate.weight", "blk.%u.attn_compress_gate.weight", il);
+        l->attn_compressor_norm = required_tensorf_alias(m, "blk.%u.attn_compressor_norm.weight", "blk.%u.attn_compress_norm.weight", il);
     }
     if (compress_ratio == 4) {
         l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
         l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
-        l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
-        l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
-        l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
-        l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+        /* Same "compressor" -> "compress" shortening plus the same
+         * dropped-suffix-on-ape pattern, one level deeper
+         * ("indexer_compressor_*" vs. this file's "indexer.compress_*",
+         * donor: LLM_TENSOR_INDEXER_COMPRESSOR_* @ llama-arch.cpp:610-613).
+         * Header-verified against blk.2.indexer.compress_{ape,gate,kv,norm}
+         * -- same BF16-vs-F16 dtype caveat as attn_compressor_{kv,gate}
+         * above applies to indexer.compress_{kv,gate} too. */
+        l->indexer_compressor_ape  = required_tensorf_alias(m, "blk.%u.indexer_compressor_ape.weight", "blk.%u.indexer.compress_ape", il);
+        l->indexer_compressor_kv   = required_tensorf_alias(m, "blk.%u.indexer_compressor_kv.weight", "blk.%u.indexer.compress_kv.weight", il);
+        l->indexer_compressor_gate = required_tensorf_alias(m, "blk.%u.indexer_compressor_gate.weight", "blk.%u.indexer.compress_gate.weight", il);
+        l->indexer_compressor_norm = required_tensorf_alias(m, "blk.%u.indexer_compressor_norm.weight", "blk.%u.indexer.compress_norm.weight", il);
     }
-    l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
-    l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
-    l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
+    l->hc_ffn_fn       = required_tensorf_alias(m, "blk.%u.hc_ffn_fn.weight", "blk.%u.hc_ffn_fn", il);
+    l->hc_ffn_scale    = required_tensorf_alias(m, "blk.%u.hc_ffn_scale.weight", "blk.%u.hc_ffn_scale", il);
+    l->hc_ffn_base     = required_tensorf_alias(m, "blk.%u.hc_ffn_base.weight", "blk.%u.hc_ffn_base", il);
     l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-    l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
+    /* Same dialect: file has "blk.%u.exp_probs_b" (no ".bias" suffix at all)
+     * and "blk.%u.ffn_gate_tid2eid" (no ".weight" suffix) -- verified
+     * against the donor (tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i) /
+     * tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i)) and the real artifact's
+     * header: blk.0.exp_probs_b {256} F32 (== DS4_N_EXPERT),
+     * blk.0.ffn_gate_tid2eid {6,129280} I32 (== DS4_N_EXPERT_USED x
+     * DS4_N_VOCAB) -- exactly what ds4 expects. */
+    l->ffn_exp_probs_b = tensor_by_namef_alias(m, "blk.%u.exp_probs_b.bias", "blk.%u.exp_probs_b", il);
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -5940,7 +6641,7 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
 
     if (il < DS4_N_HASH_LAYER) {
-        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+        l->ffn_gate_tid2eid = required_tensorf_alias(m, "blk.%u.ffn_gate_tid2eid.weight", "blk.%u.ffn_gate_tid2eid", il);
     }
 }
 
