@@ -1,0 +1,1 @@
+When rendering with a graphics API like Metal, the choice between **one large buffer** and **multiple overlapping views (or

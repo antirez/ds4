@@ -640,6 +640,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--mtp-exact-sampling")) {
+            c.engine.dspark = true;
+            c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -8412,11 +8415,12 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
-static int worker_accept_generated_token(agent_worker *w,
+static int worker_finish_generated_token(agent_worker *w,
                                          int token,
                                          int *generated,
                                          double t0,
                                          agent_stream_renderer *stream,
+                                         bool evaluate,
                                          char *err,
                                          size_t err_len) {
     ds4_tokens_push(&w->transcript, token);
@@ -8428,7 +8432,8 @@ static int worker_accept_generated_token(agent_worker *w,
     free(text);
     (*generated)++;
 
-    if (ds4_session_eval(w->session, token, err, err_len) != 0) {
+    if (evaluate &&
+        ds4_session_eval(w->session, token, err, err_len) != 0) {
         ds4_session_invalidate(w->session);
         return 1;
     }
@@ -8440,6 +8445,17 @@ static int worker_accept_generated_token(agent_worker *w,
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     return 0;
+}
+
+static int worker_accept_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         agent_stream_renderer *stream,
+                                         char *err,
+                                         size_t err_len) {
+    return worker_finish_generated_token(w, token, generated, t0, stream,
+                                         true, err, err_len);
 }
 
 static int worker_force_generated_text(agent_worker *w,
@@ -8699,54 +8715,129 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 break;
             }
 
-            size_t text_len = 0;
-            char *text = ds4_token_text(w->engine, token, &text_len);
-            if (cfg->edit_upto &&
-                agent_edit_upto_forcer_should_replace(&upto_forcer, &dsml,
-                                                       text, text_len))
-            {
-                agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
-                            token, (int)(text_len > 80 ? 80 : text_len), text);
-                free(text);
-                if (worker_force_generated_text(w, "[upto]\n", max_tokens,
-                                                &generated, t0, &stream,
-                                                err, sizeof(err)) != 0) {
+            int toks[17];
+            int ntok = 0;
+            const int block_start = ds4_session_pos(w->session);
+            if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                ntok = ds4_session_eval_speculative(
+                    w->session, token, max_tokens - generated,
+                    ds4_token_eos(w->engine),
+                    greedy_sampling ? 0.0f : cfg->gen.temperature, 0,
+                    greedy_sampling ? 1.0f : cfg->gen.top_p,
+                    greedy_sampling ? 0.0f : cfg->gen.min_p,
+                    &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+                if (ntok < 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;
                 }
             } else {
-                free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
-                                                  &stream, err, sizeof(err)) != 0) {
+                if (ds4_session_eval(w->session, token,
+                                     err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;
                 }
+                toks[0] = token;
+                ntok = 1;
+            }
+            if (ntok == 0) {
+                agent_dsml_parser_free(&dsml);
+                agent_set_error(w, "decode returned no tokens");
+                return 1;
             }
 
-            greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
-            if (greedy_sampling != status_greedy_sampling) {
-                worker_set_greedy_sampling(w, greedy_sampling);
-                status_greedy_sampling = greedy_sampling;
-            }
+            bool stop_block = false;
+            bool restart_sampling = false;
+            for (int ti = 0; ti < ntok && generated < max_tokens; ti++) {
+                token = toks[ti];
+                if (ds4_token_is_stop_for_think_mode(w->engine,
+                                                     token,
+                                                     think_mode)) {
+                    ds4_session_rewind(w->session, block_start + ti);
+                    stop_block = true;
+                    break;
+                }
 
-            if (dsml.state == AGENT_DSML_DONE) {
-                got_tool = true;
-                break;
+                size_t text_len = 0;
+                char *text = ds4_token_text(w->engine, token, &text_len);
+                if (cfg->edit_upto &&
+                    agent_edit_upto_forcer_should_replace(&upto_forcer,
+                                                           &dsml,
+                                                           text,
+                                                           text_len))
+                {
+                    agent_trace(w,
+                                "edit old auto-upto replaced token=%d text=%.*s",
+                                token,
+                                (int)(text_len > 80 ? 80 : text_len),
+                                text);
+                    free(text);
+                    ds4_session_rewind(w->session, block_start + ti);
+                    if (worker_force_generated_text(w, "[upto]\n", max_tokens,
+                                                    &generated, t0, &stream,
+                                                    err, sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    restart_sampling = true;
+                    break;
+                }
+                free(text);
+                if (worker_finish_generated_token(w, token, &generated, t0,
+                                                  &stream, false,
+                                                  err, sizeof(err)) != 0) {
+                    agent_dsml_parser_free(&dsml);
+                    agent_set_error(w, err);
+                    return 1;
+                }
+
+                const bool next_greedy =
+                    agent_stream_wants_greedy_sampling(&stream);
+                if (next_greedy != status_greedy_sampling) {
+                    worker_set_greedy_sampling(w, next_greedy);
+                    status_greedy_sampling = next_greedy;
+                }
+
+                if (dsml.state == AGENT_DSML_DONE) {
+                    got_tool = true;
+                    stop_block = true;
+                } else if (stream.tool_preflight_error) {
+                    early_tool_error = true;
+                    stop_block = true;
+                } else if (dsml.state == AGENT_DSML_ERROR ||
+                           stream.dsml_in_think) {
+                    malformed_tool = true;
+                    stop_block = true;
+                }
+                if (stop_block) {
+                    if (ti + 1 < ntok) {
+                        ds4_session_rewind(w->session,
+                                           block_start + ti + 1);
+                    }
+                    break;
+                }
+
+                if (ti + 1 < ntok && next_greedy != greedy_sampling) {
+                    /* Later tokens were proposed under the old parser mode.
+                     * Re-evaluate this boundary token to restore its logits,
+                     * then sample the suffix under the new mode. */
+                    ds4_session_rewind(w->session, block_start + ti);
+                    if (ds4_session_eval(w->session, token,
+                                         err, sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    restart_sampling = true;
+                    break;
+                }
             }
-            if (stream.tool_preflight_error) {
-                early_tool_error = true;
-                break;
-            }
-            if (dsml.state == AGENT_DSML_ERROR) {
-                malformed_tool = true;
-                break;
-            }
-            if (stream.dsml_in_think) {
-                malformed_tool = true;
-                break;
-            }
+            if (stop_block) break;
+            if (restart_sampling) continue;
         }
 
         bool interrupted = worker_should_interrupt(w);
@@ -8937,21 +9028,53 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        &rng);
         if (ds4_token_is_stop(w->engine, token)) break;
 
-        size_t text_len = 0;
-        char *text = ds4_token_text(w->engine, token, &text_len);
-        agent_trace_token(w, token, text, text_len, generated + 1);
-
-        if (ds4_session_eval(w->session, token, err, sizeof(err)) != 0) {
-            free(text);
-            agent_set_error(w, err[0] ? err : "raw decode failed");
+        int toks[17];
+        int ntok = 0;
+        const int block_start = ds4_session_pos(w->session);
+        if (ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative(
+                w->session, token, max_tokens - generated,
+                ds4_token_eos(w->engine), cfg->gen.temperature, 0,
+                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
+            if (ntok < 0) {
+                agent_set_error(w, err[0] ? err : "raw decode failed");
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+        } else {
+            if (ds4_session_eval(w->session, token, err, sizeof(err)) != 0) {
+                agent_set_error(w, err[0] ? err : "raw decode failed");
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+            toks[0] = token;
+            ntok = 1;
+        }
+        if (ntok == 0) {
+            agent_set_error(w, "raw decode returned no tokens");
             ds4_tokens_free(&prompt);
             return 1;
         }
 
-        ds4_tokens_push(&w->transcript, token);
-        agent_publish(w, text, text_len);
-        free(text);
-        generated++;
+        bool stop = false;
+        for (int ti = 0; ti < ntok && generated < max_tokens; ti++) {
+            token = toks[ti];
+            if (ds4_token_is_stop(w->engine, token)) {
+                ds4_session_rewind(w->session, block_start + ti);
+                stop = true;
+                break;
+            }
+            size_t text_len = 0;
+            char *text = ds4_token_text(w->engine, token, &text_len);
+            agent_trace_token(w, token, text, text_len, generated + 1);
+            ds4_tokens_push(&w->transcript, token);
+            agent_publish(w, text, text_len);
+            free(text);
+            generated++;
+        }
 
         double dt = now_sec() - t0;
         pthread_mutex_lock(&w->mu);
@@ -8959,6 +9082,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
         w->status.gen_tps = dt > 0.0 ? (double)generated / dt : 0.0;
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
+        if (stop) break;
     }
 
     if (worker_should_interrupt(w)) {

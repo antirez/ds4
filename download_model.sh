@@ -8,7 +8,7 @@ DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatri
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
 DS4F_Q2_Q4_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
-PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
+PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf"
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
@@ -72,8 +72,8 @@ Targets:
        6 GB. Enable it with --dspark and --mtp when running ds4 or ds4-server.
 
   pro-q2-imatrix
-       DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
-       on disk; intended for 512 GB RAM machines.
+       DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
+       430 GB on disk; intended for 512 GB RAM machines.
 
   pro-q4-layers00-30
        First half of the DeepSeek V4 PRO Q4 routed-expert quant, layers 0..30.

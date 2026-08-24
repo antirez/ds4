@@ -45,6 +45,7 @@
 #define DS4_KV_QUANTIZE_IMATRIX_DATASET   "quantize.imatrix.dataset"
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
+#define DS4_KV_COMPRESS_RATIOS             "deepseek4.attention.compress_ratios"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
 
 typedef enum {
@@ -348,6 +349,52 @@ static int64_t json_i64(const json_doc *d, int tok) {
     memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
     tmp[n] = '\0';
     return strtoll(tmp, NULL, 10);
+}
+
+typedef struct {
+    uint32_t *compress_ratios;
+    uint64_t n_compress_ratios;
+} hf_model_metadata;
+
+static hf_model_metadata load_hf_model_metadata(const char *hf_dir) {
+    hf_model_metadata m = {0};
+    char *path = path_join(hf_dir, "config.json");
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+    int ratios = json_obj_get(&d, 0, "compress_ratios");
+    if (ratios < 0 || d.v[ratios].type != JT_ARRAY) {
+        fprintf(stderr, "error: missing compress_ratios array in %s\n", path);
+        exit(1);
+    }
+
+    uint64_t count = 0;
+    for (int i = ratios + 1; i < d.len && d.v[i].parent == ratios; i = json_skip(&d, i)) count++;
+    if (count == 0 || count > 1024) {
+        fprintf(stderr, "error: invalid compress_ratios length in %s: %" PRIu64 "\n", path, count);
+        exit(1);
+    }
+    m.compress_ratios = xcalloc((size_t)count, sizeof(m.compress_ratios[0]));
+    m.n_compress_ratios = count;
+    uint64_t j = 0;
+    for (int i = ratios + 1; i < d.len && d.v[i].parent == ratios; i = json_skip(&d, i)) {
+        int64_t value = json_i64(&d, i);
+        if (value < 0 || value > INT32_MAX) {
+            fprintf(stderr, "error: invalid compress_ratios value in %s: %" PRId64 "\n", path, value);
+            exit(1);
+        }
+        m.compress_ratios[j++] = (uint32_t)value;
+    }
+
+    json_free(&d);
+    free(text);
+    free(path);
+    return m;
+}
+
+static void free_hf_model_metadata(hf_model_metadata *m) {
+    free(m->compress_ratios);
+    memset(m, 0, sizeof(*m));
 }
 
 /* =====
@@ -1539,6 +1586,7 @@ typedef struct {
     size_t kv_raw_len;
     size_t alignment;
     int n_experts;
+    uint32_t n_layers;
     size_t data_offset;
     tensor_meta *tensors;
     hmap tensor_map;
@@ -1668,7 +1716,8 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     }
 }
 
-static gguf_file load_gguf_metadata(const char *path) {
+static gguf_file load_gguf_metadata_with_override(const char *path,
+                                                  const hf_model_metadata *metadata) {
     gguf_file g = {0};
     g.path = xstrdup(path);
     FILE *fp = fopen(path, "rb");
@@ -1683,6 +1732,7 @@ static gguf_file load_gguf_metadata(const char *path) {
     g.alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
     byte_span *kv_keep = xcalloc((size_t)g.n_kv, sizeof(kv_keep[0]));
     uint64_t n_kv_keep = 0;
+    bool found_compress_ratios = false;
 
     off_t kv_start = ftello(fp);
     if (kv_start < 0) die("GGUF ftell failed");
@@ -1691,9 +1741,12 @@ static gguf_file load_gguf_metadata(const char *path) {
         if (rec_start < 0 || rec_start < kv_start) die("GGUF ftell failed");
         char *key = read_gguf_string_fp(fp);
         uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
+        if (strcmp(key, DS4_KV_COMPRESS_RATIOS) == 0) found_compress_ratios = true;
         if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
+        } else if (strcmp(key, "deepseek4.block_count") == 0 && type == GGUF_TYPE_UINT32) {
+            g.n_layers = read_u32_le_fp(fp, "GGUF layer count");
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
             if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
@@ -1712,13 +1765,20 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        const bool replace_from_config = metadata && strcmp(key, DS4_KV_COMPRESS_RATIOS) == 0;
+        if (!is_imatrix_kv_key(key) && !replace_from_config) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
             };
         }
         free(key);
+    }
+    if (metadata && !found_compress_ratios) {
+        die("template has no deepseek4.attention.compress_ratios metadata");
+    }
+    if (metadata && g.n_layers > metadata->n_compress_ratios) {
+        die("config.json compress_ratios is shorter than the template layer count");
     }
     off_t tensor_start = ftello(fp);
     if (tensor_start < 0 || tensor_start < kv_start) die("GGUF ftell failed");
@@ -1762,6 +1822,10 @@ static gguf_file load_gguf_metadata(const char *path) {
     return g;
 }
 
+static gguf_file load_gguf_metadata(const char *path) {
+    return load_gguf_metadata_with_override(path, NULL);
+}
+
 static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
     int idx = hmap_get(&g->tensor_map, name);
     if (idx < 0) {
@@ -1787,10 +1851,27 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
-static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
+static size_t extra_hf_metadata_kv_size(const hf_model_metadata *metadata) {
+    return gguf_string_size(DS4_KV_COMPRESS_RATIOS) + 4 + 4 + 8 +
+           (size_t)metadata->n_compress_ratios * 4;
+}
+
+static void write_hf_metadata_kvs(FILE *fp, const hf_model_metadata *metadata) {
+    write_gguf_string(fp, DS4_KV_COMPRESS_RATIOS);
+    write_u32(fp, GGUF_TYPE_ARRAY);
+    write_u32(fp, GGUF_TYPE_INT32);
+    write_u64(fp, metadata->n_compress_ratios);
+    for (uint64_t i = 0; i < metadata->n_compress_ratios; i++) {
+        write_u32(fp, metadata->compress_ratios[i]);
+    }
+}
+
+static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
+                                           const imatrix_store *im,
+                                           const hf_model_metadata *metadata) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im);
+    out.n_kv_extra = 1 + extra_imatrix_kv_count(im);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1818,7 +1899,8 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len +
+                    extra_hf_metadata_kv_size(metadata) + extra_imatrix_kv_size(im) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1834,7 +1916,8 @@ static void write_padding(FILE *fp, size_t n) {
 
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix,
+                            const hf_model_metadata *metadata) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -1842,6 +1925,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_tensors);
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
+    write_hf_metadata_kvs(fp, metadata);
     write_imatrix_kvs(fp, imatrix);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
@@ -2955,7 +3039,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    hf_model_metadata metadata = load_hf_model_metadata(p.hf_dir);
+    gguf_file tmpl = load_gguf_metadata_with_override(p.template_gguf, &metadata);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
@@ -2967,9 +3052,18 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
+    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, &metadata);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) return 0;
+    printf("compress_ratios: source=config.json count=%" PRIu64 "\n", metadata.n_compress_ratios);
+    if (p.dry_run) {
+        free_hf_model_metadata(&metadata);
+        imatrix_free(&imatrix);
+        free_gguf_file(&tmpl);
+        free(out_ctx.tensors);
+        for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
+        free(p.policy.overrides);
+        return 0;
+    }
 
     st_db db;
     db_open(&db, p.hf_dir);
@@ -2977,15 +3071,18 @@ int main(int argc, char **argv) {
         compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
         db_close(&db);
         imatrix_free(&imatrix);
+        free_hf_model_metadata(&metadata);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads,
+                    &imatrix, &metadata);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);
     imatrix_free(&imatrix);
+    free_hf_model_metadata(&metadata);
     free_gguf_file(&tmpl);
     free(out_ctx.tensors);
     for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);

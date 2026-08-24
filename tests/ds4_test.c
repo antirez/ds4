@@ -87,6 +87,16 @@ static void test_restore_canonical_streaming_prefill(
                      saved.batch_selected_addr);
 }
 
+static ds4_backend test_model_backend(void) {
+    const char *backend = getenv("DS4_TEST_BACKEND");
+    if (backend && !strcmp(backend, "cpu")) return DS4_BACKEND_CPU;
+#ifdef __APPLE__
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
+}
+
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
@@ -94,11 +104,7 @@ static ds4_engine *test_open_engine(bool quality) {
     const char *mtp = getenv("DS4_TEST_MTP");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
-#ifdef __APPLE__
-        .backend = DS4_BACKEND_METAL,
-#else
-        .backend = DS4_BACKEND_CUDA,
-#endif
+        .backend = test_model_backend(),
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
@@ -822,121 +828,21 @@ static void test_metal_q8_0_decode_pair_exact(void) {
 }
 
 #if defined(__APPLE__)
-static void test_metal_q8_0_output_nr4_exact_case(
-        uint32_t in_dim,
-        uint32_t out_dim,
-        uint32_t seed) {
-    const uint64_t page = (uint64_t)getpagesize();
-    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
-    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
-    const uint64_t weight_alloc =
-        test_round_up_u64(weight_bytes, page);
-    const uint64_t x_bytes = (uint64_t)in_dim * sizeof(float);
-    const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
-
-    void *weights_raw = NULL;
-    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)page,
-                               (size_t)weight_alloc) == 0);
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
-    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(out_bytes);
-    ds4_gpu_tensor *candidate = ds4_gpu_tensor_alloc(out_bytes);
-    float *x_host = malloc((size_t)x_bytes);
-    float *reference_host = malloc((size_t)out_bytes);
-    float *candidate_host = malloc((size_t)out_bytes);
-    TEST_ASSERT(weights_raw != NULL);
-    TEST_ASSERT(x != NULL);
-    TEST_ASSERT(reference != NULL);
-    TEST_ASSERT(candidate != NULL);
-    TEST_ASSERT(x_host != NULL);
-    TEST_ASSERT(reference_host != NULL);
-    TEST_ASSERT(candidate_host != NULL);
-
-    const char *force_env = "DS4_METAL_ENABLE_OUTPUT_Q8_NR4";
-    const char *disable_env = "DS4_METAL_DISABLE_M3_OUTPUT_Q8_NR4";
-    char *saved_force = test_save_env(force_env);
-    char *saved_disable = test_save_env(disable_env);
-    test_float_compare_stats stats = {0};
-
-    const bool allocated = weights_raw && x && reference && candidate &&
-        x_host && reference_host && candidate_host;
-    if (allocated) {
-        memset(weights_raw, 0, (size_t)weight_alloc);
-        test_fill_q8_0_weights(
-            (uint8_t *)weights_raw, in_dim, out_dim, seed);
-        for (uint32_t i = 0; i < in_dim; i++) {
-            const int value =
-                (int)((i * 29u + (i ^ (i >> 3u)) * 7u +
-                       seed * 17u) % 127u) - 63;
-            x_host[i] = (float)value / 72.0f;
-        }
-        for (uint32_t i = 0; i < out_dim; i++) {
-            const uint32_t poison = 0x7fc00001u + (i & 0x3ffu);
-            memcpy(reference_host + i, &poison, sizeof(poison));
-            memcpy(candidate_host + i, &poison, sizeof(poison));
-        }
-        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        reference, 0, reference_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        candidate, 0, candidate_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_set_model_map(
-                        weights_raw, weight_alloc) != 0);
-        ds4_gpu_set_quality(false);
-
-        TEST_ASSERT(unsetenv(force_env) == 0);
-        TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
-        TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(
-                        reference, weights_raw, weight_alloc, 0,
-                        in_dim, out_dim, x, 1) != 0);
-
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
-        TEST_ASSERT(unsetenv(disable_env) == 0);
-        TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(
-                        candidate, weights_raw, weight_alloc, 0,
-                        in_dim, out_dim, x, 1) != 0);
-
-        TEST_ASSERT(ds4_gpu_tensor_read(
-                        reference, 0, reference_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_read(
-                        candidate, 0, candidate_host, out_bytes) != 0);
-        stats = test_compare_float_bits(
-            reference_host, candidate_host, out_dim);
-    }
-
-    test_restore_env(force_env, saved_force);
-    test_restore_env(disable_env, saved_disable);
-    fprintf(stderr,
-            "ds4-test: output Q8 NR4 exact in=%u out=%u nsg=%u "
-            "mismatch=%zu/%u max_ulp=%u max_abs=%g\n",
-            in_dim, out_dim, out_dim > 65536u ? 8u : 4u,
-            stats.mismatch_count, out_dim, stats.max_ulp, stats.max_abs);
-    TEST_ASSERT(stats.mismatch_count == 0);
-
-    free(candidate_host);
-    free(reference_host);
-    free(x_host);
-    ds4_gpu_tensor_free(candidate);
-    ds4_gpu_tensor_free(reference);
-    ds4_gpu_tensor_free(x);
-    free(weights_raw);
-}
-
-static void test_metal_q8_0_output_nr4_exact(void) {
-    test_metal_q8_0_output_nr4_exact_case(4096, 68, 83);
-    test_metal_q8_0_output_nr4_exact_case(128, 65540, 89);
-}
-
 static void test_metal_f16_compressor_pair_state_store_exact_case(
         uint32_t width,
         uint32_t ratio,
         uint32_t pos,
         uint32_t ape_type,
-        uint32_t seed) {
+        uint32_t seed,
+        bool test_decode_pack) {
     const uint32_t in_dim = 4096u;
     const uint32_t coff = ratio == 4u ? 2u : 1u;
     const uint32_t head_dim = width / coff;
     const uint32_t state_rows = coff * ratio;
     const bool emit = ((pos + 1u) % ratio) == 0u;
+    TEST_ASSERT(!test_decode_pack ||
+                (ratio == 4u && emit &&
+                 (head_dim == 128u || head_dim == 512u)));
     const uint64_t page = (uint64_t)getpagesize();
     const uint64_t weight_bytes =
         (uint64_t)width * in_dim * sizeof(uint16_t);
@@ -1014,18 +920,24 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
         ref_state_kv_host && ref_state_score_host && fused_state_kv_host &&
         fused_state_score_host && ref_comp_host && fused_comp_host;
 
-    const char *force_env =
-        "DS4_METAL_ENABLE_COMPRESSOR_PAIR_STATE_STORE";
-    const char *disable_env =
-        "DS4_METAL_DISABLE_M3_COMPRESSOR_PAIR_STATE_STORE";
     const char *pair_disable_env =
         "DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ";
     const char *store_disable_env =
         "DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE";
-    char *saved_force = test_save_env(force_env);
-    char *saved_disable = test_save_env(disable_env);
+    const char *decode_pack_disable_env =
+        "DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_RATIO4_DECODE_PACK_FUSION";
+    const char *exact_reduction_disable_env =
+        "DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_EXACT_REDUCTION_FUSION";
+    const char *exact_reduction_poison_env =
+        "DS4_METAL_TEST_POISON_COMPRESSOR_EXACT_REDUCTION_SCRATCH";
     char *saved_pair_disable = test_save_env(pair_disable_env);
     char *saved_store_disable = test_save_env(store_disable_env);
+    char *saved_decode_pack_disable =
+        test_save_env(decode_pack_disable_env);
+    char *saved_exact_reduction_disable =
+        test_save_env(exact_reduction_disable_env);
+    char *saved_exact_reduction_poison =
+        test_save_env(exact_reduction_poison_env);
 
     test_float_compare_stats kv_stats = {0};
     test_float_compare_stats score_stats = {0};
@@ -1101,6 +1013,32 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
             ref_state_score_host[i] = (float)score_value / 72.0f;
             fused_state_score_host[i] = ref_state_score_host[i];
         }
+        if (test_decode_pack) {
+            static const uint32_t edge_bits[8] = {
+                0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+                0x3f800000u, 0xbf800000u, 0x42a00000u, 0xc2a00000u,
+            };
+            for (uint32_t col = 0; col < 4u; col++) {
+                for (uint32_t row = 0; row < 8u; row++) {
+                    const uint64_t state_col =
+                        (row >= 4u ? head_dim : 0u) + col;
+                    const uint64_t state_index =
+                        (uint64_t)row * width + state_col;
+                    const uint32_t score_bits =
+                        edge_bits[(row + col) & 7u];
+                    const uint32_t kv_bits =
+                        edge_bits[(7u - row + col) & 7u];
+                    memcpy(ref_state_score_host + state_index,
+                           &score_bits, sizeof(score_bits));
+                    memcpy(fused_state_score_host + state_index,
+                           &score_bits, sizeof(score_bits));
+                    memcpy(ref_state_kv_host + state_index,
+                           &kv_bits, sizeof(kv_bits));
+                    memcpy(fused_state_kv_host + state_index,
+                           &kv_bits, sizeof(kv_bits));
+                }
+            }
+        }
         for (uint32_t i = 0; i < head_dim; i++) {
             const uint32_t poison = 0x7fc01001u + (i & 0x3ffu);
             memcpy(ref_comp_host + i, &poison, sizeof(poison));
@@ -1134,10 +1072,13 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
         TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
         ds4_gpu_set_quality(false);
 
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
-        TEST_ASSERT(unsetenv(disable_env) == 0);
         TEST_ASSERT(unsetenv(pair_disable_env) == 0);
         TEST_ASSERT(unsetenv(store_disable_env) == 0);
+        TEST_ASSERT(setenv(exact_reduction_disable_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(exact_reduction_poison_env) == 0);
+        if (test_decode_pack) {
+            TEST_ASSERT(setenv(decode_pack_disable_env, "1", 1) == 0);
+        }
 
         TEST_ASSERT(ds4_gpu_matmul_f16_pair_tensor(
                         ref_kv, ref_score, model_raw, model_bytes,
@@ -1147,7 +1088,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         ref_comp, model_raw, model_bytes, ape_offset, ape_type,
                         norm_offset, 0, head_dim, ratio, pos, 0, 0, 0,
                         10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
-                        1.0e-6f, false) != 0);
+                        1.0e-6f, false, test_decode_pack, false) != 0);
 
         TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                         fused_kv, fused_score,
@@ -1155,6 +1096,11 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         model_raw, model_bytes, 0, score_weight_offset,
                         ape_offset, ape_type, in_dim, width, x,
                         ratio, pos) == 1);
+        if (test_decode_pack) {
+            TEST_ASSERT(unsetenv(decode_pack_disable_env) == 0);
+            TEST_ASSERT(unsetenv(exact_reduction_disable_env) == 0);
+            TEST_ASSERT(setenv(exact_reduction_poison_env, "1", 1) == 0);
+        }
         TEST_ASSERT(ds4_gpu_compressor_update_tensor(
                         fused_kv, fused_score,
                         fused_state_kv, fused_state_score,
@@ -1162,7 +1108,7 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
                         ape_offset, ape_type, norm_offset, 0,
                         head_dim, ratio, pos, 0, 0, 0,
                         10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
-                        1.0e-6f, true) != 0);
+                        1.0e-6f, true, test_decode_pack, false) != 0);
 
         TEST_ASSERT(ds4_gpu_tensor_read(
                         ref_kv, 0, ref_kv_host, out_bytes) != 0);
@@ -1201,17 +1147,23 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
             ref_comp_host, fused_comp_host, head_dim);
     }
 
-    test_restore_env(force_env, saved_force);
-    test_restore_env(disable_env, saved_disable);
     test_restore_env(pair_disable_env, saved_pair_disable);
     test_restore_env(store_disable_env, saved_store_disable);
+    test_restore_env(decode_pack_disable_env, saved_decode_pack_disable);
+    test_restore_env(exact_reduction_disable_env,
+                     saved_exact_reduction_disable);
+    test_restore_env(
+        exact_reduction_poison_env, saved_exact_reduction_poison);
 
     fprintf(stderr,
             "ds4-test: compressor pair state-store exact width=%u ratio=%u "
-            "pos=%u emit=%u ape=%s proj=%zu/%zu state=%zu/%zu "
+            "pos=%u emit=%u ape=%s decode_pack=%u exact_reduce=%u "
+            "proj=%zu/%zu state=%zu/%zu "
             "comp=%zu max_ulp=%u/%u/%u/%u/%u\n",
             width, ratio, pos, emit ? 1u : 0u,
             ape_type == 1u ? "f16" : "f32",
+            test_decode_pack ? 1u : 0u,
+            test_decode_pack ? 1u : 0u,
             kv_stats.mismatch_count, score_stats.mismatch_count,
             state_kv_stats.mismatch_count,
             state_score_stats.mismatch_count,
@@ -1252,11 +1204,13 @@ static void test_metal_f16_compressor_pair_state_store_exact_case(
 
 static void test_metal_f16_compressor_pair_state_store_exact(void) {
     test_metal_f16_compressor_pair_state_store_exact_case(
-        256, 4, 8, 0, 17);
+        256, 4, 8, 0, 17, false);
     test_metal_f16_compressor_pair_state_store_exact_case(
-        1024, 4, 11, 1, 29);
+        256, 4, 11, 1, 23, true);
     test_metal_f16_compressor_pair_state_store_exact_case(
-        512, 128, 255, 1, 43);
+        1024, 4, 11, 1, 29, true);
+    test_metal_f16_compressor_pair_state_store_exact_case(
+        512, 128, 255, 1, 43, false);
 }
 
 static void test_metal_compressor_ape_add_exact_case(
@@ -1331,15 +1285,10 @@ static void test_metal_compressor_ape_add_exact_case(
         sc_host && ref_comp_host && fused_comp_host && ref_state_kv_host &&
         ref_state_score_host && fused_state_kv_host && fused_state_score_host &&
         (!test_pack_fusion || poison_host) && model_raw;
-    const char *force_env = "DS4_METAL_ENABLE_COMPRESSOR_APE_ADD";
-    const char *disable_env = "DS4_METAL_DISABLE_M3_COMPRESSOR_APE_ADD";
-    const char *pack_force_env =
-        "DS4_METAL_ENABLE_COMPRESSOR_RATIO4_PACK_FUSION";
+    const char *disable_env = "DS4_METAL_DISABLE_COMPRESSOR_APE_ADD";
     const char *pack_disable_env =
-        "DS4_METAL_DISABLE_M3_COMPRESSOR_RATIO4_PACK_FUSION";
-    char *saved_force = test_save_env(force_env);
+        "DS4_METAL_DISABLE_COMPRESSOR_RATIO4_PACK_FUSION";
     char *saved_disable = test_save_env(disable_env);
-    char *saved_pack_force = test_save_env(pack_force_env);
     char *saved_pack_disable = test_save_env(pack_disable_env);
     test_float_compare_stats comp_stats = {0};
     test_float_compare_stats state_kv_stats = {0};
@@ -1435,11 +1384,8 @@ static void test_metal_compressor_ape_add_exact_case(
         ds4_gpu_set_quality(false);
 
         if (test_pack_fusion) {
-            TEST_ASSERT(setenv(force_env, "1", 1) == 0);
             TEST_ASSERT(unsetenv(disable_env) == 0);
-            TEST_ASSERT(unsetenv(pack_force_env) == 0);
         } else {
-            TEST_ASSERT(unsetenv(force_env) == 0);
             TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
         }
         TEST_ASSERT(setenv(pack_disable_env, "1", 1) == 0);
@@ -1484,10 +1430,8 @@ static void test_metal_compressor_ape_add_exact_case(
             TEST_ASSERT(ds4_gpu_tensor_write(
                             fused_state_score, 0, fused_state_score_host,
                             state_bytes) != 0);
-            TEST_ASSERT(setenv(pack_force_env, "1", 1) == 0);
             TEST_ASSERT(unsetenv(pack_disable_env) == 0);
         } else {
-            TEST_ASSERT(setenv(force_env, "1", 1) == 0);
             TEST_ASSERT(unsetenv(disable_env) == 0);
         }
         TEST_ASSERT(ds4_gpu_compressor_prefill_tensor(
@@ -1528,9 +1472,7 @@ static void test_metal_compressor_ape_add_exact_case(
             ref_state_score_host, fused_state_score_host, (size_t)state_count);
     }
 
-    test_restore_env(force_env, saved_force);
     test_restore_env(disable_env, saved_disable);
-    test_restore_env(pack_force_env, saved_pack_force);
     test_restore_env(pack_disable_env, saved_pack_disable);
     fprintf(stderr,
             "ds4-test: compressor %s exact head=%u ratio=%u pos=%u "
@@ -1642,15 +1584,10 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
     TEST_ASSERT(fused_state_score_host != NULL);
     TEST_ASSERT(model_raw != NULL);
 
-    const char *ape_force_env = "DS4_METAL_ENABLE_COMPRESSOR_APE_ADD";
-    const char *ape_disable_env = "DS4_METAL_DISABLE_M3_COMPRESSOR_APE_ADD";
-    const char *pack_force_env =
-        "DS4_METAL_ENABLE_COMPRESSOR_RATIO4_PACK_FUSION";
+    const char *ape_disable_env = "DS4_METAL_DISABLE_COMPRESSOR_APE_ADD";
     const char *pack_disable_env =
-        "DS4_METAL_DISABLE_M3_COMPRESSOR_RATIO4_PACK_FUSION";
-    char *saved_ape_force = test_save_env(ape_force_env);
+        "DS4_METAL_DISABLE_COMPRESSOR_RATIO4_PACK_FUSION";
     char *saved_ape_disable = test_save_env(ape_disable_env);
-    char *saved_pack_force = test_save_env(pack_force_env);
     char *saved_pack_disable = test_save_env(pack_disable_env);
     test_float_compare_stats comp_stats = {0};
     test_float_compare_stats state_kv_stats = {0};
@@ -1711,9 +1648,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
                         fused_state_score, 0, state_score_host, state_bytes) != 0);
         TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
         ds4_gpu_set_quality(false);
-        TEST_ASSERT(setenv(ape_force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(ape_disable_env) == 0);
-        TEST_ASSERT(unsetenv(pack_force_env) == 0);
         TEST_ASSERT(setenv(pack_disable_env, "1", 1) == 0);
 
         TEST_ASSERT(ds4_gpu_compressor_prefill_ratio4_replay_tensor(
@@ -1766,7 +1701,6 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
         TEST_ASSERT(ds4_gpu_tensor_write(
                         fused_state_score, 0, state_score_host,
                         state_bytes) != 0);
-        TEST_ASSERT(setenv(pack_force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(pack_disable_env) == 0);
         TEST_ASSERT(ds4_gpu_compressor_prefill_ratio4_replay_tensor(
             fused_comp, fused_state_kv, fused_state_score, kv, sc,
@@ -1807,9 +1741,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
             (size_t)state_count);
     }
 
-    test_restore_env(ape_force_env, saved_ape_force);
     test_restore_env(ape_disable_env, saved_ape_disable);
-    test_restore_env(pack_force_env, saved_pack_force);
     test_restore_env(pack_disable_env, saved_pack_disable);
     fprintf(stderr,
             "ds4-test: compressor ratio4 replay pack exact head=%u "
@@ -1923,21 +1855,13 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
     TEST_ASSERT(direct_state_score_host != NULL);
     TEST_ASSERT(model_raw != NULL);
 
-    const char *ape_force_env = "DS4_METAL_ENABLE_COMPRESSOR_APE_ADD";
-    const char *ape_disable_env = "DS4_METAL_DISABLE_M3_COMPRESSOR_APE_ADD";
-    const char *pack_force_env =
-        "DS4_METAL_ENABLE_COMPRESSOR_RATIO4_PACK_FUSION";
+    const char *ape_disable_env = "DS4_METAL_DISABLE_COMPRESSOR_APE_ADD";
     const char *pack_disable_env =
-        "DS4_METAL_DISABLE_M3_COMPRESSOR_RATIO4_PACK_FUSION";
-    const char *direct_force_env =
-        "DS4_METAL_ENABLE_COMPRESSOR_RATIO4_DIRECT_POOL";
+        "DS4_METAL_DISABLE_COMPRESSOR_RATIO4_PACK_FUSION";
     const char *direct_disable_env =
-        "DS4_METAL_DISABLE_M3_COMPRESSOR_RATIO4_DIRECT_POOL";
-    char *saved_ape_force = test_save_env(ape_force_env);
+        "DS4_METAL_DISABLE_COMPRESSOR_RATIO4_DIRECT_POOL";
     char *saved_ape_disable = test_save_env(ape_disable_env);
-    char *saved_pack_force = test_save_env(pack_force_env);
     char *saved_pack_disable = test_save_env(pack_disable_env);
-    char *saved_direct_force = test_save_env(direct_force_env);
     char *saved_direct_disable = test_save_env(direct_disable_env);
     test_float_compare_stats comp_stats = {0};
     test_float_compare_stats state_kv_stats = {0};
@@ -2041,11 +1965,8 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
         TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
         ds4_gpu_set_quality(false);
 
-        TEST_ASSERT(setenv(ape_force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(ape_disable_env) == 0);
-        TEST_ASSERT(unsetenv(direct_force_env) == 0);
         TEST_ASSERT(setenv(direct_disable_env, "1", 1) == 0);
-        TEST_ASSERT(setenv(pack_force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(pack_disable_env) == 0);
         int ref_ok;
         if (replay) {
@@ -2071,9 +1992,7 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
         TEST_ASSERT(memcmp(sc_host, source_after_host,
                            (size_t)input_bytes) == 0);
 
-        TEST_ASSERT(setenv(direct_force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(direct_disable_env) == 0);
-        TEST_ASSERT(unsetenv(pack_force_env) == 0);
         TEST_ASSERT(setenv(pack_disable_env, "1", 1) == 0);
         int direct_ok;
         if (replay) {
@@ -2125,11 +2044,8 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
             (size_t)state_count);
     }
 
-    test_restore_env(ape_force_env, saved_ape_force);
     test_restore_env(ape_disable_env, saved_ape_disable);
-    test_restore_env(pack_force_env, saved_pack_force);
     test_restore_env(pack_disable_env, saved_pack_disable);
-    test_restore_env(direct_force_env, saved_direct_force);
     test_restore_env(direct_disable_env, saved_direct_disable);
     fprintf(stderr,
             "ds4-test: compressor ratio4 direct pool exact mode=%s "
@@ -2208,18 +2124,13 @@ static void test_metal_inplace_rope_pair_exact(void) {
         { 128, 64,  64, 35,    37,  true, 0.0f },
         { 128, 64,   4, 35, UINT32_MAX - 16u, true, 1.0f },
     };
-    const char *disable_env = "DS4_METAL_DISABLE_M3_INPLACE_ROPE_PAIR";
-    const char *enable_env = "DS4_METAL_ENABLE_INPLACE_ROPE_PAIR";
+    const char *disable_env = "DS4_METAL_DISABLE_INPLACE_ROPE_PAIR";
     const char *shared_disable_env =
-        "DS4_METAL_DISABLE_M3_SHARED_ROPE_COEFF";
-    const char *affine_enable_env =
-        "DS4_METAL_ENABLE_AFFINE_ROPE_PAIR";
+        "DS4_METAL_DISABLE_SHARED_ROPE_COEFF";
     const char *affine_disable_env =
-        "DS4_METAL_DISABLE_M3_AFFINE_ROPE_PAIR";
+        "DS4_METAL_DISABLE_AFFINE_ROPE_PAIR";
     char *saved_disable = test_save_env(disable_env);
-    char *saved_enable = test_save_env(enable_env);
     char *saved_shared_disable = test_save_env(shared_disable_env);
-    char *saved_affine_enable = test_save_env(affine_enable_env);
     char *saved_affine_disable = test_save_env(affine_disable_env);
     size_t total_pair_mismatch = 0;
     size_t total_shared_mismatch = 0;
@@ -2289,9 +2200,7 @@ static void test_metal_inplace_rope_pair_exact(void) {
                 affine_candidate, 0, input, bytes) != 0);
             ds4_gpu_set_quality(false);
 
-            TEST_ASSERT(unsetenv(affine_enable_env) == 0);
             TEST_ASSERT(setenv(affine_disable_env, "1", 1) == 0);
-            TEST_ASSERT(unsetenv(enable_env) == 0);
             TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
             TEST_ASSERT(setenv(shared_disable_env, "1", 1) == 0);
             TEST_ASSERT(ds4_gpu_rope_tail_tensor(
@@ -2311,7 +2220,6 @@ static void test_metal_inplace_rope_pair_exact(void) {
                 1.0f) != 0);
 
             TEST_ASSERT(unsetenv(disable_env) == 0);
-            TEST_ASSERT(setenv(enable_env, "1", 1) == 0);
             TEST_ASSERT(ds4_gpu_rope_tail_tensor(
                 pair_candidate,
                 c->n_tok,
@@ -2345,10 +2253,8 @@ static void test_metal_inplace_rope_pair_exact(void) {
                 32.0f,
                 1.0f) != 0);
 
-            TEST_ASSERT(unsetenv(enable_env) == 0);
-            TEST_ASSERT(unsetenv(shared_disable_env) == 0);
+            TEST_ASSERT(setenv(shared_disable_env, "1", 1) == 0);
             TEST_ASSERT(unsetenv(affine_disable_env) == 0);
-            TEST_ASSERT(setenv(affine_enable_env, "1", 1) == 0);
             TEST_ASSERT(ds4_gpu_rope_tail_tensor(
                 affine_candidate,
                 c->n_tok,
@@ -2497,9 +2403,7 @@ static void test_metal_inplace_rope_pair_exact(void) {
     }
 
     test_restore_env(disable_env, saved_disable);
-    test_restore_env(enable_env, saved_enable);
     test_restore_env(shared_disable_env, saved_shared_disable);
-    test_restore_env(affine_enable_env, saved_affine_enable);
     test_restore_env(affine_disable_env, saved_affine_disable);
     fprintf(stderr,
             "ds4-test: in-place RoPE total pair=%zu/%zu shared=%zu/%zu "
@@ -2727,8 +2631,6 @@ static void test_metal_gathered_kv_stage_exact(void) {
     const uint64_t comp_base_bytes = comp_view_offset + comp_bytes + 14;
     const uint64_t dst_base_bytes = dst_view_offset + payload_bytes + 10;
     const char *envs[] = {
-        "DS4_METAL_ENABLE_GATHERED_KV_STAGE",
-        "DS4_METAL_DISABLE_M3_GATHERED_KV_STAGE",
         "DS4_METAL_REQUIRE_GATHERED_KV_STAGE",
         "DS4_METAL_DISABLE_CONTIG_F32_F16_COPY",
         "DS4_METAL_DISABLE_CONTIG_F16_F16_COPY",
@@ -2803,8 +2705,6 @@ static void test_metal_gathered_kv_stage_exact(void) {
                         raw, 0, raw_host, raw_bytes) != 0);
         TEST_ASSERT(ds4_gpu_tensor_write(
                         comp, 0, comp_host, comp_bytes) != 0);
-        ds4_gpu_set_quality(false);
-
         for (size_t ci = 0;
              ci < sizeof(raw_starts)/sizeof(raw_starts[0]);
              ci++) {
@@ -2814,17 +2714,15 @@ static void test_metal_gathered_kv_stage_exact(void) {
                             fused_base, 0, dst_init, dst_base_bytes) != 0);
 
             TEST_ASSERT(unsetenv(envs[0]) == 0);
-            TEST_ASSERT(setenv(envs[1], "1", 1) == 0);
+            TEST_ASSERT(unsetenv(envs[1]) == 0);
             TEST_ASSERT(unsetenv(envs[2]) == 0);
-            TEST_ASSERT(unsetenv(envs[3]) == 0);
-            TEST_ASSERT(unsetenv(envs[4]) == 0);
+            ds4_gpu_set_quality(true);
             TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
                             ref, raw, raw_cap, raw_starts[ci], n_raw,
                             comp, 1, n_comp, head_dim) != 0);
 
+            ds4_gpu_set_quality(false);
             TEST_ASSERT(setenv(envs[0], "1", 1) == 0);
-            TEST_ASSERT(unsetenv(envs[1]) == 0);
-            TEST_ASSERT(setenv(envs[2], "1", 1) == 0);
             TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
                             fused, raw, raw_cap, raw_starts[ci], n_raw,
                             comp, 1, n_comp, head_dim) != 0);
@@ -2849,25 +2747,19 @@ static void test_metal_gathered_kv_stage_exact(void) {
             }
         }
 
-        /* Explicit disable, either component-copy disable, and quality mode
-         * all win over force under strict selection. */
+        /* Component-copy diagnostics and quality mode prevent strict
+         * selection of the gathered kernel. */
         TEST_ASSERT(setenv(envs[0], "1", 1) == 0);
         TEST_ASSERT(setenv(envs[1], "1", 1) == 0);
-        TEST_ASSERT(setenv(envs[2], "1", 1) == 0);
         TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
                         fused, raw, raw_cap, 5, n_raw,
                         comp, 1, n_comp, head_dim) == 0);
         TEST_ASSERT(unsetenv(envs[1]) == 0);
-        TEST_ASSERT(setenv(envs[3], "1", 1) == 0);
+        TEST_ASSERT(setenv(envs[2], "1", 1) == 0);
         TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
                         fused, raw, raw_cap, 5, n_raw,
                         comp, 1, n_comp, head_dim) == 0);
-        TEST_ASSERT(unsetenv(envs[3]) == 0);
-        TEST_ASSERT(setenv(envs[4], "1", 1) == 0);
-        TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
-                        fused, raw, raw_cap, 5, n_raw,
-                        comp, 1, n_comp, head_dim) == 0);
-        TEST_ASSERT(unsetenv(envs[4]) == 0);
+        TEST_ASSERT(unsetenv(envs[2]) == 0);
         ds4_gpu_set_quality(true);
         TEST_ASSERT(ds4_gpu_flash_kv_stage_f16_tensor(
                         fused, raw, raw_cap, 5, n_raw,
@@ -3112,15 +3004,12 @@ static void test_metal_persistent_zero_attention_mask_exact_case(
         comp_host && q_host && mask_host && legacy_host && persistent_host &&
         masked_host && pad_legacy_host && after_mask_host &&
         model_raw;
-    const char *force_env =
-        "DS4_METAL_ENABLE_PERSISTENT_ZERO_ATTN_MASK";
     const char *disable_env =
-        "DS4_METAL_DISABLE_M3_PERSISTENT_ZERO_ATTN_MASK";
+        "DS4_METAL_DISABLE_PERSISTENT_ZERO_ATTN_MASK";
     const char *pad_disable_env =
-        "DS4_METAL_DISABLE_M3_GATHERED_KV_PAD_FUSION";
+        "DS4_METAL_DISABLE_GATHERED_KV_PAD_FUSION";
     const char *shared_pad_disable_env =
-        "DS4_METAL_DISABLE_M3_SHARED_KV_PAD";
-    char *saved_force = test_save_env(force_env);
+        "DS4_METAL_DISABLE_SHARED_KV_PAD";
     char *saved_disable = test_save_env(disable_env);
     char *saved_pad_disable = test_save_env(pad_disable_env);
     char *saved_shared_pad_disable = test_save_env(shared_pad_disable_env);
@@ -3161,14 +3050,12 @@ static void test_metal_persistent_zero_attention_mask_exact_case(
         TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
         ds4_gpu_set_quality(false);
 
-        unsetenv(force_env);
         TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
         TEST_ASSERT(ds4_gpu_attention_decode_heads_tensor(
             legacy, model_raw, page, 0, q, raw,
             n_raw, raw_cap, raw_start, comp, 1, n_comp,
             NULL, 0, n_head, head_dim) != 0);
 
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
         unsetenv(disable_env);
         unsetenv(pad_disable_env);
         unsetenv(shared_pad_disable_env);
@@ -3216,7 +3103,6 @@ static void test_metal_persistent_zero_attention_mask_exact_case(
             legacy_host, after_mask_host, (size_t)n_head * head_dim);
     }
 
-    test_restore_env(force_env, saved_force);
     test_restore_env(disable_env, saved_disable);
     test_restore_env(pad_disable_env, saved_pad_disable);
     test_restore_env(shared_pad_disable_env, saved_shared_pad_disable);
@@ -3417,11 +3303,8 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact_kind(
     TEST_ASSERT(masked_actual != NULL);
     TEST_ASSERT(model_raw != NULL);
 
-    const char *force_env =
-        "DS4_METAL_ENABLE_ZERO_PREFIX_PREFILL_MASK_CACHE";
     const char *disable_env =
-        "DS4_METAL_DISABLE_M3_ZERO_PREFIX_PREFILL_MASK_CACHE";
-    char *saved_force = test_save_env(force_env);
+        "DS4_METAL_DISABLE_ZERO_PREFIX_PREFILL_MASK_CACHE";
     char *saved_disable = test_save_env(disable_env);
     size_t total_mismatches = 0;
     uint32_t max_ulp = 0;
@@ -3476,7 +3359,6 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact_kind(
         TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
         ds4_gpu_set_quality(false);
 
-        TEST_ASSERT(unsetenv(force_env) == 0);
         TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
         const bool have_ref_a =
             test_metal_zero_prefix_prefill_mask_cache_run(
@@ -3494,7 +3376,6 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact_kind(
             TEST_ASSERT(key_difference != 0);
         }
 
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(disable_env) == 0);
 
         if (test_metal_zero_prefix_prefill_mask_cache_run(
@@ -3543,7 +3424,6 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact_kind(
         }
     }
 
-    test_restore_env(force_env, saved_force);
     test_restore_env(disable_env, saved_disable);
     const char *kind_name = kind == TEST_METAL_PREFILL_MASK_CACHE_RAW ? "raw" :
         (kind == TEST_METAL_PREFILL_MASK_CACHE_RATIO4 ? "ratio4" : "ratio128");
@@ -3785,11 +3665,7 @@ static void test_metal_output_hc_weights4_exact(void) {
     const uint64_t base_offset = page;
     const uint64_t model_alloc = 2u * page;
     const uint64_t bytes = n_hc * sizeof(float);
-    const char *force_env = "DS4_METAL_ENABLE_OUTPUT_HC_WEIGHTS4";
-    const char *disable_env = "DS4_METAL_DISABLE_M3_OUTPUT_HC_WEIGHTS4";
     const char *require_env = "DS4_METAL_REQUIRE_OUTPUT_HC_WEIGHTS4";
-    char *saved_force = test_save_env(force_env);
-    char *saved_disable = test_save_env(disable_env);
     char *saved_require = test_save_env(require_env);
 
     void *model_raw = NULL;
@@ -3863,17 +3739,15 @@ static void test_metal_output_hc_weights4_exact(void) {
             TEST_ASSERT(ds4_gpu_tensor_write(
                             candidate, 0, candidate_host, bytes) != 0);
             TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_alloc) != 0);
-            ds4_gpu_set_quality(false);
-
-            TEST_ASSERT(unsetenv(force_env) == 0);
-            TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
             TEST_ASSERT(unsetenv(require_env) == 0);
+            ds4_gpu_test_set_flags(0);
+            ds4_gpu_set_quality(true);
             TEST_ASSERT(ds4_gpu_output_hc_weights_tensor(
                             reference, pre, model_raw, model_alloc,
                             scale_offset, base_offset, n_hc, eps) != 0);
 
-            TEST_ASSERT(setenv(force_env, "1", 1) == 0);
-            TEST_ASSERT(unsetenv(disable_env) == 0);
+            ds4_gpu_set_quality(false);
+            ds4_gpu_test_set_flags(DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4);
             TEST_ASSERT(setenv(require_env, "1", 1) == 0);
             TEST_ASSERT(ds4_gpu_output_hc_weights_tensor(
                             candidate, pre, model_raw, model_alloc,
@@ -3895,24 +3769,16 @@ static void test_metal_output_hc_weights4_exact(void) {
             if (stats.max_ulp > max_ulp) max_ulp = stats.max_ulp;
         }
 
-        /* Explicit disable and quality mode win over force under strict
-         * selection, proving these calls cannot silently use the fast path. */
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
-        TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+        /* Quality mode prevents strict selection of the fast path. */
         TEST_ASSERT(setenv(require_env, "1", 1) == 0);
-        TEST_ASSERT(ds4_gpu_output_hc_weights_tensor(
-                        candidate, pre, model_raw, model_alloc,
-                        scale_offset, base_offset, n_hc, eps) == 0);
-        TEST_ASSERT(unsetenv(disable_env) == 0);
         ds4_gpu_set_quality(true);
         TEST_ASSERT(ds4_gpu_output_hc_weights_tensor(
                         candidate, pre, model_raw, model_alloc,
                         scale_offset, base_offset, n_hc, eps) == 0);
         ds4_gpu_set_quality(false);
+        ds4_gpu_test_set_flags(0);
     }
 
-    test_restore_env(force_env, saved_force);
-    test_restore_env(disable_env, saved_disable);
     test_restore_env(require_env, saved_require);
     fprintf(stderr,
             "ds4-test: output HC weights4 total mismatch=%zu/16 max_ulp=%u\n",
@@ -3924,205 +3790,6 @@ static void test_metal_output_hc_weights4_exact(void) {
     ds4_gpu_tensor_free(reference);
     ds4_gpu_tensor_free(pre);
     free(model_raw);
-}
-
-static void test_metal_output_hc_sum_norm_exact_case(
-        uint32_t n_embd,
-        uint32_t seed) {
-    const uint32_t n_hc = 4;
-    const float norm_eps = 1.0e-6f;
-    const uint64_t page = (uint64_t)getpagesize();
-    const uint64_t out_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_bytes = (uint64_t)n_hc * out_bytes;
-    const uint64_t weight_bytes = (uint64_t)n_hc * sizeof(float);
-    const uint64_t norm_weight_offset = page;
-    const uint64_t model_alloc = test_round_up_u64(
-        norm_weight_offset + out_bytes, page);
-
-    void *model_raw = NULL;
-    TEST_ASSERT(posix_memalign(
-                    &model_raw, (size_t)page, (size_t)model_alloc) == 0);
-    ds4_gpu_tensor *residual = ds4_gpu_tensor_alloc(residual_bytes);
-    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(weight_bytes);
-    ds4_gpu_tensor *ref_out = ds4_gpu_tensor_alloc(out_bytes);
-    ds4_gpu_tensor *fused_out = ds4_gpu_tensor_alloc(out_bytes);
-    ds4_gpu_tensor *ref_norm = ds4_gpu_tensor_alloc(out_bytes);
-    ds4_gpu_tensor *fused_norm = ds4_gpu_tensor_alloc(out_bytes);
-    float *residual_host = malloc((size_t)residual_bytes);
-    float *ref_out_host = malloc((size_t)out_bytes);
-    float *fused_out_host = malloc((size_t)out_bytes);
-    float *ref_norm_host = malloc((size_t)out_bytes);
-    float *fused_norm_host = malloc((size_t)out_bytes);
-
-    TEST_ASSERT(model_raw != NULL);
-    TEST_ASSERT(residual != NULL);
-    TEST_ASSERT(weights != NULL);
-    TEST_ASSERT(ref_out != NULL);
-    TEST_ASSERT(fused_out != NULL);
-    TEST_ASSERT(ref_norm != NULL);
-    TEST_ASSERT(fused_norm != NULL);
-    TEST_ASSERT(residual_host != NULL);
-    TEST_ASSERT(ref_out_host != NULL);
-    TEST_ASSERT(fused_out_host != NULL);
-    TEST_ASSERT(ref_norm_host != NULL);
-    TEST_ASSERT(fused_norm_host != NULL);
-
-    const bool allocated = model_raw && residual && weights && ref_out &&
-        fused_out && ref_norm && fused_norm && residual_host && ref_out_host &&
-        fused_out_host && ref_norm_host && fused_norm_host;
-    test_float_compare_stats out_stats = {0};
-    test_float_compare_stats norm_stats = {0};
-    if (allocated) {
-        float *norm_weight = (float *)(
-            (uint8_t *)model_raw + norm_weight_offset);
-        for (uint32_t i = 0; i < n_embd; i++) {
-            norm_weight[i] =
-                0.5f + (float)((i * 29u + seed * 17u) % 67u) / 64.0f;
-        }
-
-        for (uint32_t h = 0; h < n_hc; h++) {
-            for (uint32_t d = 0; d < n_embd; d++) {
-                const uint32_t key = d * 73u + h * 1009u + seed * 131u +
-                    ((d >> 5u) ^ (h * 37u));
-                const int value = (int)(key % 4093u) - 2046;
-                float v = (float)value / 1024.0f;
-                if ((key % 521u) == 0u) {
-                    const uint32_t bits = (key & 1u) ? 0x80000000u : 0u;
-                    memcpy(&v, &bits, sizeof(bits));
-                } else if ((key % 523u) == 0u) {
-                    const uint32_t bits = (key & 1u) ? 0x80000001u : 1u;
-                    memcpy(&v, &bits, sizeof(bits));
-                }
-                residual_host[(uint64_t)h * n_embd + d] = v;
-            }
-        }
-        const float weight_host[4] = {
-            0.12500012f, 0.37500024f, 0.62500036f, 0.87500048f,
-        };
-        memset(ref_out_host, 0xa5, (size_t)out_bytes);
-        memset(fused_out_host, 0xa5, (size_t)out_bytes);
-        memset(ref_norm_host, 0xa5, (size_t)out_bytes);
-        memset(fused_norm_host, 0xa5, (size_t)out_bytes);
-
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        residual, 0, residual_host, residual_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        weights, 0, weight_host, weight_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        ref_out, 0, ref_out_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        fused_out, 0, fused_out_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        ref_norm, 0, ref_norm_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_write(
-                        fused_norm, 0, fused_norm_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_alloc) != 0);
-        ds4_gpu_set_quality(false);
-
-        TEST_ASSERT(setenv(
-            "DS4_METAL_DISABLE_M3_OUTPUT_HC_SUM_NORM_FUSION", "1", 1) == 0);
-        TEST_ASSERT(unsetenv(
-            "DS4_METAL_ENABLE_OUTPUT_HC_SUM_NORM_FUSION") == 0);
-        TEST_ASSERT(unsetenv(
-            "DS4_METAL_REQUIRE_OUTPUT_HC_SUM_NORM_FUSION") == 0);
-        TEST_ASSERT(ds4_gpu_hc_weighted_sum_tensor(
-                        ref_out, residual, weights, n_embd, n_hc) != 0);
-        TEST_ASSERT(ds4_gpu_rms_norm_weight_tensor(
-                        ref_norm, ref_out, model_raw, model_alloc,
-                        norm_weight_offset,
-                        n_embd, norm_eps) != 0);
-
-        TEST_ASSERT(setenv(
-            "DS4_METAL_ENABLE_OUTPUT_HC_SUM_NORM_FUSION", "1", 1) == 0);
-        TEST_ASSERT(unsetenv(
-            "DS4_METAL_DISABLE_M3_OUTPUT_HC_SUM_NORM_FUSION") == 0);
-        TEST_ASSERT(setenv(
-            "DS4_METAL_REQUIRE_OUTPUT_HC_SUM_NORM_FUSION", "1", 1) == 0);
-        TEST_ASSERT(ds4_gpu_hc_weighted_sum_norm_tensor(
-                        fused_out, fused_norm, residual, weights,
-                        model_raw, model_alloc, norm_weight_offset,
-                        n_embd, n_hc, norm_eps) != 0);
-
-        /* Force never overrides the explicit disable, quality mode, or the
-         * production-shape restriction. These calls must not dispatch. */
-        TEST_ASSERT(unsetenv(
-            "DS4_METAL_REQUIRE_OUTPUT_HC_SUM_NORM_FUSION") == 0);
-        TEST_ASSERT(setenv(
-            "DS4_METAL_DISABLE_M3_OUTPUT_HC_SUM_NORM_FUSION", "1", 1) == 0);
-        TEST_ASSERT(ds4_gpu_hc_weighted_sum_norm_tensor(
-                        fused_out, fused_norm, residual, weights,
-                        model_raw, model_alloc, norm_weight_offset,
-                        n_embd, n_hc, norm_eps) == 0);
-        TEST_ASSERT(unsetenv(
-            "DS4_METAL_DISABLE_M3_OUTPUT_HC_SUM_NORM_FUSION") == 0);
-        ds4_gpu_set_quality(true);
-        TEST_ASSERT(ds4_gpu_hc_weighted_sum_norm_tensor(
-                        fused_out, fused_norm, residual, weights,
-                        model_raw, model_alloc, norm_weight_offset,
-                        n_embd, n_hc, norm_eps) == 0);
-        ds4_gpu_set_quality(false);
-        TEST_ASSERT(ds4_gpu_hc_weighted_sum_norm_tensor(
-                        fused_out, fused_norm, residual, weights,
-                        model_raw, model_alloc, norm_weight_offset,
-                        2048, n_hc, norm_eps) == 0);
-
-        TEST_ASSERT(ds4_gpu_tensor_read(
-                        ref_out, 0, ref_out_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_read(
-                        fused_out, 0, fused_out_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_read(
-                        ref_norm, 0, ref_norm_host, out_bytes) != 0);
-        TEST_ASSERT(ds4_gpu_tensor_read(
-                        fused_norm, 0, fused_norm_host, out_bytes) != 0);
-        out_stats = test_compare_float_bits(
-            ref_out_host, fused_out_host, n_embd);
-        norm_stats = test_compare_float_bits(
-            ref_norm_host, fused_norm_host, n_embd);
-    }
-
-    fprintf(stderr,
-            "ds4-test: output HC sum+RMSNorm exact K=%u "
-            "collapse=%zu/%u max_ulp=%u max_abs=%g "
-            "norm=%zu/%u max_ulp=%u max_abs=%g\n",
-            n_embd,
-            out_stats.mismatch_count, n_embd,
-            out_stats.max_ulp, out_stats.max_abs,
-            norm_stats.mismatch_count, n_embd,
-            norm_stats.max_ulp, norm_stats.max_abs);
-    TEST_ASSERT(out_stats.mismatch_count == 0);
-    TEST_ASSERT(norm_stats.mismatch_count == 0);
-
-    free(fused_norm_host);
-    free(ref_norm_host);
-    free(fused_out_host);
-    free(ref_out_host);
-    free(residual_host);
-    ds4_gpu_tensor_free(fused_norm);
-    ds4_gpu_tensor_free(ref_norm);
-    ds4_gpu_tensor_free(fused_out);
-    ds4_gpu_tensor_free(ref_out);
-    ds4_gpu_tensor_free(weights);
-    ds4_gpu_tensor_free(residual);
-    free(model_raw);
-}
-
-static void test_metal_output_hc_sum_norm_exact(void) {
-    const char *force_env =
-        "DS4_METAL_ENABLE_OUTPUT_HC_SUM_NORM_FUSION";
-    const char *disable_env =
-        "DS4_METAL_DISABLE_M3_OUTPUT_HC_SUM_NORM_FUSION";
-    const char *require_env =
-        "DS4_METAL_REQUIRE_OUTPUT_HC_SUM_NORM_FUSION";
-    char *saved_force = test_save_env(force_env);
-    char *saved_disable = test_save_env(disable_env);
-    char *saved_require = test_save_env(require_env);
-
-    test_metal_output_hc_sum_norm_exact_case(4096, 83);
-    test_metal_output_hc_sum_norm_exact_case(7168, 89);
-
-    test_restore_env(force_env, saved_force);
-    test_restore_env(disable_env, saved_disable);
-    test_restore_env(require_env, saved_require);
 }
 
 static void test_metal_hc_rms_scale_project_f16_exact_shape(
@@ -4339,17 +4006,15 @@ static void test_metal_hc_rms_scale_project_f16_exact_shape(
 }
 
 static void test_metal_hc_rms_scale_project_f16_exact(void) {
-    const char *force_env = "DS4_METAL_ENABLE_HC_RMS_SCALE_PROJ";
-    const char *disable_env = "DS4_METAL_DISABLE_M3_HC_RMS_SCALE_PROJ";
-    char *saved_force = test_save_env(force_env);
+    const char *disable_env = "DS4_METAL_DISABLE_HC_RMS_SCALE_PROJ";
     char *saved_disable = test_save_env(disable_env);
 
-    TEST_ASSERT(setenv(force_env, "1", 1) == 0);
     TEST_ASSERT(unsetenv(disable_env) == 0);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_HC_RMS_SCALE_PROJ);
     test_metal_hc_rms_scale_project_f16_exact_shape(16384u, 59u);
     test_metal_hc_rms_scale_project_f16_exact_shape(28672u, 61u);
+    ds4_gpu_test_set_flags(0);
 
-    test_restore_env(force_env, saved_force);
     test_restore_env(disable_env, saved_disable);
 }
 
@@ -4369,18 +4034,17 @@ static void test_metal_router_simd_finalize_exact(void) {
     };
     const uint32_t n_expert = 256;
     const uint32_t n_used = 6;
-    const uint32_t repeats = 2;
+    const uint32_t modes = 4;
     const uint64_t probs_bytes = (uint64_t)n_expert * sizeof(float);
     const uint64_t selected_bytes = (uint64_t)n_used * sizeof(int32_t);
     const uint64_t weights_bytes = (uint64_t)n_used * sizeof(float);
     const uint64_t page = (uint64_t)getpagesize();
-    const char *force_env = "DS4_METAL_ENABLE_ROUTER_SIMD_FINALIZE";
     const char *disable_env =
-        "DS4_METAL_DISABLE_M3_ROUTER_SIMD_FINALIZE";
-    const char *weights_force_env =
-        "DS4_METAL_ENABLE_ROUTER_SIMD_WEIGHTS_FUSION";
+        "DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_FINALIZE";
     const char *weights_disable_env =
-        "DS4_METAL_DISABLE_M3_ROUTER_SIMD_WEIGHTS_FUSION";
+        "DS4_METAL_DISABLE_PRE_M5_ROUTER_SIMD_WEIGHTS_FUSION";
+    const char *transform_finalize_disable_env =
+        "DS4_METAL_DISABLE_PRE_M5_ROUTER_TRANSFORM_FINALIZE_FUSION";
     const char *select_disable_env =
         "DS4_METAL_DISABLE_ROUTER_SELECT_FUSION";
 
@@ -4413,10 +4077,10 @@ static void test_metal_router_simd_finalize_exact(void) {
     TEST_ASSERT(ref_probs_host != NULL);
     TEST_ASSERT(simd_probs_host != NULL);
 
-    char *saved_force = test_save_env(force_env);
     char *saved_disable = test_save_env(disable_env);
-    char *saved_weights_force = test_save_env(weights_force_env);
     char *saved_weights_disable = test_save_env(weights_disable_env);
+    char *saved_transform_finalize_disable =
+        test_save_env(transform_finalize_disable_env);
     char *saved_select_disable = test_save_env(select_disable_env);
     size_t total_selected_mismatch = 0;
     size_t total_weights_mismatch = 0;
@@ -4432,8 +4096,7 @@ static void test_metal_router_simd_finalize_exact(void) {
         }
         TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
         ds4_gpu_set_quality(false);
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
-        TEST_ASSERT(setenv(weights_force_env, "1", 1) == 0);
+        TEST_ASSERT(setenv(transform_finalize_disable_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(select_disable_env) == 0);
 
         for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
@@ -4511,13 +4174,28 @@ static void test_metal_router_simd_finalize_exact(void) {
             }
 
             TEST_ASSERT(unsetenv(disable_env) == 0);
-            for (uint32_t rep = 0; rep <= repeats; rep++) {
-                const bool fused_weights = rep != 0;
+            for (uint32_t mode = 0; mode < modes; mode++) {
+                const bool fused_weights = mode != 0;
+                const bool fused_transform = mode >= 2;
                 if (fused_weights) {
                     TEST_ASSERT(unsetenv(weights_disable_env) == 0);
                 } else {
                     TEST_ASSERT(setenv(weights_disable_env, "1", 1) == 0);
                 }
+                if (fused_transform) {
+                    TEST_ASSERT(unsetenv(transform_finalize_disable_env) == 0);
+                } else {
+                    TEST_ASSERT(setenv(
+                        transform_finalize_disable_env, "1", 1) == 0);
+                }
+                for (uint32_t i = 0; i < n_expert; i++) {
+                    const uint32_t poison_bits = 0x7fc00001u + i;
+                    memcpy(&simd_probs_host[i],
+                           &poison_bits,
+                           sizeof(poison_bits));
+                }
+                TEST_ASSERT(ds4_gpu_tensor_write(
+                    simd_probs, 0, simd_probs_host, probs_bytes) != 0);
                 TEST_ASSERT(ds4_gpu_router_select_tensor(
                     simd_selected, simd_weights, simd_probs,
                     model_raw, page, 0, 0, 1, 0,
@@ -4549,8 +4227,9 @@ static void test_metal_router_simd_finalize_exact(void) {
                         "case=%s mode=%s rep=%u selected=%zu/%u weights=%zu/%u "
                         "probs=%zu/%u max_weight_ulp=%u max_prob_ulp=%u\n",
                         c->name,
+                        fused_transform ? "fused-transform" :
                         fused_weights ? "fused-weights" : "split-weights",
-                        fused_weights ? rep - 1u : 0u,
+                        fused_transform ? mode - 2u : 0u,
                         selected_mismatch,
                         n_used,
                         weights_stats.mismatch_count,
@@ -4569,20 +4248,20 @@ static void test_metal_router_simd_finalize_exact(void) {
         }
     }
 
-    test_restore_env(force_env, saved_force);
     test_restore_env(disable_env, saved_disable);
-    test_restore_env(weights_force_env, saved_weights_force);
     test_restore_env(weights_disable_env, saved_weights_disable);
+    test_restore_env(transform_finalize_disable_env,
+                     saved_transform_finalize_disable);
     test_restore_env(select_disable_env, saved_select_disable);
     fprintf(stderr,
             "ds4-test: router SIMD finalize total selected=%zu/%zu "
             "weights=%zu/%zu probs=%zu/%zu\n",
             total_selected_mismatch,
-            (sizeof(cases) / sizeof(cases[0])) * (repeats + 1u) * (size_t)n_used,
+            (sizeof(cases) / sizeof(cases[0])) * modes * (size_t)n_used,
             total_weights_mismatch,
-            (sizeof(cases) / sizeof(cases[0])) * (repeats + 1u) * (size_t)n_used,
+            (sizeof(cases) / sizeof(cases[0])) * modes * (size_t)n_used,
             total_probs_mismatch,
-            (sizeof(cases) / sizeof(cases[0])) * (repeats + 1u) * (size_t)n_expert);
+            (sizeof(cases) / sizeof(cases[0])) * modes * (size_t)n_expert);
     TEST_ASSERT(total_selected_mismatch == 0);
     TEST_ASSERT(total_weights_mismatch == 0);
     TEST_ASSERT(total_probs_mismatch == 0);
@@ -4630,10 +4309,8 @@ static void test_metal_router_weights_batch_exact(void) {
     const uint64_t page = (uint64_t)getpagesize();
     const uint64_t bias_offset = 0;
     const uint64_t hash_offset = 2048;
-    const char *force_env =
-        "DS4_METAL_ENABLE_ROUTER_WEIGHTS_BATCH_FUSION";
     const char *disable_env =
-        "DS4_METAL_DISABLE_M3_ROUTER_WEIGHTS_BATCH_FUSION";
+        "DS4_METAL_DISABLE_ROUTER_WEIGHTS_BATCH_FUSION";
     const char *select_disable_env =
         "DS4_METAL_DISABLE_ROUTER_SELECT_FUSION";
 
@@ -4673,7 +4350,6 @@ static void test_metal_router_weights_batch_exact(void) {
     TEST_ASSERT(ref_probs_host != NULL);
     TEST_ASSERT(batch_probs_host != NULL);
 
-    char *saved_force = test_save_env(force_env);
     char *saved_disable = test_save_env(disable_env);
     char *saved_select_disable = test_save_env(select_disable_env);
     size_t total_selected_mismatch = 0;
@@ -4708,7 +4384,6 @@ static void test_metal_router_weights_batch_exact(void) {
         ds4_gpu_set_quality(false);
         TEST_ASSERT(ds4_gpu_tensor_write(
             tokens, 0, tokens_host, tokens_bytes) != 0);
-        TEST_ASSERT(setenv(force_env, "1", 1) == 0);
         TEST_ASSERT(unsetenv(select_disable_env) == 0);
 
         for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
@@ -4835,7 +4510,6 @@ static void test_metal_router_weights_batch_exact(void) {
         }
     }
 
-    test_restore_env(force_env, saved_force);
     test_restore_env(disable_env, saved_disable);
     test_restore_env(select_disable_env, saved_select_disable);
     fprintf(stderr,
@@ -4877,7 +4551,6 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
-    test_metal_q8_0_output_nr4_exact();
     test_metal_f16_compressor_pair_state_store_exact();
     test_metal_compressor_ape_add_exact();
     test_metal_compressor_ratio4_pack_exact();
@@ -4891,7 +4564,6 @@ static void test_metal_kernel_group(void) {
     test_metal_zero_prefix_prefill_mask_cache_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
     test_metal_output_hc_weights4_exact();
-    test_metal_output_hc_sum_norm_exact();
     test_metal_hc_rms_scale_project_f16_exact();
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
@@ -6200,24 +5872,63 @@ static void test_streaming_decode_prefill_correctness(void) {
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
 
+#define TEST_LIST_FILES_USER_PROMPT \
+    "Use the list_files tool to list the current directory exactly once, " \
+    "then report the listed files and stop."
+
+#define TEST_LIST_FILES_TOOL_JSON \
+    "{\"type\":\"function\",\"function\":{" \
+        "\"name\":\"list_files\"," \
+        "\"description\":\"List files in a directory.\"," \
+        "\"parameters\":{\"type\":\"object\",\"properties\":{" \
+            "\"path\":{\"type\":\"string\",\"description\":\"Directory path to list.\"}" \
+        "},\"required\":[\"path\"]}" \
+    "}}"
+
+#define TEST_LIST_FILES_RESULT "[\"README.md\",\"Makefile\",\"ds4.c\",\"metal\"]"
+
 static const char *test_tool_call_request_json(void) {
     return
         "{"
         "\"model\":\"deepseek-v4-flash\","
-        "\"messages\":[{\"role\":\"user\",\"content\":\"List the files in the current directory. Use the provided tool; do not answer in prose.\"}],"
-        "\"tools\":[{\"type\":\"function\",\"function\":{"
-            "\"name\":\"list_files\","
-            "\"description\":\"List files in a directory.\","
-            "\"parameters\":{\"type\":\"object\",\"properties\":{"
-                "\"path\":{\"type\":\"string\",\"description\":\"Directory path to list.\"}"
-            "},\"required\":[\"path\"]}"
-        "}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\""
+            TEST_LIST_FILES_USER_PROMPT
+        "\"}],"
+        "\"tools\":[" TEST_LIST_FILES_TOOL_JSON "],"
         "\"tool_choice\":\"auto\","
         "\"think\":false,"
         "\"temperature\":0,"
         "\"max_tokens\":256,"
         "\"stream\":false"
         "}";
+}
+
+static char *test_tool_result_request_json(const char *assistant_content,
+                                           const tool_call *call) {
+    if (!call || !call->id || !call->id[0]) return NULL;
+
+    buf b = {0};
+    buf_puts(&b,
+        "{\"model\":\"deepseek-v4-flash\",\"messages\":["
+        "{\"role\":\"user\",\"content\":");
+    json_escape(&b, TEST_LIST_FILES_USER_PROMPT);
+    buf_puts(&b, "},{\"role\":\"assistant\",\"content\":");
+    json_escape(&b, assistant_content ? assistant_content : "");
+    buf_puts(&b, ",\"tool_calls\":[{\"id\":");
+    json_escape(&b, call->id);
+    buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
+    json_escape(&b, call->name ? call->name : "");
+    buf_puts(&b, ",\"arguments\":");
+    json_escape(&b, call->arguments ? call->arguments : "{}");
+    buf_puts(&b, "}}]},{\"role\":\"tool\",\"tool_call_id\":");
+    json_escape(&b, call->id);
+    buf_puts(&b, ",\"content\":");
+    json_escape(&b, TEST_LIST_FILES_RESULT);
+    buf_puts(&b,
+        "}],\"tools\":[" TEST_LIST_FILES_TOOL_JSON "],"
+        "\"tool_choice\":\"auto\",\"think\":false,"
+        "\"temperature\":0,\"max_tokens\":256,\"stream\":false}");
+    return buf_take(&b);
 }
 
 /* A complete tool call inside unclosed reasoning is recovered directly. The
@@ -6264,59 +5975,188 @@ static void test_think_tool_recovery(void) {
     buf_free(&text);
 }
 
-static void test_tool_call_quality_one(bool quality) {
-    ds4_engine *engine = test_get_engine(quality);
-    if (!engine) return;
+typedef struct {
+    char *raw;
+    char *content;
+    char *reasoning;
+    tool_calls calls;
+    const char *finish;
+} test_chat_turn;
 
-    request r;
-    char err[160];
-    TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
-                                   512, 32768, &r, err, sizeof(err)));
+static void test_chat_turn_free(test_chat_turn *turn) {
+    if (!turn) return;
+    free(turn->raw);
+    free(turn->content);
+    free(turn->reasoning);
+    tool_calls_free(&turn->calls);
+    memset(turn, 0, sizeof(*turn));
+}
 
-    ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
-    if (!session) {
-        request_free(&r);
-        return;
+/* Run the same greedy stop/tool-marker/response parse path needed by the server,
+ * while keeping one session alive so the next request genuinely continues from
+ * this sampled turn. */
+static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
+                                    const request *r, test_chat_turn *turn) {
+    memset(turn, 0, sizeof(*turn));
+    char err[160] = {0};
+    if (ds4_session_sync(session, &r->prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-test: tool-call sync failed: %s\n", err);
+        turn->finish = "error";
+        return false;
     }
-    TEST_ASSERT(ds4_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
 
     buf text = {0};
     uint64_t rng = 123;
-    bool decode_ok = true;
+    const char *finish = "length";
     bool saw_tool_start = false;
     bool saw_tool_end = false;
-    for (int i = 0; i < r.max_tokens; i++) {
-        int token = ds4_session_sample(session, r.temperature, r.top_k,
-                                       r.top_p, r.min_p, &rng);
+    bool decode_ok = true;
+
+    for (int i = 0; i < r->max_tokens; i++) {
+        int token = ds4_session_sample(session, r->temperature, r->top_k,
+                                       r->top_p, r->min_p, &rng);
+        if (ds4_token_is_stop_for_think_mode(engine, token, r->think_mode)) {
+            finish = "stop";
+            break;
+        }
+        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            finish = "error";
+            decode_ok = false;
+            break;
+        }
+
         size_t piece_len = 0;
         char *piece = ds4_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
-        observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
-        if (saw_tool_end) break;
-        if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-            decode_ok = false;
-            break;
+        if (r->has_tools) {
+            observe_tool_markers(text.ptr ? text.ptr : "",
+                                 &saw_tool_start, &saw_tool_end, NULL);
+            if (saw_tool_end) {
+                finish = "tool_calls";
+                break;
+            }
         }
     }
 
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    bool parsed = parse_generated_message_ex(text.ptr ? text.ptr : "",
-                                             false, &content, &reasoning, &calls);
-    TEST_ASSERT(decode_ok);
-    TEST_ASSERT(parsed);
-    TEST_ASSERT(calls.len > 0);
-    TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
+    turn->raw = buf_take(&text);
+    turn->finish = finish;
+    if (!decode_ok) {
+        fprintf(stderr, "ds4-test: tool-call decode failed: %s\n", err);
+        return false;
+    }
 
-    free(content);
-    free(reasoning);
-    tool_calls_free(&calls);
-    buf_free(&text);
+    bool recovered = false;
+    bool parsed = parse_generated_message_for_response_for_syntax(
+        r->model_syntax,
+        turn->raw ? turn->raw : "",
+        r->has_tools,
+        saw_tool_start,
+        ds4_think_mode_enabled(r->think_mode),
+        &turn->finish,
+        err,
+        sizeof(err),
+        &turn->content,
+        &turn->reasoning,
+        &turn->calls,
+        &recovered);
+    if (turn->calls.len > 0) turn->finish = "tool_calls";
+    if (!parsed) {
+        fprintf(stderr,
+                "ds4-test: generated message parse failed: %s recovered=%d raw=%s\n",
+                err, recovered ? 1 : 0, turn->raw ? turn->raw : "");
+    }
+    return parsed;
+}
+
+static void test_tool_call_quality_one(bool quality) {
+    ds4_engine *engine = test_get_engine(quality);
+    if (!engine) return;
+
+    server s = {0};
+    s.engine = engine;
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    request first_request = {0};
+    request second_request = {0};
+    ds4_session *session = NULL;
+    test_chat_turn first = {0};
+    test_chat_turn second = {0};
+    char *second_body = NULL;
+    char err[160] = {0};
+
+    bool request_ok = parse_chat_request(engine, &s,
+                                         test_tool_call_request_json(),
+                                         512, 32768, &first_request,
+                                         err, sizeof(err));
+    TEST_ASSERT(request_ok);
+    if (!request_ok) goto done;
+
+    bool session_ok = ds4_session_create(&session, engine, 32768) == 0;
+    TEST_ASSERT(session_ok);
+    if (!session_ok) goto done;
+
+    bool first_ok = test_generate_chat_turn(engine, session,
+                                            &first_request, &first);
+    TEST_ASSERT(first_ok);
+    TEST_ASSERT(first.finish && !strcmp(first.finish, "tool_calls"));
+    TEST_ASSERT(first.calls.len == 1);
+    TEST_ASSERT(first.calls.len == 1 && first.calls.v[0].name &&
+                !strcmp(first.calls.v[0].name, "list_files"));
+    TEST_ASSERT(first.calls.raw_tool_text && first.calls.raw_tool_text[0]);
+    if (!first_ok || first.calls.len != 1 ||
+        !first.calls.v[0].name ||
+        strcmp(first.calls.v[0].name, "list_files") ||
+        !first.calls.raw_tool_text || !first.calls.raw_tool_text[0]) {
+        goto done;
+    }
+
+    /* Use the real response-side id assignment and exact sampled-DSML memory.
+     * The same id is serialized on both the assistant call and tool result. */
+    assign_tool_call_ids(&s, &first.calls, API_OPENAI);
+    TEST_ASSERT(first.calls.v[0].id && first.calls.v[0].id[0]);
+    if (!first.calls.v[0].id || !first.calls.v[0].id[0]) goto done;
+    tool_memory_remember(&s, &first.calls);
+
+    second_body = test_tool_result_request_json(first.content,
+                                                &first.calls.v[0]);
+    TEST_ASSERT(second_body != NULL);
+    if (!second_body) goto done;
+
+    err[0] = '\0';
+    request_ok = parse_chat_request(engine, &s, second_body,
+                                    512, 32768, &second_request,
+                                    err, sizeof(err));
+    TEST_ASSERT(request_ok);
+    if (!request_ok) goto done;
+    TEST_ASSERT(second_request.tool_replay.mem == 1);
+    TEST_ASSERT(second_request.tool_replay.disk == 0);
+    TEST_ASSERT(second_request.tool_replay.canonical == 0);
+    TEST_ASSERT(second_request.tool_replay.missing_ids == 0);
+
+    bool second_ok = test_generate_chat_turn(engine, session,
+                                             &second_request, &second);
+    TEST_ASSERT(second_ok);
+    TEST_ASSERT(second.finish && !strcmp(second.finish, "stop"));
+    TEST_ASSERT(second.calls.len == 0);
+    TEST_ASSERT(second.content && second.content[0]);
+
+    fprintf(stderr,
+            "ds4-test: post-tool-result turn1 finish_reason=%s tool_calls=%d "
+            "turn2 finish_reason=%s tool_calls=%d replay_mem=%d\n",
+            first.finish ? first.finish : "-", first.calls.len,
+            second.finish ? second.finish : "-", second.calls.len,
+            second_request.tool_replay.mem);
+
+done:
+    free(second_body);
+    test_chat_turn_free(&second);
+    test_chat_turn_free(&first);
     ds4_session_free(session);
-    request_free(&r);
+    request_free(&second_request);
+    request_free(&first_request);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_tool_call_quality(void) {
@@ -6582,7 +6422,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
-    {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
+    {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
@@ -6615,6 +6455,7 @@ static void test_print_help(const char *prog) {
     puts("      Show this help.");
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
+    puts("  DS4_TEST_BACKEND=cpu       Run model tests on CPU instead of Metal/CUDA.");
     puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through Metal SSD streaming.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");

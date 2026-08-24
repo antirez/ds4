@@ -1,0 +1,1 @@
+A checksum catches accidental corruption because it acts as a compact, deterministic fingerprint of the original data, computed by an algorithm

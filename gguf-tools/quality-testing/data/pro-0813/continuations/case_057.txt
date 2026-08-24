@@ -1,0 +1,1 @@
+La differenza tra le righe **KV raw** e le righe **KV compresse** riguarda principalmente il

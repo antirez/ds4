@@ -597,17 +597,15 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(session,
-                                                       token,
-                                                       max_tokens - generated,
-                                                       ds4_token_eos(engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = ds4_session_eval_speculative(
+                session, token, max_tokens - generated,
+                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1505,17 +1503,15 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(chat->session,
-                                                       token,
-                                                       max_tokens - generated,
-                                                       ds4_token_eos(engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = ds4_session_eval_speculative(
+                chat->session, token, max_tokens - generated,
+                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1858,6 +1854,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--mtp-exact-sampling")) {
+            c.engine.dspark = true;
+            c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

@@ -7,7 +7,8 @@ safe to commit and use in release QA.
   top-logprob slices.
 - `flash`: 100 DeepSeek V4 Flash 0731 continuations from the official DeepSeek
   API, with API top-logprob slices.
-- `pro`: 100 DeepSeek V4 PRO official continuations with API top-logprob
+- `pro`: 100 DeepSeek V4 PRO preview continuations with API top-logprob slices.
+- `pro-0813`: 100 DeepSeek V4 PRO 0813 continuations with API top-logprob
   slices.
 
 Each fixture directory contains:

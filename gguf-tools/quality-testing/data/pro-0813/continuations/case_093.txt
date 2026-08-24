@@ -1,0 +1,1 @@
+A page cache makes a second file read faster because it keeps the file's data in memory (RAM) after the first

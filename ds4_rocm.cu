@@ -87,6 +87,20 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+typedef struct {
+    uint8_t e;
+    uint8_t qs[16];
+} cuda_block_mxfp4;
+
+static_assert(sizeof(cuda_block_mxfp4) == 17, "cuda_block_mxfp4 must match the GGUF MXFP4 block layout");
+
+/* Twice the MXFP4 values so each 32-value sub-block can use signed-int8
+ * dp4a; the factor of 1/2 is folded into the sub-block scale. */
+__device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
+     0,  1,  2,  3,  4,  6,  8,  12,
+     0, -1, -2, -3, -4, -6, -8, -12,
+};
+
 #include "ds4_iq2_tables_cuda.inc"
 
 #include "rocm/ds4_rocm_runtime.cuh"

@@ -113,6 +113,16 @@ make strix-halo -j"$(nproc)"
 
 `make rocm` is an alias for `make strix-halo`.
 
+After changes to the ROCm MXFP4 or routed-MoE kernels, run the standalone
+CPU-oracle regression:
+
+```sh
+make test-mxfp4-rocm
+```
+
+This test does not require a full model GGUF. It covers resident decode and
+batched routed-MoE execution at 1, 3, 32, 128, and 512 tokens.
+
 ## 5. Use the right GGUF
 
 Use the standard IQ2XXS/Q2K/Q8 imatrix GGUF:
