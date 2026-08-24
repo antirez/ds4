@@ -5822,8 +5822,177 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+static pthread_once_t g_mapped_host_flags_once = PTHREAD_ONCE_INIT;
+
+static void cuda_mapped_host_enable_once(void) {
+    /* hipDeviceMapHost is currently always enabled/ignored by the AMD
+     * runtime.  Keep the explicit request for CUDA-compatibility semantics,
+     * but never make ordinary ROCm initialization depend on it: device
+     * discovery may already have activated the primary context. */
+    hipError_t err = hipSetDeviceFlags(hipDeviceMapHost);
+    if (err != hipSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "mapped-host device flag was not applied (continuing): %s\n",
+                hipGetErrorString(err));
+        (void)hipGetLastError();
+    }
+}
+
+static void cuda_mapped_host_enable_best_effort(void) {
+    (void)pthread_once(&g_mapped_host_flags_once,
+                       cuda_mapped_host_enable_once);
+}
+
+extern "C" int ds4_gpu_host_mapping_supported(void) {
+    int device = 0;
+    hipDeviceProp_t prop;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipGetDeviceProperties(&prop, device) != hipSuccess) {
+        (void)hipGetLastError();
+        return 0;
+    }
+    return prop.canMapHostMemory != 0;
+}
+
+extern "C" int ds4_gpu_host_mapped_synchronize(const char *label) {
+    return cuda_ok(hipDeviceSynchronize(),
+                   label && label[0]
+                       ? label
+                       : "mapped host ownership synchronization");
+}
+
+extern "C" int ds4_gpu_host_register_mapped(void *host_ptr,
+                                              uint64_t bytes,
+                                              void **device_ptr) {
+    if (device_ptr) *device_ptr = NULL;
+    if (!host_ptr || !device_ptr || bytes == 0 ||
+        (uint64_t)(size_t)bytes != bytes) {
+        return 0;
+    }
+
+    cuda_mapped_host_enable_best_effort();
+    if (!ds4_gpu_host_mapping_supported()) return 0;
+
+    hipError_t err = hipHostRegister(host_ptr,
+                                     (size_t)bytes,
+                                     hipHostRegisterMapped);
+    if (err != hipSuccess) {
+        return cuda_ok(err, "mapped host registration");
+    }
+
+    void *mapped = NULL;
+    err = hipHostGetDevicePointer(&mapped, host_ptr, 0);
+    if (err != hipSuccess || !mapped) {
+        if (err != hipSuccess) {
+            (void)cuda_ok(err, "mapped host device-pointer lookup");
+        } else {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "mapped host device-pointer lookup returned NULL\n");
+        }
+        (void)hipHostUnregister(host_ptr);
+        return 0;
+    }
+
+    *device_ptr = mapped;
+    return 1;
+}
+
+extern "C" int ds4_gpu_host_unregister_mapped(void *host_ptr) {
+    if (!host_ptr) return 0;
+    const int sync_ok = ds4_gpu_host_mapped_synchronize(
+        "mapped host unregister synchronization");
+    if (!sync_ok) return 0;
+    return cuda_ok(hipHostUnregister(host_ptr),
+                   "mapped host unregister");
+}
+
+extern "C" int ds4_gpu_pool_alloc_export(uint64_t bytes, void **ptr_out,
+                                         int *fd_out) {
+    if (ptr_out) *ptr_out = NULL;
+    if (fd_out) *fd_out = -1;
+    if (!ptr_out || !fd_out || bytes == 0 || (uint64_t)(size_t)bytes != bytes)
+        return 0;
+
+    void *ptr = NULL;
+    if (!cuda_ok(hipMalloc(&ptr, (size_t)bytes), "imported pool allocation"))
+        return 0;
+
+    /* Small hipMallocs are suballocated from shared slab BOs; the exported
+     * DMA-BUF would then name the whole slab and the driver could not map
+     * this pool exclusively. Require a proven-dedicated allocation. */
+    hipDeviceptr_t base = NULL;
+    size_t range = 0;
+    hipError_t err = hipMemGetAddressRange(&base, &range, (hipDeviceptr_t)ptr);
+    if (err != hipSuccess || base != (hipDeviceptr_t)ptr || range != (size_t)bytes) {
+        if (err != hipSuccess)
+            (void)cuda_ok(err, "imported pool address range");
+        else
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "imported pool is not a dedicated allocation "
+                    "(base=%p self=%p range=%zu bytes=%llu)\n",
+                    (void *)base, ptr, range, (unsigned long long)bytes);
+        (void)hipFree(ptr);
+        return 0;
+    }
+
+    int fd = -1;
+    err = hipMemGetHandleForAddressRange(&fd, (hipDeviceptr_t)ptr,
+                                         (size_t)bytes,
+                                         hipMemRangeHandleTypeDmaBufFd, 0);
+    if (err != hipSuccess || fd < 0) {
+        if (err != hipSuccess)
+            (void)cuda_ok(err, "imported pool DMA-BUF export");
+        else
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "imported pool DMA-BUF export returned an invalid fd\n");
+        (void)hipFree(ptr);
+        return 0;
+    }
+    *ptr_out = ptr;
+    *fd_out = fd;
+    return 1;
+}
+
+extern "C" int ds4_gpu_pool_free_exported(void *ptr) {
+    if (!ptr) return 1;
+    const int sync_ok = ds4_gpu_host_mapped_synchronize(
+        "imported pool free synchronization");
+    if (!sync_ok) return 0;
+    return cuda_ok(hipFree(ptr), "imported pool free");
+}
+
+extern "C" int ds4_gpu_memcpy_to_device_sync(void *dst, const void *src,
+                                             uint64_t bytes,
+                                             const char *label) {
+    if (!dst || (!src && bytes != 0) || (uint64_t)(size_t)bytes != bytes)
+        return 0;
+    if (bytes == 0) return 1;
+    return cuda_ok(hipMemcpy(dst, src, (size_t)bytes, hipMemcpyHostToDevice),
+                   label && label[0] ? label : "imported pool host-to-device stage");
+}
+
+extern "C" int ds4_gpu_tensor_read_any(const ds4_gpu_tensor *tensor,
+                                       uint64_t offset, void *data,
+                                       uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes ||
+        bytes > tensor->bytes - offset)
+        return 0;
+    return cuda_ok(hipMemcpy(data, (const char *)tensor->ptr + offset,
+                             (size_t)bytes, hipMemcpyDefault),
+                   "tensor read (any destination)");
+}
+#endif
+
 
 extern "C" int ds4_gpu_init(void) {
+#ifdef __HIP_PLATFORM_AMD__
+    cuda_mapped_host_enable_best_effort();
+#endif
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;

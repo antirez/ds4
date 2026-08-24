@@ -77,6 +77,13 @@ typedef struct {
     bool set;
 } ds4_distributed_layers;
 
+typedef enum {
+    DS4_DIST_TRANSPORT_DEFAULT = 0,
+    DS4_DIST_TRANSPORT_AUTO,
+    DS4_DIST_TRANSPORT_TCP,
+    DS4_DIST_TRANSPORT_NHI,
+} ds4_distributed_transport;
+
 typedef struct {
     ds4_distributed_role role;
     ds4_distributed_layers layers;
@@ -87,6 +94,8 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
+    ds4_distributed_transport transport;
+    const char *nhi_device;
     bool replay_check;
     bool debug;
 } ds4_distributed_options;

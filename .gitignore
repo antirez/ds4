@@ -53,3 +53,5 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+tests/test_transport
+tests/test_dist_v3
