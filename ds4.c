@@ -20127,7 +20127,48 @@ static int qwen_mtp_top2_on(void) {
     }
     return cached;
 }
-static int qwen_mtp_choose_k(int offered, double *ema, double margin) {
+/* Exploration state for the adaptive-depth policy.
+ *
+ * Without it the policy is absorbing: once qwen_mtp_choose_k returns 0 every
+ * round has drafted == 0, qwen_mtp_update_ema matches none of its branches,
+ * the EMA freezes at whatever value stopped the drafting, and drafting can
+ * never resume however predictable the text becomes. A zero-draft round
+ * genuinely carries no evidence, so the only honest way out is to spend a
+ * draft occasionally and re-observe.
+ *
+ * The interval backs off because the two regimes have opposite economics,
+ * both measured on M5 Max. On a recoverable prompt (523-token copy-style,
+ * h forced to 0.90 so it latches at round 0) probing at a fixed 16/8/4
+ * rounds gave 37.0/45.8/48.6 t/s against 28.5 latched -- shorter is better,
+ * because recovery time is what is being bought. On a genuinely hard prompt
+ * every probe fails, and a failed probe at 10 k context costs ~4 plain
+ * decode steps (it rewinds the KV prefix, which re-converts the F16
+ * shadow), so a fixed short interval would be ruinous. Doubling on failure
+ * turns O(rounds/interval) wasted probes into O(log rounds) while keeping
+ * the eager interval whenever drafting is actually working.
+ *
+ * DS4_QWEN_MTP_PROBE=0 disables probing entirely and restores the absorbing
+ * behaviour bit-for-bit; N sets the eager (minimum) interval. */
+#define QWEN_MTP_PROBE_MAX 256
+typedef struct {
+    int quiet;    /* consecutive rounds that produced no draft evidence */
+    int interval; /* rounds to wait before the next probe; grows per probe */
+    int probing;  /* this round's draft was a probe, not a priced decision */
+} qwen_mtp_probe;
+
+static int qwen_mtp_probe_min(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("DS4_QWEN_MTP_PROBE");
+        int v = (s && s[0]) ? atoi(s) : 4;
+        if (v < 0) v = 0;
+        if (v > QWEN_MTP_PROBE_MAX) v = QWEN_MTP_PROBE_MAX;
+        cached = v;
+    }
+    return cached;
+}
+static int qwen_mtp_choose_k(int offered, double *ema, double margin,
+                             qwen_mtp_probe *pr) {
     const double h = qwen_mtp_price_h();
     /* Cap mirrors segmentedVerifyDepthCap (7), not the raw offer.
      * DS4_QWEN_MTP_TOP2=1 clamps depths 0 and 1 by the previous verify's
@@ -20157,10 +20198,31 @@ static int qwen_mtp_choose_k(int offered, double *ema, double margin) {
         expected += reach;
         depth++;
     }
+    /* Exploration probe: the rule says "do not draft", and the last
+     * pr->interval rounds produced no evidence either way, so spend one
+     * draft to re-observe. Flag it: a probe is speculative expenditure, not
+     * a priced decision, so its outcome must always widen the interval even
+     * when the draft is accepted. Accepted != profitable -- at 10 k context
+     * probes land ~0.3/round and still lose 26% overall, so treating a
+     * successful probe as "drafting works" would keep it probing forever.
+     * Only a round the cost model itself chose to draft resets the
+     * interval. */
+    if (pr) pr->probing = 0;
+    if (depth == 0 && offered > 0 && pr) {
+        const int lo = qwen_mtp_probe_min();
+        if (lo > 0) {
+            if (pr->interval < lo) pr->interval = lo;
+            if (pr->quiet >= pr->interval) {
+                pr->quiet = 0;
+                pr->probing = 1;
+                return 1;
+            }
+        }
+    }
     return depth;
 }
 static void qwen_mtp_update_ema(double *ema, int accepted, int drafted,
-                                int last_draft_is_stop) {
+                                int last_draft_is_stop, qwen_mtp_probe *pr) {
     const double alpha = 0.15;
     /* mlx.fast recordAcceptOutcome stoppedEarly: the round ended on a
      * generation-stop draft token, so position [accepted] carries no
@@ -20173,6 +20235,30 @@ static void qwen_mtp_update_ema(double *ema, int accepted, int drafted,
         ema[accepted] += alpha*(0.0 - ema[accepted]);
     } else if (!stopped_early && accepted==drafted && drafted>0 && drafted<8) {
         if (ema[drafted] < 0.95) ema[drafted] += alpha*(0.95 - ema[drafted]);
+    }
+    /* A round that drafted nothing observes nothing -- none of the branches
+     * above fire, which is exactly the absorbing state the probe exists to
+     * escape, so count it toward the next probe.
+     *
+     * Otherwise the round drafted. If the cost model chose that draft, it
+     * priced it as profitable, so return to the eager interval. If it was a
+     * probe, widen the interval regardless of the outcome: the EMA has been
+     * refreshed either way, and if drafting really is worthwhile the cost
+     * model will start choosing it on its own and reset the interval then. */
+    if (pr) {
+        const int lo = qwen_mtp_probe_min();
+        if (drafted == 0) {
+            pr->quiet++;
+        } else if (pr->probing) {
+            pr->quiet = 0;
+            int next = (pr->interval > 0 ? pr->interval : (lo > 0 ? lo : 1)) * 2;
+            if (next > QWEN_MTP_PROBE_MAX) next = QWEN_MTP_PROBE_MAX;
+            pr->interval = next;
+        } else {
+            pr->quiet = 0;
+            pr->interval = lo;
+        }
+        pr->probing = 0;
     }
 }
 
@@ -42420,6 +42506,7 @@ static int qwen_generate_hybrid(
     int token = sample_argmax(logits, DS4_N_VOCAB);
     double ema[8];
     for (int i = 0; i < 8; i++) ema[i] = 0.85 * pow(0.98, (double)i);
+    qwen_mtp_probe mtp_probe = { 0, 0, 0 };
     uint64_t n_drafted = 0, n_accepted = 0;
     double t_draft = 0.0, t_verify = 0.0, t_repair = 0.0, t_round = 0.0;
     uint64_t n_rounds = 0;
@@ -42450,7 +42537,9 @@ static int qwen_generate_hybrid(
         if (offered < 0) offered = 0;
         int K = 0;
         if (use_mtp && hidden && offered > 0) {
-            K = (fixed_k >= 0) ? fixed_k : qwen_mtp_choose_k(offered, ema, pending_margin);
+            K = (fixed_k >= 0) ? fixed_k
+                               : qwen_mtp_choose_k(offered, ema, pending_margin,
+                                                   &mtp_probe);
             if (K > offered) K = offered;
             if (K < 0) K = 0;
         }
@@ -42538,7 +42627,7 @@ static int qwen_generate_hybrid(
             else qwen_forward_token_cpu(v_logits, model, weights, token, (uint32_t)pos);
 #endif
             pos++;
-            if (use_mtp) qwen_mtp_update_ema(ema, 0, drafted, 0);
+            if (use_mtp) qwen_mtp_update_ema(ema, 0, drafted, 0, &mtp_probe);
             token = sample_argmax(v_logits, DS4_N_VOCAB);
             if (hidden) memcpy(hidden, v_hidden, (size_t)DS4_N_EMBD * sizeof(float));
             memcpy(logits, v_logits, (size_t)DS4_N_VOCAB * sizeof(float));
@@ -42551,7 +42640,8 @@ static int qwen_generate_hybrid(
         n_accepted += (uint64_t)accepted;
         if (use_mtp) qwen_mtp_update_ema(ema, accepted, drafted,
                                          accepted > 0 && accepted <= drafted &&
-                                         vocab_token_is_generation_stop(vocab, drafts[accepted-1]));
+                                         vocab_token_is_generation_stop(vocab, drafts[accepted-1]),
+                                         &mtp_probe);
 
         int done_now = 0;
         for (int d = 0; d < accepted; d++) {
@@ -44983,6 +45073,7 @@ static int generate_raw_swa_cpu(
                 }
                 double ema[8];
                 for (int i=0;i<8;i++) ema[i]=0.85*pow(0.98,(double)i);
+                qwen_mtp_probe mtp_probe = { 0, 0, 0 };
                 int pos = prompt->len;
                 int n_generated = 0;
                 // allow env override for deterministic tests
@@ -44997,7 +45088,7 @@ static int generate_raw_swa_cpu(
                     if (offered > remaining-1) offered = remaining-1;
                     if (offered > ctx_size - pos -1) offered = ctx_size - pos -1;
                     if (offered < 0) offered = 0;
-                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema, -1.0);
+                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema, -1.0, &mtp_probe);
                     if (K > offered) K = offered;
                     if (K < 0) K = 0;
                     int drafts[8] = {0};
@@ -45039,7 +45130,7 @@ static int generate_raw_swa_cpu(
                         memcpy(logits, tmp_logits_v, (size_t)DS4_N_VOCAB*sizeof(float));
                         if (vocab_token_is_generation_stop(vocab, primary)) break;
                         if (n_generated >= n_predict || pos >= ctx_size) break;
-                        qwen_mtp_update_ema(ema, 0, 0, 0);
+                        qwen_mtp_update_ema(ema, 0, 0, 0, &mtp_probe);
                         continue;
                     }
                     bool need_bonus = true;
@@ -45105,7 +45196,8 @@ static int generate_raw_swa_cpu(
                     (void)need_bonus;
                     qwen_mtp_update_ema(ema, accepted, drafted,
                                         accepted > 0 && accepted <= drafted &&
-                                        vocab_token_is_generation_stop(vocab, drafts[accepted-1]));
+                                        vocab_token_is_generation_stop(vocab, drafts[accepted-1]),
+                                        &mtp_probe);
                     // stop if last emitted was stop
                     if (accepted>0 && vocab_token_is_generation_stop(vocab, drafts[accepted-1])) break;
                 }
@@ -54823,6 +54915,7 @@ static int generate_metal_graph_raw_swa(
                 }
                 double ema[8];
                 for (int i=0;i<8;i++) ema[i]=0.85*pow(0.98,(double)i);
+                qwen_mtp_probe mtp_probe = { 0, 0, 0 };
                 int pos = prompt->len;
                 int n_generated = 0;
                 const char *env_fixed_k = getenv("DS4_QWEN_MTP_K");
@@ -54839,7 +54932,7 @@ static int generate_metal_graph_raw_swa(
                     if (offered > remaining-1) offered = remaining-1;
                     if (offered > ctx_size - pos -1) offered = ctx_size - pos -1;
                     if (offered < 0) offered = 0;
-                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema, -1.0);
+                    int K = (fixed_k >=0) ? fixed_k : qwen_mtp_choose_k(offered, ema, -1.0, &mtp_probe);
                     if (K > offered) K = offered;
                     if (K < 0) K = 0;
                     int drafts[8]={0};
@@ -54887,7 +54980,7 @@ static int generate_metal_graph_raw_swa(
                         memcpy(logits, tmp_logits_v, (size_t)DS4_N_VOCAB*sizeof(float));
                         if (vocab_token_is_generation_stop(vocab, primary)) break;
                         if (n_generated >= n_predict || pos >= ctx_size) break;
-                        qwen_mtp_update_ema(ema, 0, 0, 0);
+                        qwen_mtp_update_ema(ema, 0, 0, 0, &mtp_probe);
                         continue;
                     }
                     bool need_bonus=true;
@@ -54942,7 +55035,8 @@ static int generate_metal_graph_raw_swa(
                     (void)need_bonus;
                     qwen_mtp_update_ema(ema, accepted, drafted,
                                         accepted > 0 && accepted <= drafted &&
-                                        vocab_token_is_generation_stop(vocab, drafts[accepted-1]));
+                                        vocab_token_is_generation_stop(vocab, drafts[accepted-1]),
+                                        &mtp_probe);
                     if (accepted>0 && vocab_token_is_generation_stop(vocab, drafts[accepted-1])) break;
                 }
             qwen_metal_done:

@@ -162,17 +162,14 @@ would be strictly worse. `DS4_QWEN_MTP_H` still overrides per machine.
 
 ## Open items, in expected-payoff order
 
-1. **The adaptive policy latches off and cannot recover.** This is the biggest
-   remaining defect and it is why the h table above has a cliff between 0.35 and
-   0.18 rather than a smooth optimum. When `qwen_mtp_choose_k` returns 0,
-   `qwen_mtp_update_ema` is called with `drafted == 0`, which matches none of its
-   update branches — so the EMA freezes at whatever value stopped the drafting
-   and the policy never drafts again. Reproduce: `DS4_QWEN_MTP_AUTO=1
-   DS4_QWEN_MTP_H=0.35` at 2554 accepts 13 tokens in a whole 256-token run
-   (0.07/round) versus 113 (0.63/round) at h=0.18. The fix is an exploration
-   probe — force depth 1 every N consecutive zero rounds so the EMA keeps
-   observing — after which h should be re-fitted, since 0.18 is currently
-   partly chosen for latch-avoidance rather than for price.
+1. ~~**The adaptive policy latches off and cannot recover.**~~ **Fixed** — see
+   the exploration-probe section below. The latch was real: `qwen_mtp_choose_k`
+   returning 0 means `qwen_mtp_update_ema` sees `drafted == 0`, matches none of
+   its branches, and the EMA freezes forever. It now probes. What is *not*
+   fixed is the h fit itself: with the latch gone, h=0.18 is still the best
+   tested value, so the cliff in the h table below was the latch, and the
+   underlying price is genuinely ~0.3 at depth 1. Re-fitting h beyond the four
+   tested values is still open.
 2. **2554 is the only length still short of MLX** (25.5 vs 29.7). 523 and 10295
    are at or past the bar. Worth a `DS4_QWEN_PROFILE_ALWAYS=1` pass: decode is
    one command buffer per token, so the per-buffer aggregate localises it
@@ -191,6 +188,63 @@ would be strictly worse. `DS4_QWEN_MTP_H` still overrides per machine.
    identical text) and negative at 2554 (24.59 vs 26.61), so it stays opt-in
    until item 1 is fixed; the clamp only matters when the policy is actually
    free to choose depth.
+
+## Exploration probe — the EMA latch fix
+
+The adaptive policy was an absorbing Markov chain. Once `qwen_mtp_choose_k`
+returned 0, every subsequent round had `drafted == 0`; `qwen_mtp_update_ema`
+matches none of its branches in that case, so the EMA froze at whatever value
+stopped the drafting and no amount of newly-predictable text could restart it.
+
+A zero-draft round genuinely carries no evidence, so the only honest escape is
+to spend a draft occasionally and re-observe. `qwen_mtp_choose_k` now returns
+depth 1 after `interval` consecutive evidence-free rounds, and both it and
+`qwen_mtp_update_ema` carry a `qwen_mtp_probe { quiet, interval, probing }`.
+
+**The interval backs off, and a probe backs off even when it is accepted.**
+That second part is the non-obvious one. Resetting to the eager interval on any
+accepted draft looks right and is wrong: at 10 k context probes land ~0.3
+tokens/round and speculation is *still* a net loss there, so "accepted" kept
+re-arming the probe and cost 26 %. Accepted is not profitable. Only a round the
+cost model itself priced and chose resets the interval; a probe always widens
+it (doubling, capped at `QWEN_MTP_PROBE_MAX` 256). If drafting really is
+worthwhile the EMA rises, the cost model starts choosing depth on its own, and
+that resets the interval.
+
+`DS4_QWEN_MTP_PROBE=0` restores the absorbing behaviour bit-for-bit; N sets the
+eager interval (default 4).
+
+### Measured, M5 Max, 2 reps
+
+Inert at the shipped default h=0.18 — bit-identical output *and* identical
+accept counts on all three fixtures, so the shipped configuration is provably
+unaffected:
+
+| leg | decode | accepted | sha |
+|---|---|---|---|
+| h=0.18 @523 | 50.88 | 210 (1.59/rnd) | `59a3312301db` = golden |
+| h=0.18 @2554 | 22.94 | 113 (0.63/rnd) | `7bcf7cd460ab` = pre-fix |
+| h=0.18 @10295 | 19.84 | 58 (0.63/rnd) | `4589b20f7f04` = pre-fix |
+
+It only acts where the policy was actually stuck:
+
+| leg | `PROBE=0` (latched) | probe on | effect |
+|---|---|---|---|
+| h=0.90 @523 (recoverable) | 23.5, acc **0** | **36.0**, acc 114 (0.88/rnd) | **+52 %**, output still golden |
+| h=0.35 @2554 (marginal) | 24.7, acc 13 | 23.3, acc 71 (0.40/rnd) | −6 %, 5.5× the acceptance |
+| h=0.90 @10295 (unprofitable) | 24.5, acc 0 | 21.4, acc 3 (0.04/rnd) | −12.5 %, bounded by backoff |
+
+The 10295 row is the honest cost: where speculation cannot pay, the probe still
+samples occasionally. Backoff is what keeps it at −12.5 % rather than the −26 %
+the accept-resets-eagerly version cost. Anyone running long context with a
+hand-raised h should set `DS4_QWEN_MTP_PROBE=0`.
+
+**What is still unmeasured:** a fixture with a genuine mid-generation regime
+change (hard stretch then predictable stretch). The h=0.90 @523 leg is a proxy
+— it latches at round 0 because `ema[0]` inits to 0.85 < 0.90 on a prompt that
+is uniformly predictable. Both prose fixtures stay hard throughout, so they can
+only ever show the probe's cost, never its benefit; that asymmetry is why the
+first round of measurement here looked purely negative.
 
 ## Reproduction
 
