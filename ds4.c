@@ -18840,6 +18840,10 @@ static bool qwen_has_mtp(const ds4_model *m) {
 
 static ds4_model g_qwen_mtp_sidecar;
 static int g_qwen_mtp_sidecar_ready; /* 0 unset, 1 loaded, -1 none/fail */
+/* CLI-installed nextn sidecar: --mtp/--dflash pointing at a standalone
+ * qwen35moe-style blk.<n_layer>.nextn.* head GGUF. Storage is engine-owned;
+ * qwen_nextn_sidecar_install() arms it only after the binding validates. */
+static ds4_model *g_qwen_mtp_sidecar_model;
 static float g_mtp_prev_fused[8192];
 static float g_mtp_verified_fused[8192];
 
@@ -18930,6 +18934,10 @@ static void qwen_mtp_bind_from(qwen_mtp_weights_t *w, const ds4_model *m) {
 static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     if (!m) return;
+    if (g_qwen_mtp_sidecar_model) {
+        qwen_mtp_bind_from(w, g_qwen_mtp_sidecar_model);
+        return;
+    }
     if (g_qwen_mtp_sidecar_ready == 0) {
         const char *p = getenv("DS4_QWEN_MTP_HEAD");
         if (p && p[0]) {
@@ -18984,6 +18992,23 @@ static bool qwen_mtp_is_valid(const qwen_mtp_weights_t *w) {
     return w->e_proj && w->h_proj;
 }
 
+
+/* Install a standalone Qwen nextn MTP head sidecar: a qwen35moe-style GGUF
+ * carrying the draft head as blk.<n_layer>.nextn.* tensors (with a full MoE
+ * block) instead of dflash draft tensors. Returns 1 and arms qwen_mtp_bind()
+ * when the file binds; 0 otherwise, leaving dflash/--mtp handling untouched.
+ * The model must outlive generation — callers pass an engine-owned ds4_model
+ * and ds4_engine_close() disarms the pointer before closing it. */
+static int qwen_nextn_sidecar_install(ds4_model *m, const char *path) {
+    if (!m || !m->map) return 0;
+    qwen_mtp_weights_t probe;
+    memset(&probe, 0, sizeof(probe));
+    qwen_mtp_bind_from(&probe, m);
+    if (!qwen_mtp_is_valid(&probe)) return 0;
+    g_qwen_mtp_sidecar_model = m;
+    fprintf(stderr, "ds4: Qwen nextn MTP sidecar loaded: %s\n", path);
+    return 1;
+}
 // ---- hidden capture helpers (CPU) ----
 static void qwen_forward_token_cpu_with_hidden(float *logits, float *hidden_out, const ds4_model *model, const ds4_weights *weights, int token, uint32_t pos) {
     const uint32_t n_embd = DS4_N_EMBD;
@@ -64330,10 +64355,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         "greedy output may differ from one-token decode due "
                         "to batched floating-point operation order\n");
             }
+        } else if (qwen_nextn_sidecar_install(&e->mtp_model, opt->mtp_path)) {
+            /* Qwen nextn MTP head sidecar: drafting engages through
+             * qwen_mtp_bind() in the hybrid generate paths; the legacy
+             * session verifier stays off. */
         } else {
             fprintf(stderr,
                     "ds4: unsupported --mtp support model %s (detected=%s); "
-                    "expected legacy MTP or DSpark tensors\n",
+                    "expected legacy MTP, DSpark, or Qwen nextn tensors\n",
                     opt->mtp_path,
                     support_kind_name(e->support_kind));
             ds4_engine_close(e);
@@ -64342,49 +64371,55 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (opt->dflash_path && opt->dflash_path[0]) {
-        if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN &&
-            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35) {
-            fprintf(stderr, "ds4: --dflash requires a dense Qwen target\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         model_open(&e->dflash_model, opt->dflash_path, graph_backend, true);
-        if (!dflash2_bind(&e->dflash2, &e->dflash_model)) {
-            fprintf(stderr, "ds4: failed to bind DFlash draft model %s\n",
-                    opt->dflash_path);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (qwen_nextn_sidecar_install(&e->dflash_model, opt->dflash_path)) {
+            /* Qwen nextn MTP head sidecar handed to --dflash: drafting
+             * engages through qwen_mtp_bind() in the hybrid generate paths;
+             * dflash2 stays off. */
+        } else {
+            if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN &&
+                DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35) {
+                fprintf(stderr, "ds4: --dflash requires a dense Qwen target\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (!dflash2_bind(&e->dflash2, &e->dflash_model)) {
+                fprintf(stderr, "ds4: failed to bind DFlash draft model %s\n",
+                        opt->dflash_path);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (e->dflash2.classic && e->backend != DS4_BACKEND_METAL) {
+                fprintf(stderr, "ds4: classic DFlash currently requires the Metal backend\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (e->dflash_draft_n_max == 0) e->dflash_draft_n_max = (int)e->dflash2.block_size - 1;
+            if (e->dflash_draft_n_max > (int)e->dflash2.block_size - 1)
+                e->dflash_draft_n_max = (int)e->dflash2.block_size - 1;
+            /* Clamp to the verify batch width here so the reported draft_n, and
+             * every consumer of dflash_draft_n_max, agree with what a round can
+             * actually carry. */
+            if (e->dflash_draft_n_max > DS4_DFLASH2_MAX_DRAFT)
+                e->dflash_draft_n_max = DS4_DFLASH2_MAX_DRAFT;
+            e->dflash_ready = true;
+            fprintf(stderr,
+                    "ds4: %s draft loaded: %s (layers=%u block=%u heads=%u/%u dim=%u "
+                    "targets=%u mask=%d draft_n=%d)\n",
+                    e->dflash2.classic ? "DFlash" : "DFlash2",
+                    opt->dflash_path,
+                    e->dflash2.n_layer,
+                    e->dflash2.block_size,
+                    e->dflash2.n_head,
+                    e->dflash2.n_head_kv,
+                    e->dflash2.head_dim,
+                    e->dflash2.n_target,
+                    e->dflash2.mask_token_id,
+                    e->dflash_draft_n_max);
         }
-        if (e->dflash2.classic && e->backend != DS4_BACKEND_METAL) {
-            fprintf(stderr, "ds4: classic DFlash currently requires the Metal backend\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (e->dflash_draft_n_max == 0) e->dflash_draft_n_max = (int)e->dflash2.block_size - 1;
-        if (e->dflash_draft_n_max > (int)e->dflash2.block_size - 1)
-            e->dflash_draft_n_max = (int)e->dflash2.block_size - 1;
-        /* Clamp to the verify batch width here so the reported draft_n, and
-         * every consumer of dflash_draft_n_max, agree with what a round can
-         * actually carry. */
-        if (e->dflash_draft_n_max > DS4_DFLASH2_MAX_DRAFT)
-            e->dflash_draft_n_max = DS4_DFLASH2_MAX_DRAFT;
-        e->dflash_ready = true;
-        fprintf(stderr,
-                "ds4: %s draft loaded: %s (layers=%u block=%u heads=%u/%u dim=%u "
-                "targets=%u mask=%d draft_n=%d)\n",
-                e->dflash2.classic ? "DFlash" : "DFlash2",
-                opt->dflash_path,
-                e->dflash2.n_layer,
-                e->dflash2.block_size,
-                e->dflash2.n_head,
-                e->dflash2.n_head_kv,
-                e->dflash2.head_dim,
-                e->dflash2.n_target,
-                e->dflash2.mask_token_id,
-                e->dflash_draft_n_max);
     }
 
 
@@ -65131,6 +65166,12 @@ bool ds4_engine_dflash_ready(const ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    /* The CLI nextn sidecar points at engine-owned model storage; disarm it
+     * before the maps below are unmapped. */
+    if (g_qwen_mtp_sidecar_model == &e->mtp_model ||
+        g_qwen_mtp_sidecar_model == &e->dflash_model) {
+        g_qwen_mtp_sidecar_model = NULL;
+    }
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
