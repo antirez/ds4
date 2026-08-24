@@ -8321,7 +8321,11 @@ static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
  * that emit the corresponding log lines. */
 #define METRICS_REASONS_MAX 12
 typedef struct {
-    char name[24];
+    /* Sized for the longest current reason string,
+     * "incoming-prompt-shorter-than-live-checkpoint" (44 bytes + NUL);
+     * snprintf truncation would otherwise desynchronize the label from
+     * the corresponding log line and could collide two long reasons. */
+    char name[48];
     uint64_t count;
 } metrics_reason;
 
