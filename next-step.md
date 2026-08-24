@@ -9,8 +9,8 @@ before trusting anything you remember from it.
 
 | branch | commit | contents |
 |---|---|---|
-| `ornith15` | merge of `d6eb25f` + Min `5ee5427` | split-K shadow decode, ngrp gate fix (1..16), MTP verify-width counters, opt-in top-2 clamp, Min's Ornith measurements |
-| `main` | merge of the above | same tree |
+| `ornith15` | `46dd3e7` (nextn head-only guard) atop `5c9980e` (standalone-nextn-sidecar) atop the merge of `d6eb25f` + Min `5ee5427` | split-K shadow decode, ngrp gate fix (1..16), MTP verify-width counters, opt-in top-2 clamp, standalone nextn MTP head sidecars on `--mtp`/`--dflash`, nextn head-only bind guard, Min's Ornith measurements |
+| `main` | `ornith15` minus `46dd3e7` and `5c9980e` | everything above except the standalone-nextn-sidecar commit and its guard fix |
 | Min `5ee5427` | parallel work, merged in | independent ngrp 1..16 generalisation + full Ornith 35B/9B measurement |
 | `e5ce86d` | common ancestor | grouped shadow kernel (dead on every shipped model), adaptive depth, batched MTP priming |
 
@@ -121,6 +121,50 @@ single-pass dispatch and `2..256` forces a count for sweeps.
 - MLX-exact parity unchanged: **0/248320 diffs, max_abs 0.0**.
 - Full gate ladder green, including `exact_logits=1` metal-session-batch and
   both Ornith exact-match harnesses (the ngrp change is live for Ornith too).
+
+## Standalone nextn head sidecars (--mtp/--dflash)
+
+`5c9980e` teaches both draft-model flags to accept a standalone Qwen
+nextn MTP head GGUF. `qwen_nextn_sidecar_install()` probes the file by
+binding it (`qwen_mtp_bind_from`) and validating the result
+(`qwen_mtp_is_valid`); only then does it arm the global
+`g_qwen_mtp_sidecar_model`. On `--mtp` the nextn probe sits behind the
+legacy-MTP and DSpark detections, so existing artifacts keep their
+existing handling. On `--dflash` it runs before `dflash2_bind`, and a
+file that fails the probe falls through to dflash2 plus the existing
+dense-Qwen family gate exactly as before.
+
+Binding prefers the armed CLI sidecar over the `DS4_QWEN_MTP_HEAD`
+environment fallback, and the legacy session verifier stays off on this
+path — drafting engages through `qwen_mtp_bind()` in the hybrid generate
+paths instead. Sidecar storage is engine-owned, and `ds4_engine_close()`
+disarms the pointer before unmapping, so the model cannot outlive its
+map.
+
+Acceptance rule: a file binds only if it reads as a Qwen MTP head in
+the qwen35moe style — draft tensors under `blk.<n_layer>.nextn.*`,
+including a full MoE block. Any non-matching file falls through
+untouched.
+
+The probe as originally shipped had a hole: binding a file satisfies
+the probe whenever `blk.<N>.nextn.*` tensors are present, and a FULL
+model bundles its own nextn head. Handing the 24 GB Ornith-35B APEX
+full model to `--mtp` therefore armed it as a "standalone head"; GPU
+placement absorbed the exec layers and generation emitted ~180
+`Metal F32 tensor matmul range is outside the mapped model` warnings
+plus corrupted text instead of the designed rejection.
+
+`46dd3e7` closes this with `qwen_nextn_head_only()`: every
+`blk.<k>` tensor must have `k == DS4_N_LAYER`. Post-guard the same
+APEX file is rejected verbatim — `carries tensors outside blk.40;
+not a standalone head` — falling through to the three-format
+unsupported message with exit 1 and no arming. Re-validation after
+the fix: the legit NVFP4 bare head still loads via `--mtp`
+(`Qwen nextn MTP sidecar loaded`) and drafts (`drafted=23`,
+coherent English; `accepted=0` on this artifact is a head-quality
+fact, not a machinery failure); the `--dflash` legacy path is
+untouched (`proposed=110 accepted=109 @47.36 t/s` banner intact);
+the legacy-MTP rejection text is unchanged.
 
 ## Speculation economics inverted — read before quoting any MTP number
 
@@ -296,6 +340,14 @@ claim must come from a same-window A/B. Discard rep 1; acceptance counts are
 deterministic per config, so if `accepted/round` matches across reps and t/s
 moves, that is machine state, not your change.
 
+Qwen-hybrid-path window drift (new): the identical binary, fixture
+and machine measured prefill 78 ↔ 205 t/s and decode 7 ↔ 11 t/s
+within minutes of each other, while the Ornith models hold ±0.6 %.
+Cause unknown (AC and thermal ruled out). Rule: never quote a Qwen
+absolute t/s without an interleaved control leg of the SAME binary
+in the same window; prefer the deterministic counters (accepts,
+shas) for verdicts.
+
 ## Gates before any commit
 
 ```sh
@@ -313,6 +365,9 @@ Serialize the model-loaded harnesses (`sleep 5-10` between); ds4 refuses to
 start while another ds4/ds4-server holds the single-instance lock. Bare
 `./ds4_test` without `--server` reports 20 pre-existing Ornith-9B fixture
 failures — prove pre-existence by diffing suite verdicts, do not chase them.
+
+Full ladder ran green twice today (pre- and post-guard-fix), and
+MLX parity held at 0/248320 diffs, max_abs 0.0 across the guard fix.
 
 ## Ornith results — Min, 2026-08-24 (`5ee5427`, merged here)
 
@@ -399,3 +454,96 @@ conclusion.
 - Scripting trap that cost Min an hour: `run(){ shift; ...$1... }` names output
   files after the first env assignment rather than the intended tag, producing
   phantom diffs.
+
+## Re-measurement round 2 (2026-08-24, post latch-fix)
+
+### Top-2 clamp with the policy free
+
+Accept counts here are deterministic and load-independent — every
+rep pair matched on counts *and* sha256 — so the verdict rests on
+counters, not on the t/s columns, which are unusable this window
+(see the drift bullet under measurement discipline).
+
+| fixture | leg | accepted (/round) | sha256 |
+|---|---|---|---|
+| 512 (-n256) | default | 210 (1.59) | `59a33123…af30` |
+| 512 (-n256) | `TOP2=1` | 210 (1.59) | `59a33123…af30` |
+| p2k (-n256) | default | 113 (0.63) | `7bcf7cd4…03dac` |
+| p2k (-n256) | `TOP2=1` | 102 (0.56) | `89572561…cbd3d` |
+
+At 512 the clamp is fully neutral: identical accept profile and
+byte-identical output on both legs. At p2k it drops accepted
+113 → 102 **and** changes the output bytes under greedy decoding,
+i.e. the clamp alters token selection somewhere outside pure
+target-greedy verification (repair tokens are draft-schedule-
+dependent). It stays opt-in.
+
+### h re-fit around 0.18
+
+No h in {0.12, 0.18, 0.26} separates on the counters. Acceptance is
+flat: 210–211 @512, 0.63–0.65/round at p2k/p8k.
+
+| fixture | h=0.12 | h=0.18 | h=0.26 |
+|---|---|---|---|
+| 512 (-n256) | 210 (1.59/rnd) | 210 (1.59/rnd) | 211 (1.62/rnd) |
+| p2k (-n256) | 115 (0.64) | 113 (0.63) | 113 (0.65) |
+| p8k (-n128) | 58 (0.63) | 58 (0.63) | 57 (0.65) |
+
+Output bytes differ per h despite the equal accepts — repair tokens
+depend on the draft schedule rather than pure target-greedy verify.
+Decode t/s this window is contaminated by the drift noted under
+measurement discipline, so the re-fit **remains open** pending a
+trustworthy Qwen window. Shipped default h=0.18 unchanged.
+
+### Ornith split-K at 10k
+
+p8k.txt (~10295 tok), `-n 128` greedy, interleaved reps, rep2 pair:
+
+| model | split-K default | `SPLITK=0` | gain |
+|---|---|---|---|
+| Ornith-1.5-9B | **78.91** | 17.35 | **+354.8 %** |
+| Ornith-1.5-35B | **22.17** | 12.39 | **+78.9 %** |
+
+sha256 is byte-identical across ALL legs per model (9B `438da396…`,
+35B `99817f43…`). Disabled-leg variance is large (35B r1 read
+4.54), so treat the percentages as approximate; the ordering is
+unambiguous. Against +11.3 %/+22.4 % at 523 tokens, the split-K
+gain grows with context. Default stays ON.
+
+### Where the 2554 fixed cost lives
+
+**Blocked by machine drift.** Qwen3.8 serial measured 5.3–11 t/s
+decode / 66–82 prefill all day (doc baseline 26 / ~230), and an
+interleaved control proved binary-invariance: the main build itself
+swung prefill 205.6 → 78.5 between windows minutes apart on
+identical hardware, AC power, pmset thermals clean. No Qwen
+fixed-cost number is quotable today; the ~34 ms + 6.4 µs/tok model
+can neither be confirmed nor refuted on Qwen.
+
+Reference point that did measure clean: Ornith-35B serial p2k with
+`DS4_QWEN_PROFILE_ALWAYS=1` — steady-state decode command buffer
+median **8.51 ms** (p90 8.72, min 8.46, max 16.12), whole-run sum
+2556.79 ms over 140 CBs, warmup fill CBs 0.48/0.56 ms, prefill
+giants 510.94 + 458.82 + 347.68 ms. The old fixed-cost model does
+not describe this config either (predicts ~47 ms/CB at 2048 ctx).
+Refit deferred.
+
+### Probe benefit on a mid-generation regime change
+
+New fixture `regime_change.txt` (local-only, gitignored dir):
+hard-prose prefix, then a repetitive field-report tail. At h=0.90
+the documented EMA-freeze latch reproduces on it — `PROBE=0` sits at
+drafted=0 / accepted=0 frozen for the entire run — while the probe
+restarts drafting (drafted=9, accepted=8), so the structural benefit
+is demonstrated. The recovery itself is modest:
+
+| leg | decode t/s | drafted | accepted |
+|---|---|---|---|
+| h=0.50, probe on | 5.75 | 225 | 193 (1.40/rnd) |
+| h=0.50, `PROBE=0` | 5.68 | 225 | 193 (1.40/rnd) |
+| h=0.90, probe on | 2.87 | 9 | 8 |
+| h=0.90, `PROBE=0` | 2.76 | 0 | 0 (latched) |
+
+h=0.50 never latches (both legs byte-identical, 193 accepted).
+Magnitudes come from the drifted window; the ordering and the
+counts are trustworthy.
