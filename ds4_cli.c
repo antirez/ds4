@@ -2031,6 +2031,10 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
         exit(2);
     }
+    if (c.gen.imatrix_output_path && ds4_dist_enabled(c.dist)) {
+        fprintf(stderr, "ds4: --imatrix-out does not support distributed roles\n");
+        exit(2);
+    }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);

@@ -234,6 +234,19 @@ if [ -x ./ds4 ]; then
     fi
 fi
 
+# 8: imatrix collection requires the complete model, not a distributed slice.
+if [ -x ./ds4 ]; then
+    ./ds4 --role coordinator --listen 127.0.0.1 9911 --layers 0:20 \
+        --imatrix-dataset /dev/null --imatrix-out /tmp/imatrix.bin -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q -- "--imatrix-out does not support distributed roles" "$LOG"; then
+        ok "imatrix collection rejects distributed coordinator"
+    else
+        fail "imatrix collection did not reject distributed coordinator"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+fi
+
 rm -f "$LOG"
 
 echo ""
