@@ -18931,6 +18931,148 @@ static void qwen_mtp_bind_from(qwen_mtp_weights_t *w, const ds4_model *m) {
     }
 }
 
+typedef enum {
+    QWEN_MTP_TRUNK_UNKNOWN = 0,
+    QWEN_MTP_TRUNK_Q4_K,
+    QWEN_MTP_TRUNK_APEX_Q5_Q6,
+} qwen_mtp_trunk_kind;
+
+typedef enum {
+    QWEN_MTP_HEAD_UNKNOWN = 0,
+    QWEN_MTP_HEAD_NVFP4_NEXTN,
+} qwen_mtp_head_kind;
+
+typedef struct {
+    uint32_t q4_k;
+    uint32_t q5_k;
+    uint32_t q6_k;
+    uint32_t other;
+    uint32_t missing;
+} qwen_mtp_type_counts;
+
+/* Pairing is numerical, not structural. The regular Q4_K_M and APEX trunks
+ * are both qwen35moe 40L/2048 and accept the exact same nextn tensor shapes,
+ * but the NVFP4 standalone head measured 1 accepted token / 126 rounds on
+ * Q4_K_M versus 64 / 63 and serial-identical output on APEX. Classify from
+ * the tensors that produced those measurements, never from filenames. */
+static qwen_mtp_trunk_kind qwen_mtp_classify_trunk(
+        const ds4_model *m, qwen_mtp_type_counts *counts) {
+    memset(counts, 0, sizeof(*counts));
+    if (!m) return QWEN_MTP_TRUNK_UNKNOWN;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char name[96];
+        const char *parts[] = {"ffn_gate_exps", "ffn_up_exps"};
+        for (size_t j = 0; j < sizeof(parts) / sizeof(parts[0]); j++) {
+            snprintf(name, sizeof(name), "blk.%u.%s.weight", il, parts[j]);
+            const ds4_tensor *t = model_find_tensor(m, name);
+            if (!t) {
+                counts->missing++;
+            } else if (t->type == DS4_TENSOR_Q4_K) {
+                counts->q4_k++;
+            } else if (t->type == DS4_TENSOR_Q5_K) {
+                counts->q5_k++;
+            } else if (t->type == DS4_TENSOR_Q6_K) {
+                counts->q6_k++;
+            } else {
+                counts->other++;
+            }
+        }
+    }
+    const uint32_t present =
+        counts->q4_k + counts->q5_k + counts->q6_k + counts->other;
+    if (present > 0 && counts->missing == 0 && counts->other == 0) {
+        if (counts->q4_k == present) return QWEN_MTP_TRUNK_Q4_K;
+        if (counts->q4_k == 0 && counts->q5_k > 0 && counts->q6_k > 0)
+            return QWEN_MTP_TRUNK_APEX_Q5_Q6;
+    }
+    return QWEN_MTP_TRUNK_UNKNOWN;
+}
+
+static qwen_mtp_head_kind qwen_mtp_classify_head(
+        const ds4_model *m, const qwen_mtp_weights_t *w) {
+    if (!m || !w || !w->eh_proj || !w->ffn_gate_exps ||
+        !w->ffn_up_exps || !w->ffn_down_exps) {
+        return QWEN_MTP_HEAD_UNKNOWN;
+    }
+    const ds4_tensor *output = model_find_tensor(m, "output.weight");
+    const ds4_tensor *embd = model_find_tensor(m, "token_embd.weight");
+    if (output && output->type == DS4_TENSOR_NVFP4 &&
+        embd && embd->type == DS4_TENSOR_Q5_K &&
+        w->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        w->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        w->ffn_down_exps->type == DS4_TENSOR_Q6_K) {
+        return QWEN_MTP_HEAD_NVFP4_NEXTN;
+    }
+    return QWEN_MTP_HEAD_UNKNOWN;
+}
+
+static const char *qwen_mtp_trunk_kind_name(qwen_mtp_trunk_kind kind) {
+    switch (kind) {
+    case QWEN_MTP_TRUNK_Q4_K: return "uniform-q4_k-gate/up";
+    case QWEN_MTP_TRUNK_APEX_Q5_Q6: return "apex-q5_k/q6_k-gate/up";
+    default: return "unknown";
+    }
+}
+
+static const char *qwen_mtp_head_kind_name(qwen_mtp_head_kind kind) {
+    return kind == QWEN_MTP_HEAD_NVFP4_NEXTN
+        ? "nvfp4-readout+q4_k/q6_k-nextn"
+        : "unknown";
+}
+
+static int qwen_mtp_pairing_force(void) {
+    const char *s = getenv("DS4_QWEN_MTP_FORCE");
+    return s && strcmp(s, "1") == 0;
+}
+
+/* Returns 0 when this is not a full-MoE nextn sidecar (legacy dense MTP
+ * handling must remain untouched), 1 when allowed, and -1 when recognized
+ * but refused. Known-bad means refused even with FORCE; unknown means
+ * fail-closed unless FORCE=1. Always print both type identities. */
+static int qwen_mtp_check_nextn_pair(
+        const ds4_model *trunk,
+        const ds4_model *head,
+        const qwen_mtp_weights_t *w,
+        const char *path) {
+    if (!w || !w->eh_proj || !w->ffn_gate_exps ||
+        !w->ffn_up_exps || !w->ffn_down_exps) {
+        return 0;
+    }
+    qwen_mtp_type_counts tc;
+    const qwen_mtp_trunk_kind tk = qwen_mtp_classify_trunk(trunk, &tc);
+    const qwen_mtp_head_kind hk = qwen_mtp_classify_head(head, w);
+    const char *verdict = NULL;
+    int rc = -1;
+    if (tk == QWEN_MTP_TRUNK_APEX_Q5_Q6 &&
+        hk == QWEN_MTP_HEAD_NVFP4_NEXTN) {
+        verdict = "ALLOW_MEASURED_GOOD";
+        rc = 1;
+    } else if (tk == QWEN_MTP_TRUNK_Q4_K &&
+               hk == QWEN_MTP_HEAD_NVFP4_NEXTN) {
+        verdict = "REFUSE_MEASURED_BAD";
+    } else if (qwen_mtp_pairing_force()) {
+        verdict = "ALLOW_FORCED_UNKNOWN";
+        rc = 1;
+    } else {
+        verdict = "REFUSE_UNKNOWN_SET_DS4_QWEN_MTP_FORCE=1";
+    }
+    fprintf(stderr,
+            "ds4: Qwen nextn pair trunk=%s"
+            "(q4=%u q5=%u q6=%u other=%u missing=%u) "
+            "head=%s verdict=%s path=%s\n",
+            qwen_mtp_trunk_kind_name(tk),
+            tc.q4_k, tc.q5_k, tc.q6_k, tc.other, tc.missing,
+            qwen_mtp_head_kind_name(hk), verdict, path ? path : "(env)");
+    if (tk == QWEN_MTP_TRUNK_Q4_K &&
+        hk == QWEN_MTP_HEAD_NVFP4_NEXTN) {
+        fprintf(stderr,
+                "ds4: refusing known-bad nextn pair: measured acceptance "
+                "1/126 rounds and 52 t/s versus 109 t/s serial; "
+                "DS4_QWEN_MTP_FORCE does not override known-bad pairs\n");
+    }
+    return rc;
+}
+
 static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     if (!m) return;
@@ -18946,6 +19088,13 @@ static void qwen_mtp_bind(qwen_mtp_weights_t *w, const ds4_model *m) {
             memset(&probe, 0, sizeof(probe));
             qwen_mtp_bind_from(&probe, &g_qwen_mtp_sidecar);
             if (qwen_mtp_is_valid(&probe)) {
+                const int pair = qwen_mtp_check_nextn_pair(
+                    m, &g_qwen_mtp_sidecar, &probe, p);
+                if (pair < 0) {
+                    model_close(&g_qwen_mtp_sidecar);
+                    g_qwen_mtp_sidecar_ready = -1;
+                    return; /* Explicit head rejected: do not silently use bundled. */
+                }
                 g_qwen_mtp_sidecar_ready = 1;
                 fprintf(stderr, "ds4: using MTP head sidecar %s\n", p);
                 if ((probe.draft_lm_head || probe.draft_lm_head_q) && probe.draft_rerank) {
@@ -19020,25 +19169,29 @@ static bool qwen_nextn_head_only(const ds4_model *m) {
 /* Install a standalone Qwen nextn MTP head sidecar: a qwen35moe-style GGUF
  * carrying the draft head as blk.<n_layer>.nextn.* tensors (with a full MoE
  * block) instead of dflash draft tensors. Returns 1 and arms qwen_mtp_bind()
- * when the file binds; 0 otherwise, leaving dflash/--mtp handling untouched.
- * Full-model files (which bundle exec layers blk.0..blk.<N>-1) are rejected
- * here because GPU placement would otherwise try to fit those layers and
- * corrupt drafting.
- * The model must outlive generation — callers pass an engine-owned ds4_model
- * and ds4_engine_close() disarms the pointer before closing it. */
-static int qwen_nextn_sidecar_install(ds4_model *m, const char *path) {
-    if (!m || !m->map) return 0;
+ * when the file binds and the pair is allowed, 0 when this is not that format
+ * (legacy handling continues, including files that carry exec-layer tensors
+ * blk.0..blk.<N>-1: GPU placement would try to fit them and corrupt
+ * drafting), and -1 when a recognized nextn pair is refused.
+ * The sidecar model must outlive generation — callers pass engine-owned
+ * storage and ds4_engine_close() disarms the pointer before closing it. */
+static int qwen_nextn_sidecar_install(
+        const ds4_model *trunk, ds4_model *sidecar, const char *path) {
+    if (!trunk || !sidecar || !sidecar->map) return 0;
     qwen_mtp_weights_t probe;
     memset(&probe, 0, sizeof(probe));
-    qwen_mtp_bind_from(&probe, m);
+    qwen_mtp_bind_from(&probe, sidecar);
     if (!qwen_mtp_is_valid(&probe)) return 0;
-    if (!qwen_nextn_head_only(m)) {
+    if (!qwen_nextn_head_only(sidecar)) {
         fprintf(stderr, "ds4: nextn sidecar %s carries tensors outside blk.%u; not a standalone head\n",
                 path, DS4_N_LAYER);
         return 0;
     }
-    g_qwen_mtp_sidecar_model = m;
-    fprintf(stderr, "ds4: Qwen nextn MTP sidecar loaded: %s\n", path);
+    const int pair = qwen_mtp_check_nextn_pair(trunk, sidecar, &probe, path);
+    if (pair <= 0) return pair;
+    g_qwen_mtp_sidecar_model = sidecar;
+    fprintf(stderr, "ds4: Qwen nextn MTP sidecar loaded after pairing check: %s\n",
+            path);
     return 1;
 }
 // ---- hidden capture helpers (CPU) ----
@@ -64387,27 +64540,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         "greedy output may differ from one-token decode due "
                         "to batched floating-point operation order\n");
             }
-        } else if (qwen_nextn_sidecar_install(&e->mtp_model, opt->mtp_path)) {
-            /* Qwen nextn MTP head sidecar: drafting engages through
-             * qwen_mtp_bind() in the hybrid generate paths; the legacy
-             * session verifier stays off. */
         } else {
-            fprintf(stderr,
-                    "ds4: unsupported --mtp support model %s (detected=%s); "
-                    "expected legacy MTP, DSpark, or Qwen nextn tensors\n",
-                    opt->mtp_path,
-                    support_kind_name(e->support_kind));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+            const int nextn = qwen_nextn_sidecar_install(
+                &e->model, &e->mtp_model, opt->mtp_path);
+            if (nextn < 0) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            } else if (nextn > 0) {
+                /* Drafting engages through qwen_mtp_bind() in the hybrid
+                 * generate paths; the legacy session verifier stays off. */
+            } else {
+                fprintf(stderr,
+                        "ds4: unsupported --mtp support model %s (detected=%s); "
+                        "expected legacy MTP, DSpark, or Qwen nextn tensors\n",
+                        opt->mtp_path,
+                        support_kind_name(e->support_kind));
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
     }
     if (opt->dflash_path && opt->dflash_path[0]) {
         model_open(&e->dflash_model, opt->dflash_path, graph_backend, true);
-        if (qwen_nextn_sidecar_install(&e->dflash_model, opt->dflash_path)) {
-            /* Qwen nextn MTP head sidecar handed to --dflash: drafting
-             * engages through qwen_mtp_bind() in the hybrid generate paths;
-             * dflash2 stays off. */
+        const int nextn = qwen_nextn_sidecar_install(
+            &e->model, &e->dflash_model, opt->dflash_path);
+        if (nextn < 0) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        } else if (nextn > 0) {
+            /* Drafting engages through qwen_mtp_bind() in the hybrid
+             * generate paths; dflash2 stays off. */
         } else {
             if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN &&
                 DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35) {
