@@ -17989,7 +17989,8 @@ static int qwen_hybrid_metal_forward_tokens(
     const int skip_ffn = getenv("DS4_QWEN_SKIP_FFN") != NULL;
     const int skip_head = getenv("DS4_QWEN_SKIP_HEAD") != NULL;
 
-    const int capture_gdn_steps = (argmax_out != NULL);
+    const int capture_gdn_steps = (argmax_out != NULL) &&
+        !(getenv("DS4_QWEN_GDN_SNAP") && getenv("DS4_QWEN_GDN_SNAP")[0] == '0');
     if (capture_gdn_steps) {
         if (n_tok > (g_qwen_pool.spec_cap ? g_qwen_pool.spec_cap : 8u)) return 0;
         if (!qwen_metal_ensure_gdn_steps()) return 0;
@@ -18419,7 +18420,8 @@ static int qwen_hybrid_metal_forward_tokens(
         }
         int fused_ffn = 0;
         if (ok && !fused_ffn && ((lw->ffn_gate->type == DS4_TENSOR_NVFP4 && lw->ffn_up->type == DS4_TENSOR_NVFP4) ||
-                   (lw->ffn_gate->type == DS4_TENSOR_Q4_K && lw->ffn_up->type == DS4_TENSOR_Q4_K)) &&
+                   (lw->ffn_gate->type == DS4_TENSOR_Q4_K && lw->ffn_up->type == DS4_TENSOR_Q4_K) ||
+                   (lw->ffn_gate->type == DS4_TENSOR_Q4_64A && lw->ffn_up->type == DS4_TENSOR_Q4_64A)) &&
             ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(g_qwen_pool.batch_mid, model->map, model->size,
                                                         lw->ffn_gate->abs_offset, lw->ffn_up->abs_offset,
                                                         lw->ffn_gate->type, n_embd, ff_dense,

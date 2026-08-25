@@ -2086,6 +2086,106 @@ template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_3")]] kernel mul
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_4")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_5")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<5>;
 
+template<short r1ptg>
+void kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_impl(
+        constant ds4_metal_args_mul_mv_ext & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_mid,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG   = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+    const short chpt = 4;
+    const short chpb = 16;
+    const short nypsg = (32/nxpsg);
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+    const int i01 = tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty;
+    const int i11 = tgpig.y*r1ptg;
+    const uint64_t offset0 = i01*args.nb01;
+    const uint64_t offset1 = i11*args.nb11;
+    device const ds4_dense_block_q4_64a * xq_gate =
+        (i01 < args.ne01) ? (device const ds4_dense_block_q4_64a *)(src0_gate + offset0) + tx/chpb
+                          : (device const ds4_dense_block_q4_64a *)src0_gate;
+    device const ds4_dense_block_q4_64a * xq_up =
+        (i01 < args.ne01) ? (device const ds4_dense_block_q4_64a *)(src0_up + offset0) + tx/chpb
+                          : (device const ds4_dense_block_q4_64a *)src0_up;
+    device const float4 * y4[r1ptg];
+    for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
+        y4[ir1] = (i11 + ir1 < args.ne11)
+            ? (device const float4 *)(src1 + offset1 + ir1*args.nb11) + tx
+            : (device const float4 *)src1;
+    }
+    float sum_gate[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
+    float sum_up[r1ptg]   = { [ 0 ... r1ptg - 1 ] = 0.0f };
+    short cch = tx%chpb;
+    for (int ich = tx; 4*ich < args.ne00; ich += chpt*nxpsg) {
+        float4 lg[chpt];
+        float4 lu[chpt];
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+            dequantize_dense_q4_64a_t4(xq_gate, cch, lg[ch]);
+            dequantize_dense_q4_64a_t4(xq_up,   cch, lu[ch]);
+            cch += nxpsg;
+            if (cch >= chpb) {
+                xq_gate += cch/chpb;
+                xq_up   += cch/chpb;
+                cch %= chpb;
+            }
+        }
+#pragma unroll(chpt)
+        for (short ch = 0; ch < chpt; ++ch) {
+#pragma unroll(r1ptg)
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                const float4 y = y4[ir1][ch*nxpsg];
+                sum_gate[ir1] += dot(lg[ch], y);
+                sum_up[ir1] += dot(lu[ch], y);
+            }
+        }
+#pragma unroll(r1ptg)
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            y4[ir1] += chpt*nxpsg;
+        }
+    }
+    for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+        if (nxpsg >= 32) { sum_gate[ir1] += simd_shuffle_down(sum_gate[ir1], 16); sum_up[ir1] += simd_shuffle_down(sum_up[ir1], 16); }
+        if (nxpsg >= 16) { sum_gate[ir1] += simd_shuffle_down(sum_gate[ir1],  8); sum_up[ir1] += simd_shuffle_down(sum_up[ir1],  8); }
+        if (nxpsg >=  8) { sum_gate[ir1] += simd_shuffle_down(sum_gate[ir1],  4); sum_up[ir1] += simd_shuffle_down(sum_up[ir1],  4); }
+        if (nxpsg >=  4) { sum_gate[ir1] += simd_shuffle_down(sum_gate[ir1],  2); sum_up[ir1] += simd_shuffle_down(sum_up[ir1],  2); }
+        if (nxpsg >=  2) { sum_gate[ir1] += simd_shuffle_down(sum_gate[ir1],  1); sum_up[ir1] += simd_shuffle_down(sum_up[ir1],  1); }
+    }
+    if (tx == 0 && i01 < args.ne01) {
+        for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
+            device float * mid_f32 = (device float *)dst_mid + (uint64_t)(i11 + ir1)*args.ne0;
+            const float g = sum_gate[ir1];
+            const float u = sum_up[ir1];
+            mid_f32[i01] = (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+template<short r1ptg>
+kernel void kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_disp(
+        constant ds4_metal_args_mul_mv_ext & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_mid,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_impl<r1ptg>(
+            args, src0_gate, src0_up, src1, dst_mid, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_disp<2>) mul_mv_ext_q4_64a_pair_swiglu_f32_t;
+template [[host_name("kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_r1_2")]] kernel mul_mv_ext_q4_64a_pair_swiglu_f32_t kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_disp<2>;
+template [[host_name("kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_r1_4")]] kernel mul_mv_ext_q4_64a_pair_swiglu_f32_t kernel_mul_mv_ext_q4_64a_pair_swiglu_f32_disp<4>;
+
+
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
 

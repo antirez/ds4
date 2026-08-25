@@ -3617,6 +3617,98 @@ kernel void kernel_mul_mv_q4_64a_mlx_bf16(
     (void)shmem;
 }
 
+/* mlx.fast S=4 affine4 QMV: one xsums table + factored bias, nsg=2, 4 rows/simd.
+ * Opt-in host: DS4_METAL_Q4_64A_XSUMS=1. Native ds4 packing, F32 activations. */
+#define N_R0_Q4_64A_N4 4
+#define N_TOK_Q4_64A_N4 4
+kernel void kernel_q4_64a_xsums_n4(
+        constant int32_t &K [[buffer(0)]],
+        device const float *x [[buffer(1)]],
+        device float *xsums [[buffer(2)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lid [[thread_index_in_threadgroup]]) {
+    const uint k0 = tgpig.y * 512u;
+    const uint lane = lid;
+    const uint Ku = (uint)K;
+    for (uint m = 0; m < 4u; ++m) {
+        device const float *xm = x + m * Ku + k0 + lane * 16u;
+        float s = 0.f;
+        for (uint i = 0; i < 16u; ++i) s += xm[i];
+        xsums[(tgpig.y * 32u + lane) * 4u + m] = s;
+    }
+}
+
+kernel void kernel_mul_mv_q4_64a_n4_xsums(
+        constant ds4_metal_args_mul_mv & args,
+        device const char *src0,
+        device const char *src1,
+        device const float *xsums,
+        device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const int first_row = (int)((tgpig.x * (uint)NSG + sgitg) * N_R0_Q4_64A_N4);
+    const int groups = args.ne00 / 64;
+    float result[N_R0_Q4_64A_N4][N_TOK_Q4_64A_N4];
+    for (int row = 0; row < N_R0_Q4_64A_N4; ++row) {
+        for (int m = 0; m < N_TOK_Q4_64A_N4; ++m) result[row][m] = 0.f;
+    }
+    device const float *x = (device const float *)src1;
+    const int lane_group = (int)tiisg / 4;
+    const int lane_sub = (int)tiisg & 3;
+    const int K = args.ne00;
+
+    for (int g0 = 0; g0 < groups; g0 += 8) {
+        const int group = g0 + lane_group;
+        const int x0 = group * 64 + lane_sub * 16;
+        const int kb = g0 / 8;
+        const device float *st = xsums + (kb * 32 + (int)tiisg) * 4;
+        float xsum[4] = {st[0], st[1], st[2], st[3]};
+        float xv[4][16];
+        for (int m = 0; m < 4; ++m) {
+            device const float *xm = x + m * K + x0;
+            for (int i = 0; i < 16; ++i) xv[m][i] = xm[i];
+        }
+        for (int row = 0; row < N_R0_Q4_64A_N4; ++row) {
+            const int r = first_row + row;
+            if (r >= args.ne0) continue;
+            device const char *bl = src0 + (uint64_t)r * args.nb01 + (uint64_t)group * 36u;
+            device const ushort *ws = (device const ushort *)(bl + lane_sub * 8);
+            const float scale = as_type<float>((uint)*((device const ushort *)(bl + 32)) << 16);
+            const float bias  = as_type<float>((uint)*((device const ushort *)(bl + 34)) << 16);
+            for (int m = 0; m < 4; ++m) {
+                float accum = 0.f;
+                for (int i = 0; i < 4; ++i) {
+                    const uint p = (uint)ws[i];
+                    accum += xv[m][4 * i + 0] * (float)(p & 0x000fu)
+                           + xv[m][4 * i + 1] * (float)((p >> 4) & 0x000fu)
+                           + xv[m][4 * i + 2] * (float)((p >> 8) & 0x000fu)
+                           + xv[m][4 * i + 3] * (float)((p >> 12) & 0x000fu);
+                }
+                result[row][m] += scale * accum + xsum[m] * bias;
+            }
+        }
+    }
+    device float *out = (device float *)dst;
+    for (int row = 0; row < N_R0_Q4_64A_N4; ++row) {
+        const int r = first_row + row;
+        if (r >= args.ne0) continue;
+        for (int m = 0; m < 4; ++m) {
+            float v = result[row][m];
+            v += simd_shuffle_xor(v, 1u);
+            v += simd_shuffle_xor(v, 2u);
+            v += simd_shuffle_xor(v, 4u);
+            v += simd_shuffle_xor(v, 8u);
+            v += simd_shuffle_xor(v, 16u);
+            if (tiisg == 0) out[m * args.ne0 + r] = v;
+        }
+    }
+    (void)shmem;
+}
+
+
 // NVFP4 decode: ggml block_nvfp4 (36B/64) = 4 e4m3 scales + 32B packed e2m1.
 // Same occupancy as Q4_64A classic (nsg=4, nr0=2, 32 lanes × 2 elems).
 static constant float ds4_nvfp4_e2m1[16] = {

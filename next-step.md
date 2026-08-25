@@ -46,6 +46,110 @@ Prefill is unchanged: ~230 t/s @523, ~440 @2554, ~510 @10295, and with the MTP
 head loaded ~205 @523 — Min's batched priming (lever 3) does hold up on Max, the
 old 150–170 t/s ceiling is gone.
 
+## 2026-08-25 — PR 1354 transfer (Q4 NAX split prefix)
+
+`Layr-Labs/qwen-3.8-mtp-challenge#1354` (ox-alpha): pinned bf16 head wins vs
+q2-q4 rerank (~26%); mlx packed GDN S<=2 does **not** transfer (ds4 already
+fuses conv+core). Transferable hole: `ds4_gpu_matmul_quant_impl_tensor`
+required `n_tok % 32 == 0` for Q4/Q6 NAX, so the 523-token fixture (and any
+unaligned last prefill chunk) never hit `n128`. Ported the Q8_0
+`split_nax_prefix` (`n_tok >= 192`, aligned prefix on NAX, remainder on tiled
+mm). `DS4_METAL_Q4_NAX_SPLIT=0` restores the old gate.
+
+Same binary, 523-tok longcopy, greedy `-n 256`, same window:
+
+| leg | prefill | decode | acc | sha |
+|---|---|---|---|---|
+| serial | 421.07 | 20.55 | — | `59a33123…af30` |
+| K=3 split=0 | 177.29 | 29.98 | 190/197 (1.46) | same |
+| K=3 split=1 | **364.44** | 27.48 | 190/197 (1.46) | same |
+
+Text is byte-identical to serial. Prefill is the win; decode t/s is window
+noise. `test_metal_session_batch exact_logits=1`; both Ornith exact-match
+harnesses green.
+
+Tried and rejected same day: fused Q4_64A gate+up+SwiGLU on the live
+`mul_mv_ext` path. Bit-exact vs unfused, but serial 27.4 vs 28.4 t/s and
+MTP K=3 verify 58 vs 55 ms — concurrent gate/up already overlapped. Not
+shipped. K=6/7 on longcopy is not faster than K=3 (58.6 / 54.5 vs 58.9)
+and diverges from serial. Current K=3 is **2.11× serial** (58.9 / 27.9).
+mlx.fast pinned-head longcopy is **~3.58×** (0.0106 vs 0.038 s/tok). Gap
+is verify cost (~54 ms for w=4), not acceptance (copy is nearly lossless).
+
+w=4 verify skip (soaked window, means only): full 101.6 ms, skip-FFN 22.9,
+skip-GDN 44.6. FFN is the verify cost. Live n_tok=4 path is
+`kernel_mul_mv_ext_q4_64a_f32_r1_4` (nsg=4), not `kernel_mul_mv_q4_64a_dense_f32`.
+Occupancy A/B, all sha `57e2fe23…` / later `ed739af1…` = serial:
+tiled mm (EXT_MAX=1) 198 ms verify — lose. Last paired run: nsg8 29 t/s /
+113 ms vs nsg4 42 t/s / 77 ms. Default stays nsg=4.
+`DS4_METAL_Q4_64A_NSG=8` remains an override. Still ~2.1× serial, not mlx.fast.
+
+
+
+mlx.fast S=4 GDN: prefix-replay tape, no per-row SSM dump. ds4 verify writes
+`gdn_state_steps` (spec_cap×64×48×128×128 f32). `DS4_QWEN_GDN_SNAP=0` skips
+that. ABBA on longcopy K=3, sha `57e2fe23…`: snap-on 61.9/61.6 t/s verify
+53.1/53.4 ms; snap-off **64.2/64.3 t/s** verify **50.9/50.9 ms**. Real, small.
+Reject path still needs the dump or a replay; default stays snap-on. Not mlx.fast.
+
+mlx.fast S=4 affine QMV (`qwen35_custom_affine4` + xsums) ported as
+`DS4_METAL_Q4_64A_XSUMS=1` (`kernel_mul_mv_q4_64a_n4_xsums`, nsg=2, 4 rows/simd,
+factored bias). ABBA longcopy K=3, sha `57e2fe23…`, log `n4 xsums QMV active`:
+ext 61.23/62.19 t/s verify 53.9/53.1 ms; xsums **54.89/57.77 t/s** verify
+**61.6/58.0 ms**. Bit-exact, slower. Default stays `mul_mv_ext` r1_4. Not mlx.fast.
+
+Q4_64A fused gate/up+SwiGLU (`DS4_METAL_Q4_64A_PAIR=1`, ext r1_4 occupancy).
+ABBA longcopy K=3, sha `57e2fe23…`, log `pair swiglu active`: baseline
+62.15/61.96 t/s verify 53.1/53.2 ms; pair first 59.68 (cold compile) then
+**62.99 t/s / 52.0 ms**. Bit-exact, noise-level. Default off. Not mlx.fast.
+
+Q4_64A ext nxpsg A/B (`DS4_METAL_Q4_64A_NXPSG`): 8 (default) 61.93/61.82,
+16 61.76 / outlier 65.25, 32 62.07. All sha `57e2fe23…`. Occupancy on K
+is not the gap. Default 8.
+
+Qwen3.8 GDN used legacy `kernel_qwen_gdn_core` (rows4 gated to 32-head).
+`DS4_QWEN_GDN_ROWS4=1` on 48-head: log `core_rows4 active v_heads=48`, sha
+`57e2fe23…`. Decode 62.18/61.97 vs 61.87/61.77 (noise). Prefill 425 vs 409.
+skip-GDN live w=4 38ms vs 53ms → GDN block ~15ms, mostly Q4_64A in/out proj
+not the SSM core. Default stays legacy core.
+
+mlx.fast cost-model can offer depth 8 (near-flat verify). ds4 K=7 on longcopy:
+56.95 t/s, w=8 mean 89 ms, draft 260 ms, repair 13.9 ms, acc 1.54/round, sha
+`cc774c20…` (differs from K=3 `57e2fe23…` — extra blank line). K=3 stays
+61.8 t/s / w=4 53 ms. Verify is not flat. Default K=3.
+
+ds4 already `requestResidency` + queue add at load. `DS4_METAL_NO_RESIDENCY=1`
+ABBA longcopy K=3, sha `57e2fe23…`: on 61.91/61.93 t/s prefill 410/408; off
+61.72/61.69 t/s prefill 385/388. Decode not residency-bound.
+
+GPU CB profile (`DS4_QWEN_PROFILE_ALWAYS=1`): serial n_tok=1 **33.4 ms GPU**.
+K=3 verify n_tok=4 **~50 ms GPU** (one `command batch`); each MTP draft **3.3 ms
+GPU** own CB (readback). 4-wide is 1.5× serial, not 4× — extra 17 ms is width-4
+ALU/activation, not dispatch. Wall verify ≈ GPU busy. No commit.
+
+GPU width: n_tok=1 33.4 ms, n_tok=2 36.0 ms (near-flat), n_tok=4 50 ms.
+`DS4_METAL_Q4_64A_R1=2 NXPSG=16` (two Y-groups, w=2 occupancy) at n_tok=4:
+57.3/57.5 t/s verify 58.5/58.3 ms vs default 61.9/61.6. 2× weight scan loses.
+Keep r1=4. No commit.
+
+Same-machine longcopy, mlxfast unloaded first. ds4 n=64 K=3 still **61.58 t/s**
+(acc 1.50, w=4 53.8 ms). Cooled ds4 serial n=64 **22.0 t/s** (prefill 349; KV
+grows — not the 30.7 n=16 GPU 33.4 ms). mlxfast mtp-timed n=64 K=3 **54.31 t/s**.
+Local ds4 MTP > local mlx. Ranked ~94 t/s / 3.58× still unmatched. No commit.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## Correction: the grouped kernel never ran on Qwen3.8
 
 The previous revision claimed a **3.3× long-context win** from
