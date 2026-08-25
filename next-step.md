@@ -137,6 +137,48 @@ Same-machine longcopy, mlxfast unloaded first. ds4 n=64 K=3 still **61.58 t/s**
 grows — not the 30.7 n=16 GPU 33.4 ms). mlxfast mtp-timed n=64 K=3 **54.31 t/s**.
 Local ds4 MTP > local mlx. Ranked ~94 t/s / 3.58× still unmatched. No commit.
 
+MTPLX PR 335 row 8 (device-resident draft chain): `qwen_mtp_draft_chain_metal`
+fuses K Metal drafts into one CB and embeds step d>0 from GPU argmax
+(`DS4_QWEN_MTP_CHAIN=1`; compact/ofou/MoE/conv stay sequential). Longcopy
+n=64 K=3, sha `be2ea2db…` both ways. Warm draft 180.8 vs 179.8 ms; 59.2 vs
+60.0 t/s. Host tok round-trip was not the 3.3 ms. Default off. No commit.
+
+`DS4_METAL_Q4_64A_NSG=2` vs 4, same fixture: sha identical, 56.0 vs 58.8 t/s
+(verify 58.7 vs 56.1 ms). Keep nsg=4.
+
+GDN SNAP=0 + pre-verify blit + reject replay (restore slot 0, re-forward
+accepted+1). Full-accept longcopy: sha identical, 59.4 vs 61.1 t/s — the
+pre-save ate the old +4% dump skip. Default snap-on. No commit.
+
+`r1_4` float4-sum / four y-pointers in `kernel_mul_mv_ext_q4_f32_impl`: sha
+`be2ea2db…`, verify 53.9–54.6 vs 54.2 ms, 60.8/61.4 vs 61.1 t/s. Pointer
+packing is not the 17 ms. Reverted. No commit.
+
+Q4_64A NAX pad32 (`DS4_METAL_Q4_NAX_PAD`) and NR1=8 zero-pad
+(`DS4_METAL_Q4_64A_NAX8`): both ran, both **wrong** (accept 0.02, binary
+garbage, verify 82–106 ms). MMA tile mixes padded rows; F16 NAX ≠ F32 ext.
+Reverted. No commit.
+
+GDN SNAP=0 blit folded into the verify CB (no extra begin/end): sha
+`be2ea2db…`, 60.6 vs 60.1 t/s (noise). In-CB 201 MB copy ≈ per-row dumps.
+Default snap-on. No commit.
+
+F32 `kernel_mul_mm_q4_64a_f32` pad-to-32 (`DS4_METAL_Q4_64A_MM32`): ran,
+wrong (looping フレッシュ, accept 1.20, verify 177 ms). Half RHS staging
+is not r1_4 F32. Reverted. No commit.
+
+F32-RHS `kernel_mul_mm_q4_64a_f32rhs` pad32 (`DS4_METAL_Q4_64A_MM32F`):
+compiled, ran, accept 0.00, binary garbage, verify 179 ms. Tiled mul_mm
+layout is not r1_4. Reverted. No commit.
+
+SNAP=0 dump-skip without restore diverges on reject. GDN split writes
+scratch and restores prefix (same as SNAP=1); full accept swaps. Longcopy +
+prose sha match. Dump still paid; SNAP default on.
+
+Q4_64A pair SwiGLU default on (`PAIR=0` disables). Classic dense small-M
+(4 decode dispatches) sha-matched but 142 vs 58 ms verify — not shipped.
+w=4: FFN ~34 ms, GDN ~21 ms. Stopped at ~58 t/s vs mlx.fast ~94.
+
 
 
 

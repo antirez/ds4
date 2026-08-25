@@ -30088,6 +30088,9 @@ extern "C" void ds4_gpu_set_concurrent_encoder(int on) { (void)on; }
  * the link fails. Returning 0 makes the caller take its documented failure
  * path instead of silently producing wrong activations. */
 extern "C" void ds4_gpu_qwen_set_gdn_snapshot(int enable) { (void)enable; }
+extern "C" void ds4_gpu_qwen_set_gdn_out(ds4_gpu_tensor *conv_out, ds4_gpu_tensor *state_out) {
+    (void)conv_out; (void)state_out;
+}
 extern "C" int ds4_gpu_interleave_rows_f32_tensor(
         ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
         uint32_t width, uint32_t rows, uint32_t slots, uint32_t slot) {

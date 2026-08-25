@@ -89,6 +89,7 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 void ds4_gpu_set_concurrent_encoder(int on);
 
+void ds4_gpu_qwen_set_gdn_out(ds4_gpu_tensor *conv_out, ds4_gpu_tensor *state_out);
 int ds4_gpu_qwen_gdn_core_tensor(
         ds4_gpu_tensor       *core,
         ds4_gpu_tensor       *conv,

@@ -19224,7 +19224,6 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 return 1;
             }
         }
-
         if (weight_type == DS4_METAL_TENSOR_Q4_64A &&
             n_tok == 4u &&
             (in_dim % 512u) == 0 &&
@@ -19913,8 +19912,8 @@ int ds4_gpu_matmul_q4_k_pair_swiglu_rows_tensor(
     if (weight_type == DS4_METAL_TENSOR_Q4_64A &&
         n_tok >= 2u && n_tok <= 8u && n_tok != 3u && n_tok != 5u &&
         (in_dim % 128u) == 0 && mid && x && model_map &&
-        getenv("DS4_METAL_Q4_64A_PAIR") &&
-        getenv("DS4_METAL_Q4_64A_PAIR")[0] == '1') {
+        !(getenv("DS4_METAL_Q4_64A_PAIR") &&
+          getenv("DS4_METAL_Q4_64A_PAIR")[0] == '0')) {
         if (!g_initialized && !ds4_gpu_init()) return 0;
         uint64_t row_bytes = 0;
         if (in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
@@ -20076,6 +20075,12 @@ void ds4_gpu_qwen_set_gdn_steps(ds4_gpu_tensor *conv_steps, ds4_gpu_tensor *stat
     g_qwen_gdn_conv_steps = conv_steps;
     g_qwen_gdn_state_steps = state_steps;
 }
+static ds4_gpu_tensor *g_qwen_gdn_conv_out;
+static ds4_gpu_tensor *g_qwen_gdn_state_out;
+void ds4_gpu_qwen_set_gdn_out(ds4_gpu_tensor *conv_out, ds4_gpu_tensor *state_out) {
+    g_qwen_gdn_conv_out = conv_out;
+    g_qwen_gdn_state_out = state_out;
+}
 static int g_qwen_gdn_snapshot;
 void ds4_gpu_qwen_set_gdn_snapshot(int enable) {
     g_qwen_gdn_snapshot = enable ? 1 : 0;
@@ -20220,6 +20225,10 @@ int ds4_gpu_qwen_gdn_core_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(qkv) offset:ds4_gpu_tensor_offset(qkv) atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(g_qwen_gdn_conv_steps ? g_qwen_gdn_conv_steps : conv)
                offset:ds4_gpu_tensor_offset(g_qwen_gdn_conv_steps ? g_qwen_gdn_conv_steps : conv) atIndex:5];
+        {
+            ds4_gpu_tensor *cout = g_qwen_gdn_conv_out ? g_qwen_gdn_conv_out : conv;
+            [enc setBuffer:ds4_gpu_tensor_buffer(cout) offset:ds4_gpu_tensor_offset(cout) atIndex:6];
+        }
         [enc dispatchThreads:MTLSizeMake(qkv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20241,6 +20250,10 @@ int ds4_gpu_qwen_gdn_core_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(core) offset:ds4_gpu_tensor_offset(core) atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state)
                offset:ds4_gpu_tensor_offset(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state) atIndex:10];
+        {
+            ds4_gpu_tensor *sout = g_qwen_gdn_state_out ? g_qwen_gdn_state_out : state;
+            [enc setBuffer:ds4_gpu_tensor_buffer(sout) offset:ds4_gpu_tensor_offset(sout) atIndex:11];
+        }
         [enc dispatchThreadgroups:MTLSizeMake(v_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -20441,6 +20454,10 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(qkv) offset:ds4_gpu_tensor_offset(qkv) atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(g_qwen_gdn_conv_steps ? g_qwen_gdn_conv_steps : conv)
                offset:ds4_gpu_tensor_offset(g_qwen_gdn_conv_steps ? g_qwen_gdn_conv_steps : conv) atIndex:5];
+        {
+            ds4_gpu_tensor *cout = g_qwen_gdn_conv_out ? g_qwen_gdn_conv_out : conv;
+            [enc setBuffer:ds4_gpu_tensor_buffer(cout) offset:ds4_gpu_tensor_offset(cout) atIndex:6];
+        }
         [enc dispatchThreads:MTLSizeMake(qkv_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20524,6 +20541,10 @@ int ds4_gpu_qwen_gdn_core_rows_tensor(
             [enc setBuffer:ds4_gpu_tensor_buffer(core) offset:ds4_gpu_tensor_offset(core) atIndex:9];
             [enc setBuffer:ds4_gpu_tensor_buffer(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state)
                    offset:ds4_gpu_tensor_offset(g_qwen_gdn_state_steps ? g_qwen_gdn_state_steps : state) atIndex:10];
+            {
+                ds4_gpu_tensor *sout = g_qwen_gdn_state_out ? g_qwen_gdn_state_out : state;
+                [enc setBuffer:ds4_gpu_tensor_buffer(sout) offset:ds4_gpu_tensor_offset(sout) atIndex:11];
+            }
             if (use_rows4) {
                 [enc dispatchThreadgroups:MTLSizeMake(32, v_heads, 1)
                      threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];

@@ -36,6 +36,7 @@ kernel void kernel_qwen_gdn_conv(
         device float * conv,
         device float * mixed,
         device float * conv_steps,
+        device float * conv_out,
         uint gid [[thread_position_in_grid]]) {
     if (gid >= args.n_channels) return;
     device float *h = conv + ((uint)args.layer * args.n_channels + gid) * QWEN_GDN_CONV_K;
@@ -44,20 +45,19 @@ kernel void kernel_qwen_gdn_conv(
     const uint layer_off = ((uint)args.layer * args.n_channels + gid) * QWEN_GDN_CONV_K;
     const uint n_layers = args.n_layers == 0u ? 64u : args.n_layers;
     const uint step_stride = n_layers * args.n_channels * QWEN_GDN_CONV_K;
+    float h0 = h[0], h1 = h[1], h2 = h[2], h3 = h[3];
     for (uint t = 0; t < ntok; t++) {
         const float x = qkv[t * args.n_channels + gid];
-        h[0] = h[1];
-        h[1] = h[2];
-        h[2] = h[3];
-        h[3] = x;
-        float acc = w[0]*h[0] + w[1]*h[1] + w[2]*h[2] + w[3]*h[3];
+        h0 = h1; h1 = h2; h2 = h3; h3 = x;
+        float acc = w[0]*h0 + w[1]*h1 + w[2]*h2 + w[3]*h3;
         mixed[t * args.n_channels + gid] = acc / (1.0f + exp(-acc));
         if (args.snapshot && ntok > 1u) {
             device float *hs = conv_steps + t * step_stride + layer_off;
-            hs[0] = h[0]; hs[1] = h[1]; hs[2] = h[2]; hs[3] = h[3];
+            hs[0] = h0; hs[1] = h1; hs[2] = h2; hs[3] = h3;
         }
-
     }
+    device float *ho = conv_out + layer_off;
+    ho[0] = h0; ho[1] = h1; ho[2] = h2; ho[3] = h3;
 }
 
 
@@ -74,6 +74,7 @@ kernel void kernel_qwen_gdn_core(
         device float * state,
         device float * core,
         device float * state_steps,
+        device float * state_out,
         uint3 tgpig [[threadgroup_position_in_grid]],
         uint  lid   [[thread_index_in_threadgroup]]) {
 
@@ -206,8 +207,10 @@ kernel void kernel_qwen_gdn_core(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+    device float *So = state_out + ((uint)args.layer * v_heads + vh) *
+                       QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM + j * QWEN_GDN_HEAD_DIM;
     for (uint i = 0; i < QWEN_GDN_HEAD_DIM; i += 4u)
-        *(device float4 *)(Sj + i) = float4(Srow[i], Srow[i + 1u], Srow[i + 2u], Srow[i + 3u]);
+        *(device float4 *)(So + i) = float4(Srow[i], Srow[i + 1u], Srow[i + 2u], Srow[i + 3u]);
 }
 // llama.cpp-style recurrent geometry: one 4-simdgroup threadgroup owns four
 // state rows, and each lane keeps only four contiguous state columns.
@@ -225,6 +228,7 @@ kernel void kernel_qwen_gdn_core_rows4(
         device float * state,
         device float * core,
         device float * state_steps,
+        device float * state_out,
         uint3 group [[threadgroup_position_in_grid]],
         uint3 tid [[thread_position_in_threadgroup]]) {
     (void)z;
@@ -288,7 +292,9 @@ kernel void kernel_qwen_gdn_core_rows4(
             *(device float4 *)(dst + i) = s;
         }
     }
-    *(device float4 *)(Sj + i) = s;
+    device float *So = state_out + ((uint)args.layer * v_heads + vh) *
+        QWEN_GDN_HEAD_DIM * QWEN_GDN_HEAD_DIM + j * QWEN_GDN_HEAD_DIM;
+    *(device float4 *)(So + i) = s;
 }
 
 kernel void kernel_qwen_gdn_qk_l2(
