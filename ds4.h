@@ -116,6 +116,7 @@ typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    DS4_TP_TRANSPORT_NHI,
 } ds4_tp_transport;
 
 typedef struct {
@@ -127,6 +128,8 @@ typedef struct {
     int leader_port;
     ds4_tp_transport transport;
     const char *rdma_device;
+    const char *nhi_device;     /* local thunderbolt-stream device path */
+    uint32_t nhi_ring_frames;   /* imported TX/RX ring geometry (default 4096) */
     int rdma_gid_index;
     bool rdma_gid_index_set;
     bool glm_token_prefill;
@@ -395,6 +398,9 @@ int ds4_token_assistant(ds4_engine *e);
  * with the caller. */
 struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
+/* Quiesce GPU gate users and release the engine-owned data plane while the
+ * TCP control object remains alive for ordered NHI teardown. */
+void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
@@ -487,6 +493,9 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+#ifndef DS4_NO_GPU
+int ds4_test_graph_deferred_dump_roundtrip(void);
+#endif
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

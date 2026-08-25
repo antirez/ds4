@@ -616,6 +616,32 @@ __global__ static void matmul_q8_0_f32_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* One-token K-slice projection for network TP.  X is compact (or starts at
+ * x_elem_off), while each quantized weight row keeps the full matrix stride. */
+__global__ static void matmul_q8_0_f32_kslice_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint64_t full_blocks,
+        uint64_t block0,
+        uint64_t blocks,
+        uint64_t out_dim,
+        uint64_t x_elem_off) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * full_blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const unsigned char *blk = wr + (block0 + b) * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        acc += d * (float)q * x[x_elem_off + b * 32u + lane];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
         float *out,
         const unsigned char *w,

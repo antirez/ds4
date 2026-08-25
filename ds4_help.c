@@ -254,7 +254,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     para(fp, c, "Tensor parallelism uses the same coordinator/worker addresses as distributed mode, but always runs one 50/50 worker. Add --tensor-parallel, omit --layers, start the worker, then start the coordinator.");
     fputc('\n', fp);
     opt(fp, c, "--tensor-parallel", "Switch --role/--listen/--coordinator to two-machine tensor parallelism.");
-    opt(fp, c, "--transport auto|rdma|tcp", "Tensor gate transport. Default: auto");
+    opt(fp, c, "--transport auto|rdma|tcp|nhi", "Tensor gate transport. ROCm NHI requires --nhi-device. Default: auto");
+    opt(fp, c, "--nhi-device PATH", "ROCm NHI tensor-gate device, for example /run/ds4-tbstream/device.");
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");

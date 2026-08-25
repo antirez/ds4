@@ -46,6 +46,8 @@
 #include "ds4_tp.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
+#if defined(__linux__) && defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#include "ds4_tp_nhi.h"
 #endif
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
@@ -15815,6 +15817,17 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  */
 
 enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
+enum { DS4_GRAPH_DEBUG_DEFERRED_MAX = DS4_MAX_LAYER * 4 };
+
+typedef struct {
+    const char *name;
+    uint64_t offset;
+    uint64_t count;
+    uint32_t layer;
+    uint32_t pos;
+    bool is_i32;
+    bool queued;
+} metal_graph_debug_deferred_capture;
 
 typedef struct {
     /* Class P — per-tier replicated kernel scratch buffers.
@@ -16104,6 +16117,17 @@ typedef struct {
     bool ssd_streaming_cold;
     bool streaming_static_decode_map_current;
     float *cpu_router_norm;
+
+    /* Optional one-token diagnostic snapshots. Selected replicated layer
+     * states are copied device-to-device in stream order and read only after
+     * the prefill/output command sequence completes. This avoids the
+     * synchronize/end/restart perturbation of the ordinary dump hooks. */
+    ds4_gpu_tensor *debug_deferred_arena;
+    metal_graph_debug_deferred_capture
+        debug_deferred[DS4_GRAPH_DEBUG_DEFERRED_MAX];
+    uint32_t debug_deferred_count;
+    bool debug_deferred_active;
+    bool debug_deferred_failed;
 
     /* Metal network tensor parallelism. These views alias engine-owned
      * transport slabs except tp_logits_half, whose view object is session-owned. */
@@ -16598,9 +16622,34 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    bool debug_deferred_queued = false;
+    for (uint32_t i = 0; i < g->debug_deferred_count; i++) {
+        if (g->debug_deferred[i].queued) {
+            debug_deferred_queued = true;
+            break;
+        }
+    }
+    if (g->debug_deferred_arena &&
+        g->debug_deferred_active && debug_deferred_queued &&
+        ds4_gpu_synchronize() == 0) {
+        /* Completion remains unknown. The queued D2D copies reference both
+         * the destination arena and graph-owned source workspaces. Return
+         * before invalidating graphs or freeing any GPU object; one-shot
+         * process/backend teardown reclaims the deliberately leaked graph. */
+        fprintf(stderr,
+                "ds4: quarantining entire graph after deferred capture "
+                "synchronization failure\n");
+        return;
+    }
     /* Captured decode-island graphs bake this graph's buffer addresses
-     * into their kernel nodes; retire them before the buffers go away. */
+     * into their kernel nodes; retire them only after deferred copies are
+     * known complete. */
     ds4_gpu_decode_graphs_invalidate();
+    ds4_gpu_tensor_free(g->debug_deferred_arena);
+    g->debug_deferred_arena = NULL;
+    g->debug_deferred_count = 0;
+    g->debug_deferred_active = false;
+    g->debug_deferred_failed = false;
     /* free every Class P slot across all DS4_MAX_GPUS tier
      * slots. Unallocated slots are NULL and ds4_gpu_tensor_free(NULL) is a
      * no-op. The hc_pre / hc_post / hc_comb views must be freed BEFORE
@@ -17046,8 +17095,10 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
  *
  * The release path calls these after important stages, but they are no-ops
  * unless DS4_METAL_GRAPH_DUMP_PREFIX or DS4_ROCM_GRAPH_DUMP_PREFIX is set.
- * Dumping synchronizes and restarts the command batch, so it is intentionally
- * isolated here.
+ * Ordinary dumping synchronizes and restarts the command batch, so it is
+ * intentionally isolated here. DS4_*_GRAPH_DUMP_DEFER_LAYER_STATE instead
+ * snapshots the four replicated one-token layer-state hooks device-to-device
+ * and writes them only after the prefill/output command sequence completes.
  */
 
 typedef struct {
@@ -17058,6 +17109,7 @@ typedef struct {
     uint32_t layer;
     int pos_set;
     uint32_t pos;
+    int defer_layer_state;
 } metal_graph_debug_config;
 
 static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
@@ -17084,6 +17136,9 @@ static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
             cfg.pos_set = 1;
             cfg.pos = (uint32_t)strtoul(pos_env, NULL, 10);
         }
+        cfg.defer_layer_state = glm_graph_env_present(
+                "DS4_ROCM_GRAPH_DUMP_DEFER_LAYER_STATE",
+                "DS4_METAL_GRAPH_DUMP_DEFER_LAYER_STATE");
     }
     return &cfg;
 }
@@ -17201,6 +17256,429 @@ static void metal_graph_debug_dump_i32_tensor(
         fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
+
+/* Release only after no copies were queued or their stream was successfully
+ * synchronized. Keeping this separate prevents a second, fallible synchronize
+ * from turning a successful flush into an unreported quarantine. */
+static void metal_graph_debug_deferred_release_quiesced(ds4_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor_free(g->debug_deferred_arena);
+    g->debug_deferred_arena = NULL;
+    memset(g->debug_deferred, 0, sizeof(g->debug_deferred));
+    g->debug_deferred_count = 0;
+    g->debug_deferred_active = false;
+    g->debug_deferred_failed = false;
+}
+
+static bool metal_graph_debug_deferred_discard(ds4_gpu_graph *g) {
+    if (!g) return true;
+    bool queued = false;
+    for (uint32_t i = 0; i < g->debug_deferred_count; i++) {
+        if (g->debug_deferred[i].queued) {
+            queued = true;
+            break;
+        }
+    }
+    if (queued && ds4_gpu_synchronize() == 0) {
+        g->debug_deferred_failed = true;
+        fprintf(stderr,
+                "ds4: deferred graph capture arena quarantined instead of "
+                "being freed after failed synchronization\n");
+        return false;
+    }
+    metal_graph_debug_deferred_release_quiesced(g);
+    return true;
+}
+
+static bool metal_graph_debug_deferred_names_valid(const char *names) {
+    if (!names || !names[0]) return false;
+    static const char *allowed[] = {
+        "hc_attn_post",
+        "ffn_moe_topk",
+        "ffn_moe_weights_scaled",
+        "hc_ffn_post",
+        "result_output",
+    };
+    const char *p = names;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        const size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        bool matched = false;
+        if (len == 0) return false;
+        for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+            if (strlen(allowed[i]) == len && memcmp(p, allowed[i], len) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return true;
+}
+
+static bool metal_graph_debug_deferred_begin_range(
+        ds4_gpu_graph *g,
+        uint32_t       pos,
+        uint32_t       n_tokens,
+        uint32_t       first_layer,
+        uint32_t       end_layer) {
+    if (!g) return false;
+    if (g->debug_deferred_arena &&
+        g->debug_deferred_active && g->debug_deferred_failed) {
+        fprintf(stderr,
+                "ds4: cannot reuse quarantined deferred graph capture arena\n");
+        return false;
+    }
+    if (!metal_graph_debug_deferred_discard(g)) return false;
+    const metal_graph_debug_config *cfg = metal_graph_debug_get_config();
+    if (!cfg->defer_layer_state) return true;
+    if (!metal_graph_debug_deferred_names_valid(cfg->name)) {
+        fprintf(stderr,
+                "ds4: deferred graph layer-state dump name list contains "
+                "an unsupported or empty entry\n");
+        return false;
+    }
+    if (DS4_MODEL_VARIANT != DS4_VARIANT_FLASH ||
+        DS4_N_HC == 0 || DS4_N_EXPERT_USED == 0) {
+        fprintf(stderr,
+                "ds4: deferred graph layer-state dump supports only the "
+                "Flash replicated-HC graph\n");
+        return false;
+    }
+    if (n_tokens != 1u || pos != 0u || g_n_gpus != 1 ||
+        first_layer >= end_layer || end_layer > (uint32_t)DS4_N_LAYER) {
+        fprintf(stderr,
+                "ds4: deferred graph layer-state dump requires one token "
+                "at position zero, one local GPU, and a valid layer range "
+                "(tokens=%u pos=%u gpus=%d layers=%u:%u/%u)\n",
+                n_tokens, pos, g_n_gpus, first_layer, end_layer,
+                (uint32_t)DS4_N_LAYER);
+        return false;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const struct {
+        const char *name;
+        uint64_t count;
+        bool is_i32;
+    } specs[] = {
+        {"hc_attn_post", hc_dim, false},
+        {"ffn_moe_topk", DS4_N_EXPERT_USED, true},
+        {"ffn_moe_weights_scaled", DS4_N_EXPERT_USED, false},
+        {"hc_ffn_post", hc_dim, false},
+    };
+    uint64_t total_bytes = 0;
+    for (uint32_t il = first_layer; il < end_layer; il++) {
+        for (size_t si = 0; si < sizeof(specs) / sizeof(specs[0]); si++) {
+            if (!metal_graph_debug_wants(specs[si].name, il, pos)) continue;
+            if (g->debug_deferred_count >= DS4_GRAPH_DEBUG_DEFERRED_MAX ||
+                specs[si].count > UINT64_MAX / sizeof(uint32_t)) {
+                metal_graph_debug_deferred_discard(g);
+                return false;
+            }
+            const uint64_t bytes = specs[si].count * sizeof(uint32_t);
+            if (total_bytes > UINT64_MAX - bytes) {
+                metal_graph_debug_deferred_discard(g);
+                return false;
+            }
+            metal_graph_debug_deferred_capture *cap =
+                &g->debug_deferred[g->debug_deferred_count++];
+            cap->name = specs[si].name;
+            cap->offset = total_bytes;
+            cap->count = specs[si].count;
+            cap->layer = il;
+            cap->pos = pos;
+            cap->is_i32 = specs[si].is_i32;
+            total_bytes += bytes;
+        }
+    }
+    if (total_bytes != 0) {
+        g->debug_deferred_arena = ds4_gpu_tensor_alloc(total_bytes);
+        if (!g->debug_deferred_arena) {
+            metal_graph_debug_deferred_discard(g);
+            return false;
+        }
+    }
+    g->debug_deferred_active = true;
+    fprintf(stderr,
+            "ds4: deferred graph layer-state dump armed entries=%u bytes=%llu "
+            "layers=%u:%u\n",
+            g->debug_deferred_count, (unsigned long long)total_bytes,
+            first_layer, end_layer);
+    return true;
+}
+
+static bool metal_graph_debug_deferred_begin(
+        ds4_gpu_graph *g,
+        uint32_t       pos,
+        uint32_t       n_tokens) {
+    return metal_graph_debug_deferred_begin_range(
+            g, pos, n_tokens, 0, (uint32_t)DS4_N_LAYER);
+}
+
+static bool metal_graph_debug_deferred_queue(
+        ds4_gpu_graph *g,
+        const char *name,
+        ds4_gpu_tensor *t,
+        uint64_t count,
+        uint32_t il,
+        uint32_t pos,
+        bool is_i32) {
+    if (!g || !name || !t || count == 0 ||
+        !g->debug_deferred_active || !g->debug_deferred_arena) {
+        if (g) g->debug_deferred_failed = true;
+        fprintf(stderr,
+                "ds4: deferred graph capture reached without an active plan "
+                "for %s layer %u pos %u\n",
+                name ? name : "(null)", il, pos);
+        return false;
+    }
+    for (uint32_t i = 0; i < g->debug_deferred_count; i++) {
+        metal_graph_debug_deferred_capture *cap = &g->debug_deferred[i];
+        if (cap->layer != il || cap->pos != pos || cap->is_i32 != is_i32 ||
+            strcmp(cap->name, name) != 0) {
+            continue;
+        }
+        if (cap->queued || cap->count != count) {
+            g->debug_deferred_failed = true;
+            return false;
+        }
+        const uint64_t bytes = count * sizeof(uint32_t);
+        if (ds4_gpu_tensor_copy(g->debug_deferred_arena, cap->offset,
+                                t, 0, bytes) == 0) {
+            g->debug_deferred_failed = true;
+            return false;
+        }
+        cap->queued = true;
+        return true;
+    }
+    g->debug_deferred_failed = true;
+    return false;
+}
+
+static bool metal_graph_debug_capture_f32_tensor(
+        ds4_gpu_graph *g,
+        const char *name,
+        ds4_gpu_tensor *t,
+        uint64_t count,
+        uint32_t il,
+        uint32_t pos) {
+    if (!metal_graph_debug_wants(name, il, pos)) return true;
+    if (!metal_graph_debug_get_config()->defer_layer_state) {
+        metal_graph_debug_dump_tensor(name, t, count, il, pos);
+        return true;
+    }
+    return metal_graph_debug_deferred_queue(g, name, t, count, il, pos, false);
+}
+
+static bool metal_graph_debug_capture_i32_tensor(
+        ds4_gpu_graph *g,
+        const char *name,
+        ds4_gpu_tensor *t,
+        uint64_t count,
+        uint32_t il,
+        uint32_t pos) {
+    if (!metal_graph_debug_wants(name, il, pos)) return true;
+    if (!metal_graph_debug_get_config()->defer_layer_state) {
+        metal_graph_debug_dump_i32_tensor(name, t, count, il, pos);
+        return true;
+    }
+    return metal_graph_debug_deferred_queue(g, name, t, count, il, pos, true);
+}
+
+static bool metal_graph_debug_deferred_has_queued(
+        const ds4_gpu_graph *g) {
+    if (!g) return false;
+    for (uint32_t i = 0; i < g->debug_deferred_count; i++) {
+        if (g->debug_deferred[i].queued) return true;
+    }
+    return false;
+}
+
+static void metal_graph_debug_deferred_abort(ds4_gpu_graph *g) {
+    if (!g || !g->debug_deferred_active) return;
+    if (!metal_graph_debug_deferred_has_queued(g)) {
+        metal_graph_debug_deferred_release_quiesced(g);
+        return;
+    }
+    if (ds4_gpu_synchronize() != 0) {
+        metal_graph_debug_deferred_release_quiesced(g);
+        return;
+    }
+    g->debug_deferred_failed = true;
+    fprintf(stderr,
+            "ds4: deferred graph capture arena quarantined after failed "
+            "error-path synchronization\n");
+}
+
+static bool metal_graph_debug_deferred_flush(ds4_gpu_graph *g) {
+    if (!g) return false;
+    if (!g->debug_deferred_active) return true;
+    bool ok = !g->debug_deferred_failed;
+    if (g->debug_deferred_count != 0 && !g->debug_deferred_arena) ok = false;
+    if (g->debug_deferred_count != 0 && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize deferred graph layer-state dump; arena quarantined\n");
+        g->debug_deferred_failed = true;
+        return false;
+    }
+
+    uint64_t max_count = 0;
+    for (uint32_t i = 0; i < g->debug_deferred_count; i++) {
+        if (g->debug_deferred[i].count > max_count)
+            max_count = g->debug_deferred[i].count;
+    }
+    if (max_count > SIZE_MAX / sizeof(uint32_t)) ok = false;
+    uint32_t *buf = max_count && max_count <= SIZE_MAX / sizeof(uint32_t) ?
+                    xmalloc((size_t)max_count * sizeof(buf[0])) : NULL;
+    for (uint32_t i = 0; i < g->debug_deferred_count; i++) {
+        const metal_graph_debug_deferred_capture *cap = &g->debug_deferred[i];
+        if (!cap->queued) {
+            fprintf(stderr,
+                    "ds4: missing deferred graph capture %s layer %u pos %u\n",
+                    cap->name, cap->layer, cap->pos);
+            ok = false;
+            continue;
+        }
+        const uint64_t bytes = cap->count * sizeof(buf[0]);
+        if (ds4_gpu_tensor_read(g->debug_deferred_arena, cap->offset,
+                                buf, bytes) == 0) {
+            fprintf(stderr,
+                    "ds4: failed to read deferred graph capture %s layer %u pos %u\n",
+                    cap->name, cap->layer, cap->pos);
+            ok = false;
+            continue;
+        }
+        const char *prefix = metal_graph_debug_prefix_for(
+                cap->name, cap->layer, cap->pos);
+        if (!prefix) {
+            ok = false;
+            continue;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.%s",
+                 prefix, cap->name, cap->layer, cap->pos,
+                 cap->is_i32 ? "i32" : "bin");
+        bool wrote = false;
+        if (cap->is_i32) {
+            FILE *fp = fopen(path, "wb");
+            if (fp) {
+                wrote = fwrite(buf, sizeof(int32_t), (size_t)cap->count, fp) ==
+                        (size_t)cap->count;
+                if (fclose(fp) != 0) wrote = false;
+            }
+        } else {
+            wrote = write_f32_binary_file(path, (const float *)buf, cap->count);
+        }
+        if (!wrote) {
+            fprintf(stderr,
+                    "ds4: failed to write deferred graph capture %s layer %u pos %u\n",
+                    cap->name, cap->layer, cap->pos);
+            ok = false;
+            continue;
+        }
+        fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s (deferred)\n",
+                cap->name, cap->layer, cap->pos, path);
+    }
+    free(buf);
+    /* The synchronization above proved both arena and source workspaces
+     * quiescent, so release without introducing a second failure point. */
+    metal_graph_debug_deferred_release_quiesced(g);
+    return ok;
+}
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_graph_deferred_dump_roundtrip(void) {
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    const int saved_n_gpus = g_n_gpus;
+    g_n_gpus = 1;
+    bool ok = !metal_graph_debug_deferred_begin(&g, 0, 2) &&
+              !metal_graph_debug_deferred_begin(&g, 1, 1);
+    g_n_gpus = 2;
+    ok = ok && !metal_graph_debug_deferred_begin(&g, 0, 1);
+    g_n_gpus = 1;
+    if (ok) ok = metal_graph_debug_deferred_begin_range(&g, 0, 1, 10, 12);
+    if (ok) {
+        const uint64_t subset_bytes = 2u *
+            (2u * (uint64_t)DS4_N_HC * DS4_N_EMBD +
+             2u * (uint64_t)DS4_N_EXPERT_USED) * sizeof(uint32_t);
+        ok = g.debug_deferred_count == 8u &&
+             ds4_gpu_tensor_bytes(g.debug_deferred_arena) == subset_bytes;
+    }
+    metal_graph_debug_deferred_discard(&g);
+    const uint64_t hc_count = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t topk_count = DS4_N_EXPERT_USED;
+    ds4_gpu_tensor *hc_attn = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+    ds4_gpu_tensor *hc_ffn = ds4_gpu_tensor_alloc(hc_count * sizeof(float));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(topk_count * sizeof(float));
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(topk_count * sizeof(int32_t));
+    int32_t topk_host[DS4_MAX_EXPERT_USED];
+    ok = ok && hc_attn && hc_ffn && weights && topk &&
+              topk_count <= DS4_MAX_EXPERT_USED &&
+              ds4_gpu_tensor_fill_f32(hc_attn, 1.25f, hc_count) != 0 &&
+              ds4_gpu_tensor_fill_f32(hc_ffn, -2.5f, hc_count) != 0 &&
+              ds4_gpu_tensor_fill_f32(weights, 0.125f, topk_count) != 0;
+    for (uint32_t i = 0; i < topk_count && i < DS4_MAX_EXPERT_USED; i++)
+        topk_host[i] = (int32_t)i;
+    if (ok) {
+        ok = ds4_gpu_tensor_write(topk, 0, topk_host,
+                                  topk_count * sizeof(topk_host[0])) != 0;
+    }
+    if (ok) ok = metal_graph_debug_deferred_begin(&g, 0, 1);
+    if (ok) {
+        ok = g.debug_deferred_count == (uint32_t)DS4_N_LAYER * 4u &&
+             ds4_gpu_tensor_bytes(g.debug_deferred_arena) ==
+                 (uint64_t)DS4_N_LAYER *
+                 (2u * hc_count + 2u * topk_count) * sizeof(uint32_t);
+    }
+    bool commands_open = false;
+    if (ok) {
+        ok = ds4_gpu_begin_commands() != 0;
+        commands_open = ok;
+    }
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+#ifdef DS4_ROCM_BUILD
+        /* Prove stream ordering rather than merely copying immutable sources:
+         * each queued snapshot must retain this layer's value after the same
+         * source tensor is overwritten for the next layer. */
+        ok = ds4_gpu_tensor_fill_f32(hc_attn, 1.25f + (float)il,
+                                     hc_count) != 0 &&
+             ds4_gpu_tensor_fill_f32(hc_ffn, -2.5f - (float)il,
+                                     hc_count) != 0 &&
+             ds4_gpu_tensor_fill_f32(weights, 0.125f + (float)il,
+                                     topk_count) != 0;
+#endif
+        ok = ok && metal_graph_debug_capture_f32_tensor(
+                &g, "hc_attn_post", hc_attn, hc_count, il, 0) &&
+             metal_graph_debug_capture_i32_tensor(
+                &g, "ffn_moe_topk", topk, topk_count, il, 0) &&
+             metal_graph_debug_capture_f32_tensor(
+                &g, "ffn_moe_weights_scaled", weights, topk_count, il, 0) &&
+             metal_graph_debug_capture_f32_tensor(
+                &g, "hc_ffn_post", hc_ffn, hc_count, il, 0);
+    }
+    if (commands_open) {
+        const bool end_ok = ds4_gpu_end_commands() != 0;
+        commands_open = false;
+        ok = ok && end_ok;
+    }
+    if (ok) ok = metal_graph_debug_deferred_flush(&g);
+    else if (!metal_graph_debug_deferred_discard(&g)) {
+        /* Preserve both queued-copy sources and destination when the failure
+         * oracle cannot establish quiescence. Process teardown reclaims them. */
+        g_n_gpus = saved_n_gpus;
+        return 0;
+    }
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(hc_ffn);
+    ds4_gpu_tensor_free(hc_attn);
+    g_n_gpus = saved_n_gpus;
+    return ok ? 1 : 0;
+}
+#endif
 
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
@@ -22814,6 +23292,15 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
 
     bool ok = true;
+    bool tp_failure_logged = false;
+#define DS4_TP_DECODE_STAGE_CHECK(stage_name) do {                              \
+        if (!ok && g->tp_world == 2 && !tp_failure_logged) {                    \
+            fprintf(stderr,                                                     \
+                    "ds4: TP decode failed layer=%u pos=%u stage=%s rank=%u\n", \
+                    il, pos, (stage_name), g->tp_rank);                          \
+            tp_failure_logged = true;                                            \
+        }                                                                        \
+    } while (0)
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
     const bool fuse_shared_gate_up =
@@ -24563,6 +25050,7 @@ static bool metal_graph_encode_decode_layer_phase(
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
+    DS4_TP_DECODE_STAGE_CHECK("attn_output");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", metal_graph_attn_low(g), (uint64_t)n_groups * rank, il, pos);
     }
@@ -24598,8 +25086,11 @@ static bool metal_graph_encode_decode_layer_phase(
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
+    DS4_TP_DECODE_STAGE_CHECK("attn_hc_post");
     if (ok) {
-        metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_after_attn_hc(g), hc_dim, il, pos);
+        ok = metal_graph_debug_capture_f32_tensor(
+                g, "hc_attn_post", metal_graph_after_attn_hc(g),
+                hc_dim, il, pos);
     }
     bool ffn_hc_producer_pre_norm_fused = false;
     if (ok && !tp_ablate_hcpre) {
@@ -24741,6 +25232,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                        layer->hc_ffn_base->abs_offset);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
+    DS4_TP_DECODE_STAGE_CHECK("ffn_hc_pre");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", metal_graph_hc_mix(g), mix_hc, il, pos);
         metal_graph_debug_dump_tensor("hc_ffn_pre_weights", metal_graph_hc_pre(g), DS4_N_HC, il, pos);
@@ -24755,6 +25247,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
+    DS4_TP_DECODE_STAGE_CHECK("ffn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", metal_graph_ffn_norm(g), DS4_N_EMBD, il, pos);
     }
@@ -24905,12 +25398,19 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    g);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
+    DS4_TP_DECODE_STAGE_CHECK("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_router_probs(g), DS4_N_EXPERT, il, pos);
-        metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_router_selected(g), DS4_N_EXPERT_USED, il, pos);
-        metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_router_weights(g), DS4_N_EXPERT_USED, il, pos);
+        ok = metal_graph_debug_capture_i32_tensor(
+                g, "ffn_moe_topk", metal_graph_router_selected(g),
+                DS4_N_EXPERT_USED, il, pos);
+        if (ok) {
+            ok = metal_graph_debug_capture_f32_tensor(
+                    g, "ffn_moe_weights_scaled", metal_graph_router_weights(g),
+                    DS4_N_EXPERT_USED, il, pos);
+        }
     }
     if (phase == METAL_DECODE_LAYER_TO_ROUTER) return ok;
     }
@@ -25537,7 +26037,9 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
         if (ok) {
-            metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
+            ok = metal_graph_debug_capture_f32_tensor(
+                    g, "hc_ffn_post", metal_graph_after_ffn_hc(g),
+                    hc_dim, il, pos);
         }
         return ok;
     }
@@ -25735,7 +26237,9 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
         if (ok) {
-            metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
+            ok = metal_graph_debug_capture_f32_tensor(
+                    g, "hc_ffn_post", metal_graph_after_ffn_hc(g),
+                    hc_dim, il, pos);
         }
         return ok;
     }
@@ -25999,6 +26503,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    DS4_TP_DECODE_STAGE_CHECK("shared_gate_up");
     if (ok && cuda_tp_ep_reduce_deferred) {
         ok = metal_graph_cuda_tp_ep_finish_reduce(
                 g,
@@ -26145,6 +26650,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    1);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+    DS4_TP_DECODE_STAGE_CHECK("shared_down");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", metal_graph_shared_out(g), DS4_N_EMBD, il, pos);
     }
@@ -26173,6 +26679,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 il,
                 false) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe_folded");
+        DS4_TP_DECODE_STAGE_CHECK("routed_moe_folded");
     }
     ds4_gpu_tensor *tp_ffn_a = NULL;    /* rank0/rank1 partials consumed */
     ds4_gpu_tensor *tp_ffn_b = NULL;    /* directly by the HC expand */
@@ -26206,6 +26713,7 @@ static bool metal_graph_encode_decode_layer_phase(
             }
         }
     }
+    DS4_TP_DECODE_STAGE_CHECK("ffn_gate");
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(metal_graph_ffn_out(g),
@@ -26244,9 +26752,13 @@ static bool metal_graph_encode_decode_layer_phase(
                                                   DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+    DS4_TP_DECODE_STAGE_CHECK("ffn_hc_post");
+#undef DS4_TP_DECODE_STAGE_CHECK
 #undef DS4_METAL_PROFILE_DECODE_STAGE
     if (ok) {
-        metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
+        ok = metal_graph_debug_capture_f32_tensor(
+                g, "hc_ffn_post", metal_graph_after_ffn_hc(g),
+                hc_dim, il, pos);
     }
     return ok;
 }
@@ -31218,8 +31730,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                             DS4_N_HC) != 0;
     }
     if (ok) {
-        metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_batch_after_attn_hc(g),
-                                      (uint64_t)n_tokens * hc_dim, il, pos0);
+        ok = metal_graph_debug_capture_f32_tensor(
+                g, "hc_attn_post", metal_graph_batch_after_attn_hc(g),
+                (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_attn_out);
@@ -31435,10 +31948,15 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_probs", metal_graph_batch_router_probs(g),
                                       (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
-        metal_graph_debug_dump_i32_tensor("ffn_moe_topk", metal_graph_batch_router_selected(g),
-                                          (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
-        metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_batch_router_weights(g),
-                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+        ok = metal_graph_debug_capture_i32_tensor(
+                g, "ffn_moe_topk", metal_graph_batch_router_selected(g),
+                (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+        if (ok) {
+            ok = metal_graph_debug_capture_f32_tensor(
+                    g, "ffn_moe_weights_scaled",
+                    metal_graph_batch_router_weights(g),
+                    (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+        }
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
@@ -31898,8 +32416,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
     if (ok) {
-        metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_batch_next_hc(g),
-                                      (uint64_t)n_tokens * hc_dim, il, pos0);
+        ok = metal_graph_debug_capture_f32_tensor(
+                g, "hc_ffn_post", metal_graph_batch_next_hc(g),
+                (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_ffn_x);
@@ -31958,6 +32477,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
     }
+    if (!metal_graph_debug_deferred_begin(g, pos, 1)) return false;
 
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
@@ -32045,8 +32565,10 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after batched SSD streaming graph eval failure also failed\n");
             }
+            metal_graph_debug_deferred_abort(g);
+            return false;
         }
-        return ok;
+        return metal_graph_debug_deferred_flush(g);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
 
@@ -32124,8 +32646,10 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
         }
+        metal_graph_debug_deferred_abort(g);
+        return false;
     }
-    return ok;
+    return metal_graph_debug_deferred_flush(g);
 }
 
 /* Execute one Metal decode token and read back logits. */
@@ -32139,6 +32663,7 @@ static bool metal_graph_eval_token_raw_swa(
     if (g && g->ssd_streaming) {
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
+    if (!metal_graph_debug_deferred_begin(g, pos, 1)) return false;
 
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
@@ -32176,8 +32701,10 @@ static bool metal_graph_eval_token_raw_swa(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
         }
+        metal_graph_debug_deferred_abort(g);
+        return false;
     }
-    return ok;
+    return metal_graph_debug_deferred_flush(g);
 }
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
@@ -36114,6 +36641,8 @@ static bool metal_graph_prefill_layer_major(
                                                         display_progress_ud);
     }
 
+    if (!metal_graph_debug_deferred_begin(g, start, n_tokens)) return false;
+
     if (!split_commands) {
         ok = g->prefill_has_visual ?
             metal_graph_upload_visual_prompt_embeddings_hc(
@@ -36181,6 +36710,7 @@ static bool metal_graph_prefill_layer_major(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after whole-prefill graph failure also failed\n");
             }
+            metal_graph_debug_deferred_discard(g);
             return false;
         }
 #ifdef __APPLE__
@@ -36201,12 +36731,16 @@ static bool metal_graph_prefill_layer_major(
                     (t_read - t_before_read) * 1000.0,
                     (t_read - t0) * 1000.0);
         }
-        return ok;
+        const bool deferred_ok = metal_graph_debug_deferred_flush(g);
+        return ok && deferred_ok;
     }
 
     if (g->ssd_streaming) {
         g->streaming_static_decode_map_current = false;
-        if (!metal_graph_stream_map_token(model, weights)) return false;
+        if (!metal_graph_stream_map_token(model, weights)) {
+            metal_graph_debug_deferred_discard(g);
+            return false;
+        }
     }
     metal_graph_stream_prefill_selected_profile_reset(g);
     metal_graph_stream_prepare_slot layer_prepare_slots[DS4_STREAM_PREFILL_MAX_PREPARE_AHEAD];
@@ -36252,6 +36786,7 @@ static bool metal_graph_prefill_layer_major(
                                                             layer_selected_addr,
                                                             layer_prepare_slots,
                                                             layer_prepare_ahead)) {
+                metal_graph_debug_deferred_discard(g);
                 return false;
             }
         } else {
@@ -36270,6 +36805,7 @@ static bool metal_graph_prefill_layer_major(
                                                         weights,
                                                         0,
                                                         n_tokens)) {
+        metal_graph_debug_deferred_discard(g);
         return false;
     }
 #endif
@@ -36306,6 +36842,7 @@ static bool metal_graph_prefill_layer_major(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill embed failure also failed\n");
         }
+        metal_graph_debug_deferred_discard(g);
         return false;
     }
 
@@ -36607,6 +37144,7 @@ static bool metal_graph_prefill_layer_major(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
             }
+            metal_graph_debug_deferred_discard(g);
             return false;
         }
         graph_power_note_prefill_layer(g, il, layer_elapsed);
@@ -36633,6 +37171,7 @@ static bool metal_graph_prefill_layer_major(
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
         }
+        metal_graph_debug_deferred_discard(g);
         return false;
     }
 #ifdef __APPLE__
@@ -36653,15 +37192,21 @@ static bool metal_graph_prefill_layer_major(
      */
     if (g->ssd_streaming &&
         !ds4_gpu_stream_expert_cache_finish_pending_batch()) {
+        (void)ds4_gpu_synchronize();
+        metal_graph_debug_deferred_discard(g);
         return false;
     }
     (void)ds4_gpu_stream_expert_cache_release_layer_cache();
     if (g->ssd_streaming) ds4_gpu_release_q8_f16_cache();
 #endif
     if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
+        (void)ds4_gpu_synchronize();
+        metal_graph_debug_deferred_discard(g);
         return false;
     }
     if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
+        (void)ds4_gpu_synchronize();
+        metal_graph_debug_deferred_discard(g);
         return false;
     }
 
@@ -36712,7 +37257,11 @@ static bool metal_graph_prefill_layer_major(
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc_by_tier[g->active_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
+    if (!ok) {
+        (void)ds4_gpu_synchronize();
+        metal_graph_debug_deferred_discard(g);
+        return false;
+    }
 
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {
@@ -36736,7 +37285,8 @@ static bool metal_graph_prefill_layer_major(
                 (t_read - t_before_read) * 1000.0,
                 (t_read - t0) * 1000.0);
     }
-    return ok;
+    const bool deferred_ok = metal_graph_debug_deferred_flush(g);
+    return ok && deferred_ok;
 }
 
 static bool metal_graph_prefill_raw_swa(
@@ -38668,6 +39218,9 @@ typedef struct {
     ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
     ds4_gpu_tensor **batch_in_views;
     ds4_gpu_tensor *zero_vec;
+#if defined(__linux__) && defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    ds4_tp_nhi *nhi;
+#endif
     uint64_t eval_seq;          /* leader: mirrored eval counter */
     uint64_t next_session_id;   /* leader: stable worker-session handle */
     int rank;
@@ -54089,18 +54642,78 @@ static void ds4_release_instance_lock(void) {
     }
 }
 
+/* Root diagnostics launched through sudo may intentionally reuse the normal
+ * service user's lock. Other cross-uid files are rejected: accepting them in
+ * sticky /tmp would let an unrelated user choose or replace the lock inode. */
+static int ds4_instance_lock_owner_allowed(uid_t owner) {
+    const uid_t euid = geteuid();
+    if (owner == euid) return 1;
+    if (euid != 0) return 0;
+
+    const char *text = getenv("SUDO_UID");
+    if (!text || !text[0]) return 0;
+    errno = 0;
+    char *end = NULL;
+    const unsigned long value = strtoul(text, &end, 10);
+    const uid_t sudo_uid = (uid_t)value;
+    return errno == 0 && end != text && *end == '\0' &&
+           (unsigned long)sudo_uid == value && owner == sudo_uid;
+}
+
+static int ds4_instance_lock_stat_safe(const struct stat *st) {
+    if (!S_ISREG(st->st_mode)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (st->st_nlink != 1) {
+        errno = EMLINK;
+        return 0;
+    }
+    if ((st->st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        !ds4_instance_lock_owner_allowed(st->st_uid)) {
+        errno = EACCES;
+        return 0;
+    }
+    return 1;
+}
+
+/* Open an existing lock without O_CREAT first. Linux protected_regular can
+ * reject O_CREAT in sticky /tmp when a safe lock belongs to the sudo caller.
+ * O_NOFOLLOW plus the post-flock inode check ensure ftruncate never follows a
+ * pathname-selected symlink or a pre-open replacement. */
+static int ds4_open_instance_lock(const char *path) {
+    const int flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC;
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        int fd = open(path, flags);
+        if (fd >= 0) return fd;
+        if (errno != ENOENT) return -1;
+
+        fd = open(path, flags | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) return -1;
+    }
+    errno = EAGAIN;
+    return -1;
+}
+
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
-    const int fd = open(path, O_RDWR | O_CREAT, 0600);
+    const int fd = ds4_open_instance_lock(path);
     if (fd < 0) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
         exit(2);
     }
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    struct stat fd_st;
+    if (fstat(fd, &fd_st) != 0 || !ds4_instance_lock_stat_safe(&fd_st)) {
+        const int saved = errno;
+        fprintf(stderr, "ds4: unsafe lock file %s: %s\n", path, strerror(saved));
+        close(fd);
+        exit(2);
+    }
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
@@ -54125,6 +54738,19 @@ static void ds4_acquire_instance_lock(void) {
         exit(2);
     }
 
+    struct stat path_st;
+    errno = 0;
+    if (fstat(fd, &fd_st) != 0 || !ds4_instance_lock_stat_safe(&fd_st) ||
+        fstatat(AT_FDCWD, path, &path_st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(path_st.st_mode) || path_st.st_dev != fd_st.st_dev ||
+        path_st.st_ino != fd_st.st_ino) {
+        int saved = errno;
+        if (saved == 0) saved = ESTALE;
+        fprintf(stderr, "ds4: lock file changed while opening %s: %s\n",
+                path, strerror(saved));
+        close(fd);
+        exit(2);
+    }
     if (ftruncate(fd, 0) != 0) {
         fprintf(stderr, "ds4: failed to truncate lock file %s: %s\n", path, strerror(errno));
         close(fd);
@@ -64483,42 +65109,176 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && defined(__linux__) && defined(DS4_ROCM_BUILD)
+static void *ds4_engine_tp_nhi_tx_slot(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    return e && e->tp.nhi ? ds4_tp_nhi_tx_slot(e->tp.nhi, seq) : NULL;
+}
+
+static const void *ds4_engine_tp_nhi_rx_slot(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    return e && e->tp.nhi ? ds4_tp_nhi_rx_slot(e->tp.nhi, seq) : NULL;
+}
+
+static int ds4_engine_tp_nhi_acquire_tx(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    char err[256] = "";
+    const int ok = e && e->tp.nhi &&
+        ds4_tp_nhi_acquire_tx(e->tp.nhi, seq, err, sizeof(err));
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: NHI TX acquire failed at seq %llu: %s\n",
+                (unsigned long long)seq, err[0] ? err : "transport closed");
+        if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+    }
+    return ok;
+}
+
+static int ds4_engine_tp_nhi_submit(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    char err[256] = "";
+    const int ok = e && e->tp.nhi &&
+        ds4_tp_nhi_submit(e->tp.nhi, seq, err, sizeof(err));
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: NHI submit failed at seq %llu: %s\n",
+                (unsigned long long)seq, err[0] ? err : "transport closed");
+        if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+    }
+    return ok;
+}
+
+static int ds4_engine_tp_nhi_consumed(void *ud, uint64_t seq) {
+    ds4_engine *e = ud;
+    char err[256] = "";
+    const int ok = e && e->tp.nhi &&
+        ds4_tp_nhi_consumed(e->tp.nhi, seq, err, sizeof(err)) &&
+        !ds4_tp_nhi_peer_closed(e->tp.nhi);
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: NHI RX release failed at seq %llu: %s\n",
+                (unsigned long long)seq, err[0] ? err : "peer closed");
+        if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+    }
+    return ok;
+}
+
+static void ds4_engine_tp_nhi_failed(void *ud) {
+    ds4_engine *e = ud;
+    if (e && e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+}
+#endif
+
+#ifndef DS4_NO_GPU
+static void ds4_engine_tp_release_resources(ds4_engine *e) {
+    if (!e) return;
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    if (e->tp.active || e->tp.slab) ds4_gpu_tp_shutdown();
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    if (e->tp.nhi) {
+        char err[256] = "";
+        if (!ds4_tp_nhi_quiesce(e->tp.nhi, err, sizeof(err))) {
+            fprintf(stderr, "ds4-tp: NHI quiesce failed: %s\n",
+                    err[0] ? err : "unknown error");
+            if (e->tp.ctx) ds4_tp_mark_failed(e->tp.ctx);
+        }
+        ds4_tp_nhi_close(e->tp.nhi);
+    }
+#endif
+    const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
+    for (uint32_t i = 0; i < slots; i++) {
+        if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
+        if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
+    }
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
+        if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
+        if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
+    }
+    free(e->tp.batch_out_views);
+    free(e->tp.batch_in_views);
+    free(e->tp.out_views);
+    free(e->tp.in_views);
+    ds4_gpu_tensor_free(e->tp.zero_vec);
+    ds4_gpu_tensor_free(e->tp.slab);
+    memset(&e->tp, 0, sizeof(e->tp));
+}
+#endif
+
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+#ifdef DS4_NO_GPU
     (void)e; (void)tp;
-    snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+    snprintf(err, errlen, "tensor parallelism requires a GPU backend");
     return 0;
 #else
-    if (e->backend != DS4_BACKEND_METAL) {
-        snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+    if (!e || !tp) {
+        snprintf(err, errlen, "invalid tensor-parallel bind");
         return 0;
     }
-    if (e->tp.active) {
+    bool metal = false;
+    bool rocm_nhi = false;
+#ifdef __APPLE__
+    metal = e->backend == DS4_BACKEND_METAL && !ds4_tp_is_nhi(tp);
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    rocm_nhi = e->backend == DS4_BACKEND_CUDA && ds4_tp_is_nhi(tp);
+#endif
+    if (!metal && !rocm_nhi) {
+        snprintf(err, errlen, "unsupported tensor-parallel backend/transport");
+        return 0;
+    }
+    if (rocm_nhi && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        snprintf(err, errlen, "ROCm/NHI tensor parallelism initially supports DS4 decode only");
+        return 0;
+    }
+    if (e->tp.active || e->tp.slab) {
         snprintf(err, errlen, "tensor parallelism already bound");
         return 0;
     }
+
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    const uint64_t slab_bytes =
+        ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    e->tp.ctx = tp;
+    e->tp.rank = ds4_tp_rank(tp);
     e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
-    e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
-    e->tp.batch_in_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
-    if (!e->tp.batch_out_views || !e->tp.batch_in_views) {
-        snprintf(err, errlen, "tp: batch view table allocation failed");
-        return 0;
-    }
-    if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views || !e->tp.in_views) {
+    e->tp.batch_out_views =
+        calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
+    e->tp.batch_in_views =
+        calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
+    if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views ||
+        !e->tp.in_views || !e->tp.batch_out_views ||
+        !e->tp.batch_in_views) {
         snprintf(err, errlen, "tp: slab allocation failed (%llu bytes)",
                  (unsigned long long)slab_bytes);
-        return 0;
+        goto fail;
     }
-    memset(ds4_gpu_tensor_contents(e->tp.slab), 0, slab_bytes);
-    memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
-    if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab), err, errlen))
-        return 0;
+
+#ifdef __APPLE__
+    if (metal) {
+        memset(ds4_gpu_tensor_contents(e->tp.slab), 0, slab_bytes);
+        memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
+        if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab),
+                                err, errlen))
+            goto fail;
+    }
+#endif
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    if (rocm_nhi) {
+        if (!ds4_gpu_tensor_fill_f32(e->tp.slab, 0.0f, slab_bytes / sizeof(float)) ||
+            !ds4_gpu_tensor_fill_f32(e->tp.zero_vec, 0.0f,
+                                     vec_bytes / sizeof(float)) ||
+            !ds4_gpu_synchronize()) {
+            snprintf(err, errlen, "tp: failed to zero ROCm gate slab");
+            goto fail;
+        }
+        if (!ds4_tp_nhi_open(&e->tp.nhi, ds4_tp_nhi_device(tp),
+                             ds4_tp_nhi_ring_frames(tp), err, errlen))
+            goto fail;
+    }
+#endif
+
     for (uint32_t l = 0; l < (uint32_t)DS4_N_LAYER; l++) {
         for (uint32_t gate = 0; gate < DS4_TP_GATES_PER_LAYER; gate++) {
             const uint32_t slot = l * DS4_TP_GATES_PER_LAYER + gate;
@@ -64528,7 +65288,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                     e->tp.slab, ds4_tp_slab_in_offset(tp, l, gate), vec_bytes);
             if (!e->tp.out_views[slot] || !e->tp.in_views[slot]) {
                 snprintf(err, errlen, "tp: slab view creation failed");
-                return 0;
+                goto fail;
             }
         }
         e->tp.batch_out_views[l] = ds4_gpu_tensor_view(
@@ -64539,30 +65299,68 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                 (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
         if (!e->tp.batch_out_views[l] || !e->tp.batch_in_views[l]) {
             snprintf(err, errlen, "tp: batch slab view creation failed");
-            return 0;
+            goto fail;
         }
     }
-    if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
-                         e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
-                         ds4_tp_slab_out_offset(tp, 0, 0), vec_bytes,
-                         ds4_engine_tp_exchange, tp)) {
-        snprintf(err, errlen, "tp: gate service init failed");
-        return 0;
+
+#ifdef __APPLE__
+    if (metal) {
+        if (!ds4_gpu_tp_init((uint32_t)e->tp.rank,
+                             e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
+                             ds4_tp_slab_out_offset(tp, 0, 0), vec_bytes,
+                             ds4_engine_tp_exchange, tp)) {
+            snprintf(err, errlen, "tp: Metal gate service init failed");
+            goto fail;
+        }
+        ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+        ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     }
-    ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+#endif
     g_tp_block_ctx = tp;
-    ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
-    /* GLM keeps its replicated output head unsplit in v0: the
-     * leader computes full logits and nothing crosses the wire. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
-    e->tp.ctx = tp;
-    e->tp.rank = ds4_tp_rank(tp);
+#if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    if (rocm_nhi &&
+        !ds4_gpu_tp_nhi_init((uint32_t)e->tp.rank,
+                             e->tp.slab,
+                             ds4_tp_slab_out_offset(tp, 0, 0),
+                             ds4_tp_slab_in_offset(tp, 0, 0),
+                             slots, (uint32_t)DS4_N_EMBD,
+                             ds4_engine_tp_nhi_tx_slot,
+                             ds4_engine_tp_nhi_rx_slot,
+                             ds4_engine_tp_nhi_acquire_tx,
+                             ds4_engine_tp_nhi_submit,
+                             ds4_engine_tp_nhi_consumed,
+                             ds4_engine_tp_nhi_failed,
+                             e)) {
+        snprintf(err, errlen, "tp: ROCm/NHI gate service init failed");
+        goto fail;
+    }
+    if (rocm_nhi && !ds4_tp_nhi_ready_barrier(tp, err, errlen))
+        goto fail;
+#endif
+
+    /* The Stage-3 ROCm spike keeps the output head replicated; the
+     * established Metal path retains its DS4 vocab split. */
+    e->tp.vocab_split = metal && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
     e->tp.eval_seq = 0;
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
             "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
-            e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+            e->tp.rank,
+            rocm_nhi ? "nhi" : (ds4_tp_is_rdma(tp) ? "rdma" : "tcp"));
     return 1;
+
+fail:
+    ds4_engine_tp_release_resources(e);
+    return 0;
+#endif
+}
+
+void ds4_engine_tp_unbind(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    if (e && (e->tp.active || e->tp.slab))
+        ds4_engine_tp_release_resources(e);
+#else
+    (void)e;
 #endif
 }
 
@@ -64573,27 +65371,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (e->tp.active) {
-        ds4_gpu_tp_shutdown();
-        const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
-        for (uint32_t i = 0; i < slots; i++) {
-            if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
-            if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
-        }
-        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
-            if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
-            if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
-        }
-        free(e->tp.batch_out_views);
-        free(e->tp.batch_in_views);
-        free(e->tp.out_views);
-        free(e->tp.in_views);
-        ds4_gpu_tensor_free(e->tp.zero_vec);
-        ds4_gpu_tensor_free(e->tp.slab);
-        memset(&e->tp, 0, sizeof(e->tp));
-    }
-#endif
+    ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -65000,15 +65778,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->graph.tp_batch_out = e->tp.batch_out_views;
         s->graph.tp_batch_in = e->tp.batch_in_views;
         s->graph.tp_zero = e->tp.zero_vec;
-        const uint64_t half = (uint64_t)DS4_N_VOCAB / 2u;
-        s->graph.tp_logits_half = ds4_gpu_tensor_view(
-                metal_graph_logits(&s->graph),
-                (uint64_t)e->tp.rank * half * sizeof(float),
-                half * sizeof(float));
-        if (!s->graph.tp_logits_half) {
-            metal_graph_free(&s->graph);
-            free(s);
-            return 1;
+        if (e->tp.vocab_split) {
+            const uint64_t half = (uint64_t)DS4_N_VOCAB / 2u;
+            s->graph.tp_logits_half = ds4_gpu_tensor_view(
+                    metal_graph_logits(&s->graph),
+                    (uint64_t)e->tp.rank * half * sizeof(float),
+                    half * sizeof(float));
+            if (!s->graph.tp_logits_half) {
+                metal_graph_free(&s->graph);
+                free(s);
+                return 1;
+            }
         }
     }
     s->graph.power_percent = (uint32_t)e->power_percent;
@@ -66133,12 +66913,21 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         return 0;
     }
 
+    if (!metal_graph_debug_deferred_begin_range(
+            g, pos0, n_tokens, layer_start, layer_end + 1u)) {
+        if (errlen) snprintf(err, errlen,
+                             "deferred layer-slice capture setup failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
     if (n_tokens == 1 && pos0 > 0) {
         if (g->raw_cap == 0) {
             if (errlen) snprintf(err, errlen, "%s layer-slice decode has no raw KV cache",
                                  ds4_backend_name(e->backend));
+            metal_graph_debug_deferred_abort(g);
             s->checkpoint_valid = false;
             return 1;
         }
@@ -66232,10 +67021,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (ok && output_logits) {
             ok = ds4_gpu_tensor_read_any(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
+        if (ok) ok = metal_graph_debug_deferred_flush(g);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: synchronize after layer-slice decode failure also failed\n");
             }
+            metal_graph_debug_deferred_abort(g);
             if (errlen) snprintf(err, errlen, "%s layer-slice decode failed",
                                  ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
@@ -66368,10 +67159,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (ok && output_logits) {
         ok = ds4_gpu_tensor_read_any(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok) ok = metal_graph_debug_deferred_flush(g);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: synchronize after layer-slice failure also failed\n");
         }
+        metal_graph_debug_deferred_abort(g);
         if (errlen) snprintf(err, errlen, "%s layer-slice failed",
                              ds4_backend_name(e->backend));
         s->checkpoint_valid = false;
@@ -67472,7 +68265,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (suffix > 0 && (uint32_t)suffix >= resume_min &&
+            !(e->tp.active && ds4_tp_is_nhi(e->tp.ctx))) {
             bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
@@ -67546,7 +68340,29 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    if (e->tp.active && ds4_tp_is_nhi(e->tp.ctx)) {
+        /* Stage-3 NHI bring-up keeps prefill on the proven one-row gate
+         * path.  Large batch/big gates remain disabled until they have
+         * their own transport acceptance run. */
+        ok = true;
+        for (int i = 0; ok && i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            ok = metal_graph_eval_token_raw_swa(
+                    &s->graph, &e->model, &e->weights,
+                    (uint32_t)prompt->v[i], (uint32_t)s->checkpoint.len,
+                    s->logits);
+            if (ok) {
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                s->checkpoint_valid = true;
+                if (s->progress)
+                    s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                                prompt->len);
+            }
+        }
+    } else if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
             .session = s,
@@ -68677,7 +69493,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         ds4_session_invalidate(s);
         return rc;
     }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_BUILD))
     if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
         snprintf(err, errlen, "tp: gate transport failed");
         if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
