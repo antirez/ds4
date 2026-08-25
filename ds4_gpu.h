@@ -443,7 +443,7 @@ void ds4_gpu_model_residency_skip(int skip);
 /* Submit one trivial command buffer (first-submission costs paid at load). */
 int ds4_gpu_warm_command_queue(void);
 
-/* Tensor-parallel sliced projections (Metal decode path only).
+/* Tensor-parallel sliced projections (Metal and ROCm decode paths).
  *
  * ds4_gpu_matmul_q8_0_kslice_tensor computes a k-range partial matvec:
  * out[out_dim] = W[:, k_off : k_off + k_cnt] @ x[x_elem_off : +k_cnt] where

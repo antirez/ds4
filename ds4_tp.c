@@ -42,6 +42,7 @@
 /* V4.1 CUDA workers now return half-logit frames after successful work. */
 #define DS4_TP_PROTOCOL_VERSION 14u
 
+
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
@@ -59,6 +60,10 @@ typedef struct {
     uint32_t version;
     uint32_t role;
     uint32_t rdma_ok;    /* this side has a usable verbs device */
+    uint32_t nhi_ok;     /* this side explicitly selected an NHI device */
+    uint32_t nhi_ring_frames;
+    uint32_t nhi_msg_frames;
+    uint32_t transport;
     uint64_t gguf_bytes;
     uint32_t model_id;
     uint32_t n_layer;
@@ -185,6 +190,7 @@ struct ds4_tp {
     int control_fd;
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
+    bool nhi_active;
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -472,8 +478,11 @@ void ds4_tp_usage(FILE *fp) {
     fprintf(fp,
         "Tensor parallelism (two identical machines):\n"
         "  --tensor-parallel           Use --role/--listen/--coordinator for a 50/50 TP pair.\n"
-        "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
+        "  --transport <auto|rdma|tcp|nhi>\n"
+        "                              Gate transport (default auto; ROCm requires nhi).\n"
         "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
+        "  --nhi-device <path>         Select the local thunderbolt-stream device.\n"
+        "  --nhi-ring-frames <n>       Imported NHI ring geometry (default 4096).\n"
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
@@ -498,6 +507,7 @@ int ds4_tp_parse_cli_arg(
         if (!strcmp(v, "auto")) opt->transport = DS4_TP_TRANSPORT_AUTO;
         else if (!strcmp(v, "rdma")) opt->transport = DS4_TP_TRANSPORT_RDMA;
         else if (!strcmp(v, "tcp")) opt->transport = DS4_TP_TRANSPORT_TCP;
+        else if (!strcmp(v, "nhi")) opt->transport = DS4_TP_TRANSPORT_NHI;
         else {
             tp_set_err(err, errlen, "invalid %s value: %s", arg, v);
             return DS4_TP_CLI_ERROR;
@@ -505,6 +515,24 @@ int ds4_tp_parse_cli_arg(
     } else if (!strcmp(arg, "--rdma-device")) {
         if (i + 1 >= argc) goto missing;
         opt->rdma_device = argv[++i];
+    } else if (!strcmp(arg, "--nhi-device")) {
+        if (i + 1 >= argc) goto missing;
+        opt->nhi_device = argv[++i];
+        if (!opt->nhi_device[0]) {
+            tp_set_err(err, errlen, "--nhi-device requires a nonempty path");
+            return DS4_TP_CLI_ERROR;
+        }
+    } else if (!strcmp(arg, "--nhi-ring-frames")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(argv[++i], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || value == 0 ||
+            value > UINT32_MAX || (value % DS4_TP_NHI_MSG_FRAMES) != 0) {
+            tp_set_err(err, errlen, "invalid --nhi-ring-frames %s", argv[i]);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->nhi_ring_frames = (uint32_t)value;
     } else if (!strcmp(arg, "--rdma-gid-index")) {
         if (i + 1 >= argc) goto missing;
         char *end = NULL;
@@ -593,6 +621,8 @@ int ds4_tp_adopt_distributed_options(
         return 0;
     }
 
+    if (!tp->nhi_device && dist->nhi_device)
+        tp->nhi_device = dist->nhi_device;
     memset(dist, 0, sizeof(*dist));
     return 1;
 }
@@ -604,7 +634,8 @@ int ds4_tp_validate_engine_options(
 {
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
-            opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
+            opt->tp.rdma_device || opt->tp.nhi_device ||
+            opt->tp.nhi_ring_frames != 0 || opt->tp.rdma_gid_index_set ||
             opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");
@@ -612,16 +643,40 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
-    bool supported_backend = opt->backend == DS4_BACKEND_METAL;
+    bool supported_backend = opt->backend == DS4_BACKEND_METAL &&
+                             opt->tp.transport != DS4_TP_TRANSPORT_NHI;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    supported_backend |= opt->backend == DS4_BACKEND_CUDA;
+    supported_backend |= opt->backend == DS4_BACKEND_CUDA &&
+                         opt->tp.transport != DS4_TP_TRANSPORT_NHI;
+#endif
+#ifdef DS4_ROCM_BUILD
+    supported_backend = supported_backend ||
+                        (opt->backend == DS4_BACKEND_CUDA &&
+                         opt->tp.transport == DS4_TP_TRANSPORT_NHI);
 #endif
     if (!supported_backend) {
-        tp_set_err(err, errlen, "network tensor parallelism requires Metal or supported CUDA models");
+        tp_set_err(err, errlen,
+#ifdef DS4_ROCM_BUILD
+                   "ROCm tensor parallelism requires --transport nhi"
+#else
+                   "network tensor parallelism requires Metal or supported CUDA models"
+#endif
+        );
         return 0;
     }
     if (opt->backend == DS4_BACKEND_CUDA && (opt->cuda_tensor_parallel || opt->ssd_streaming)) {
         tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
+        return 0;
+    }
+    if (opt->tp.transport == DS4_TP_TRANSPORT_NHI && !opt->tp.nhi_device) {
+        tp_set_err(err, errlen,
+                   "--transport nhi requires --nhi-device PATH");
+        return 0;
+    }
+    if (opt->tp.transport != DS4_TP_TRANSPORT_NHI &&
+        (opt->tp.nhi_device || opt->tp.nhi_ring_frames != 0)) {
+        tp_set_err(err, errlen,
+                   "--nhi-device/--nhi-ring-frames require --transport nhi");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
@@ -1928,6 +1983,11 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .version = DS4_TP_PROTOCOL_VERSION,
         .role = (uint32_t)tp->opt.role,
         .rdma_ok = (uint32_t)rdma_ok,
+        .nhi_ok = (uint32_t)(tp->opt.transport == DS4_TP_TRANSPORT_NHI &&
+                             tp->opt.nhi_device != NULL),
+        .nhi_ring_frames = tp->opt.nhi_ring_frames,
+        .nhi_msg_frames = DS4_TP_NHI_MSG_FRAMES,
+        .transport = (uint32_t)tp->opt.transport,
         .gguf_bytes = id->gguf_bytes,
         .model_id = id->model_id,
         .n_layer = id->n_layer,
@@ -1995,9 +2055,34 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     memcpy(tp->gate_slot_mask, id->gate_slot_mask,
            sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
-    /* Transport decision: RDMA only when both sides can. */
-    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
+    if (theirs.transport != mine.transport) {
+        tp_set_err(err, errlen,
+                   "tp hello: transport mismatch (peer=%u local=%u)",
+                   theirs.transport, mine.transport);
+        return 0;
+    }
+    tp->nhi_active = mine.nhi_ok && theirs.nhi_ok;
+    if (tp->opt.transport == DS4_TP_TRANSPORT_NHI) {
+        if (!tp->nhi_active) {
+            tp_set_err(err, errlen,
+                       "tp: --transport nhi but %s side has no configured device",
+                       mine.nhi_ok ? "the peer" : "this");
+            return 0;
+        }
+        if (theirs.nhi_ring_frames != mine.nhi_ring_frames ||
+            theirs.nhi_msg_frames != mine.nhi_msg_frames) {
+            tp_set_err(err, errlen,
+                       "tp hello: NHI geometry mismatch "
+                       "(peer ring=%u msg=%u, local ring=%u msg=%u)",
+                       theirs.nhi_ring_frames, theirs.nhi_msg_frames,
+                       mine.nhi_ring_frames, mine.nhi_msg_frames);
+            return 0;
+        }
+    }
+    /* Legacy data plane: RDMA only when both AUTO/RDMA peers can. */
+    const int want_rdma = tp->opt.transport == DS4_TP_TRANSPORT_AUTO ||
+                          tp->opt.transport == DS4_TP_TRANSPORT_RDMA;
+    tp->rdma_active = !tp->nhi_active && want_rdma && rdma_ok && theirs.rdma_ok;
     if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
         tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
                    rdma_ok ? "the peer" : "this");
@@ -2020,6 +2105,8 @@ int ds4_tp_create(
         return 0;
     }
     tp->opt = *opt;
+    if (tp->opt.nhi_ring_frames == 0)
+        tp->opt.nhi_ring_frames = DS4_TP_NHI_DEFAULT_RING_FRAMES;
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
     tp->control_fd = -1;
     tp->data_fd = -1;
@@ -2035,7 +2122,8 @@ int ds4_tp_create(
 
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
-    if (opt->transport != DS4_TP_TRANSPORT_TCP &&
+    if ((opt->transport == DS4_TP_TRANSPORT_AUTO ||
+         opt->transport == DS4_TP_TRANSPORT_RDMA) &&
         (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG)
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
 #endif
@@ -2089,7 +2177,7 @@ int ds4_tp_create(
     if (listener >= 0) close(listener);
     fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp",
+            tp->nhi_active ? "nhi" : (tp->rdma_active ? "rdma" : "tcp"),
             (unsigned long long)tp->gate_timeout_ms);
     *out = tp;
     return 1;
@@ -2142,12 +2230,34 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
+bool ds4_tp_is_nhi(const ds4_tp *tp) { return tp && tp->nhi_active; }
+const char *ds4_tp_nhi_device(const ds4_tp *tp) {
+    return tp && tp->nhi_active ? tp->opt.nhi_device : NULL;
+}
+uint32_t ds4_tp_nhi_ring_frames(const ds4_tp *tp) {
+    return tp && tp->nhi_active ? tp->opt.nhi_ring_frames : 0;
+}
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
 void ds4_tp_mark_failed(ds4_tp *tp) {
     if (tp) atomic_store_explicit(&tp->failed, true, memory_order_release);
+}
+
+int ds4_tp_nhi_ready_barrier(ds4_tp *tp, char *err, size_t errlen) {
+    if (!tp || !tp->nhi_active) return tp != NULL;
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_NHI_READY, NULL, 0)) {
+        tp_set_err(err, errlen, "tp NHI ready send failed");
+        return 0;
+    }
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_NHI_READY || bytes != 0) {
+        tp_set_err(err, errlen, "tp NHI ready barrier failed");
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------------
@@ -2643,7 +2753,12 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    if (!tp || !tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0))
+        return 0;
+    if (!tp->nhi_active) return 1;
+    uint32_t type = 0, bytes = 0;
+    return tp_read_frame_header(tp->control_fd, &type, &bytes) &&
+           type == DS4_TP_FRAME_NHI_CLOSED && bytes == 0;
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -3048,6 +3163,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     ds4_log(stderr, DS4_LOG_OK, "tp worker ready for mirrored sessions");
 
     int rc = 0;
+    bool normal_stop = false;
     ds4_tokens prompt = {0};
     while (1) {
         ds4_tp_command command;
@@ -3058,6 +3174,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         }
         if (command.type == DS4_TP_FRAME_STOP) {
             ds4_log(stderr, DS4_LOG_DEFAULT, "tp worker: leader finished");
+            normal_stop = true;
             ds4_tp_command_free(&command);
             break;
         }
@@ -3214,7 +3331,13 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     free(sessions.v);
     free(logits);
+    /* NHI teardown is receiver-last: worker quiesces and closes its GPU
+     * data plane while the leader keeps its device open, then acknowledges
+     * over the still-live TCP control channel. */
     ds4_engine_tp_unbind(engine);
+    if (normal_stop && ds4_tp_is_nhi(tp) &&
+        !tp_send_frame(tp->control_fd, DS4_TP_FRAME_NHI_CLOSED, NULL, 0))
+        rc = 1;
     ds4_tp_free(tp);
     return rc;
 }

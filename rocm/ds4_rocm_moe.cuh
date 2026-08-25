@@ -2787,6 +2787,9 @@ __global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
+        uint32_t weight_first,
+        uint32_t owned_first,
+        uint32_t owned_count,
         uint32_t write_aux,
         float clamp) {
     constexpr uint32_t rows_per_wave = 1u;
@@ -2800,9 +2803,26 @@ __global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_kernel(
     const uint32_t pair = blockIdx.y;
     const uint32_t tok = pair / n_expert;
     const uint32_t slot = pair - tok * n_expert;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
-    const uint32_t expert = (uint32_t)expert_i;
+    const int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    const bool owned = expert_i >= 0 &&
+        (uint32_t)expert_i >= owned_first &&
+        (uint32_t)expert_i - owned_first < owned_count;
+    if (!owned) {
+        if (lane == 0u) {
+            for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+                const uint32_t row = first_row + rr;
+                if (row >= expert_mid_dim) continue;
+                const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+                if (write_aux) {
+                    gate_out[off] = 0.0f;
+                    up_out[off] = 0.0f;
+                }
+                mid_out[off] = 0.0f;
+            }
+        }
+        return;
+    }
+    const uint32_t expert = (uint32_t)expert_i - weight_first;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     float gate[rows_per_wave] = {0.0f};
     float up[rows_per_wave] = {0.0f};
@@ -3120,7 +3140,10 @@ __global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t weight_first,
+        uint32_t owned_first,
+        uint32_t owned_count) {
     constexpr uint32_t rows_per_wave = 1u;
     constexpr uint32_t waves_per_block = 8u;
     constexpr uint32_t rows_per_block = rows_per_wave * waves_per_block;
@@ -3140,8 +3163,10 @@ __global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
     #pragma unroll
     for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
         if (slot >= n_expert) continue;
-        int32_t expert_i = token_selected[slot];
-        if (expert_i < 0) expert_i = 0;
+        const int32_t expert_i = token_selected[slot];
+        if (expert_i < 0 || (uint32_t)expert_i < owned_first ||
+            (uint32_t)expert_i - owned_first >= owned_count)
+            continue;
         const cuda_block_q8_K *xq = token_midq + (uint64_t)slot * midq_blocks;
         for (uint32_t mb = block_lane; mb < mxfp4_blocks; mb += 16u) {
             const cuda_block_q8_K *yb = xq + (mb >> 3u);
@@ -3151,7 +3176,8 @@ __global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
                 if (row >= out_dim) continue;
                 const cuda_block_mxfp4 *down_blocks =
                     (const cuda_block_mxfp4 *)(down_base +
-                        (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+                        (uint64_t)((uint32_t)expert_i - weight_first) *
+                            down_expert_bytes +
                         (uint64_t)row * down_row_bytes);
                 total[rr] += dev_dot_mxfp4_q8_K_half_block(
                     down_blocks + mb, yb, mb & 7u, half);

@@ -60,6 +60,7 @@ contain real conversations.
 - [Session payload implementation](../ds4.c) and
   [cache header definitions](../ds4_kvstore.h)
 - [Pipeline protocol](../ds4_distributed.c) and [TP protocol](../ds4_tp.c)
+- [GPU graph dump hooks and deferred one-token layer-state capture](../DEBUGGING.md)
 
 For changes to state handling, cover rewind/replay, save/load, images, and
 multiple sessions as well as a fresh prompt. For distributed changes, exercise

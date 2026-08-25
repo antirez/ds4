@@ -580,6 +580,8 @@ static int routed_moe_launch(
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens,
+        uint32_t owned_first,
+        uint32_t owned_count,
         bool force_resident) {
     routed_moe_launch_plan plan;
     if (!routed_moe_build_plan(out, gate, up, mid, down, model_map, model_size,
@@ -595,6 +597,12 @@ static int routed_moe_launch(
     const int iq2_gate_path = iq2_path || iq2_iq2_path;
     const int q2k_path = plan.q2k_path;
     const int mxfp4_path = plan.mxfp4_path;
+    if (owned_first > n_total_expert ||
+        owned_count > n_total_expert - owned_first || owned_count == 0)
+        return 0;
+    if ((owned_first != 0 || owned_count != n_total_expert) &&
+        (!mxfp4_path || n_tokens != 1u))
+        return 0;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
     uint64_t pair_count64 = 0;
@@ -607,6 +615,60 @@ static int routed_moe_launch(
     const char *gate_w = NULL;
     const char *up_w = NULL;
     const char *down_w = NULL;
+    uint32_t weight_first = 0;
+    int owned_shard_cached = 0;
+    const int owned_shard_requested =
+        owned_first != 0 || owned_count != n_total_expert;
+    /* Resident engine TP caches one contiguous expert-table half, not a
+     * synthetic full-table image. Resolve that exact range and let the
+     * ownership-aware MXFP4 kernels translate global expert IDs to local
+     * weight rows. This must precede streaming/compact-selected fallbacks:
+     * the rank-local spans are already the authoritative resident source. */
+    if (owned_shard_requested && mxfp4_path && n_tokens == 1u) {
+        uint64_t local_gate_bytes = 0, local_down_bytes = 0;
+        uint64_t gate_delta = 0, down_delta = 0;
+        uint64_t local_gate_offset = 0, local_up_offset = 0;
+        uint64_t local_down_offset = 0;
+        if (!cuda_u64_mul_checked(owned_count, gate_expert_bytes,
+                                  &local_gate_bytes) ||
+            !cuda_u64_mul_checked(owned_count, down_expert_bytes,
+                                  &local_down_bytes) ||
+            !cuda_u64_mul_checked(owned_first, gate_expert_bytes,
+                                  &gate_delta) ||
+            !cuda_u64_mul_checked(owned_first, down_expert_bytes,
+                                  &down_delta) ||
+            !routed_moe_u64_add_checked(gate_offset, gate_delta,
+                                        &local_gate_offset) ||
+            !routed_moe_u64_add_checked(up_offset, gate_delta,
+                                        &local_up_offset) ||
+            !routed_moe_u64_add_checked(down_offset, down_delta,
+                                        &local_down_offset)) {
+            return 0;
+        }
+        if (cuda_model_range_is_cached(model_map, local_gate_offset,
+                                       local_gate_bytes) &&
+            cuda_model_range_is_cached(model_map, local_up_offset,
+                                       local_gate_bytes) &&
+            cuda_model_range_is_cached(model_map, local_down_offset,
+                                       local_down_bytes)) {
+            gate_w = cuda_model_range_ptr(model_map, local_gate_offset,
+                                          local_gate_bytes, "moe_gate_shard");
+            up_w = cuda_model_range_ptr(model_map, local_up_offset,
+                                        local_gate_bytes, "moe_up_shard");
+            down_w = cuda_model_range_ptr(model_map, local_down_offset,
+                                          local_down_bytes, "moe_down_shard");
+            if (!gate_w || !up_w || !down_w) return 0;
+            weight_first = owned_first;
+            owned_shard_cached = 1;
+        }
+    }
+    if (owned_shard_requested && !owned_shard_cached) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "TP routed MoE expert shard is not fully "
+                "resident (layer=%u first=%u count=%u)\n",
+                layer_index, owned_first, owned_count);
+        return 0;
+    }
     const char **gate_slot_ptrs = NULL;
     const char **up_slot_ptrs = NULL;
     const char **down_slot_ptrs = NULL;
@@ -621,6 +683,7 @@ static int routed_moe_launch(
     uint32_t stream_batch_resident_count = 0;
     uint32_t stream_batch_missing_count = 0;
     const int stream_full_layer =
+        !owned_shard_cached &&
         (n_tokens > 1u || force_resident) &&
         cuda_stream_layer_expert_cache_apply(model_map,
                                              layer_index,
@@ -634,6 +697,7 @@ static int routed_moe_launch(
                                              &up_w,
                                              &down_w);
     const int full_table_cached =
+        !owned_shard_cached &&
         !stream_full_layer &&
         routed_moe_full_table_is_cached(model_map,
                                         gate_offset,
@@ -642,6 +706,7 @@ static int routed_moe_launch(
                                         gate_bytes,
                                         down_bytes);
     const int batch_stream_split_selected =
+        !owned_shard_cached &&
         !stream_full_layer &&
         !full_table_cached &&
         n_tokens > 1u &&
@@ -668,6 +733,7 @@ static int routed_moe_launch(
                                                &stream_batch_missing_count,
                                                &stream_batch_unique);
     const int batch_stream_selected =
+        !owned_shard_cached &&
         !stream_full_layer &&
         !full_table_cached &&
         !batch_stream_split_selected &&
@@ -697,7 +763,8 @@ static int routed_moe_launch(
     int split_selected = 0;
     const int compact_selected =
         split_selected ||
-        (!stream_full_layer &&
+        (!owned_shard_cached &&
+        !stream_full_layer &&
         n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
                                    layer_index,
@@ -709,7 +776,8 @@ static int routed_moe_launch(
                                    &gate_w,
                                    &up_w,
                                    &down_w));
-    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
+    if (!owned_shard_cached && !compact_selected &&
+        !batch_stream_selected && !batch_stream_split_selected) {
         if (g_ssd_streaming_mode &&
             n_total_expert > n_expert &&
             !stream_full_layer &&
@@ -1639,6 +1707,9 @@ static int routed_moe_launch(
                         xq_blocks,
                         expert_mid_dim,
                         n_expert,
+                        weight_first,
+                        owned_first,
+                        owned_count,
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
@@ -1913,7 +1984,10 @@ static int routed_moe_launch(
                             down_row_bytes,
                             midq_blocks,
                             out_dim,
-                            n_expert);
+                            n_expert,
+                            weight_first,
+                            owned_first,
+                            owned_count);
                     } else {
                         moe_down_mxfp4_sum6_qwarp32_kernel<true><<<mxgrid, 256>>>(
                             (float *)out->ptr,
@@ -1924,7 +1998,10 @@ static int routed_moe_launch(
                             down_row_bytes,
                             midq_blocks,
                             out_dim,
-                            n_expert);
+                            n_expert,
+                            weight_first,
+                            owned_first,
+                            owned_count);
                     }
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
@@ -2825,18 +2902,20 @@ static int routed_moe_launch(
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in, uint32_t layer_index, bool force_resident) {
-    if (add_in) {
-        fprintf(stderr, "ds4: routed MoE addend fold is Metal-only\n");
-        return 0;
-    }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1,
-                             force_resident);
+    uint32_t owned_first = 0, owned_count = n_total_expert;
+    ds4_rocm_tp_expert_range(n_total_expert, &owned_first, &owned_count);
+    int ok = routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                               gate_offset, up_offset, down_offset,
+                               gate_type, down_type,
+                               gate_expert_bytes, gate_row_bytes,
+                               down_expert_bytes, down_row_bytes,
+                               expert_in_dim, expert_mid_dim, out_dim,
+                               selected, weights, n_total_expert, n_expert,
+                               clamp, x, layer_index, 1,
+                               owned_first, owned_count, force_resident);
+    if (ok && add_in)
+        ok = ds4_gpu_add_tensor(out, out, add_in, out_dim) != 0;
+    return ok;
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     if (mid_is_f16) *mid_is_f16 = false;
@@ -2847,5 +2926,5 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
-                             force_resident);
+                             0, n_total_expert, force_resident);
 }
