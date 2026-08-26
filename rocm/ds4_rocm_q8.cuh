@@ -910,6 +910,49 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
         for (uint32_t u = 0; u < TOK_TILE; ++u) {
             out[(uint64_t)u * out_dim + row] = acc[u];
         }
+
+/* Tiny-batch direct variant for speculative verify rows (2..8 tokens).
+ * The shared-x tile kernel above pays two block-wide barriers per 16-block
+ * chunk with only ~17 KiB of weight reads between them; at verify row
+ * counts the whole activation set fits L2 and is reused by every row
+ * block, so reading x directly and dropping LDS entirely is faster.  One
+ * warp owns one output row with TOK accumulators; weights stream once,
+ * the per-token reduction order matches the tile kernel (blocks ascending,
+ * warp sum last). */
+template <uint32_t TOK>
+__global__ static void matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + (uint64_t)row * row_bytes;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc[TOK];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK; u++) acc[u] = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        const float wv = d * (float)q;
+        const uint64_t kk = ((uint64_t)b << 5u) + lane;
+#pragma unroll
+        for (uint32_t u = 0; u < TOK; u++) {
+            acc[u] += wv * x[(uint64_t)u * in_dim + kk];
+        }
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < TOK; u++) {
+        const float s = warp_sum_f32(acc[u]);
+        if (lane == 0u) out[(uint64_t)u * out_dim + row] = s;
     }
 }
 

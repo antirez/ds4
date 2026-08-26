@@ -286,10 +286,22 @@ int ds4_transport_configure_link(
         uint64_t generation,
         uint32_t peer_frame_size,
         uint32_t peer_ring_size,
+        uint32_t negotiated_max_payload,
         char *err,
         size_t errlen) {
     if (!t || generation == 0) {
         transport_set_err(err, errlen, "invalid transport link generation");
+        errno = EINVAL;
+        return -1;
+    }
+    const int zerocopy = t->ops &&
+        (t->ops->caps & DS4_TRANSPORT_CAP_ZEROCOPY) != 0;
+    if ((zerocopy && (peer_frame_size == 0 || peer_ring_size < 2u ||
+                      negotiated_max_payload == 0)) ||
+        (!zerocopy && (peer_frame_size != 0 || peer_ring_size != 0 ||
+                       negotiated_max_payload != 0))) {
+        transport_set_err(err, errlen,
+                          "invalid negotiated transport geometry or payload limit");
         errno = EINVAL;
         return -1;
     }
@@ -303,7 +315,8 @@ int ds4_transport_configure_link(
     if (t->configured) {
         const int same = t->generation == generation &&
             t->peer_frame_size == peer_frame_size &&
-            t->peer_ring_size == peer_ring_size;
+            t->peer_ring_size == peer_ring_size &&
+            t->negotiated_max_payload == negotiated_max_payload;
         pthread_mutex_unlock(&t->link_mu);
         if (same) return 0;
         transport_set_err(err, errlen, "transport link is already configured");
@@ -313,10 +326,21 @@ int ds4_transport_configure_link(
     int rc = t->ops && t->ops->configure
         ? t->ops->configure(t, peer_frame_size, peer_ring_size, err, errlen)
         : 0;
+    if (rc == 0 && zerocopy) {
+        const size_t backend_max = t->ops && t->ops->max_oob_bytes
+            ? t->ops->max_oob_bytes(t) : 0;
+        if (backend_max == 0 || negotiated_max_payload > backend_max) {
+            transport_set_err(err, errlen,
+                              "negotiated payload limit exceeds transport geometry");
+            errno = EPROTO;
+            rc = -1;
+        }
+    }
     if (rc == 0) {
         t->generation = generation;
         t->peer_frame_size = peer_frame_size;
         t->peer_ring_size = peer_ring_size;
+        t->negotiated_max_payload = negotiated_max_payload;
         t->tx_prepare_sequence = 1;
         t->tx_send_sequence = 1;
         t->rx_sequence = 1;
@@ -345,7 +369,14 @@ uint32_t ds4_transport_ring_size(const ds4_transport *t) {
 
 size_t ds4_transport_max_oob_bytes(const ds4_transport *t) {
     if (!t || !t->ops || !t->ops->max_oob_bytes) return 0;
-    return t->ops->max_oob_bytes(t);
+    const size_t backend_max = t->ops->max_oob_bytes(t);
+    ds4_transport *mutable_t = (ds4_transport *)t;
+    pthread_mutex_lock(&mutable_t->link_mu);
+    const uint32_t negotiated = mutable_t->configured
+        ? mutable_t->negotiated_max_payload : 0;
+    pthread_mutex_unlock(&mutable_t->link_mu);
+    if (negotiated != 0 && negotiated < backend_max) return negotiated;
+    return backend_max;
 }
 
 int ds4_transport_can_oob(const ds4_transport *t, size_t payload_bytes) {
@@ -404,8 +435,11 @@ int ds4_transport_prepare_bulk(
     desc->payload_bytes = payload_bytes;
     desc->element_bits = element_bits;
 
-    const size_t max_oob = t->ops && t->ops->max_oob_bytes
+    size_t max_oob = t->ops && t->ops->max_oob_bytes
         ? t->ops->max_oob_bytes(t) : 0;
+    if (t->negotiated_max_payload != 0 &&
+        t->negotiated_max_payload < max_oob)
+        max_oob = t->negotiated_max_payload;
     if ((t->ops->caps & DS4_TRANSPORT_CAP_ZEROCOPY) != 0 &&
         max_oob != 0 && payload_bytes <= max_oob) {
         const uint64_t total = (uint64_t)DS4_NHI_ENVELOPE_BYTES + payload_bytes;

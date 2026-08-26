@@ -49,6 +49,9 @@
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
+#define DS4_TP_MAX_TIMEOUT_SEC 86400u
+#define DS4_TP_COMMAND_MAX_TOKENS 1048576u
+#define DS4_TP_COMMAND_MAX_BATCH_ITEMS 4096u
 
 typedef struct {
     uint32_t magic;
@@ -186,6 +189,7 @@ struct ds4_tp {
     bool rdma_active;
     bool nhi_active;
     uint32_t peer_ctx;
+    uint32_t local_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
     uint64_t vec_bytes;
@@ -266,7 +270,7 @@ static int tp_read_full(int fd, void *buf, size_t len) {
     return 1;
 }
 
-static void tp_socket_tune(int fd) {
+static void tp_socket_tune(int fd, uint64_t timeout_sec) {
     int one = 1;
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -277,6 +281,12 @@ static void tp_socket_tune(int fd) {
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    struct timeval timeout = {
+        .tv_sec = (time_t)timeout_sec,
+        .tv_usec = 0,
+    };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 }
 
 static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
@@ -1865,11 +1875,23 @@ int ds4_tp_create(
     if (tp->opt.nhi_ring_frames == 0)
         tp->opt.nhi_ring_frames = DS4_TP_NHI_DEFAULT_RING_FRAMES;
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+    tp->local_ctx = id->ctx_size;
     tp->control_fd = -1;
     tp->data_fd = -1;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
-    if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
+    if (tmo) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(tmo, &end, 10);
+        if (errno != 0 || !end || *end != '\0' || value == 0 ||
+            value > DS4_TP_MAX_TIMEOUT_SEC) {
+            tp_set_err(err, errlen, "tp: invalid DS4_TP_TIMEOUT_SEC %s", tmo);
+            ds4_tp_free(tp);
+            return 0;
+        }
+        tp->timeout_sec = (uint64_t)value;
+    }
     tp->gate_timeout_ms = DS4_TP_DEFAULT_GATE_TIMEOUT_MS;
     const char *gate_tmo = getenv("DS4_TP_GATE_TIMEOUT_MS");
     if (gate_tmo) {
@@ -1901,7 +1923,7 @@ int ds4_tp_create(
                                  (double)tp->timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
     }
-    tp_socket_tune(tp->control_fd);
+    tp_socket_tune(tp->control_fd, tp->timeout_sec);
 
     if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
 
@@ -1925,7 +1947,7 @@ int ds4_tp_create(
                                   (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) goto fail;
         }
-        tp_socket_tune(tp->data_fd);
+        tp_socket_tune(tp->data_fd, tp->timeout_sec);
         if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
             tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
             goto fail;
@@ -2320,7 +2342,11 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
                                  uint32_t count) {
     const uint64_t bytes64 = sizeof(ds4_tp_token_command_header) +
                              (uint64_t)count * sizeof(int32_t);
-    if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX) return 0;
+    if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX ||
+        (type == DS4_TP_FRAME_SYNC &&
+         (count > tp->local_ctx || count > DS4_TP_COMMAND_MAX_TOKENS)) ||
+        (type == DS4_TP_FRAME_VERIFY &&
+         (count == 0 || count > DS4_TP_BATCH_MAX_ROWS))) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes ? bytes : 1u);
     if (!payload) return 0;
@@ -2334,6 +2360,8 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
 }
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
+    if (!tp || ctx_size <= 0 || (uint32_t)ctx_size > tp->local_ctx ||
+        (uint32_t)ctx_size > DS4_TP_COMMAND_MAX_TOKENS) return 0;
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
@@ -2435,7 +2463,9 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count) {
     const uint64_t bytes64 = sizeof(ds4_tp_batch_command_header) +
                              (uint64_t)count * sizeof(*items);
-    if (!tp || !items || count == 0 || bytes64 > UINT32_MAX) return 0;
+    if (!tp || !items || count == 0 ||
+        count > DS4_TP_COMMAND_MAX_BATCH_ITEMS ||
+        bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes);
     if (!payload) return 0;
@@ -2456,7 +2486,11 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
     const uint64_t item_bytes = (uint64_t)count * sizeof(*items);
     const uint64_t bytes64 = sizeof(ds4_tp_mixed_command_header) +
                              prompt_bytes + item_bytes;
-    if (!tp || !prompt || prompt_count == 0 || !items || count == 0 ||
+    if (!tp || !prompt || prompt_count == 0 ||
+        prompt_count > tp->local_ctx ||
+        prompt_count > DS4_TP_COMMAND_MAX_TOKENS ||
+        !items || count == 0 ||
+        count > DS4_TP_COMMAND_MAX_BATCH_ITEMS ||
         bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes);
@@ -2522,6 +2556,48 @@ void ds4_tp_command_free(ds4_tp_command *command) {
     free(command->images);
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
+}
+
+static int tp_command_frame_size_allowed(
+        const ds4_tp *tp, uint32_t type, uint32_t bytes) {
+    if (!tp) return 0;
+    const uint64_t ctx_tokens = tp->peer_ctx < DS4_TP_COMMAND_MAX_TOKENS
+        ? tp->peer_ctx : DS4_TP_COMMAND_MAX_TOKENS;
+    switch (type) {
+    case DS4_TP_FRAME_SYNC:
+        return bytes >= sizeof(ds4_tp_token_command_header) &&
+            bytes <= sizeof(ds4_tp_token_command_header) +
+                     ctx_tokens * sizeof(int32_t);
+    case DS4_TP_FRAME_VERIFY:
+        return bytes >= sizeof(ds4_tp_token_command_header) + sizeof(int32_t) &&
+            bytes <= sizeof(ds4_tp_token_command_header) +
+                     (uint64_t)DS4_TP_BATCH_MAX_ROWS * sizeof(int32_t);
+    case DS4_TP_FRAME_SESSION_CREATE:
+    case DS4_TP_FRAME_REWIND:
+        return bytes == sizeof(ds4_tp_value_command);
+    case DS4_TP_FRAME_SESSION_DESTROY:
+    case DS4_TP_FRAME_INVALIDATE:
+        return bytes == sizeof(uint64_t);
+    case DS4_TP_FRAME_EVAL:
+        return bytes == sizeof(ds4_tp_eval_command);
+    case DS4_TP_FRAME_EVAL_BATCH:
+        return bytes >= sizeof(ds4_tp_batch_command_header) +
+                        sizeof(ds4_tp_batch_item) &&
+            bytes <= sizeof(ds4_tp_batch_command_header) +
+                     (uint64_t)DS4_TP_COMMAND_MAX_BATCH_ITEMS *
+                         sizeof(ds4_tp_batch_item);
+    case DS4_TP_FRAME_MIXED_BATCH:
+        return bytes >= sizeof(ds4_tp_mixed_command_header) + sizeof(int32_t) +
+                        sizeof(ds4_tp_batch_item) &&
+            bytes <= sizeof(ds4_tp_mixed_command_header) +
+                     ctx_tokens * sizeof(int32_t) +
+                     (uint64_t)DS4_TP_COMMAND_MAX_BATCH_ITEMS *
+                         sizeof(ds4_tp_batch_item);
+    case DS4_TP_FRAME_STOP:
+        return bytes == 0;
+    default:
+        return 0;
+    }
 }
 
 static int tp_command_decode_tokens(ds4_tp_command *command,
@@ -2628,6 +2704,14 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         tp_set_err(err, errlen, "tp: control channel closed");
         return 0;
     }
+    if (!tp_command_frame_size_allowed(tp, ftype, bytes)) {
+        ds4_tp_mark_failed(tp);
+        shutdown(tp->control_fd, SHUT_RDWR);
+        tp_set_err(err, errlen,
+                   "tp: invalid or oversized command frame type %u (%u bytes)",
+                   ftype, bytes);
+        return 0;
+    }
     uint8_t *payload = NULL;
     if (bytes != 0) {
         payload = malloc(bytes);
@@ -2683,7 +2767,8 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         memcpy(&h, payload, sizeof(h));
         const uint64_t want = sizeof(h) +
                               (uint64_t)h.count * sizeof(ds4_tp_batch_item);
-        if (h.count == 0 || want != bytes) { ok = 0; break; }
+        if (h.count == 0 || h.count > DS4_TP_COMMAND_MAX_BATCH_ITEMS ||
+            want != bytes) { ok = 0; break; }
         command->items = malloc((size_t)h.count * sizeof(*command->items));
         if (!command->items) { ok = -1; break; }
         memcpy(command->items, payload + sizeof(h),
@@ -2700,7 +2785,9 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         const uint64_t item_bytes =
             (uint64_t)h.item_count * sizeof(ds4_tp_batch_item);
         const uint64_t want = sizeof(h) + token_bytes + item_bytes;
-        if (h.prompt_count == 0 || h.item_count == 0 || want != bytes) {
+        if (h.prompt_count == 0 || h.prompt_count > tp->peer_ctx ||
+            h.item_count == 0 ||
+            h.item_count > DS4_TP_COMMAND_MAX_BATCH_ITEMS || want != bytes) {
             ok = 0;
             break;
         }

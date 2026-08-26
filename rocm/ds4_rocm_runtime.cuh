@@ -1,4 +1,8 @@
 static const void *g_model_host_base;
+/* The first mapping is the target model. Later mappings are support models;
+ * keep optional target Q8->F16 acceleration semantically stable when they are
+ * loaded, while declining support-model expansion by default. */
+static const void *g_primary_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
 static int g_model_device_owned;
@@ -284,6 +288,10 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_support_disabled_after_failure;
+static int g_q8_f16_optional_preload_disabled;
+/* Multi-model mode: support expansion is disabled by default; primary target
+ * expansion remains eligible to preserve single-model arithmetic. */
 static int g_q8_f16_disabled_for_multi_model;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
@@ -4797,8 +4805,21 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
              cuda_env_present(q8_prequant_env));
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
-        g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
-        g_rocm_cfg.shared_down_cublas = !g_quality_mode;
+        /* Explicit =0 rollbacks so small speculative-verify batches can be
+         * A/B tested against the Q8 kernels (the f16 copies double the
+         * weight bytes read per matmul). */
+        const char *attn_out_cublas_env =
+            getenv("DS4_ROCM_ATTN_OUTPUT_CUBLAS");
+        g_rocm_cfg.attention_output_cublas_all =
+            !g_quality_mode &&
+            (attn_out_cublas_env == NULL ||
+             cuda_env_present(attn_out_cublas_env));
+        const char *shared_down_cublas_env =
+            getenv("DS4_ROCM_SHARED_DOWN_CUBLAS");
+        g_rocm_cfg.shared_down_cublas =
+            !g_quality_mode &&
+            (shared_down_cublas_env == NULL ||
+             cuda_env_present(shared_down_cublas_env));
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
         /*
@@ -4985,7 +5006,24 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
     return 1;
 }
 
-static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
+static void cuda_q8_f16_cache_disable_after_failure(
+        const void *model_map,
+        const char *what,
+        uint64_t request_bytes) {
+    if (g_q8_f16_disabled_for_multi_model &&
+        model_map != g_primary_model_host_base) {
+        if (!g_q8_f16_support_disabled_after_failure) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "support q8 fp16 cache disabled after %s "
+                    "(request=%.2f MiB); primary target cache preserved\n",
+                    what ? what : "failure",
+                    (double)request_bytes / 1048576.0);
+        }
+        g_q8_f16_support_disabled_after_failure = 1;
+        (void)cudaGetLastError();
+        return;
+    }
     if (!g_q8_f16_disabled_after_oom) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "q8 fp16 cache disabled after %s "
@@ -5002,15 +5040,23 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     (void)cudaGetLastError();
 }
 
-static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+static int cuda_q8_f16_cache_allowed(
+        const void *model_map,
+        const char *label,
+        uint64_t in_dim,
+        uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
-    /* Multi-model (MTP) setups disable the cache by default to protect the
-     * memory margin for session/context tensors.  The budget check in
-     * cuda_q8_f16_cache_has_budget() still applies per allocation; the env
-     * opt-in re-enables the speed path when the host has headroom. */
+    if (g_q8_f16_support_disabled_after_failure &&
+        model_map != g_primary_model_host_base) return 0;
+    /* A second GGUF must not silently change the target model's arithmetic.
+     * Keep the primary target eligible for the same expanded-F16 kernels it
+     * uses alone. To protect session/context headroom, support models remain
+     * on their normal Q8 kernels unless the existing explicit opt-in is set;
+     * every target allocation still passes the ordinary budget check. */
     if (g_q8_f16_disabled_for_multi_model &&
-        getenv("DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL") == NULL) return 0;
+        model_map != g_primary_model_host_base &&
+        !cuda_env_present(getenv("DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL"))) return 0;
     /* Resident GLM nearly fills a 128 GB unified-memory host, and its decode
      * uses native Q8 kernels. Avoid speculative F16 copies that are discarded
      * as soon as the remaining headroom is exhausted. */
@@ -5046,12 +5092,16 @@ static int cuda_q8_label_is_attention_output(const char *label) {
             strstr(label, "attention_output_b") != NULL);
 }
 
-static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+static int cuda_q8_f16_preload_allowed(
+        const void *model_map,
+        const char *label,
+        uint64_t in_dim,
+        uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
         !cuda_runtime_config()->attention_output_cublas_all) {
         return 0;
     }
-    return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
+    return cuda_q8_f16_cache_allowed(model_map, label, in_dim, out_dim);
 }
 
 static const __half *cuda_q8_f16_ptr(
@@ -5061,6 +5111,8 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    if (g_q8_f16_support_disabled_after_failure &&
+        model_map != g_primary_model_host_base) return NULL;
     auto exact = g_q8_f16_by_offset.find(offset);
     if (exact != g_q8_f16_by_offset.end()) {
         const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
@@ -5076,7 +5128,7 @@ static const __half *cuda_q8_f16_ptr(
             return r.device_ptr;
         }
     }
-    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (!cuda_q8_f16_cache_allowed(model_map, label, in_dim, out_dim)) return NULL;
 
     uint64_t out_bytes = 0;
     if (in_dim == 0u || out_dim == 0u ||
@@ -5091,7 +5143,7 @@ static const __half *cuda_q8_f16_ptr(
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "q8 fp16 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
+        cuda_q8_f16_cache_disable_after_failure(model_map, "allocation failure", out_bytes);
         return NULL;
     }
     const uint64_t blocks = (in_dim + 31) / 32;
@@ -5103,7 +5155,7 @@ static const __half *cuda_q8_f16_ptr(
                                                           blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
         (void)cudaFree(dev);
-        cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
+        cuda_q8_f16_cache_disable_after_failure(model_map, "dequant launch failure", out_bytes);
         return NULL;
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
@@ -5119,6 +5171,8 @@ static const __half *cuda_q8_f16_transpose_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    if (g_q8_f16_support_disabled_after_failure &&
+        model_map != g_primary_model_host_base) return NULL;
     auto exact = g_q8_f16_transpose_by_offset.find(offset);
     if (exact != g_q8_f16_transpose_by_offset.end()) {
         const cuda_q8_f16_transpose_range &r = g_q8_f16_transpose_ranges[exact->second];
@@ -5134,7 +5188,7 @@ static const __half *cuda_q8_f16_transpose_ptr(
             return r.device_ptr;
         }
     }
-    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (!cuda_q8_f16_cache_allowed(model_map, label, in_dim, out_dim)) return NULL;
     uint64_t out_bytes = 0;
     if (in_dim == 0u || out_dim == 0u ||
         !cuda_u64_mul3_checked(in_dim, out_dim, sizeof(__half), &out_bytes)) return NULL;
@@ -5146,7 +5200,7 @@ static const __half *cuda_q8_f16_transpose_ptr(
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "q8 fp16 transpose cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        cuda_q8_f16_cache_disable_after_failure("transpose allocation failure", out_bytes);
+        cuda_q8_f16_cache_disable_after_failure(model_map, "transpose allocation failure", out_bytes);
         return NULL;
     }
     const uint64_t blocks = (in_dim + 31u) / 32u;
@@ -5158,7 +5212,7 @@ static const __half *cuda_q8_f16_transpose_ptr(
                                                                      blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 transpose dequant launch")) {
         (void)cudaFree(dev);
-        cuda_q8_f16_cache_disable_after_failure("transpose launch failure", out_bytes);
+        cuda_q8_f16_cache_disable_after_failure(model_map, "transpose launch failure", out_bytes);
         return NULL;
     }
     g_q8_f16_transpose_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
@@ -6066,6 +6120,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_q8_f16_cache_release_all();
     cuda_stream_selected_cache_release();
     g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_support_disabled_after_failure = 0;
+    g_q8_f16_optional_preload_disabled = 0;
     g_q8_f16_disabled_for_multi_model = 0;
     g_q8_f16_budget_notice_printed = 0;
     if (g_cuda_tmp) {
@@ -6104,6 +6160,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_selected_readback_event_value = 0;
     cuda_model_image_release_all();
     g_model_host_base = NULL;
+    g_primary_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
     g_model_device_owned = 0;
@@ -6286,25 +6343,58 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+extern "C" int ds4_gpu_set_primary_model_map(
+        const void *model_map,
+        uint64_t model_size) {
+    if (!model_map || model_size == 0) return 0;
+    if (g_primary_model_host_base != model_map) {
+        if ((!g_q8_f16_ranges.empty() || !g_q8_f16_transpose_ranges.empty()) &&
+            !cuda_ok(cudaDeviceSynchronize(), "primary model cache reset sync")) {
+            return 0;
+        }
+        cuda_q8_f16_cache_release_all();
+        g_q8_f16_disabled_after_oom = 0;
+        g_q8_f16_support_disabled_after_failure = 0;
+        g_q8_f16_optional_preload_disabled = 0;
+        g_q8_f16_disabled_for_multi_model = 0;
+        g_q8_f16_budget_notice_printed = 0;
+        g_primary_model_host_base = model_map;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
-    const int multi_model =
-        g_model_host_base != NULL &&
-        (g_model_host_base != model_map || g_model_registered_size != model_size);
+    if (!g_primary_model_host_base) g_primary_model_host_base = model_map;
+    const int secondary_model = model_map != g_primary_model_host_base;
+    const int preserve_primary_cache =
+        g_q8_f16_disabled_for_multi_model || secondary_model;
+    if ((!g_q8_f16_ranges.empty() || !g_q8_f16_transpose_ranges.empty()) &&
+        !cuda_ok(cudaDeviceSynchronize(), "model map cache handoff sync")) {
+        return 0;
+    }
     cuda_model_range_release_all();
-    cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
-    g_q8_f16_budget_notice_printed = 0;
-    if (multi_model) {
-        /*
-         * MTP loads a second GGUF mapping.  Its weights are small, but on UMA
-         * ROCm systems the optional expanded Q8->F16 cache can consume the
-         * memory margin needed for session/context tensors once both model
-         * mappings are resident.  The cache is only a speed path; the normal
-         * Q8 kernels remain available and keep MTP startup reliable.
-         */
+    if (!preserve_primary_cache) {
+        cuda_q8_f16_cache_release_all();
+        g_q8_f16_disabled_after_oom = 0;
+        g_q8_f16_budget_notice_printed = 0;
+    } else {
+        /* Q8->F16 ranges are keyed by host mapping and remain valid while both
+         * GGUFs are resident. Preserve primary ranges: releasing or globally
+         * disabling them here changes ordinary target prefill arithmetic merely
+         * because a support model was loaded. Support ranges stay disabled by
+         * cuda_q8_f16_cache_allowed() unless explicitly opted in. */
         g_q8_f16_disabled_for_multi_model = 1;
+        if (secondary_model) {
+            g_q8_f16_support_disabled_after_failure = 0;
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "multi-model q8 fp16 policy: primary target preserved, "
+                    "support expansion %s\n",
+                    !cuda_env_present(getenv("DS4_ROCM_Q8_F16_CACHE_MULTI_MODEL"))
+                        ? "disabled" : "enabled by environment");
+        }
     }
     g_model_host_base = model_map;
     g_model_device_base = cuda_model_image_owned(model_map) ?
@@ -6527,10 +6617,14 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    static int optional_q8_preload_disabled = 0;
-    if (optional_q8_preload_disabled) return 1;
+    const int primary_multi_model =
+        g_q8_f16_disabled_for_multi_model &&
+        model_map == g_primary_model_host_base;
+    if (g_q8_f16_optional_preload_disabled) {
+        return primary_multi_model ? 0 : 1;
+    }
     const char *cache_label = label ? label : "q8_0";
-    if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
+    if (!cuda_q8_f16_preload_allowed(model_map, cache_label, in_dim, out_dim)) return 1;
     const int preload_transposed_b = !g_quality_mode &&
                                      strstr(cache_label, "attn_output_b") != NULL;
     if (preload_transposed_b) {
@@ -6550,13 +6644,23 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
             return 1;
         }
     }
-    optional_q8_preload_disabled = 1;
+    if (primary_multi_model) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "required primary q8 fp16 cache unavailable in multi-model mode "
+                "for %s; refusing arithmetic-changing fallback\n",
+                cache_label);
+        return 0;
+    }
+    g_q8_f16_optional_preload_disabled = 1;
     return 1;
 }
 
 extern "C" void ds4_gpu_release_q8_f16_cache(void) {
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_support_disabled_after_failure = 0;
+    g_q8_f16_optional_preload_disabled = 0;
     g_q8_f16_budget_notice_printed = 0;
 }
 

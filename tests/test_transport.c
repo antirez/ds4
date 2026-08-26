@@ -180,9 +180,9 @@ static void test_descriptor_sequences(void) {
     if (!left || !right) goto done;
 
     const uint64_t generation = 0x1122334455667788ull;
-    CHECK(ds4_transport_configure_link(left, generation, 0, 0,
+    CHECK(ds4_transport_configure_link(left, generation, 0, 0, 0,
                                        err, sizeof(err)) == 0);
-    CHECK(ds4_transport_configure_link(right, generation, 0, 0,
+    CHECK(ds4_transport_configure_link(right, generation, 0, 0, 0,
                                        err, sizeof(err)) == 0);
     CHECK(ds4_transport_generation(left) == generation);
     CHECK(ds4_transport_generation(right) == generation);
@@ -271,6 +271,51 @@ done:
     if (sv[0] >= 0) close(sv[0]);
 }
 
+static void test_negotiated_oob_limit(void) {
+    int sv[2] = {-1, -1};
+    char err[128] = "";
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    fake_lease_ctx *ctx = calloc(1, sizeof(*ctx));
+    CHECK(ctx != NULL);
+    if (!ctx) goto done;
+    ds4_transport *t = ds4_transport_internal_create(
+        &fake_lease_ops, sv[0], 0, ctx, 4096u, 8u, err, sizeof(err));
+    CHECK(t != NULL);
+    if (!t) {
+        free(ctx);
+        goto done;
+    }
+    errno = 0;
+    CHECK(ds4_transport_configure_link(t, 91u, 4096u, 8u, 30000u,
+                                       err, sizeof(err)) == -1);
+    CHECK(errno == EPROTO);
+    CHECK(ds4_transport_configure_link(t, 91u, 4096u, 8u, 128u,
+                                       err, sizeof(err)) == 0);
+    CHECK(ds4_transport_max_oob_bytes(t) == 128u);
+
+    unsigned char payload[129];
+    unsigned char received[sizeof(payload)];
+    memset(payload, 0x5a, sizeof(payload));
+    memset(received, 0, sizeof(received));
+    ds4_transport_bulk_desc desc;
+    CHECK(ds4_transport_prepare_bulk(
+              t, DS4_TRANSPORT_BULK_INPUT_HIDDEN, 4u, 7u,
+              (uint32_t)sizeof(payload), 16u,
+              &desc, err, sizeof(err)) == 0);
+    CHECK(desc.mode == DS4_TRANSPORT_BULK_TCP_INLINE);
+    CHECK(ds4_transport_send_bulk_desc(t, &desc,
+                                       payload, sizeof(payload)) == 0);
+    CHECK(ds4_transport_tcp_read(sv[1], received, sizeof(received)) == 1);
+    CHECK(memcmp(received, payload, sizeof(payload)) == 0);
+    ds4_transport_release(t);
+
+done:
+    if (sv[1] >= 0) close(sv[1]);
+    if (sv[0] >= 0) close(sv[0]);
+}
+
 static void test_mapped_lease_core(void) {
     int sv[2] = {-1, -1};
     char err[128] = "";
@@ -287,7 +332,7 @@ static void test_mapped_lease_core(void) {
         free(ctx);
         goto done;
     }
-    CHECK(ds4_transport_configure_link(t, 77u, 4096u, 8u,
+    CHECK(ds4_transport_configure_link(t, 77u, 4096u, 8u, 128u,
                                        err, sizeof(err)) == 0);
     CHECK(ds4_transport_mapped_leases_supported(t) == 1);
     CHECK((ds4_transport_caps(t) & DS4_TRANSPORT_CAP_GPU_MAPPED) != 0);
@@ -298,6 +343,9 @@ static void test_mapped_lease_core(void) {
               &desc, err, sizeof(err)) == 0);
     CHECK(desc.mode == DS4_TRANSPORT_BULK_NHI_OOB);
     CHECK(desc.sequence == 1u);
+    CHECK(ds4_transport_max_oob_bytes(t) == 128u);
+    CHECK(ds4_transport_can_oob(t, 128u) == 1);
+    CHECK(ds4_transport_can_oob(t, 129u) == 0);
 
     ds4_transport_lease *lease = NULL;
     CHECK(ds4_transport_tx_lease_acquire(t, &desc, &lease,
@@ -454,6 +502,7 @@ int main(void) {
     CHECK(errno == EINVAL);
 
     test_descriptor_sequences();
+    test_negotiated_oob_limit();
     test_mapped_lease_core();
 
     fprintf(stderr, "test_transport: %d/%d checks passed (%d failed)\n",

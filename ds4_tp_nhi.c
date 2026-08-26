@@ -109,6 +109,7 @@ int ds4_tp_nhi_open(ds4_tp_nhi **out,
     if (!ds4_gpu_tp_pool_alloc_export_uc(t->pool_bytes, &t->tx_pool, &tx_fd) ||
         !ds4_gpu_tp_pool_alloc_export_uc(t->pool_bytes, &t->rx_pool, &rx_fd)) {
         if (tx_fd >= 0) close(tx_fd);
+        if (rx_fd >= 0) close(rx_fd);
         tp_nhi_set_err(err, errlen,
                        "uncached TP pool allocation/export failed "
                        "(dedicated BO required)");

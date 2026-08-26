@@ -190,6 +190,9 @@ static void test_offer_validation(void) {
     offer.capabilities = DS4_DIST_V3_CAP_BULK_DESC_V1 |
                          DS4_DIST_V3_CAP_NHI_CPU_COPY_V1;
     CHECK(ds4_dist_v3_hello_ext_validate(&offer, err, sizeof(err)) == -1);
+    offer = tcp_offer(DS4_DIST_V3_POLICY_AUTO);
+    offer.capabilities |= DS4_DIST_V3_CAP_SPEC_EXACT_V1;
+    CHECK(ds4_dist_v3_hello_ext_validate(&offer, err, sizeof(err)) == -1);
     offer = tcp_offer(DS4_DIST_V3_POLICY_REQUIRE_NHI);
     CHECK(ds4_dist_v3_hello_ext_validate(&offer, err, sizeof(err)) == -1);
     offer = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_LARGE,
@@ -221,6 +224,34 @@ static void test_negotiation(void) {
     CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
                                          err, sizeof(err)) == 0);
 
+    /* Speculative-decode extensions are opt-in per link: selected only
+     * when both peers advertise them. */
+    worker.capabilities |= DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0);
+    coordinator.capabilities |= DS4_DIST_V3_CAP_SPEC_DECODE_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) ==
+          DS4_DIST_V3_CAP_SPEC_DECODE_V1);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) == 0);
+    worker.capabilities |= DS4_DIST_V3_CAP_SPEC_EXACT_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) == 0);
+    coordinator.capabilities |= DS4_DIST_V3_CAP_SPEC_EXACT_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) ==
+          DS4_DIST_V3_CAP_SPEC_EXACT_V1);
+    CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
+                                         err, sizeof(err)) == 0);
+    worker.capabilities &= ~(DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
+                             DS4_DIST_V3_CAP_SPEC_EXACT_V1);
+    coordinator.capabilities &= ~(DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
+                                  DS4_DIST_V3_CAP_SPEC_EXACT_V1);
+
     worker = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_LARGE,
                        NHI_MAX_LARGE);
     coordinator = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_SMALL,
@@ -235,6 +266,16 @@ static void test_negotiation(void) {
     CHECK(ack.nhi_max_payload == NHI_MAX_SMALL);
     CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
                                          err, sizeof(err)) == 0);
+
+    /* Equal rings do not erase a peer's deliberately lower payload ceiling. */
+    worker = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_LARGE,
+                       NHI_MAX_LARGE);
+    coordinator = nhi_offer(DS4_DIST_V3_POLICY_AUTO, NHI_RING_LARGE,
+                            NHI_MAX_SMALL);
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation + 2u,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK(ack.nhi_ring_size == NHI_RING_LARGE);
+    CHECK(ack.nhi_max_payload == NHI_MAX_SMALL);
 
     coordinator = tcp_offer(DS4_DIST_V3_POLICY_AUTO);
     CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation + 2u,
@@ -296,6 +337,73 @@ static void test_negotiation(void) {
     ack.nhi_max_payload = 0;
     CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
                                          err, sizeof(err)) == -1);
+}
+
+static void test_result_payload_limits(void) {
+    char err[160];
+    const ds4_dist_v3_result_limits limits = {
+        .allowed_kinds = DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_ACK) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_HIDDEN_STATE) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS_DRAFTS) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS_NROWS) |
+            DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS_DECODE2),
+        .hidden_wire_bytes = 8192u,
+        .logits_bytes = 4096u,
+        .nrows_bytes = 12288u,
+    };
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_ACK, 0, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS, 4096, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS, 4097, 32, &limits, 16,
+              err, sizeof(err)) == -1);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS, UINT32_MAX, 32, &limits, 16,
+              err, sizeof(err)) == -1);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_HIDDEN_STATE, 8192, 16, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_HIDDEN_STATE, 8192, 32, &limits, 16,
+              err, sizeof(err)) == -1);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_DRAFTS, 4100, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_DRAFTS, 4164, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_DRAFTS, 4168, 32, &limits, 16,
+              err, sizeof(err)) == -1);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_NROWS, 12288, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_NROWS, 12356, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_NROWS, 12360, 32, &limits, 16,
+              err, sizeof(err)) == -1);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_LOGITS_DECODE2, 4100, 32, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              1, 99, DS4_DIST_REMOTE_ERROR_MAX_BYTES, 8, &limits, 16,
+              err, sizeof(err)) == 0);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              1, 99, DS4_DIST_REMOTE_ERROR_MAX_BYTES + 1u, 8, &limits, 16,
+              err, sizeof(err)) == -1);
+
+    ds4_dist_v3_result_limits logits_only = limits;
+    logits_only.allowed_kinds =
+        DS4_DIST_RESULT_KIND_BIT(DS4_DIST_RESULT_LOGITS);
+    CHECK(ds4_dist_v3_result_payload_validate(
+              0, DS4_DIST_RESULT_HIDDEN_STATE, 8192, 16,
+              &logits_only, 16, err, sizeof(err)) == -1);
 }
 
 static void test_frame_sizes(void) {
@@ -459,6 +567,7 @@ int main(void) {
     test_endian_round_trips();
     test_offer_validation();
     test_negotiation();
+    test_result_payload_limits();
     test_frame_sizes();
     test_ready_barrier();
     test_descriptor_validation();

@@ -225,67 +225,6 @@ extern "C" int ds4_gpu_set_decode_score_vec4(int enabled) {
     return 0;
 }
 
-/* The exact-rows contract promises every row in the one-row reduction
- * order.  Rows 2..5 ride the k-row tiers; beyond that, evaluate each row
- * through the one-row path rather than silently handing the span to the
- * generic batch tiers, whose reduction order differs. */
-extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint32_t n_rows) {
-    if (n_rows <= 5u) {
-        return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
-                                          weight_offset, in_dim, out_dim, x,
-                                          n_rows);
-    }
-    for (uint32_t r = 0; r < n_rows; r++) {
-        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
-            out, (uint64_t)r * out_dim * sizeof(float),
-            out_dim * sizeof(float));
-        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
-            x, (uint64_t)r * in_dim * sizeof(float), in_dim * sizeof(float));
-        const int ok = out_row && x_row &&
-            ds4_gpu_matmul_q8_0_tensor(out_row, model_map, model_size,
-                                       weight_offset, in_dim, out_dim,
-                                       x_row, 1u);
-        if (out_row) ds4_gpu_tensor_free(out_row);
-        if (x_row) ds4_gpu_tensor_free(x_row);
-        if (!ok) return 0;
-    }
-    return 1;
-}
-
-extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, const void *model_map,
-        uint64_t model_size, uint64_t weight0_offset,
-        uint64_t weight1_offset, uint64_t in_dim, uint64_t out0_dim,
-        uint64_t out1_dim, const ds4_gpu_tensor *x, uint32_t n_rows) {
-    if (n_rows <= 5u) {
-        return ds4_gpu_matmul_q8_0_pair_tensor(
-                out0, out1, model_map, model_size, weight0_offset,
-                weight1_offset, in_dim, out0_dim, out1_dim, x, n_rows);
-    }
-    for (uint32_t r = 0; r < n_rows; r++) {
-        ds4_gpu_tensor *o0 = ds4_gpu_tensor_view(
-            out0, (uint64_t)r * out0_dim * sizeof(float),
-            out0_dim * sizeof(float));
-        ds4_gpu_tensor *o1 = ds4_gpu_tensor_view(
-            out1, (uint64_t)r * out1_dim * sizeof(float),
-            out1_dim * sizeof(float));
-        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
-            x, (uint64_t)r * in_dim * sizeof(float), in_dim * sizeof(float));
-        const int ok = o0 && o1 && x_row &&
-            ds4_gpu_matmul_q8_0_pair_tensor(
-                o0, o1, model_map, model_size, weight0_offset,
-                weight1_offset, in_dim, out0_dim, out1_dim, x_row, 1u);
-        if (o0) ds4_gpu_tensor_free(o0);
-        if (o1) ds4_gpu_tensor_free(o1);
-        if (x_row) ds4_gpu_tensor_free(x_row);
-        if (!ok) return 0;
-    }
-    return 1;
-}
-
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows) {

@@ -1,4 +1,6 @@
 /* Bit-exactness test for the ROCm k-row Q8_0 prequant matvec tier.
+ * Includes the production 7168-wide vocabulary-head input with a small output
+ * dimension so dispatch arithmetic is realistic without a large test model.
  *
  * The decode tier (matmul_q8_0_preq_rows_w32_kernel) defines the reference
  * summation order for one-row evals.  The k-row tier must produce, for
@@ -18,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -62,7 +65,16 @@ static void fill_q8_weights(uint8_t *w, uint32_t out_dim, uint32_t blocks) {
     }
 }
 
-static int run_shape(const shape *sh) {
+static int run_shape(const shape *sh, bool exact_api_only) {
+    int gpu_ready = 0;
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "q8 krow: ds4_gpu_init failed\n");
+        return 0;
+    }
+    gpu_ready = 1;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+
     const uint32_t in_dim = sh->in_dim;
     const uint32_t out_dim = sh->out_dim;
     const uint32_t blocks = (in_dim + 31u) / 32u;
@@ -117,8 +129,9 @@ static int run_shape(const shape *sh) {
     }
     for (uint64_t i = 0; i < (uint64_t)MAX_K * in_dim; i++) x[i] = rng_float();
 
-    if (!ds4_gpu_set_model_map(model, model_size)) {
-        fprintf(stderr, "q8 krow: model map setup failed\n");
+    if (!ds4_gpu_set_primary_model_map(model, model_size) ||
+        !ds4_gpu_set_model_map(model, model_size)) {
+        fprintf(stderr, "q8 krow: primary model map setup failed\n");
         ok = 0;
         goto cleanup;
     }
@@ -174,17 +187,16 @@ static int run_shape(const shape *sh) {
                 }
             }
         }
-        /* Timed pass: the same call the exactness check exercised.  With
-         * DS4_ROCM_DSV4_PREQUANT_DECODE=0 the dispatch reverts to the f32
-         * batch tiers, so this doubles as an A/B probe for the tier. */
+        /* Timed pass through the exact API. The disabled child and spans
+         * wider than five must remain on its serial one-row rollback. */
         const int iters = 100;
         double best = 1e30;
         for (int t = 0; t < 3; t++) {
             const double t0 = now_sec();
             for (int i = 0; i < iters; i++) {
-                if (!ds4_gpu_matmul_q8_0_tensor(out_batch_t, model, model_size,
-                                                weight_offset, in_dim, out_dim,
-                                                x_batch_t, k)) {
+                if (!ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        out_batch_t, model, model_size, weight_offset,
+                        in_dim, out_dim, x_batch_t, k)) {
                     ok = 0;
                     break;
                 }
@@ -267,6 +279,8 @@ static int run_shape(const shape *sh) {
         free(out1_batch);
         free(out1_row);
     }
+
+    if (exact_api_only) goto cleanup;
 
     /* Shared-expert rows entry: per-row bit-equality with the one-row
      * shared gate/up + swiglu entry (both weight matrices point at the
@@ -383,32 +397,208 @@ cleanup:
     if (x_row_t) ds4_gpu_tensor_free(x_row_t);
     if (out_batch_t) ds4_gpu_tensor_free(out_batch_t);
     if (out_row_t) ds4_gpu_tensor_free(out_row_t);
+    /* The ROCm runtime can retain hipHostRegister state for the current
+     * model mapping. Release it while the mmap is still valid. */
+    if (gpu_ready) ds4_gpu_cleanup();
     if (model != MAP_FAILED) munmap(model, (size_t)model_size);
     if (model_file) fclose(model_file);
+    free(x);
+    free(out_batch);
+    free(out_row);
     return ok;
 }
 
-int main(void) {
+static int test_primary_cache_survives_support_map(void) {
+    int gpu_ready = 0;
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "q8 multi-model: ds4_gpu_init failed\n");
+        return 0;
+    }
+    gpu_ready = 1;
+    ds4_gpu_set_quality(false);
+    ds4_gpu_set_ssd_streaming(false);
+
+    enum { IN_DIM = 2048u, OUT_DIM = 4096u, N_TOK = 8u };
+    const uint32_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t weight_offset = 4096u;
+    const uint64_t weight_bytes =
+        (uint64_t)OUT_DIM * blocks * Q8_BLOCK_BYTES;
+    const uint64_t model_size = weight_offset + weight_bytes;
+    const uint64_t support_size = 4096u;
+
+    int ok = 1;
+    FILE *model_file = tmpfile();
+    FILE *support_file = tmpfile();
+    FILE *support2_file = tmpfile();
+    void *model = MAP_FAILED;
+    void *support = MAP_FAILED;
+    void *support2 = MAP_FAILED;
+    float *x = NULL;
+    float *before = NULL;
+    float *after = NULL;
+    ds4_gpu_tensor *x_t = NULL;
+    ds4_gpu_tensor *out_t = NULL;
+
+    if (model_file && ftruncate(fileno(model_file), (off_t)model_size) == 0) {
+        model = mmap(NULL, (size_t)model_size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fileno(model_file), 0);
+    }
+    if (support_file &&
+        ftruncate(fileno(support_file), (off_t)support_size) == 0) {
+        support = mmap(NULL, (size_t)support_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fileno(support_file), 0);
+    }
+    if (support2_file &&
+        ftruncate(fileno(support2_file), (off_t)support_size) == 0) {
+        support2 = mmap(NULL, (size_t)support_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fileno(support2_file), 0);
+    }
+    x = (float *)malloc((size_t)N_TOK * IN_DIM * sizeof(float));
+    before = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    after = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    if (!model_file || !support_file || !support2_file ||
+        model == MAP_FAILED || support == MAP_FAILED ||
+        support2 == MAP_FAILED || !x || !before || !after) {
+        fprintf(stderr, "q8 multi-model: host allocation failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+    memset(model, 0, (size_t)model_size);
+    memset(support, 0, (size_t)support_size);
+    memset(support2, 0, (size_t)support_size);
+    rng_state = 0x6d756c74u;
+    fill_q8_weights((uint8_t *)model + weight_offset, OUT_DIM, blocks);
+    for (uint64_t i = 0; i < (uint64_t)N_TOK * IN_DIM; i++) {
+        x[i] = rng_float();
+    }
+
+    /* Enter multi-model mode before the explicit target preload so failure is
+     * fail-closed rather than an optional direct-Q8 fallback. */
+    if (!ds4_gpu_set_primary_model_map(model, model_size) ||
+        !ds4_gpu_set_model_map(model, model_size) ||
+        !ds4_gpu_set_model_map(support, support_size) ||
+        !ds4_gpu_cache_q8_f16_range(model, model_size, weight_offset,
+                                     weight_bytes, IN_DIM, OUT_DIM,
+                                     "ffn_down_shexp")) {
+        fprintf(stderr, "q8 multi-model: primary cache setup failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+    x_t = ds4_gpu_tensor_alloc((uint64_t)N_TOK * IN_DIM * sizeof(float));
+    out_t = ds4_gpu_tensor_alloc((uint64_t)N_TOK * OUT_DIM * sizeof(float));
+    if (!x_t || !out_t ||
+        !ds4_gpu_tensor_write(x_t, 0u, x,
+                              (uint64_t)N_TOK * IN_DIM * sizeof(float)) ||
+        !ds4_gpu_matmul_q8_0_tensor(out_t, model, model_size,
+                                    weight_offset, IN_DIM, OUT_DIM,
+                                    x_t, N_TOK) ||
+        !ds4_gpu_tensor_read(out_t, 0u, before,
+                             (uint64_t)N_TOK * OUT_DIM * sizeof(float))) {
+        fprintf(stderr, "q8 multi-model: primary baseline failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+
+    if (!ds4_gpu_set_model_map(support2, support_size) ||
+        !ds4_gpu_matmul_q8_0_tensor(out_t, model, model_size,
+                                    weight_offset, IN_DIM, OUT_DIM,
+                                    x_t, N_TOK) ||
+        !ds4_gpu_tensor_read(out_t, 0u, after,
+                             (uint64_t)N_TOK * OUT_DIM * sizeof(float))) {
+        fprintf(stderr, "q8 multi-model: target eval after support map failed\n");
+        ok = 0;
+        goto cleanup;
+    }
+    if (memcmp(before, after,
+               (size_t)N_TOK * OUT_DIM * sizeof(float)) != 0) {
+        uint64_t first = 0;
+        while (first < (uint64_t)N_TOK * OUT_DIM &&
+               memcmp(&before[first], &after[first], sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr,
+                "q8 multi-model: target output changed after support map "
+                "(first=%llu before=%a after=%a)\n",
+                (unsigned long long)first,
+                first < (uint64_t)N_TOK * OUT_DIM ? before[first] : 0.0,
+                first < (uint64_t)N_TOK * OUT_DIM ? after[first] : 0.0);
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "q8 multi-model primary cache: BITEXACT after support map\n");
+    }
+
+cleanup:
+    if (x_t) ds4_gpu_tensor_free(x_t);
+    if (out_t) ds4_gpu_tensor_free(out_t);
+    free(x);
+    free(before);
+    free(after);
+    /* Primary and support mappings must outlive every retained model range
+     * and Q8-F16 cache registration. */
+    if (gpu_ready) ds4_gpu_cleanup();
+    if (model != MAP_FAILED) munmap(model, (size_t)model_size);
+    if (support != MAP_FAILED) munmap(support, (size_t)support_size);
+    if (support2 != MAP_FAILED) munmap(support2, (size_t)support_size);
+    if (model_file) fclose(model_file);
+    if (support_file) fclose(support_file);
+    if (support2_file) fclose(support2_file);
+    return ok;
+}
+
+int main(int argc, char **argv) {
+    const bool fallback_mode = argc == 2 &&
+                               strcmp(argv[1], "--prequant-disabled") == 0;
+    if (argc != 1 && !fallback_mode) {
+        fprintf(stderr, "usage: %s [--prequant-disabled]\n", argv[0]);
+        return 2;
+    }
+    /* Make both direct and forked modes self-describing: the parent must
+     * exercise the k-row tier even if the shell inherited =0, while the
+     * rollback mode must disable it before the runtime caches the setting. */
+    if (setenv("DS4_ROCM_DSV4_PREQUANT_DECODE",
+               fallback_mode ? "0" : "1", 1) != 0 ||
+        setenv("DS4_ROCM_Q8_EXACT_KROW_REQUIRED",
+               fallback_mode ? "0" : "1", 1) != 0 ||
+        setenv("DS4_ROCM_SHARED_DOWN_CUBLAS",
+               fallback_mode ? "0" : "1", 1) != 0) {
+        perror("q8 krow: setenv");
+        return 1;
+    }
+    if (!fallback_mode) {
+        const pid_t child = fork();
+        if (child == 0) {
+            execlp(argv[0], argv[0], "--prequant-disabled", (char *)NULL);
+            _exit(127);
+        }
+        int status = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "q8 krow: prequant-disabled subprocess failed\n");
+            return 1;
+        }
+    }
+
     /* Production decode matvec shapes: square attention-sized, the shared
-     * expert pair, a wide FFN, and an odd out_dim for row-guard coverage. */
+     * expert pair, a wide FFN, an odd out_dim for row guards, and the vocab
+     * head's real 7168 input width with a memory-bounded output dimension. */
     const shape shapes[] = {
         {4096u, 4096u},
         {2048u, 4096u},
         {4096u, 14336u},
         {4096u, 4099u},
+        {7168u, 257u},
     };
-    if (!ds4_gpu_init()) {
-        fprintf(stderr, "q8 krow: ds4_gpu_init failed\n");
-        return 1;
-    }
-    ds4_gpu_set_quality(false);
-    ds4_gpu_set_ssd_streaming(false);
     int ok = 1;
-    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
-        if (!run_shape(&shapes[i])) ok = 0;
+    const size_t first = fallback_mode ?
+        sizeof(shapes) / sizeof(shapes[0]) - 1u : 0u;
+    for (size_t i = first; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        if (!run_shape(&shapes[i], fallback_mode)) ok = 0;
     }
-    ds4_gpu_set_model_map(NULL, 0u);
-    ds4_gpu_cleanup();
-    fprintf(stderr, "Q8_0 k-row ROCm matvec: %s\n", ok ? "PASS" : "FAIL");
+    if (!fallback_mode && !test_primary_cache_survives_support_map()) ok = 0;
+    fprintf(stderr, "%s: %s\n",
+            fallback_mode ? "Q8_0 k-row ROCm prequant-disabled"
+                          : "Q8_0 k-row ROCm matvec",
+            ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

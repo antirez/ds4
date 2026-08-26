@@ -856,10 +856,24 @@ static int routed_moe_launch(
         }
         const uint32_t use_mxfp4_tiny_batch =
             mxfp4_path && n_tokens <= mxfp4_direct_max_cached;
+        /* Q4_K historically kept the per-pair path below 32 tokens, but
+         * speculative verify spans (2..8 rows) re-read duplicate experts
+         * from DRAM there: measured 36 pair reads vs ~21 unique experts at
+         * 6 rows.  DS4_ROCM_Q4K_SORTED_MIN overrides the threshold. */
+        static uint32_t q4k_sorted_min_cached = 0;
+        if (q4k_sorted_min_cached == 0u) {
+            uint32_t v = 32u;
+            const char *env = getenv("DS4_ROCM_Q4K_SORTED_MIN");
+            if (env && env[0]) {
+                const long parsed = strtol(env, NULL, 10);
+                if (parsed >= 2 && parsed <= 4096) v = (uint32_t)parsed;
+            }
+            q4k_sorted_min_cached = v;
+        }
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             !use_mxfp4_tiny_batch &&
-            (!q4k_path || n_tokens >= 32u) &&
+            (!q4k_path || n_tokens >= q4k_sorted_min_cached) &&
             !disable_resident_iq2_sorted;
         const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;

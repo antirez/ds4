@@ -89,6 +89,7 @@ struct ds4_transport {
     uint32_t local_ring_size;
     uint32_t peer_frame_size;
     uint32_t peer_ring_size;
+    uint32_t negotiated_max_payload;
     int configured;
     int fatal_error;
 };

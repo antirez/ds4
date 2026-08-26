@@ -722,6 +722,9 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	python3 tests/test_exact_shared_rows_static.py
+	python3 tests/test_exact_route_probe_static.py
+	python3 tests/test_dist_dspark_stats_static.py
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
 

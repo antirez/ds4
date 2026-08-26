@@ -12650,9 +12650,20 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode &&
+        const bool can_mtp_spec =
+            (!s->batched_mode || s->slot_count <= 1) && temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (getenv("DS4_MTP_SPEC_LOG")) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: mtp spec gate batched=%d slots=%d temp=%.3f drafts=%d -> %s",
+                       s->batched_mode ? 1 : 0,
+                       s->slot_count,
+                       temperature,
+                       ds4_engine_mtp_draft_tokens(s->engine),
+                       can_mtp_spec ? "run" : "skip");
+        }
+        if (can_mtp_spec)
         {
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(

@@ -261,6 +261,9 @@ static inline int ds4_gpu_tensor_read_any(const ds4_gpu_tensor *tensor,
 }
 #endif
 
+/* Mark the target model before mapping it. Backends with process-global
+ * multi-model caches use this to distinguish target and support mappings. */
+int ds4_gpu_set_primary_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
