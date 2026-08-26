@@ -51,3 +51,18 @@ Run the backend regression with:
 ```sh
 make test-graph-deferred-dump-rocm HIPCC=/path/to/hipcc
 ```
+
+## Exact-span routed-expert overlap probe
+
+Set `DS4_DIST_SPEC_EXACT_ROUTE_PROBE=1` alongside the experimental exact-span
+switches to snapshot every selected routed-expert ID for each row and layer of
+a 2..5-row exact span. The probe queues D2D snapshots at the router boundary,
+uses the span's existing end-of-command synchronization, then emits one line
+per layer containing raw row selections, adjacent intersections/Jaccards, and
+the whole-layer union. It works for both the ordinary exact loop and the
+`DS4_DIST_SPEC_EXACT_SHARED_ROWS` helper. It is otherwise allocation-, copy-,
+and log-free.
+
+`DS4_DIST_SPEC_EXACT_ROUTE_PROBE_LIMIT=N` limits successful probe spans per
+session; `N` must be in `1..UINT32_MAX`. Allocation, copy, read, formatting, or
+invalid-limit failures fail the requested span instead of omitting records.

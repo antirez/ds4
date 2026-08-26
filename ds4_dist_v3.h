@@ -22,6 +22,17 @@
 #define DS4_DIST_V3_CAP_BULK_DESC_V1    0x00000001u
 #define DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 0x00000002u
 #define DS4_DIST_V3_CAP_NHI_TAGGED_V1   0x00000004u
+/* Speculative-decode WORK/RESULT extensions (F_SPEC_VERIFY, F_SPEC_ROLLBACK,
+ * F_OUTPUT_DRAFTS, F_OUTPUT_ALL_LOGITS, F_SPEC_COMMIT,
+ * F_SPEC_EXACT_REQUIRED and the LOGITS_NROWS
+ * result kind).  Additive: unknown advertised bits are ignored by older
+ * peers, and a coordinator must not set the speculative WORK flags unless
+ * this bit was selected for every hop of the route. */
+#define DS4_DIST_V3_CAP_SPEC_DECODE_V1  0x00000008u
+/* Explicit bilateral exact-row requirement flag. Kept separate from the v1
+ * speculative capability so mixed pre-flag peers fall back to replay rather
+ * than receiving an unknown WORK bit. */
+#define DS4_DIST_V3_CAP_SPEC_EXACT_V1   0x00000010u
 #define DS4_DIST_V3_CAP_NHI_V1 \
     (DS4_DIST_V3_CAP_BULK_DESC_V1 | \
      DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 | \
@@ -42,6 +53,27 @@ typedef enum {
     DS4_DIST_V3_TRANSPORT_TCP = 1,
     DS4_DIST_V3_TRANSPORT_NHI = 2,
 } ds4_dist_v3_transport_kind;
+
+/* RESULT kinds retain their established v2 wire values. V3 receivers use the
+ * request-specific limits below before allocating or reading peer payloads. */
+typedef enum {
+    DS4_DIST_RESULT_ACK = 0,
+    DS4_DIST_RESULT_HIDDEN_STATE = 1,
+    DS4_DIST_RESULT_LOGITS = 2,
+    DS4_DIST_RESULT_LOGITS_DRAFTS = 3,
+    DS4_DIST_RESULT_LOGITS_NROWS = 4,
+    DS4_DIST_RESULT_LOGITS_DECODE2 = 5,
+} ds4_dist_result_kind;
+
+#define DS4_DIST_RESULT_KIND_BIT(kind) (UINT32_C(1) << (kind))
+#define DS4_DIST_REMOTE_ERROR_MAX_BYTES 4096u
+
+typedef struct {
+    uint32_t allowed_kinds;
+    uint32_t hidden_wire_bytes;
+    uint32_t logits_bytes;
+    uint32_t nrows_bytes;
+} ds4_dist_v3_result_limits;
 
 /* Appended to the existing v2 HELLO fixed record in a HELLO_V3 payload. */
 typedef struct {
@@ -129,6 +161,19 @@ int ds4_dist_v3_negotiate(
         const ds4_dist_v3_hello_ext *coordinator,
         uint64_t generation,
         ds4_dist_v3_hello_ack *ack,
+        char *err,
+        size_t errlen);
+
+/* Reject a RESULT header before telemetry/payload allocation or read. Error
+ * payloads are capped independently; successful payloads must exactly match
+ * the request's hidden/logit geometry (plus at most 16 encoded draft ids). */
+int ds4_dist_v3_result_payload_validate(
+        uint32_t status,
+        uint32_t result_kind,
+        uint32_t payload_bytes,
+        uint32_t payload_bits,
+        const ds4_dist_v3_result_limits *limits,
+        uint32_t activation_bits,
         char *err,
         size_t errlen);
 

@@ -85,15 +85,17 @@ ds4_transport *ds4_transport_nhi_dup(
         char *err,
         size_t errlen);
 
-/* Configure the negotiated connection identity and peer receive geometry.
- * TCP accepts zero peer geometry. NHI requires its peer frame size to match
- * and limits each message and aggregate in-flight frames to the smaller ring.
+/* Configure the negotiated connection identity, peer receive geometry, and
+ * payload ceiling. TCP requires all three geometry/ceiling fields to be zero.
+ * NHI requires its peer frame size to match and limits each message to both
+ * the smaller ring and negotiated_max_payload.
  */
 int ds4_transport_configure_link(
         ds4_transport *t,
         uint64_t generation,
         uint32_t peer_frame_size,
         uint32_t peer_ring_size,
+        uint32_t negotiated_max_payload,
         char *err,
         size_t errlen);
 uint64_t ds4_transport_generation(const ds4_transport *t);

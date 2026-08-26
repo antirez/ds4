@@ -20,6 +20,72 @@ static int v3_fail(int error, char *err, size_t errlen, const char *message) {
     return -1;
 }
 
+int ds4_dist_v3_result_payload_validate(
+        uint32_t status,
+        uint32_t result_kind,
+        uint32_t payload_bytes,
+        uint32_t payload_bits,
+        const ds4_dist_v3_result_limits *limits,
+        uint32_t activation_bits,
+        char *err,
+        size_t errlen) {
+    if (!limits)
+        return v3_fail(EINVAL, err, errlen,
+                       "missing distributed result limits");
+    if (status != 0) {
+        return payload_bytes <= DS4_DIST_REMOTE_ERROR_MAX_BYTES
+            ? 0
+            : v3_fail(EPROTO, err, errlen,
+                      "distributed error payload exceeds limit");
+    }
+    if (result_kind > DS4_DIST_RESULT_LOGITS_DECODE2 ||
+        (limits->allowed_kinds & DS4_DIST_RESULT_KIND_BIT(result_kind)) == 0)
+        return v3_fail(EPROTO, err, errlen,
+                       "distributed result kind is not valid for request");
+
+    const uint64_t bytes = payload_bytes;
+    int valid = 0;
+    switch (result_kind) {
+    case DS4_DIST_RESULT_ACK:
+        valid = bytes == 0 && payload_bits == 32u;
+        break;
+    case DS4_DIST_RESULT_HIDDEN_STATE:
+        valid = limits->hidden_wire_bytes != 0 &&
+            bytes == limits->hidden_wire_bytes &&
+            payload_bits == activation_bits;
+        break;
+    case DS4_DIST_RESULT_LOGITS:
+        valid = limits->logits_bytes != 0 &&
+            bytes == limits->logits_bytes && payload_bits == 32u;
+        break;
+    case DS4_DIST_RESULT_LOGITS_DRAFTS: {
+        const uint64_t first = (uint64_t)limits->logits_bytes + 4u;
+        valid = limits->logits_bytes != 0 && bytes >= first &&
+            bytes <= first + 16u * 4u && (bytes - first) % 4u == 0u &&
+            payload_bits == 32u;
+        break;
+    }
+    case DS4_DIST_RESULT_LOGITS_NROWS: {
+        const uint64_t first = (uint64_t)limits->nrows_bytes + 4u;
+        valid = limits->nrows_bytes != 0 && payload_bits == 32u &&
+            (bytes == limits->nrows_bytes ||
+             (bytes >= first && bytes <= first + 16u * 4u &&
+              (bytes - first) % 4u == 0u));
+        break;
+    }
+    case DS4_DIST_RESULT_LOGITS_DECODE2:
+        valid = limits->logits_bytes != 0 &&
+            bytes == (uint64_t)limits->logits_bytes + 4u &&
+            payload_bits == 32u;
+        break;
+    default:
+        break;
+    }
+    return valid ? 0 : v3_fail(
+        EPROTO, err, errlen,
+        "distributed result payload exceeds request bounds");
+}
+
 static int v3_add_u32(uint32_t a, uint32_t b, uint32_t *out) {
     if (!out) {
         errno = EINVAL;
@@ -189,6 +255,10 @@ int ds4_dist_v3_hello_ext_validate(
         return v3_fail(EPROTO, err, errlen, "v3 HELLO reserved field is nonzero");
     if ((hello->capabilities & DS4_DIST_V3_CAP_BULK_DESC_V1) == 0)
         return v3_fail(EPROTONOSUPPORT, err, errlen, "v3 HELLO lacks bulk descriptor support");
+    if ((hello->capabilities & DS4_DIST_V3_CAP_SPEC_EXACT_V1) != 0 &&
+        (hello->capabilities & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0)
+        return v3_fail(EPROTONOSUPPORT, err, errlen,
+                       "v3 HELLO exact speculation lacks base speculation capability");
 
     nhi_bits = hello->capabilities & DS4_DIST_V3_CAP_NHI_OPTIONAL;
     if (nhi_bits != 0 && nhi_bits != DS4_DIST_V3_CAP_NHI_OPTIONAL)
@@ -233,13 +303,17 @@ int ds4_dist_v3_hello_ack_validate(
     if (generation == 0)
         return v3_fail(EPROTO, err, errlen, "v3 HELLO ACK has a zero generation");
     if ((ack->coordinator_caps & DS4_DIST_V3_CAP_BULK_DESC_V1) == 0 ||
+        ((ack->coordinator_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) != 0 &&
+         (ack->coordinator_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0) ||
         ((ack->coordinator_caps & DS4_DIST_V3_CAP_NHI_OPTIONAL) != 0 &&
          (ack->coordinator_caps & DS4_DIST_V3_CAP_NHI_OPTIONAL) !=
              DS4_DIST_V3_CAP_NHI_OPTIONAL))
         return v3_fail(EPROTONOSUPPORT, err, errlen, "v3 HELLO ACK advertises invalid coordinator capabilities");
     common_caps = local_offer->capabilities & ack->coordinator_caps;
     if ((ack->selected_caps & ~common_caps) != 0 ||
-        (ack->selected_caps & DS4_DIST_V3_CAP_BULK_DESC_V1) == 0)
+        (ack->selected_caps & DS4_DIST_V3_CAP_BULK_DESC_V1) == 0 ||
+        ((ack->selected_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) != 0 &&
+         (ack->selected_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0))
         return v3_fail(EPROTO, err, errlen, "v3 HELLO ACK selected unsupported capabilities");
 
     if (ack->selected_transport == DS4_DIST_V3_TRANSPORT_TCP) {
@@ -328,7 +402,9 @@ int ds4_dist_v3_negotiate(
     *ack = (ds4_dist_v3_hello_ack){0};
     ack->protocol_version = DS4_DIST_V3_PROTOCOL_VERSION;
     ack->coordinator_caps = coordinator->capabilities;
-    ack->selected_caps = common_caps & DS4_DIST_V3_CAP_BULK_DESC_V1;
+    ack->selected_caps = common_caps & (DS4_DIST_V3_CAP_BULK_DESC_V1 |
+                                        DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
+                                        DS4_DIST_V3_CAP_SPEC_EXACT_V1);
     ds4_dist_v3_u64_to_halves(generation,
                               &ack->generation_hi, &ack->generation_lo);
     if (both_nhi) {
