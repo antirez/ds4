@@ -57531,7 +57531,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
+#if defined(DS4_ROCM_BUILD)
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --rocm\n");
+#elif defined(DS4_NO_GPU)
+        fprintf(stderr, "ds4: --ssd-streaming requires a GPU build; this binary is CPU-only\n");
+#elif defined(__APPLE__)
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal\n");
+#else
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --cuda\n");
+#endif
         ds4_engine_close(e);
         *out = NULL;
         return 1;
