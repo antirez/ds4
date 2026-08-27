@@ -12987,6 +12987,18 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 
 #define DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK 2048u
 
+/*
+ * Largest prefill chunk the GPU graph can stage.
+ *
+ * The raw KV cache is sized align_up(raw_window + prefill_cap, 256) and then
+ * clamped to 8192 rows (metal_graph_raw_cap_for_context / engine_planner_raw_cap).
+ * A chunk larger than that cannot be staged: the raw cache clamps silently and
+ * the prefill then dies inside the attention batch encode with
+ * "gpu layer N attention batch encode failed" and nothing pointing at the
+ * cause.  Verified empirically -- 8192 runs, 8448 does not.
+ */
+#define DS4_PREFILL_MAX_CHUNK 8192u
+
 static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
                                             uint32_t requested_chunk) {
     if (requested_chunk != 0) return requested_chunk;
@@ -13015,6 +13027,22 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     }
 
     if (cap == 0) cap = 1;
+    /*
+     * Clamp rather than abort: an out-of-range --prefill-chunk or
+     * DS4_METAL_PREFILL_CHUNK should degrade to the largest workable value and
+     * say so, not fail deep in the graph encode with an unrelated message.
+     */
+    if (cap > DS4_PREFILL_MAX_CHUNK) {
+        static int warned_prefill_chunk_clamped;
+        if (!warned_prefill_chunk_clamped) {
+            fprintf(stderr,
+                    "ds4: prefill chunk %u exceeds the %u-row raw KV cache "
+                    "limit; using %u\n",
+                    cap, DS4_PREFILL_MAX_CHUNK, DS4_PREFILL_MAX_CHUNK);
+            warned_prefill_chunk_clamped = 1;
+        }
+        cap = DS4_PREFILL_MAX_CHUNK;
+    }
     if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
     return cap;
 }
