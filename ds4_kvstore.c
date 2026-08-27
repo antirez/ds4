@@ -517,6 +517,7 @@ static bool kv_cache_incoming_supersedes_continued(
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
     if (e->weights_fp24 != 0 && incoming->weights_fp24 != 0 &&
+        e->quant_bits == incoming->quant_bits &&
         e->weights_fp24 != incoming->weights_fp24) return false;
     if (incoming->reject_different_quant &&
         e->quant_bits != incoming->quant_bits)
@@ -1212,7 +1213,11 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
+        /* Same quantization, different weights: never reusable.  Across
+         * quantizations the fingerprints differ by construction, so the
+         * existing reject_different_quant policy stays the only gate. */
         if (weights_fp24 != 0 && e->weights_fp24 != 0 &&
+            e->quant_bits == (uint8_t)quant_bits &&
             e->weights_fp24 != weights_fp24) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
@@ -1266,7 +1271,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
-        } else if (hdr.weights_fp24 != 0 && hdr.weights_fp24 != weights_fp24) {
+        } else if (hdr.weights_fp24 != 0 &&
+                   hdr.quant_bits == (uint8_t)quant_bits &&
+                   hdr.weights_fp24 != weights_fp24) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for different model weights";
         } else if ((uint64_t)text_bytes > prompt_bytes) {

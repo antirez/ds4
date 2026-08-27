@@ -4245,6 +4245,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         ok = false;
     }
     if (ok && hdr.payload_bytes != 0 && hdr.weights_fp24 != 0 &&
+        hdr.quant_bits == (uint8_t)ds4_engine_routed_quant_bits(w->engine) &&
         hdr.weights_fp24 != ds4_engine_weights_fp24(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for different model weights");
