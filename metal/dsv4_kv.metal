@@ -1,10 +1,3 @@
-constant float dsv4_e4m3fn_exp_scale[16] = {
-    0.0f, 0.015625f, 0.03125f, 0.0625f,
-    0.125f, 0.25f, 0.5f, 1.0f,
-    2.0f, 4.0f, 8.0f, 16.0f,
-    32.0f, 64.0f, 128.0f, 256.0f,
-};
-
 constant float dsv4_e2m1fn_values[8] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
 };
@@ -55,39 +48,41 @@ struct ds4_metal_args_dsv4_compressor_store_one {
     uint32_t ape_type;
 };
 
-static inline float dsv4_e4m3fn_value(int i) {
-    const int exp  = (i >> 3) & 0x0f;
-    const int mant = i & 0x07;
-    return exp == 0
-        ? float(mant) * 0.001953125f
-        : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];
-}
-
 static inline float dsv4_e4m3fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), 448.0f);
 
-    int lo = 0;
-    int hi = 126;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
+    /*
+     * The per-code value table this used to search lives on as the independent
+     * oracle in test_metal_e4m3fn_dequant_exact (tests/ds4_test.c).
+     *
+     * E4M3FN magnitudes are exactly (8 + mant) * 2^(e - 10), where e is the
+     * 4-bit exponent field and the subnormal case (e == 0) continues the same
+     * 2^-9 spacing as the first normal binade.  So picking the nearest
+     * representable value is: find the binade, express ax in units of that
+     * binade's spacing, round to nearest-even, and scale back.  The rounded
+     * integer q is 8 + mant, and q * scale is already the value -- there is
+     * no code index or table lookup anywhere in this.
+     *
+     * q rounds half to even, and code = (e - 1) * 8 + q, so code and q always
+     * have the same parity.  That makes rint() exactly reproduce the
+     * ties-to-even-code rule of the binary search this replaces.  A tie at the
+     * top of a binade rounds q to 16, which scales to the same value as the
+     * next binade's q == 8, so no carry handling is needed.
+     *
+     * The scale factors are built directly from the exponent field rather than
+     * with exp2() so they are exact regardless of the shader's fast-math
+     * setting.  For e in [1, 15] the biased exponents stay in [118, 136], well
+     * inside the normal range.
+     */
+    const uint32_t bits = as_type<uint32_t>(ax);
+    const int fe = (int)((bits >> 23) & 0xffu) - 127;
+    const int e = clamp(fe + 7, 1, 15);
 
-    int best = lo;
-    if (best < 126) {
-        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
-        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
-        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
-            best = best + 1;
-        }
-    }
+    const float scale     = as_type<float>((uint32_t)(127 + (e - 10)) << 23);
+    const float inv_scale = as_type<float>((uint32_t)(127 - (e - 10)) << 23);
 
-    return sign * dsv4_e4m3fn_value(best);
+    return sign * (rint(ax * inv_scale) * scale);
 }
 
 static inline float dsv4_e2m1fn_dequant(float x) {
