@@ -85,6 +85,33 @@ static inline float dsv4_e4m3fn_dequant(float x) {
     return sign * (rint(ax * inv_scale) * scale);
 }
 
+/*
+ * amax across the 64 lanes covering one FP8 block: two simd_max plus a single
+ * exchange, replacing a six-step threadgroup reduction tree.
+ *
+ * `a` is the lane's |value|, or 0 for lanes past the end of a partial block.
+ * Passing it in a register removes the staging array the tree needed, and with
+ * it the whole class of bug where a partial block left some slots
+ * uninitialised and folded them into the result.
+ *
+ * max over non-negative finite floats is associative and exact, so the result
+ * is bit-identical to the tree regardless of reduction order.
+ *
+ * scratch needs only two floats.  The barrier is unconditional so every thread
+ * reaches it, including in callers whose threadgroup is wider than 64 lanes.
+ */
+static inline float ds4_metal_fp8_amax64(
+        float a,
+        uint tid,
+        threadgroup float * scratch) {
+    const float sg = simd_max(a);
+    if (tid < 64u && (tid & 31u) == 0u) {
+        scratch[tid >> 5] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return max(scratch[0], scratch[1]);
+}
+
 static inline float dsv4_e2m1fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), 6.0f);
@@ -146,20 +173,12 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
 
     for (int64_t off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
+        float a = 0.0f;
         if (tid < 64) {
             v = *((device const float *) (src_base + (off + tid)*args.nb00));
-            scratch[tid] = abs(v);
+            a = abs(v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(ds4_metal_fp8_amax64(a, tid, scratch), 1.0e-4f);
         const float scale = exp2(ceil(log2(amax / 448.0f)));
         if (tid < 64) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
@@ -244,22 +263,12 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
 
     for (int off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
+        float a = 0.0f;
         if (off + (int)tid < n_nope) {
             v = kv[off + tid];
-            scratch[tid] = abs(v);
-        } else {
-            scratch[tid] = 0.0f;
+            a = abs(v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(ds4_metal_fp8_amax64(a, tid, scratch), 1.0e-4f);
         const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
