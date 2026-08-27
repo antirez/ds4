@@ -65,8 +65,19 @@ buffers.
 Use these kernel parameters:
 
 ```text
-amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856
+ttm.pages_limit=32505856 ttm.page_pool_size=32505856
 ```
+
+`ttm.pages_limit` alone sets the GTT ceiling: `mem_info_gtt_total` comes out at exactly
+`pages_limit * 4096`. `amdgpu.gttsize` is not needed, and ROCm issue #5595 advises against
+setting it together with `ttm.pages_limit`.
+
+> **On `amd_iommu=off`.** Earlier revisions of this document recommended it. It may buy a
+> small memory-read speedup, but it is **not required** — DS4 has been run with the full
+> 80.76 GiB model on a 128 GB Ryzen AI MAX+ 395 host with IOMMU translation active
+> (`iommu.passthrough=0`). If your machine has an **XDNA2 NPU**, do not use it: the
+> `amdxdna` driver needs an IOMMU present for PASID, so `amd_iommu=off` disables the NPU
+> entirely.
 
 On Ubuntu with GRUB:
 
@@ -78,7 +89,7 @@ sudoedit /etc/default/grub
 Set:
 
 ```text
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash ttm.pages_limit=32505856 ttm.page_pool_size=32505856"
 ```
 
 Then:
@@ -92,16 +103,14 @@ After reboot, verify:
 
 ```sh
 cat /proc/cmdline
-sudo dmesg | grep -Ei 'GTT|gttsize|TTM|VRAM'
+cat /sys/class/drm/card*/device/mem_info_gtt_total
+sudo dmesg | grep -Ei 'GTT|TTM|VRAM'
 rocminfo | grep -A80 'Name:                    gfx1151'
 ```
 
-Expected signs:
-
-```text
-amdgpu:  126976M of GTT memory ready
-rocminfo gfx1151 pool: 130023424 KB
-```
+Expected signs: `mem_info_gtt_total` should equal `pages_limit * 4096` — with
+`ttm.pages_limit=32505856` that is `133143986176` bytes (124 GiB), and rocminfo should
+report a matching gfx1151 pool.
 
 ## 4. Build DS4
 
