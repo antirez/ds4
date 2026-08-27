@@ -57746,8 +57746,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     if (e->ssd_streaming && e->multi_tier) {
-        fprintf(stderr,
-                "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
+        /* An explicit --gpu-vram budget smaller than the model classifies
+         * the remaining layers as CPU spill, which makes even a single-GPU
+         * placement multi-tier: on that path the old "multi-GPU" wording
+         * sent people hunting for a second device (issue #880). */
+        if (gpu_cfg && gpu_cfg->n_gpus == 1) {
+            fprintf(stderr,
+                    "ds4: --ssd-streaming does not support tiered placement: "
+                    "the explicit --gpu-vram budget is smaller than the model, "
+                    "so layers would spill to CPU. Drop --gpu-vram and let "
+                    "streaming manage VRAM itself.\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
+        }
         ds4_engine_close(e);
         *out = NULL;
         return 1;
