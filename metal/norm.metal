@@ -349,6 +349,22 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
         if (tid < 64u && off + (int)tid < n_nope) {
             v = kv[off + tid];
             scratch[tid] = abs(v);
+        } else if (tid < 64u) {
+            /*
+             * Seed the lanes past the end of a partial final block.  Without
+             * this the amax tree below folds whatever the previous iteration
+             * or dispatch left in those slots into fp8_scale, which makes the
+             * result both wrong and irreproducible.  kernel_dsv4_kv_fp8_store_f32
+             * in dsv4_kv.metal -- which this kernel's comment claims to copy
+             * verbatim -- has always had it.
+             *
+             * The tid < 64u guard is load-bearing and cannot be a bare else:
+             * the standalone kernel returns early for tid >= 64, but this fused
+             * kernel runs on the much wider RMSNorm threadgroup (up to 1024
+             * threads), while scratch is shmem_f32 + 32 inside a 32 + 64 float
+             * allocation and owns only 64 slots.
+             */
+            scratch[tid] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
