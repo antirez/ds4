@@ -2644,7 +2644,17 @@ static void ds4_gpu_detect_metal4_features(void) {
         }
 
         if (g_metal4_family_supported) {
+            /*
+             * DS4_METAL_FORCE_METAL4 enables the tensor path on hardware the
+             * automatic gate declines.  Only DS4_METAL_DISABLE_METAL4 existed,
+             * so on a pre-M5 device the entire kernel_mul_mm_mpp_direct_rhs
+             * family could not be measured at all -- not even to establish
+             * that it does not pay.  This exists for that measurement; it
+             * stays off by default.
+             */
+            const int forced = ds4_gpu_env_bool("DS4_METAL_FORCE_METAL4") > 0;
             const int default_enable =
+                forced ||
                 ds4_gpu_device_name_contains("M5") ||
                 ds4_gpu_device_name_contains("M6") ||
                 ds4_gpu_device_name_contains("A19") ||
@@ -2665,7 +2675,9 @@ static void ds4_gpu_detect_metal4_features(void) {
                     fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
                 }
             } else {
-                fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
+                fprintf(stderr,
+                        "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices "
+                        "(set DS4_METAL_FORCE_METAL4=1 to measure it anyway)\n");
             }
         }
     }
