@@ -44,6 +44,11 @@ typedef struct {
     /* Stored in header byte 7.  Flash is 0 for backward compatibility with
      * older cache files where this reserved byte was always written as zero. */
     uint8_t model_id;
+    /* Stored in header bytes 21..23.  model_id identifies the model shape;
+     * this identifies the weights (see ds4_engine_weights_fp24).  0 means
+     * the header predates fingerprints: such entries are accepted for
+     * backward compatibility, like model_id 0 above (issue #805). */
+    uint32_t weights_fp24;
     uint8_t reason;
     uint32_t tokens;
     uint32_t hits;
@@ -83,6 +88,7 @@ typedef struct {
     const char *text;
     size_t text_len;
     uint8_t model_id;
+    uint32_t weights_fp24;
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
@@ -157,7 +163,8 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size);
+                                 int model_id, uint32_t weights_fp24,
+                                 int quant_bits, int ctx_size);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -201,7 +208,8 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
-                             uint8_t model_id, uint8_t quant_bits,
+                             uint8_t model_id, uint32_t weights_fp24,
+                             uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,

@@ -4244,6 +4244,12 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "KV checkpoint was written for a different model");
         ok = false;
     }
+    if (ok && hdr.payload_bytes != 0 && hdr.weights_fp24 != 0 &&
+        hdr.weights_fp24 != ds4_engine_weights_fp24(w->engine))
+    {
+        snprintf(err, err_len, "KV checkpoint was written for different model weights");
+        ok = false;
+    }
     if (ok && hdr.payload_bytes != 0 &&
         hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
     {
@@ -4392,7 +4398,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     }
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
+    ds4_kvstore_fill_header(h, (uint8_t)model_id,
+                            ds4_engine_weights_fp24(w->engine),
+                            (uint8_t)quant_bits,
                             ds4_kvstore_reason_code(reason),
                             session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
                             (uint32_t)tokens->len, 0,
@@ -5783,7 +5791,8 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+    ds4_kvstore_fill_header(h, hdr.model_id, hdr.weights_fp24,
+                            hdr.quant_bits, hdr.reason, hdr.ext_flags,
                             stripped_token_count, hdr.hits, hdr.ctx_size,
                             hdr.created_at, now, 0);
     uint8_t tb[4];

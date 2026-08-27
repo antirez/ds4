@@ -36856,6 +36856,8 @@ typedef struct {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    /* Lazily computed by ds4_engine_weights_fp24(); 0 = not computed yet. */
+    uint32_t weights_fp24;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -58427,6 +58429,84 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
+}
+
+static uint32_t weights_fp24_step(uint32_t h, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+/* FNV-1a over the file size plus 64 evenly spaced 64-byte windows of the
+ * tensor data region.  Reads via pread when a descriptor is available, else
+ * from the mapping — under SSD streaming the mapping is partial on purpose,
+ * so the descriptor path is the safe default.  Cost is a few dozen page
+ * reads once per engine, off the hot path. */
+static uint32_t weights_fp24_compute(int fd, const uint8_t *map,
+                                     uint64_t data_start, uint64_t file_size) {
+    enum { FP_WINDOWS = 64, FP_WINDOW_BYTES = 64 };
+    uint32_t h = 2166136261u;
+    uint8_t size_le[8];
+    for (int i = 0; i < 8; i++) size_le[i] = (uint8_t)(file_size >> (i * 8));
+    h = weights_fp24_step(h, size_le, sizeof(size_le));
+    if ((fd >= 0 || map) && file_size > data_start) {
+        const uint64_t span = file_size - data_start;
+        uint8_t buf[FP_WINDOW_BYTES];
+        for (uint32_t w = 0; w < FP_WINDOWS; w++) {
+            uint64_t off = data_start + (span / FP_WINDOWS) * w;
+            if (off >= file_size) break;
+            size_t want = FP_WINDOW_BYTES;
+            if (off + want > file_size) want = (size_t)(file_size - off);
+            if (fd >= 0) {
+                ssize_t got = pread(fd, buf, want, (off_t)off);
+                if (got > 0) h = weights_fp24_step(h, buf, (size_t)got);
+            } else {
+                h = weights_fp24_step(h, map + off, want);
+            }
+        }
+    }
+    uint32_t fp = (h ^ (h >> 24)) & 0xffffffu;
+    return fp ? fp : 1u; /* 0 is reserved for "header predates fingerprints" */
+}
+
+uint32_t ds4_weights_fp24_of_fd(int fd, uint64_t data_start, uint64_t file_size) {
+    return weights_fp24_compute(fd, NULL, data_start, file_size);
+}
+
+uint32_t ds4_engine_weights_fp24(ds4_engine *e) {
+    /* Benign race under concurrent first calls: both compute the same
+     * value from the same file and store it, so no synchronization. */
+    if (e->weights_fp24 != 0) return e->weights_fp24;
+    const ds4_model *m = &e->model;
+    if (m->tensors && m->n_tensors > 0 && (m->fd >= 0 || m->map)) {
+        /* Sample the head of EVERY tensor, so no single-tensor edit can
+         * slip between windows.  ~1000 reads of 64 bytes, once. */
+        uint32_t h = 2166136261u;
+        uint8_t meta[16];
+        for (int i = 0; i < 8; i++) meta[i] = (uint8_t)(m->size >> (i * 8));
+        for (int i = 0; i < 8; i++) meta[8 + i] = (uint8_t)(m->n_tensors >> (i * 8));
+        h = weights_fp24_step(h, meta, sizeof(meta));
+        for (uint64_t t = 0; t < m->n_tensors; t++) {
+            const ds4_tensor *ten = &m->tensors[t];
+            uint64_t off = ten->abs_offset;
+            if (off >= m->size) continue;
+            size_t want = 64;
+            if (want > ten->bytes) want = (size_t)ten->bytes;
+            if (off + want > m->size) want = (size_t)(m->size - off);
+            if (m->fd >= 0) {
+                uint8_t buf[64];
+                ssize_t got = pread(m->fd, buf, want, (off_t)off);
+                if (got > 0) h = weights_fp24_step(h, buf, (size_t)got);
+            } else {
+                h = weights_fp24_step(h, m->map + off, want);
+            }
+        }
+        uint32_t fp = (h ^ (h >> 24)) & 0xffffffu;
+        e->weights_fp24 = fp ? fp : 1u;
+    } else {
+        e->weights_fp24 = weights_fp24_compute(m->fd, m->map,
+                                               m->tensor_data_pos, m->size);
+    }
+    return e->weights_fp24;
 }
 
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity):

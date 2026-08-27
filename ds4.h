@@ -249,6 +249,14 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+/* 24-bit fingerprint of the weights actually loaded, from samples of the
+ * GGUF tensor data.  model_id only identifies the model *shape*, so two
+ * GGUFs with different weights (a fine-tune, a requant) share it; the
+ * fingerprint is what tells them apart in the disk KV cache header
+ * (issue #805).  Never returns 0: that value is reserved for headers
+ * written before the fingerprint existed. */
+uint32_t ds4_engine_weights_fp24(ds4_engine *e);
+uint32_t ds4_weights_fp24_of_fd(int fd, uint64_t data_start, uint64_t file_size);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
