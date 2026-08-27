@@ -70,6 +70,11 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
+/*
+ * Two-stage matvec reduction: each simdgroup reduces its own partial sums,
+ * stages one float per simdgroup in threadgroup memory, then simdgroup 0
+ * reduces those.
+ */
 template<short NR0>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
@@ -103,11 +108,21 @@ static inline void helper_mv_reduce_and_write(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
-        float tot = simd_sum(shmem_f32[row][tiisg]);
+    /*
+     * Only simdgroup 0's result is used, so restricting the final tree to it
+     * drops NSG-1 redundant 32-lane reductions per matvec threadgroup. sgitg is
+     * simdgroup-uniform, so simd_sum stays convergent, and there is no barrier
+     * after this point inside the helper -- the other simdgroups simply reach
+     * the caller's next barrier sooner.
+     *
+     */
+    if (sgitg == 0) {
+        for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+            const float tot = simd_sum(shmem_f32[row][tiisg]);
 
-        if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            if (tiisg == 0) {
+                dst_f32[r0 + row] = tot;
+            }
         }
     }
 }
