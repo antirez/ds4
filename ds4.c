@@ -6153,7 +6153,36 @@ static void config_validate_glm53_model(const ds4_model *m) {
     config_validate_glm53_layer_types(m);
 }
 
+/*
+ * Every FP8 KV quantise path walks the non-RoPE prefix in fixed 64-element
+ * blocks: dsv4_fp8_kv_quantize_row_inplace_cpu, kernel_dsv4_fp8_kv_quantize_f32,
+ * kernel_dsv4_kv_fp8_store_f32, kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32,
+ * and the CUDA/ROCm equivalents.  On a partial final block those implementations
+ * do not agree with one another, so a variant whose prefix is not 64-aligned
+ * would diverge between backends rather than fail.
+ *
+ * All four shipped variants give 448 or 512 and are unaffected.  This exists so
+ * that a fifth variant with an unaligned prefix fails loudly at load instead of
+ * producing quietly different numbers per backend.  It cannot be a
+ * _Static_assert: the shape tables are selected at runtime.
+ *
+ * This lives at the shared entry point rather than in
+ * config_validate_fixed_shape because the GLM-DSA branch below returns before
+ * ever reaching that function, and the invariant binds on both architectures.
+ */
+static void config_validate_fp8_kv_prefix_alignment(void) {
+    const uint32_t head_dim = (uint32_t)DS4_N_HEAD_DIM;
+    const uint32_t n_rot = (uint32_t)DS4_N_ROT;
+    if (n_rot > head_dim || ((head_dim - n_rot) % 64u) != 0u) {
+        ds4_die("model variant has (key_length - rope.dimension_count) not a "
+                "multiple of 64; FP8 KV quantisation requires a 64-aligned "
+                "non-RoPE prefix");
+    }
+}
+
 static void config_validate_model(const ds4_model *m) {
+    config_validate_fp8_kv_prefix_alignment();
+
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
