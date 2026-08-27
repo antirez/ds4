@@ -187,6 +187,12 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void);
+/*
+ * Strict test oracle for the Metal E4M3FN conversion.  Evaluates
+ * dsv4_e4m3fn_dequant over `count` inputs so the host can compare it against
+ * the CPU reference element by element.  Returns 0 if the dispatch failed.
+ */
+int ds4_gpu_test_e4m3fn_dequant(const float *in, float *out, uint32_t count);
 /* Strict test oracle for the generated resident-prefill MXFP4 half LUT. */
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits);

@@ -105,6 +105,26 @@ static inline float dsv4_e2m1fn_dequant(float x) {
     return sign * dsv4_e2m1fn_values[best];
 }
 
+/*
+ * Test hook: evaluate dsv4_e4m3fn_dequant over a caller-supplied input array.
+ *
+ * The FP8 KV path is required to be bit-identical between the CPU reference
+ * (dsv4_e4m3fn_dequant_cpu) and this file. Nothing in the tree tested that,
+ * which made any rewrite of the conversion an argument rather than a proof.
+ * Exposing the scalar conversion lets the host compare both implementations
+ * element by element over an exhaustive input set.
+ */
+kernel void kernel_test_dsv4_e4m3fn_dequant(
+        device const float *in [[buffer(0)]],
+        device       float *out [[buffer(1)]],
+        constant     uint  &count [[buffer(2)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= count) {
+        return;
+    }
+    out[tid] = dsv4_e4m3fn_dequant(in[tid]);
+}
+
 // Quantizes the non-RoPE part of a KV row through E4M3FN and writes the
 // dequantized value back as float. DS4 uses this to match the FP8 KV-cache
 // semantics while keeping the Metal graph's cache buffers float-addressable.

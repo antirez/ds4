@@ -4721,6 +4721,152 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+/*
+ * E4M3FN conversion equivalence.
+ *
+ * The FP8 KV cache requires the Metal conversion and the CPU reference in
+ * ds4.c to agree exactly, and nothing in the tree tested that. Without a test
+ * any rewrite of dsv4_e4m3fn_dequant -- which is currently a 7-step serial
+ * binary search per element on the decode critical path -- is an argument
+ * rather than a proof.
+ *
+ * The oracle below is deliberately NOT a copy of either implementation: it is
+ * a linear scan built straight from the E4M3FN format definition, so it
+ * validates the shipped binary search as well as anything that replaces it.
+ *
+ * Codes 0..126 are the valid magnitudes (code 127 is NaN in the FN variant,
+ * which is why the search bounds stop at 126); code 126 is the 448 maximum.
+ */
+static float test_e4m3fn_code_value(int code) {
+    static const float exp_scale[16] = {
+        0.0f,   0.015625f, 0.03125f, 0.0625f,
+        0.125f, 0.25f,     0.5f,     1.0f,
+        2.0f,   4.0f,      8.0f,     16.0f,
+        32.0f,  64.0f,     128.0f,   256.0f,
+    };
+    const int exp = (code >> 3) & 0x0f;
+    const int mant = code & 0x07;
+    return exp == 0 ? (float)mant * 0.001953125f
+                    : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
+}
+
+/* Nearest representable magnitude, ties to the even code index. */
+static float test_e4m3fn_reference(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = fabsf(x);
+    if (ax > 448.0f) ax = 448.0f;
+
+    int best = 0;
+    for (int code = 1; code <= 126; code++) {
+        if (test_e4m3fn_code_value(code) <= ax) best = code;
+    }
+    if (best < 126) {
+        const float best_diff = fabsf(ax - test_e4m3fn_code_value(best));
+        const float next_diff = fabsf(ax - test_e4m3fn_code_value(best + 1));
+        if (next_diff < best_diff ||
+            (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best++;
+        }
+    }
+    return sign * test_e4m3fn_code_value(best);
+}
+
+static void test_metal_e4m3fn_dequant_exact(void) {
+    float *in = NULL;
+    float *got = NULL;
+    uint32_t n = 0;
+    const uint32_t cap = 64u * 1024u;
+
+    in = (float *)malloc((size_t)cap * sizeof(float));
+    got = (float *)malloc((size_t)cap * sizeof(float));
+    TEST_ASSERT(in != NULL && got != NULL);
+    if (!in || !got) { free(in); free(got); return; }
+
+#define TEST_E4M3_PUSH(v) do { if (n < cap) in[n++] = (float)(v); } while (0)
+
+    /* Every representable magnitude, both signs: each must map to itself. */
+    for (int code = 0; code <= 126; code++) {
+        const float v = test_e4m3fn_code_value(code);
+        TEST_E4M3_PUSH(v);
+        TEST_E4M3_PUSH(-v);
+    }
+
+    /* Midpoints between adjacent magnitudes, and one ULP either side of each.
+     * This is the round-half-to-even path, which a rewrite is most likely to
+     * get wrong and which random sampling essentially never hits. */
+    for (int code = 0; code < 126; code++) {
+        const float a = test_e4m3fn_code_value(code);
+        const float b = test_e4m3fn_code_value(code + 1);
+        const float mid = (a + b) * 0.5f;
+        TEST_E4M3_PUSH(mid);
+        TEST_E4M3_PUSH(-mid);
+        TEST_E4M3_PUSH(nextafterf(mid, 0.0f));
+        TEST_E4M3_PUSH(-nextafterf(mid, 0.0f));
+        TEST_E4M3_PUSH(nextafterf(mid, 1000.0f));
+        TEST_E4M3_PUSH(-nextafterf(mid, 1000.0f));
+    }
+
+    /* Zero, signed zero, and the saturating clamp above the 448 maximum. */
+    TEST_E4M3_PUSH(0.0f);
+    TEST_E4M3_PUSH(-0.0f);
+    TEST_E4M3_PUSH(448.0f);
+    TEST_E4M3_PUSH(-448.0f);
+    TEST_E4M3_PUSH(448.5f);
+    TEST_E4M3_PUSH(-448.5f);
+    TEST_E4M3_PUSH(1.0e9f);
+    TEST_E4M3_PUSH(-1.0e9f);
+
+    /* Subnormal range: below the smallest normal, where the exp == 0 branch
+     * applies and where a half-precision intermediate would flush to zero. */
+    for (int i = 0; i < 64; i++) {
+        TEST_E4M3_PUSH((float)i * 0.0001220703125f);
+        TEST_E4M3_PUSH(-(float)i * 0.0001220703125f);
+    }
+
+    /* Deterministic sweep across the whole range. */
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    while (n < cap) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        const double u = (double)((rng >> 11) & ((1ull << 53) - 1)) /
+                         (double)(1ull << 53);
+        TEST_E4M3_PUSH((float)((u * 2.0 - 1.0) * 448.0));
+    }
+#undef TEST_E4M3_PUSH
+
+    TEST_ASSERT(ds4_gpu_test_e4m3fn_dequant(in, got, n) != 0);
+
+    uint32_t mismatches = 0;
+    float worst_in = 0.0f, worst_ref = 0.0f, worst_got = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const float ref = test_e4m3fn_reference(in[i]);
+        uint32_t rb, gb;
+        memcpy(&rb, &ref, sizeof(rb));
+        memcpy(&gb, &got[i], sizeof(gb));
+        /* Bit-exact, treating +0 and -0 as equal (the sign of zero is not
+         * meaningful here and both implementations return +0 for -0). */
+        if (rb != gb && !(ref == 0.0f && got[i] == 0.0f)) {
+            if (mismatches == 0) {
+                worst_in = in[i];
+                worst_ref = ref;
+                worst_got = got[i];
+            }
+            mismatches++;
+        }
+    }
+    if (mismatches != 0) {
+        fprintf(stderr,
+                "ds4-test: E4M3 mismatch %u/%u, first: in=%.9g ref=%.9g got=%.9g\n",
+                mismatches, n, (double)worst_in, (double)worst_ref,
+                (double)worst_got);
+    }
+    TEST_ASSERT(mismatches == 0);
+    fprintf(stderr, "ds4-test: E4M3 dequant exactness: %u inputs, %u mismatches\n",
+            n, mismatches);
+
+    free(in);
+    free(got);
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -4746,6 +4892,7 @@ static void test_metal_kernel_group(void) {
     test_metal_hc_rms_scale_project_f16_exact();
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
+    test_metal_e4m3fn_dequant_exact();
 #endif
 }
 

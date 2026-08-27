@@ -8885,6 +8885,43 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
     return 1;
 }
 
+int ds4_gpu_test_e4m3fn_dequant(const float *in, float *out, uint32_t count) {
+    if (!in || !out || count == 0) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    @autoreleasepool {
+        const NSUInteger bytes = (NSUInteger)count * sizeof(float);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_test_dsv4_e4m3fn_dequant");
+        id<MTLBuffer> src = [g_device newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = [g_device newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        if (!pipeline || !src || !dst || !cb) {
+            fprintf(stderr, "ds4: Metal E4M3 dequant test setup failed\n");
+            return 0;
+        }
+        memcpy([src contents], in, bytes);
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBytes:&count length:sizeof(count) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        if (!ds4_gpu_wait_command_buffer(cb, "E4M3 dequant equivalence test")) {
+            return 0;
+        }
+        memcpy(out, [dst contents], bytes);
+    }
+    return 1;
+}
+
 void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
