@@ -95,7 +95,7 @@ private:
 // Init
 // ----------------------------------------------------------------------------
 
-// Step 7 task #29: experimental persistent Q8_1 scratch buffer.
+// Persistent Q8_1 scratch buffer.
 //
 // Hypothesis: ggml_cuda_pool_alloc inside ds4_mmq_moe_vec_impl records a
 // cudaMallocAsync graph node into the captured layer graph.  At replay
@@ -104,18 +104,27 @@ private:
 // the matvec reads stale/wrong memory and produces a different output
 // than eager execution, even with identical inputs.
 //
-// Mitigation under test: pre-allocate a persistent device buffer at
-// startup via plain cudaMalloc (NOT cudaMallocAsync, NOT inside any
-// capture).  When the env flag DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set,
-// ds4_mmq_moe_vec_impl uses this persistent buffer instead of pool_alloc.
+// Pre-allocate a persistent device buffer at startup via plain cudaMalloc
+// (NOT cudaMallocAsync, NOT inside any capture).  This is the default on
+// integrated Blackwell devices such as GB10.  DS4_CUDA_MMQ_Q81_PERSISTENT=0
+// restores the pool path; =1 opts other CUDA devices into the same path.
 //
 // Sized for V4 Flash decode shapes: gate Q8_1 ~8 KB, down Q8_1 ~14 KB.
 // 256 KB allocation gives generous headroom for short prefill batches.
 static void *g_q81_scratch_ptr   = nullptr;
 static size_t g_q81_scratch_bytes = 0;
 static bool   g_q81_scratch_enabled = false;
+static int    g_q81_scratch_device = -1;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
+
+static bool q81_persistent_requested(int device,
+                                     const ggml_cuda_device_info &info) {
+    const char *env = getenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
+    if (env && env[0] == '0') return false;
+    if (env && env[0] == '1') return true;
+    return info.devices[device].integrated && info.devices[device].cc >= 1200;
+}
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -298,11 +307,12 @@ extern "C" int ds4_mmq_init(int device) {
         return -1;
     }
 
-    // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
+    // Allocate before any layer-graph capture so every replay sees the same
+    // pointer and avoids stream-ordered allocation/free nodes.
     // Must happen here (before any layer-graph capture) so the cudaMalloc
     // is not forbidden by capture-mode restrictions, and so the kernel
     // pointer arg baked into the captured graph stays valid at replay.
-    if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
+    if (q81_persistent_requested(device, info) && !g_q81_scratch_ptr) {
         const size_t bytes = 256 * 1024;
         cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
         if (err != cudaSuccess) {
@@ -314,11 +324,30 @@ extern "C" int ds4_mmq_init(int device) {
         } else {
             g_q81_scratch_bytes = bytes;
             g_q81_scratch_enabled = true;
+            g_q81_scratch_device = device;
             fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
                     bytes, g_q81_scratch_ptr);
         }
     }
     return 0;
+}
+
+extern "C" void ds4_mmq_cleanup(void) {
+    g_aligned_q81_scratch_ptr = nullptr;
+    g_aligned_q81_scratch_bytes = 0;
+    if (g_q81_scratch_ptr) {
+        int previous = -1;
+        (void)cudaGetDevice(&previous);
+        if (g_q81_scratch_device >= 0) {
+            (void)cudaSetDevice(g_q81_scratch_device);
+        }
+        (void)cudaFree(g_q81_scratch_ptr);
+        if (previous >= 0) (void)cudaSetDevice(previous);
+        g_q81_scratch_ptr = nullptr;
+    }
+    g_q81_scratch_bytes = 0;
+    g_q81_scratch_enabled = false;
+    g_q81_scratch_device = -1;
 }
 
 // ----------------------------------------------------------------------------
@@ -3837,6 +3866,59 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+extern "C" int ds4_mmq_q8_0_aligned_dense_pair_vec(
+        const void *W0_aligned, const void *W1_aligned,
+        const float *X_f32, float *out0_f32, float *out1_f32,
+        int M0, int M1, int K, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q8_0_aligned_dense_pair_vec";
+    if (!W0_aligned || !W1_aligned || !X_f32 || !out0_f32 || !out1_f32 ||
+        M0 <= 0 || M1 <= 0 || K <= 0 || K % 1024 != 0) return -1;
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    ds4_pool_set_stream(stream);
+    const size_t nbytes_q8_1 = (size_t)(K / QK8_1) * sizeof(block_q8_1);
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, K);
+    if (!x8) {
+        if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
+            g_q81_scratch_bytes >= nbytes_q8_1) {
+            x8 = (char *)g_q81_scratch_ptr;
+        } else {
+            q8_pool.alloc(ctx->pool(), nbytes_q8_1);
+            x8 = q8_pool.get();
+        }
+        quantize_row_q8_1_cuda(X_f32, nullptr, x8, GGML_TYPE_Q8_0,
+            K, K, K, K, K, 1, 1, 1, stream);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: quantize failed: %s\n", tag,
+                    cudaGetErrorString(err));
+            return -2;
+        }
+    }
+
+    const block_q8_1 *x8p = (const block_q8_1 *)x8;
+    const uint64_t nblk0 = (uint64_t)M0 * (uint64_t)(K / 32);
+    const uint64_t nblk1 = (uint64_t)M1 * (uint64_t)(K / 32);
+    const uint64_t dq0 = (nblk0 * 2u + 63u) & ~63ull;
+    const uint64_t dq1 = (nblk1 * 2u + 63u) & ~63ull;
+    q8_0_aligned_dense_vec_kernel<<<(unsigned)M0, 32, 0, stream>>>(
+        out0_f32, (const int4 *)((const char *)W0_aligned + dq0),
+        (const __half *)W0_aligned, x8p, M0, K / 32);
+    q8_0_aligned_dense_vec_kernel<<<(unsigned)M1, 32, 0, stream>>>(
+        out1_f32, (const int4 *)((const char *)W1_aligned + dq1),
+        (const __half *)W1_aligned, x8p, M1, K / 32);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag,
+                cudaGetErrorString(err));
         return -3;
     }
     return 0;
