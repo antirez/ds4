@@ -5789,10 +5789,29 @@ int ds4_dist_session_sync(
  * frames of one session never interleave with another's, and each session's
  * prefix hash is read before its own slice commits.
  */
+/* Build the transcript a failed step must be replayed from.
+ *
+ * The local layer slice commits its token onto the session timeline before the
+ * remote step runs (ds4_session_eval_layer_slice -> slice_commit_timeline), so
+ * once a remote failure is being handled the checkpoint already contains that
+ * token.  Copying the checkpoint and pushing the token again replays it twice
+ * and rebuilds the worker against a timeline that never existed.  Rebuild from
+ * the length the timeline had before the slice instead.
+ */
+static void dist_recovery_transcript(ds4_tokens *out,
+                                     const ds4_tokens *checkpoint,
+                                     uint32_t pos0,
+                                     int token) {
+    ds4_tokens_copy(out, checkpoint);
+    if (out->len > (int)pos0) out->len = (int)pos0;
+    ds4_tokens_push(out, token);
+}
+
 /* Per-member state for one batched decode step. */
 typedef struct {
     uint64_t request_id;
     uint64_t result_hash;
+    uint32_t pos0;          /* timeline length before this member's slice ran */
     bool submitted;
     int rc;
 } ds4_dist_batch_member;
@@ -5815,6 +5834,7 @@ static int dist_batch_submit_member(
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
     const uint32_t pos0 = (uint32_t)item->checkpoint->len;
+    member->pos0 = pos0;
     uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
     if (dist_session_token_hash_prefix(item->owner, pos0, &prefix_hash,
                                        err, errlen) != 0) {
@@ -5855,17 +5875,16 @@ static int dist_batch_submit_member(
 static int dist_batch_recover_member(
         ds4_dist_coordinator_state *state,
         const ds4_dist_decode_item *item,
-        int member_rc,
+        const ds4_dist_batch_member *member,
         char *err,
         size_t errlen) {
     ds4_dist_session *d = item->dist;
     ds4_tokens transcript = {0};
-    ds4_tokens_copy(&transcript, item->checkpoint);
-    ds4_tokens_push(&transcript, item->token);
+    dist_recovery_transcript(&transcript, item->checkpoint, member->pos0, item->token);
     int rc = dist_coordinator_rebuild_from_transcript(
             state, item->owner, &d->plan, &transcript, d->session_id,
             &d->request_id, item->logits, &d->plan_generation,
-            member_rc != DS4_DIST_RECV_REMOTE_ERROR, err, errlen);
+            member->rc != DS4_DIST_RECV_REMOTE_ERROR, err, errlen);
     ds4_tokens_free(&transcript);
     if (rc == 0) {
         d->plan_ready = true;
@@ -5930,8 +5949,11 @@ int ds4_dist_sessions_eval(
         return 1;
     }
 
-    char first_err[256];
-    first_err[0] = '\0';
+    /* One message stands for the batch.  The submit/collect pass keeps the
+     * first failure; a later recovery failure replaces it, because that is the
+     * reason the batch could not be salvaged. */
+    char report_err[256];
+    report_err[0] = '\0';
     int failed = 0;
 
     for (int i = 0; i < count; i++) {
@@ -5941,7 +5963,7 @@ int ds4_dist_sessions_eval(
                                                  hidden, hidden_bytes,
                                                  member_err, sizeof(member_err));
         if (members[i].rc != 0 && !failed++) {
-            snprintf(first_err, sizeof(first_err), "%s", member_err);
+            snprintf(report_err, sizeof(report_err), "%s", member_err);
         }
     }
 
@@ -5957,7 +5979,7 @@ int ds4_dist_sessions_eval(
                 items[i].logits, member_err, sizeof(member_err));
         if (rc != 0) {
             members[i].rc = rc;
-            if (!failed++) snprintf(first_err, sizeof(first_err), "%s", member_err);
+            if (!failed++) snprintf(report_err, sizeof(report_err), "%s", member_err);
         }
     }
 
@@ -5965,12 +5987,12 @@ int ds4_dist_sessions_eval(
         if (members[i].rc == 0) continue;
         char member_err[256];
         member_err[0] = '\0';
-        if (dist_batch_recover_member(state, &items[i], members[i].rc,
+        if (dist_batch_recover_member(state, &items[i], &members[i],
                                       member_err, sizeof(member_err)) == 0) {
             members[i].rc = 0;
             failed--;
         } else {
-            snprintf(first_err, sizeof(first_err), "%s", member_err);
+            snprintf(report_err, sizeof(report_err), "%s", member_err);
         }
     }
 
@@ -5979,7 +6001,7 @@ int ds4_dist_sessions_eval(
     if (failed) {
         if (errlen) {
             snprintf(err, errlen, "%s",
-                     first_err[0] ? first_err : "distributed decode batch failed");
+                     report_err[0] ? report_err : "distributed decode batch failed");
         }
         return 1;
     }
@@ -6000,12 +6022,17 @@ int ds4_dist_session_eval(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
+    /* Read before the span, whose local slice commits the token onto the
+     * timeline; the recovery below has to replay from here, not from where the
+     * checkpoint ends up. */
+    const uint32_t pos0 = (uint32_t)checkpoint->len;
+
     int rc = dist_coordinator_eval_span(&d->coord->state,
                                         owner,
                                         &d->plan,
                                         &token,
                                         1,
-                                        (uint32_t)checkpoint->len,
+                                        pos0,
                                         d->session_id,
                                         d->request_id++,
                                         false,
@@ -6014,8 +6041,7 @@ int ds4_dist_session_eval(
                                         errlen);
     if (rc != 0) {
         ds4_tokens transcript = {0};
-        ds4_tokens_copy(&transcript, checkpoint);
-        ds4_tokens_push(&transcript, token);
+        dist_recovery_transcript(&transcript, checkpoint, pos0, token);
         if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                      owner,
                                                      &d->plan,
