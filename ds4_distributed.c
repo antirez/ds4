@@ -42,6 +42,14 @@
  * ========================================================================= */
 
 #define DS4_DIST_MAGIC 0x44533444u /* DS4D */
+
+/* Default ceiling on coordinator sessions a worker will hold.  Each one costs
+ * its own KV and context buffers -- 1.03 GiB at ctx 32768 on the Flash Q4
+ * measurement rig, once the prefill workspace is aliased -- against whatever
+ * headroom is left after the resident layer slice.  Eight fits the tested
+ * envelope with room to spare; a coordinator with more resident slots than this
+ * should raise it deliberately, having checked the worker's memory. */
+#define DS4_DIST_WORKER_MAX_SESSIONS_DEFAULT 8u
 #define DS4_DIST_MSG_HELLO 1u
 #define DS4_DIST_MSG_ERROR 2u
 #define DS4_DIST_MSG_WORK 3u
@@ -273,6 +281,8 @@ typedef struct {
     int listen_fd;
     pthread_mutex_t mu;
     ds4_dist_worker_session *sessions;
+    uint32_t session_count;
+    uint32_t max_sessions;
 } ds4_dist_worker_state;
 
 typedef struct ds4_dist_worker_upstream ds4_dist_worker_upstream;
@@ -6869,6 +6879,19 @@ static ds4_dist_worker_session *dist_worker_get_session_locked(
         if (it->session_id == session_id) return it;
     }
 
+    /* Refuse past the cap instead of allocating into an OOM kill.  A worker is
+     * told how many sessions to hold, never asked, so this is the only place it
+     * can say no; the coordinator surfaces the error as a failed request. */
+    if (state->max_sessions != 0 && state->session_count >= state->max_sessions) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "distributed worker is holding its maximum of %u sessions; "
+                     "raise --max-sessions to accept more",
+                     state->max_sessions);
+        }
+        return NULL;
+    }
+
     ds4_dist_worker_session *entry = calloc(1, sizeof(*entry));
     if (!entry) {
         if (errlen) snprintf(err, errlen, "out of memory creating distributed session");
@@ -6882,6 +6905,7 @@ static ds4_dist_worker_session *dist_worker_get_session_locked(
     entry->session_id = session_id;
     entry->next = state->sessions;
     state->sessions = entry;
+    state->session_count++;
     return entry;
 }
 
@@ -6899,6 +6923,7 @@ static uint32_t dist_worker_clear_sessions(ds4_dist_worker_state *state) {
     pthread_mutex_lock(&state->mu);
     ds4_dist_worker_session *it = state->sessions;
     state->sessions = NULL;
+    state->session_count = 0;
     pthread_mutex_unlock(&state->mu);
 
     while (it) {
@@ -8030,6 +8055,8 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     state.has_output = opt->layers.has_output;
     state.ctx_size = ctx_size;
     state.listen_fd = listen_fd;
+    state.max_sessions = opt->max_sessions ? opt->max_sessions
+                                           : DS4_DIST_WORKER_MAX_SESSIONS_DEFAULT;
     pthread_mutex_init(&state.mu, NULL);
 
     pthread_t data_tid;
@@ -8215,6 +8242,9 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator TCP listen address. Workers may later use it to force their data listener.\n"
         "  --coordinator HOST PORT\n"
         "      Coordinator TCP address for --role worker.\n"
+        "  --max-sessions N\n"
+        "      Worker cap on concurrent coordinator sessions. Default: 8. Each costs its own\n"
+        "      KV and context buffers, so raise it only against measured worker headroom.\n"
         "  --dist-prefill-chunk N\n"
         "      Coordinator prefill pipeline chunk size. Default: session cap, normally 4096.\n"
         "      Non-default values are experimental and can change logits unless validated.\n"
@@ -8328,6 +8358,21 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         }
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--max-sessions")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        uint32_t n = 0;
+        if (!dist_parse_positive_u32(value, arg, &n, err, errlen)) {
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->max_sessions = n;
+        return DS4_DIST_CLI_MATCHED;
+    }
+
     if (!strcmp(arg, "--dist-activation-bits")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -8439,6 +8484,10 @@ int ds4_dist_prepare_engine_options(
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
     if (opt && opt->replay_check && opt->role != DS4_DISTRIBUTED_COORDINATOR) {
         if (errlen) snprintf(err, errlen, "--dist-replay-check requires --role coordinator");
+        return 1;
+    }
+    if (opt && opt->max_sessions != 0 && opt->role != DS4_DISTRIBUTED_WORKER) {
+        if (errlen) snprintf(err, errlen, "--max-sessions requires --role worker");
         return 1;
     }
     if (engine && opt) {
