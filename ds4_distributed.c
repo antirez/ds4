@@ -2354,13 +2354,39 @@ static int dist_logits_argmax(const float *logits, int n_vocab) {
     return best;
 }
 
+/* Builds the plan, then gives it its own connection to the first hop.
+ *
+ * The dial sits here and not in dist_coordinator_build_route_plan() because
+ * that runs with the registry mutex held, and a TCP connect must not block
+ * worker registration.  Every caller that produces a usable plan goes through
+ * this function, including the recovery path in
+ * dist_coordinator_rebuild_from_transcript(), so every plan gets a connection.
+ */
 static bool dist_coordinator_ensure_route(
         ds4_dist_coordinator_state *state,
         ds4_dist_route_plan *plan,
         uint64_t *generation,
         char *err,
         size_t errlen) {
-    return dist_coordinator_build_route_plan(state, plan, generation, err, errlen);
+    if (!dist_coordinator_build_route_plan(state, plan, generation, err, errlen)) {
+        return false;
+    }
+    /* count == 0 is a local-only route; fd >= 0 is the one-shot coordinator's
+     * dup() of the control link. */
+    if (plan->count == 0 || plan->entry[0].fd >= 0) return true;
+
+    int fd = dist_connect_endpoint(plan->entry[0].host,
+                                   (int)plan->entry[0].port,
+                                   err,
+                                   errlen);
+    if (fd < 0) {
+        dist_route_plan_free(plan);
+        if (generation) *generation = 0;
+        return false;
+    }
+    dist_set_socket_low_latency(fd);
+    plan->entry[0].fd = fd;
+    return true;
 }
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
@@ -5492,7 +5518,14 @@ int ds4_dist_coordinator_open(
     c->state.local_can_output_head = ds4_engine_has_output_head(engine);
     c->state.replay_check = opt->replay_check;
     c->state.debug = opt->debug;
-    c->state.use_control_for_work = true;
+    /* The control link carries HELLO and liveness for one registry entry, but
+     * WORK is per session: several sessions writing frames onto one stream
+     * would interleave, since a frame is several sequential writes.  Each
+     * session dials the worker's data port instead.  The standalone one-shot
+     * coordinator keeps the control link -- it runs a single session in its own
+     * process, so sharing is safe there and it saves a connect.
+     */
+    c->state.use_control_for_work = false;
     c->state.prefill_chunk = opt->prefill_chunk;
     c->state.prefill_window = opt->prefill_window;
     c->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
