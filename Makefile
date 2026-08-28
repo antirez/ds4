@@ -20,6 +20,9 @@ DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+# Shared version string for every binary's --version.  Computed once so all
+# tools report the same value.  Each ds4_*.o rule passes it as DS4_VERSION.
+DS4_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -252,7 +255,7 @@ ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
+	$(CC) $(CFLAGS) -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_cli.c
 
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
@@ -267,16 +270,16 @@ ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_gpu_args.c
 
 ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+	$(CC) $(CFLAGS) -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
+	$(CC) $(CFLAGS) -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
+	$(CC) $(CFLAGS) -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_eval.c
 
 ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
+	$(CC) $(CFLAGS) -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_agent.c
 
 ds4_web.o: ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
@@ -303,22 +306,22 @@ ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_cli.c
 
 ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_gpu_args.c
 
 ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_server.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_bench.c
 
 ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_eval.c
 
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -DDS4_VERSION=\"$(DS4_VERSION)\" -c -o $@ ds4_agent.c
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m

@@ -45,6 +45,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef DS4_VERSION
+#define DS4_VERSION "unknown"
+#endif
+
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_DIM "\x1b[90m"
 #define ANSI_RED "\x1b[31m"
@@ -1531,6 +1535,10 @@ static eval_config parse_options(int argc, char **argv) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
+            exit(0);
+        }
+        if (!strcmp(arg, "--version")) {
+            fprintf(stdout, "ds4-eval %s\n", DS4_VERSION);
             exit(0);
         }
         char dist_parse_err[256] = {0};

@@ -25,6 +25,10 @@
 
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
 
+#ifndef DS4_VERSION
+#define DS4_VERSION "unknown"
+#endif
+
 typedef struct {
     const char *model_path;
     const char *prompt_path;
@@ -215,6 +219,10 @@ static bench_config parse_options(int argc, char **argv) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
+            exit(0);
+        }
+        if (!strcmp(arg, "--version")) {
+            fprintf(stdout, "ds4-bench %s\n", DS4_VERSION);
             exit(0);
         }
         char dist_parse_err[256] = {0};
