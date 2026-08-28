@@ -434,6 +434,9 @@ static uint64_t g_cuda_tmp_bytes;
 static void *g_tt_scratch;
 static uint64_t g_tt_scratch_bytes;
 static int g_tt_scratch_device = -1;
+static void *g_indexed_topk_sort_scratch;
+static uint64_t g_indexed_topk_sort_scratch_bytes;
+static int g_indexed_topk_sort_scratch_device = -1;
 #ifdef DS4_CUDA_HAVE_MXF4
 static void *g_indexer_mxf4_scratch;
 static uint64_t g_indexer_mxf4_scratch_bytes;
@@ -618,6 +621,34 @@ static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
     return g_tt_scratch;
 }
 
+static void *indexed_topk_sort_scratch_ensure(uint64_t bytes, const char *what) {
+    if (bytes == 0) return NULL;
+    if (g_indexed_topk_sort_scratch_bytes >= bytes) return g_indexed_topk_sort_scratch;
+
+    int device = -1;
+    if (!cuda_ok(cudaGetDevice(&device), "get device for indexed topk sort scratch")) {
+        return NULL;
+    }
+    if (g_indexed_topk_sort_scratch) {
+        if (!cuda_ok(cudaDeviceSynchronize(),
+                     "synchronize indexed topk sort scratch growth")) {
+            return NULL;
+        }
+        (void)cudaFree(g_indexed_topk_sort_scratch);
+        g_indexed_topk_sort_scratch = NULL;
+        g_indexed_topk_sort_scratch_bytes = 0;
+        g_indexed_topk_sort_scratch_device = -1;
+    }
+    if (!cuda_ok(cudaMalloc(&g_indexed_topk_sort_scratch, (size_t)bytes),
+                 what ? what : "allocate indexed topk sort scratch")) {
+        g_indexed_topk_sort_scratch = NULL;
+        return NULL;
+    }
+    g_indexed_topk_sort_scratch_bytes = bytes;
+    g_indexed_topk_sort_scratch_device = device;
+    return g_indexed_topk_sort_scratch;
+}
+
 static inline uint64_t tt_align256_u64(uint64_t x) {
     return (x + 255ull) & ~255ull;
 }
@@ -702,7 +733,9 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if ((g_model_device_owned || g_model_registered) && model_map == g_model_host_base) {
+        return cuda_model_ptr(model_map, offset);
+    }
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
@@ -2808,6 +2841,12 @@ extern "C" void ds4_gpu_cleanup(void) {
             g_tt_scratch = NULL;
             g_tt_scratch_bytes = 0;
             g_tt_scratch_device = -1;
+        }
+        if (g_indexed_topk_sort_scratch && g_indexed_topk_sort_scratch_device == c->device_id) {
+            (void)cudaFree(g_indexed_topk_sort_scratch);
+            g_indexed_topk_sort_scratch = NULL;
+            g_indexed_topk_sort_scratch_bytes = 0;
+            g_indexed_topk_sort_scratch_device = -1;
         }
 #ifdef DS4_CUDA_HAVE_MXF4
         if (g_indexer_mxf4_scratch &&
@@ -10040,9 +10079,11 @@ attention_indexed_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const uint32_t comp_idx = sr < raw_count
-                ? 0u
-                : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
+            const int32_t raw_k = sr < raw_count
+                ? 0
+                : topk[(uint64_t)t * top_k + (sr - raw_count)];
+            const uint32_t comp_idx = (raw_k >= 0 && (uint32_t)raw_k < visible_comp)
+                ? (uint32_t)raw_k : 0u;
             const float4 *src = sr < raw_count
                 ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
                 : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
@@ -17879,9 +17920,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
-        int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(logical_tier, sort_bytes, "indexed attention topk sort");
+        int32_t *sorted = (int32_t *)indexed_topk_sort_scratch_ensure(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
-        indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
+        indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>((int32_t *)sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
