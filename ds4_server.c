@@ -39,6 +39,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef DS4_VERSION
+#define DS4_VERSION "unknown"
+#endif
+
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
@@ -13096,6 +13100,10 @@ static server_config parse_options(int argc, char **argv) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
+            exit(0);
+        }
+        if (!strcmp(arg, "--version")) {
+            fprintf(stdout, "ds4-server %s\n", DS4_VERSION);
             exit(0);
         }
         char dist_parse_err[256] = {0};

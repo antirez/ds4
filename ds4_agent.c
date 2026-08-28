@@ -30,6 +30,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef DS4_VERSION
+#define DS4_VERSION "unknown"
+#endif
+
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
@@ -586,6 +590,10 @@ static agent_config parse_options(int argc, char **argv) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
+            exit(0);
+        }
+        if (!strcmp(arg, "--version")) {
+            fprintf(stdout, "ds4-agent %s\n", DS4_VERSION);
             exit(0);
         }
         char dist_parse_err[256] = {0};
