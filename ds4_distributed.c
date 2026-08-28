@@ -1919,6 +1919,11 @@ static void dist_coordinator_add_worker(
             old->has_output == hello->has_output)
         {
             *link = old->next;
+            /* Same ownership rule as above.  Dropping the entry without
+             * touching the socket left the owning thread parked on a live
+             * connection, so the descriptor survived until the far end
+             * happened to hang up. */
+            if (old->fd >= 0) shutdown(old->fd, SHUT_RDWR);
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: dropped stale worker %s:%s layers=%u:%u%s\n",
                              old->peer_host,
@@ -2136,7 +2141,13 @@ static void dist_coordinator_forget_route_workers(
                 continue;
             }
             *link = entry->next;
-            close(entry->fd);
+            /* The descriptor belongs to the client thread that accepted it,
+             * which is parked on a blocking read and closes it when that read
+             * returns.  close() here would release the number while that
+             * thread still holds it: an accept() could be handed the same
+             * number and the thread's own close() would land on an unrelated
+             * connection.  shutdown() wakes it and leaves a single owner. */
+            if (entry->fd >= 0) shutdown(entry->fd, SHUT_RDWR);
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: forgot failed route worker %s:%u layers=%u:%u%s\n",
                              plan->entry[i].host,
