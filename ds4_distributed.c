@@ -4335,10 +4335,30 @@ static void *dist_coordinator_accept_main(void *arg) {
     return NULL;
 }
 
+/* Workers key their KV timelines by session id, in one table shared by every
+ * connection, so two live sessions that pick the same id silently merge their
+ * KV and corrupt both.  time(), getpid(), a heap address and clock() do not
+ * guarantee a difference between sessions built back to back in one process:
+ * they share the pid, can land in the same second and the same clock tick, and
+ * malloc can hand back an address a freed session just released.
+ *
+ * Reserve the low 16 bits for a per-process counter.  The upper bits still
+ * separate coordinators across hosts and restarts; collisions inside one
+ * coordinator become impossible rather than unlikely.  There are no atomics in
+ * this file and it stays C99, so the counter sits behind a mutex.
+ */
 static uint64_t dist_make_session_id(const void *ptr) {
+    static pthread_mutex_t seq_mu = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seq = 0;
+
+    pthread_mutex_lock(&seq_mu);
+    const uint64_t n = ++seq;
+    pthread_mutex_unlock(&seq_mu);
+
     uint64_t id = ((uint64_t)(uint32_t)time(NULL) << 32) ^ (uint64_t)getpid();
     id ^= ((uint64_t)(uintptr_t)ptr << 17) ^ (uint64_t)(uintptr_t)ptr;
     id ^= (uint64_t)clock();
+    id = (id & ~UINT64_C(0xffff)) | (n & UINT64_C(0xffff));
     return id ? id : 1u;
 }
 
@@ -5528,6 +5548,9 @@ int ds4_dist_session_create(
      * WORK results are outstanding.  Keep them out of the WORK request-id stream
      * so progress callbacks cannot perturb the reader's contiguous expectations. */
     d->snapshot_request_id = UINT64_C(1) << 63;
+    DIST_COORD_DEBUG(&coord->state,
+                     "ds4: distributed coordinator API: session id=0x%016llx\n",
+                     (unsigned long long)d->session_id);
     *out = d;
     return 0;
 }
