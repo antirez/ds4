@@ -112,6 +112,24 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* Decode one token on each of several coordinator sessions, overlapping their
+ * remote waits. Every member's frame is submitted before any result is
+ * collected, so the batch costs the longest wait rather than their sum.
+ */
+typedef struct {
+    ds4_dist_session *dist;
+    ds4_session *owner;
+    const ds4_tokens *checkpoint;
+    int token;
+    float *logits;
+} ds4_dist_decode_item;
+
+int ds4_dist_sessions_eval(
+        ds4_dist_decode_item *items,
+        int count,
+        char *err,
+        size_t errlen);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

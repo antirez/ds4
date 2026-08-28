@@ -61967,6 +61967,20 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
 }
 
+/* A distributed coordinator maps only its own --layers slice, but the batch
+ * encoders below build a full local decode graph per session and would walk
+ * layers this process never loaded.  Those sessions take the serialized
+ * fallback instead, which routes each token over the wire.
+ * ds4_sessions_eval_batch_metal_supported() refuses them for the same reason;
+ * the CUDA path, which ROCm also uses, needs the same exclusion. */
+static bool ds4_decode_batch_has_distributed(const ds4_decode_item *items,
+                                             int count) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].session && items[i].session->distributed) return true;
+    }
+    return false;
+}
+
 #ifndef DS4_NO_GPU
 static bool ds4_sessions_eval_batch_metal_supported(
         ds4_decode_item *items,
@@ -62727,6 +62741,50 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         char *err,
         size_t errlen);
 
+/* Adapt the engine's decode batch to the distributed one.  A mixed batch, where
+ * only some members are distributed, cannot happen: every session on a
+ * coordinator engine is distributed, and ds4_sessions_eval_batch() has already
+ * rejected members belonging to a different engine. */
+static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count,
+                                               char *err, size_t errlen) {
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s->distributed) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "decode batch item %d is not a distributed session", i);
+            }
+            return 1;
+        }
+        if (!s->checkpoint_valid) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "distributed decode requires a valid checkpoint");
+            }
+            return 1;
+        }
+    }
+
+    ds4_dist_decode_item *dist_items =
+        xmalloc((size_t)count * sizeof(*dist_items));
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        dist_items[i].dist = s->distributed;
+        dist_items[i].owner = s;
+        dist_items[i].checkpoint = &s->checkpoint;
+        dist_items[i].token = items[i].token;
+        dist_items[i].logits = s->logits;
+    }
+    int rc = ds4_dist_sessions_eval(dist_items, count, err, errlen);
+    free(dist_items);
+    if (rc != 0) {
+        /* Members can be left at different points in the timeline, so rebuild
+         * every one rather than expose a partially committed logical batch. */
+        for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+    }
+    return rc;
+}
+
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -62775,6 +62833,14 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
             }
             return 1;
         }
+    }
+
+    /* Distributed members spend most of a decode step blocked on a socket, not
+     * on this GPU. Hand them to the distributed batch, which submits every
+     * frame before collecting any result, instead of the serialized fallback
+     * below that pays one full round trip per member. */
+    if (ds4_decode_batch_has_distributed(items, count)) {
+        return ds4_sessions_eval_batch_distributed(items, count, err, errlen);
     }
 
 #ifndef DS4_NO_GPU
@@ -66345,20 +66411,6 @@ static bool metal_graph_eval_mixed_prefill_decode(
     return ok;
 }
 #endif
-
-/* A distributed coordinator maps only its own --layers slice, but the batch
- * encoders below build a full local decode graph per session and would walk
- * layers this process never loaded.  Those sessions take the serialized
- * fallback instead, which routes each token over the wire.
- * ds4_sessions_eval_batch_metal_supported() refuses them for the same reason;
- * the CUDA path, which ROCm also uses, needs the same exclusion. */
-static bool ds4_decode_batch_has_distributed(const ds4_decode_item *items,
-                                             int count) {
-    for (int i = 0; i < count; i++) {
-        if (items[i].session && items[i].session->distributed) return true;
-    }
-    return false;
-}
 
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {

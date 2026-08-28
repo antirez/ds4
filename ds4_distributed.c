@@ -2611,6 +2611,81 @@ static int dist_coordinator_send_remote_work_on_fd(
     return 0;
 }
 
+/* Collect one already-submitted WORK result and turn it into logits.
+ *
+ * Split out of dist_coordinator_eval_remote_on_fd() so a batch can submit every
+ * member's frame before waiting on any of them.  A distributed decode is a
+ * local layer slice on this GPU followed by a wait on the socket, and the wait
+ * is the larger half, so collecting in submit order costs the maximum of the
+ * waits rather than their sum.
+ */
+static int dist_coordinator_finish_remote_on_fd(
+        ds4_dist_coordinator_state *state,
+        ds4_session *session,
+        int fd,
+        uint32_t n_tokens,
+        uint64_t request_id,
+        uint64_t expected_result_hash,
+        uint32_t hidden_hc_bytes,
+        float *logits,
+        char *err,
+        size_t errlen) {
+    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
+    const double recv_t0 = profile ? dist_now_sec() : 0.0;
+    uint32_t kind = 0, payload_bytes = 0;
+    uint64_t result_hash = 0;
+    void *payload = NULL;
+    int rc = dist_recv_result_alloc(fd,
+                                    state,
+                                    request_id,
+                                    &kind,
+                                    &result_hash,
+                                    &payload,
+                                    &payload_bytes,
+                                    err,
+                                    errlen);
+    if (profile) {
+        fprintf(stderr,
+                "ds4: dist decode profile: remote request=%llu wait_result=%.3fms kind=%u payload=%.2fMiB\n",
+                (unsigned long long)request_id,
+                (dist_now_sec() - recv_t0) * 1000.0,
+                kind,
+                (double)payload_bytes / (1024.0 * 1024.0));
+    }
+    if (rc != 0) return rc;
+    if (result_hash != expected_result_hash) {
+        free(payload);
+        if (errlen) snprintf(err, errlen, "distributed result prefix hash mismatch");
+        return 1;
+    }
+
+    const uint32_t logits_bytes =
+        (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
+    if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
+        memcpy(logits, payload, logits_bytes);
+        free(payload);
+        return 0;
+    }
+    if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
+        int head_rc = ds4_session_eval_output_head_from_hc(session,
+                                                           payload,
+                                                           n_tokens,
+                                                           logits,
+                                                           err,
+                                                           errlen);
+        free(payload);
+        return head_rc;
+    }
+    if (kind == DS4_DIST_RESULT_HIDDEN_STATE) {
+        free(payload);
+        if (errlen) snprintf(err, errlen, "distributed route returned invalid hidden-state size");
+        return 1;
+    }
+    free(payload);
+    if (errlen) snprintf(err, errlen, "distributed route did not return logits or hidden-state");
+    return 1;
+}
+
 static int dist_coordinator_eval_remote_on_fd(
         ds4_dist_coordinator_state *state,
         ds4_session *session,
@@ -2629,9 +2704,6 @@ static int dist_coordinator_eval_remote_on_fd(
         float *logits,
         char *err,
         size_t errlen) {
-    const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
-    const double total_t0 = profile ? dist_now_sec() : 0.0;
-    const double send_t0 = profile ? dist_now_sec() : 0.0;
     int rc = dist_coordinator_send_remote_work_on_fd(state,
                                                      plan,
                                                      fd,
@@ -2648,83 +2720,17 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      hidden_hc_bytes,
                                                      err,
                                                      errlen);
-    const double send_t1 = profile ? dist_now_sec() : 0.0;
-    uint32_t kind = 0, payload_bytes = 0;
-    uint64_t result_hash = 0;
-    void *payload = NULL;
-    if (rc == 0) {
-        const double recv_t0 = profile ? dist_now_sec() : 0.0;
-        rc = dist_recv_result_alloc(fd,
-                                    state,
-                                    request_id,
-                                    &kind,
-                                    &result_hash,
-                                    &payload,
-                                    &payload_bytes,
-                                    err,
-                                    errlen);
-        const double recv_t1 = profile ? dist_now_sec() : 0.0;
-        if (profile) {
-            fprintf(stderr,
-                    "ds4: dist decode profile: remote request=%llu pos=%u send=%.3fms wait_result=%.3fms kind=%u payload=%.2fMiB\n",
-                    (unsigned long long)request_id,
-                    pos0,
-                    (send_t1 - send_t0) * 1000.0,
-                    (recv_t1 - recv_t0) * 1000.0,
-                    kind,
-                    (double)payload_bytes / (1024.0 * 1024.0));
-        }
-    }
     if (rc != 0) return rc;
-    if (result_hash != expected_result_hash) {
-        free(payload);
-        if (errlen) snprintf(err, errlen, "distributed result prefix hash mismatch");
-        return 1;
-    }
-
-    const uint32_t logits_bytes = (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
-    if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
-        const double copy_t0 = profile ? dist_now_sec() : 0.0;
-        memcpy(logits, payload, logits_bytes);
-        free(payload);
-        if (profile) {
-            const double copy_t1 = dist_now_sec();
-            fprintf(stderr,
-                    "ds4: dist decode profile: remote request=%llu copy_logits=%.3fms total=%.3fms\n",
-                    (unsigned long long)request_id,
-                    (copy_t1 - copy_t0) * 1000.0,
-                    (copy_t1 - total_t0) * 1000.0);
-        }
-        return 0;
-    }
-    if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
-        const double head_t0 = profile ? dist_now_sec() : 0.0;
-        int head_rc = ds4_session_eval_output_head_from_hc(session,
-                                                           payload,
-                                                           n_tokens,
-                                                           logits,
-                                                           err,
-                                                           errlen);
-        free(payload);
-        if (profile) {
-            const double head_t1 = dist_now_sec();
-            fprintf(stderr,
-                    "ds4: dist decode profile: remote request=%llu output_head=%.3fms total=%.3fms rc=%d\n",
-                    (unsigned long long)request_id,
-                    (head_t1 - head_t0) * 1000.0,
-                    (head_t1 - total_t0) * 1000.0,
-                    head_rc);
-        }
-        return head_rc;
-    }
-    if (kind == DS4_DIST_RESULT_HIDDEN_STATE) {
-        free(payload);
-        if (errlen) snprintf(err, errlen, "distributed route returned invalid hidden-state size");
-        return 1;
-    }
-    free(payload);
-    if (errlen) snprintf(err, errlen, "distributed route did not return logits or hidden-state");
-    return 1;
+    return dist_coordinator_finish_remote_on_fd(state,
+                                                session,
+                                                fd,
+                                                n_tokens,
+                                                request_id,
+                                                expected_result_hash,
+                                                hidden_hc_bytes,
+                                                logits,
+                                                err,
+                                                errlen);
 }
 
 static int dist_coordinator_eval_span(
@@ -5762,6 +5768,220 @@ int ds4_dist_session_sync(
             return 1;
         }
         d->plan_ready = true;
+    }
+    return 0;
+}
+
+/* One decode step across several coordinator sessions at once.
+ *
+ * A distributed decode is a local layer slice on this GPU and then a wait on
+ * the socket, and the wait is the larger half: 34 ms local against 44 ms
+ * blocked, measured on the two-node LAN rig at Flash Q4. Evaluating sessions
+ * one at a time therefore leaves both GPUs idle for most of a step, and the
+ * waste grows with the number of stages.
+ *
+ * Every member's WORK frame is submitted before any result is collected, so the
+ * remote waits overlap each other and the remaining local slices. Local slices
+ * stay serialized -- there is one GPU, and each member's slice commits its own
+ * session timeline before the next one starts.
+ *
+ * Ordering that makes this safe: each session owns its connection, so the
+ * frames of one session never interleave with another's, and each session's
+ * prefix hash is read before its own slice commits.
+ */
+/* Per-member state for one batched decode step. */
+typedef struct {
+    uint64_t request_id;
+    uint64_t result_hash;
+    bool submitted;
+    int rc;
+} ds4_dist_batch_member;
+
+/* Submit one member: local layer slice on this GPU, then its WORK frame.
+ *
+ * The prefix hash is read before the slice runs, because the slice commits this
+ * session's timeline (ds4_session_eval_layer_slice -> slice_commit_timeline) and
+ * the hash must describe the state the worker is expected to be in.
+ */
+static int dist_batch_submit_member(
+        ds4_dist_coordinator_state *state,
+        const ds4_dist_decode_item *item,
+        ds4_dist_batch_member *member,
+        float *hidden,
+        uint32_t hidden_bytes,
+        char *err,
+        size_t errlen) {
+    ds4_dist_session *d = item->dist;
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+
+    const uint32_t pos0 = (uint32_t)item->checkpoint->len;
+    uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
+    if (dist_session_token_hash_prefix(item->owner, pos0, &prefix_hash,
+                                       err, errlen) != 0) {
+        return 1;
+    }
+
+    /* A route with no remote hop means the whole model is local: an ordinary
+     * decode, with nothing to overlap. */
+    if (d->plan.count == 0) {
+        return ds4_session_eval_layer_slice(item->owner, &item->token, 1, pos0,
+                                            state->local_start, state->local_end,
+                                            NULL, NULL, true, item->logits,
+                                            err, errlen);
+    }
+
+    member->result_hash = dist_token_hash_update_span(prefix_hash, &item->token, 1);
+    member->request_id = d->request_id++;
+    if (ds4_session_eval_layer_slice(item->owner, &item->token, 1, pos0,
+                                     state->local_start, state->local_end,
+                                     NULL, hidden, false, NULL,
+                                     err, errlen) != 0) {
+        return 1;
+    }
+    if (dist_coordinator_send_remote_work_on_fd(
+            state, &d->plan, d->plan.entry[0].fd, &item->token, 1, pos0,
+            d->session_id, member->request_id, prefix_hash, member->result_hash,
+            false, false, hidden, hidden_bytes, err, errlen) != 0) {
+        return 1;
+    }
+    member->submitted = true;
+    return 0;
+}
+
+/* Rebuild one member that failed, exactly as the single-session path does, so a
+ * transient worker fault stays invisible to the client rather than becoming a
+ * failed request because batching happened to be active.
+ */
+static int dist_batch_recover_member(
+        ds4_dist_coordinator_state *state,
+        const ds4_dist_decode_item *item,
+        int member_rc,
+        char *err,
+        size_t errlen) {
+    ds4_dist_session *d = item->dist;
+    ds4_tokens transcript = {0};
+    ds4_tokens_copy(&transcript, item->checkpoint);
+    ds4_tokens_push(&transcript, item->token);
+    int rc = dist_coordinator_rebuild_from_transcript(
+            state, item->owner, &d->plan, &transcript, d->session_id,
+            &d->request_id, item->logits, &d->plan_generation,
+            member_rc != DS4_DIST_RECV_REMOTE_ERROR, err, errlen);
+    ds4_tokens_free(&transcript);
+    if (rc == 0) {
+        d->plan_ready = true;
+    } else {
+        d->plan_ready = false;
+        d->plan_generation = 0;
+    }
+    return rc;
+}
+
+/* One decode step across several coordinator sessions at once.
+ *
+ * A distributed decode is a local layer slice on this GPU and then a wait on
+ * the socket, and the wait is the larger half: 34 ms local against 44 ms
+ * blocked, measured on the two-node LAN rig at Flash Q4. Evaluating sessions one
+ * at a time therefore leaves both GPUs idle for most of a step, and the waste
+ * grows with the number of stages.
+ *
+ * Every member's frame is submitted before any result is collected, so the
+ * remote waits overlap each other and the remaining local slices. Local slices
+ * stay serialized -- there is one GPU. Each session owns its connection, so the
+ * frames of one never interleave with another's.
+ */
+int ds4_dist_sessions_eval(
+        ds4_dist_decode_item *items,
+        int count,
+        char *err,
+        size_t errlen) {
+    if (!items || count <= 0) {
+        if (errlen) snprintf(err, errlen, "empty distributed decode batch");
+        return 1;
+    }
+    if (count == 1) {
+        return ds4_dist_session_eval(items[0].dist, items[0].owner,
+                                     items[0].checkpoint, items[0].token,
+                                     items[0].logits, err, errlen);
+    }
+
+    ds4_dist_coordinator_state *state = &items[0].dist->coord->state;
+    const uint64_t hidden_bytes64 =
+        ds4_engine_hidden_f32_values(state->engine) * sizeof(float);
+    if (hidden_bytes64 > UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "distributed coordinator hidden-state chunk is too large");
+        return 1;
+    }
+    const uint32_t hidden_bytes = (uint32_t)hidden_bytes64;
+
+    /* One hidden-state buffer serves the whole batch: a slice writes it and the
+     * following send drains it into the socket before the next slice runs.
+     *
+     * That is safe because a slice is complete when it returns, on every
+     * backend: ds4_session_eval_layer_slice() ends in ds4_gpu_end_commands(),
+     * which waits on the command buffer under Metal and synchronizes the
+     * device or stream under CUDA and ROCm.  If a backend ever made that
+     * asynchronous, this buffer would need to be one per member. */
+    float *hidden = malloc(hidden_bytes);
+    ds4_dist_batch_member *members = calloc((size_t)count, sizeof(members[0]));
+    if (!hidden || !members) {
+        free(hidden);
+        free(members);
+        if (errlen) snprintf(err, errlen, "out of memory preparing distributed decode batch");
+        return 1;
+    }
+
+    char first_err[256];
+    first_err[0] = '\0';
+    int failed = 0;
+
+    for (int i = 0; i < count; i++) {
+        char member_err[256];
+        member_err[0] = '\0';
+        members[i].rc = dist_batch_submit_member(state, &items[i], &members[i],
+                                                 hidden, hidden_bytes,
+                                                 member_err, sizeof(member_err));
+        if (members[i].rc != 0 && !failed++) {
+            snprintf(first_err, sizeof(first_err), "%s", member_err);
+        }
+    }
+
+    /* Collect every submitted member even when a peer has already failed, so no
+     * connection is left holding an unread result. */
+    for (int i = 0; i < count; i++) {
+        if (!members[i].submitted) continue;
+        char member_err[256];
+        member_err[0] = '\0';
+        int rc = dist_coordinator_finish_remote_on_fd(
+                state, items[i].owner, items[i].dist->plan.entry[0].fd, 1,
+                members[i].request_id, members[i].result_hash, hidden_bytes,
+                items[i].logits, member_err, sizeof(member_err));
+        if (rc != 0) {
+            members[i].rc = rc;
+            if (!failed++) snprintf(first_err, sizeof(first_err), "%s", member_err);
+        }
+    }
+
+    for (int i = 0; i < count && failed; i++) {
+        if (members[i].rc == 0) continue;
+        char member_err[256];
+        member_err[0] = '\0';
+        if (dist_batch_recover_member(state, &items[i], members[i].rc,
+                                      member_err, sizeof(member_err)) == 0) {
+            members[i].rc = 0;
+            failed--;
+        } else {
+            snprintf(first_err, sizeof(first_err), "%s", member_err);
+        }
+    }
+
+    free(hidden);
+    free(members);
+    if (failed) {
+        if (errlen) {
+            snprintf(err, errlen, "%s",
+                     first_err[0] ? first_err : "distributed decode batch failed");
+        }
+        return 1;
     }
     return 0;
 }
