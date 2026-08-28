@@ -339,6 +339,43 @@ static void test_negotiation(void) {
                                          err, sizeof(err)) == -1);
 }
 
+static void test_work_capability_validation(void) {
+    static const uint32_t spec_flags[] = {
+        DS4_DIST_WORK_F_SPEC_VERIFY,
+        DS4_DIST_WORK_F_SPEC_ROLLBACK,
+        DS4_DIST_WORK_F_OUTPUT_DRAFTS,
+        DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS,
+        DS4_DIST_WORK_F_SPEC_COMMIT,
+    };
+    char err[160];
+
+    CHECK(ds4_dist_v3_work_caps_validate(
+              DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS,
+              0, err, sizeof(err)) == 0);
+    for (size_t i = 0; i < sizeof(spec_flags) / sizeof(spec_flags[0]); i++) {
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  spec_flags[i], 0, err, sizeof(err)) == -1);
+        CHECK(errno == EPROTO);
+        CHECK(strstr(err, "negotiated speculation capability") != NULL);
+        CHECK(ds4_dist_v3_work_caps_validate(
+                  spec_flags[i], DS4_DIST_V3_CAP_SPEC_DECODE_V1,
+                  err, sizeof(err)) == 0);
+    }
+    CHECK(ds4_dist_v3_work_caps_validate(
+              DS4_DIST_WORK_F_SPEC_VERIFY |
+                  DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED,
+              DS4_DIST_V3_CAP_SPEC_DECODE_V1,
+              err, sizeof(err)) == -1);
+    CHECK(errno == EPROTO);
+    CHECK(strstr(err, "negotiated exact capability") != NULL);
+    CHECK(ds4_dist_v3_work_caps_validate(
+              DS4_DIST_WORK_F_SPEC_VERIFY |
+                  DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED,
+              DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
+                  DS4_DIST_V3_CAP_SPEC_EXACT_V1,
+              err, sizeof(err)) == 0);
+}
+
 static void test_result_payload_limits(void) {
     char err[160];
     const ds4_dist_v3_result_limits limits = {
@@ -567,6 +604,7 @@ int main(void) {
     test_endian_round_trips();
     test_offer_validation();
     test_negotiation();
+    test_work_capability_validation();
     test_result_payload_limits();
     test_frame_sizes();
     test_ready_barrier();

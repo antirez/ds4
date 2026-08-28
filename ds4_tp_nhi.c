@@ -43,7 +43,7 @@
 #include "ds4_tbstream_uapi.h"
 #include "ds4_tp_nhi.h"
 
-#define DS4_TP_NHI_MSG_FRAMES 8u
+#define DS4_TP_NHI_MSG_FRAMES 64u
 #define DS4_TP_NHI_REAP_BATCH 64u
 
 struct ds4_tp_nhi {
@@ -123,6 +123,36 @@ int ds4_tp_nhi_open(ds4_tp_nhi **out,
         close(tx_fd);
         close(rx_fd);
         goto fail;
+    }
+
+    /* The TP exchange depends on behavioral fixes across the zerocopy
+     * patch series (RX priming, MSI-X clear flush, batched doorbells).
+     * Series 18+ advertises a read-only zc_series module parameter;
+     * anything older cannot be distinguished from a broken build, so
+     * warn loudly and continue. */
+    {
+        static const char *series_path =
+            "/sys/module/thunderbolt_stream/parameters/zc_series";
+        char buf[32] = {0};
+        int sfd = open(series_path, O_RDONLY | O_CLOEXEC);
+        if (sfd >= 0) {
+            ssize_t n = read(sfd, buf, sizeof(buf) - 1);
+            close(sfd);
+            const long level = n > 0 ? strtol(buf, NULL, 10) : 0;
+            if (level < 18)
+                fprintf(stderr,
+                        "ds4-tp: WARNING: thunderbolt_stream reports "
+                        "zerocopy series %ld; TP NHI wants series >= 18 -- "
+                        "rebuild the module from strix-rdma main\n",
+                        level);
+        } else {
+            fprintf(stderr,
+                    "ds4-tp: WARNING: cannot determine thunderbolt_stream "
+                    "zerocopy series level (%s missing); TP NHI wants "
+                    "series >= 18 -- rebuild the module from strix-rdma "
+                    "main if gates stall\n",
+                    series_path);
+        }
     }
 
     /* Both directions imported in one call, before ENABLE (rule 2). */

@@ -647,7 +647,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             return cuda_ok(cudaGetLastError(),
                            "matmul_q8_0 f32 tiny exact8 launch");
         }
-        if (!g_quality_mode && (in_dim % 32u) == 0u &&
+        static int disable_q8_wmma_prefill_cached = -1;
+        if (disable_q8_wmma_prefill_cached < 0) {
+            const char *env = getenv("DS4_ROCM_DISABLE_Q8_WMMA_PREFILL");
+            disable_q8_wmma_prefill_cached =
+                env && env[0] && strcmp(env, "0") != 0;
+        }
+        if (!disable_q8_wmma_prefill_cached && !g_quality_mode &&
+            (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {

@@ -33,7 +33,7 @@ enum {
     DS4_TP_GATES_PER_LAYER = 2,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
-    DS4_TP_NHI_MSG_FRAMES = 8,
+    DS4_TP_NHI_MSG_FRAMES = 64,
     DS4_TP_NHI_DEFAULT_RING_FRAMES = 4096,
 };
 
@@ -95,7 +95,12 @@ int ds4_tp_validate_engine_options(
 
 /* Connection bring-up.  The leader listens and accepts one worker; the
  * worker dials with retry.  Both then exchange and validate identities.
- * Blocking; call after the engine is loaded (identity needs the shape). */
+ * Blocking; call after the engine is loaded (identity needs the shape).
+ * Frontends with a SIGINT/SIGTERM handler should call ds4_tp_request_stop()
+ * so these waits and the worker's blocking control read exit promptly. */
+void ds4_tp_request_stop(void);
+bool ds4_tp_stop_requested(void);
+void ds4_tp_clear_stop_request(void);
 int ds4_tp_create(
         ds4_tp **out,
         const ds4_tp_options *opt,

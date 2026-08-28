@@ -19,6 +19,28 @@
 #define DS4_DIST_MSG_HELLO_ACK 12u
 #define DS4_DIST_MSG_HELLO_READY 13u
 
+/* WORK flag values are shared by v2 and v3 framing. Speculative extensions
+ * are accepted only when their corresponding v3 capabilities were selected
+ * for the active link. */
+#define DS4_DIST_WORK_F_INPUT_HC            0x00000001u
+#define DS4_DIST_WORK_F_OUTPUT_LOGITS       0x00000002u
+#define DS4_DIST_WORK_F_RESET_SESSION       0x00000004u
+#define DS4_DIST_WORK_F_ACK_ONLY            0x00000008u
+#define DS4_DIST_WORK_F_SPEC_VERIFY         0x00000010u
+#define DS4_DIST_WORK_F_SPEC_ROLLBACK       0x00000020u
+#define DS4_DIST_WORK_F_OUTPUT_DRAFTS       0x00000040u
+#define DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS   0x00000080u
+#define DS4_DIST_WORK_F_SPEC_COMMIT         0x00000100u
+#define DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED 0x00000200u
+#define DS4_DIST_WORK_F_SPEC_MASK \
+    (DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_SPEC_ROLLBACK | \
+     DS4_DIST_WORK_F_OUTPUT_DRAFTS | DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS | \
+     DS4_DIST_WORK_F_SPEC_COMMIT | DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED)
+#define DS4_DIST_WORK_F_VALID_MASK \
+    (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_SPEC_MASK)
+
 #define DS4_DIST_V3_CAP_BULK_DESC_V1    0x00000001u
 #define DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 0x00000002u
 #define DS4_DIST_V3_CAP_NHI_TAGGED_V1   0x00000004u
@@ -161,6 +183,14 @@ int ds4_dist_v3_negotiate(
         const ds4_dist_v3_hello_ext *coordinator,
         uint64_t generation,
         ds4_dist_v3_hello_ack *ack,
+        char *err,
+        size_t errlen);
+
+/* Reject speculative WORK extensions unless the active link selected the
+ * required bilateral capabilities. Non-speculative flags are unaffected. */
+int ds4_dist_v3_work_caps_validate(
+        uint32_t work_flags,
+        uint32_t selected_caps,
         char *err,
         size_t errlen);
 

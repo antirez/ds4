@@ -601,7 +601,7 @@ static int routed_moe_launch(
         owned_count > n_total_expert - owned_first || owned_count == 0)
         return 0;
     if ((owned_first != 0 || owned_count != n_total_expert) &&
-        (!mxfp4_path || n_tokens != 1u))
+        !mxfp4_path)
         return 0;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
@@ -624,7 +624,7 @@ static int routed_moe_launch(
      * ownership-aware MXFP4 kernels translate global expert IDs to local
      * weight rows. This must precede streaming/compact-selected fallbacks:
      * the rank-local spans are already the authoritative resident source. */
-    if (owned_shard_requested && mxfp4_path && n_tokens == 1u) {
+    if (owned_shard_requested && mxfp4_path) {
         uint64_t local_gate_bytes = 0, local_down_bytes = 0;
         uint64_t gate_delta = 0, down_delta = 0;
         uint64_t local_gate_offset = 0, local_up_offset = 0;
@@ -892,10 +892,10 @@ static int routed_moe_launch(
         const uint32_t use_down_row2048 =
             !q4k_path && !mxfp4_path && use_atomic_down && use_down_tile16;
         const uint32_t use_direct_down_sum6 =
-            (n_tokens == 1u || use_mxfp4_tiny_batch) &&
+            (n_tokens == 1u || use_mxfp4_tiny_batch || owned_shard_requested) &&
             n_expert <= DS4_ROCM_N_EXPERT_USED;
         const uint32_t use_mxfp4_ldsB =
-            mxfp4_path && use_expert_tiles && n_tokens >= 128u &&
+            mxfp4_path && use_expert_tiles && !owned_shard_requested && n_tokens >= 128u &&
             16u * gate_row_bytes <= 60u * 1024u &&
             (expert_mid_dim % 8u) == 0u &&
             getenv("DS4_ROCM_ENABLE_MXFP4_LDSB") != NULL;
@@ -1490,6 +1490,7 @@ static int routed_moe_launch(
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile32_total, tile32_experts, tile32_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            weight_first, owned_first, owned_count,
                             0u, write_gate_up, clamp);
                     } else if (use_mxfp4_ldsB && tile128_total && tile128_experts && tile128_starts) {
                         /* B-staged prefill path: 8 output rows x up to 128
@@ -1525,6 +1526,7 @@ static int routed_moe_launch(
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile4_total, tile4_experts, tile4_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            weight_first, owned_first, owned_count,
                             0u, write_gate_up, clamp);
                     } else if (use_mxfp4_row64) {
                         const uint32_t row64_shmem = xq_blocks <= 28u ?
@@ -1553,6 +1555,7 @@ static int routed_moe_launch(
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                            weight_first, owned_first, owned_count,
                             0u, write_gate_up, clamp);
                     } else {
                     dim3 tgrid(tile_capacity, (expert_mid_dim + 31u) / 32u, 1);
@@ -1586,6 +1589,7 @@ static int routed_moe_launch(
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                         gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        weight_first, owned_first, owned_count,
                         0u, write_gate_up, clamp);
                     }
                 } else if (use_gate_row2048) {
@@ -2933,6 +2937,8 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     if (mid_is_f16) *mid_is_f16 = false;
+    uint32_t owned_first = 0, owned_count = n_total_expert;
+    ds4_rocm_tp_expert_range(n_total_expert, &owned_first, &owned_count);
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -2940,5 +2946,5 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
-                             0, n_total_expert, force_resident);
+                             owned_first, owned_count, force_resident);
 }

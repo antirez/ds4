@@ -512,6 +512,7 @@ typedef struct {
     hipEvent_t tx_ready;
     hipEvent_t rx_consumed;
     int in_use;
+    int rx_queued; /* producer queued the matching RX spin-copy */
 } ds4_rocm_tp_request;
 
 static ds4_gpu_tensor *g_tp_engine_slab;
@@ -547,8 +548,17 @@ static ds4_rocm_tp_request g_tp_engine_requests[DS4_ROCM_TP_QUEUE];
 static uint32_t g_tp_engine_pending[DS4_ROCM_TP_QUEUE];
 static uint32_t g_tp_engine_pending_head;
 static uint32_t g_tp_engine_pending_count;
+static uint32_t g_tp_engine_inflight[DS4_ROCM_TP_QUEUE];
+static uint32_t g_tp_engine_inflight_head;
+static uint32_t g_tp_engine_inflight_count;
 static uint32_t g_tp_engine_next_record;
 static uint32_t g_tp_engine_building;
+/* Transport ring capacity in messages (ring slot = seq % msgs); the
+ * producer never lets more than this many messages stand between their
+ * TX fill and their RX spin.  Plumbed from ds4_tp_nhi_msgs() at engine
+ * init via ds4_gpu_tp_nhi_set_ring_msgs; the default is a conservative
+ * floor below the 4096-frame production ring (4096 / 64 frames = 64). */
+static uint32_t g_tp_engine_ring_msgs = 32;
 
 static void ds4_rocm_tp_expert_range(uint32_t n_total_expert,
                                      uint32_t *first_expert,
@@ -599,6 +609,12 @@ static void ds4_rocm_tp_fail(const char *what,
         }
         if (g_tp_nhi_fail_fn) g_tp_nhi_fail_fn(g_tp_nhi_ud);
     }
+    /* A big prefill gate can have a producer blocked waiting for a free
+     * request record.  Failure must wake that waiter even if the service
+     * thread is also exiting. */
+    pthread_mutex_lock(&g_tp_engine_mutex);
+    pthread_cond_broadcast(&g_tp_engine_cond);
+    pthread_mutex_unlock(&g_tp_engine_mutex);
 }
 
 static void ds4_rocm_tp_cancel_build(ds4_rocm_tp_request *req) {
@@ -618,53 +634,105 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_tp_engine_mutex);
         while (g_tp_engine_pending_count == 0 &&
+               g_tp_engine_inflight_count == 0 &&
                (!__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
                 g_tp_engine_building != 0))
             pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
-        if (g_tp_engine_pending_count == 0 && g_tp_engine_building == 0 &&
+        if (g_tp_engine_pending_count == 0 &&
+            g_tp_engine_inflight_count == 0 &&
+            g_tp_engine_building == 0 &&
             __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
             pthread_mutex_unlock(&g_tp_engine_mutex);
             break;
         }
-        const uint32_t index = g_tp_engine_pending[g_tp_engine_pending_head];
-        g_tp_engine_pending_head =
-            (g_tp_engine_pending_head + 1u) % DS4_ROCM_TP_QUEUE;
-        g_tp_engine_pending_count--;
+        const int have_pending = g_tp_engine_pending_count != 0;
+        uint32_t index = 0;
+        if (have_pending) {
+            index = g_tp_engine_pending[g_tp_engine_pending_head];
+            g_tp_engine_pending_head =
+                (g_tp_engine_pending_head + 1u) % DS4_ROCM_TP_QUEUE;
+            g_tp_engine_pending_count--;
+        }
         pthread_mutex_unlock(&g_tp_engine_mutex);
 
-        ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
-        int ok = hipEventSynchronize(req->tx_ready) == hipSuccess;
-        if (!ok) ds4_rocm_tp_fail("TX-ready event synchronize", req);
+        /* Submit as soon as this record's TX fill lands; never wait for an
+         * older record's RX final-reader event, so the wire stays busy
+         * while the peer is still draining earlier messages. */
+        if (have_pending) {
+            ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
+            if (hipEventSynchronize(req->tx_ready) != hipSuccess)
+                ds4_rocm_tp_fail("TX-ready event synchronize", req);
+            const uint32_t state = g_tp_engine_state_host
+                ? __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE)
+                : 1u;
+            if (state == 0 &&
+                !(g_tp_nhi_submit_fn &&
+                  g_tp_nhi_submit_fn(g_tp_nhi_ud, req->seq)))
+                ds4_rocm_tp_fail("NHI submit", req);
 
-        const uint32_t state = g_tp_engine_state_host
-            ? __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) : 1u;
-        int submitted = 0;
-        if (ok && state == 0) {
-            submitted = g_tp_nhi_submit_fn &&
-                        g_tp_nhi_submit_fn(g_tp_nhi_ud, req->seq);
-            if (!submitted) ds4_rocm_tp_fail("NHI submit", req);
+            pthread_mutex_lock(&g_tp_engine_mutex);
+            const uint32_t tail =
+                (g_tp_engine_inflight_head + g_tp_engine_inflight_count) %
+                DS4_ROCM_TP_QUEUE;
+            g_tp_engine_inflight[tail] = index;
+            g_tp_engine_inflight_count++;
+            pthread_mutex_unlock(&g_tp_engine_mutex);
         }
 
-        /* Always wait the final-reader marker.  On transport failure or
-         * shutdown the mapped state word aborts the spin, so this cannot
-         * leave teardown blocked behind peer traffic. */
-        if (hipEventSynchronize(req->rx_consumed) != hipSuccess)
-            ds4_rocm_tp_fail("RX-consumed event synchronize", req);
-        if (g_tp_engine_state_host &&
-            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 1u)
-            ds4_rocm_tp_fail("RX stamp timeout", req);
+        /* Retire in-flight records in strict sequence order: consumed_fn
+         * requires ordered seqs, so only the head is ever examined. */
+        for (;;) {
+            pthread_mutex_lock(&g_tp_engine_mutex);
+            if (g_tp_engine_inflight_count == 0) {
+                pthread_mutex_unlock(&g_tp_engine_mutex);
+                break;
+            }
+            ds4_rocm_tp_request *req =
+                &g_tp_engine_requests[g_tp_engine_inflight[g_tp_engine_inflight_head]];
+            /* rx_consumed is a complete final-reader marker only once the
+             * producer queued the matching RX spin.  A producer that
+             * aborted mid-window always trips the failure/shutdown state,
+             * which also wakes this wait. */
+            while (!req->rx_queued &&
+                   g_tp_engine_state_host &&
+                   __atomic_load_n(g_tp_engine_state_host,
+                                   __ATOMIC_ACQUIRE) == 0 &&
+                   !__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE))
+                pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
+            pthread_mutex_unlock(&g_tp_engine_mutex);
 
-        if (submitted &&
-            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 0 &&
-            (!g_tp_nhi_consumed_fn ||
-             !g_tp_nhi_consumed_fn(g_tp_nhi_ud, req->seq))) {
-            ds4_rocm_tp_fail("NHI RX consume/repost", req);
+            const hipError_t query = hipEventQuery(req->rx_consumed);
+            if (query == hipErrorNotReady) {
+                pthread_mutex_lock(&g_tp_engine_mutex);
+                const int more_pending = g_tp_engine_pending_count != 0;
+                pthread_mutex_unlock(&g_tp_engine_mutex);
+                if (more_pending) break; /* keep submitting; retire later */
+                /* Nothing else to submit: block on the oldest reader.  On
+                 * transport failure or shutdown the mapped state word
+                 * aborts the spin, so teardown cannot wedge here. */
+                if (hipEventSynchronize(req->rx_consumed) != hipSuccess)
+                    ds4_rocm_tp_fail("RX-consumed event synchronize", req);
+            } else if (query != hipSuccess) {
+                ds4_rocm_tp_fail("RX-consumed event query", req);
+            }
+            if (g_tp_engine_state_host &&
+                __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 1u)
+                ds4_rocm_tp_fail("RX stamp timeout", req);
+
+            if (g_tp_engine_state_host &&
+                __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 0 &&
+                g_tp_nhi_consumed_fn &&
+                !g_tp_nhi_consumed_fn(g_tp_nhi_ud, req->seq))
+                ds4_rocm_tp_fail("NHI RX consume/repost", req);
+
+            pthread_mutex_lock(&g_tp_engine_mutex);
+            g_tp_engine_inflight_head =
+                (g_tp_engine_inflight_head + 1u) % DS4_ROCM_TP_QUEUE;
+            g_tp_engine_inflight_count--;
+            req->in_use = 0;
+            pthread_cond_broadcast(&g_tp_engine_cond);
+            pthread_mutex_unlock(&g_tp_engine_mutex);
         }
-
-        pthread_mutex_lock(&g_tp_engine_mutex);
-        req->in_use = 0;
-        pthread_cond_broadcast(&g_tp_engine_cond);
-        pthread_mutex_unlock(&g_tp_engine_mutex);
     }
     return NULL;
 }
@@ -682,6 +750,10 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             DS4_GPU_LOG_PREFIX
             "ROCm network tensor parallelism requires the NHI gate service\n");
     return 0;
+}
+
+extern "C" void ds4_gpu_tp_nhi_set_ring_msgs(uint32_t msgs) {
+    if (msgs != 0) g_tp_engine_ring_msgs = msgs;
 }
 
 extern "C" int ds4_gpu_tp_nhi_init(
@@ -729,6 +801,8 @@ extern "C" int ds4_gpu_tp_nhi_init(
     g_tp_split_world = 2;
     g_tp_engine_pending_head = 0;
     g_tp_engine_pending_count = 0;
+    g_tp_engine_inflight_head = 0;
+    g_tp_engine_inflight_count = 0;
     g_tp_engine_next_record = 0;
     g_tp_engine_building = 0;
     __atomic_store_n(&g_tp_engine_shutdown, 0, __ATOMIC_RELEASE);
@@ -809,94 +883,93 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     g_tp_session_batch_mode = 0;
 }
 
-extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+#define DS4_ROCM_TP_BIG_GATE_TAG 0xB16u
+
+/* TX phase of one NHI message: allocate a request record, reserve the
+ * transport slot, enqueue the fill + stamp-release kernels, and hand the
+ * record to the service thread's pending queue.  Returns the record index,
+ * or -1 on failure.  The matching ds4_rocm_tp_enqueue_gate_rx must follow
+ * (after at most g_tp_engine_ring_msgs outstanding TX phases) so the RX
+ * spin-copy is queued before the service thread retires the record. */
+static int ds4_rocm_tp_enqueue_gate_tx(uint32_t layer,
+                                       uint32_t gate,
+                                       const void *src,
+                                       uint32_t n_floats) {
     if (!g_tp_engine_thread_running ||
         __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
-        gate >= 2u) return 0;
-    const uint32_t slot = layer * 2u + gate;
-    if (slot >= g_tp_engine_slots ||
-        __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)
-        return 0;
+        !src || n_floats == 0 ||
+        n_floats > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX)
+        return -1;
+    if (__atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)
+        return -1;
+
     uint32_t index = UINT32_MAX;
     pthread_mutex_lock(&g_tp_engine_mutex);
-    if (__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE)) {
-        pthread_mutex_unlock(&g_tp_engine_mutex);
-        return 0;
+    for (;;) {
+        if (__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0) {
+            pthread_mutex_unlock(&g_tp_engine_mutex);
+            return -1;
+        }
+        for (uint32_t n = 0; n < DS4_ROCM_TP_QUEUE; n++) {
+            const uint32_t candidate =
+                (g_tp_engine_next_record + n) % DS4_ROCM_TP_QUEUE;
+            if (!g_tp_engine_requests[candidate].in_use) {
+                index = candidate;
+                g_tp_engine_next_record =
+                    (candidate + 1u) % DS4_ROCM_TP_QUEUE;
+                g_tp_engine_requests[candidate].in_use = 1;
+                break;
+            }
+        }
+        if (index != UINT32_MAX) break;
+        /* A large prefill gate can need more than 512 transport messages.
+         * Wait for the service thread to retire older chunks instead of
+         * failing the graph encode. */
+        pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
     }
     if (g_tp_engine_seq > UINT32_MAX) {
+        g_tp_engine_requests[index].in_use = 0;
+        pthread_cond_broadcast(&g_tp_engine_cond);
         pthread_mutex_unlock(&g_tp_engine_mutex);
         ds4_rocm_tp_fail("32-bit stamp sequence exhausted", NULL);
-        return 0;
-    }
-    for (uint32_t n = 0; n < DS4_ROCM_TP_QUEUE; n++) {
-        const uint32_t candidate =
-            (g_tp_engine_next_record + n) % DS4_ROCM_TP_QUEUE;
-        if (!g_tp_engine_requests[candidate].in_use) {
-            index = candidate;
-            g_tp_engine_next_record = (candidate + 1u) % DS4_ROCM_TP_QUEUE;
-            g_tp_engine_requests[candidate].in_use = 1;
-            break;
-        }
-    }
-    if (index == UINT32_MAX) {
-        pthread_mutex_unlock(&g_tp_engine_mutex);
-        ds4_rocm_tp_fail("request/event ring exhausted", NULL);
-        return 0;
+        return -1;
     }
     ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
     req->layer = layer;
     req->gate = gate;
     req->seq = g_tp_engine_seq++;
+    req->rx_queued = 0;
     g_tp_engine_building++;
     pthread_mutex_unlock(&g_tp_engine_mutex);
+
     if (!g_tp_nhi_acquire_tx_fn(g_tp_nhi_ud, req->seq)) {
         ds4_rocm_tp_cancel_build(req);
         ds4_rocm_tp_fail("NHI TX slot acquire", req);
-        return 0;
+        return -1;
     }
     void *tx_slot = g_tp_nhi_tx_slot_fn(g_tp_nhi_ud, req->seq);
-    const void *rx_slot = g_tp_nhi_rx_slot_fn(g_tp_nhi_ud, req->seq);
-    const uint64_t vec_bytes =
-        (uint64_t)g_tp_engine_n_embd * sizeof(float);
-    const float *out = (const float *)((const char *)g_tp_engine_slab->ptr +
-                                       g_tp_engine_out_offset +
-                                       (uint64_t)slot * vec_bytes);
-    float *in = (float *)((char *)g_tp_engine_slab->ptr +
-                          g_tp_engine_in_offset +
-                          (uint64_t)slot * vec_bytes);
-    if (!tx_slot || !rx_slot) {
+    if (!tx_slot) {
         ds4_rocm_tp_cancel_build(req);
         ds4_rocm_tp_fail("null transport slot", req);
-        return 0;
+        return -1;
     }
 
     const uint32_t block = 256u;
-    const uint32_t grid = (g_tp_engine_n_embd + block - 1u) / block;
+    const uint32_t grid = (n_floats + block - 1u) / block;
     hipLaunchKernelGGL(dsv4_tp_slot_copy_f32_kernel,
                        dim3(grid), dim3(block), 0, 0,
-                       (unsigned char *)tx_slot, out, g_tp_engine_n_embd);
+                       (unsigned char *)tx_slot, (const float *)src,
+                       n_floats);
     hipLaunchKernelGGL(dsv4_tp_stamp_release_kernel,
                        dim3(1), dim3(1), 0, 0,
                        (unsigned char *)tx_slot,
                        ds4_rocm_tp_stamp((uint32_t)g_tp_split_rank, req->seq));
-    int ok = hipGetLastError() == hipSuccess &&
-             hipEventRecord(req->tx_ready, 0) == hipSuccess;
-    if (ok) {
-        hipLaunchKernelGGL(dsv4_tp_spin_copy_f32_kernel,
-                           dim3(1), dim3(256), 0, 0,
-                           in, (const unsigned char *)rx_slot,
-                           g_tp_engine_n_embd,
-                           ds4_rocm_tp_stamp((uint32_t)(g_tp_split_rank ^ 1),
-                                             req->seq),
-                           g_tp_engine_max_spins,
-                           g_tp_engine_state_dev);
-        ok = hipGetLastError() == hipSuccess &&
-             hipEventRecord(req->rx_consumed, 0) == hipSuccess;
-    }
-    if (!ok) {
+    if (hipGetLastError() != hipSuccess ||
+        hipEventRecord(req->tx_ready, 0) != hipSuccess) {
         ds4_rocm_tp_cancel_build(req);
-        ds4_rocm_tp_fail("gate kernel/event enqueue", req);
-        return 0;
+        ds4_rocm_tp_fail("gate TX kernel/event enqueue", req);
+        return -1;
     }
 
     pthread_mutex_lock(&g_tp_engine_mutex);
@@ -906,7 +979,7 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         pthread_cond_broadcast(&g_tp_engine_cond);
         pthread_mutex_unlock(&g_tp_engine_mutex);
         ds4_rocm_tp_fail("service queue overflow", req);
-        return 0;
+        return -1;
     }
     const uint32_t tail =
         (g_tp_engine_pending_head + g_tp_engine_pending_count) %
@@ -916,7 +989,77 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (g_tp_engine_building != 0) g_tp_engine_building--;
     pthread_cond_broadcast(&g_tp_engine_cond);
     pthread_mutex_unlock(&g_tp_engine_mutex);
+    return (int)index;
+}
+
+/* RX phase of one NHI message: enqueue the spin-copy that waits the peer's
+ * stamp and lands the RX payload into dst, then flag the record so the
+ * service thread may treat rx_consumed as the final-reader marker and
+ * retire it. */
+static int ds4_rocm_tp_enqueue_gate_rx(uint32_t index,
+                                       void *dst,
+                                       uint32_t n_floats) {
+    if (index >= DS4_ROCM_TP_QUEUE || !dst || n_floats == 0 ||
+        n_floats > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX)
+        return 0;
+    ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
+    const void *rx_slot = g_tp_nhi_rx_slot_fn(g_tp_nhi_ud, req->seq);
+    int ok = rx_slot != NULL;
+    if (ok) {
+        hipLaunchKernelGGL(dsv4_tp_spin_copy_f32_kernel,
+                           dim3(1), dim3(256), 0, 0,
+                           (float *)dst, (const unsigned char *)rx_slot,
+                           n_floats,
+                           ds4_rocm_tp_stamp((uint32_t)(g_tp_split_rank ^ 1),
+                                             req->seq),
+                           g_tp_engine_max_spins,
+                           g_tp_engine_state_dev);
+        ok = hipGetLastError() == hipSuccess &&
+             hipEventRecord(req->rx_consumed, 0) == hipSuccess;
+    }
+    /* Set rx_queued even on failure: the service thread's retire wait must
+     * not linger until shutdown, and the latched failure state makes the
+     * retire path skip submit/consume for this record. */
+    pthread_mutex_lock(&g_tp_engine_mutex);
+    req->rx_queued = 1;
+    pthread_cond_broadcast(&g_tp_engine_cond);
+    pthread_mutex_unlock(&g_tp_engine_mutex);
+    if (!ok) {
+        ds4_rocm_tp_fail("gate RX kernel/event enqueue", req);
+        return 0;
+    }
     return 1;
+}
+
+/* Queue one NHI message.  The caller's GPU stream owns ordering: the RX
+ * spin-copy is enqueued immediately after the TX fill, so later graph work
+ * cannot consume the destination until this message's stamp has arrived. */
+static int ds4_rocm_tp_enqueue_gate(uint32_t layer,
+                                    uint32_t gate,
+                                    const void *src,
+                                    void *dst,
+                                    uint32_t n_floats) {
+    if (!dst) return 0;
+    const int index =
+        ds4_rocm_tp_enqueue_gate_tx(layer, gate, src, n_floats);
+    if (index < 0) return 0;
+    return ds4_rocm_tp_enqueue_gate_rx((uint32_t)index, dst, n_floats);
+}
+
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    if (gate >= 2u) return 0;
+    const uint32_t slot = layer * 2u + gate;
+    if (slot >= g_tp_engine_slots) return 0;
+    const uint64_t vec_bytes =
+        (uint64_t)g_tp_engine_n_embd * sizeof(float);
+    const float *out = (const float *)((const char *)g_tp_engine_slab->ptr +
+                                       g_tp_engine_out_offset +
+                                       (uint64_t)slot * vec_bytes);
+    float *in = (float *)((char *)g_tp_engine_slab->ptr +
+                          g_tp_engine_in_offset +
+                          (uint64_t)slot * vec_bytes);
+    return ds4_rocm_tp_enqueue_gate(layer, gate, out, in,
+                                    g_tp_engine_n_embd);
 }
 
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
@@ -957,8 +1100,56 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                           const ds4_gpu_tensor *out_t,
                                           ds4_gpu_tensor *in_t,
                                           uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
+    (void)rows;
+    if (!out_t || !in_t || bytes == 0 || (bytes & 3u) != 0 ||
+        bytes > out_t->bytes || bytes > in_t->bytes)
+        return 0;
+
+    /* Pipeline in windows: queue up to `window` TX fills before queuing
+     * their RX spin-copies, so one message's submit/RTT overlaps the next
+     * messages' fills instead of serializing per chunk.  The window must
+     * not exceed the transport ring capacity: a ring slot is seq % msgs,
+     * so more than `msgs` outstanding unconsumed messages would let a
+     * later fill target a ring slot the peer has not consumed yet. */
+    uint32_t window = g_tp_engine_ring_msgs;
+    if (window > DS4_ROCM_TP_QUEUE / 2u) window = DS4_ROCM_TP_QUEUE / 2u;
+    if (window == 0) window = 1;
+    int tx_records[DS4_ROCM_TP_QUEUE / 2];
+
+    const uint64_t n_floats = bytes / sizeof(float);
+    uint64_t tx_done = 0;
+    uint64_t rx_done = 0;
+    while (rx_done < n_floats) {
+        uint32_t n_window = 0;
+        while (tx_done < n_floats && n_window < window) {
+            uint64_t left = n_floats - tx_done;
+            const uint32_t chunk =
+                left > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX ?
+                    DS4_ROCM_TP_PAYLOAD_FLOATS_MAX : (uint32_t)left;
+            const int index = ds4_rocm_tp_enqueue_gate_tx(
+                layer,
+                DS4_ROCM_TP_BIG_GATE_TAG,
+                (const float *)out_t->ptr + tx_done,
+                chunk);
+            if (index < 0)
+                return 0;
+            tx_records[n_window++] = index;
+            tx_done += chunk;
+        }
+        for (uint32_t i = 0; i < n_window; i++) {
+            uint64_t left = n_floats - rx_done;
+            const uint32_t chunk =
+                left > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX ?
+                    DS4_ROCM_TP_PAYLOAD_FLOATS_MAX : (uint32_t)left;
+            if (!ds4_rocm_tp_enqueue_gate_rx(
+                    (uint32_t)tx_records[i],
+                    (float *)in_t->ptr + rx_done,
+                    chunk))
+                return 0;
+            rx_done += chunk;
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
