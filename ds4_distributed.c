@@ -383,12 +383,25 @@ typedef struct {
     uint64_t tensor_bytes;
 } ds4_dist_kv_shard_file;
 
-struct ds4_dist_session {
+/* The listener, the accept loop and the worker registry describe the cluster
+ * this process joined, not any one session, so the engine owns one of these and
+ * every coordinator session borrows it.  Binding them per session used to cap a
+ * coordinator at one resident session: the second bind hit EADDRINUSE.
+ */
+struct ds4_dist_coordinator {
     ds4_dist_coordinator_state state;
     int listen_fd;
     pthread_t accept_tid;
     bool accept_started;
     ds4_dist_accept_ctx accept_ctx;
+};
+
+struct ds4_dist_session {
+    ds4_dist_coordinator *coord;
+    /* The plan stays per session because it owns a dup() of the first hop's
+     * descriptor.  One plan behind several sessions would put several writers
+     * on one stream, and a WORK frame is several sequential writes.
+     */
     ds4_dist_route_plan plan;
     bool plan_ready;
     uint64_t plan_generation;
@@ -4334,10 +4347,10 @@ static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errl
         if (errlen) snprintf(err, errlen, "missing distributed session");
         return 1;
     }
-    uint64_t generation = dist_coordinator_generation(&d->state);
+    uint64_t generation = dist_coordinator_generation(&d->coord->state);
     if (d->plan_ready && d->plan_generation == generation) return 0;
     dist_route_plan_free(&d->plan);
-    if (!dist_coordinator_ensure_route(&d->state, &d->plan, &generation, err, errlen)) {
+    if (!dist_coordinator_ensure_route(&d->coord->state, &d->plan, &generation, err, errlen)) {
         d->plan_ready = false;
         d->plan_generation = 0;
         return 1;
@@ -4878,8 +4891,8 @@ static void dist_kv_route_shard(
         const ds4_dist_route_entry **entry) {
     if (entry) *entry = NULL;
     if (shard == 0) {
-        if (layer_start) *layer_start = d->state.local_start;
-        if (layer_end) *layer_end = d->state.local_end;
+        if (layer_start) *layer_start = d->coord->state.local_start;
+        if (layer_end) *layer_end = d->coord->state.local_end;
         return;
     }
     const ds4_dist_route_entry *e = &d->plan.entry[shard - 1u];
@@ -4892,25 +4905,25 @@ static int dist_kv_route_validate(
         const ds4_dist_session *d,
         char *err,
         size_t errlen) {
-    if (!d || d->state.n_layers == 0 ||
-        d->state.local_start != 0 ||
-        d->state.local_end >= d->state.n_layers) {
+    if (!d || d->coord->state.n_layers == 0 ||
+        d->coord->state.local_start != 0 ||
+        d->coord->state.local_end >= d->coord->state.n_layers) {
         if (errlen) snprintf(err, errlen, "distributed KV route does not start at layer 0");
         return 1;
     }
-    uint32_t prev = d->state.local_end;
+    uint32_t prev = d->coord->state.local_end;
     for (uint32_t i = 0; i < d->plan.count; i++) {
         const ds4_dist_route_entry *e = &d->plan.entry[i];
         if (prev == UINT32_MAX ||
             e->layer_start != prev + 1u ||
             e->layer_end < e->layer_start ||
-            e->layer_end >= d->state.n_layers) {
+            e->layer_end >= d->coord->state.n_layers) {
             if (errlen) snprintf(err, errlen, "distributed KV route is not contiguous");
             return 1;
         }
         prev = e->layer_end;
     }
-    if (prev + 1u != d->state.n_layers) {
+    if (prev + 1u != d->coord->state.n_layers) {
         if (errlen) snprintf(err, errlen, "distributed KV route does not cover all layers");
         return 1;
     }
@@ -4940,7 +4953,7 @@ static int dist_save_remote_shard_to_file(
 
     ds4_dist_snapshot_req_fixed req;
     memset(&req, 0, sizeof(req));
-    req.model_id = d->state.model_id;
+    req.model_id = d->coord->state.model_id;
     dist_u64_to_halves(d->session_id, &req.session_hi, &req.session_lo);
     dist_u64_to_halves(request_id, &req.request_hi, &req.request_lo);
     dist_u64_to_halves(token_hash, &req.token_hash_hi, &req.token_hash_lo);
@@ -4972,7 +4985,7 @@ static int dist_save_remote_shard_to_file(
     uint64_t got_session = dist_u64_from_halves(begin.session_hi, begin.session_lo);
     uint64_t got_request = dist_u64_from_halves(begin.request_hi, begin.request_lo);
     uint64_t got_hash = dist_u64_from_halves(begin.token_hash_hi, begin.token_hash_lo);
-    if (begin.model_id != d->state.model_id ||
+    if (begin.model_id != d->coord->state.model_id ||
         got_session != d->session_id ||
         got_request != request_id ||
         got_hash != token_hash ||
@@ -5019,7 +5032,7 @@ static int dist_prepare_shard_from_session_payload(
         goto cleanup;
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         uint64_t layer_bytes = 0;
-        if (!dist_kv_layer_tensor_bytes(d->state.engine, layout, il,
+        if (!dist_kv_layer_tensor_bytes(d->coord->state.engine, layout, il,
                                         n_comp[il], n_index_comp[il],
                                         &layer_bytes)) {
             if (errlen) snprintf(err, errlen, "distributed KV layer byte count overflow");
@@ -5057,7 +5070,7 @@ static int dist_load_remote_shard_from_payload(
 
     ds4_dist_snapshot_begin_fixed begin;
     memset(&begin, 0, sizeof(begin));
-    begin.model_id = d->state.model_id;
+    begin.model_id = d->coord->state.model_id;
     dist_u64_to_halves(d->session_id, &begin.session_hi, &begin.session_lo);
     dist_u64_to_halves(request_id, &begin.request_hi, &begin.request_lo);
     dist_u64_to_halves(token_hash, &begin.token_hash_hi, &begin.token_hash_lo);
@@ -5109,7 +5122,7 @@ int ds4_dist_session_save_payload(
     }
     const uint32_t token_count = (uint32_t)tokens->len;
     const uint64_t token_hash = dist_token_hash_prefix(tokens->v, token_count);
-    const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(d->state.engine);
+    const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(d->coord->state.engine);
     float *logits = malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         if (errlen) snprintf(err, errlen, "out of memory saving distributed logits");
@@ -5123,8 +5136,8 @@ int ds4_dist_session_save_payload(
 
     const uint32_t shard_count = dist_kv_route_shard_count(d);
     ds4_dist_kv_shard_file *shards = calloc(shard_count, sizeof(shards[0]));
-    uint32_t *n_comp = calloc(d->state.n_layers, sizeof(n_comp[0]));
-    uint32_t *n_index_comp = calloc(d->state.n_layers, sizeof(n_index_comp[0]));
+    uint32_t *n_comp = calloc(d->coord->state.n_layers, sizeof(n_comp[0]));
+    uint32_t *n_index_comp = calloc(d->coord->state.n_layers, sizeof(n_index_comp[0]));
     if (!shards || !n_comp || !n_index_comp) {
         free(logits);
         free(shards);
@@ -5163,7 +5176,7 @@ int ds4_dist_session_save_payload(
             if (errlen) snprintf(err, errlen, "distributed KV shard is empty");
             goto cleanup;
         }
-        if (dist_kv_parse_layer_payload(d->state.engine,
+        if (dist_kv_parse_layer_payload(d->coord->state.engine,
                                         shards[shard].fp,
                                         shards[shard].bytes,
                                         layer_start,
@@ -5178,7 +5191,7 @@ int ds4_dist_session_save_payload(
             goto cleanup;
     }
     if (!layout_set || layout.token_count != token_count ||
-        layout.n_layers != d->state.n_layers ||
+        layout.n_layers != d->coord->state.n_layers ||
         layout.vocab != vocab) {
         if (errlen) snprintf(err, errlen, "distributed KV shard metadata mismatch");
         goto cleanup;
@@ -5260,11 +5273,11 @@ int ds4_dist_session_load_payload(
         .vocab = h[11],
         .raw_live = h[12],
     };
-    if (layout.n_layers != d->state.n_layers ||
+    if (layout.n_layers != d->coord->state.n_layers ||
         layout.ctx > (uint32_t)ds4_session_ctx(owner) ||
         layout.token_count >= (uint32_t)ds4_session_ctx(owner) ||
-        layout.vocab != (uint32_t)ds4_engine_vocab_size(d->state.engine) ||
-        !dist_kv_raw_live_valid(d->state.engine, &layout)) {
+        layout.vocab != (uint32_t)ds4_engine_vocab_size(d->coord->state.engine) ||
+        !dist_kv_raw_live_valid(d->coord->state.engine, &layout)) {
         if (errlen) snprintf(err, errlen, "DS4 KV payload does not match current distributed runtime");
         return 1;
     }
@@ -5292,7 +5305,7 @@ int ds4_dist_session_load_payload(
             return 1;
         }
         if (tok > (uint32_t)INT_MAX ||
-            tok >= (uint32_t)ds4_engine_vocab_size(d->state.engine)) {
+            tok >= (uint32_t)ds4_engine_vocab_size(d->coord->state.engine)) {
             free(tokens);
             free(logits);
             free(n_comp);
@@ -5399,17 +5412,15 @@ cleanup:
  * selects these calls when the owning session has a coordinator attached.
  */
 
-int ds4_dist_session_create(
-        ds4_dist_session **out,
+int ds4_dist_coordinator_open(
+        ds4_dist_coordinator **out,
         ds4_engine *engine,
         const ds4_dist_options *opt,
-        ds4_session *owner,
         int ctx_size,
         char *err,
         size_t errlen) {
-    (void)owner;
     if (!out || !engine || !opt) {
-        if (errlen) snprintf(err, errlen, "missing distributed session parameters");
+        if (errlen) snprintf(err, errlen, "missing distributed coordinator parameters");
         return 1;
     }
     *out = NULL;
@@ -5422,81 +5433,112 @@ int ds4_dist_session_create(
     int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
     if (listen_fd < 0) return 1;
 
-    ds4_dist_session *d = calloc(1, sizeof(*d));
-    if (!d) {
+    ds4_dist_coordinator *c = calloc(1, sizeof(*c));
+    if (!c) {
         close(listen_fd);
-        if (errlen) snprintf(err, errlen, "out of memory creating distributed session");
+        if (errlen) snprintf(err, errlen, "out of memory creating distributed coordinator");
         return 1;
     }
 
-    d->listen_fd = listen_fd;
-    d->state.engine = engine;
-    d->state.model_id = (uint32_t)ds4_engine_model_id(engine);
-    d->state.n_layers = (uint32_t)ds4_engine_layer_count(engine);
-    d->state.local_start = opt->layers.start;
-    d->state.local_end = dist_resolved_layer_end(opt, d->state.n_layers);
-    d->state.ctx_size = ctx_size > 0 ? (uint32_t)ctx_size : 0u;
-    d->state.local_has_output = opt->layers.has_output;
-    d->state.local_can_output_head = ds4_engine_has_output_head(engine);
-    d->state.replay_check = opt->replay_check;
-    d->state.debug = opt->debug;
-    d->state.use_control_for_work = true;
-    d->state.prefill_chunk = opt->prefill_chunk;
-    d->state.prefill_window = opt->prefill_window;
-    d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
-    pthread_mutex_init(&d->state.mu, NULL);
+    c->listen_fd = listen_fd;
+    c->state.engine = engine;
+    c->state.model_id = (uint32_t)ds4_engine_model_id(engine);
+    c->state.n_layers = (uint32_t)ds4_engine_layer_count(engine);
+    c->state.local_start = opt->layers.start;
+    c->state.local_end = dist_resolved_layer_end(opt, c->state.n_layers);
+    c->state.ctx_size = ctx_size > 0 ? (uint32_t)ctx_size : 0u;
+    c->state.local_has_output = opt->layers.has_output;
+    c->state.local_can_output_head = ds4_engine_has_output_head(engine);
+    c->state.replay_check = opt->replay_check;
+    c->state.debug = opt->debug;
+    c->state.use_control_for_work = true;
+    c->state.prefill_chunk = opt->prefill_chunk;
+    c->state.prefill_window = opt->prefill_window;
+    c->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
+    pthread_mutex_init(&c->state.mu, NULL);
+
+    char local_end[32];
+    if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
+    else snprintf(local_end, sizeof(local_end), "%u", opt->layers.end);
+    DIST_COORD_DEBUG(&c->state,
+                     "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
+                     opt->listen_host,
+                     opt->listen_port,
+                     c->state.model_id,
+                     c->state.n_layers,
+                     opt->layers.start,
+                     local_end,
+                     c->state.activation_bits);
+
+    c->accept_ctx.state = &c->state;
+    c->accept_ctx.listen_fd = listen_fd;
+    if (pthread_create(&c->accept_tid, NULL, dist_coordinator_accept_main, &c->accept_ctx) != 0) {
+        close(listen_fd);
+        pthread_mutex_destroy(&c->state.mu);
+        free(c);
+        if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
+        return 1;
+    }
+    pthread_detach(c->accept_tid);
+    c->accept_started = true;
+    *out = c;
+    return 0;
+}
+
+void ds4_dist_coordinator_close(ds4_dist_coordinator *c) {
+    if (!c) return;
+    if (c->listen_fd >= 0) {
+        shutdown(c->listen_fd, SHUT_RDWR);
+        close(c->listen_fd);
+        c->listen_fd = -1;
+    }
+    pthread_mutex_lock(&c->state.mu);
+    c->state.shutting_down = true;
+    for (ds4_dist_worker_entry *it = c->state.workers; it; it = it->next) {
+        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&c->state.mu);
+    /* The accept loop and the per-worker client threads are detached and keep
+     * using this registry and its mutex while they unwind.  Keep the object
+     * itself process-lifetime rather than racing them at shutdown; there is now
+     * exactly one per process instead of one per resident session.
+     */
+}
+
+int ds4_dist_session_create(
+        ds4_dist_session **out,
+        ds4_dist_coordinator *coord,
+        char *err,
+        size_t errlen) {
+    if (!out || !coord) {
+        if (errlen) snprintf(err, errlen, "missing distributed session parameters");
+        return 1;
+    }
+    *out = NULL;
+
+    ds4_dist_session *d = calloc(1, sizeof(*d));
+    if (!d) {
+        if (errlen) snprintf(err, errlen, "out of memory creating distributed session");
+        return 1;
+    }
+    d->coord = coord;
     d->session_id = dist_make_session_id(d);
     d->request_id = 1;
     /* KV snapshots use separate data connections and can run while pipelined
      * WORK results are outstanding.  Keep them out of the WORK request-id stream
      * so progress callbacks cannot perturb the reader's contiguous expectations. */
     d->snapshot_request_id = UINT64_C(1) << 63;
-
-    char local_end[32];
-    if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
-    else snprintf(local_end, sizeof(local_end), "%u", opt->layers.end);
-    DIST_COORD_DEBUG(&d->state,
-                     "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
-                     opt->listen_host,
-                     opt->listen_port,
-                     d->state.model_id,
-                     d->state.n_layers,
-                     opt->layers.start,
-                     local_end,
-                     d->state.activation_bits);
-
-    d->accept_ctx.state = &d->state;
-    d->accept_ctx.listen_fd = listen_fd;
-    if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main, &d->accept_ctx) != 0) {
-        close(listen_fd);
-        pthread_mutex_destroy(&d->state.mu);
-        free(d);
-        if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
-        return 1;
-    }
-    pthread_detach(d->accept_tid);
-    d->accept_started = true;
     *out = d;
     return 0;
 }
 
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
-    if (d->listen_fd >= 0) {
-        shutdown(d->listen_fd, SHUT_RDWR);
-        close(d->listen_fd);
-        d->listen_fd = -1;
-    }
+    /* Closes this session's dup() of the first hop.  The registry's descriptor
+     * belongs to the accepting client thread and is untouched here.
+     */
     dist_route_plan_free(&d->plan);
-    pthread_mutex_lock(&d->state.mu);
-    d->state.shutting_down = true;
-    for (ds4_dist_worker_entry *it = d->state.workers; it; it = it->next) {
-        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
-    }
-    pthread_mutex_unlock(&d->state.mu);
-    /* Client threads are detached and remove their registry entries after the
-     * socket closes. Keep this small coordinator object process-lifetime to
-     * avoid racing those threads during application shutdown. */
+    free(d);
 }
 
 int ds4_dist_session_route_ready(ds4_dist_session *d, char *err, size_t errlen) {
@@ -5506,7 +5548,7 @@ int ds4_dist_session_route_ready(ds4_dist_session *d, char *err, size_t errlen) 
     }
 
     ds4_dist_route_plan probe = {0};
-    if (!dist_coordinator_build_route_plan(&d->state, &probe, NULL, err, errlen)) {
+    if (!dist_coordinator_build_route_plan(&d->coord->state, &probe, NULL, err, errlen)) {
         return 0;
     }
     dist_route_plan_free(&probe);
@@ -5536,13 +5578,13 @@ int ds4_dist_session_sync(
         if (checkpoint->len == prompt->len) return 0;
 
         uint32_t chunk_cap = 0;
-        if (dist_coordinator_prefill_chunk_cap(&d->state, owner, &chunk_cap, err, errlen) != 0) {
+        if (dist_coordinator_prefill_chunk_cap(&d->coord->state, owner, &chunk_cap, err, errlen) != 0) {
             return 1;
         }
         const uint32_t pos0 = (uint32_t)checkpoint->len;
         const uint32_t suffix = (uint32_t)prompt->len - pos0;
-        if (dist_coordinator_can_pipeline_prefill(&d->state, &d->plan, owner, suffix, chunk_cap)) {
-            int prefill_rc = dist_coordinator_prefill_prompt_pipelined(&d->state,
+        if (dist_coordinator_can_pipeline_prefill(&d->coord->state, &d->plan, owner, suffix, chunk_cap)) {
+            int prefill_rc = dist_coordinator_prefill_prompt_pipelined(&d->coord->state,
                                                                        owner,
                                                                        &d->plan,
                                                                        prompt,
@@ -5556,7 +5598,7 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
-                if (dist_coordinator_rebuild_from_transcript(&d->state,
+                if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                              owner,
                                                              &d->plan,
                                                              prompt,
@@ -5580,7 +5622,7 @@ int ds4_dist_session_sync(
         while (pos < (uint32_t)prompt->len) {
             const uint32_t remaining = (uint32_t)prompt->len - pos;
             const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
-            int eval_rc = dist_coordinator_eval_span(&d->state,
+            int eval_rc = dist_coordinator_eval_span(&d->coord->state,
                                                      owner,
                                                      &d->plan,
                                                      prompt->v + pos,
@@ -5593,7 +5635,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
-                if (dist_coordinator_rebuild_from_transcript(&d->state,
+                if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                              owner,
                                                              &d->plan,
                                                              prompt,
@@ -5617,7 +5659,7 @@ int ds4_dist_session_sync(
         return 0;
     }
 
-    int prefill_rc = dist_coordinator_prefill_prompt(&d->state,
+    int prefill_rc = dist_coordinator_prefill_prompt(&d->coord->state,
                                                      owner,
                                                      &d->plan,
                                                      prompt,
@@ -5627,7 +5669,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
-        if (dist_coordinator_rebuild_from_transcript(&d->state,
+        if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                      owner,
                                                      &d->plan,
                                                      prompt,
@@ -5661,7 +5703,7 @@ int ds4_dist_session_eval(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
-    int rc = dist_coordinator_eval_span(&d->state,
+    int rc = dist_coordinator_eval_span(&d->coord->state,
                                         owner,
                                         &d->plan,
                                         &token,
@@ -5677,7 +5719,7 @@ int ds4_dist_session_eval(
         ds4_tokens transcript = {0};
         ds4_tokens_copy(&transcript, checkpoint);
         ds4_tokens_push(&transcript, token);
-        if (dist_coordinator_rebuild_from_transcript(&d->state,
+        if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                      owner,
                                                      &d->plan,
                                                      &transcript,
