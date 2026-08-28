@@ -12972,7 +12972,7 @@ static int parse_nonneg_int_arg(const char *s, const char *opt) {
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
-    if (!s[0] || *end || v < minv || v > maxv) {
+    if (!s[0] || *end || !isfinite(v) || v < minv || v > maxv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
