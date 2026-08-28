@@ -12979,6 +12979,13 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 }
 
 #define DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK 2048u
+/* Validated ROCm TP+NHI prefill chunk bound.  The big-gate exchange enqueues
+ * one NHI slot per token per gate, so the default 4096-row cap for long
+ * prompts overruns the TP request queue/NHI ring and wedges the exchange
+ * (leader reports "RX stamp timeout" at layer 0 gate 0 while the worker's
+ * RX ring fills; see PR #861 discussion).  When the user did not pick a
+ * chunk, bound ROCm TP to the tested 256-row default instead. */
+#define DS4_ROCM_TP_DEFAULT_PREFILL_CHUNK 512u
 
 static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
                                             uint32_t requested_chunk) {
@@ -30053,6 +30060,19 @@ static ds4_gpu_tensor *metal_graph_tensor_row_range_view(
                                  (uint64_t)rows * row_values * sizeof(float));
 }
 
+static bool metal_graph_tp_row_split_attention_shape_supported(
+        bool full_raw, bool static_mixed, bool indexed) {
+#ifdef DS4_ROCM_BUILD
+    /* ROCm implements the raw and static-mixed row-range attention kernels;
+     * the indexed TP path reuses the batch indexed attention entry point
+     * with row-range views (no dedicated range kernel needed).  All three
+     * shapes can split attention across TP ranks. */
+    return full_raw || static_mixed || indexed;
+#else
+    return full_raw || static_mixed || indexed;
+#endif
+}
+
 /* TP prefill threshold for row-splitting the replicated shared expert.
  * Routed experts remain ownership-split at every batch size. */
 static uint32_t metal_graph_tp_prefill_split_min(void) {
@@ -30129,8 +30149,10 @@ static bool metal_graph_encode_layer_attention_batch(
         tp_attn_n_comp > DS4_N_INDEXER_TOP_K;
     const bool tp_row_split_attn =
         g->tp_world == 2 &&
+        metal_graph_tp_row_split_attention_shape_supported(tp_attn_full_raw,
+                                                           tp_attn_static_mixed,
+                                                           tp_attn_indexed) &&
         g->tp_batch_rows != n_tokens &&
-        (tp_attn_full_raw || tp_attn_static_mixed || tp_attn_indexed) &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         !visual_attention &&
         n_tokens >= metal_graph_tp_prefill_split_min();
@@ -30343,7 +30365,7 @@ static bool metal_graph_encode_layer_attention_batch(
      * tensors (batch_q_half is F16, so its view is built directly). */
     ds4_gpu_tensor *tp_q = tp_row_split_attn ?
         metal_graph_tensor_row_range_view(metal_graph_batch_q(g), tp_row0, tp_rows, q_dim) : NULL;
-    ds4_gpu_tensor *tp_q_half = tp_row_split_attn ?
+    ds4_gpu_tensor *tp_q_half = tp_row_split_attn && g->batch_q_half ?
         ds4_gpu_tensor_view(g->batch_q_half,
                             (uint64_t)tp_row0 * q_dim * sizeof(uint16_t),
                             (uint64_t)tp_rows * q_dim * sizeof(uint16_t)) : NULL;
@@ -30355,11 +30377,25 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_tensor_row_range_view(metal_graph_batch_attn_out(g), tp_row0, tp_rows,
                                           DS4_N_EMBD) : NULL;
     if (tp_row_split_attn &&
-        (!tp_q || !tp_q_half || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
+        (!tp_q || !tp_qr_norm || !tp_heads || !tp_attn_out ||
+         (g->batch_q_half && !tp_q_half))) {
+        fprintf(stderr,
+                "ds4: TP prefill attention row view failed (layer=%u pos=%u tokens=%u row0=%u rows=%u q=%d q_half=%d qr_norm=%d heads=%d attn_out=%d)\n",
+                il,
+                pos0,
+                n_tokens,
+                tp_row0,
+                tp_rows,
+                tp_q != NULL,
+                tp_q_half != NULL,
+                tp_qr_norm != NULL,
+                tp_heads != NULL,
+                tp_attn_out != NULL);
         ok = false;
     }
     bool q_b_f16_out = false;
-    if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0) {
+    if (ok && !q_path_debug && layer->attn_q_b->type == DS4_TENSOR_Q8_0 &&
+        (tp_q_half || g->batch_q_half)) {
         q_b_f16_out = ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
                                                                      tp_q_half ? tp_q_half : g->batch_q_half,
                                                                      model->map,
@@ -30528,6 +30564,7 @@ static bool metal_graph_encode_layer_attention_batch(
      * sized to hold the current chunk plus the previous SWA window, while the
      * attention mask still enforces the 128-token logical window.
      */
+    const bool raw_store_attempted = ok;
     if (ok && zero_prefix) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                                     metal_graph_batch_kv(g),
                                                                     g->raw_cap,
@@ -30535,7 +30572,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_tokens,
                                                                     DS4_N_HEAD_DIM) != 0;
     if (!ok) {
-        fprintf(stderr, "ds4: gpu layer %u raw KV batch store failed\n", il);
+        fprintf(stderr,
+                "ds4: gpu layer %u raw KV batch store failed (pos0=%u tokens=%u raw_cap=%u attempted=%d kv_bytes=%llu raw_bytes=%llu)\n",
+                il,
+                pos0,
+                n_tokens,
+                g->raw_cap,
+                raw_store_attempted ? 1 : 0,
+                (unsigned long long)ds4_gpu_tensor_bytes(metal_graph_batch_kv(g)),
+                g->layer_raw_cache[il] ?
+                    (unsigned long long)ds4_gpu_tensor_bytes(g->layer_raw_cache[il]) : 0);
     }
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
@@ -32472,6 +32518,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                 (uint32_t)((uint64_t)tp_rows * DS4_N_EMBD)) != 0;
         ds4_gpu_tensor_free(own_rows);
     }
+    DS4_METAL_PROFILE_FFN_STAGE("ffn_shared_fold");
 
     if (ok && tp_split_ffn && !tp_split_batch_moe) {
         /* All rows contain this rank's routed-expert partial.  Exchange that
@@ -32502,6 +32549,7 @@ static bool metal_graph_encode_layer_ffn_batch(
             fprintf(stderr, "ds4: TP prefill FFN all-reduce failed (layer %u)\n", il);
         }
     }
+    DS4_METAL_PROFILE_FFN_STAGE("ffn_allreduce");
 
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_batch_ffn_out(g) &&
@@ -39419,6 +39467,7 @@ struct ds4_engine {
     bool dspark_strict;
     bool dspark_exact_sampling;
     bool cuda_tensor_parallel;
+    bool tp_requested;
     bool glm_tp_token_prefill;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -62632,6 +62681,7 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+#ifndef DS4_ROCM_BUILD
 /* TP sharding: touch the dense weights and only this rank's contiguous range
  * of every routed-expert blob, so the other range is never faulted in.
  * Replaces the whole-file residency request; the pages
@@ -62715,6 +62765,7 @@ static void model_warm_weights_sharded(const ds4_model *m,
         fprintf(stderr, "ds4: command queue warm failed (continuing)\n");
 #endif
 }
+#endif
 
 /* =========================================================================
  * Wave-2 multi-GPU placement scaffolding: engine placement helpers.
@@ -63978,6 +64029,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->dspark_strict = opt->dspark_strict;
     e->dspark_exact_sampling = opt->dspark_exact_sampling;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
+    e->tp_requested = opt->tp.role != DS4_TP_NONE;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
@@ -64011,6 +64063,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->prefill_chunk =
         ds4_effective_prefill_chunk(opt->cuda_tensor_parallel,
                                     opt->prefill_chunk);
+#ifdef DS4_ROCM_BUILD
+    if (opt->prefill_chunk == 0 && opt->tp.role != DS4_TP_NONE &&
+        !e->ssd_streaming &&
+        (e->prefill_chunk == 0 ||
+         e->prefill_chunk > DS4_ROCM_TP_DEFAULT_PREFILL_CHUNK)) {
+        if (e->prefill_chunk == 0) {
+            fprintf(stderr,
+                    "ds4: ROCm tensor parallelism defaults to "
+                    "--prefill-chunk %u (validated NHI bound; set "
+                    "--prefill-chunk explicitly to override)\n",
+                    (unsigned)DS4_ROCM_TP_DEFAULT_PREFILL_CHUNK);
+        }
+        e->prefill_chunk = DS4_ROCM_TP_DEFAULT_PREFILL_CHUNK;
+    }
+#endif
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
@@ -64559,10 +64626,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
 #endif
     }
+#ifdef __APPLE__
     /* With a raised wired limit the sharded span views (~97 GiB) fit the
-     * GPU budget, so let the residency set pin them — that is what makes
-     * the shard actually resident.  Without the sysctl, fall back to lazy
-     * faulting (slow but functional). */
+     * GPU budget, so let the Metal residency set pin them.  Linux/ROCm copies
+     * the selected spans into device allocations and has no iogpu sysctl. */
     if (graph_backend && tp_shard && glm_graph_wired_limit_bytes() == 0) {
         fprintf(stderr,
                 "ds4: iogpu.wired_limit_mb is 0 -- TP expert shard will page "
@@ -64570,6 +64637,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 "for full residency\n");
         ds4_gpu_model_residency_skip(1);
     }
+#endif
     if (graph_backend) {
         if (e->multi_tier) {
             /* Wave-2 multi-tier branch.
@@ -64936,8 +65004,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         if (tp_shard) {
+#ifdef DS4_ROCM_BUILD
+            /* ds4_gpu_set_model_map_spans() just copied the exact ROCm shard
+             * and discarded its source pages.  Touching the mmap again here
+             * repopulates the same ~77 GiB in the host page cache on UMA,
+             * doubling the startup working set and starving later graph
+             * allocations.  Metal is view-backed and still needs the warm. */
+#else
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
+#endif
         }
         const bool support_model_runtime_ready =
             e->mtp_ready ||
@@ -65869,6 +65945,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: ROCm/NHI gate service init failed");
         goto fail;
     }
+    if (rocm_nhi)
+        ds4_gpu_tp_nhi_set_ring_msgs(ds4_tp_nhi_msgs(e->tp.nhi));
     if (rocm_nhi && !ds4_tp_nhi_ready_barrier(tp, err, errlen))
         goto fail;
 #endif
@@ -66071,6 +66149,11 @@ static int ds4_session_tp_register(ds4_session *s) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    if (e->tp_requested && !e->tp.active) {
+        fprintf(stderr,
+                "ds4: tensor parallelism was configured but not bound before session creation\n");
+        return 1;
+    }
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
@@ -70250,10 +70333,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
-    if (e->tp.active && ds4_tp_is_nhi(e->tp.ctx)) {
-        /* Stage-3 NHI bring-up keeps prefill on the proven one-row gate
-         * path.  Large batch/big gates remain disabled until they have
-         * their own transport acceptance run. */
+    const char *nhi_token_prefill_env = getenv("DS4_TP_NHI_TOKEN_PREFILL");
+    const bool nhi_token_prefill =
+        nhi_token_prefill_env && nhi_token_prefill_env[0] &&
+        strcmp(nhi_token_prefill_env, "0") != 0;
+    if (e->tp.active && ds4_tp_is_nhi(e->tp.ctx) && nhi_token_prefill) {
+        /* Diagnostic fallback: force the proven one-row gate path.  Normal
+         * NHI operation uses the chunked batch prefill below; its big gates
+         * are split across the imported ring by ds4_gpu_tp_big_gate_encode(). */
         ok = true;
         for (int i = 0; ok && i < prompt->len; i++) {
             if (ds4_session_cancelled(s)) {

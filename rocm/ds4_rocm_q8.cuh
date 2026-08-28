@@ -910,6 +910,8 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
         for (uint32_t u = 0; u < TOK_TILE; ++u) {
             out[(uint64_t)u * out_dim + row] = acc[u];
         }
+    }
+}
 
 /* Tiny-batch direct variant for speculative verify rows (2..8 tokens).
  * The shared-x tile kernel above pays two block-wide barriers per 16-block
@@ -955,7 +957,6 @@ __global__ static void matmul_q8_0_f32_batch_direct_warp_rows_w32_kernel(
         if (lane == 0u) out[(uint64_t)u * out_dim + row] = s;
     }
 }
-
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;

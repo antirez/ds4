@@ -20,6 +20,23 @@ static int v3_fail(int error, char *err, size_t errlen, const char *message) {
     return -1;
 }
 
+int ds4_dist_v3_work_caps_validate(
+        uint32_t work_flags,
+        uint32_t selected_caps,
+        char *err,
+        size_t errlen) {
+    if (err && errlen != 0) err[0] = '\0';
+    if ((work_flags & DS4_DIST_WORK_F_SPEC_MASK) != 0 &&
+        (selected_caps & DS4_DIST_V3_CAP_SPEC_DECODE_V1) == 0)
+        return v3_fail(EPROTO, err, errlen,
+                       "speculative WORK requires negotiated speculation capability");
+    if ((work_flags & DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED) != 0 &&
+        (selected_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) == 0)
+        return v3_fail(EPROTO, err, errlen,
+                       "exact speculative WORK requires negotiated exact capability");
+    return 0;
+}
+
 int ds4_dist_v3_result_payload_validate(
         uint32_t status,
         uint32_t result_kind,

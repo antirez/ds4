@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -52,6 +54,23 @@
 #define DS4_TP_MAX_TIMEOUT_SEC 86400u
 #define DS4_TP_COMMAND_MAX_TOKENS 1048576u
 #define DS4_TP_COMMAND_MAX_BATCH_ITEMS 4096u
+
+/* Frontend signal handlers set this so peer waits and the worker's blocking
+ * control read do not outlive a service stop.  It is process-global because
+ * TP bring-up happens before either frontend owns a session object. */
+static volatile sig_atomic_t g_tp_stop_requested;
+
+void ds4_tp_request_stop(void) {
+    g_tp_stop_requested = 1;
+}
+
+bool ds4_tp_stop_requested(void) {
+    return g_tp_stop_requested != 0;
+}
+
+void ds4_tp_clear_stop_request(void) {
+    g_tp_stop_requested = 0;
+}
 
 typedef struct {
     uint32_t magic;
@@ -270,7 +289,37 @@ static int tp_read_full(int fd, void *buf, size_t len) {
     return 1;
 }
 
-static void tp_socket_tune(int fd, uint64_t timeout_sec) {
+static int tp_read_full_stoppable(int fd, void *buf, size_t len) {
+    char *p = buf;
+    while (len) {
+        if (ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            return 0;
+        }
+        ssize_t r = read(fd, p, len);
+        if (r < 0) {
+            if (errno == EINTR && !ds4_tp_stop_requested()) continue;
+            if (errno == EINTR) errno = ECANCELED;
+            return 0;
+        }
+        if (r == 0) return 0;
+        p += r;
+        len -= (size_t)r;
+    }
+    return 1;
+}
+
+static int tp_read_frame_header_stoppable(int fd, uint32_t *type,
+                                          uint32_t *bytes) {
+    ds4_tp_frame_header h;
+    if (!tp_read_full_stoppable(fd, &h, sizeof(h))) return 0;
+    if (h.magic != DS4_TP_MAGIC) return 0;
+    *type = h.type;
+    *bytes = h.bytes;
+    return 1;
+}
+
+static int tp_socket_tune(int fd, uint64_t timeout_sec) {
     int one = 1;
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -285,8 +334,12 @@ static void tp_socket_tune(int fd, uint64_t timeout_sec) {
         .tv_sec = (time_t)timeout_sec,
         .tv_usec = 0,
     };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) != 0)
+        return 0;
+    return 1;
 }
 
 static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
@@ -342,13 +395,88 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
     return fd;
 }
 
+static int tp_poll_deadline(int fd, short events, double deadline) {
+    for (;;) {
+        if (ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            return 0;
+        }
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0.0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        double ms_double = remaining * 1000.0;
+        if (ms_double > (double)INT_MAX) ms_double = (double)INT_MAX;
+        int timeout_ms = (int)ms_double;
+        if (timeout_ms < 1) timeout_ms = 1;
+        struct pollfd pfd = { .fd = fd, .events = events, .revents = 0 };
+        const int rc = poll(&pfd, 1, timeout_ms);
+        if (rc > 0) return 1;
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        if (errno == EINTR && ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            return 0;
+        }
+        if (errno != EINTR) return 0;
+    }
+}
+
+static int tp_accept_deadline(int listener, double timeout_sec,
+                              char *err, size_t errlen) {
+    const double deadline = tp_now_sec() + timeout_sec;
+    for (;;) {
+        if (!tp_poll_deadline(listener, POLLIN, deadline)) {
+            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            return -1;
+        }
+        const int fd = accept(listener, NULL, NULL);
+        if (fd >= 0) return fd;
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            return -1;
+        }
+    }
+}
+
+static int tp_connect_one_deadline(int fd, const struct sockaddr *addr,
+                                   socklen_t addrlen, double deadline) {
+    const int old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0 || fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) != 0)
+        return 0;
+    if (connect(fd, addr, addrlen) == 0) {
+        if (fcntl(fd, F_SETFL, old_flags) != 0) return 0;
+        return 1;
+    }
+    if (errno != EINPROGRESS && errno != EWOULDBLOCK) return 0;
+    if (!tp_poll_deadline(fd, POLLOUT, deadline)) return 0;
+    int socket_error = 0;
+    socklen_t socket_error_len = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                   &socket_error, &socket_error_len) != 0)
+        return 0;
+    if (socket_error != 0) {
+        errno = socket_error;
+        return 0;
+    }
+    if (fcntl(fd, F_SETFL, old_flags) != 0) return 0;
+    return 1;
+}
+
 static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    double deadline = tp_now_sec() + timeout_sec;
+    const double deadline = tp_now_sec() + timeout_sec;
     int last_errno = 0;
     uint32_t attempts = 0;
     do {
+        if (ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            break;
+        }
         struct addrinfo hints = {0}, *res = NULL;
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -357,12 +485,17 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
             for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
                 int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
                 if (fd < 0) continue;
-                if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+                double attempt_deadline = tp_now_sec() + 5.0;
+                if (attempt_deadline > deadline) attempt_deadline = deadline;
+                if (tp_connect_one_deadline(fd, ai->ai_addr,
+                                            ai->ai_addrlen,
+                                            attempt_deadline)) {
                     freeaddrinfo(res);
                     return fd;
                 }
                 last_errno = errno;
                 close(fd);
+                if (tp_now_sec() >= deadline) break;
             }
             freeaddrinfo(res);
         }
@@ -373,7 +506,7 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
                     gai != 0 ? gai_strerror(gai) :
                     last_errno ? strerror(last_errno) : "no address worked");
         }
-        usleep(200 * 1000);
+        if (tp_now_sec() < deadline) usleep(200 * 1000);
     } while (tp_now_sec() < deadline);
     tp_set_err(err, errlen, "tp connect %s:%d: %s", host, port,
                last_errno ? strerror(last_errno) : "unreachable");
@@ -1913,17 +2046,19 @@ int ds4_tp_create(
         if (listener < 0) goto fail;
         fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
                 opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
-            goto fail;
-        }
+        tp->control_fd = tp_accept_deadline(
+            listener, (double)tp->timeout_sec, err, errlen);
+        if (tp->control_fd < 0) goto fail;
     } else {
         tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
                                  (double)tp->timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
     }
-    tp_socket_tune(tp->control_fd, tp->timeout_sec);
+    if (!tp_socket_tune(tp->control_fd, tp->timeout_sec)) {
+        tp_set_err(err, errlen, "tp control socket timeout setup: %s",
+                   strerror(errno));
+        goto fail;
+    }
 
     if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
 
@@ -1937,7 +2072,8 @@ int ds4_tp_create(
          * interleave with gate payloads.  Created under RDMA too for
          * headers, verify-block gates, and transport fallback. */
         if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
+            tp->data_fd = tp_accept_deadline(
+                listener, (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) {
                 tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
                 goto fail;
@@ -1947,7 +2083,11 @@ int ds4_tp_create(
                                   (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) goto fail;
         }
-        tp_socket_tune(tp->data_fd, tp->timeout_sec);
+        if (!tp_socket_tune(tp->data_fd, tp->timeout_sec)) {
+            tp_set_err(err, errlen, "tp data socket timeout setup: %s",
+                       strerror(errno));
+            goto fail;
+        }
         if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
             tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
             goto fail;
@@ -2700,8 +2840,10 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
-        tp_set_err(err, errlen, "tp: control channel closed");
+    if (!tp_read_frame_header_stoppable(tp->control_fd, &ftype, &bytes)) {
+        tp_set_err(err, errlen, "tp: %s",
+                   ds4_tp_stop_requested() ? "shutdown requested" :
+                       "control channel closed");
         return 0;
     }
     if (!tp_command_frame_size_allowed(tp, ftype, bytes)) {
@@ -2715,9 +2857,11 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     uint8_t *payload = NULL;
     if (bytes != 0) {
         payload = malloc(bytes);
-        if (!payload || !tp_read_full(tp->control_fd, payload, bytes)) {
+        if (!payload || !tp_read_full_stoppable(tp->control_fd, payload, bytes)) {
             free(payload);
-            tp_set_err(err, errlen, "tp: truncated command frame");
+            tp_set_err(err, errlen, "tp: %s",
+                       ds4_tp_stop_requested() ? "shutdown requested" :
+                           "truncated command frame");
             return 0;
         }
     }
@@ -2981,6 +3125,11 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
 
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, sizeof(err))) {
+        if (ds4_tp_stop_requested()) {
+            ds4_log(stderr, DS4_LOG_DEFAULT,
+                    "tp worker: shutdown requested before leader connect");
+            return 0;
+        }
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: %s", err);
         return 1;
     }
@@ -3007,6 +3156,12 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     while (1) {
         ds4_tp_command command;
         if (!ds4_tp_recv_command(tp, &command, err, sizeof(err))) {
+            if (ds4_tp_stop_requested()) {
+                ds4_log(stderr, DS4_LOG_DEFAULT,
+                        "tp worker: shutdown requested");
+                normal_stop = true;
+                break;
+            }
             ds4_log(stderr, DS4_LOG_ERROR, "tp worker: %s", err);
             rc = 1;
             break;

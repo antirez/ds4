@@ -56,3 +56,10 @@ __pycache__/
 .DS_Store
 tests/test_transport
 tests/test_dist_v3
+.idea/
+DeepSeek-V4-Flash-mxfp4-0731.gguf
+tests/test_distributed_transport
+tests/test_gpu_timing_stubs
+tests/test_nhi_live
+tests/test_rocm_timing_fake
+.pi/

@@ -54,6 +54,7 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 static void stop_signal_handler(int sig) {
     (void)sig;
+    ds4_tp_request_stop();
     if (g_stop_requested) _exit(130);
     g_stop_requested = 1;
     if (g_listen_fd >= 0) {
@@ -14158,6 +14159,7 @@ static void server_close_resources(server *s) {
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
     }
+    if (s->tp_leader) ds4_tp_send_stop(s->tp_leader);
     free(s->slot_threads);
     free(s->slots);
     pthread_mutex_destroy(&s->tool_mu);
@@ -14452,11 +14454,6 @@ static server_config parse_options(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
         exit(2);
     }
-    if (c.engine.tp.role == DS4_TP_WORKER) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --role worker is a serving mode; start tensor-parallel workers with ./ds4");
-        exit(2);
-    }
     return c;
 }
 
@@ -14529,15 +14526,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options gen = {
-            .ctx_size = cfg.ctx_size,
-        };
-        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);
         return rc;
     }
-
     ds4_tp *tp_leader = NULL;
     if (cfg.engine.tp.role == DS4_TP_LEADER) {
         char tp_err[256] = "";
@@ -14555,15 +14548,31 @@ int main(int argc, char **argv) {
                                     &tp_id.gate_slot_step,
                                     &tp_id.gates_per_token,
                                     tp_id.gate_slot_mask);
-        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
-                           tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader,
-                                tp_err, sizeof(tp_err))) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        if (!ds4_tp_create(&tp_leader,
+                           &cfg.engine.tp,
+                           &tp_id,
+                           tp_err,
+                           sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine,
+                                tp_leader,
+                                tp_err,
+                                sizeof(tp_err))) {
+            const bool stopping = ds4_tp_stop_requested();
+            server_log(stopping ? DS4_LOG_DEFAULT : DS4_LOG_ERROR,
+                       "ds4-server: %s",
+                       stopping ? "tensor-parallel shutdown requested" : tp_err);
             ds4_tp_free(tp_leader);
             ds4_engine_close(engine);
-            return 1;
+            return stopping ? 0 : 1;
         }
+    }
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
     }
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;

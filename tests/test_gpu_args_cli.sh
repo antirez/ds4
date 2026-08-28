@@ -71,7 +71,7 @@ for i in "${!BINS[@]}"; do
         assert_grep "$name --help runtime mentions --dspark-confidence" \
             "--dspark-confidence" "$LOG"
     fi
-    if [ "$name" = "ds4" ]; then
+    if [ "$name" = "ds4" ] || [ "$name" = "ds4-server" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
         assert_grep "$name --help distributed mentions --tensor-parallel-token-prefill" \
             "tensor-parallel-token-prefill" "$LOG"
@@ -417,6 +417,34 @@ if [ -x ./ds4-agent ]; then
         fail "ds4-agent accepted two initial prompt sources"
     fi
     rm -f "$PROMPT_FILE"
+fi
+
+# The server must own the same TP parser and lifecycle as the CLI. These
+# probes stop before model loading or at the intentionally invalid model, so
+# they need no accelerator or peer.
+if [ -x ./ds4-server ]; then
+    ./ds4-server --tensor-parallel --role worker -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -q "requires --coordinator HOST PORT" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-server tensor-parallel worker requires coordinator address"
+    else
+        fail "ds4-server rejected tensor-parallel worker in option parsing"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+
+    ./ds4-server --metal --tensor-parallel --role coordinator \
+        --listen 127.0.0.1 9911 --transport tcp -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -qE "model file is too small|another ds4 process is already running" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-server tensor-parallel leader reaches model loading"
+    else
+        fail "ds4-server tensor-parallel leader did not reach model loading"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
 fi
 
 # 7: --gpu-vram 40,12 layout line.

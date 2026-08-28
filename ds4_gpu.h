@@ -456,6 +456,10 @@ int ds4_gpu_tp_nhi_init(uint32_t rank,
                         ds4_gpu_tp_nhi_seq_fn consumed_fn,
                         ds4_gpu_tp_nhi_fail_fn fail_fn,
                         void *ud);
+/* Set the transport ring capacity in messages; bounds the big-gate
+ * pipelining window so a ring slot is never refilled before its prior
+ * message was consumed.  Call after ds4_gpu_tp_nhi_init. */
+void ds4_gpu_tp_nhi_set_ring_msgs(uint32_t msgs);
 void ds4_gpu_tp_shutdown(void);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector

@@ -7,6 +7,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "ds4.c").read_text(encoding="utf-8")
 DIST_SOURCE = (ROOT / "ds4_distributed.c").read_text(encoding="utf-8")
+DIST_V3_HEADER = (ROOT / "ds4_dist_v3.h").read_text(encoding="utf-8")
 TP_SOURCE = (ROOT / "ds4_tp.c").read_text(encoding="utf-8")
 TP_NHI_SOURCE = (ROOT / "ds4_tp_nhi.c").read_text(encoding="utf-8")
 Q8_TEST_SOURCE = (ROOT / "tests" / "test_q8_krow_rocm.c").read_text(
@@ -73,6 +74,12 @@ class DistributedSafetyContractsStaticTest(unittest.TestCase):
         self.assertLess(bounds, allocation)
         self.assertIn("result.telemetry_count > state->n_layers + 1u", fn)
 
+    def test_success_result_sender_uses_protocol_payload_width(self) -> None:
+        fn = c_function_from(DIST_SOURCE, "dist_send_work_result_prepared")
+        self.assertIn("else if (status == 0)", fn)
+        self.assertIn("payload_bits = 32u", fn)
+        self.assertIn("zero is reserved for remote", fn)
+
     def test_tp_frame_bounds_precede_command_allocation(self) -> None:
         fn = c_function_from(TP_SOURCE, "ds4_tp_recv_command")
         header = fn.index("tp_read_frame_header")
@@ -82,6 +89,16 @@ class DistributedSafetyContractsStaticTest(unittest.TestCase):
         self.assertLess(bounds, allocation)
         self.assertIn("shutdown(tp->control_fd, SHUT_RDWR)", fn)
         self.assertNotIn("atoi(tmo)", TP_SOURCE)
+
+    def test_tp_socket_lifecycle_uses_bounded_waits(self) -> None:
+        accept_fn = c_function_from(TP_SOURCE, "tp_accept_deadline")
+        connect_fn = c_function_from(TP_SOURCE, "tp_connect_one_deadline")
+        create_fn = c_function_from(TP_SOURCE, "ds4_tp_create")
+        self.assertIn("tp_poll_deadline(listener, POLLIN, deadline)", accept_fn)
+        self.assertIn("O_NONBLOCK", connect_fn)
+        self.assertIn("tp_poll_deadline(fd, POLLOUT, deadline)", connect_fn)
+        self.assertEqual(create_fn.count("tp_accept_deadline("), 2)
+        self.assertEqual(create_fn.count("tp_socket_tune("), 2)
 
     def test_gpu_cleanup_precedes_model_unmap(self) -> None:
         definition = SOURCE[SOURCE.index("void ds4_engine_close(") :]
@@ -93,14 +110,44 @@ class DistributedSafetyContractsStaticTest(unittest.TestCase):
         self.assertLess(cleanup, target_close)
 
     def test_exact_verify_is_explicitly_required_on_worker(self) -> None:
+        self.assertIn(
+            "#define DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED", DIST_V3_HEADER
+        )
         self.assertGreaterEqual(
-            DIST_SOURCE.count("DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED"), 5
+            DIST_SOURCE.count("DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED"), 4
         )
         worker = c_function_from(DIST_SOURCE, "dist_worker_process_work_message")
         coordinator = c_function_from(DIST_SOURCE, "dist_coordinator_eval_span")
         self.assertIn("worker exact speculative verify gate is unavailable", worker)
         self.assertIn("spec_exact_required &&", worker)
         self.assertIn("coordinator exact speculative verify gate is unavailable", coordinator)
+
+    def test_worker_enforces_negotiated_speculative_capabilities(self) -> None:
+        worker = c_function_from(DIST_SOURCE, "dist_worker_process_work_message")
+        flags = worker.index("work.flags & ~DS4_DIST_WORK_F_VALID_MASK")
+        caps = worker.index("ds4_dist_v3_work_caps_validate", flags)
+        semantics = worker.index("const bool spec_verify", caps)
+        self.assertLess(flags, caps)
+        self.assertLess(caps, semantics)
+        self.assertIn("upstream->selected_caps", worker[caps:semantics])
+        self.assertIn("DS4_DIST_WORK_F_SPEC_MASK", DIST_V3_HEADER)
+
+    def test_prefill_tracks_one_exact_result_kind_per_request(self) -> None:
+        pipeline = c_function_from(
+            DIST_SOURCE, "dist_coordinator_prefill_prompt_pipelined"
+        )
+        reader = c_function_from(DIST_SOURCE, "dist_prefill_result_reader_main")
+        self.assertIn("reader.expected_kinds = calloc", pipeline)
+        self.assertIn("intermediate_ack_only", pipeline)
+        self.assertIn(
+            "slot->ack_only = reader.expected_kinds[submitted_chunks] ==",
+            pipeline,
+        )
+        self.assertIn("expected_kind = reader->expected_kinds[i]", reader)
+        self.assertIn("DS4_DIST_RESULT_KIND_BIT(expected_kind)", reader)
+        self.assertIn("expected_kind == DS4_DIST_RESULT_ACK", reader)
+        self.assertIn("expected_kind == DS4_DIST_RESULT_LOGITS", reader)
+        self.assertIn("expected_kind == DS4_DIST_RESULT_HIDDEN_STATE", reader)
 
     def test_partial_tp_pool_failure_closes_both_export_fds(self) -> None:
         open_fn = c_function_from(TP_NHI_SOURCE, "ds4_tp_nhi_open")
