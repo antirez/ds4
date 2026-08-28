@@ -66340,6 +66340,20 @@ static bool metal_graph_eval_mixed_prefill_decode(
 }
 #endif
 
+/* A distributed coordinator maps only its own --layers slice, but the batch
+ * encoders below build a full local decode graph per session and would walk
+ * layers this process never loaded.  Those sessions take the serialized
+ * fallback instead, which routes each token over the wire.
+ * ds4_sessions_eval_batch_metal_supported() refuses them for the same reason;
+ * the CUDA path, which ROCm also uses, needs the same exclusion. */
+static bool ds4_decode_batch_has_distributed(const ds4_decode_item *items,
+                                             int count) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].session && items[i].session->distributed) return true;
+    }
+    return false;
+}
+
 static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -66391,6 +66405,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * while preserving the exact one-token kernels and per-session KV order. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_decode_batch_has_distributed(items, count) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
@@ -66528,6 +66543,8 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         native_requested &&
         e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(prefill_session) &&
+        !prefill_session->distributed &&
+        !ds4_decode_batch_has_distributed(items, count) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prefill_prompt, start, prefill_rows,
