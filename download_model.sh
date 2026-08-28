@@ -207,9 +207,9 @@ case "$MODEL" in
         MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    glm-53-flash-antirez-fp4)
+    glm-53-flash-antirez-fp8)
         REPO=$GLM_53_FLASH_ANTIREZ_REPO
-        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_FP4_FILE
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_FP8_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)
