@@ -8384,6 +8384,17 @@ int ds4_dist_prepare_engine_options(
             engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
             engine->load_output = opt->layers.has_output;
         }
+        /* A worker creates one session per coordinator session, on demand, and
+         * runs every eval on a single thread behind its state mutex.  That is
+         * the same serialization the server relies on when it aliases this
+         * workspace across resident sessions, so the worker can alias it too.
+         * Without this each worker session allocates its own prefill workspace
+         * and a coordinator with several sessions OOMs the worker, which has no
+         * say in how many sessions it is asked to hold.
+         */
+        if (opt->role == DS4_DISTRIBUTED_WORKER) {
+            engine->share_session_prefill_workspace = true;
+        }
     }
     return 0;
 }
