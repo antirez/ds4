@@ -463,6 +463,18 @@ test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 endif
 
+tests/attention_multi_smoke.o: tests/attention_multi_smoke.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/attention_multi_smoke.c
+
+tests/attention_multi_smoke: tests/attention_multi_smoke.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/rope_multi_bench.o: tests/rope_multi_bench.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/rope_multi_bench.c
+
+tests/rope_multi_bench: tests/rope_multi_bench.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)

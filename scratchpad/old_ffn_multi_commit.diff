@@ -1,0 +1,287 @@
+commit e4e415dc646b22feb377a88fa849b088c4e65142
+Author: iCreil <catalano.mirko@gmail.com>
+Date:   Tue Jul 7 20:51:56 2026 +0200
+
+    Graph: run batched-decode routed experts per sequence
+    
+    metal_graph_encode_layer_ffn_decode_multi replaces the prefill FFN batch
+    in the batched-decode driver.  The dense stages (HC pre/norm, router,
+    shared expert, HC post) stay batched with n_tokens = n_seqs, where the
+    same weights serve every sequence.  The routed experts now run one
+    sequence at a time through the single-token decode MoE kernel
+    (ds4_gpu_routed_moe_one_tensor) on batch-scratch row views: at batch 2-4
+    the selected experts of different sequences are almost always distinct,
+    so the generic batch expert path reads them all without sharing, costing
+    more than n_seqs single-token passes.  Token streams stay identical to
+    single decode (batched_decode_smoke MATCH).
+
+diff --git a/ds4.c b/ds4.c
+index ba5b781..5dbf252 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -19822,12 +19822,248 @@ static bool metal_graph_encode_layer_attention_decode_multi(
+     return ok;
+ }
+ 
++/* Batched-decode FFN layer.  The dense stages — HC pre/norm, router, shared
++ * expert, HC post — run once on the batch scratch with n_tokens = n_seqs,
++ * which is where batching pays (the same weights serve every sequence).  The
++ * routed experts run per sequence through the single-token decode MoE kernel:
++ * at batch 2-4 the selected experts of different sequences are almost always
++ * distinct, so there is nothing to share, and the generic batch expert path
++ * costs far more than n_seqs single-token passes.  ffn_out materialization
++ * (steering/debug) is not supported here; the driver gates steering off. */
++static bool metal_graph_encode_layer_ffn_decode_multi(
++        ds4_gpu_graph  *g,
++        uint32_t                n_seqs,
++        const ds4_model        *model,
++        const ds4_layer_weights *layer,
++        uint32_t                il,
++        uint32_t                pos0) {
++    if (n_seqs == 0 || n_seqs > DS4_GPU_DECODE_MULTI_MAX || n_seqs > g->prefill_cap) return false;
++
++    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
++    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
++    const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
++    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
++    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
++    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
++    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
++    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
++    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
++    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
++    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
++
++    ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
++            g->scr->batch_hc_mix, 0, (uint64_t)n_seqs * mix_hc * sizeof(float));
++    ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
++            g->scr->batch_hc_split, 0, (uint64_t)n_seqs * mix_hc * sizeof(float));
++    ds4_gpu_tensor *ffn_cur_view = ds4_gpu_tensor_view(
++            g->scr->batch_ffn_cur, 0, (uint64_t)n_seqs * DS4_N_EMBD * sizeof(float));
++    ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
++            g->scr->batch_next_hc, 0, (uint64_t)n_seqs * hc_dim * sizeof(float));
++    bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
++    const bool fuse_hc_norm = DS4_N_HC == 4 &&
++                              !metal_graph_use_reference_hc_decode() &&
++                              metal_graph_enable_batch_hc_norm_fusion();
++
++    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->scr->batch_flat_hc,
++                                                      g->scr->batch_after_attn_hc,
++                                                      (uint32_t)hc_dim,
++                                                      n_seqs,
++                                                      DS4_RMS_EPS) != 0;
++    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
++                                             model->map,
++                                             model->size,
++                                             layer->hc_ffn_fn->abs_offset,
++                                             hc_dim,
++                                             mix_hc,
++                                             g->scr->batch_flat_hc,
++                                             n_seqs) != 0;
++    if (metal_graph_use_reference_hc_decode()) {
++        if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
++                                                        hc_mix_view,
++                                                        model->map,
++                                                        model->size,
++                                                        layer->hc_ffn_scale->abs_offset,
++                                                        layer->hc_ffn_base->abs_offset,
++                                                        DS4_N_HC,
++                                                        DS4_N_HC_SINKHORN_ITER,
++                                                        DS4_HC_EPS) != 0;
++        if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(ffn_cur_view,
++                                                            g->scr->batch_after_attn_hc,
++                                                            hc_split_view,
++                                                            DS4_N_EMBD,
++                                                            DS4_N_HC) != 0;
++    } else if (fuse_hc_norm) {
++        if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(ffn_cur_view,
++                                                                 g->scr->batch_ffn_norm,
++                                                                 hc_split_view,
++                                                                 hc_mix_view,
++                                                                 g->scr->batch_after_attn_hc,
++                                                                 model->map,
++                                                                 model->size,
++                                                                 layer->hc_ffn_scale->abs_offset,
++                                                                 layer->hc_ffn_base->abs_offset,
++                                                                 layer->ffn_norm->abs_offset,
++                                                                 DS4_N_EMBD,
++                                                                 DS4_N_HC,
++                                                                 DS4_N_HC_SINKHORN_ITER,
++                                                                 DS4_HC_EPS,
++                                                                 DS4_RMS_EPS) != 0;
++    } else {
++        if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(ffn_cur_view,
++                                                            hc_split_view,
++                                                            hc_mix_view,
++                                                            g->scr->batch_after_attn_hc,
++                                                            model->map,
++                                                            model->size,
++                                                            layer->hc_ffn_scale->abs_offset,
++                                                            layer->hc_ffn_base->abs_offset,
++                                                            DS4_N_EMBD,
++                                                            DS4_N_HC,
++                                                            DS4_N_HC_SINKHORN_ITER,
++                                                            DS4_HC_EPS) != 0;
++    }
++    if (ok && !fuse_hc_norm) {
++        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->scr->batch_ffn_norm,
++                                                  g->scr->batch_ffn_cur,
++                                                  model->map,
++                                                  model->size,
++                                                  layer->ffn_norm->abs_offset,
++                                                  DS4_N_EMBD,
++                                                  n_seqs,
++                                                  DS4_RMS_EPS) != 0;
++    }
++
++    if (ok) ok = ds4_gpu_matmul_f16_tensor(g->scr->batch_router_logits,
++                                             model->map,
++                                             model->size,
++                                             layer->ffn_gate_inp->abs_offset,
++                                             DS4_N_EMBD,
++                                             DS4_N_EXPERT,
++                                             g->scr->batch_ffn_norm,
++                                             n_seqs) != 0;
++    if (ok) ok = ds4_gpu_router_select_batch_tensor(g->scr->batch_router_selected,
++                                                      g->scr->batch_router_weights,
++                                                      g->scr->batch_router_probs,
++                                                      model->map,
++                                                      model->size,
++                                                      layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
++                                                      layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
++                                                      layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
++                                                      0,
++                                                      0,
++                                                      layer->ffn_exp_probs_b != NULL,
++                                                      layer->ffn_gate_tid2eid != NULL,
++                                                      g->scr->batch_router_logits,
++                                                      g->scr->prefill_tokens,
++                                                      DS4_N_EXPERT,
++                                                      DS4_N_EXPERT_USED,
++                                                      DS4_EXPERT_WEIGHT_SCALE,
++                                                      n_seqs) != 0;
++
++    /* Shared expert, batched (same weights for every sequence). */
++    bool shared_down_f16 = false;
++    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate", il, pos0,
++                                                      g->scr->batch_shared_gate,
++                                                      model, layer->ffn_gate_shexp,
++                                                      DS4_N_EMBD, shared_dim,
++                                                      g->scr->batch_ffn_norm, n_seqs);
++    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_up", il, pos0,
++                                                      g->scr->batch_shared_up,
++                                                      model, layer->ffn_up_shexp,
++                                                      DS4_N_EMBD, shared_dim,
++                                                      g->scr->batch_ffn_norm, n_seqs);
++    if (ok) ok = ds4_gpu_swiglu_tensor(g->scr->batch_shared_mid,
++                                         g->scr->batch_shared_gate,
++                                         g->scr->batch_shared_up,
++                                         (uint32_t)((uint64_t)n_seqs * shared_dim),
++                                         DS4_SWIGLU_CLAMP_EXP,
++                                         1.0f) != 0;
++    if (ok) {
++        shared_down_f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(g->scr->batch_q_half,
++                                                             model->map,
++                                                             model->size,
++                                                             layer->ffn_down_shexp->abs_offset,
++                                                             shared_dim,
++                                                             DS4_N_EMBD,
++                                                             g->scr->batch_shared_mid,
++                                                             n_seqs) != 0;
++    }
++    if (ok && !shared_down_f16) {
++        ok = metal_graph_matmul_q8_0_named_tensor("shared_down", il, pos0,
++                                                  g->scr->batch_shared_out,
++                                                  model, layer->ffn_down_shexp,
++                                                  shared_dim, DS4_N_EMBD,
++                                                  g->scr->batch_shared_mid, n_seqs);
++    }
++
++    /* Routed experts, one sequence at a time through the decode kernel. */
++    for (uint32_t b = 0; ok && b < n_seqs; b++) {
++        ds4_gpu_tensor *routed_out_row = metal_graph_tensor_row_view(
++                g->scr->batch_routed_out, b, DS4_N_EMBD);
++        ds4_gpu_tensor *ffn_norm_row = metal_graph_tensor_row_view(
++                g->scr->batch_ffn_norm, b, DS4_N_EMBD);
++        ds4_gpu_tensor *selected_row = metal_graph_tensor_row_view(
++                g->scr->batch_router_selected, b, DS4_N_EXPERT_USED);
++        ds4_gpu_tensor *weights_row = metal_graph_tensor_row_view(
++                g->scr->batch_router_weights, b, DS4_N_EXPERT_USED);
++        ok = routed_out_row && ffn_norm_row && selected_row && weights_row &&
++             ds4_gpu_routed_moe_one_tensor(routed_out_row,
++                                             g->scr->routed_gate,
++                                             g->scr->routed_up,
++                                             g->scr->routed_mid,
++                                             g->scr->routed_down,
++                                             model->map, model->size,
++                                             layer->ffn_gate_exps->abs_offset,
++                                             layer->ffn_up_exps->abs_offset,
++                                             layer->ffn_down_exps->abs_offset,
++                                             layer->ffn_gate_exps->type,
++                                             layer->ffn_down_exps->type,
++                                             gate_expert_bytes, gate_row_bytes,
++                                             down_expert_bytes, down_row_bytes,
++                                             (uint32_t)expert_in_dim,
++                                             (uint32_t)down_in_dim,
++                                             (uint32_t)routed_out_dim,
++                                             selected_row, weights_row,
++                                             DS4_N_EXPERT,
++                                             DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
++                                             ffn_norm_row,
++                                             il) != 0;
++        ds4_gpu_tensor_free(weights_row);
++        ds4_gpu_tensor_free(selected_row);
++        ds4_gpu_tensor_free(ffn_norm_row);
++        ds4_gpu_tensor_free(routed_out_row);
++    }
++
++    if (ok && shared_down_f16) {
++        ok = ds4_gpu_hc_expand_add_split_half_add_tensor(next_hc_view,
++                                                         g->scr->batch_routed_out,
++                                                         g->scr->batch_q_half,
++                                                         g->scr->batch_after_attn_hc,
++                                                         hc_split_view,
++                                                         DS4_N_EMBD,
++                                                         DS4_N_HC) != 0;
++    } else if (ok) {
++        ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
++                                                  g->scr->batch_routed_out,
++                                                  g->scr->batch_shared_out,
++                                                  g->scr->batch_after_attn_hc,
++                                                  hc_split_view,
++                                                  DS4_N_EMBD,
++                                                  DS4_N_HC) != 0;
++    }
++    ds4_gpu_tensor_free(next_hc_view);
++    ds4_gpu_tensor_free(ffn_cur_view);
++    ds4_gpu_tensor_free(hc_split_view);
++    ds4_gpu_tensor_free(hc_mix_view);
++    return ok;
++}
++
+ /* Encode one decode token for each of n_seqs sequences in a single pass over
+- * the layers: attention via the batched-decode layer above, FFN and output
+- * head via the existing batch functions (graphs[0] carries the shared engine
+- * scratch; the FFN stages use no per-graph state).  The per-sequence caches
+- * and counters advance exactly as n_seqs independent single-token evals
+- * would.  Logits for sequence b land in scr->spec_logits row b. */
++ * the layers: attention and FFN via the batched-decode layer halves above,
++ * output head via the existing batch function (graphs[0] carries the shared
++ * engine scratch; the FFN stages use no per-graph state).  The per-sequence
++ * caches and counters advance exactly as n_seqs independent single-token
++ * evals would.  Logits for sequence b land in scr->spec_logits row b. */
+ static bool metal_graph_encode_decode_multi(
+         ds4_gpu_graph  *const *graphs,
+         uint32_t                n_seqs,
+@@ -19874,8 +20110,9 @@ static bool metal_graph_encode_decode_multi(
+             fprintf(stderr, "ds4: gpu layer %u batched decode attention failed\n", il);
+         }
+         if (ok) {
+-            ok = metal_graph_encode_layer_ffn_batch(g, model, &weights->layer[il],
+-                                                    il, pos[0], n_seqs);
++            ok = metal_graph_encode_layer_ffn_decode_multi(g, n_seqs, model,
++                                                           &weights->layer[il],
++                                                           il, pos[0]);
+             if (!ok) {
+                 fprintf(stderr, "ds4: gpu layer %u batched decode ffn failed\n", il);
+             }

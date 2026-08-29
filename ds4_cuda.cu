@@ -6198,6 +6198,51 @@ static int cuda_q8_mma_try_launch(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 mma launch") ? 1 : -1;
 }
 
+/* Narrow-batch q8_0 matmul for 2-4 tokens (batched decode).
+ *
+ * The batch kernel above puts n_tok on the grid Y axis, so every token
+ * re-reads the same weight row from VRAM independently: at n_tok=2 the
+ * weights stream through memory twice for no reason.  In decode the weights
+ * are the whole cost, so that doubles the time.  This kernel keeps the grid
+ * one-dimensional (one warp per output row) and, for each 32-weight block it
+ * reads once, dots it against all n_tok activation blocks — the weight bytes
+ * cross memory once and are reused from L1 for the remaining tokens.  Output
+ * layout matches the batch kernel: out[tok * out_dim + row]. */
+#define DS4_CUDA_NARROW_MAX 4u
+__global__ static void matmul_q8_0_preq_narrow_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_tok,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc[DS4_CUDA_NARROW_MAX];
+#pragma unroll
+    for (uint32_t t = 0; t < DS4_CUDA_NARROW_MAX; t++) acc[t] = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const float wscale = __half2float(*(const __half *)(wr + b * 34));
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
+            const float xs = xscale[(uint64_t)t * blocks + b];
+            const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc[t] += wscale * xs * (float)dot;
+        }
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float a = warp_sum_f32(acc[t]);
+        if (lane == 0) out[(uint64_t)t * out_dim + row] = a;
+    }
+}
 
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
@@ -6842,6 +6887,153 @@ __global__ static void rope_tail_decode_rows_kernel(
     const float x1 = tail[i + 1u];
     tail[i] = x0 * c - x1 * s;
     tail[i + 1u] = x0 * s + x1 * c;
+}
+
+/* Batched-decode limits and per-sequence KV view.  ds4_cuda.cu does not
+ * include ds4_gpu.h, so these mirror the definitions there and must stay in
+ * sync (DS4_GPU_DECODE_MULTI_MAX, ds4_gpu_attn_seqview). */
+#ifndef DS4_GPU_DECODE_MULTI_MAX
+#define DS4_GPU_DECODE_MULTI_MAX 4u
+#endif
+
+typedef struct {
+    const ds4_gpu_tensor *raw_kv;
+    const ds4_gpu_tensor *comp_kv;     /* NULL when the layer keeps no compressed cache */
+    const ds4_gpu_tensor *comp_mask;   /* per-sequence mask row (n_comp floats), NULL = none */
+    uint32_t                n_raw;
+    uint32_t                raw_cap;
+    uint32_t                raw_start;
+    uint32_t                n_comp;
+} ds4_gpu_attn_seqview;
+
+/* pos-vector twins of the two RoPE kernels above, for batched decode where
+ * each token belongs to a different sequence at an arbitrary position.  The
+ * per-element arithmetic is kept identical so token t matches a single-token
+ * launch with pos0 = pos.v[t] bitwise. */
+typedef struct {
+    uint32_t v[DS4_GPU_DECODE_MULTI_MAX];
+} cuda_rope_pos;
+
+__global__ static void head_rms_norm_rope_tail_multi_kernel(
+        float *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        cuda_rope_pos pos,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_tok * n_head) return;
+    uint32_t t = row / n_head;
+    float *xr = x + (uint64_t)row * head_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const uint32_t n_nope = head_dim - n_rot;
+    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
+        xr[i] *= scale;
+    }
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
+        uint32_t i = pair * 2u;
+        float theta_extrap = (float)pos.v[t] * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        float c = cosf(theta) * mscale;
+        float s = sinf(theta) * mscale;
+        if (inverse) s = -s;
+        float *tail = xr + n_nope;
+        float x0 = tail[i] * scale;
+        float x1 = tail[i + 1] * scale;
+        tail[i] = x0 * c - x1 * s;
+        tail[i + 1] = x0 * s + x1 * c;
+    }
+}
+
+__global__ static void rope_tail_multi_kernel(
+        float *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        cuda_rope_pos pos,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t pairs = n_tok * n_head * (n_rot / 2);
+    if (gid >= pairs) return;
+    uint32_t pair = gid % (n_rot / 2);
+    uint32_t tmp = gid / (n_rot / 2);
+    uint32_t h = tmp % n_head;
+    uint32_t t = tmp / n_head;
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t i = pair * 2;
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+
+    float theta_extrap = (float)pos.v[t] * powf(freq_base, -((float)i) / (float)n_rot);
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+
+    float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+    float x0 = tail[i];
+    float x1 = tail[i + 1];
+    tail[i] = x0 * c - x1 * s;
+    tail[i + 1] = x0 * s + x1 * c;
 }
 
 __device__ static float dsv4_e4m3fn_value_dev(int i) {
@@ -11283,6 +11475,123 @@ static int ds4_cuda_attn_tokentile_arch_ok(void) {
     return prop.major >= 8;
 }
 
+/* Multi-sequence decode attention.  One block column per sequence: sequence b
+ * evaluates its single query token against its own raw + compressed caches
+ * with everything visible, exactly like the n_tokens==1 launch of
+ * attention_decode_mixed_kernel, but each sequence reads from its own
+ * cache pointers.  Kept as a standalone kernel so the single-session hot
+ * path stays untouched. */
+typedef struct {
+    const float *raw_kv;
+    const float *comp_kv;
+    const float *comp_mask;   /* per-sequence mask row, NULL = none */
+    uint32_t n_raw;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+    uint32_t n_comp;
+} cuda_attn_seqview;
+
+typedef struct {
+    cuda_attn_seqview v[DS4_GPU_DECODE_MULTI_MAX];
+} cuda_attn_seqviews;
+
+__global__ static void attention_decode_multi_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        cuda_attn_seqviews views,
+        uint32_t n_seqs,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= n_seqs || h >= n_head) return;
+    const cuda_attn_seqview view = views.v[t];
+    const uint32_t raw_count = view.n_raw > 256u ? 256u : view.n_raw;
+    const uint32_t visible_comp = view.n_comp;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    const float scale = rsqrtf((float)head_dim);
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (view.raw_start + r) % view.raw_cap;
+    }
+    __syncthreads();
+    const uint32_t n_score = raw_count + visible_comp;
+    float local_max = sinks[h];
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        const float *kvrow = view.raw_kv + (uint64_t)raw_rows[r] * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+        scores[r] = dot * scale;
+        local_max = fmaxf(local_max, scores[r]);
+    }
+    for (uint32_t cidx = threadIdx.x; cidx < visible_comp; cidx += blockDim.x) {
+        float add = view.comp_mask ? view.comp_mask[cidx] : 0.0f;
+        float s = -INFINITY;
+        if (add > -1.0e20f) {
+            const float *kvrow = view.comp_kv + (uint64_t)cidx * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            s = dot * scale + add;
+        }
+        scores[raw_count + cidx] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        scores[i] = expf(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    if (head_dim == 512u && blockDim.x == 256u) {
+        const uint32_t d0 = threadIdx.x;
+        const uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const float s = scores[r];
+            const float *kv = view.raw_kv + (uint64_t)raw_rows[r] * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        for (uint32_t cidx = 0; cidx < visible_comp; cidx++) {
+            const float s = scores[raw_count + cidx];
+            const float *kv = view.comp_kv + (uint64_t)cidx * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        oh[d0] = acc0 / denom;
+        oh[d1] = acc1 / denom;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) acc += view.raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
+            for (uint32_t cidx = 0; cidx < visible_comp; cidx++) acc += view.comp_kv[(uint64_t)cidx * head_dim + d] * scores[raw_count + cidx];
+            oh[d] = acc / denom;
+        }
+    }
+}
+
 __global__ static void __launch_bounds__(256, 4)
 attention_decode_mixed_heads8_online_kernel(
         float *heads,
@@ -14491,6 +14800,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "q8_0");
     if (!wptr) return 0;
+    /* 2-4 tokens (batched decode) go through the narrow kernel, which reads
+     * each weight row once and reuses it across tokens.  It beats both cuBLAS
+     * (GEMM setup dwarfs the work at tiny n_tok) and the batch warp kernel
+     * (which re-reads weights per token), so it takes priority here.  Like the
+     * n_tok==1 warp8 kernel it loops blocks with a lane stride, so it handles
+     * any in_dim (no blocks<=32 restriction). */
+    const bool narrow = n_tok >= 2 && n_tok <= DS4_CUDA_NARROW_MAX &&
+                        getenv("DS4_CUDA_NO_Q8_NARROW") == NULL;
     /* mmq fused-dequant-matmul prefill tier (ported from the Entrpi/ds4
      * fork).  Layout-compatible drop-in for the cuBLAS+dequant pipeline
      * below: mmq's [out_dim, n_tok] column-major output flattens to
@@ -14498,8 +14815,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * and the Q8_0 weight is already in mmq's expected row-major block
      * layout (the GGUF on-disk format).  K must be a multiple of 256;
      * every Q8_0 weight in V4 Flash satisfies this, odd shapes fall
-     * through to the legacy paths. */
-    if (n_tok > 1 && (in_dim % 256u) == 0 && cuda_use_mmq()) {
+     * through to the legacy paths.  Narrow-batch decode (2-4 tokens)
+     * keeps priority over mmq: n_tok that small is a co-decoded session
+     * batch, not a prefill tile. */
+    if (!narrow && n_tok > 1 && (in_dim % 256u) == 0 && cuda_use_mmq()) {
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
                                     (cudaStream_t)0);
@@ -14508,7 +14827,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 rc, label ? label : "", (unsigned long long)in_dim,
                 (unsigned long long)out_dim, (unsigned long long)n_tok);
     }
-    if (g_cublas_ready && n_tok > 1) {
+    if (!narrow && g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, physical_device, label);
         if (w_f32) {
             const float alpha = 1.0f;
@@ -14676,6 +14995,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const bool force_decode_warp =
         n_tok == 2u && g_glm_mtp_verify_mode;
+    if (narrow && !force_decode_warp) {
+        matmul_q8_0_preq_narrow_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                (uint32_t)n_tok,
+                blocks,
+                use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 narrow launch");
+    }
     if (n_tok > 1u && !force_decode_warp) {
         /* T matches the reduction width of whichever reference kernel would
          * have run: warp tree (32) for blocks <= 32, exact-thread tree
@@ -16339,6 +16671,27 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
             ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope tail decode rows launch");
 }
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_multi_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, const uint32_t *pos, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
+    if (!x || !pos || n_tok == 0 || n_tok > DS4_GPU_DECODE_MULTI_MAX ||
+        n_rot > head_dim || (n_rot & 1u) ||
+        x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    cuda_rope_pos p;
+    memset(&p, 0, sizeof(p));
+    for (uint32_t t = 0; t < n_tok; t++) p.v[t] = pos[t];
+    head_rms_norm_rope_tail_multi_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, p, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail_multi launch");
+}
+extern "C" int ds4_gpu_rope_tail_multi_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, const uint32_t *pos, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    if (!x || !pos || n_tok == 0 || n_tok > DS4_GPU_DECODE_MULTI_MAX ||
+        n_rot > head_dim || (n_rot & 1u) ||
+        x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    cuda_rope_pos p;
+    memset(&p, 0, sizeof(p));
+    for (uint32_t t = 0; t < n_tok; t++) p.v[t] = pos[t];
+    uint32_t pairs = n_tok * n_head * (n_rot / 2);
+    rope_tail_multi_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, p, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "rope_tail_multi launch");
+}
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
@@ -17336,6 +17689,68 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(),
                    "attention decode rows inverse rope launch");
+}
+
+extern "C" int ds4_gpu_attention_decode_multi_supported(uint32_t n_comp, uint32_t comp_kv_f16) {
+    return comp_kv_f16 == 0 && cuda_attention_score_buffer_fits(n_comp) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_attention_decode_heads_multi_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_attn_seqview *seqs,
+        uint32_t                n_seqs,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (comp_kv_f16 || !heads || !q || !seqs || !model_map ||
+        n_seqs == 0 || n_seqs > DS4_GPU_DECODE_MULTI_MAX ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_seqs * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_seqs * n_head * head_dim * sizeof(float)) {
+        return 0;
+    }
+    cuda_attn_seqviews views;
+    memset(&views, 0, sizeof(views));
+    for (uint32_t b = 0; b < n_seqs; b++) {
+        const ds4_gpu_attn_seqview *sv = &seqs[b];
+        if (!sv->raw_kv || sv->n_raw == 0 || sv->raw_cap < sv->n_raw ||
+            sv->raw_start >= sv->raw_cap ||
+            (sv->n_comp != 0 && !sv->comp_kv) ||
+            sv->raw_kv->bytes < (uint64_t)sv->raw_cap * head_dim * sizeof(float) ||
+            (sv->n_comp && sv->comp_kv->bytes < (uint64_t)sv->n_comp * head_dim * sizeof(float)) ||
+            (sv->comp_mask && sv->comp_mask->bytes < (uint64_t)sv->n_comp * sizeof(float))) {
+            return 0;
+        }
+        if (!cuda_attention_score_buffer_fits(sv->n_comp)) {
+            /* The large-context online variant is not implemented for the
+             * multi path yet; callers gate batched decode on this. */
+            return 0;
+        }
+        views.v[b].raw_kv = (const float *)sv->raw_kv->ptr;
+        views.v[b].comp_kv = sv->n_comp ? (const float *)sv->comp_kv->ptr : (const float *)sv->raw_kv->ptr;
+        views.v[b].comp_mask = sv->comp_mask ? (const float *)sv->comp_mask->ptr : NULL;
+        views.v[b].n_raw = sv->n_raw;
+        views.v[b].raw_cap = sv->raw_cap;
+        views.v[b].raw_start = sv->raw_start;
+        views.v[b].n_comp = sv->n_comp;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(n_seqs, n_head, 1);
+    attention_decode_multi_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                 sinks,
+                                                 (const float *)q->ptr,
+                                                 views,
+                                                 n_seqs,
+                                                 n_head,
+                                                 head_dim);
+    return cuda_ok(cudaGetLastError(), "attention decode multi launch");
 }
 
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {

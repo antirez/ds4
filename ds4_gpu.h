@@ -1733,6 +1733,42 @@ int ds4_gpu_glm_attention_flash_tensor(
         uint32_t              value_dim,
         bool                  cache_f16);
 
+/* pos-vector variants for batched decode: token t uses pos[t] instead of
+ * pos0 + t.  n_tok is capped at DS4_GPU_DECODE_MULTI_MAX (positions travel
+ * by value in the kernel parameters). */
+int ds4_gpu_head_rms_norm_rope_tail_multi_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const uint32_t   *pos,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps);
+
+int ds4_gpu_rope_tail_multi_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const uint32_t   *pos,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
@@ -1969,6 +2005,40 @@ int ds4_gpu_flash_kv_stage_f16_tensor(
         const ds4_gpu_tensor *comp,
         uint32_t                comp_is_f16,
         uint32_t                n_comp,
+        uint32_t                head_dim);
+
+/* Batched multi-sequence decode attention: one query token per sequence,
+ * each attending to its own KV caches (all rows visible, decode semantics).
+ * Slot b reads q row b and writes heads row b. */
+#define DS4_GPU_DECODE_MULTI_MAX 4u
+
+typedef struct {
+    const ds4_gpu_tensor *raw_kv;
+    const ds4_gpu_tensor *comp_kv;     /* NULL when the layer keeps no compressed cache */
+    const ds4_gpu_tensor *comp_mask;   /* per-sequence mask row (n_comp floats), NULL = none */
+    uint32_t                n_raw;
+    uint32_t                raw_cap;
+    uint32_t                raw_start;
+    uint32_t                n_comp;
+} ds4_gpu_attn_seqview;
+
+/* True when the multi-sequence decode attention kernel can serve a sequence
+ * with n_comp visible compressed rows (score buffer bound, no online variant
+ * yet) and the compressed cache layout it supports. */
+int ds4_gpu_attention_decode_multi_supported(
+        uint32_t                n_comp,
+        uint32_t                comp_kv_f16);
+
+int ds4_gpu_attention_decode_heads_multi_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_attn_seqview *seqs,
+        uint32_t                n_seqs,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_head,
         uint32_t                head_dim);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(

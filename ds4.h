@@ -163,6 +163,10 @@ typedef struct {
     int placement_session_count_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
+    /* Number of resident sessions the batched server will create after the
+     * engine opens; used to keep that much VRAM out of the lazy weight
+     * caches so session creation cannot fail.  0 = single-session server. */
+    int resident_sessions;
     bool first_token_test;
     bool metal_graph_test;
     bool load_slice;
