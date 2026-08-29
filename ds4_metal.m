@@ -2012,7 +2012,12 @@ static int ds4_gpu_zero_prefix_prefill_mask_cache_enabled(void) {
         getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL) {
         return 0;
     }
-    return ds4_gpu_device_name_contains("M3");
+    /* m2ultra-pro: extend the zero-prefix prefill mask cache to M2 Ultra.
+     * The original whitelist covered only M3; the dual-die M2 Ultra shares
+     * the pre-M5 GPU architecture and passes the bit-exact verification
+     * harness with this cache enabled (see speed-bench/m2u_scan/). */
+    return ds4_gpu_device_name_contains("M3") ||
+           ds4_gpu_device_name_contains("M2");
 }
 
 static ds4_gpu_zero_prefix_prefill_mask_cache_entry *
@@ -3412,7 +3417,13 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    /* m2ultra-pro: extend the decode attention RoPE fusion whitelist to
+     * M2 Ultra. The inplace/affine pair kernels are architecture-level, not
+     * M3/M5-specific; M2 Ultra passes the bit-exact A/B harness with them
+     * enabled (see speed-bench/m2u_scan/). */
+    if (!ds4_gpu_device_name_contains("M3") &&
+        !ds4_gpu_device_name_contains("M5") &&
+        !ds4_gpu_device_name_contains("M2")) return 0;
     return 1;
 }
 
