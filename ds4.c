@@ -40158,9 +40158,17 @@ static bool glm_graph_memory_guard_for_compact_cap(
             wired_limit > margin ? wired_limit - margin : wired_limit;
         if (wired_budget > budget) budget = wired_budget;
     }
-    if (ds4_model_is_glm53()) {
+    bool glm53_fixed_ceiling_applied = false;
+    if (ds4_model_is_glm53() &&
+        budget_base <= 160ull * 1024ull * 1024ull * 1024ull) {
+        /* The 110 GiB ceiling protects 128 GiB Q2 and tensor-parallel ranks.
+         * Larger hosts can run resident Q4 safely under the normal host,
+         * reserve, and explicitly raised wired-limit budgets above. */
         const uint64_t glm53_max = 110ull * 1024ull * 1024ull * 1024ull;
-        if (budget > glm53_max) budget = glm53_max;
+        if (budget > glm53_max) {
+            budget = glm53_max;
+            glm53_fixed_ceiling_applied = true;
+        }
     }
 
     if (required <= budget) {
@@ -40231,10 +40239,13 @@ static bool glm_graph_memory_guard_for_compact_cap(
             fraction,
             reserve_gib,
             glm_graph_bytes_to_gib(transient_extra_bytes));
-    if (ds4_model_is_glm53()) {
+    if (glm53_fixed_ceiling_applied) {
         fprintf(stderr,
                 "ds4:   GLM-5.3 has a fixed 110 GiB per-rank ceiling; use a "
                 "smaller --ctx, tensor parallelism, or SSD streaming\n");
+    } else if (ds4_model_is_glm53()) {
+        fprintf(stderr,
+                "ds4:   use a smaller --ctx, tensor parallelism, or SSD streaming\n");
     } else {
         fprintf(stderr,
                 "ds4:   set DS4_GLM_MEMORY_GUARD=0 to bypass, use a smaller --ctx, "

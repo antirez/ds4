@@ -213,9 +213,10 @@ from the official FP8 checkpoint:
 
 The Q2 file uses imatrix-guided IQ2_XXS gate/up experts and Q2_K down experts.
 It runs resident on a 128 GB M3 Max or M5 Max, and on one DGX Spark. The Q4
-file is the higher-quality control. Run it across two 128 GB Macs, or use SSD
-streaming on one Mac. The FP8 file preserves the released text weights without
-requantization; DwarfStar cannot execute that artifact yet.
+file is the higher-quality control. Run it resident on a 256 GB or larger Mac,
+across two 128 GB Macs, or use SSD streaming on a smaller single Mac. The FP8
+file preserves the released text weights without requantization; DwarfStar
+cannot execute that artifact yet.
 
 On one 128 GB Mac:
 

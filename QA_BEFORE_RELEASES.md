@@ -459,6 +459,9 @@ block. A GLM 5.2 pass does not cover these paths.
   begins after token 4096. The model must recover the tail instruction and
   complete a tool or exact-output task. A short coherent continuation at token
   4109 is not sufficient: it previously missed a broken sparse selector.
+- On a 256 GB or larger Mac, start resident Q4 without a memory-guard override.
+  Record the planned model, graph, and total bytes, then run a 30K-token prefill
+  and greedy decode. Memory pressure must remain healthy and swap must not grow.
 - Run physical Q4 50/50 TP over the explicit TB5 RDMA devices. Graduate context
   allocation through 10K, 25K, and 50K, checking both ranks before advancing.
   The original 50K Q4 run reported 102.20 GiB per rank. Correct accounting for
