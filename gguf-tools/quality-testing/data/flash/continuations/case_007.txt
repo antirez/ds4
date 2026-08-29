@@ -1,0 +1,1 @@
+Speculative decoding preserves exact greedy output through a **strict verification and rejection mechanism**, not by trusting the draft model's guesses

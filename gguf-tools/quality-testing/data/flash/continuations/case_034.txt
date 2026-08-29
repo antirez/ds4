@@ -1,0 +1,3 @@
+# Formato Sicuro per Header di Checkpoint Modello
+
+Ecco una descrizione dettagliata di un

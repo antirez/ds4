@@ -1,0 +1,4 @@
+Here are a few ways to complete that comment, depending on the context:
+
+**Generic/Common:**
+```c

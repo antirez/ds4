@@ -1,0 +1,2 @@
+Complete the C statement with the next exact token only:
+return snprintf(buf, sizeof(buf), "%d", value

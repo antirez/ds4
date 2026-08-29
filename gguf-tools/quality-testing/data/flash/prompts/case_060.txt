@@ -1,0 +1,1 @@
+Write a tiny Python function that returns the median of three numbers.

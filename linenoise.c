@@ -565,6 +565,25 @@ static int isUnsupportedTerm(void) {
     return 0;
 }
 
+static void linenoiseMakeRawMode(struct termios *raw) {
+    raw->c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw->c_oflag &= ~(OPOST);
+    raw->c_cflag |= (CS8);
+    raw->c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw->c_cc[VMIN] = 1;
+    raw->c_cc[VTIME] = 0;
+}
+
+static int linenoiseTermiosRawFieldsEqual(const struct termios *a,
+                                          const struct termios *b) {
+    return a->c_iflag == b->c_iflag &&
+           a->c_oflag == b->c_oflag &&
+           a->c_cflag == b->c_cflag &&
+           a->c_lflag == b->c_lflag &&
+           a->c_cc[VMIN] == b->c_cc[VMIN] &&
+           a->c_cc[VTIME] == b->c_cc[VTIME];
+}
+
 /* Raw mode: 1960 magic shit. */
 static int enableRawMode(int fd) {
     struct termios raw;
@@ -584,19 +603,7 @@ static int enableRawMode(int fd) {
     if (tcgetattr(fd,&orig_termios) == -1) goto fatal;
 
     raw = orig_termios;  /* modify the original mode */
-    /* input modes: no break, no CR to NL, no parity check, no strip char,
-     * no start/stop output control. */
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    /* output modes - disable post processing */
-    raw.c_oflag &= ~(OPOST);
-    /* control modes - set 8 bit chars */
-    raw.c_cflag |= (CS8);
-    /* local modes - choing off, canonical off, no extended functions,
-     * no signal chars (^Z,^C) */
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    /* control chars - set return condition: min number of bytes and timer.
-     * We want read to return every single byte, without timeout. */
-    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0; /* 1 byte, no timer */
+    linenoiseMakeRawMode(&raw);
 
     /* put terminal in raw mode after flushing */
     if (tcsetattr(fd,TCSAFLUSH,&raw) < 0) goto fatal;
@@ -622,6 +629,25 @@ static void disableRawMode(int fd) {
         if (write(rawmode_output, "\x1b[?2004l", 8) == -1) {}
         rawmode = 0;
     }
+}
+
+/* Re-enable raw mode if a child process changed the terminal state.  This is
+ * useful when the application spawns external processes that may reset the
+ * terminal to cooked mode.  This is deliberately conservative: while an editor
+ * is active, orig_termios must remain the cooked-mode state used by
+ * disableRawMode(), so never replace it with the current terminal attributes.
+ * TCSANOW avoids discarding bytes the user typed while the child was running. */
+void linenoiseRestoreRawMode(void) {
+    if (getenv("LINENOISE_ASSUME_TTY")) return;
+    if (!rawmode) return;
+    if (!isatty(STDIN_FILENO)) return;
+    struct termios current, raw = orig_termios;
+    linenoiseMakeRawMode(&raw);
+    if (tcgetattr(STDIN_FILENO, &current) == -1) return;
+    if (!linenoiseTermiosRawFieldsEqual(&current, &raw))
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    /* Re-enable bracketed paste mode in case the child disabled it. */
+    if (write(rawmode_output, "\x1b[?2004h", 8) == -1) {}
 }
 
 /* Use the ESC [6n escape sequence to query the horizontal cursor position

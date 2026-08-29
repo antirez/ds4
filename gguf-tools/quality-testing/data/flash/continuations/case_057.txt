@@ -1,0 +1,1 @@
+Per comprendere la differenza tra **righe KV raw** e **righe KV compresse**, dobbiamo

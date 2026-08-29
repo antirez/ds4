@@ -1,0 +1,1 @@
+La decodifica speculativa mantiene l'output **esattamente identico** a quello di un modello

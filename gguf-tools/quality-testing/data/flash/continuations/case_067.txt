@@ -1,0 +1,1 @@
+The short answer is: **mmap reserves virtual address space, but physical memory (or page residency) is only allocated

@@ -1,0 +1,3 @@
+# Checklist per la revisione della lifetime di memoria in una PR
+
+## 1. **Analisi dei riferimenti

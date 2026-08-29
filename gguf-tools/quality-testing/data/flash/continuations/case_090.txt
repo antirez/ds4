@@ -1,0 +1,3 @@
+To understand the role of calibration data in neural network quantization, it helps to first understand what quantization does. 
+
+Quantization

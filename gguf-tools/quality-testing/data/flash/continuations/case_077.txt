@@ -1,0 +1,1 @@
+La differenza tra la **dimensione virtuale** e la **residenza** (o *resident set

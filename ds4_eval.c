@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1205,13 +1207,23 @@ typedef struct {
     uint64_t seed;
     int pause_ms;
     int power_percent;
+    uint32_t prefill_chunk;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_full_layers;
+    uint32_t ssd_streaming_preload_experts;
+    uint64_t simulate_used_memory_bytes;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
+    ds4_dist_options dist;
     bool plain;
     bool warm_weights;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
+    bool ssd_streaming_full_layers_set;
     bool self_test_extractors;
 } eval_config;
 
@@ -1430,6 +1442,16 @@ static int parse_int_arg(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_nonnegative_int_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
+        fprintf(stderr, "ds4-eval: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static uint64_t parse_u64_arg(const char *s, const char *opt) {
     char *end = NULL;
     unsigned long long v = strtoull(s, &end, 10);
@@ -1460,10 +1482,18 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
+#else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-eval: invalid value for %s: %s\n", opt, s);
+#ifdef DS4_ROCM_BUILD
+    fprintf(stderr, "ds4-eval: valid backends are: metal, rocm, cpu\n");
+#else
     fprintf(stderr, "ds4-eval: valid backends are: metal, cuda, cpu\n");
+#endif
     exit(2);
 }
 
@@ -1477,53 +1507,8 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-eval [options]\n"
-        "\n"
-        "Runs a small built-in GPQA Diamond/audited SuperGPQA/AIME2025/COMPSEC integration test.\n"
-        "The TTY UI keeps the question list on the left and streams sampled\n"
-        "tokens live on the right; thinking text is dim grey until </think>.\n"
-        "In the TTY UI, Up/Down selects a question, Enter runs it next,\n"
-        "p pauses or resumes evaluation, and q exits with a report.\n"
-        "\n"
-        "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  -c, --ctx N            Allocated session context. Default: auto-sized.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
-        "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
-        "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
-        "\n"
-        "Evaluation:\n"
-        "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
-        "  --questions N          Run only the first N embedded questions.\n"
-        "  --case-sequence LIST   Run 1-based case numbers in this comma-separated order.\n"
-        "  --temp F               Sampling temperature. Default: 0\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --min-p F              Keep tokens scoring at least F times the top token. Default: 0.05\n"
-        "  --seed N               Sampling seed. Default: time-based\n"
-        "  --trace FILE           Write questions, outputs, and grading decisions.\n"
-        "  --regrade-trace FILE   Regrade a prior --trace file without loading the model.\n"
-        "  --think                Enable thinking mode. Default\n"
-        "  --think-max            Use Think Max. Auto context allocates at least 393216 tokens.\n"
-        "  --nothink              Disable thinking mode.\n"
-        "  --soft-limit-reply-budget N\n"
-        "                         Inside the last N tokens, close thinking if\n"
-        "                         </think> is already among the top close ranks.\n"
-        "                         Default: 1024\n"
-        "  --hard-limit-reply-budget N\n"
-        "                         Force </think> with N tokens left for the answer.\n"
-        "                         Default: 512\n"
-        "  --soft-limit-think-close-rank N\n"
-        "                         Soft-close when </think> is in the top N tokens.\n"
-        "                         Default: 3\n"
-        "  --pause-ms N           Pause after each result in the TTY UI. Default: 350\n"
-        "  --plain                Disable split-screen ANSI UI.\n"
-        "  --self-test-extractors Run answer-extractor self-tests and exit.\n"
-        "  -h, --help             Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_EVAL, topic);
 }
 
 static eval_config parse_options(int argc, char **argv) {
@@ -1543,9 +1528,29 @@ static eval_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.dist,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-eval: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
@@ -1583,12 +1588,57 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal")) {
             c.backend = DS4_BACKEND_METAL;
+#ifdef DS4_ROCM_BUILD
+        } else if (!strcmp(arg, "--rocm")) {
+            c.backend = DS4_BACKEND_CUDA;
+#else
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
+#endif
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_experts = experts;
+            c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-full-layers")) {
+            int v = parse_nonnegative_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.ssd_streaming_full_layers = (uint32_t)v;
+            c.ssd_streaming_full_layers_set = true;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-eval: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-eval: --prefill-chunk must be positive\n");
+                exit(2);
+            }
+            c.prefill_chunk = (uint32_t)v;
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -1609,11 +1659,21 @@ static eval_config parse_options(int argc, char **argv) {
             c.self_test_extractors = true;
         } else {
             fprintf(stderr, "ds4-eval: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
+
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
 
     if (c.max_tokens > EVAL_MAX_CONTEXT) {
         fprintf(stderr,
@@ -2653,6 +2713,62 @@ static char *find_last_answer_marker(const char *visible) {
     return last ? last : strcasestr_local(visible, "answer");
 }
 
+/* True when the in-range capital at `letter` is the object of an explicit
+ * rejection earlier on the same answer line -- "not B", "isn't B",
+ * "rules out C", "eliminate E" -- so it is a distractor the model is
+ * discarding, not its pick.  This rewrites only the lexical "first valid
+ * letter wins" default for clear elimination phrasing; the cue set is kept
+ * small and high-precision on purpose, and there is no general
+ * selection-vs-rejection sentence parsing (issue #321).  It never looks before
+ * `start` or across a newline, so "D, not B" still grades D: the pick is
+ * reached and accepted before the rejected distractor is ever inspected. */
+static bool mc_letter_is_negated(const char *start, const char *letter) {
+    const char *p = letter;
+    /* Step back over the gap to the previous word: spaces and light separating
+     * punctuation only, and never across a line break. */
+    while (p > start) {
+        char c = p[-1];
+        if (c == '\n') return false;
+        if (c == ' ' || c == '\t' || c == ',' || c == ';') p--;
+        else break;
+    }
+    /* Read the immediately preceding word (letters/apostrophe), lowercased. */
+    const char *wend = p;
+    while (p > start && (isalpha((unsigned char)p[-1]) || p[-1] == '\'')) p--;
+    size_t wlen = (size_t)(wend - p);
+    if (wlen == 0 || wlen >= 16) return false;
+    char w[16];
+    for (size_t i = 0; i < wlen; i++) w[i] = (char)tolower((unsigned char)p[i]);
+    w[wlen] = '\0';
+
+    /* Contraction form: isn't / aren't / wasn't / doesn't / won't / can't. */
+    if (wlen >= 3 && strcmp(w + wlen - 3, "n't") == 0) return true;
+
+    static const char *cues[] = {
+        "not", "except", "excluding", "exclude", "excludes",
+        "eliminate", "eliminates", "eliminated",
+        "reject", "rejects", "rejected", "rejecting", NULL
+    };
+    for (int i = 0; cues[i]; i++) if (strcmp(w, cues[i]) == 0) return true;
+
+    /* Two-word cue: "rule out" / "rules out" / "ruled out". */
+    if (strcmp(w, "out") == 0) {
+        const char *q = p;
+        while (q > start && (q[-1] == ' ' || q[-1] == '\t')) q--;
+        const char *rend = q;
+        while (q > start && isalpha((unsigned char)q[-1])) q--;
+        size_t rl = (size_t)(rend - q);
+        if (rl && rl < 8) {
+            char r[8];
+            for (size_t i = 0; i < rl; i++) r[i] = (char)tolower((unsigned char)q[i]);
+            r[rl] = '\0';
+            if (!strcmp(r, "rule") || !strcmp(r, "rules") || !strcmp(r, "ruled"))
+                return true;
+        }
+    }
+    return false;
+}
+
 static char find_answer_letter(const char *generated, int nchoices) {
     if (nchoices <= 0) return '?';
     const char *visible = strstr(generated, "</think>");
@@ -2668,7 +2784,22 @@ static char find_answer_letter(const char *generated, int nchoices) {
             if (c >= 'A' && c <= max_answer) {
                 char before = p == visible ? ' ' : p[-1];
                 char after = p[1];
-                if (is_letter_boundary(before, after)) return c;
+                if (!is_letter_boundary(before, after)) continue;
+                /* A standalone capital that begins a same-line English word
+                 * ("A careful ...") or a contraction ("I'll ...") is prose,
+                 * not the model's pick: the real letter comes later on the
+                 * line. Skip it; the reverse scan below still recovers it if
+                 * it was the only candidate (e.g. "Answer: A is correct"). */
+                if (after == '\'') continue;
+                if (after == ' ' || after == '\t') {
+                    const char *w = p + 1;
+                    while (*w == ' ' || *w == '\t') w++;
+                    if (islower((unsigned char)*w)) continue;
+                }
+                /* A distractor explicitly rejected before the pick on the same
+                 * line ("not B, ... D") must not win over the real choice. */
+                if (mc_letter_is_negated(answer, p)) continue;
+                return c;
             }
         }
     }
@@ -2721,7 +2852,17 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     if (answer) {
         const char *end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
-        if (scan_first_integer(answer, end, dst, dstlen)) return;
+        /* Restrict to the final answer line: digits after it (continued
+         * reasoning, footnotes, years) must not override the answer. */
+        const char *nl = memchr(answer, '\n', (size_t)(end - answer));
+        if (nl) end = nl;
+        /* When the line shows arithmetic ("m+n = 256+37 = 293") the stated
+         * result is the right-hand side of the LAST '='. Otherwise the first
+         * integer on the line is the answer (keeps "Final answer: 082"). */
+        const char *eq = NULL;
+        for (const char *r = answer; r < end; r++) if (*r == '=') eq = r;
+        if (scan_first_integer(eq ? eq + 1 : answer, end, dst, dstlen)) return;
+        if (eq && scan_first_integer(answer, end, dst, dstlen)) return;
     }
 
     const char *last_start = NULL;
@@ -3088,6 +3229,32 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     return out;
 }
 
+typedef enum {
+    REGRADE_NOT_GRADED,
+    REGRADE_PASSED,
+    REGRADE_FAILED,
+} regrade_outcome;
+
+/* Decide how one trace case regrades. Only PASSED/FAILED traces were graded by
+ * a completed run; STOPPED/SKIPPED/SWITCHED/ERROR cases carry partial or no
+ * model output and must be reported as not-graded rather than counted, since
+ * grading them inflates the totals and raises spurious "changed" drift. An
+ * empty status keeps legacy traces (written before the status line) working. */
+static regrade_outcome regrade_case_outcome(const eval_case *tc,
+                                            const char *traced_status,
+                                            const char *model_output,
+                                            char *got, size_t gotlen) {
+    bool gradeable = traced_status[0] == '\0' ||
+                     !strcmp(traced_status, "PASSED") ||
+                     !strcmp(traced_status, "FAILED");
+    if (!gradeable) {
+        if (gotlen) got[0] = '\0';
+        return REGRADE_NOT_GRADED;
+    }
+    find_case_answer(tc, model_output, got, gotlen);
+    return answer_matches(tc, got) ? REGRADE_PASSED : REGRADE_FAILED;
+}
+
 static int regrade_trace_file(const char *path) {
     size_t len = 0;
     char *text = read_text_file(path, &len);
@@ -3101,6 +3268,7 @@ static int regrade_trace_file(const char *path) {
     int changed = 0;
     int unknown = 0;
     int parse_errors = 0;
+    int not_graded = 0;
 
     while (true) {
         const char *case_start = trace_find_next_case(start, end);
@@ -3142,8 +3310,14 @@ static int regrade_trace_file(const char *path) {
         }
 
         char got[EVAL_ANSWER_MAX];
-        find_case_answer(tc, model_output, got, sizeof(got));
-        bool ok = answer_matches(tc, got);
+        regrade_outcome outcome =
+            regrade_case_outcome(tc, traced_status, model_output, got, sizeof(got));
+        if (outcome == REGRADE_NOT_GRADED) {
+            not_graded++;
+            free(model_output);
+            continue;
+        }
+        bool ok = (outcome == REGRADE_PASSED);
         if (ok) passed++;
         else failed++;
 
@@ -3160,8 +3334,8 @@ static int regrade_trace_file(const char *path) {
         free(model_output);
     }
 
-    printf("ds4-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d unknown=%d parse_errors=%d\n",
-           total, path, passed, failed, changed, unknown, parse_errors);
+    printf("ds4-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d not_graded=%d unknown=%d parse_errors=%d\n",
+           total, path, passed, failed, changed, not_graded, unknown, parse_errors);
     free(text);
     return (unknown || parse_errors || total == 0) ? 1 : 0;
 }
@@ -3229,10 +3403,37 @@ static int trace_copy_self_test_case(void) {
     return 0;
 }
 
+static int regrade_status_self_test_case(void) {
+    int failed = 0;
+    const eval_case integer = {.source = "AIME2025", .answer = "82"};
+    char got[EVAL_ANSWER_MAX];
+
+    if (regrade_case_outcome(&integer, "PASSED", "</think>Answer: 82",
+                             got, sizeof(got)) != REGRADE_PASSED) {
+        fprintf(stderr, "ds4-eval: regrade self-test failed: PASSED trace not regraded\n");
+        failed++;
+    }
+    /* An interrupted run whose partial output happens to look correct must not
+     * be counted or flagged as drift. */
+    if (regrade_case_outcome(&integer, "STOPPED", "</think>Answer: 82",
+                             got, sizeof(got)) != REGRADE_NOT_GRADED) {
+        fprintf(stderr, "ds4-eval: regrade self-test failed: STOPPED trace was graded\n");
+        failed++;
+    }
+    /* Legacy traces without a status line stay gradeable. */
+    if (regrade_case_outcome(&integer, "", "</think>Answer: 82",
+                             got, sizeof(got)) != REGRADE_PASSED) {
+        fprintf(stderr, "ds4-eval: regrade self-test failed: legacy empty status not graded\n");
+        failed++;
+    }
+    return failed;
+}
+
 static int run_extractor_self_tests(void) {
     int failed = 0;
 
     failed += trace_copy_self_test_case();
+    failed += regrade_status_self_test_case();
 
     const eval_case mc = {
         .source = "SuperGPQA",
@@ -3292,6 +3493,93 @@ static int run_extractor_self_tests(void) {
         "**Answer:** 10</think>The primary write is at line 10.\n"
         "Answer: 10",
         "10");
+
+    /* --- Regression cases for answer-extractor false negatives. These guard
+     *     against the grader under-reporting model accuracy on well-formed
+     *     final-answer lines. --- */
+
+    /* Multiple choice: a standalone in-range capital that merely begins an
+     * English word ("I think", "A careful") or a contraction ("I'll") must
+     * not shadow the choice the model actually states later on the line.
+     * Only reachable when the stray letter is itself a valid option, i.e.
+     * 10-choice (A-J) cases, of which the embedded set has 24. */
+    const eval_case mc_c = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+        .answer = "C",
+    };
+    failed += extractor_self_test_case(
+        "MC: leading pronoun 'I' does not shadow the chosen letter",
+        &mc_c, "</think>Answer: I think it is C", "C");
+    failed += extractor_self_test_case(
+        "MC: contraction I'll does not shadow the chosen letter",
+        &mc_c, "</think>Answer: I'll go with C.", "C");
+    failed += extractor_self_test_case(
+        "MC: leading article 'A' does not shadow the chosen letter",
+        &mc_c, "</think>Answer: A careful reading shows C.", "C");
+
+    const eval_case mc_i = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+        .answer = "I",
+    };
+    failed += extractor_self_test_case(
+        "MC: a genuine standalone 'I' answer is still picked",
+        &mc_i, "</think>Answer: I.", "I");
+
+    const eval_case mc4_d = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D"},
+        .answer = "D",
+    };
+    failed += extractor_self_test_case(
+        "MC: out-of-range pronoun is harmless on 4-choice cases",
+        &mc4_d, "</think>Answer: I think it is D", "D");
+
+    /* A distractor the model explicitly rejects *before* stating its pick on
+     * the same line must not shadow the real choice ("not B, ... D" /
+     * "rules out C, leaving D"). The bare first-valid-letter rule grabbed the
+     * rejected letter; a small, high-precision negation-cue skip fixes it.
+     * "D, not B" is the guard against the naive "take the last letter" fix:
+     * the pick is reached and accepted before the rejected distractor. #321 */
+    const eval_case mc_d = {
+        .source = "SuperGPQA",
+        .choice = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+        .answer = "D",
+    };
+    failed += extractor_self_test_case(
+        "MC: 'not B' distractor before the pick does not shadow it",
+        &mc_d, "</think>Answer: It is not B, the answer is D", "D");
+    failed += extractor_self_test_case(
+        "MC: 'rules out C, leaving D' grades the surviving choice",
+        &mc_d, "</think>Answer: rules out C, leaving D", "D");
+    failed += extractor_self_test_case(
+        "MC: contraction negation (isn't B) before the pick is skipped",
+        &mc_d, "</think>Answer: It isn't B, so D", "D");
+    failed += extractor_self_test_case(
+        "MC: a leading pick followed by 'not B' is still graded as the pick",
+        &mc_d, "</think>Answer: D, not B", "D");
+
+    /* Integer: when the answer line shows the arithmetic, the graded value
+     * must be the stated result (right of the last '='), not the first
+     * summand/factor; digits on later lines must not leak in either. Many
+     * embedded AIME2025 cases ask for a derived sum (m+n, a+b+c, ...). */
+    const eval_case int_293 = {.source = "AIME2025", .answer = "293"};
+    failed += extractor_self_test_case(
+        "integer: sum line grades the total, not the first summand",
+        &int_293, "</think>Answer: m+n = 256+37 = 293", "293");
+    const eval_case int_62 = {.source = "AIME2025", .answer = "62"};
+    failed += extractor_self_test_case(
+        "integer: three-term sum line grades the total",
+        &int_62, "</think>Answer: a+b+c = 12+25+25 = 62", "62");
+    const eval_case int_81 = {.source = "AIME2025", .answer = "81"};
+    failed += extractor_self_test_case(
+        "integer: product-sum line grades the result, not the first factor",
+        &int_81, "</think>Answer: 2*7 + 3*6 + 5*4 + 7*5 = 81", "81");
+    const eval_case int_82 = {.source = "AIME2025", .answer = "82"};
+    failed += extractor_self_test_case(
+        "integer: digits on a later line do not override the answer line",
+        &int_82, "</think>Answer: 82\nThe value 2025 is just the year.", "82");
 
     if (failed) return 1;
     printf("ds4-eval: answer extractor self-tests passed\n");
@@ -3484,7 +3772,6 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
-    const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
     for (int i = 0; i < generation_limit; i++) {
@@ -3586,7 +3873,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
-        if (token == eos) break;
+        if (ds4_token_is_stop(engine, token)) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
             think_close.kind = close_kind;
@@ -3742,8 +4029,15 @@ static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *
     return 0;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk,
+                               bool        ssd_streaming) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill_mode(backend,
+                                                      ctx_size,
+                                                      prefill_chunk,
+                                                      ssd_streaming);
     fprintf(stderr,
             "ds4-eval: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -3752,6 +4046,34 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap);
+}
+
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "ds4-eval: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "ds4-eval: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            fprintf(stderr, "ds4-eval: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
 }
 
 static const char *report_status_name(eval_status st) {
@@ -3834,12 +4156,30 @@ int main(int argc, char **argv) {
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
+        .prefill_chunk = cfg.prefill_chunk,
+        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
+        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
+        .distributed = cfg.dist,
     };
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {
@@ -3870,11 +4210,23 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ds4-eval: model shape %s\n", ds4_engine_model_name(engine));
     eval_warn_think_max_downgraded(&cfg);
     trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases, max_prompt_tokens);
-    log_context_memory(cfg.backend, cfg.ctx_size);
+    log_context_memory(cfg.backend,
+                       cfg.ctx_size,
+                       cfg.prefill_chunk,
+                       cfg.ssd_streaming);
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
+        if (trace) fclose(trace);
+        ds4_engine_close(engine);
+        free(case_sequence);
+        return 1;
+    }
+    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0)
+    {
+        ds4_session_free(session);
         if (trace) fclose(trace);
         ds4_engine_close(engine);
         free(case_sequence);

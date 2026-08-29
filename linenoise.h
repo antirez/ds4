@@ -139,6 +139,8 @@ void linenoiseSetMultiLine(int ml);
 void linenoisePrintKeyCodes(void);
 void linenoiseMaskModeEnable(void);
 void linenoiseMaskModeDisable(void);
+/* Re-enable raw mode if a child process changed the terminal state. */
+void linenoiseRestoreRawMode(void);
 
 #ifdef __cplusplus
 }

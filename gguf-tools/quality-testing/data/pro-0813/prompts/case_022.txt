@@ -1,0 +1,1 @@
+Explain the difference between a mutex and an atomic counter.

@@ -1,0 +1,1 @@
+Binary search finds the insertion point by repeatedly narrowing the search range until it finds the exact position where a new element should be

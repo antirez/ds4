@@ -1,0 +1,3 @@
+Here are a few ways to complete that comment depending on what the lock is actually protecting. 
+
+**The most common and

@@ -1,0 +1,1 @@
+La ricerca di appartenenza (cioè verificare se un elemento è presente in una collezione) diventa molto

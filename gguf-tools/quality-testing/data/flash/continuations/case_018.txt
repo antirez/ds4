@@ -1,0 +1,1 @@
+Per capire perché il **prefill** (elaborazione del prompt) può essere più veloce del **decode

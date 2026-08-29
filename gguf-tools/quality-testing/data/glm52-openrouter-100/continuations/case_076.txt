@@ -1,0 +1,1 @@
+Testare un parser da riga di comando (CLI) in modo rigoroso è fondamentale, poiché questo componente è

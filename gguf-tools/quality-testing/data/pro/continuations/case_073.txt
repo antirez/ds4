@@ -1,0 +1,5 @@
+Ecco un esempio classico di race condition in C usando i thread:
+
+```c
+#include <stdio.h>
+#include

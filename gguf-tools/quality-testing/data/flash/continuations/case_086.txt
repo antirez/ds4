@@ -1,0 +1,1 @@
+Checksums catch accidental corruption because they exploit the mathematical principle that any change to a data block—even a single flipped

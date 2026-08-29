@@ -1,0 +1,1 @@
+To understand why a second file read is faster, you have to look at the difference between **where the data lives**

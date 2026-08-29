@@ -1,0 +1,7 @@
+Here’s a concise checklist for reviewing a PR that touches memory lifetimes:
+
+---
+
+### Memory Lifetime Review Checklist
+
+**1

@@ -1,0 +1,1 @@
+A **hash table** (or hash map) is a data structure that maps keys to values using a mathematical function called

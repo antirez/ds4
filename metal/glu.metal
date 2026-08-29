@@ -38,3 +38,26 @@ kernel void kernel_swiglu_f32(
         dst_row[i0] = silu*x1*args.alpha;
     }
 }
+
+kernel void kernel_swiglu_flat_f32(
+        constant ds4_metal_args_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= (uint)args.ne0) return;
+
+    device const float * src0_f32 = (device const float *) src0 + args.i00;
+    device const float * src1_f32 = (device const float *) src1 + args.i10;
+    device       float * dst_f32  = (device       float *) dst;
+
+    float x0 = src0_f32[i];
+    float x1 = src1_f32[i];
+    if (args.limit > 1.0e-6f) {
+        x0 = min(x0, args.limit);
+        x1 = clamp(x1, -args.limit, args.limit);
+    }
+
+    const float silu = x0 / (1.0f + exp(-x0));
+    dst_f32[i] = silu*x1*args.alpha;
+}

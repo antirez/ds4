@@ -1,0 +1,1 @@
+To understand the tradeoffs between **top-p sampling** and **temperature-zero decoding**, it helps to first clarify what they
