@@ -408,6 +408,9 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+void ds4_session_set_stream(ds4_session *s, int stream_id);
+int ds4_session_eval_begin(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_end(ds4_session *s, char *err, size_t errlen);
 
 typedef struct {
     ds4_session *session;

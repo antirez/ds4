@@ -49597,6 +49597,9 @@ struct ds4_session {
     void *cancel_ud;
     uint32_t prefill_cap;
     int ctx_size;
+    int stream_id;
+    int pending_token;
+    bool pending_eval;
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
@@ -61951,6 +61954,80 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+void ds4_session_set_stream(ds4_session *s, int stream_id) {
+    if (s) s->stream_id = stream_id;
+}
+
+/* Async decode pair for multi-stream generation: _begin encodes and commits
+ * one token's decode pass on the session's own GPU stream without waiting;
+ * _end waits for that stream, reads logits, and commits the token to the
+ * session timeline.  Callers interleave other sessions' _begin calls in
+ * between; independent per-stream queues let the GPU overlap them.  Metal
+ * encoding must stay serialized by the caller (one thread, or a lock around
+ * _begin). */
+int ds4_session_eval_begin(ds4_session *s, int token, char *err, size_t errlen) {
+    if (!s) return -1;
+#ifdef DS4_NO_GPU
+    (void)token; snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    if (s->distributed || ds4_session_is_cpu(s) || !s->checkpoint_valid) {
+        return ds4_session_eval(s, token, err, errlen);   /* sync fallback */
+    }
+    int room = s->ctx_size - s->checkpoint.len;
+    if (room <= 1) { snprintf(err, errlen, "context is full"); return -1; }
+    ds4_engine *e = s->engine;
+    ds4_gpu_set_stream(s->stream_id);
+    if (ds4_gpu_begin_commands() == 0) {
+        snprintf(err, errlen, "%s begin failed", ds4_backend_name(e->backend));
+        return -1;
+    }
+    if (!metal_graph_encode_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                          token, (uint32_t)s->checkpoint.len,
+                                          true, false)) {
+        (void)ds4_gpu_synchronize();
+        snprintf(err, errlen, "%s decode encode failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    if (ds4_gpu_end_commands_async() == 0) {
+        snprintf(err, errlen, "%s commit failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    s->pending_token = token;
+    s->pending_eval = true;
+    return 0;
+#endif
+}
+
+int ds4_session_eval_end(ds4_session *s, char *err, size_t errlen) {
+    if (!s) return -1;
+#ifdef DS4_NO_GPU
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    if (!s->pending_eval) return 0;
+    s->pending_eval = false;
+    ds4_engine *e = s->engine;
+    if (ds4_gpu_wait_stream(s->stream_id) == 0) {
+        snprintf(err, errlen, "%s stream wait failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    if (ds4_gpu_tensor_read(metal_graph_logits(&s->graph), 0, s->logits,
+                            (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) == 0) {
+        snprintf(err, errlen, "%s logits readback failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    token_vec_push(&s->checkpoint, s->pending_token);
+    s->mtp_draft_valid = false;
+    s->checkpoint_valid = true;
+    return 0;
+#endif
+}
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
@@ -62378,10 +62455,55 @@ static int ds4_sessions_eval_batch_metal(
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
-    bool ok = ds4_gpu_begin_commands() != 0;
-    const bool native_shared = ok &&
+    /* Per-session GPU-stream overlap: encode each DeepSeek session's decode
+     * pass on its own command queue and let the GPU overlap the latency-bound
+     * chains.  Measured ~2x aggregate over one-queue encoding at 4-8 sessions
+     * when the model buffers opt out of hazard tracking
+     * (DS4_METAL_MODEL_UNTRACKED=1), which otherwise serializes the queues.
+     * The fused native session batch stays preferred where supported; GLM and
+     * tensor-parallel sessions keep the single-queue path. */
+    bool overlap_all_deepseek = true;
+    for (int i = 0; i < count; i++) {
+        if (ds4_session_is_glm(items[i].session)) { overlap_all_deepseek = false; break; }
+    }
+    bool native_shared = false;
+    bool native_qkv = false;
+    /* SSD streaming's expert-cache slabs are process-global mutable state,
+     * so concurrently executing streams must not share them: keep streaming
+     * configurations on the single-queue path. */
+    const bool stream_overlap =
+        overlap_all_deepseek && !e->tp.active && !mirror && count > 1 &&
+        !e->ssd_streaming &&
+        getenv("DS4_METAL_NO_STREAM_OVERLAP") == NULL;
+    bool ok = true;
+    if (stream_overlap) {
+        int started = 0;
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            ds4_gpu_set_stream(i % 8);
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_token_raw_swa(&s->graph,
+                                                          &e->model,
+                                                          &e->weights,
+                                                          items[i].token,
+                                                          (uint32_t)s->checkpoint.len,
+                                                          true,
+                                                          false);
+            if (ok) ok = ds4_gpu_end_commands_async() != 0;
+            if (ok) started = i + 1;
+        }
+        const int waited = started < count ? started : count;
+        const int n_streams = waited < 8 ? waited : 8;
+        for (int i = 0; i < n_streams; i++) {
+            if (ds4_gpu_wait_stream(i) == 0) ok = false;
+        }
+        ds4_gpu_set_stream(0);
+        if (!ok) (void)ds4_gpu_synchronize();
+    } else {
+    ok = ds4_gpu_begin_commands() != 0;
+    native_shared = ok &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
-    const bool native_qkv = native_shared &&
+    native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
     if (native_shared) {
         ok = metal_graph_encode_native_session_batch_shared(
@@ -62413,6 +62535,7 @@ static int ds4_sessions_eval_batch_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    }
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_gpu_tp_failed()) {
