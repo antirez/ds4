@@ -443,6 +443,187 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
+/* Non-causal batch attention over a raw KV ring for the DSpark draft block
+ * (ROCm port of the CUDA kernel). Every query row attends over all n_raw
+ * visible rows plus the per-head sink, with the same one-block
+ * max/denominator/value accumulation order as the reference decode
+ * attention (scores in shared, sequential value pass). */
+__global__ static void attention_noncausal_raw_batch_heads_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t n_tokens,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t tok = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (tok >= n_tokens || h >= n_head) return;
+    extern __shared__ float sh_scores[]; /* n_raw floats */
+    const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        const uint32_t row = (raw_start + r) % raw_cap;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+        sh_scores[r] = dot * scale;
+    }
+    __syncthreads();
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    float local_max = sinks[h];
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        local_max = fmaxf(local_max, sh_scores[r]);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        sh_scores[r] = expf(sh_scores[r] - max_s);
+        den_local += sh_scores[r];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+    float *oh = heads + ((uint64_t)tok * n_head + h) * head_dim;
+    if ((head_dim & 3u) == 0u) {
+        for (uint32_t d = threadIdx.x * 4u; d < head_dim;
+             d += blockDim.x * 4u) {
+            float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t row = (raw_start + r) % raw_cap;
+                const float4 kv = ((const float4 *)(raw_kv +
+                    (uint64_t)row * head_dim + d))[0];
+                const float weight = sh_scores[r];
+                acc.x += kv.x * weight;
+                acc.y += kv.y * weight;
+                acc.z += kv.z * weight;
+                acc.w += kv.w * weight;
+            }
+            ((float4 *)oh)[d >> 2u] = make_float4(
+                acc.x / denom, acc.y / denom,
+                acc.z / denom, acc.w / denom);
+        }
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < n_raw; r++) {
+                const uint32_t row = (raw_start + r) % raw_cap;
+                acc += raw_kv[(uint64_t)row * head_dim + d] * sh_scores[r];
+            }
+            oh[d] = acc / denom;
+        }
+    }
+}
+
+extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_tokens,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    if (!heads || !q || !raw_kv || !model_map ||
+        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
+        raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "dspark_attn_sinks");
+    if (!sinks) return 0;
+    const size_t shmem = (size_t)n_raw * sizeof(float);
+    if (shmem > 32768) return 0; /* draft blocks are tiny; guard anyway */
+    dim3 grid(n_tokens, n_head, 1);
+    attention_noncausal_raw_batch_heads_kernel<<<grid, 256, shmem>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_tokens, n_raw, raw_cap, raw_start, n_head, head_dim);
+    if (!cuda_ok(cudaGetLastError(), "attention noncausal raw batch heads launch")) return 0;
+    static int verify_left = -1;
+    if (verify_left < 0) {
+        verify_left = getenv("DS4_DSPARK_VERIFY_NONCAUSAL") != NULL ? 3 : 0;
+    }
+    if (verify_left > 0) {
+        verify_left--;
+        (void)cudaDeviceSynchronize();
+        const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+        const uint64_t kn = (uint64_t)raw_cap * head_dim;
+        std::vector<float> hq(qn), hkv(kn), hout(qn), hsink(n_head);
+        (void)cudaMemcpy(hq.data(), q->ptr, qn * 4, cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hkv.data(), raw_kv->ptr, kn * 4, cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hout.data(), heads->ptr, qn * 4, cudaMemcpyDeviceToHost);
+        (void)cudaMemcpy(hsink.data(), sinks, (uint64_t)n_head * 4, cudaMemcpyDeviceToHost);
+        double max_abs = 0.0, max_rel = 0.0;
+        const double scale = 1.0 / sqrt((double)head_dim);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t h = 0; h < n_head; h++) {
+                std::vector<double> sc(n_raw);
+                double mx = (double)hsink[h];
+                for (uint32_t r = 0; r < n_raw; r++) {
+                    const uint32_t row = (raw_start + r) % raw_cap;
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        dot += (double)hq[((uint64_t)t * n_head + h) * head_dim + d] *
+                               (double)hkv[(uint64_t)row * head_dim + d];
+                    }
+                    sc[r] = dot * scale;
+                    if (sc[r] > mx) mx = sc[r];
+                }
+                double den = exp((double)hsink[h] - mx);
+                for (uint32_t r = 0; r < n_raw; r++) den += exp(sc[r] - mx);
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    double acc = 0.0;
+                    for (uint32_t r = 0; r < n_raw; r++) {
+                        const uint32_t row = (raw_start + r) % raw_cap;
+                        acc += exp(sc[r] - mx) * (double)hkv[(uint64_t)row * head_dim + d];
+                    }
+                    const double ref = acc / den;
+                    const double got = (double)hout[((uint64_t)t * n_head + h) * head_dim + d];
+                    const double ad = fabs(ref - got);
+                    if (ad > max_abs) max_abs = ad;
+                    if (fabs(ref) > 1e-3 && ad / fabs(ref) > max_rel) max_rel = ad / fabs(ref);
+                }
+            }
+        }
+        fprintf(stderr,
+                "ds4: DSpark noncausal verify n_tok=%u n_raw=%u start=%u cap=%u "
+                "max_abs=%.3e max_rel=%.3e\n",
+                n_tokens, n_raw, raw_start, raw_cap, max_abs, max_rel);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -1115,7 +1296,10 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
+            /* Small batches (DSpark verify n<=16) waste up to 6x ALU on the
+             * fixed 32-wide token tile; pick the narrowest tile that fits.
+             * Per-token accumulation order is unchanged (bit-identical). */
+            const uint32_t tile = n_tokens <= 8u ? 8u : (n_tokens <= 16u ? 16u : 32u);
             const uint32_t block_tile = 16u;
             cuda_launch_grouped_q8_a_sharedx((float *)low->ptr,
                                              out_a,

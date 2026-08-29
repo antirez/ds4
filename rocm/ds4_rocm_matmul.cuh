@@ -408,7 +408,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
+            /* Small batches (DSpark verify n<=16) waste up to 6x ALU on the
+             * fixed 32-wide token tile; pick the narrowest tile that fits.
+             * Per-token accumulation order is unchanged (bit-identical). */
+            const uint32_t tile = n_tok <= 8u ? 8u : (n_tok <= 16u ? 16u : 32u);
             const uint32_t block_tile = 16u;
             cuda_launch_q8_batch_sharedx((float *)out->ptr,
                                          reinterpret_cast<const unsigned char *>(wptr),

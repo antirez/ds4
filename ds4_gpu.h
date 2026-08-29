@@ -498,6 +498,10 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+/* Alternates the w2 scan direction between chain steps (L3 tail reuse;
+ * oracle-safe: argmax is direction-independent). Default 0 = forward. */
+void ds4_gpu_dspark_markov_set_reverse(int rev);
+
 int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         const ds4_gpu_tensor *logits_row,
                                         const void *model_map,
