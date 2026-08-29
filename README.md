@@ -115,7 +115,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh ds4f-q2-q4   # q2 with the last 6 expert layers at q4
 ./download_model.sh ds4f-q4      # >= 256 GB RAM machines
 ./download_model.sh ds4f-mxfp4   # native MXFP4 experts, about 156 GB
-./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
+./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO 0813 q2 imatrix
 ```
 
 The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
@@ -140,10 +140,10 @@ Authentication is optional for public downloads, but `--token TOKEN`,
 
 If you want to regenerate GGUF files or collect a new imatrix, see
 [gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
-model-building work and can take a long time on the full DeepSeek V4 Flash
-weights. Flash GGUF generation is supported by the local tools. PRO GGUF
-production currently still depends on the external `llama.cpp`-based workflow;
-native tooling can be added later.
+model-building work and can take a long time on the full DeepSeek weights.
+Flash and PRO GGUF generation are supported by the local tools. PRO conversion
+uses a compatible published PRO GGUF as its metadata, tensor-layout, and output
+type template.
 
 GLM 5.2 support is limited to the GGUF files tested by this branch:
 
@@ -232,21 +232,41 @@ is not supported. On Metal, the main model may be resident or use
 state to the memory requirement. DSpark replaces the legacy one-stage MTP
 support model for that run rather than stacking with it.
 
-Run it with greedy decoding:
+Run it with the normal sampling defaults:
 
 ```sh
 ./ds4 -m ds4flash.gguf \
   --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
-  --dspark --temp 0
+  --dspark
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm;
-it prunes suffixes that are unlikely to repay their verification cost.
+The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm.
+It prunes suffixes that are unlikely to repay their verification cost.
 `--dspark-confidence 0` forces fixed five-token blocks and is intended for
-diagnostics. Sampled decoding does not use DSpark proposals. `--quality` and
-`--dspark-strict` also keep target-only decoding, which is useful for
-reproducibility checks.
+diagnostics.
+
+At a non-zero temperature, ordinary `--dspark` uses opportunistic sampling.
+Tokens evaluated normally are sampled with the requested temperature, top-p,
+top-k, and min-p. DFlash then proposes a temperature-zero suffix. Every draft
+token that matches the target's temperature-zero continuation is committed
+directly, even though the requested temperature is non-zero. Sampling resumes
+at the first mismatch. This is deliberately more deterministic than ordinary
+temperature sampling. On an M5 Max it retained enough of the greedy DSpark gain
+to improve a predictable code continuation by about 8% at temperature 1. A
+single M3 Max run was slightly slower, the same test was nearly neutral on DGX
+Spark, and it was slower on Strix Halo, where verification is more expensive.
+
+Use `--mtp-exact-sampling` when the output must follow the ordinary target
+distribution. With the DFlash support model, exact mode disables direct
+temperature-zero matching: it accepts each greedy proposal with its target
+probability and, on rejection, samples from the remaining target distribution.
+It uses a stricter `0.8` confidence threshold by default. Add `--temp 0` for
+fully greedy decoding. `--quality` and `--dspark-strict` keep target-only
+decoding, which is useful for reproducibility checks.
+The same DSpark flags work with `ds4-agent` and with non-batched
+`ds4-server` requests. Session-batched serving currently uses ordinary target
+decoding.
 
 ## Speed
 
@@ -349,7 +369,7 @@ and occasional work when you accept slow generation. Start with `--nothink`:
 ./download_model.sh pro-q2-imatrix
 
 ./ds4 \
-  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
+  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf \
   --ssd-streaming \
   --ctx 32768 \
   --nothink
@@ -365,7 +385,7 @@ re-enable thinking with a conservative generation limit:
 
 ```sh
 ./ds4 \
-  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
+  -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf \
   --ssd-streaming \
   --ctx 32768 \
   --think \
@@ -419,6 +439,12 @@ To build an initial mental model, here are the high level concepts:
 3. You assign one of the machines the role of `coordinator`, the others the roles of `workers`. Workers will connect to the coordinator and will tell they are there and which layers they are able to process.
 4. Each worker keeps its slice of the KV cache.
 5. Communication is worker-to-worker, there is no need to use the coordinator as relay, so if your coordinator is `A`, and you make a request, activations will flow in `A -> B -> C -> back to A`.
+
+The resident ROCm MXFP4 routed-expert path supports the same pipeline mode. A
+tested two-host Strix Halo split uses `--layers 0:21` on the coordinator and
+`--layers 22:output` on the worker. This is a capacity configuration for a
+model that does not fit on one 128 GB system; it does not add ROCm SSD
+streaming support for Flash.
 
 ### How it works and how to configure it
 

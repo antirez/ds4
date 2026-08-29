@@ -3,12 +3,13 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
+GLM_53_FLASH_ANTIREZ_REPO="antirez/glm-5.3-flash-gguf"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
 DS4F_Q2_Q4_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
-PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
+PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf"
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
@@ -18,6 +19,9 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
+GLM_53_FLASH_ANTIREZ_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
+GLM_53_FLASH_ANTIREZ_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
+GLM_53_FLASH_ANTIREZ_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -45,6 +49,9 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
+  ./download_model.sh glm-53-flash-antirez-fp8 [--token TOKEN]
+  ./download_model.sh glm-53-flash-antirez-q2 [--token TOKEN]
+  ./download_model.sh glm-53-flash-antirez-q4 [--token TOKEN]
 
 Targets:
 
@@ -72,8 +79,8 @@ Targets:
        6 GB. Enable it with --dspark and --mtp when running ds4 or ds4-server.
 
   pro-q2-imatrix
-       DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
-       on disk; intended for 512 GB RAM machines.
+       DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
+       430 GB on disk; intended for 512 GB RAM machines.
 
   pro-q4-layers00-30
        First half of the DeepSeek V4 PRO Q4 routed-expert quant, layers 0..30.
@@ -103,6 +110,18 @@ Targets:
   glm-antirez-q4
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
+
+  glm-53-flash-antirez-q2
+       GLM 5.3-flash antirez routed Q2 GGUF from antirez/glm-5.3-flash-gguf.
+       About 96 GB on disk.
+
+    glm-53-flash-antirez-q4
+       GLM 5.3-flash antirez routed Q4_K GGUF from antirez/glm-5.3-flash-gguf.
+       About 191 GB on disk.
+
+    glm-53-flash-antirez-fp8
+       GLM 5.3-flash antirez routed FP8 GGUF from antirez/glm-5.3-flash-gguf.
+       About 327 GB on disk.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -176,6 +195,21 @@ case "$MODEL" in
     glm-antirez-q4)
         REPO=$GLM_ANTIREZ_REPO
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-53-flash-antirez-q2)
+        REPO=$GLM_53_FLASH_ANTIREZ_REPO
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-53-flash-antirez-q4)
+        REPO=$GLM_53_FLASH_ANTIREZ_REPO
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-53-flash-antirez-fp8)
+        REPO=$GLM_53_FLASH_ANTIREZ_REPO
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_FP8_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)

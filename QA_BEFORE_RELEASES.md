@@ -12,7 +12,7 @@ run.
 
 Preferred release test hosts:
 
-- CUDA / DGX Spark: `toor@192.168.60.184`.
+- CUDA / DGX Spark: `toor@192.168.4.180` and `toor@192.168.4.181`.
 - Metal / distributed Mac testing: `mac-m5max-it` and `mac-m5max-us`.
 - ROCm: The Strix Halo system at antirez@strixhalo (Framework Desktop).
 
@@ -176,8 +176,12 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   routed reference is lower quality but should stay near first-token match
   `92/100`, API top-1 agreement about `0.890`, and API pair-order agreement
   about `0.800` unless the quantization changed deliberately.
-- Run the 100-case DeepSeek V4 PRO fixture for every released PRO GGUF:
-  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro.gguf gguf-tools/quality-testing/data/pro/manifest.tsv /tmp/pro.tsv 4096`.
+- Match every PRO GGUF to its checkpoint. The June preview uses
+  `gguf-tools/quality-testing/data/pro/manifest.tsv`; the August 0813 release
+  uses `gguf-tools/quality-testing/data/pro-0813/manifest.tsv`. Never interpret
+  a cross-checkpoint score as a quantization result.
+- Run the 100-case DeepSeek V4 PRO 0813 fixture for the new release GGUF:
+  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-pro-0813.gguf gguf-tools/quality-testing/data/pro-0813/manifest.tsv /tmp/pro-0813.tsv 4096 --ssd-streaming`.
 - For SSD streaming, run the same official-continuation scorer once with full
   residency and once with `--ssd-streaming` for the release model.  The summary
   and API agreement should stay in the same quality band.
@@ -231,6 +235,20 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - 64-token guardrail:
   `DS4_DSPARK_FIXTURE_TOKENS=64 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+- Opportunistic sampled acceptance fixture:
+  `DS4_DSPARK_FIXTURE_TEMPERATURE=1 DS4_DSPARK_FIXTURE_TOP_P=0.95 DS4_DSPARK_FIXTURE_MIN_P=0.05 DS4_DSPARK_FIXTURE_SEED=12345 DS4_DSPARK_FIXTURE_TOKENS=32 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
+  Require proposals, a direct commit, and zero errors. Output identity with the
+  baseline is not expected: normally evaluated boundary tokens are sampled,
+  while verified DFlash/target greedy matches are committed without sampling.
+- Exact sampled acceptance fixture:
+  repeat the command above with `DS4_DSPARK_FIXTURE_EXACT_SAMPLING=1`.
+  This mode must preserve the requested target distribution. Seeded output
+  identity is not expected because speculative accept/reject decisions consume
+  additional random numbers.
+- `make test` includes a 100,000-draw distribution check for general `p/q`
+  correction and for the point-mass DFlash proposal used at runtime. Both
+  histograms must remain within the stated tolerance of the target
+  distribution.
 - Fixed-block direct partial commit:
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
@@ -246,6 +264,13 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
   `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the Metal MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
+- On Metal, benchmark at least one predictable code continuation and one
+  deliberately unpredictable prose continuation at temperature 1. For the
+  128-token M5 Max hash-table prompt, ordinary sampling measured
+  41.71/44.49/44.73 t/s and opportunistic DSpark measured
+  47.15/49.08/48.19 t/s, a median gain of about 8.3%. A surreal-prose control
+  measured 44.46 t/s ordinary and 41.66 t/s opportunistic. DSpark remains
+  opt-in because prompts with little useful speculation can still be slower.
 
 ### Session Microbatching And Metal TP
 
@@ -390,8 +415,8 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 ## 8. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.
-Use the DGX Spark / GB10 host `toor@192.168.60.184`.  Do not claim CUDA is
-release-ready without this pass.
+Use either DGX Spark / GB10 host, `toor@192.168.4.180` or
+`toor@192.168.4.181`. Do not claim CUDA is release-ready without this pass.
 
 - Fetch or push the exact release commit to the CUDA machine.
 - Build:
@@ -463,6 +488,9 @@ a substitute for CUDA or Metal release testing.
 - Build:
   `make clean && make strix-halo`.
 - Require the ROCm build to complete without compiler warnings.
+- After MXFP4 or ROCm routed-MoE changes, run `make test-mxfp4-rocm`. Require
+  zero `failures` for both `mid` and `out` at 1, 3, 32, 128, and 512 tokens,
+  followed by `MXFP4 ROCm routed MoE: PASS`.
 - Use the q2 Flash imatrix GGUF for release smoke tests:
   `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`.
 - Do not use the mixed q2-q4 or Q4 Flash GGUFs for routine Strix Halo QA yet.
@@ -484,6 +512,12 @@ a substitute for CUDA or Metal release testing.
   direct build must be faster. DSpark is not currently expected to beat
   ordinary ROCm decode, so do not describe it as a ROCm speedup without a new
   measurement.
+- Repeat one opportunistic DSpark run with
+  `--temp 1 --top-p 0.95 --min-p 0.05`, then repeat it with
+  `--mtp-exact-sampling`. The current 128-token code references are
+  16.26 t/s ordinary, 12.28 t/s opportunistic, and 13.52 t/s exact, with no
+  verifier errors. This is a correctness gate, not a ROCm speed claim; the
+  ROCm batched verifier is still too expensive.
 - Run one longer prompt if ROCm kernels, backend hooks, tensor loading, model
   cache, KV cache, or graph prefill code changed.
 - Run the GLM Q2 release model through ROCm SSD streaming with at least four
@@ -575,6 +609,13 @@ The agent is the most stateful component.  Test it manually, not only by build.
   ASCII character ramp or output dimensions.  Verify the agent edits the
   existing file instead of rewriting the whole project, and that the final
   program still builds and runs.
+- With a matched DSpark support file and temperature 1, repeat a coding-tool
+  turn that crosses sampled prose, greedy DSML structure, parameter text, and
+  back to sampled prose. Require the tool to execute, the final answer to be
+  valid, and DSpark stats to show zero verifier errors and replay fallbacks.
+  Run the opportunistic default and `--mtp-exact-sampling`. The M5 Max
+  opportunistic smoke created, compiled, and ran a C program printing
+  `OPPORTUNISTIC_OK`, accepting 196 of 235 draft tokens.
 - Bash tools:
   test short output, large output truncation, non-zero exit output, long-running
   jobs, `bash_status`, and `bash_stop`.
@@ -633,15 +674,21 @@ claims across different models or contexts.
 | System and backend | Model and workload | Prefill | Decode |
 | --- | --- | ---: | ---: |
 | MacBook Pro M3 Max 128 GB, Metal | Flash q2, 11,709-token prompt | 250.11 t/s | 21.47 t/s |
+| MacBook Pro M3 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 29.16 t/s ordinary; 28.18 t/s DSpark |
 | MacBook Pro M5 Max 128 GB, Metal | Flash q2, 11,707-token prompt | 463.44 t/s | 25.90 t/s |
+| MacBook Pro M5 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 44.49 t/s ordinary median; 48.19 t/s DSpark median |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q2, 11,709-token prompt | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token context | about 94 t/s | 15.4 t/s |
 | DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
 | DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture | - | 24.48 t/s direct; 13.93 t/s replay predecessor |
+| DGX Spark GB10, CUDA | pre-0731 Flash q2, exact-sampled 128-token code prompt | - | 18.17 t/s ordinary; 18.30 t/s DSpark |
+| DGX Spark GB10, CUDA | pre-0731 Flash q2, opportunistic temperature-1 128-token code prompt | - | 18.32 t/s ordinary; 18.43 t/s DSpark |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 17.27 t/s; FP32 rollback 9.70 t/s |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
 | Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture | - | 11.40 t/s direct; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
+| Strix Halo gfx1151, ROCm | Flash 0731 IQ2, exact-sampled 128-token code prompt | - | 16.55 t/s ordinary; 12.68 t/s DSpark |
+| Strix Halo gfx1151, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 t/s ordinary; 12.28 t/s opportunistic; 13.52 t/s exact |
 | 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
 | 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
 

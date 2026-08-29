@@ -288,6 +288,273 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
+__device__ __forceinline__ static float dev_e8m0_to_f32(uint8_t e) {
+    const uint32_t bits = e == 0u ? 0x00400000u : (uint32_t)e << 23u;
+    return __uint_as_float(bits);
+}
+
+/* Expand four MXFP4 codes to signed, doubled int8 values in one register.
+ * On AMDGPU, V_PERM_B32 treats selector bytes 0..3 as bytes from src1,
+ * 4..7 as bytes from src0, 12 as zero, and 13 as 0xff.  Keeping both
+ * halves of the tiny value table in SGPR-immediate operands avoids four
+ * divergent global LUT reads for every packed word. */
+__device__ __forceinline__ static uint32_t dev_mxfp4_unpack4(uint32_t codes) {
+#if defined(__AMDGCN__)
+    const uint32_t selectors = codes & 0x07070707u;
+    const uint32_t positive = __builtin_amdgcn_perm(
+        0x0c080604u, 0x03020100u, selectors);
+    const uint32_t negative = __builtin_amdgcn_perm(
+        0xf4f8fafcu, 0xfdfeff00u, selectors);
+    const uint32_t sign_selectors =
+        0x0c0c0c0cu + ((codes & 0x08080808u) >> 3u);
+    const uint32_t sign_mask = __builtin_amdgcn_perm(
+        0u, 0u, sign_selectors);
+    return (positive & ~sign_mask) | (negative & sign_mask);
+#else
+    uint32_t result = 0u;
+    #pragma unroll
+    for (uint32_t i = 0; i < 4u; i++) {
+        const uint32_t code = (codes >> (8u * i)) & 0x0fu;
+        const uint32_t base = code & 7u;
+        int32_t value = (int32_t)(base + (base > 4u ? base - 4u : 0u) +
+                                  (base == 7u ? 2u : 0u));
+        if ((code & 8u) != 0u) value = -value;
+        result |= (uint32_t)(uint8_t)value << (8u * i);
+    }
+    return result;
+#endif
+}
+
+__device__ __forceinline__ static void dev_mxfp4_unpack2x4(
+        const uint8_t *q,
+        int32_t *low,
+        int32_t *high) {
+    const uint32_t packed = *(const uint32_t *)q;
+    *low = (int32_t)dev_mxfp4_unpack4(packed);
+    *high = (int32_t)dev_mxfp4_unpack4(packed >> 4u);
+}
+
+/* One q8_K chunk covers eight consecutive 32-value MXFP4 blocks.  MXFP4
+ * stores the first 16 values in the low nibbles and the second 16 in the
+ * high nibbles, rather than interleaving them. */
+__device__ static float dev_dot_mxfp4_q8_K_block(
+        const cuda_block_mxfp4 *x8,
+        const cuda_block_q8_K *y) {
+    float chunk = 0.0f;
+    #pragma unroll
+    for (uint32_t sb = 0; sb < 8u; sb++) {
+        const cuda_block_mxfp4 *x = x8 + sb;
+        const int8_t *q8 = y->qs + sb * 32u;
+        int32_t bsum = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < 16u; j += 4u) {
+            int32_t wlo, whi;
+            dev_mxfp4_unpack2x4(x->qs + j, &wlo, &whi);
+            bsum = __dp4a(wlo, *(const int32_t *)(q8 + j), bsum);
+            bsum = __dp4a(whi, *(const int32_t *)(q8 + 16u + j), bsum);
+        }
+        chunk += dev_e8m0_to_f32(x->e) * (float)bsum;
+    }
+    return 0.5f * y->d * chunk;
+}
+
+/* Split one 32-value MXFP4 block across a pair of lanes.  A wave therefore
+ * reads 16 consecutive 17-byte blocks instead of having each quarter-wave
+ * lane jump by a full 136-byte Q8_K chunk.  This mirrors the coalesced Metal
+ * decode layout while retaining the faster Q8_K activation path on gfx1151. */
+__device__ __forceinline__ static float dev_dot_mxfp4_q8_K_half_block(
+        const cuda_block_mxfp4 *x,
+        const cuda_block_q8_K *y,
+        uint32_t subblock,
+        uint32_t half) {
+    const uint32_t weight_offset = half * 8u;
+    const uint32_t activation_offset = subblock * 32u + weight_offset;
+    const int8_t *q8_lo = y->qs + activation_offset;
+    const int8_t *q8_hi = y->qs + activation_offset + 16u;
+    const uint8_t *q = x->qs + weight_offset;
+    int32_t bsum = 0;
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; j += 4u) {
+        int32_t wlo, whi;
+        dev_mxfp4_unpack2x4(q + j, &wlo, &whi);
+        bsum = __dp4a(wlo, *(const int32_t *)(q8_lo + j), bsum);
+        bsum = __dp4a(whi, *(const int32_t *)(q8_hi + j), bsum);
+    }
+    return 0.5f * y->d * dev_e8m0_to_f32(x->e) * (float)bsum;
+}
+
+/* Aligned-activation variant of the 8-pair chunk dot.  The staged copies
+ * hold each pair's 256 quant bytes 16-byte aligned with the Q8_K scale in
+ * a separate array, so one b128 load replaces four dword loads per half
+ * sub-block: this kernel family is issue-bound, not bandwidth-bound, and
+ * the load count per dp4a is what gates it.  The low/high nibble sums use
+ * separate integer accumulators; integer reassociation is exact, so the
+ * result is bit-identical to the struct-layout helper. */
+__device__ static void dev_dot_mxfp4_q8a_block8(
+        const cuda_block_mxfp4 *x8,
+        const int8_t *q0, const int8_t *q1, const int8_t *q2, const int8_t *q3,
+        const int8_t *q4, const int8_t *q5, const int8_t *q6, const int8_t *q7,
+        float d0, float d1, float d2, float d3,
+        float d4, float d5, float d6, float d7,
+        uint32_t n,
+        float acc[8]) {
+    const int8_t *qs[8] = { q0, q1, q2, q3, q4, q5, q6, q7 };
+    const float ds[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };
+    float chunk[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+    for (uint32_t sb = 0; sb < 8u; sb++) {
+        const cuda_block_mxfp4 *x = x8 + sb;
+        /* One misaligned b128 covers the block's 16 packed bytes; gfx11
+         * global loads support arbitrary alignment. */
+        const uint4 w4 = *(const uint4 *)(x->qs);
+        int32_t wlo[4], whi[4];
+        wlo[0] = (int32_t)dev_mxfp4_unpack4(w4.x);
+        whi[0] = (int32_t)dev_mxfp4_unpack4(w4.x >> 4u);
+        wlo[1] = (int32_t)dev_mxfp4_unpack4(w4.y);
+        whi[1] = (int32_t)dev_mxfp4_unpack4(w4.y >> 4u);
+        wlo[2] = (int32_t)dev_mxfp4_unpack4(w4.z);
+        whi[2] = (int32_t)dev_mxfp4_unpack4(w4.z >> 4u);
+        wlo[3] = (int32_t)dev_mxfp4_unpack4(w4.w);
+        whi[3] = (int32_t)dev_mxfp4_unpack4(w4.w >> 4u);
+        const float d = dev_e8m0_to_f32(x->e);
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) {
+            if (p < n) {
+                const int4 lo = *(const int4 *)(qs[p] + sb * 32u);
+                const int4 hi = *(const int4 *)(qs[p] + sb * 32u + 16u);
+                int32_t s = 0;
+                int32_t t = 0;
+                s = __dp4a(wlo[0], lo.x, s);
+                t = __dp4a(whi[0], hi.x, t);
+                s = __dp4a(wlo[1], lo.y, s);
+                t = __dp4a(whi[1], hi.y, t);
+                s = __dp4a(wlo[2], lo.z, s);
+                t = __dp4a(whi[2], hi.z, t);
+                s = __dp4a(wlo[3], lo.w, s);
+                t = __dp4a(whi[3], hi.w, t);
+                chunk[p] += d * (float)(s + t);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p < n) acc[p] += 0.5f * ds[p] * chunk[p];
+    }
+}
+
+/* Fused gate+up flavor: one activation load pair feeds both weight
+ * matrices, halving the dominant b128 traffic of the gate/up tile
+ * kernel.  Per-matrix accumulation is unchanged. */
+__device__ static void dev_dot_mxfp4_q8a_pair_block8(
+        const cuda_block_mxfp4 *g8,
+        const cuda_block_mxfp4 *u8,
+        const int8_t *q0, const int8_t *q1, const int8_t *q2, const int8_t *q3,
+        const int8_t *q4, const int8_t *q5, const int8_t *q6, const int8_t *q7,
+        float d0, float d1, float d2, float d3,
+        float d4, float d5, float d6, float d7,
+        uint32_t n,
+        float gate[8],
+        float up[8]) {
+    const int8_t *qs[8] = { q0, q1, q2, q3, q4, q5, q6, q7 };
+    const float ds[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };
+    float gchunk[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float uchunk[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+    for (uint32_t sb = 0; sb < 8u; sb++) {
+        const uint4 gw = *(const uint4 *)(g8[sb].qs);
+        const uint4 uw = *(const uint4 *)(u8[sb].qs);
+        int32_t glo[4], ghi[4], ulo[4], uhi[4];
+        glo[0] = (int32_t)dev_mxfp4_unpack4(gw.x);
+        ghi[0] = (int32_t)dev_mxfp4_unpack4(gw.x >> 4u);
+        glo[1] = (int32_t)dev_mxfp4_unpack4(gw.y);
+        ghi[1] = (int32_t)dev_mxfp4_unpack4(gw.y >> 4u);
+        glo[2] = (int32_t)dev_mxfp4_unpack4(gw.z);
+        ghi[2] = (int32_t)dev_mxfp4_unpack4(gw.z >> 4u);
+        glo[3] = (int32_t)dev_mxfp4_unpack4(gw.w);
+        ghi[3] = (int32_t)dev_mxfp4_unpack4(gw.w >> 4u);
+        ulo[0] = (int32_t)dev_mxfp4_unpack4(uw.x);
+        uhi[0] = (int32_t)dev_mxfp4_unpack4(uw.x >> 4u);
+        ulo[1] = (int32_t)dev_mxfp4_unpack4(uw.y);
+        uhi[1] = (int32_t)dev_mxfp4_unpack4(uw.y >> 4u);
+        ulo[2] = (int32_t)dev_mxfp4_unpack4(uw.z);
+        uhi[2] = (int32_t)dev_mxfp4_unpack4(uw.z >> 4u);
+        ulo[3] = (int32_t)dev_mxfp4_unpack4(uw.w);
+        uhi[3] = (int32_t)dev_mxfp4_unpack4(uw.w >> 4u);
+        const float gd = dev_e8m0_to_f32(g8[sb].e);
+        const float ud = dev_e8m0_to_f32(u8[sb].e);
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) {
+            if (p < n) {
+                const int4 lo = *(const int4 *)(qs[p] + sb * 32u);
+                const int4 hi = *(const int4 *)(qs[p] + sb * 32u + 16u);
+                int32_t gs = 0;
+                int32_t gt = 0;
+                int32_t us = 0;
+                int32_t ut = 0;
+                gs = __dp4a(glo[0], lo.x, gs);
+                gt = __dp4a(ghi[0], hi.x, gt);
+                us = __dp4a(ulo[0], lo.x, us);
+                ut = __dp4a(uhi[0], hi.x, ut);
+                gs = __dp4a(glo[1], lo.y, gs);
+                gt = __dp4a(ghi[1], hi.y, gt);
+                us = __dp4a(ulo[1], lo.y, us);
+                ut = __dp4a(uhi[1], hi.y, ut);
+                gs = __dp4a(glo[2], lo.z, gs);
+                gt = __dp4a(ghi[2], hi.z, gt);
+                us = __dp4a(ulo[2], lo.z, us);
+                ut = __dp4a(uhi[2], hi.z, ut);
+                gs = __dp4a(glo[3], lo.w, gs);
+                gt = __dp4a(ghi[3], hi.w, gt);
+                us = __dp4a(ulo[3], lo.w, us);
+                ut = __dp4a(uhi[3], hi.w, ut);
+                gchunk[p] += gd * (float)(gs + gt);
+                uchunk[p] += ud * (float)(us + ut);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p < n) {
+            gate[p] += 0.5f * ds[p] * gchunk[p];
+            up[p] += 0.5f * ds[p] * uchunk[p];
+        }
+    }
+}
+
+__device__ static void dev_dot_mxfp4_q8_K_block8(
+        const cuda_block_mxfp4 *x8,
+        const cuda_block_q8_K *y0,
+        const cuda_block_q8_K *y1,
+        const cuda_block_q8_K *y2,
+        const cuda_block_q8_K *y3,
+        const cuda_block_q8_K *y4,
+        const cuda_block_q8_K *y5,
+        const cuda_block_q8_K *y6,
+        const cuda_block_q8_K *y7,
+        uint32_t n,
+        float acc[8]) {
+    const cuda_block_q8_K *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
+    float chunk[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll
+    for (uint32_t sb = 0; sb < 8u; sb++) {
+        const cuda_block_mxfp4 *x = x8 + sb;
+        int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        #pragma unroll
+        for (uint32_t j = 0; j < 16u; j += 4u) {
+            int32_t wlo, whi;
+            dev_mxfp4_unpack2x4(x->qs + j, &wlo, &whi);
+            for (uint32_t p = 0; p < n; p++) {
+                const int8_t *q8 = ys[p]->qs + sb * 32u;
+                bsum[p] = __dp4a(wlo, *(const int32_t *)(q8 + j), bsum[p]);
+                bsum[p] = __dp4a(whi, *(const int32_t *)(q8 + 16u + j), bsum[p]);
+            }
+        }
+        const float d = dev_e8m0_to_f32(x->e);
+        for (uint32_t p = 0; p < n; p++) chunk[p] += d * (float)bsum[p];
+    }
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.5f * ys[p]->d * chunk[p];
+}
+
 __device__ static void dev_dot_q4_K_q8_K_block4(
         const cuda_block_q4_K *x,
         const cuda_block_q8_K *y0,
@@ -1838,6 +2105,501 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_row32_kernel(
     }
 }
 
+__global__ static void moe_gate_up_mid_mxfp4_expert_tile8_row32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t max_count,
+        uint32_t write_aux,
+        float clamp) {
+    /* Grid is (tile, row-block): consecutive blocks re-walk the same
+     * 32-row weight slice across an expert's token tiles, so the slice
+     * stays L2-resident and the expert's weights stream from DRAM ~once
+     * instead of once per 8-token tile.  Pure scheduling change; every
+     * output element's arithmetic is untouched. */
+    uint32_t tile = blockIdx.x;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.y * 32u + (threadIdx.x >> 3u);
+    uint32_t expert = tile_experts[tile];
+    uint32_t count = counts[expert];
+    if (max_count != 0u && count >= max_count) return;
+    uint32_t local_start = tile_starts[tile];
+    /* Staged activations live as 16-byte-aligned quant slices with the
+     * Q8_K scales in a separate array: the dot helper is issue-bound, and
+     * the aligned layout lets it load b128 instead of four dwords.  The
+     * layout also drops the unused 32-byte bsums from every staged chunk.
+     * Sized by the launch to 8 * xq_blocks * (256 + 4) bytes. */
+    extern __shared__ int4 sxq4[];
+    int8_t *sqs = (int8_t *)sxq4;
+    float *sds = (float *)(sqs + (uint64_t)8u * xq_blocks * 256u);
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    /* Fixed-count predicated setup keeps pair/xqb in registers instead of
+     * dynamically indexed scratch.  The tail xqb entries stay at valid
+     * dummy rows and are never read past np. */
+    const cuda_block_q8_K *xqb[8] = { xq, xq, xq, xq, xq, xq, xq, xq };
+    uint32_t np = count - local_start;
+    if (np > 8u) np = 8u;
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p < np) {
+            pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+            xqb[p] = xq + (uint64_t)(pair[p] / n_expert) * xq_blocks;
+        }
+    }
+    const int staged = xq_blocks <= 28u;
+    if (staged) {
+        for (uint32_t i = threadIdx.x; i < np * xq_blocks * 16u; i += blockDim.x) {
+            const uint32_t u = i / (xq_blocks * 16u);
+            const uint32_t rem = i - u * (xq_blocks * 16u);
+            const uint32_t b = rem >> 4u;
+            const uint32_t k = rem & 15u;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            const int32_t *src = (const int32_t *)
+                xq[(uint64_t)(sp / n_expert) * xq_blocks + b].qs + k * 4u;
+            ((int4 *)sqs)[(u * xq_blocks + b) * 16u + k] =
+                make_int4(src[0], src[1], src[2], src[3]);
+        }
+        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
+            const uint32_t u = i / xq_blocks;
+            const uint32_t b = i - u * xq_blocks;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            sds[i] = xq[(uint64_t)(sp / n_expert) * xq_blocks + b].d;
+        }
+        __syncthreads();
+    }
+    if (row >= expert_mid_dim) return;
+    const char *gate_row = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const char *up_row = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const uint64_t gate_chunk_bytes = gate_row_bytes / xq_blocks;
+    float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint64_t sq = (uint64_t)xq_blocks << 8u;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        const cuda_block_mxfp4 *gb = (const cuda_block_mxfp4 *)(gate_row + (uint64_t)b * gate_chunk_bytes);
+        const cuda_block_mxfp4 *ub = (const cuda_block_mxfp4 *)(up_row + (uint64_t)b * gate_chunk_bytes);
+        if (staged) {
+            const int8_t *qb = sqs + ((uint64_t)b << 8u);
+            dev_dot_mxfp4_q8a_pair_block8(gb, ub,
+                qb, qb + sq, qb + 2u * sq, qb + 3u * sq,
+                qb + 4u * sq, qb + 5u * sq, qb + 6u * sq, qb + 7u * sq,
+                sds[b], sds[xq_blocks + b], sds[2u * xq_blocks + b], sds[3u * xq_blocks + b],
+                sds[4u * xq_blocks + b], sds[5u * xq_blocks + b], sds[6u * xq_blocks + b], sds[7u * xq_blocks + b],
+                np, gate, up);
+        } else {
+            dev_dot_mxfp4_q8_K_block8(gb, xqb[0] + b, xqb[1] + b, xqb[2] + b, xqb[3] + b,
+                                      xqb[4] + b, xqb[5] + b, xqb[6] + b, xqb[7] + b, np, gate);
+            dev_dot_mxfp4_q8_K_block8(ub, xqb[0] + b, xqb[1] + b, xqb[2] + b, xqb[3] + b,
+                                      xqb[4] + b, xqb[5] + b, xqb[6] + b, xqb[7] + b, np, up);
+        }
+    }
+    /* pair == tok * n_expert + slot, so it indexes weights directly. */
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p >= np) continue;
+        gate[p] = quarter_warp_sum_f32(gate[p], lane);
+        up[p] = quarter_warp_sum_f32(up[p], lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate[p] > clamp) gate[p] = clamp;
+                if (up[p] > clamp) up[p] = clamp;
+                if (up[p] < -clamp) up[p] = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate[p];
+                up_out[off] = up[p];
+            }
+            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[pair[p]];
+        }
+    }
+}
+
+/* Generic-tile MXFP4 gate/up kernel: TILE_TOKENS tokens per expert tile,
+ * QWARPS 32-row slots per block (blockDim = QWARPS*8).  Lets the launch
+ * trade staging footprint against resident-warp count: tile4 stages
+ * TILE_TOKENS*xq_blocks*260 B (29.1 KiB at 7168 dims -> 4 blocks/WGP),
+ * row64 keeps 8-token staging but runs 512 threads (2 blocks/WGP -> 32
+ * resident warps).  Both target the tile8 kernel's latency-bound profile
+ * (1-2 blocks/WGP today) without touching arithmetic.
+ *
+ * Exactness: per (token,row) output the accumulation order is identical
+ * to moe_gate_up_mid_mxfp4_expert_tile8_row32_kernel - same 8-lane split
+ * of the q8_K block loop, same dev_dot helpers, same quarter-warp
+ * reduction, same epilogue.  Only grid/tile geometry changes. */
+template <uint32_t TILE_TOKENS, uint32_t QWARPS>
+__global__ static void moe_gate_up_mid_mxfp4_expert_tileN_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t max_count,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t tile = blockIdx.x;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.y * QWARPS + (threadIdx.x >> 3u);
+    uint32_t expert = tile_experts[tile];
+    uint32_t count = counts[expert];
+    if (max_count != 0u && count >= max_count) return;
+    uint32_t local_start = tile_starts[tile];
+    extern __shared__ int4 sxq4[];
+    int8_t *sqs = (int8_t *)sxq4;
+    float *sds = (float *)(sqs + (uint64_t)TILE_TOKENS * xq_blocks * 256u);
+    uint32_t pair[TILE_TOKENS] = {0};
+    const cuda_block_q8_K *xqb[TILE_TOKENS];
+    #pragma unroll
+    for (uint32_t p = 0; p < TILE_TOKENS; p++) xqb[p] = xq;
+    uint32_t np = count - local_start;
+    if (np > TILE_TOKENS) np = TILE_TOKENS;
+    #pragma unroll
+    for (uint32_t p = 0; p < TILE_TOKENS; p++) {
+        if (p < np) {
+            pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+            xqb[p] = xq + (uint64_t)(pair[p] / n_expert) * xq_blocks;
+        }
+    }
+    const int staged = xq_blocks <= 28u;
+    if (staged) {
+        for (uint32_t i = threadIdx.x; i < np * xq_blocks * 16u; i += blockDim.x) {
+            const uint32_t u = i / (xq_blocks * 16u);
+            const uint32_t rem = i - u * (xq_blocks * 16u);
+            const uint32_t b = rem >> 4u;
+            const uint32_t k = rem & 15u;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            const int32_t *src = (const int32_t *)
+                xq[(uint64_t)(sp / n_expert) * xq_blocks + b].qs + k * 4u;
+            ((int4 *)sqs)[(u * xq_blocks + b) * 16u + k] =
+                make_int4(src[0], src[1], src[2], src[3]);
+        }
+        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
+            const uint32_t u = i / xq_blocks;
+            const uint32_t b = i - u * xq_blocks;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            sds[i] = xq[(uint64_t)(sp / n_expert) * xq_blocks + b].d;
+        }
+        __syncthreads();
+    }
+    if (row >= expert_mid_dim) return;
+    const char *gate_row = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const char *up_row = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const uint64_t gate_chunk_bytes = gate_row_bytes / xq_blocks;
+    float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint64_t sq = (uint64_t)xq_blocks << 8u;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        const cuda_block_mxfp4 *gb = (const cuda_block_mxfp4 *)(gate_row + (uint64_t)b * gate_chunk_bytes);
+        const cuda_block_mxfp4 *ub = (const cuda_block_mxfp4 *)(up_row + (uint64_t)b * gate_chunk_bytes);
+        if (staged) {
+            const int8_t *qb = sqs + ((uint64_t)b << 8u);
+            const int8_t *qp[8];
+            float sd[8];
+            #pragma unroll
+            for (uint32_t p = 0; p < 8u; p++) {
+                qp[p] = qb + (p < TILE_TOKENS ? p : 0u) * sq;
+                sd[p] = sds[(p < TILE_TOKENS ? p : 0u) * xq_blocks + b];
+            }
+            dev_dot_mxfp4_q8a_pair_block8(gb, ub,
+                qp[0], qp[1], qp[2], qp[3], qp[4], qp[5], qp[6], qp[7],
+                sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7],
+                np, gate, up);
+        } else {
+            const cuda_block_q8_K *xq8[8];
+            #pragma unroll
+            for (uint32_t p = 0; p < 8u; p++) xq8[p] = xqb[p < TILE_TOKENS ? p : 0u] + b;
+            dev_dot_mxfp4_q8_K_block8(gb, xq8[0], xq8[1], xq8[2], xq8[3],
+                                      xq8[4], xq8[5], xq8[6], xq8[7], np, gate);
+            dev_dot_mxfp4_q8_K_block8(ub, xq8[0], xq8[1], xq8[2], xq8[3],
+                                      xq8[4], xq8[5], xq8[6], xq8[7], np, up);
+        }
+    }
+    /* pair == tok * n_expert + slot, so it indexes weights directly. */
+    #pragma unroll
+    for (uint32_t p = 0; p < TILE_TOKENS; p++) {
+        if (p >= np) continue;
+        gate[p] = quarter_warp_sum_f32(gate[p], lane);
+        up[p] = quarter_warp_sum_f32(up[p], lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate[p] > clamp) gate[p] = clamp;
+                if (up[p] > clamp) up[p] = clamp;
+                if (up[p] < -clamp) up[p] = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate[p];
+                up_out[off] = up[p];
+            }
+            mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[pair[p]];
+        }
+    }
+}
+
+/* Prefill-oriented MXFP4 gate/up kernel: one block covers 8 output rows
+ * for up to 128 tokens of a single expert, with the 8 gate+up weight
+ * rows staged in LDS (16 * gate_row_bytes; 60.9 KiB at row_bytes=3808).
+ * Each expert's weights are then read from DRAM ~once per 128-token
+ * tile instead of once per 8-token tile (16x re-read reduction at
+ * balanced routing), while the quantized activations stream from global
+ * (the expert's ~1 MiB xq working set stays L2-resident across its row
+ * blocks).
+ *
+ * Exactness: per (token,row) output the accumulation order is identical
+ * to moe_gate_up_mid_mxfp4_expert_tile8_row32_kernel - same 8-lane split
+ * of the q8_K block loop, same dev_dot_mxfp4_q8_K_block8 helper, same
+ * quarter-warp reduction, same epilogue.  Only data movement changes. */
+__global__ static void moe_gate_up_mid_mxfp4_expert_row8_ldsB_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t max_count,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t count = counts[expert];
+    if (max_count != 0u && count >= max_count) return;
+    const uint32_t local_start = tile_starts[tile];
+    const uint32_t row0 = blockIdx.x * 8u;
+    if (row0 >= expert_mid_dim) return;
+
+    /* LDS layout: 16 segments (gate rows 0..7 then up rows 0..7), each
+     * gate_row_bytes long, laid out exactly like the global weight row so
+     * the dot helper can point into it directly. */
+    extern __shared__ char sB[];
+    {
+        const uint32_t nseg4 = (uint32_t)(gate_row_bytes >> 4u); /* 16 B units per row */
+        const int4 *g4 = (const int4 *)(gate_base + (uint64_t)expert * gate_expert_bytes) + (uint64_t)row0 * nseg4;
+        const int4 *u4 = (const int4 *)(up_base + (uint64_t)expert * gate_expert_bytes) + (uint64_t)row0 * nseg4;
+        int4 *dst = (int4 *)sB;
+        for (uint32_t m = 0; m < 2u; m++) {
+            const int4 *src = m == 0u ? g4 : u4;
+            for (uint32_t r = 0; r < 8u; r++) {
+                for (uint32_t i = threadIdx.x; i < nseg4; i += blockDim.x) {
+                    dst[(m * 8u + r) * nseg4 + i] = src[r * nseg4 + i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t qwarp = threadIdx.x >> 3u;          /* 0..31 */
+    const uint32_t row_in = qwarp & 7u;                /* row within the block's 8 */
+    const uint32_t tok_grp = qwarp >> 3u;              /* 4 token groups of 8 per round */
+    const uint32_t row = row0 + row_in;
+    const uint32_t avail = count - local_start;
+
+    for (uint32_t round = 0u; round * 32u < avail; round++) {
+        const uint32_t t0 = local_start + round * 32u + tok_grp * 8u;
+        uint32_t np = (t0 < count) ? count - t0 : 0u;
+        if (np > 8u) np = 8u;
+        uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const cuda_block_q8_K *xqb[8] = { xq, xq, xq, xq, xq, xq, xq, xq };
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) {
+            if (p < np) {
+                pair[p] = sorted_pairs[offsets[expert] + t0 + p];
+                xqb[p] = xq + (uint64_t)(pair[p] / n_expert) * xq_blocks;
+            }
+        }
+        const char *sB_gate = sB + (uint64_t)row_in * gate_row_bytes;
+        const char *sB_up   = sB + (uint64_t)(8u + row_in) * gate_row_bytes;
+        const uint64_t chunk_bytes = gate_row_bytes / xq_blocks;
+        float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            const cuda_block_mxfp4 *gb = (const cuda_block_mxfp4 *)(sB_gate + (uint64_t)b * chunk_bytes);
+            const cuda_block_mxfp4 *ub = (const cuda_block_mxfp4 *)(sB_up + (uint64_t)b * chunk_bytes);
+            dev_dot_mxfp4_q8_K_block8(gb, xqb[0] + b, xqb[1] + b, xqb[2] + b, xqb[3] + b,
+                                      xqb[4] + b, xqb[5] + b, xqb[6] + b, xqb[7] + b, np, gate);
+            dev_dot_mxfp4_q8_K_block8(ub, xqb[0] + b, xqb[1] + b, xqb[2] + b, xqb[3] + b,
+                                      xqb[4] + b, xqb[5] + b, xqb[6] + b, xqb[7] + b, np, up);
+        }
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) {
+            if (p >= np) continue;
+            gate[p] = quarter_warp_sum_f32(gate[p], lane);
+            up[p] = quarter_warp_sum_f32(up[p], lane);
+            if (lane == 0) {
+                if (clamp > 1.0e-6f) {
+                    if (gate[p] > clamp) gate[p] = clamp;
+                    if (up[p] > clamp) up[p] = clamp;
+                    if (up[p] < -clamp) up[p] = -clamp;
+                }
+                const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+                if (write_aux) {
+                    gate_out[off] = gate[p];
+                    up_out[off] = up[p];
+                }
+                mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[pair[p]];
+            }
+        }
+    }
+}
+
+/* MXFP4 prefill gate/up tile32 kernel: each quarter-warp owns one output
+ * row and FOUR 8-token groups (32 tokens), so the 17-byte weight chunks it
+ * loads per q8_K block are reused across 32 tokens instead of 8.  At
+ * balanced routing (128 tokens/expert) this cuts the expert-weight DRAM
+ * re-read factor from 16x to 4x; the production tile8 path is bound by
+ * exactly that traffic (~64 GB per 10.5k-token prefill).
+ *
+ * Exactness: identical to the tile8 kernel per (token,row) output - same
+ * 8-lane split of the q8_K block loop, same dev_dot_mxfp4_q8_K_block8
+ * helper per 8-token group, same quarter-warp reduction and epilogue.
+ * Only the weight-load reuse changes. */
+__global__ static void moe_gate_up_mid_mxfp4_expert_tile32_row32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t max_count,
+        uint32_t write_aux,
+        float clamp) {
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t count = counts[expert];
+    if (max_count != 0u && count >= max_count) return;
+    const uint32_t local_start = tile_starts[tile];
+    if (row >= expert_mid_dim) return;
+    const char *gate_row = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const char *up_row = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+    const uint64_t chunk_bytes = gate_row_bytes / xq_blocks;
+
+    uint32_t pair[32];
+    uint32_t np4[4] = {0u, 0u, 0u, 0u};
+    #pragma unroll
+    for (uint32_t g = 0; g < 4u; g++) {
+        const uint32_t t0 = local_start + g * 8u;
+        uint32_t np = (t0 < count) ? count - t0 : 0u;
+        if (np > 8u) np = 8u;
+        np4[g] = np;
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) {
+            pair[g * 8u + p] = (p < np)
+                ? sorted_pairs[offsets[expert] + t0 + p]
+                : 0u;
+        }
+    }
+    float gate[32];
+    float up[32];
+    #pragma unroll
+    for (uint32_t i = 0; i < 32u; i++) { gate[i] = 0.0f; up[i] = 0.0f; }
+
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        const cuda_block_mxfp4 *gb = (const cuda_block_mxfp4 *)(gate_row + (uint64_t)b * chunk_bytes);
+        const cuda_block_mxfp4 *ub = (const cuda_block_mxfp4 *)(up_row + (uint64_t)b * chunk_bytes);
+        #pragma unroll
+        for (uint32_t g = 0; g < 4u; g++) {
+            if (np4[g] == 0u) continue;
+            const uint32_t tok0 = pair[g * 8u + 0] / n_expert;
+            const cuda_block_q8_K *xg = xq + (uint64_t)tok0 * xq_blocks;
+            /* Groups are 8 consecutive sorted pairs of one expert; pairs
+             * share the expert, but the tokens are arbitrary, so the xq
+             * base must be per-token.  Build the 8 pointers for this
+             * group (registers reused across the b loop). */
+            const cuda_block_q8_K *xp[8];
+            #pragma unroll
+            for (uint32_t p = 0; p < 8u; p++) {
+                xp[p] = (p < np4[g])
+                    ? xq + (uint64_t)(pair[g * 8u + p] / n_expert) * xq_blocks + b
+                    : xg + b;
+            }
+            dev_dot_mxfp4_q8_K_block8(gb, xp[0], xp[1], xp[2], xp[3],
+                                      xp[4], xp[5], xp[6], xp[7], np4[g], gate + g * 8u);
+            dev_dot_mxfp4_q8_K_block8(ub, xp[0], xp[1], xp[2], xp[3],
+                                      xp[4], xp[5], xp[6], xp[7], np4[g], up + g * 8u);
+        }
+    }
+    #pragma unroll
+    for (uint32_t g = 0; g < 4u; g++) {
+        #pragma unroll
+        for (uint32_t p = 0; p < 8u; p++) {
+            if (p >= np4[g]) continue;
+            const uint32_t i = g * 8u + p;
+            gate[i] = quarter_warp_sum_f32(gate[i], lane);
+            up[i] = quarter_warp_sum_f32(up[i], lane);
+            if (lane == 0) {
+                if (clamp > 1.0e-6f) {
+                    if (gate[i] > clamp) gate[i] = clamp;
+                    if (up[i] > clamp) up[i] = clamp;
+                    if (up[i] < -clamp) up[i] = -clamp;
+                }
+                const uint64_t off = (uint64_t)pair[i] * expert_mid_dim + row;
+                if (write_aux) {
+                    gate_out[off] = gate[i];
+                    up_out[off] = up[i];
+                }
+                mid_out[off] = (gate[i] / (1.0f + expf(-gate[i]))) * up[i] * weights[pair[i]];
+            }
+        }
+    }
+}
+
 __global__ static DS4_ROCM_UNUSED void moe_down_kernel(
         float *down_out,
         const char *down_base,
@@ -1998,6 +2760,88 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
                 up_out[off] = up;
             }
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
+__global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    constexpr uint32_t rows_per_wave = 1u;
+    constexpr uint32_t waves_per_block = 8u;
+    constexpr uint32_t rows_per_block = rows_per_wave * waves_per_block;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t block_lane = lane >> 1u;
+    const uint32_t half = lane & 1u;
+    const uint32_t first_row = blockIdx.x * rows_per_block + wave * rows_per_wave;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate[rows_per_wave] = {0.0f};
+    float up[rows_per_wave] = {0.0f};
+    const uint32_t mxfp4_blocks = xq_blocks * 8u;
+
+    for (uint32_t mb = block_lane; mb < mxfp4_blocks; mb += 16u) {
+        const cuda_block_q8_K *yb = xqb + (mb >> 3u);
+        #pragma unroll
+        for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+            const uint32_t row = first_row + rr;
+            if (row >= expert_mid_dim) continue;
+            const cuda_block_mxfp4 *gate_blocks =
+                (const cuda_block_mxfp4 *)(gate_base +
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)row * gate_row_bytes);
+            const cuda_block_mxfp4 *up_blocks =
+                (const cuda_block_mxfp4 *)(up_base +
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)row * gate_row_bytes);
+            const uint32_t subblock = mb & 7u;
+            gate[rr] += dev_dot_mxfp4_q8_K_half_block(
+                gate_blocks + mb, yb, subblock, half);
+            up[rr] += dev_dot_mxfp4_q8_K_half_block(
+                up_blocks + mb, yb, subblock, half);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+        const uint32_t row = first_row + rr;
+        if (row >= expert_mid_dim) continue;
+        gate[rr] = warp_sum_f32(gate[rr]);
+        up[rr] = warp_sum_f32(up[rr]);
+        if (lane == 0u) {
+            float g = gate[rr];
+            float u = up[rr];
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = g;
+                up_out[off] = u;
+            }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u *
+                weights[(uint64_t)tok * n_expert + slot];
         }
     }
 }
@@ -2257,6 +3101,64 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+template <bool Batch>
+__global__ static void moe_down_mxfp4_sum6_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    constexpr uint32_t rows_per_wave = 1u;
+    constexpr uint32_t waves_per_block = 8u;
+    constexpr uint32_t rows_per_block = rows_per_wave * waves_per_block;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t block_lane = lane >> 1u;
+    const uint32_t half = lane & 1u;
+    const uint32_t first_row = blockIdx.x * rows_per_block + wave * rows_per_wave;
+    const uint32_t tok = Batch ? blockIdx.y : 0u;
+    const int32_t *token_selected = selected + (uint64_t)tok * n_expert;
+    const cuda_block_q8_K *token_midq =
+        midq + (uint64_t)tok * n_expert * midq_blocks;
+    float *token_out = out + (uint64_t)tok * out_dim;
+    float total[rows_per_wave] = {0.0f};
+    const uint32_t mxfp4_blocks = midq_blocks * 8u;
+
+    #pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        int32_t expert_i = token_selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const cuda_block_q8_K *xq = token_midq + (uint64_t)slot * midq_blocks;
+        for (uint32_t mb = block_lane; mb < mxfp4_blocks; mb += 16u) {
+            const cuda_block_q8_K *yb = xq + (mb >> 3u);
+            #pragma unroll
+            for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+                const uint32_t row = first_row + rr;
+                if (row >= out_dim) continue;
+                const cuda_block_mxfp4 *down_blocks =
+                    (const cuda_block_mxfp4 *)(down_base +
+                        (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+                        (uint64_t)row * down_row_bytes);
+                total[rr] += dev_dot_mxfp4_q8_K_half_block(
+                    down_blocks + mb, yb, mb & 7u, half);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t rr = 0; rr < rows_per_wave; rr++) {
+        const uint32_t row = first_row + rr;
+        if (row >= out_dim) continue;
+        total[rr] = warp_sum_f32(total[rr]);
+        if (lane == 0u) token_out[row] = total[rr];
+    }
+}
+
 __global__ static void moe_down_q4K_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -2431,6 +3333,107 @@ __global__ static void moe_down_q4K_expert_tile8_row32_kernel(
                 down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
             }
         }
+    }
+}
+
+__global__ static void moe_down_mxfp4_expert_tile8_row32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t atomic_out,
+        uint32_t row_groups) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t expert = tile_experts[tile];
+    uint32_t local_start = tile_starts[tile];
+    /* Aligned quant slices plus separate scales, as in the gate/up tile
+     * kernel, so the dot helper loads b128 from LDS. */
+    __shared__ int4 sxq4[8u * 8u * 16u];
+    __shared__ float sds[8u * 8u];
+    int8_t *sqs = (int8_t *)sxq4;
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    /* Fixed-count predicated setup keeps pair/xqb in registers; the tail
+     * xqb entries stay at valid dummy rows and are never read past np. */
+    const cuda_block_q8_K *xqb[8] = { midq, midq, midq, midq, midq, midq, midq, midq };
+    uint32_t count = counts[expert];
+    uint32_t np = count - local_start;
+    if (np > 8u) np = 8u;
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p < np) {
+            pair[p] = sorted_pairs[offsets[expert] + local_start + p];
+            xqb[p] = midq + (uint64_t)pair[p] * midq_blocks;
+        }
+    }
+    const int staged = midq_blocks <= 8u;
+    if (staged) {
+        for (uint32_t i = threadIdx.x; i < np * midq_blocks * 16u; i += blockDim.x) {
+            const uint32_t u = i / (midq_blocks * 16u);
+            const uint32_t rem = i - u * (midq_blocks * 16u);
+            const uint32_t b = rem >> 4u;
+            const uint32_t k = rem & 15u;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            const int32_t *src = (const int32_t *)
+                midq[(uint64_t)sp * midq_blocks + b].qs + k * 4u;
+            ((int4 *)sqs)[(u * midq_blocks + b) * 16u + k] =
+                make_int4(src[0], src[1], src[2], src[3]);
+        }
+        for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
+            const uint32_t u = i / midq_blocks;
+            const uint32_t b = i - u * midq_blocks;
+            const uint32_t sp = sorted_pairs[offsets[expert] + local_start + u];
+            sds[i] = midq[(uint64_t)sp * midq_blocks + b].d;
+        }
+        __syncthreads();
+    }
+    /* Each block covers row_groups consecutive 32-row groups against one
+     * staged copy of the tile's activations: activation staging traffic
+     * and block-launch count both divide by row_groups.  Per (token,row)
+     * the arithmetic is untouched (same helper, same lane-strided block
+     * loop, same reduction), so results are bit-identical to
+     * row_groups=1. */
+    for (uint32_t rg = 0u; rg < row_groups; rg++) {
+    uint32_t row = (blockIdx.x * row_groups + rg) * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) continue;
+    const char *down_row = down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
+    const uint64_t down_chunk_bytes = down_row_bytes / midq_blocks;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint64_t sq = (uint64_t)midq_blocks << 8u;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+        const cuda_block_mxfp4 *wb = (const cuda_block_mxfp4 *)(down_row + (uint64_t)b * down_chunk_bytes);
+        if (staged) {
+            const int8_t *qb = sqs + ((uint64_t)b << 8u);
+            dev_dot_mxfp4_q8a_block8(wb,
+                qb, qb + sq, qb + 2u * sq, qb + 3u * sq,
+                qb + 4u * sq, qb + 5u * sq, qb + 6u * sq, qb + 7u * sq,
+                sds[b], sds[midq_blocks + b], sds[2u * midq_blocks + b], sds[3u * midq_blocks + b],
+                sds[4u * midq_blocks + b], sds[5u * midq_blocks + b], sds[6u * midq_blocks + b], sds[7u * midq_blocks + b],
+                np, acc);
+        } else {
+            dev_dot_mxfp4_q8_K_block8(wb, xqb[0] + b, xqb[1] + b, xqb[2] + b, xqb[3] + b,
+                                      xqb[4] + b, xqb[5] + b, xqb[6] + b, xqb[7] + b, np, acc);
+        }
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < 8u; p++) {
+        if (p >= np) continue;
+        acc[p] = quarter_warp_sum_f32(acc[p], lane);
+        if (lane == 0) {
+            down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+        }
+    }
     }
 }
 

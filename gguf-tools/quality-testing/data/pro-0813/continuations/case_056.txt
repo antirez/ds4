@@ -1,0 +1,1 @@
+In un layer **Mixture-of-Experts (MoE)**, il **router** (chiamato anche *

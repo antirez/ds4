@@ -1,0 +1,4 @@
+Here's pseudocode for a binary heap push operation (assuming a min-heap):
+
+```
+function push(heap, value

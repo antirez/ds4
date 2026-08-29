@@ -14887,6 +14887,21 @@ static void output_logits_one_decode_scratch(
 
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
+static bool sample_build_probabilities(const float *logits,
+                                       uint32_t n_vocab,
+                                       float temperature,
+                                       int top_k,
+                                       float top_p,
+                                       float min_p,
+                                       float *probs);
+static int sample_probabilities(const float *probs, uint32_t n_vocab,
+                                uint64_t *rng);
+#ifdef DS4_TEST_HOOKS
+static int sample_residual_probabilities(float *target_probs,
+                                         const float *draft_probs,
+                                         uint32_t n_vocab,
+                                         uint64_t *rng);
+#endif
 
 /* =========================================================================
  * Metal Reference Comparison Helpers.
@@ -36852,6 +36867,7 @@ struct ds4_engine {
     int mtp_draft_tokens;
     float mtp_margin;
     float dspark_confidence_threshold;
+    bool dspark_confidence_threshold_set;
     char *directional_steering_file;
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
@@ -36871,6 +36887,7 @@ struct ds4_engine {
     bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
+    bool dspark_exact_sampling;
     bool cuda_tensor_parallel;
     bool glm_tp_token_prefill;
     bool ssd_streaming;
@@ -38363,6 +38380,191 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
     }
 }
 
+/* Materialize the exact distribution represented by the public sampling
+ * knobs. Speculative decoding needs probabilities, rather than only a sampled
+ * token, for the p/q acceptance test and the corrected rejection sample. */
+static bool sample_build_probabilities(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        int          top_k,
+        float        top_p,
+        float        min_p,
+        float       *probs) {
+    if (!logits || !probs || n_vocab == 0) return false;
+    memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+
+    if (temperature <= 0.0f) {
+        probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        return true;
+    }
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+    if (top_k > 1024) top_k = 1024;
+    if (top_k < 0) top_k = 0;
+    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
+
+    enum { SAMPLE_PROB_FAST_CAP = 512 };
+    sample_candidate heap[1024];
+    const uint32_t heap_cap = top_k > 0 ? (uint32_t)top_k :
+        (uint32_t)SAMPLE_PROB_FAST_CAP;
+    uint32_t finite = 0;
+    uint32_t heap_n = 0;
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (!isfinite(logits[i])) continue;
+        finite++;
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+    if (finite == 0) {
+        probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        return true;
+    }
+
+    float full_sum = 0.0f;
+    float heap_sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float raw = expf((v - max_logit) / temperature);
+        full_sum += raw;
+        sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
+        if (heap_n < heap_cap) {
+            heap[heap_n] = cand;
+            heap_sum += raw;
+            sample_heap_sift_up(heap, heap_n);
+            heap_n++;
+        } else if (sample_candidate_gt(cand, heap[0])) {
+            heap_sum -= heap[0].prob;
+            heap[0] = cand;
+            heap_sum += raw;
+            sample_heap_sift_down(heap, heap_n, 0);
+        }
+    }
+    if (full_sum <= 0.0f || !isfinite(full_sum) || heap_n == 0) {
+        probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        return true;
+    }
+
+    qsort(heap, heap_n, sizeof(heap[0]), sample_candidate_cmp_desc);
+    float base_sum = top_k > 0 ? heap_sum : full_sum;
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    bool stopped_by_min_p = false;
+    bool reached_top_p = false;
+    const float min_raw = heap[0].prob * min_p;
+    for (uint32_t i = 0; i < heap_n; i++) {
+        if (i > 0 && heap[i].prob < min_raw) {
+            stopped_by_min_p = true;
+            break;
+        }
+        filtered_sum += heap[i].prob;
+        filtered++;
+        if (filtered_sum / base_sum >= top_p) {
+            reached_top_p = true;
+            break;
+        }
+    }
+
+    const bool heap_has_all = heap_n == finite;
+    const bool min_p_proves_tail_filtered =
+        stopped_by_min_p && heap[heap_n - 1u].prob < min_raw;
+    const bool fast_complete = top_k > 0 || heap_has_all || reached_top_p ||
+        min_p_proves_tail_filtered;
+
+    sample_candidate *cand = heap;
+    uint32_t cand_n = heap_n;
+    bool owned = false;
+    if (!fast_complete) {
+        cand = xmalloc((size_t)finite * sizeof(cand[0]));
+        cand_n = 0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            cand[cand_n++] = (sample_candidate){
+                .id = (int)i,
+                .logit = v,
+                .prob = expf((v - max_logit) / temperature),
+            };
+        }
+        qsort(cand, cand_n, sizeof(cand[0]), sample_candidate_cmp_desc);
+        base_sum = full_sum;
+        filtered_sum = 0.0f;
+        filtered = 0;
+        const float full_min_raw = cand[0].prob * min_p;
+        for (uint32_t i = 0; i < cand_n; i++) {
+            if (i > 0 && cand[i].prob < full_min_raw) break;
+            filtered_sum += cand[i].prob;
+            filtered++;
+            if (filtered_sum / base_sum >= top_p) break;
+        }
+        owned = true;
+    }
+
+    if (filtered == 0 || filtered_sum <= 0.0f || !isfinite(filtered_sum)) {
+        probs[cand[0].id] = 1.0f;
+    } else {
+        const float inv_sum = 1.0f / filtered_sum;
+        for (uint32_t i = 0; i < filtered; i++) {
+            probs[cand[i].id] = cand[i].prob * inv_sum;
+        }
+    }
+    if (owned) free(cand);
+    return true;
+}
+
+static int sample_probabilities(const float *probs, uint32_t n_vocab,
+                                uint64_t *rng) {
+    if (!probs || !rng || n_vocab == 0) return -1;
+    float sum = 0.0f;
+    int best = 0;
+    float best_p = probs[0];
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float p = probs[i];
+        if (p > 0.0f && isfinite(p)) sum += p;
+        if (p > best_p) {
+            best_p = p;
+            best = (int)i;
+        }
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return best;
+    float r = sample_rng_f32(rng) * sum;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float p = probs[i];
+        if (p <= 0.0f || !isfinite(p)) continue;
+        r -= p;
+        if (r <= 0.0f) return (int)i;
+    }
+    return best;
+}
+
+/* Replace target_probs with normalized max(0, p-q) and sample it. This is the
+ * correction that keeps speculative decoding distributed exactly as p after
+ * a rejected draft token. */
+#ifdef DS4_TEST_HOOKS
+static int sample_residual_probabilities(float *target_probs,
+                                         const float *draft_probs,
+                                         uint32_t n_vocab,
+                                         uint64_t *rng) {
+    if (!target_probs || !draft_probs || !rng || n_vocab == 0) return -1;
+    int target_best = 0;
+    float target_best_p = target_probs[0];
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (target_probs[i] > target_best_p) {
+            target_best_p = target_probs[i];
+            target_best = (int)i;
+        }
+        float residual = target_probs[i] - draft_probs[i];
+        if (!(residual > 0.0f) || !isfinite(residual)) residual = 0.0f;
+        target_probs[i] = residual;
+        sum += residual;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return target_best;
+    return sample_probabilities(target_probs, n_vocab, rng);
+}
+#endif
+
 static bool sample_fast_top_p(
         const float *logits,
         uint32_t     n_vocab,
@@ -38694,6 +38896,65 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
     if (!logits || !rng || n_vocab == 0) return -1;
     return sample_top_p_min_p(logits, n_vocab, temperature, top_k,
                               top_p, min_p, rng, prob_scratch);
+}
+
+int ds4_test_sampling_probabilities(const float *logits, uint32_t n_vocab,
+                                    float temperature, int top_k,
+                                    float top_p, float min_p, float *probs) {
+    return sample_build_probabilities(logits, n_vocab, temperature, top_k,
+                                      top_p, min_p, probs) ? 1 : 0;
+}
+
+int ds4_test_speculative_sample(const float *target_logits,
+                                const float *draft_logits,
+                                uint32_t n_vocab,
+                                float temperature,
+                                int top_k,
+                                float top_p,
+                                float min_p,
+                                uint64_t *rng,
+                                float *target_probs,
+                                float *draft_probs) {
+    if (!target_logits || !draft_logits || !rng || !target_probs ||
+        !draft_probs || n_vocab == 0 || temperature <= 0.0f) {
+        return -1;
+    }
+    if (!sample_build_probabilities(draft_logits, n_vocab, temperature,
+                                    top_k, top_p, min_p, draft_probs) ||
+        !sample_build_probabilities(target_logits, n_vocab, temperature,
+                                    top_k, top_p, min_p, target_probs)) {
+        return -1;
+    }
+    const int proposal = sample_probabilities(draft_probs, n_vocab, rng);
+    if (proposal < 0) return -1;
+    const float q = draft_probs[proposal];
+    const float p = target_probs[proposal];
+    if (q <= 0.0f || sample_rng_f32(rng) * q <= p) return proposal;
+    return sample_residual_probabilities(target_probs, draft_probs,
+                                         n_vocab, rng);
+}
+
+int ds4_test_speculative_delta_sample(const float *target_logits,
+                                      uint32_t n_vocab,
+                                      int draft_token,
+                                      float temperature,
+                                      int top_k,
+                                      float top_p,
+                                      float min_p,
+                                      uint64_t *rng,
+                                      float *target_probs) {
+    if (!target_logits || !rng || !target_probs || n_vocab == 0 ||
+        draft_token < 0 || (uint32_t)draft_token >= n_vocab ||
+        temperature <= 0.0f ||
+        !sample_build_probabilities(target_logits, n_vocab, temperature,
+                                    top_k, top_p, min_p, target_probs)) {
+        return -1;
+    }
+    if (sample_rng_f32(rng) <= target_probs[draft_token]) {
+        return draft_token;
+    }
+    target_probs[draft_token] = 0.0f;
+    return sample_probabilities(target_probs, n_vocab, rng);
 }
 
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
@@ -49317,7 +49578,10 @@ struct ds4_session {
     double dspark_last_target_eval_ms;
     double dspark_last_propose_ms;
     float dspark_last_confidence0;
+    float dspark_sample_temperature;
+    uint64_t *dspark_sample_rng;
     bool dspark_draft_valid;
+    bool dspark_stochastic_draft;
     bool dspark_sched_skipped_cycle;
     bool dspark_sched_long_accept_seen;
     bool dspark_last_confidence0_valid;
@@ -50946,7 +51210,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
-        return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+        return (gate->type == DS4_TENSOR_Q4_K ||
+                gate->type == DS4_TENSOR_MXFP4) ? 4 : 2;
     }
     return 0;
 }
@@ -57150,6 +57415,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
     e->dspark_strict = opt->dspark_strict;
+    e->dspark_exact_sampling = opt->dspark_exact_sampling;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
@@ -57174,6 +57440,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->dspark_confidence_threshold =
             e->backend == DS4_BACKEND_METAL ? 0.6f : 0.7f;
     }
+    e->dspark_confidence_threshold_set =
+        opt->dspark_confidence_threshold_set;
     if (opt->cuda_tensor_parallel &&
         (opt->backend != DS4_BACKEND_CUDA || !gpu_cfg ||
          gpu_cfg->n_gpus < 2 || (gpu_cfg->n_gpus & 1) != 0)) {
@@ -57594,7 +57862,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
-                        "greedy output may differ from one-token decode due "
+                        "output may differ from one-token decode due "
                         "to batched floating-point operation order\n");
             }
         } else {
@@ -60923,7 +61191,14 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     const bool fake_argmax_enabled =
         enabled &&
         fake_argmax && fake_argmax[0] && strcmp(fake_argmax, "0") != 0;
-    const float confidence_threshold = s->engine->dspark_confidence_threshold;
+    const bool stochastic_requested =
+        s->dspark_sample_rng != NULL &&
+        s->dspark_sample_temperature > 0.0f;
+    const float confidence_threshold =
+        stochastic_requested &&
+        !s->engine->dspark_confidence_threshold_set &&
+        s->engine->dspark_confidence_threshold < 0.8f ?
+            0.8f : s->engine->dspark_confidence_threshold;
     const bool stats_enabled = ds4_dspark_stats_enabled();
     const bool scheduler_enabled = ds4_dspark_scheduler_enabled();
     const bool time_enabled =
@@ -60938,6 +61213,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     } while (0)
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
+    s->dspark_stochastic_draft = false;
     s->dspark_last_confidence0 = 0.0f;
     s->dspark_last_confidence0_valid = false;
     if (scheduler_enabled) s->dspark_last_propose_ms = 0.0;
@@ -61196,14 +61472,15 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                         0,
                                         logits,
                                         logits_bytes) != 0 &&
-                    dspark_apply_markov_greedy_probe(logits,
-                                                     &s->engine->mtp_model,
-                                                     dw,
-                                                     token,
-                                                     markov_state,
-                                                     markov_bias,
-                                                     markov_proposal,
-                                                     &markov_proposal_len);
+                    dspark_apply_markov_greedy_probe(
+                        logits,
+                        &s->engine->mtp_model,
+                        dw,
+                        token,
+                        markov_state,
+                        markov_bias,
+                        markov_proposal,
+                        &markov_proposal_len);
                 if (markov_ok && probe_log) {
                     /* Runtime only needs the greedy proposal. Keep the GPU
                      * writeback for probe mode, where spec_logits may be
@@ -61278,10 +61555,15 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             if (s->dspark_draft_len > DS4_DSPARK_MAX_BLOCK_SIZE) {
                 s->dspark_draft_len = DS4_DSPARK_MAX_BLOCK_SIZE;
             }
+            if (stochastic_requested && s->dspark_draft_len < 2u) {
+                s->dspark_draft_len = 0;
+            }
             for (uint32_t i = 0; i < s->dspark_draft_len; i++) {
                 s->dspark_draft_tokens[i] = markov_proposal[i];
             }
             s->dspark_draft_valid = s->dspark_draft_len != 0;
+            s->dspark_stochastic_draft =
+                s->dspark_draft_valid && stochastic_requested;
         }
         if (confidence_ok && confidence_len != 0) {
             s->dspark_last_confidence0 = confidence0;
@@ -61292,6 +61574,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             s->dspark_draft_tokens[0] = sample_argmax(s->logits, DS4_N_VOCAB);
             s->dspark_draft_len = 1;
             s->dspark_draft_valid = true;
+            s->dspark_stochastic_draft = false;
             fake_argmax_ok = true;
         }
         if (probe_log) {
@@ -62695,7 +62978,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
         return n_accept;
     }
     if (drafts[0] == eos_token) draft_n = 1;
-
     ds4_engine *e = s->engine;
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
@@ -63009,6 +63291,367 @@ static int ds4_session_eval_dspark_speculative_argmax(
     DS4_DSPARK_STATS_FINISH();
 #undef DS4_DSPARK_SCHED_EXTRA_MS
 #undef DS4_DSPARK_STATS_FINISH
+    return n_accept;
+}
+
+static bool dspark_stochastic_accept(float target_p, float draft_p,
+                                     uint64_t *rng) {
+    if (!rng || !(draft_p > 0.0f) || !isfinite(draft_p)) return false;
+    if (target_p >= draft_p) return true;
+    if (!(target_p > 0.0f) || !isfinite(target_p)) return false;
+    return sample_rng_f32(rng) * draft_p <= target_p;
+}
+
+static int dspark_stochastic_replacement(
+        ds4_session *s,
+        int draft_token,
+        uint64_t *rng) {
+    if (!s || !s->sample_probs || !rng ||
+        draft_token < 0 || draft_token >= (int)DS4_N_VOCAB) {
+        return -1;
+    }
+    s->sample_probs[draft_token] = 0.0f;
+    return sample_probabilities(s->sample_probs, DS4_N_VOCAB, rng);
+}
+
+static int ds4_session_eval_dspark_speculative_stochastic(
+        ds4_session *s,
+        int n_accept,
+        int max_tokens,
+        int eos_token,
+        float temperature,
+        int top_k,
+        float top_p,
+        float min_p,
+        uint64_t *rng,
+        int *accepted,
+        int accepted_cap,
+        char *err,
+        size_t errlen) {
+    const bool stats_enabled = s && ds4_dspark_stats_enabled();
+    const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled();
+    const double stats_t0 =
+        (stats_enabled ||
+         (scheduler_enabled && ds4_dspark_scheduler_timing_enabled()))
+            ? now_sec() : 0.0;
+#define DS4_DSPARK_STOCH_FINISH() do {                                      \
+        if (stats_enabled) {                                                \
+            s->dspark_stats.total_ms += (now_sec() - stats_t0) * 1000.0;    \
+        }                                                                   \
+    } while (0)
+#define DS4_DSPARK_STOCH_EXTRA_MS()                                         \
+    ((scheduler_enabled && stats_t0 != 0.0) ?                               \
+     s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
+
+    if (stats_enabled) {
+        s->dspark_stats.cycles++;
+        if (n_accept > 0) s->dspark_stats.first_tokens++;
+    }
+    if (!s || !rng || !s->dspark_draft_valid ||
+        !s->dspark_stochastic_draft || s->dspark_draft_len == 0) {
+        if (stats_enabled) {
+            s->dspark_stats.no_draft++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        if (s) {
+            ds4_session_dspark_scheduler_note(
+                s, 0, true, DS4_DSPARK_STOCH_EXTRA_MS());
+        }
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
+
+    int draft_n = (int)s->dspark_draft_len;
+    if (draft_n > max_tokens - n_accept) draft_n = max_tokens - n_accept;
+    if (draft_n > accepted_cap - n_accept) draft_n = accepted_cap - n_accept;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_n > room - 1) draft_n = room - 1;
+    if (draft_n <= 0) {
+        s->dspark_draft_valid = false;
+        s->dspark_stochastic_draft = false;
+        s->dspark_draft_len = 0;
+        if (stats_enabled) {
+            s->dspark_stats.no_room++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
+
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    for (int i = 0; i < draft_n; i++) {
+        drafts[i] = s->dspark_draft_tokens[i];
+        if (drafts[i] < 0 || drafts[i] >= (int)DS4_N_VOCAB) {
+            s->dspark_draft_valid = false;
+            s->dspark_stochastic_draft = false;
+            s->dspark_draft_len = 0;
+            if (stats_enabled) s->dspark_stats.invalid_draft++;
+            DS4_DSPARK_STOCH_FINISH();
+            return n_accept;
+        }
+    }
+    for (int i = 0; i < draft_n; i++) {
+        if (drafts[i] == eos_token) {
+            draft_n = i + 1;
+            break;
+        }
+    }
+    if (stats_enabled) {
+        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
+                                  (uint32_t)draft_n);
+    }
+    s->dspark_draft_valid = false;
+    s->dspark_stochastic_draft = false;
+    s->dspark_draft_len = 0;
+
+    if (!sample_build_probabilities(s->logits, DS4_N_VOCAB,
+                                    temperature, top_k, top_p, min_p,
+                                    s->sample_probs)) {
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
+    if (!dspark_stochastic_accept(s->sample_probs[drafts[0]], 1.0f, rng)) {
+        const int replacement = dspark_stochastic_replacement(
+            s, drafts[0], rng);
+        if (replacement < 0 ||
+            ds4_session_eval_probe_tp(s, replacement, false,
+                                      err, errlen) != 0) {
+            if (replacement < 0 && errlen) {
+                snprintf(err, errlen,
+                         "DSpark stochastic rejection sampling failed");
+            }
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        accepted[n_accept++] = replacement;
+        if (stats_enabled) {
+            s->dspark_stats.first_misses++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        ds4_session_dspark_scheduler_note(
+            s, 0, false, DS4_DSPARK_STOCH_EXTRA_MS());
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
+    ds4_engine *e = s->engine;
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
+    const int start = s->checkpoint.len;
+    bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    bool ok = have_frontier && s->spec_row_logits;
+    bool verifier_may_have_mutated = false;
+    bool tp_verify_sent = false;
+    if (ok && ds4_session_tp_leader(s)) {
+        if (!ds4_tp_send_verify(e->tp.ctx, s->tp_session_id,
+                                drafts, (uint32_t)draft_n)) {
+            snprintf(err, errlen, "tp: verify send failed");
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        tp_verify_sent = true;
+    }
+    if (ok) {
+        for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+        verifier_may_have_mutated = true;
+        ds4_verify_suffix_timing verify_timing;
+        const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+        ok = metal_graph_verify_suffix_tops(
+            &s->graph, &e->model, &e->weights, &s->checkpoint,
+            (uint32_t)start, (uint32_t)draft_n,
+            draft_n > 1 &&
+                draft_n <= (int)DS4_SPEC_PREFIX_SLOTS + 1,
+            true, draft_n > 1 ? row_tops : NULL, NULL,
+            stats_enabled ? &verify_timing : NULL);
+        if (stats_enabled) {
+            s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
+            s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
+            s->dspark_stats.verify_layer_ms += verify_timing.layer_ms;
+            s->dspark_stats.verify_head_ms += verify_timing.head_ms;
+            s->dspark_stats.verify_read_ms += verify_timing.read_ms;
+            if (verify_timing.fused_head) s->dspark_stats.verifier_fused_head++;
+        }
+    }
+
+    int accepted_drafts = ok ? 1 : 0;
+    int replacement = -1;
+    for (int i = 1; ok && i < draft_n; i++) {
+        ok = metal_graph_read_spec_logits_row(
+            &s->graph, (uint32_t)(i - 1), s->spec_row_logits);
+        if (!ok ||
+            !sample_build_probabilities(s->spec_row_logits, DS4_N_VOCAB,
+                                        temperature, top_k, top_p, min_p,
+                                        s->sample_probs)) {
+            ok = false;
+            break;
+        }
+        if (!dspark_stochastic_accept(s->sample_probs[drafts[i]], 1.0f, rng)) {
+            replacement = dspark_stochastic_replacement(
+                s, drafts[i], rng);
+            if (replacement < 0) ok = false;
+            break;
+        }
+        accepted_drafts++;
+    }
+
+    if (ok && replacement < 0 && accepted_drafts == draft_n) {
+        ok = metal_graph_read_spec_logits_row(
+            &s->graph, (uint32_t)(draft_n - 1), s->spec_row_logits);
+        if (ok && tp_verify_sent &&
+            !ds4_tp_send_verify_commit(e->tp.ctx, 1, 0)) {
+            snprintf(err, errlen, "tp: verify commit send failed");
+            s->checkpoint_valid = false;
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        if (ok) {
+            memcpy(s->logits, s->spec_row_logits,
+                   (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+            int emitted = 0;
+            for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                accepted[n_accept++] = drafts[i];
+                emitted++;
+                if (drafts[i] == eos_token) break;
+            }
+            s->checkpoint_valid = true;
+            ds4_session_dspark_capture_note_checkpoint(s);
+            if (stats_enabled) {
+                s->dspark_stats.full_accepts++;
+                s->dspark_stats.direct_full_commits++;
+                s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                          (uint32_t)emitted);
+            }
+            ds4_session_dspark_scheduler_note(
+                s, (uint32_t)emitted, false,
+                DS4_DSPARK_STOCH_EXTRA_MS());
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STOCH_FINISH();
+            return n_accept;
+        }
+    }
+
+    if (!ok || replacement < 0) {
+        if (verifier_may_have_mutated) {
+            s->checkpoint.len = start;
+            ds4_session_dspark_capture_invalidate(s);
+            if (!have_frontier || !spec_frontier_restore(&frontier, s)) {
+                if (tp_verify_sent) (void)ds4_tp_send_verify_commit(e->tp.ctx, 0, 0);
+                snprintf(err, errlen, "DSpark verifier rollback failed");
+                s->checkpoint_valid = false;
+                spec_frontier_free(&frontier);
+                DS4_DSPARK_STOCH_FINISH();
+                return -1;
+            }
+        }
+        if (tp_verify_sent &&
+            !ds4_tp_send_verify_commit(e->tp.ctx, 0, 0)) {
+            snprintf(err, errlen, "tp: verify commit send failed");
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        if (stats_enabled) {
+            s->dspark_stats.verifier_unavailable++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+        spec_frontier_free(&frontier);
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
+
+    bool direct_prefix = false;
+    if (!tp_verify_sent && accepted_drafts > 0 &&
+        accepted_drafts <= (int)DS4_SPEC_PREFIX_SLOTS) {
+        s->checkpoint.len = start;
+        ds4_session_dspark_capture_invalidate(s);
+        direct_prefix = spec_frontier_commit_prefix(
+            s, (uint32_t)accepted_drafts);
+        if (direct_prefix) {
+            for (int i = 0; i < accepted_drafts; i++) {
+                token_vec_push(&s->checkpoint, drafts[i]);
+            }
+            s->checkpoint_valid = true;
+            ds4_session_dspark_capture_note_checkpoint(s);
+        }
+    }
+
+    if (!direct_prefix) {
+        s->checkpoint.len = start;
+        ds4_session_dspark_capture_invalidate(s);
+        if (!have_frontier || !spec_frontier_restore(&frontier, s)) {
+            if (tp_verify_sent) (void)ds4_tp_send_verify_commit(e->tp.ctx, 0, 0);
+            snprintf(err, errlen, "DSpark verifier rollback failed");
+            s->checkpoint_valid = false;
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        if (tp_verify_sent &&
+            !ds4_tp_send_verify_commit(e->tp.ctx, 0, accepted_drafts)) {
+            snprintf(err, errlen, "tp: verify commit send failed");
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        for (int i = 0; i < accepted_drafts; i++) {
+            if (!metal_graph_eval_token_raw_swa(
+                    &s->graph, &e->model, &e->weights, drafts[i],
+                    (uint32_t)s->checkpoint.len, s->spec_row_logits)) {
+                snprintf(err, errlen, "%s decode failed",
+                         ds4_backend_name(e->backend));
+                s->checkpoint_valid = false;
+                spec_frontier_free(&frontier);
+                DS4_DSPARK_STOCH_FINISH();
+                return -1;
+            }
+            token_vec_push(&s->checkpoint, drafts[i]);
+        }
+        if (accepted_drafts > 0 && tp_verify_sent && e->tp.vocab_split) {
+            const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+            if (!ds4_tp_recv_logits_half(e->tp.ctx,
+                                         s->spec_row_logits + vhalf,
+                                         vhalf)) {
+                snprintf(err, errlen, "tp: replay logits half missing");
+                s->checkpoint_valid = false;
+                spec_frontier_free(&frontier);
+                DS4_DSPARK_STOCH_FINISH();
+                return -1;
+            }
+        }
+        s->checkpoint_valid = true;
+        ds4_session_dspark_capture_note_checkpoint(s);
+    }
+
+    if (ds4_session_eval_probe_tp(s, replacement, false,
+                                  err, errlen) != 0) {
+        spec_frontier_free(&frontier);
+        DS4_DSPARK_STOCH_FINISH();
+        return -1;
+    }
+    int emitted = 0;
+    for (int i = 0; i < accepted_drafts && n_accept < accepted_cap; i++) {
+        accepted[n_accept++] = drafts[i];
+        emitted++;
+    }
+    if (n_accept < accepted_cap) accepted[n_accept++] = replacement;
+    if (stats_enabled) {
+        s->dspark_stats.partial_accepts++;
+        if (direct_prefix) s->dspark_stats.direct_partial_commits++;
+        else if (accepted_drafts > 0) s->dspark_stats.replay_fallbacks++;
+        s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted;
+        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                  (uint32_t)emitted);
+    }
+    ds4_session_dspark_scheduler_note(
+        s, (uint32_t)emitted, false, DS4_DSPARK_STOCH_EXTRA_MS());
+    spec_frontier_free(&frontier);
+    DS4_DSPARK_STOCH_FINISH();
+#undef DS4_DSPARK_STOCH_EXTRA_MS
+#undef DS4_DSPARK_STOCH_FINISH
     return n_accept;
 }
 #endif
@@ -66668,6 +67311,84 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
     return n_accept;
+#endif
+}
+
+int ds4_session_eval_speculative(ds4_session *s, int first_token,
+                                 int max_tokens, int eos_token,
+                                 float temperature, int top_k,
+                                 float top_p, float min_p, uint64_t *rng,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen) {
+    if (temperature <= 0.0f) {
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+    }
+    if (!s || !accepted || !rng || max_tokens <= 0 || accepted_cap <= 0) {
+        return 0;
+    }
+    if (s->distributed || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)eos_token; (void)top_k; (void)top_p; (void)min_p;
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    accepted[0] = first_token;
+    return 1;
+#else
+    ds4_engine *e = s->engine;
+    const bool opportunistic_dspark =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        !e->quality && !e->dspark_strict && !e->dspark_exact_sampling;
+    if (opportunistic_dspark) {
+        /* first_token was sampled with the requested temperature. Commit the
+         * following DFlash tokens while they match the target's greedy path;
+         * after a divergence the caller samples the next boundary token. */
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+    }
+    const bool stochastic_dspark =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        !e->quality && !e->dspark_strict && e->dspark_exact_sampling;
+    bool can_prepare = stochastic_dspark && first_token != eos_token &&
+        max_tokens > 1 && accepted_cap > 1;
+    bool tail_skip = false;
+    if (can_prepare && ds4_dspark_scheduler_enabled()) {
+        const uint32_t tail_min = ds4_dspark_scheduler_tail_min_tokens();
+        if (tail_min != 0 && (uint32_t)max_tokens < tail_min) {
+            can_prepare = false;
+            tail_skip = true;
+            if (ds4_dspark_stats_enabled()) s->dspark_stats.tail_skips++;
+        }
+    }
+
+    s->dspark_sample_temperature = temperature;
+    s->dspark_sample_rng = can_prepare ? rng : NULL;
+    const int eval_rc = ds4_session_eval_probe_tp(
+        s, first_token, can_prepare, err, errlen);
+    s->dspark_sample_rng = NULL;
+    if (eval_rc != 0) {
+        s->dspark_sample_temperature = 0.0f;
+        return -1;
+    }
+
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (!can_prepare || tail_skip || first_token == eos_token ||
+        max_tokens == 1 || n_accept >= accepted_cap) {
+        s->dspark_sample_temperature = 0.0f;
+        return n_accept;
+    }
+    const int result = ds4_session_eval_dspark_speculative_stochastic(
+        s, n_accept, max_tokens, eos_token,
+        temperature, top_k, top_p, min_p, rng,
+        accepted, accepted_cap, err, errlen);
+    s->dspark_sample_temperature = 0.0f;
+    return result;
 #endif
 }
 

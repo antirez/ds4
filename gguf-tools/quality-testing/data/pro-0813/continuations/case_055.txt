@@ -1,0 +1,3 @@
+Un grande buffer Metal può essere peggiore delle viste sovrapposte per diversi motivi:
+
+## 1.

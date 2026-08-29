@@ -17,8 +17,10 @@ calling hosted APIs:
   OpenRouter `z-ai/glm-5.2` with `top_logprobs=20`.
 - `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
-- `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
+- `data/pro`: 100 DeepSeek V4 PRO preview continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
+- `data/pro-0813`: 100 DeepSeek V4 PRO 0813 continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -65,14 +67,14 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort none
 ```
 
-Use one output directory per official model. For PRO through the official
+Use one output directory per checkpoint. For PRO 0813 through the official
 DeepSeek API:
 
 ```sh
 python3 gguf-tools/quality-testing/collect_official.py \
   --model deepseek-v4-pro \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/pro \
+  --out gguf-tools/quality-testing/data/pro-0813 \
   --count 100 \
   --max-tokens 24 \
   --top-logprobs 20
@@ -119,11 +121,12 @@ gguf-tools/quality-testing/score_official \
   4096
 ```
 
-Use `data/flash/manifest.tsv` for Flash GGUFs,
-`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs, and
-`data/pro/manifest.tsv` for PRO GGUFs.  The scorer and comparator do not care
-which model produced the manifest; the manifest path selects the continuation
-set.
+Use `data/flash/manifest.tsv` for Flash GGUFs and
+`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs. Use
+`data/pro/manifest.tsv` for the PRO preview checkpoint and
+`data/pro-0813/manifest.tsv` for PRO 0813. The scorer and comparator do not
+care which model produced the manifest; the manifest path selects the
+continuation set.
 
 Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest

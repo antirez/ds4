@@ -11,6 +11,15 @@ REQUIRE_IDENTICAL=${DS4_DSPARK_FIXTURE_REQUIRE_IDENTICAL:-0}
 PROPOSAL_QUALITY_GUARD=${DS4_DSPARK_FIXTURE_REQUIRE_PROPOSAL_QUALITY:-auto}
 C_ADD_MIN_ACCEPTED=${DS4_DSPARK_FIXTURE_C_ADD_MIN_ACCEPTED:-8}
 CONFIDENCE=${DS4_DSPARK_FIXTURE_CONFIDENCE:-}
+TEMPERATURE=${DS4_DSPARK_FIXTURE_TEMPERATURE:-0}
+TOP_P=${DS4_DSPARK_FIXTURE_TOP_P:-0.95}
+MIN_P=${DS4_DSPARK_FIXTURE_MIN_P:-0.05}
+SEED=${DS4_DSPARK_FIXTURE_SEED:-12345}
+EXACT_SAMPLING=${DS4_DSPARK_FIXTURE_EXACT_SAMPLING:-0}
+exact_sampling_arg=
+if [ "$EXACT_SAMPLING" != 0 ]; then
+    exact_sampling_arg=--mtp-exact-sampling
+fi
 partial_cases=0
 direct_partial_cases=0
 direct_commits=0
@@ -93,17 +102,19 @@ print_metadata() {
     printf '# model=%s model_bytes=%s support=%s support_bytes=%s\n' \
         "$MODEL" "$(file_bytes "$MODEL")" \
         "$SUPPORT" "$(file_bytes "$SUPPORT")"
-    printf '# tokens=%s ctx=default flags="--temp 0 --nothink" confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
-        "$TOKENS" "$confidence" "$scheduler" "$no_draft_skip" \
+    printf '# tokens=%s ctx=default flags="--temp %s --top-p %s --min-p %s --seed %s --nothink" exact_sampling=%s confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
+        "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED" \
+        "$EXACT_SAMPLING" "$confidence" "$scheduler" "$no_draft_skip" \
         "$short_accept_skip" "$cold_low_conf_skip" "$cold_low_conf_milli" \
         "$tail_min_tokens" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED" \
         "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
-    printf '# baseline_command=%s -m %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "$MODEL" "$TOKENS"
-    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s -m %s --mtp %s --tokens %s --temp 0 --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
-        "$MODEL" "$SUPPORT" "$TOKENS"
+    printf '# baseline_command=%s -m %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
+        "$DS4_BIN" "$MODEL" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
+    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
+        "$DS4_BIN" "${exact_sampling_arg:+ $exact_sampling_arg}" \
+        "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
+        "$MODEL" "$SUPPORT" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
 }
 
 if [ ! -x "$DS4_BIN" ]; then
@@ -131,19 +142,24 @@ run_case() {
     dspark_err="$tmpdir/$id.dspark.err"
 
     "$DS4_BIN" -m "$MODEL" \
-        --tokens "$TOKENS" --temp 0 --nothink -p "$prompt" \
+        --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
+        --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
         >"$base_out" 2>"$base_err"
 
     if [ -n "$CONFIDENCE" ]; then
         DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark --dspark-confidence "$CONFIDENCE" \
+        "$DS4_BIN" --dspark $exact_sampling_arg \
+            --dspark-confidence "$CONFIDENCE" \
             -m "$MODEL" --mtp "$SUPPORT" \
-            --tokens "$TOKENS" --temp 0 --nothink -p "$prompt" \
+            --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
+            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
             >"$dspark_out" 2>"$dspark_err"
     else
         DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark -m "$MODEL" --mtp "$SUPPORT" \
-            --tokens "$TOKENS" --temp 0 --nothink -p "$prompt" \
+        "$DS4_BIN" --dspark $exact_sampling_arg \
+            -m "$MODEL" --mtp "$SUPPORT" \
+            --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
+            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
             >"$dspark_out" 2>"$dspark_err"
     fi
 
