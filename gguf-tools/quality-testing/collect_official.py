@@ -239,7 +239,13 @@ def main() -> int:
         raise SystemExit("--top-logprobs must be between 0 and 20")
 
     openrouter = "openrouter.ai" in args.endpoint
-    api_key_env = args.api_key_env or ("OPENROUTER_API_KEY" if openrouter else "DEEPSEEK_API_KEY")
+    orcarouter = "orcarouter.ai" in args.endpoint
+    if orcarouter:
+        api_key_env = args.api_key_env or "ORCAROUTER_API_KEY"
+    elif openrouter:
+        api_key_env = args.api_key_env or "OPENROUTER_API_KEY"
+    else:
+        api_key_env = args.api_key_env or "DEEPSEEK_API_KEY"
     api_key = os.environ.get(api_key_env)
     if not api_key:
         raise SystemExit(f"{api_key_env} is not set")

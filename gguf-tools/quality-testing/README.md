@@ -67,6 +67,26 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort none
 ```
 
+For DeepSeek V4 Flash through OrcaRouter:
+
+```sh
+export ORCAROUTER_API_KEY=...
+python3 gguf-tools/quality-testing/collect_official.py \
+  --model deepseek/deepseek-v4-flash \
+  --endpoint https://api.orcarouter.ai/v1/chat/completions \
+  --prompts gguf-tools/quality-testing/prompts.jsonl \
+  --out gguf-tools/quality-testing/data/flash-orcarouter \
+  --count 100 \
+  --max-tokens 24 \
+  --top-logprobs 20 \
+  --thinking disabled \
+  --reasoning-effort omit
+```
+
+When the endpoint contains `orcarouter.ai`, the script reads
+`ORCAROUTER_API_KEY` automatically, mirroring the `OPENROUTER_API_KEY`
+handling for OpenRouter endpoints.
+
 Use one output directory per checkpoint. For PRO 0813 through the official
 DeepSeek API:
 
