@@ -10880,12 +10880,17 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * reasoning bytes, so the next request would miss the session cache even though
  * the visible conversation prefix is logically the same.
  *
+ * DeepSeek replays a reasoning-free assistant turn as:
+ *
  *   prompt-without-final-<think> + </think> + visible-content + eos
  *
- * is exactly the visible prefix that render_chat_prompt_text() will produce on
- * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
- * that caused long post-answer pauses and threw away useful sampled state.
- * Instead, remember the visible bytes as a key for the current sampled frontier.
+ * GLM replays it as:
+ *
+ *   prompt-including-final-<think> + </think> + trimmed-visible-content
+ *
+ * Do not rebuild the KV cache to erase hidden reasoning here: that caused long
+ * post-answer pauses and threw away useful sampled state.  Instead, remember
+ * the syntax-correct visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
 static char *build_toolless_thinking_visible_text(const request *r,
@@ -10902,10 +10907,18 @@ static char *build_toolless_thinking_visible_text(const request *r,
     }
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
-    buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
+        /* render_glm_chat_prompt_text() keeps the opening tag when it drops old
+         * reasoning, trims assistant text, and has no DeepSeek EOS marker. */
+        buf_append(&visible, r->prompt_text, pt_len);
+        buf_puts(&visible, "</think>");
+        append_trimmed_text(&visible, content);
+    } else {
+        buf_append(&visible, r->prompt_text, pt_len - tag_len);
+        buf_puts(&visible, "</think>");
+        buf_puts(&visible, content ? content : "");
+        buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    }
     return buf_take(&visible);
 }
 
@@ -18332,6 +18345,65 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
+static void test_glm_thinking_checkpoint_canonical_matches_future_prompt(void) {
+    /* GLM keeps the opening <think> tag when old reasoning is omitted, trims
+     * assistant content, and does not terminate the assistant turn with the
+     * DeepSeek EOS marker.  The remembered visible key must match that exact
+     * rendering so a real thinking turn can continue from live KV. */
+    chat_msgs prefix_msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&prefix_msgs, user1);
+
+    char *prompt_text = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &prefix_msgs, NULL, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    const char *reasoning = "Let me think... 2+2 = 4";
+    const char *content = "  The answer is 4.  \n";
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
+    char *visible = build_toolless_thinking_visible_text(&r, content);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(visible, "<|assistant|><think></think>The answer is 4.") != NULL);
+    TEST_ASSERT(strstr(visible, "<｜end▁of▁sentence｜>") == NULL);
+    request_free(&r);
+
+    chat_msgs future_msgs = {0};
+    chat_msg h_user1 = {0};
+    h_user1.role = xstrdup("user");
+    h_user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&future_msgs, h_user1);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup(reasoning);
+    h_asst.content = xstrdup(content);
+    chat_msgs_push(&future_msgs, h_asst);
+    chat_msg h_user2 = {0};
+    h_user2.role = xstrdup("user");
+    h_user2.content = xstrdup("Thanks!");
+    chat_msgs_push(&future_msgs, h_user2);
+
+    char *future_prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &future_msgs, NULL, NULL, DS4_THINK_HIGH);
+    size_t visible_len = strlen(visible);
+    TEST_ASSERT(strlen(future_prompt) > visible_len);
+    TEST_ASSERT(!memcmp(future_prompt, visible, visible_len));
+    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);
+
+    free(future_prompt);
+    free(visible);
+    free(prompt_text);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&future_msgs);
+}
+
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -18590,6 +18662,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_glm_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
