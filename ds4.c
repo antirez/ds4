@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
@@ -50,6 +51,7 @@
  * the packer in multi-tier mode, but the headers are tiny and C-safe). */
 #include "ds4_layer_pack.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_dspark_runtime.h"
 
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
@@ -2088,6 +2090,7 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    char *path;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2323,6 +2326,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    free(m->path);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2480,6 +2484,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->path = ds4_strdup(path);
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -4162,16 +4167,26 @@ typedef struct {
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
+enum { DS4_DSPARK_MTP_LAYERS = 3 };
+
 typedef struct {
-    ds4_tensor *e_proj;
-    ds4_tensor *h_proj;
-    ds4_tensor *enorm;
-    ds4_tensor *hnorm;
-    ds4_tensor *norm;
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block;
+    ds4_mtp_draft_kind kind;
+    ds4_dspark_config  dspark;
+    ds4_tensor        *e_proj;
+    ds4_tensor        *h_proj;
+    ds4_tensor        *enorm;
+    ds4_tensor        *hnorm;
+    ds4_tensor        *norm;
+    ds4_tensor        *hc_head_base;
+    ds4_tensor        *hc_head_fn;
+    ds4_tensor        *hc_head_scale;
+    ds4_tensor        *main_proj;
+    ds4_tensor        *main_norm;
+    ds4_tensor        *markov_w1;
+    ds4_tensor        *markov_w2;
+    ds4_tensor        *confidence_proj;
+    ds4_layer_weights  block;
+    ds4_layer_weights  stage[DS4_DSPARK_MTP_LAYERS];
 } ds4_mtp_weights;
 
 typedef struct {
@@ -5114,21 +5129,48 @@ static void weights_validate_layout(
     }
 }
 
-static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
+
+void ds4_dspark_config_init_defaults(ds4_dspark_config *cfg) {
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->n_mtp_layers = 3;
+    cfg->block_size = 5;
+    cfg->noise_token_id = 128799u;
+    cfg->markov_rank = 256;
+    cfg->target_layer_ids[0] = 40;
+    cfg->target_layer_ids[1] = 41;
+    cfg->target_layer_ids[2] = 42;
+}
+
+const char *ds4_mtp_draft_kind_name(ds4_mtp_draft_kind kind) {
+    switch (kind) {
+    case DS4_MTP_DRAFT_LEGACY: return "legacy-mtp";
+    case DS4_MTP_DRAFT_DSPARK:  return "dspark";
+    case DS4_MTP_DRAFT_DSPARK_NONSEQ: return "dspark-nonseq";
+    default:                    return "none";
+    }
+}
+
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess_ex(bool has_e_proj,
+                                                bool has_main_proj,
+                                                bool has_markov_w1,
+                                                bool markov_rank_set,
+                                                uint32_t markov_rank) {
+    if (has_main_proj && has_markov_w1) return DS4_MTP_DRAFT_DSPARK;
+    if (has_main_proj && markov_rank_set && markov_rank == 0) return DS4_MTP_DRAFT_DSPARK_NONSEQ;
+    if (has_e_proj) return DS4_MTP_DRAFT_LEGACY;
+    return DS4_MTP_DRAFT_NONE;
+}
+
+ds4_mtp_draft_kind ds4_mtp_draft_kind_guess(bool has_e_proj, bool has_main_proj, bool has_markov_w1) {
+    return ds4_mtp_draft_kind_guess_ex(has_e_proj, has_main_proj, has_markov_w1, false, 0);
+}
+
+static void mtp_layer_validate_layout(const ds4_layer_weights *l, bool require_exp_probs_b) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
-    const ds4_layer_weights *l = &w->block;
-
-    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
-    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->e_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->h_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
 
     tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
     tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
@@ -5142,13 +5184,16 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
     tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
     tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
-
     tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
     tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
     tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
     tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    if (require_exp_probs_b) {
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    } else {
+        tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+    }
     tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
     tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
     tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
@@ -5158,6 +5203,20 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
     tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+}
+
+static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+
+    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
+    tensor_expect_layout(w->e_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->h_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+    tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+    mtp_layer_validate_layout(&w->block, true);
 }
 
 typedef enum {
@@ -6546,6 +6605,21 @@ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
     memset(spans, 0, sizeof(*spans));
     model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
+}
+
+
+bool ds4_mtp_speculative_draft_ready(ds4_mtp_draft_kind kind) {
+    return kind == DS4_MTP_DRAFT_LEGACY ||
+           kind == DS4_MTP_DRAFT_DSPARK;
+}
+
+bool ds4_mtp_draft_runtime_supported(ds4_backend backend, ds4_mtp_draft_kind kind) {
+    if (backend == DS4_BACKEND_CPU) return false;
+    if (!ds4_mtp_speculative_draft_ready(kind)) return false;
+    const bool dspark_family = kind == DS4_MTP_DRAFT_DSPARK ||
+                               kind == DS4_MTP_DRAFT_DSPARK_NONSEQ;
+    if (dspark_family && backend != DS4_BACKEND_METAL) return false;
+    return true;
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -12141,6 +12215,7 @@ typedef struct {
     uint32_t head_dim;
 } ds4_kv_cache;
 
+
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -15157,6 +15232,7 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
+
     uint32_t prefill_cap;
     uint32_t raw_window;
     uint32_t batch_token_offset;
@@ -16868,7 +16944,7 @@ static uint64_t metal_graph_q8_0_row_bytes(uint64_t in_dim) {
  * legacy 1-arg helpers when g_n_gpus <= 1. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
-        const ds4_weights     *weights,
+        const ds4_weights       *weights,
         const ds4_layer_weights *layer,
         uint32_t                raw_cap,
         uint32_t                ctx_size,
@@ -30738,7 +30814,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     return ok;
 }
 
-/* Execute one Metal decode token and read back logits. */
+/* Execute one Metal decode token and optionally capture the target hidden states
+ * that DSpark uses as the draft model's cross-token input. */
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -30757,7 +30834,8 @@ static bool metal_graph_eval_token_raw_swa(
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos,
+                                                  logits != NULL, true);
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
@@ -30789,6 +30867,8 @@ static bool metal_graph_eval_token_raw_swa(
     }
     return ok;
 }
+
+/* Execute one Metal decode token and read back logits. */
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
         const ds4_weights *weights) {
@@ -51231,8 +51311,10 @@ static bool ds4_engine_glm_mtp_spec_enabled(const ds4_engine *e) {
 bool ds4_engine_has_mtp(ds4_engine *e) {
     return e && e->backend != DS4_BACKEND_CPU &&
            e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->mtp_ready;
+           e->mtp_ready &&
+           ds4_mtp_draft_runtime_supported(e->backend, e->mtp_weights.kind);
 }
+
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -66717,7 +66799,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     /* Legacy MTP verify is not TP-mirrored; fall back to per-token decode. */
     if (e->tp.active) return n_accept;
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    if (!ds4_engine_has_mtp(e) || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
