@@ -59,10 +59,45 @@ static int reference_candidate_cmp_desc(const void *a, const void *b) {
     return (ca->id > cb->id) - (ca->id < cb->id);
 }
 
+/* Top-n-sigma reference mask: population sigma over the finite logits with
+ * double accumulation, mirroring the optimized implementation exactly. */
+static const float *reference_top_n_sigma_mask(const float *logits,
+                                               uint32_t n_vocab,
+                                               float n,
+                                               float *out) {
+    float max_logit = -INFINITY;
+    double sum = 0.0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) max_logit = v;
+        sum += v;
+    }
+    if (finite == 0) return logits;
+
+    const float mean = (float)(sum / (double)finite);
+    double acc = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float d = v - mean;
+        acc += (double)d * (double)d;
+    }
+    const float sigma = (float)sqrt(acc / (double)finite);
+    const float cutoff = max_logit - n * sigma;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        out[i] = isfinite(v) && v < cutoff ? -INFINITY : v;
+    }
+    return out;
+}
+
 /* This is the sampler immediately before the optimized implementation. */
-static int reference_sample(const float *logits, uint32_t n_vocab,
-                            float temperature, int top_k,
-                            float top_p, float min_p, uint64_t *rng) {
+static int reference_sample_inner(const float *logits, uint32_t n_vocab,
+                                  float temperature, int top_k,
+                                  float top_p, float min_p, uint64_t *rng) {
     if (temperature <= 0.0f) return reference_argmax(logits, n_vocab);
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
@@ -192,6 +227,26 @@ static int reference_sample(const float *logits, uint32_t n_vocab,
     return id;
 }
 
+static int reference_sample(const float *logits, uint32_t n_vocab,
+                            float temperature, int top_k,
+                            float top_p, float min_p, float top_n_sigma,
+                            uint64_t *rng) {
+    if (temperature <= 0.0f) return reference_argmax(logits, n_vocab);
+
+    float *masked = NULL;
+    if (top_n_sigma > 0.0f) {
+        masked = malloc((size_t)n_vocab * sizeof(*masked));
+        CHECK(masked != NULL, "reference top-n-sigma mask allocation");
+        if (!masked) return reference_argmax(logits, n_vocab);
+        logits = reference_top_n_sigma_mask(logits, n_vocab, top_n_sigma,
+                                            masked);
+    }
+    const int token = reference_sample_inner(logits, n_vocab, temperature,
+                                             top_k, top_p, min_p, rng);
+    free(masked);
+    return token;
+}
+
 static uint64_t data_rng_next(uint64_t *state) {
     *state = *state * 6364136223846793005ULL + 1442695040888963407ULL;
     return *state;
@@ -209,14 +264,16 @@ static void fill_logits(float *logits, uint32_t n, uint64_t seed) {
 
 static void compare_case(const float *logits, float *scratch, uint32_t n,
                          float temperature, int top_k,
-                         float top_p, float min_p, const char *label) {
+                         float top_p, float min_p, float top_n_sigma,
+                         const char *label) {
     for (uint64_t seed = 0; seed < 256; seed++) {
         uint64_t ref_rng = seed;
         uint64_t opt_rng = seed;
         const int ref = reference_sample(logits, n, temperature, top_k,
-                                         top_p, min_p, &ref_rng);
+                                         top_p, min_p, top_n_sigma, &ref_rng);
         const int opt = ds4_test_sample_logits(logits, n, temperature, top_k,
-                                               top_p, min_p, &opt_rng, scratch);
+                                               top_p, min_p, top_n_sigma,
+                                               &opt_rng, scratch);
         CHECK(ref == opt,
               "%s seed=%llu token reference=%d optimized=%d",
               label, (unsigned long long)seed, ref, opt);
@@ -234,11 +291,11 @@ static void check_greedy_argmax_case(const float *logits, uint32_t n,
     CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
           "%s select unrolled argmax", label);
     const int unrolled = ds4_test_sample_logits(
-            logits, n, 0.0f, 0, 1.0f, 0.0f, &unrolled_rng, NULL);
+            logits, n, 0.0f, 0, 1.0f, 0.0f, 0.0f, &unrolled_rng, NULL);
     CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
           "%s select scalar argmax", label);
     const int scalar = ds4_test_sample_logits(
-            logits, n, 0.0f, 0, 1.0f, 0.0f, &scalar_rng, NULL);
+            logits, n, 0.0f, 0, 1.0f, 0.0f, 0.0f, &scalar_rng, NULL);
     CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
           "%s restore unrolled argmax", label);
     CHECK(unrolled == scalar,
@@ -363,23 +420,38 @@ int main(void) {
     if (!logits || !scratch) return 1;
     fill_logits(logits, semantic_n, 0x123456789abcdef0ULL);
 
-    compare_case(logits, scratch, semantic_n, 1.0f, 0, 1.0f, 0.05f,
+    compare_case(logits, scratch, semantic_n, 1.0f, 0, 1.0f, 0.05f, 0.0f,
                  "default-min-p");
-    compare_case(logits, scratch, semantic_n, 0.7f, 0, 1.0f, 0.0f,
+    compare_case(logits, scratch, semantic_n, 0.7f, 0, 1.0f, 0.0f, 0.0f,
                  "full-softmax");
-    compare_case(logits, scratch, semantic_n, 1.3f, 0, 0.9f, 0.05f,
+    compare_case(logits, scratch, semantic_n, 1.3f, 0, 0.9f, 0.05f, 0.0f,
                  "top-p-min-p");
-    compare_case(logits, scratch, semantic_n, 0.9f, 0, 0.95f, 0.0f,
+    compare_case(logits, scratch, semantic_n, 0.9f, 0, 0.95f, 0.0f, 0.0f,
                  "top-p");
-    compare_case(logits, scratch, semantic_n, 0.8f, 64, 0.9f, 0.05f,
+    compare_case(logits, scratch, semantic_n, 0.8f, 64, 0.9f, 0.05f, 0.0f,
                  "top-k");
+    /* Top-n-sigma parity against the reference mask at several n values,
+     * alone, stacked with the other truncation samplers, and across
+     * temperatures. */
+    compare_case(logits, scratch, semantic_n, 1.5f, 0, 1.0f, 0.0f, 1.0f,
+                 "top-n-sigma-1.5");
+    compare_case(logits, scratch, semantic_n, 1.0f, 0, 1.0f, 0.0f, 2.0f,
+                 "top-n-sigma-2");
+    compare_case(logits, scratch, semantic_n, 1.5f, 0, 0.95f, 0.05f, 1.0f,
+                 "top-n-sigma+top-p+min-p");
+    compare_case(logits, scratch, semantic_n, 0.9f, 64, 0.9f, 0.05f, 1.0f,
+                 "top-k+top-n-sigma");
+    compare_case(logits, scratch, semantic_n, 0.5f, 0, 1.0f, 0.0f, 0.1f,
+                 "top-n-sigma-tiny-n");
+    compare_case(logits, scratch, semantic_n, 3.0f, 0, 1.0f, 0.0f, 20.0f,
+                 "top-n-sigma-huge-n");
     CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
           "select unrolled argmax default");
-    compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f,
+    compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f, 0.0f,
                  "greedy");
     CHECK(setenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX", "1", 1) == 0,
           "set scalar argmax control");
-    compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f,
+    compare_case(logits, scratch, semantic_n, 0.0f, 0, 1.0f, 0.05f, 0.0f,
                  "greedy-scalar-control");
     CHECK(unsetenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == 0,
           "restore unrolled argmax default");
@@ -458,7 +530,7 @@ int main(void) {
     float boundary_scratch[sizeof(boundary_logits) / sizeof(boundary_logits[0])];
     compare_case(boundary_logits, boundary_scratch,
                  (uint32_t)(sizeof(boundary_logits) / sizeof(boundary_logits[0])),
-                 1.0f, 0, 1.0f, 0.05f, "min-p-boundary");
+                 1.0f, 0, 1.0f, 0.05f, 0.0f, "min-p-boundary");
 
     const float tied_logits[] = {
         2.0f, 2.0f, 2.0f, 1.0f, 1.0f, 0.0f, -INFINITY, NAN,
@@ -466,30 +538,96 @@ int main(void) {
     float tied_scratch[sizeof(tied_logits) / sizeof(tied_logits[0])];
     compare_case(tied_logits, tied_scratch,
                  (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-                 1.0f, 0, 1.0f, 0.05f, "equal-logits-default");
+                 1.0f, 0, 1.0f, 0.05f, 0.0f, "equal-logits-default");
     compare_case(tied_logits, tied_scratch,
                  (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-                 1.0f, 0, 0.8f, 0.05f, "equal-logits-top-p");
+                 1.0f, 0, 0.8f, 0.05f, 0.0f, "equal-logits-top-p");
     compare_case(tied_logits, tied_scratch,
                  (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-                 0.01f, 0, 1.0f, 0.05f, "low-temperature");
+                 0.01f, 0, 1.0f, 0.05f, 0.0f, "low-temperature");
     compare_case(tied_logits, tied_scratch,
                  (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-                 100.0f, 0, 1.0f, 0.05f, "high-temperature");
+                 100.0f, 0, 1.0f, 0.05f, 0.0f, "high-temperature");
     compare_case(tied_logits, tied_scratch,
                  (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-                 1.0f, 0, 1.0f, 1.0f, "min-p-one");
+                 1.0f, 0, 1.0f, 1.0f, 0.0f, "min-p-one");
+
+    /* Top-n-sigma temperature invariance: with min-p and top-p off, the
+     * nucleus is exactly the surviving set, and that set must not change
+     * with temperature (Theorem 4 of the paper).  For tied_logits at n=1
+     * the cutoff is max - 1*sigma = 2 - 0.7454 = 1.2546, so only the three
+     * logit-2.0 tokens survive. */
+    float tied_masked[sizeof(tied_logits) / sizeof(tied_logits[0])];
+    reference_top_n_sigma_mask(
+            tied_logits,
+            (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
+            1.0f, tied_masked);
+    uint64_t seen_t1 = 0, seen_t15 = 0;
+    for (uint64_t seed = 0; seed < 2048; seed++) {
+        uint64_t rng1 = seed;
+        uint64_t rng2 = seed;
+        const int t1 = ds4_test_sample_logits(
+                tied_logits,
+                (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
+                1.0f, 0, 1.0f, 0.0f, 1.0f, &rng1, tied_scratch);
+        const int t15 = ds4_test_sample_logits(
+                tied_logits,
+                (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
+                1.5f, 0, 1.0f, 0.0f, 1.0f, &rng2, tied_scratch);
+        CHECK(t1 >= 0 && t1 < 8 && t15 >= 0 && t15 < 8,
+              "top-n-sigma sampled out of range");
+        CHECK(t1 >= 0 && t1 < 8 && isfinite(tied_masked[t1]),
+              "top-n-sigma sampled a masked-out token at T=1.0");
+        CHECK(t15 >= 0 && t15 < 8 && isfinite(tied_masked[t15]),
+              "top-n-sigma sampled a masked-out token at T=1.5");
+        seen_t1 |= 1ull << (uint32_t)t1;
+        seen_t15 |= 1ull << (uint32_t)t15;
+    }
+    const uint64_t expected_n1 = (1u << 0) | (1u << 1) | (1u << 2);
+    CHECK(seen_t1 == expected_n1,
+          "top-n-sigma T=1.0 nucleus=%llx expected=%llx",
+          (unsigned long long)seen_t1, (unsigned long long)expected_n1);
+    CHECK(seen_t15 == expected_n1,
+          "top-n-sigma T=1.5 nucleus=%llx expected=%llx",
+          (unsigned long long)seen_t15, (unsigned long long)expected_n1);
+
+    /* The mask must not modify the caller's logits. */
+    float copy_check[sizeof(tied_logits) / sizeof(tied_logits[0])];
+    memcpy(copy_check, tied_logits, sizeof(tied_logits));
+    uint64_t check_rng = 7;
+    (void)ds4_test_sample_logits(
+            tied_logits,
+            (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
+            1.5f, 0, 1.0f, 0.0f, 1.0f, &check_rng, tied_scratch);
+    CHECK(memcmp(copy_check, tied_logits, sizeof(tied_logits)) == 0,
+          "top-n-sigma modified the caller logits");
+
+    /* A single dominant outlier: n-sigma keeps only the outlier and its
+     * immediate neighbors; the Gaussian body is cut. */
+    const float outlier_logits[] = {
+        0.0f, 0.1f, -0.2f, 0.05f, 10.0f, 0.3f, -0.1f, 0.2f,
+    };
+    float outlier_scratch[sizeof(outlier_logits) /
+                          sizeof(outlier_logits[0])];
+    compare_case(outlier_logits, outlier_scratch,
+                 (uint32_t)(sizeof(outlier_logits) /
+                            sizeof(outlier_logits[0])),
+                 1.5f, 0, 1.0f, 0.0f, 1.0f, "outlier-top-n-sigma");
+    compare_case(outlier_logits, outlier_scratch,
+                 (uint32_t)(sizeof(outlier_logits) /
+                            sizeof(outlier_logits[0])),
+                 1.5f, 0, 1.0f, 0.0f, 3.0f, "outlier-top-n-sigma-3");
 
     uint64_t null_ref_rng = 42;
     uint64_t null_opt_rng = 42;
     const int null_ref = reference_sample(
             tied_logits,
             (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-            1.0f, 0, 1.0f, 0.05f, &null_ref_rng);
+            1.0f, 0, 1.0f, 0.05f, 0.0f, &null_ref_rng);
     const int null_opt = ds4_test_sample_logits(
             tied_logits,
             (uint32_t)(sizeof(tied_logits) / sizeof(tied_logits[0])),
-            1.0f, 0, 1.0f, 0.05f, &null_opt_rng, NULL);
+            1.0f, 0, 1.0f, 0.05f, 0.0f, &null_opt_rng, NULL);
     CHECK(null_ref == null_opt && null_ref_rng == null_opt_rng,
           "null probability scratch fallback mismatch");
 
@@ -499,7 +637,7 @@ int main(void) {
     compare_case(nonfinite_logits, nonfinite_scratch,
                  (uint32_t)(sizeof(nonfinite_logits) /
                             sizeof(nonfinite_logits[0])),
-                 1.0f, 0, 1.0f, 0.05f, "all-nonfinite");
+                 1.0f, 0, 1.0f, 0.05f, 0.0f, "all-nonfinite");
 
     free(logits);
     free(scratch);
@@ -517,7 +655,7 @@ int main(void) {
     double start = now_sec();
     for (int i = 0; i < iterations; i++) {
         checksum += (uint64_t)reference_sample(logits, perf_n, 1.0f, 0,
-                                               1.0f, 0.05f, &ref_rng);
+                                               1.0f, 0.05f, 0.0f, &ref_rng);
     }
     const double reference_ms = (now_sec() - start) * 1000.0;
 
@@ -525,7 +663,7 @@ int main(void) {
     start = now_sec();
     for (int i = 0; i < iterations; i++) {
         checksum += (uint64_t)ds4_test_sample_logits(logits, perf_n, 1.0f, 0,
-                                                     1.0f, 0.05f,
+                                                     1.0f, 0.05f, 0.0f,
                                                      &opt_rng, scratch);
     }
     const double optimized_ms = (now_sec() - start) * 1000.0;
@@ -539,7 +677,7 @@ int main(void) {
     start = now_sec();
     for (int i = 0; i < iterations; i++) {
         checksum += (uint64_t)reference_sample(logits, perf_n, 1.0f, 0,
-                                               0.9f, 0.05f, &ref_rng);
+                                               0.9f, 0.05f, 0.0f, &ref_rng);
     }
     const double reference_top_p_ms = (now_sec() - start) * 1000.0;
 
@@ -547,7 +685,7 @@ int main(void) {
     start = now_sec();
     for (int i = 0; i < iterations; i++) {
         checksum += (uint64_t)ds4_test_sample_logits(logits, perf_n, 1.0f, 0,
-                                                     0.9f, 0.05f,
+                                                     0.9f, 0.05f, 0.0f,
                                                      &opt_rng, scratch);
     }
     const double optimized_top_p_ms = (now_sec() - start) * 1000.0;
@@ -555,6 +693,29 @@ int main(void) {
     printf("sampling top-p+min-p: reference %.3f ms, optimized %.3f ms, %.2fx, checksum=%llu\n",
            reference_top_p_ms, optimized_top_p_ms,
            optimized_top_p_ms > 0.0 ? reference_top_p_ms / optimized_top_p_ms : 0.0,
+           (unsigned long long)checksum);
+
+    ref_rng = 9012;
+    start = now_sec();
+    for (int i = 0; i < iterations; i++) {
+        checksum += (uint64_t)reference_sample(logits, perf_n, 1.5f, 0,
+                                               1.0f, 0.0f, 1.0f, &ref_rng);
+    }
+    const double reference_top_n_sigma_ms = (now_sec() - start) * 1000.0;
+
+    opt_rng = 9012;
+    start = now_sec();
+    for (int i = 0; i < iterations; i++) {
+        checksum += (uint64_t)ds4_test_sample_logits(logits, perf_n, 1.5f, 0,
+                                                     1.0f, 0.0f, 1.0f,
+                                                     &opt_rng, scratch);
+    }
+    const double optimized_top_n_sigma_ms = (now_sec() - start) * 1000.0;
+    CHECK(ref_rng == opt_rng, "top-n-sigma performance RNG state mismatch");
+    printf("sampling top-n-sigma: reference %.3f ms, optimized %.3f ms, %.2fx, checksum=%llu\n",
+           reference_top_n_sigma_ms, optimized_top_n_sigma_ms,
+           optimized_top_n_sigma_ms > 0.0 ?
+               reference_top_n_sigma_ms / optimized_top_n_sigma_ms : 0.0,
            (unsigned long long)checksum);
 
     free(logits);

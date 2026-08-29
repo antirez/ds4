@@ -38816,6 +38816,47 @@ static int sample_full_vocab(
     return id;
 }
 
+/* Top-n-sigma truncation (arXiv:2411.07641).  Logits split into a
+ * Gaussian-distributed noisy region and a small informative region; the
+ * cutoff max - n*sigma sits at that boundary.  Mean and standard deviation
+ * are computed over the finite logits only, matching llama.cpp.  Working on
+ * raw logits is equivalent to the paper's temperature-scaled version: both
+ * max and sigma scale with 1/T, so the surviving set is temperature-
+ * invariant by construction (Theorem 4 of the paper). */
+static const float *sample_top_n_sigma_mask(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        n,
+        float       *out) {
+    float max_logit = DS4_NEG_INF;
+    double sum = 0.0;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) max_logit = v;
+        sum += v;
+    }
+    if (finite == 0) return logits;
+
+    const float mean = (float)(sum / (double)finite);
+    double acc = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float d = v - mean;
+        acc += (double)d * (double)d;
+    }
+    const float sigma = (float)sqrt(acc / (double)finite);
+    const float cutoff = max_logit - n * sigma;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        out[i] = isfinite(v) && v < cutoff ? -INFINITY : v;
+    }
+    return out;
+}
+
 static int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,
@@ -38823,19 +38864,32 @@ static int sample_top_p_min_p(
         int          top_k,
         float        top_p,
         float        min_p,
+        float        top_n_sigma,
         uint64_t    *rng,
         float       *prob_scratch) {
     if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
+
+    /* Mask into a private copy so the caller's logits stay untouched; the
+     * downstream paths already skip non-finite entries, so a masked vector
+     * is a drop-in input. */
+    float *masked = NULL;
+    if (top_n_sigma > 0.0f) {
+        masked = xmalloc((size_t)n_vocab * sizeof(masked[0]));
+        logits = sample_top_n_sigma_mask(logits, n_vocab, top_n_sigma, masked);
+    }
+
+    int token;
     if (top_k <= 0) {
         const bool owned_scratch = prob_scratch == NULL;
         if (owned_scratch) {
             prob_scratch = xmalloc((size_t)n_vocab * sizeof(prob_scratch[0]));
         }
-        const int token = sample_full_vocab(logits, n_vocab, temperature,
-                                            top_p, min_p, rng, prob_scratch);
+        token = sample_full_vocab(logits, n_vocab, temperature,
+                                  top_p, min_p, rng, prob_scratch);
         if (owned_scratch) free(prob_scratch);
+        free(masked);
         return token;
     }
     if (top_k > 1024) top_k = 1024;
@@ -38857,7 +38911,10 @@ static int sample_top_p_min_p(
         vals[j] = v;
         ids[j] = (int)i;
     }
-    if (n == 0) return sample_argmax(logits, n_vocab);
+    if (n == 0) {
+        token = sample_argmax(logits, n_vocab);
+        goto done;
+    }
 
     float probs[1024];
     const float max_logit = vals[0];
@@ -38866,7 +38923,10 @@ static int sample_top_p_min_p(
         probs[i] = expf((vals[i] - max_logit) / temperature);
         sum += probs[i];
     }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+    if (sum <= 0.0f || !isfinite(sum)) {
+        token = ids[0];
+        goto done;
+    }
 
     const float min_prob = (probs[0] / sum) * min_p;
     float filtered_sum = 0.0f;
@@ -38878,24 +38938,34 @@ static int sample_top_p_min_p(
         filtered++;
         if (filtered_sum / sum >= top_p) break;
     }
-    if (filtered <= 0) return ids[0];
+    if (filtered <= 0) {
+        token = ids[0];
+        goto done;
+    }
 
     float r = sample_rng_f32(rng) * filtered_sum;
     for (int i = 0; i < filtered; i++) {
         r -= probs[i];
-        if (r <= 0.0f) return ids[i];
+        if (r <= 0.0f) {
+            token = ids[i];
+            goto done;
+        }
     }
-    return ids[filtered - 1];
+    token = ids[filtered - 1];
+done:
+    free(masked);
+    return token;
 }
 
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
-                           float top_p, float min_p, uint64_t *rng,
+                           float top_p, float min_p, float top_n_sigma,
+                           uint64_t *rng,
                            float *prob_scratch) {
     if (!logits || !rng || n_vocab == 0) return -1;
     return sample_top_p_min_p(logits, n_vocab, temperature, top_k,
-                              top_p, min_p, rng, prob_scratch);
+                              top_p, min_p, top_n_sigma, rng, prob_scratch);
 }
 
 int ds4_test_sampling_probabilities(const float *logits, uint32_t n_vocab,
@@ -61000,19 +61070,20 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 }
 
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
-                      int top_k, float top_p, float min_p, uint64_t *rng) {
+                      int top_k, float top_p, float min_p, float top_n_sigma,
+                      uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
     float *scratch = xmalloc((size_t)n_vocab * sizeof(scratch[0]));
     const int token = sample_top_p_min_p(logits, (uint32_t)n_vocab,
                                          temperature, top_k, top_p, min_p,
-                                         rng, scratch);
+                                         top_n_sigma, rng, scratch);
     free(scratch);
     return token;
 }
 
-int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, float top_n_sigma, uint64_t *rng) {
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
-                              top_p, min_p, rng, s->sample_probs);
+                              top_p, min_p, top_n_sigma, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {

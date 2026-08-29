@@ -203,6 +203,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--temp F", "Sampling temperature. 0 is greedy/deterministic.");
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
+    opt(fp, c, "--top-n-sigma F", "Keep tokens within F standard deviations of the top logit (arXiv:2411.07641). Disables the min-p default.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
     para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
     opt(fp, c, "--think", "Use normal thinking mode.");

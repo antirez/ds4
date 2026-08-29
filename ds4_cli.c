@@ -67,9 +67,11 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float top_n_sigma;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_n_sigma_set;
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logits_path;
@@ -516,6 +518,7 @@ static void cli_apply_model_sampling_defaults(
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
     if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!gen->top_n_sigma_set) gen->top_n_sigma = 0.0f;
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -591,7 +594,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             have_greedy_next = false;
         } else {
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
-                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+                                       cfg->gen.top_p, cfg->gen.min_p,
+                                       cfg->gen.top_n_sigma, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
@@ -1497,6 +1501,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        0,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
+                                       cfg->gen.top_n_sigma,
                                        &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
@@ -1766,6 +1771,7 @@ static cli_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
+            .top_n_sigma = 0.0f,
             .dump_logprobs_top_k = 20,
             .think_mode = DS4_THINK_HIGH,
         },
@@ -1870,6 +1876,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
+        } else if (!strcmp(arg, "--top-n-sigma")) {
+            c.gen.top_n_sigma = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.gen.top_n_sigma_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -2023,6 +2032,11 @@ static cli_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    /* Top-n-sigma is a truncation sampler in its own right: an explicit
+     * --top-n-sigma replaces the implicit min-p default so temperature and
+     * top-n-sigma alone shape the distribution.  An explicit --min-p still
+     * wins. */
+    if (c.gen.top_n_sigma_set && !c.gen.min_p_set) c.gen.min_p = 0.0f;
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
         fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
         exit(2);
@@ -2162,6 +2176,7 @@ int main(int argc, char **argv) {
             .temperature = cfg.gen.temperature,
             .top_p = cfg.gen.top_p,
             .min_p = cfg.gen.min_p,
+            .top_n_sigma = cfg.gen.top_n_sigma,
             .seed = cfg.gen.seed,
             .think_mode = cfg.gen.think_mode,
         };

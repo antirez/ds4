@@ -29,6 +29,7 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float top_n_sigma;
     uint64_t seed;
     ds4_think_mode think_mode;
 } ds4_dist_generation_options;

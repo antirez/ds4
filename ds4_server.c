@@ -656,11 +656,13 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float top_n_sigma;
     /* Explicit client sampling wins even in thinking mode; the fixed
      * DeepSeek-style thinking defaults apply only to omitted knobs. */
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_n_sigma_set;
     bool top_k_set;
     uint64_t seed;
     bool stream;
@@ -821,6 +823,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
+    r->top_n_sigma = 0.0f;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -3057,6 +3060,14 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "top_n_sigma")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_n_sigma = (float)v;
+            r->top_n_sigma_set = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -3267,6 +3278,14 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "top_n_sigma")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_n_sigma = (float)v;
+            r->top_n_sigma_set = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -4167,6 +4186,14 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "top_n_sigma")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_n_sigma = (float)v;
+            r->top_n_sigma_set = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -4399,6 +4426,14 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "top_n_sigma")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->top_n_sigma = (float)v;
+            r->top_n_sigma_set = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -10067,7 +10102,7 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\ntop_n_sigma: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
@@ -10081,6 +10116,7 @@ static uint64_t trace_begin(
             j->req.top_k,
             j->req.top_p,
             j->req.min_p,
+            j->req.top_n_sigma,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
@@ -11644,6 +11680,7 @@ decode_again:
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
+        float top_n_sigma = j->req.top_n_sigma;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
             /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
              * only for knobs the client left out: an explicit request value
@@ -11653,12 +11690,18 @@ decode_again:
             if (!j->req.top_k_set) top_k = 0;
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
             if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
+            if (!j->req.top_n_sigma_set) top_n_sigma = 0.0f;
         }
+        /* Top-n-sigma is a truncation sampler in its own right: an explicit
+         * top_n_sigma replaces the implicit min-p default so temperature and
+         * top-n-sigma alone shape the distribution.  An explicit min_p from
+         * the client still wins. */
+        if (top_n_sigma > 0.0f && !j->req.min_p_set) min_p = 0.0f;
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
         int token = ds4_session_sample(slot->session, temperature, top_k,
-                                       top_p, min_p, &rng);
+                                       top_p, min_p, top_n_sigma, &rng);
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -12639,6 +12682,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"top_n_sigma\","
             "\"stop\","
             "\"seed\","
             "\"stream\","
@@ -14933,6 +14977,7 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(r.top_n_sigma == 0.0f);
     request_free(&r);
 }
 

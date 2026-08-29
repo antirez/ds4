@@ -58,9 +58,11 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float top_n_sigma;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_n_sigma_set;
     uint64_t seed;
     ds4_think_mode think_mode;
 } agent_generation_options;
@@ -575,6 +577,7 @@ static agent_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
+            .top_n_sigma = 0.0f,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -656,6 +659,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
+        } else if (!strcmp(arg, "--top-n-sigma")) {
+            c.gen.top_n_sigma = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.gen.top_n_sigma_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
@@ -749,6 +755,11 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    /* Top-n-sigma is a truncation sampler in its own right: an explicit
+     * --top-n-sigma replaces the implicit min-p default so temperature and
+     * top-n-sigma alone shape the distribution.  An explicit --min-p still
+     * wins. */
+    if (c.gen.top_n_sigma_set && !c.gen.min_p_set) c.gen.min_p = 0.0f;
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -777,6 +788,7 @@ static void agent_apply_model_sampling_defaults(
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
     if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (!gen->top_n_sigma_set) gen->top_n_sigma = 0.0f;
 }
 
 static ds4_think_mode effective_think_mode(const agent_config *cfg) {
@@ -8527,6 +8539,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                               0,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
+                              greedy ? 0.0f : cfg->gen.top_n_sigma,
                               rng);
 }
 
@@ -9025,6 +9038,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        0,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
+                                       cfg->gen.top_n_sigma,
                                        &rng);
         if (ds4_token_is_stop(w->engine, token)) break;
 

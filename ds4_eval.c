@@ -1204,6 +1204,8 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float top_n_sigma;
+    bool min_p_set;
     uint64_t seed;
     int pause_ms;
     int power_percent;
@@ -1518,6 +1520,7 @@ static eval_config parse_options(int argc, char **argv) {
         .max_tokens = 16000,
         .top_p = DS4_DEFAULT_TOP_P,
         .min_p = DS4_DEFAULT_MIN_P,
+        .top_n_sigma = 0.0f,
         .pause_ms = 350,
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
@@ -1568,6 +1571,13 @@ static eval_config parse_options(int argc, char **argv) {
             c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
             c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.min_p_set = true;
+        } else if (!strcmp(arg, "--top-n-sigma")) {
+            c.top_n_sigma = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            /* Top-n-sigma is a truncation sampler in its own right: an
+             * explicit --top-n-sigma replaces the implicit min-p default so
+             * temperature and top-n-sigma alone shape the distribution. */
+            if (!c.min_p_set) c.min_p = 0.0f;
         } else if (!strcmp(arg, "--seed")) {
             c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -2571,6 +2581,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "temperature: %.6g\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
+            "top_n_sigma: %.6g\n"
             "seed: %llu\n"
             "think_mode_requested: %s\n"
             "soft_limit_reply_budget: %d\n"
@@ -2588,6 +2599,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             cfg->temperature,
             cfg->top_p,
             cfg->min_p,
+            cfg->top_n_sigma,
             (unsigned long long)cfg->seed,
             ds4_think_mode_name(cfg->think_mode),
             cfg->soft_limit_reply_budget,
@@ -2630,6 +2642,7 @@ static void trace_write_case(FILE *trace,
             "temperature: %.6g\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
+            "top_n_sigma: %.6g\n"
             "think_mode_effective: %s\n",
             idx + 1, ncases, tc->source, tc->id,
             (long long)time(NULL),
@@ -2646,6 +2659,7 @@ static void trace_write_case(FILE *trace,
             cfg->temperature,
             cfg->top_p,
             cfg->min_p,
+            cfg->top_n_sigma,
             ds4_think_mode_name(effective_think_mode));
     if (think_close && think_close->kind != EVAL_THINK_CLOSE_NONE) {
         fprintf(trace,
@@ -3872,7 +3886,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         }
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
-                                       cfg->top_p, cfg->min_p, rng);
+                                       cfg->top_p, cfg->min_p,
+                                       cfg->top_n_sigma, rng);
         if (ds4_token_is_stop(engine, token)) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
