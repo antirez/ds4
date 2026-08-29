@@ -30,6 +30,7 @@
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
 /tests/test_sampling
+/tests/test_kvstore_sweep
 *.o
 *.dSYM/
 __pycache__/
@@ -37,3 +38,22 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+# Local agent tooling (pi) — not part of the repo
+.pi/
+AGENTS.md
+AGENTS.md.bak
+
+# Local KV-cache investigation notes
+KV_CACHE_FINDINGS.md
+KV_CACHE_WHITESPACE_FINDINGS.md
+KV_CACHE_WHITESPACE_FIX.md
+KV_cache_lead.md
+STRIXHALO.md
+
+# Local server operations cruft
+.kv-cache-stats.jsonl
+com.ds4.server.plist.bakKV.plist
+cleanup-kv-cache.sh
+rotate-logs.sh
+download_shards.py

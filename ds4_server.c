@@ -2437,6 +2437,21 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* Clients that must echo reasoning_content back (DeepSeek thinking mode
+ * rejects an empty string) pad an empty thinking channel with a single space
+ * on replay.  The model itself always samples the closing tag immediately
+ * after the opening one, so a whitespace-only channel re-renders to nothing:
+ * <think> + " " + </think> re-tokenizes to an extra
+ * space token that the live KV does not have, and that one token
+ * invalidates the whole prefix.  Render it as the clean <think></think>
+ * boundary the KV was sampled from. */
+static const char *thinking_reasoning_visible(const char *reasoning) {
+    if (!reasoning) return "";
+    const char *p = reasoning;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p ? reasoning : "";
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -2491,7 +2506,7 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
                 if (think) {
                     if (tool_context || i > last_user_idx) {
                         buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        buf_puts(&out, thinking_reasoning_visible(m->reasoning));
                         buf_puts(&out, "</think>");
                     } else {
                         buf_puts(&out, "</think>");
@@ -2672,7 +2687,7 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
+                    buf_puts(&out, thinking_reasoning_visible(m->reasoning));
                     buf_puts(&out, "</think>");
                 } else {
                     buf_puts(&out, "</think>");
@@ -9856,184 +9871,8 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
 }
 
 /* =========================================================================
- * Trace Diagnostics.
- * =========================================================================
- *
- * The human transcript is not enough to debug prompt-cache misses.  The model
- * may generate text that is semantically accepted as a tool call, while the
- * next OpenAI request re-renders a slightly different canonical DSML block.
- * That creates a token mismatch even if the conversation "looks" continuous.
- *
- * When --trace is enabled we therefore record the exact cache decision and a
- * small token window around the first mismatch between the live KV checkpoint
- * and the incoming prompt.  Normal server logs stay compact; trace files get
- * enough data to diagnose tokenizer-boundary and canonicalization problems.
- */
-
-#define TRACE_CACHE_BEFORE 8
-#define TRACE_CACHE_AFTER  8
-#define TRACE_CACHE_WINDOW (TRACE_CACHE_BEFORE + 1 + TRACE_CACHE_AFTER)
-
-typedef struct {
-    bool valid;
-    int old_pos;
-    int prompt_len;
-    int common;
-    int rewind_to;
-    int start;
-    int count;
-    int live_id[TRACE_CACHE_WINDOW];
-    int prompt_id[TRACE_CACHE_WINDOW];
-} trace_cache_diag;
-
-static void trace_cache_capture(
-        trace_cache_diag *d,
-        const ds4_tokens *live,
-        const ds4_tokens *prompt,
-        int old_pos,
-        int common)
-{
-    memset(d, 0, sizeof(*d));
-    d->valid = true;
-    d->rewind_to = -1;
-    d->old_pos = old_pos;
-    d->prompt_len = prompt ? prompt->len : 0;
-    d->common = common;
-
-    const int live_len = live ? live->len : 0;
-    const int prompt_len = prompt ? prompt->len : 0;
-    int max_len = live_len > prompt_len ? live_len : prompt_len;
-    int start = common - TRACE_CACHE_BEFORE;
-    if (start < 0) start = 0;
-    int end = common + TRACE_CACHE_AFTER + 1;
-    if (end > max_len) end = max_len;
-    if (end < start) end = start;
-
-    d->start = start;
-    d->count = end - start;
-    if (d->count > TRACE_CACHE_WINDOW) d->count = TRACE_CACHE_WINDOW;
-    for (int i = 0; i < d->count; i++) {
-        int pos = start + i;
-        d->live_id[i] = live && pos < live->len ? live->v[pos] : -1;
-        d->prompt_id[i] = prompt && pos < prompt->len ? prompt->v[pos] : -1;
-    }
-}
-
-static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
-    if (!d || !d->valid) return "unknown";
-    if (d->old_pos == 0) return "no-live-checkpoint";
-    if (d->rewind_to >= 0) return "live-prefix-rewind";
-    if (d->common != d->old_pos) return "token-mismatch";
-    if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
-    return "live-prefix-match";
-}
-
-static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
-    return d && d->valid &&
-           (d->rewind_to >= 0 ||
-            (d->old_pos > 0 && d->common == d->old_pos &&
-             d->prompt_len >= d->old_pos));
-}
-
-static void trace_write_escaped_bytes(FILE *fp, const char *p, size_t len) {
-    static const char hex[] = "0123456789abcdef";
-    fputc('"', fp);
-    for (size_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)p[i];
-        if (c == '"' || c == '\\') {
-            fputc('\\', fp);
-            fputc((char)c, fp);
-        } else if (c == '\n') {
-            fputs("\\n", fp);
-        } else if (c == '\r') {
-            fputs("\\r", fp);
-        } else if (c == '\t') {
-            fputs("\\t", fp);
-        } else if (c < 0x20 || c == 0x7f) {
-            fputs("\\x", fp);
-            fputc(hex[c >> 4], fp);
-            fputc(hex[c & 15], fp);
-        } else {
-            fputc((char)c, fp);
-        }
-    }
-    fputc('"', fp);
-}
-
-static void trace_write_token(FILE *fp, ds4_engine *engine, int token) {
-    if (token < 0) {
-        fputs("- <none>", fp);
-        return;
-    }
-    size_t len = 0;
-    char *piece = ds4_token_text(engine, token, &len);
-    fprintf(fp, "%d ", token);
-    trace_write_escaped_bytes(fp, piece, len);
-    free(piece);
-}
-
-static void trace_write_cache_diag(
-        server *s,
-        const trace_cache_diag *d,
-        const tool_replay_stats *tool_replay,
-        int cached,
-        const char *cache_source,
-        int disk_cached,
-        const char *disk_path)
-{
-    fprintf(s->trace,
-            "\n--- cache decision ---\n"
-            "live_tokens_before: %d\n"
-            "prompt_tokens: %d\n"
-            "live_prompt_common: %d\n"
-            "memory_token_reusable: %d\n"
-            "memory_miss_reason: %s\n"
-            "tool_replay: mem=%d disk=%d canonical=%d missing_ids=%d\n"
-            "cache_source: %s\n"
-            "cached_tokens: %d\n"
-            "disk_cached_tokens: %d\n",
-            d && d->valid ? d->old_pos : 0,
-            d && d->valid ? d->prompt_len : 0,
-            d && d->valid ? d->common : 0,
-            trace_cache_memory_reusable(d) ? 1 : 0,
-            trace_cache_miss_reason(d),
-            tool_replay ? tool_replay->mem : 0,
-            tool_replay ? tool_replay->disk : 0,
-            tool_replay ? tool_replay->canonical : 0,
-            tool_replay ? tool_replay->missing_ids : 0,
-            cache_source ? cache_source : "none",
-            cached,
-            disk_cached);
-    if (disk_path && disk_path[0]) fprintf(s->trace, "disk_cache_file: %s\n", disk_path);
-
-    if (!d || !d->valid || d->old_pos == 0 ||
-        trace_cache_memory_reusable(d))
-    {
-        return;
-    }
-
-    fprintf(s->trace,
-            "\nfirst_mismatch_token: %d\n"
-            "token_window: [%d..%d)\n",
-            d->common,
-            d->start,
-            d->start + d->count);
-    for (int i = 0; i < d->count; i++) {
-        int pos = d->start + i;
-        int live = d->live_id[i];
-        int prompt = d->prompt_id[i];
-        const char *mark;
-        if (live < 0) mark = "prompt-only";
-        else if (prompt < 0) mark = "live-only";
-        else mark = live == prompt ? "==" : "!=";
-
-        fprintf(s->trace, "%7d %-11s live ", pos, mark);
-        trace_write_token(s->trace, s->engine, live);
-        fputs(" | prompt ", s->trace);
-        trace_write_token(s->trace, s->engine, prompt);
-        fputc('\n', s->trace);
-    }
-}
+ * Request Trace.
+ * ========================================================================= */
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
@@ -10055,11 +9894,7 @@ static uint64_t trace_begin(
         server *s,
         const job *j,
         int cached,
-        int effective_prompt_tokens,
-        const trace_cache_diag *cache_diag,
-        const char *cache_source,
-        int disk_cached,
-        const char *disk_path) {
+        int effective_prompt_tokens) {
     if (!s->trace) return 0;
 
     pthread_mutex_lock(&s->trace_mu);
@@ -10084,8 +9919,6 @@ static uint64_t trace_begin(
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
-    trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
-                           cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
         fputs("\n--- raw request json ---\n", s->trace);
         fputs(j->req.raw_body, s->trace);
@@ -11189,9 +11022,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
-                        &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
@@ -11267,7 +11097,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             pthread_mutex_unlock(&s->inference_mu);
             cached = rewind_to;
             cache_source = "memory-rewind";
-            cache_diag.rewind_to = rewind_to;
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
                        old_pos, rewind_to);
@@ -11301,10 +11130,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d",
                    responses_protocol ? " RESPPROTO" : "",
-                   old_pos, j->req.prompt.len, common,
-                   trace_cache_miss_reason(&cache_diag));
+                   old_pos, j->req.prompt.len, common);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -11341,8 +11169,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
-    uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
-                                    cache_source, disk_cached, disk_cache_path);
+    uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -17218,6 +17045,37 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+/* A whitespace-only thinking channel must render back as empty so the
+ * reconstituted prompt matches a cleanly sampled live KV (the cache-miss
+ * bug: the model's separator token desyncs byte-prefix matching). */
+static void test_thinking_whitespace_renders_empty(void) {
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible(NULL), ""));
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible(" "), ""));
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible("\n\t"), ""));
+    TEST_ASSERT(!strcmp(thinking_reasoning_visible("need a tool"), "need a tool"));
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("continue");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup(" ");
+    assistant.content = xstrdup("");
+    chat_msgs_push(&msgs, assistant);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    /* The padded space must not survive into the rendered tags: the
+     * boundary is the clean opening tag immediately followed by the
+     * closing one, exactly as the live KV was sampled. */
+    TEST_ASSERT(strstr(prompt, "<think></think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<think> </think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -18412,6 +18270,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_thinking_whitespace_renders_empty();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
