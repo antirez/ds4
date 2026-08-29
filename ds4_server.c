@@ -5810,12 +5810,14 @@ typedef struct {
     openai_tool_stream tool;
 } openai_stream;
 
+static bool prompt_thinking_open(const request *r);
+
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->mode = prompt_thinking_open(r) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
     st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+        prompt_thinking_open(r) && r->has_tools;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -6806,7 +6808,7 @@ typedef struct {
 
 static void responses_stream_init(const request *r, responses_stream *st) {
     memset(st, 0, sizeof(*st));
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
+    st->mode = prompt_thinking_open(r) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
     responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
@@ -7784,9 +7786,9 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
     memset(st, 0, sizeof(*st));
     st->active = ok;
-    st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->mode = prompt_thinking_open(r) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
     st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+        prompt_thinking_open(r) && r->has_tools;
     return ok;
 }
 
@@ -10416,6 +10418,17 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* True when generation for this request begins inside an open <think> block.
+ * Thinking mode alone is not enough: an assistant prefill whose rendered tail
+ * already closed </think> means the model is generating the final answer, not
+ * reasoning.  Classifying by think_mode alone misfiles that answer into
+ * reasoning_content (and streams it as reasoning deltas). */
+static bool prompt_thinking_open(const request *r) {
+    if (!r || !ds4_think_mode_enabled(r->think_mode)) return false;
+    thinking_state st = thinking_state_from_prompt(r);
+    return st.inside;
+}
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
@@ -12149,7 +12162,7 @@ decode_again:
             text.ptr ? text.ptr : "",
             j->req.has_tools,
             saw_tool_start,
-            ds4_think_mode_enabled(j->req.think_mode),
+            prompt_thinking_open(&j->req),
             &final_finish,
             err,
             sizeof(err),
@@ -17420,6 +17433,30 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_prompt_closed_prefill_generates_content(void) {
+    /* A trailing assistant prefill whose rendered tail already closed
+     * </think> generates the final answer, not reasoning. */
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup("[gMASK]<sop><|user|>q<|assistant|>"
+                            "<think>partial reasoning</think>");
+    TEST_ASSERT(prompt_thinking_open(&r) == false);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup("[gMASK]<sop><|user|>q<|assistant|><think>");
+    TEST_ASSERT(prompt_thinking_open(&r) == true);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_NONE;
+    r.prompt_text = xstrdup("<|assistant|><think>");
+    TEST_ASSERT(prompt_thinking_open(&r) == false);
+    request_free(&r);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -18615,6 +18652,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_prompt_closed_prefill_generates_content();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
