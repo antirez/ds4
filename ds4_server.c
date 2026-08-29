@@ -9316,8 +9316,9 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
-                            ctx_size, created_at, last_used, payload_bytes);
+    ds4_kvstore_fill_header(h, 0, 0, quant_bits, reason, ext_flags, tokens,
+                            hits, ctx_size, created_at, last_used,
+                            payload_bytes);
 }
 #endif
 
@@ -9357,7 +9358,12 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint32_t text_bytes = 0;
         bool ok = kv_read_header(fp, &hdr, &text_bytes);
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
-        if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
+        if (ok && hdr.model_id == model_id &&
+            (hdr.weights_fp24 == 0 || !s->engine ||
+             hdr.quant_bits !=
+                 (uint8_t)ds4_engine_routed_quant_bits(s->engine) ||
+             hdr.weights_fp24 == ds4_engine_weights_fp24(s->engine)) &&
+            (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
         {
@@ -9644,7 +9650,8 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
 #ifdef DS4_SERVER_TEST
 static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
+    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, 0, quant_bits,
+                                        ctx_size);
 }
 #endif
 
@@ -17440,7 +17447,10 @@ static void test_kv_stub_file(const char *dir, const char *sha,
 }
 
 static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
+                                         uint8_t model_id,
+                                         uint32_t weights_fp24,
+                                         uint8_t quant_bits,
+                                         uint8_t reason,
                                          uint32_t tokens,
                                          uint64_t payload_bytes) {
     char sha[41];
@@ -17456,8 +17466,8 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, weights_fp24, quant_bits, reason, 0,
+                            tokens, 0, 32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -17473,7 +17483,7 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
 static void test_kv_text_stub_file(const char *dir, const char *text,
                                    uint8_t reason,
                                    uint32_t tokens, uint64_t payload_bytes) {
-    test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
+    test_kv_text_stub_file_model(dir, text, 0, 0, 2, reason, tokens, payload_bytes);
 }
 
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
@@ -17523,7 +17533,7 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     if (!dir) return;
 
     const char *text = "shared rendered prefix";
-    test_kv_text_stub_file_model(dir, text, 1, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text, 1, 0, 2, KV_REASON_COLD, 512, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -17531,9 +17541,9 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     kc.opt = kv_cache_default_options();
 
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
-                                             0, 2, 32768) < 0);
+                                             0, 0, 2, 32768) < 0);
     int idx = ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
-                                           1, 2, 32768);
+                                           1, 0, 2, 32768);
     TEST_ASSERT(idx >= 0);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 1);
 
@@ -17546,6 +17556,93 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     unlink(path);
     free(path);
     rmdir(dir);
+}
+
+static void test_kv_cache_lookup_rejects_wrong_weights(void) {
+    char tmpl[] = "/tmp/ds4-kv-weights-fp-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Same model shape, three headers: fingerprinted with A, fingerprinted
+     * with B, and a legacy header without a fingerprint (issue #805). */
+    const char *text_a = "prompt cached under weights A";
+    const char *text_b = "prompt cached under weights B";
+    const char *text_legacy = "prompt cached before fingerprints";
+    test_kv_text_stub_file_model(dir, text_a, 0, 0x00A11CEu, 2, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text_b, 0, 0x00B0BB0u, 2, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text_legacy, 0, 0, 2, KV_REASON_COLD, 512, 0);
+    /* A q4 checkpoint of the SAME logical model: fingerprints necessarily
+     * differ across quants, so the fingerprint must not veto it — the
+     * existing reject_different_quant policy stays the only cross-quant
+     * gate. */
+    const char *text_q4 = "prompt cached under the q4 requant";
+    test_kv_text_stub_file_model(dir, text_q4, 0, 0x00C4C4Cu, 4, KV_REASON_COLD, 512, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* An engine with weights A must not pick up the checkpoint of B... */
+    int idx = ds4_kvstore_find_text_prefix(&kc, text_b, 0, 0x00A11CEu, 2, 32768);
+    TEST_ASSERT(idx < 0);
+    /* ...must still pick up its own... */
+    idx = ds4_kvstore_find_text_prefix(&kc, text_a, 0, 0x00A11CEu, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].weights_fp24 == 0x00A11CEu);
+    /* ...and legacy entries without a fingerprint stay loadable, like
+     * model_id 0 does for old cache files. */
+    idx = ds4_kvstore_find_text_prefix(&kc, text_legacy, 0, 0x00A11CEu, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].weights_fp24 == 0);
+    /* ...and the cross-quant checkpoint stays reusable despite the
+     * different fingerprint (reject_different_quant is false here). */
+    idx = ds4_kvstore_find_text_prefix(&kc, text_q4, 0, 0x00A11CEu, 2, 32768);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].quant_bits == 4);
+
+    kv_cache_close(&kc);
+    const char *texts[] = {text_a, text_b, text_legacy, text_q4};
+    for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
+        char sha[41], name[44];
+        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
+    rmdir(dir);
+}
+
+static void test_weights_fp24_of_fd_tells_weights_apart(void) {
+    char tmpl_a[] = "/tmp/ds4-fp24-a.XXXXXX";
+    char tmpl_b[] = "/tmp/ds4-fp24-b.XXXXXX";
+    int fd_a = mkstemp(tmpl_a);
+    int fd_b = mkstemp(tmpl_b);
+    TEST_ASSERT(fd_a >= 0 && fd_b >= 0);
+    if (fd_a < 0 || fd_b < 0) return;
+
+    /* Two files with identical size and header region, one byte of tensor
+     * data apart — the scenario of #805 in miniature. */
+    enum { FILE_BYTES = 1 << 16, DATA_START = 512 };
+    uint8_t *buf = xmalloc(FILE_BYTES);
+    for (int i = 0; i < FILE_BYTES; i++) buf[i] = (uint8_t)(i * 31u);
+    TEST_ASSERT(write(fd_a, buf, FILE_BYTES) == FILE_BYTES);
+    /* Flip a byte the sampler is guaranteed to read: the first window
+     * always starts exactly at data_start. */
+    buf[DATA_START] ^= 0xff;
+    TEST_ASSERT(write(fd_b, buf, FILE_BYTES) == FILE_BYTES);
+    free(buf);
+
+    uint32_t fp_a = ds4_weights_fp24_of_fd(fd_a, DATA_START, FILE_BYTES);
+    uint32_t fp_b = ds4_weights_fp24_of_fd(fd_b, DATA_START, FILE_BYTES);
+    TEST_ASSERT(fp_a != 0 && fp_b != 0);
+    TEST_ASSERT(fp_a != fp_b);
+    /* Same bytes, same fingerprint. */
+    TEST_ASSERT(ds4_weights_fp24_of_fd(fd_a, DATA_START, FILE_BYTES) == fp_a);
+
+    close(fd_a);
+    close(fd_b);
+    unlink(tmpl_a);
+    unlink(tmpl_b);
 }
 
 static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
@@ -17581,7 +17678,7 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     kc.opt = kv_cache_default_options();
 
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "stale rendered prefix and tail",
-                                             0, 2, 32768) < 0);
+                                             0, 0, 2, 32768) < 0);
 
     kv_cache_close(&kc);
     unlink(path);
@@ -18424,6 +18521,8 @@ static void ds4_server_unit_tests_run(void) {
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
+    test_kv_cache_lookup_rejects_wrong_weights();
+    test_weights_fp24_of_fd_tells_weights_apart();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
