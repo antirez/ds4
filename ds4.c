@@ -40568,6 +40568,11 @@ static uint32_t glm_graph_indexed_prefill_chunk_tokens(
             return 0;
         }
         uint32_t chunk = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+        const char *ce = getenv("DS4_GLM53_PREFILL_CHUNK");
+        if (ce && ce[0]) {
+            int v = atoi(ce);
+            if (v >= 512) chunk = (uint32_t)v;
+        }
         if (compact_cap != 0 && chunk > compact_cap) chunk = compact_cap;
         return chunk;
     }
@@ -45661,7 +45666,8 @@ static bool glm_graph_mtp_step(
         int                next_token,
         uint32_t           pos,
         uint32_t           min_pos,
-        int               *draft_out) {
+        int               *draft_out,
+        bool               raw_hidden) {
     if (!g || !model || !weights || !draft_out) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
@@ -45746,6 +45752,15 @@ static bool glm_graph_mtp_step(
 #define DS4_GLM_MTP_STAGE(name_) do { if (ok) mtp_stage = (name_); } while (0)
     bool ok = glm_graph_begin_commands_if_needed();
     /* MTP input: concat(enorm(embed(next_token)), hnorm(h)) -> eh_proj. */
+    if (ok && raw_hidden && g->glm53) {
+        /* Snapshot the previous nextn step's output hidden before the
+         * embed stage overwrites g->next. */
+        ok = ds4_gpu_tensor_copy(g->hc_output,
+                                 0,
+                                 g->next,
+                                 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
     if (ok && !input_ready) {
         ok = glm_graph_mtp_embed_token(g,
                                        model,
@@ -45763,7 +45778,11 @@ static bool glm_graph_mtp_step(
                                                 DS4_RMS_EPS) != 0;
     DS4_GLM_MTP_STAGE("hnorm");
     const ds4_gpu_tensor *target_hidden = g->cur;
-    if (ok && g->glm53) {
+    if (ok && raw_hidden) {
+        /* Chained draft: hidden is the previous nextn step's own output,
+         * snapshotted into g->hc_output before the embed stage. */
+        target_hidden = g->hc_output;
+    } else if (ok && g->glm53) {
         ok = ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
                                             g->hc_cur,
                                             g->hc_mean_weights,
@@ -52287,6 +52306,10 @@ struct ds4_session {
     int glm_mtp_draft;
     int glm_mtp_parent;
     int glm_mtp_have;
+    /* K-width draft chain (DS4_GLM_MTP_WIDTH): glm_mtp_chain[0..len-1] are
+     * successive nextn drafts for positions pos+1..pos+len. */
+    int glm_mtp_chain[8];
+    int glm_mtp_chain_len;
     bool glm_mtp_rollback_valid;
     uint32_t glm_mtp_rollback_pos;
     uint32_t glm_mtp_rollback_dense_len;
@@ -54076,6 +54099,18 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
 }
 
 #ifndef DS4_NO_GPU
+/* K-width greedy GLM MTP: number of target tokens verified per cycle.
+ * 2 is the upstream serial-verify behavior; DS4_GLM_MTP_WIDTH raises it. */
+static int ds4_engine_glm_mtp_spec_width(const ds4_engine *e) {
+    if (!e || !e->glm_mtp || DS4_N_NEXTN_PREDICT == 0) return 1;
+    const char *env = getenv("DS4_GLM_MTP_WIDTH");
+    if (!env || !env[0]) return 2;
+    int w = atoi(env);
+    if (w < 2) return 2;
+    if (w > 8) w = 8;
+    return w;
+}
+
 static bool ds4_engine_glm_mtp_spec_enabled(const ds4_engine *e) {
     return e && e->backend != DS4_BACKEND_CPU &&
            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
@@ -62412,6 +62447,391 @@ static int speculative_point_replacement(ds4_session *s,
  * draft as a point-mass proposal and uses stochastic p/q acceptance.  Returns
  * one or two committed tokens with s->logits at the last committed position,
  * or -1 on error. */
+/* Run the shared output head on one GLM-5.3 hc row and return its argmax.
+ * Used by the K-width verifier to score every verified row. */
+static bool glm53_session_row_argmax(ds4_session *s,
+                                     const uint32_t row,
+                                     const uint64_t hc_row_values,
+                                     const uint64_t hc_row_bytes,
+                                     int *out) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    float *logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!logits) return false;
+    const bool ok =
+        ds4_gpu_tensor_write(g->hc_cur,
+                             0,
+                             s->glm_mtp_hc + row * hc_row_values,
+                             hc_row_bytes) != 0 &&
+        glm_graph_forward_output_head(g,
+                                      &s->engine->model,
+                                      &s->engine->weights,
+                                      g->hc_cur,
+                                      logits);
+    if (ok) *out = glm_session_logits_argmax(logits);
+    free(logits);
+    return ok;
+}
+
+/* Build the next cycle's draft chain (up to width-1 drafts).
+ *
+ * Rows 0..rows-1 of s->glm_mtp_hc hold the target hidden for positions
+ * pos..pos+rows-1; arg[0..rows-1] hold the per-row argmax (token[pos+i+1]).
+ * The next cycle starts at pos' = pos+rows with first' = arg[rows-1] and
+ * needs drafts for pos'+1..pos'+width-1.
+ *
+ * A nextn step at slot p consumes target (or chained) hidden h[p] and
+ * token[p+1], writes its KV at slot p, and drafts token[p+2].  The next
+ * cycle's chain steps therefore read slots pos+rows-1..pos+2*rows... the
+ * window covers slots this cycle must populate: seeding steps at
+ * pos..pos+rows-2 (tokens the target already accepted; drafts discarded)
+ * plus the chain-building steps at pos+rows-1..pos+rows+width-3. */
+static bool glm53_session_build_chain(ds4_session *s,
+                                      ds4_engine *e,
+                                      const int *arg,
+                                      const uint64_t hc_row_values,
+                                      const uint64_t hc_row_bytes,
+                                      const uint32_t pos,
+                                      const int rows,
+                                      const uint32_t min_pos,
+                                      const int width) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    s->glm_mtp_chain_len = 0;
+    /* Seeding steps are skipped by default: slots pos..pos+rows-2 already
+     * hold KV written by the previous cycle's chain steps for the same
+     * positions (accepted verbatim).  Stale entries on the reject path only
+     * degrade draft quality, never correctness (drafts are re-verified).
+     * DS4_GLM_MTP_SEED_STEPS=1 restores fresh seeding. */
+    static int seed_steps = -1;
+    if (seed_steps < 0) {
+        const char *ss = getenv("DS4_GLM_MTP_SEED_STEPS");
+        seed_steps = ss && ss[0] == '1' ? 1 : 0;
+    }
+    if (seed_steps) {
+        for (int i = 0; i < rows - 1; i++) {
+            if (ds4_gpu_tensor_write(g->hc_cur,
+                                     0,
+                                     s->glm_mtp_hc +
+                                         (uint64_t)i * hc_row_values,
+                                     hc_row_bytes) == 0) {
+                return false;
+            }
+            int discard = -1;
+            if (!glm_graph_mtp_step(g, &e->model, &e->weights, arg[i],
+                                    pos + (uint32_t)i, min_pos, &discard,
+                                    false)) {
+                return false;
+            }
+            (void)discard;
+        }
+    }
+    /* chain[0]: hidden row rows-1, token arg[rows-1] (token[pos+rows]). */
+    if (ds4_gpu_tensor_write(g->hc_cur,
+                             0,
+                             s->glm_mtp_hc +
+                                 (uint64_t)(rows - 1) * hc_row_values,
+                             hc_row_bytes) == 0) {
+        return false;
+    }
+    int tok = arg[rows - 1];
+    uint32_t p = pos + (uint32_t)rows - 1u;
+    bool first = true;
+    for (int j = 0; j < width - 1; j++) {
+        int d = -1;
+        if (!glm_graph_mtp_step(g, &e->model, &e->weights, tok, p,
+                                min_pos, &d, !first)) {
+            return false;
+        }
+        first = false;
+        if (d < 0) return false;
+        s->glm_mtp_chain[s->glm_mtp_chain_len++] = d;
+        tok = d;
+        p++;
+    }
+    return true;
+}
+
+/* K-width greedy GLM-5.3 MTP cycle (DS4_GLM_MTP_WIDTH >= 3).  Verifies
+ * first_token plus chain_len drafts in one layer-major forward, commits the
+ * matching prefix, and rebuilds the chain from the verified hidden rows.
+ * Greedy only: every accepted draft equals the target argmax, so the output
+ * stream is identical to serial decoding. */
+static int ds4_session_glm_spec_cycle_wide(
+        ds4_session *s,
+        int          first_token,
+        int          eos_token,
+        int         *accepted,
+        int          accepted_cap,
+        const int    width,
+        char        *err,
+        size_t       errlen) {
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    const bool timing = s->engine->glm_mtp_timing;
+    const uint32_t dense_before = s->glm_dense_cache_len;
+    const uint64_t hc_row_values =
+        (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t hc_row_bytes = hc_row_values * sizeof(float);
+
+    /* Chain validity: drafts are only usable when the target took exactly
+     * the parent path that produced them. */
+    if (s->glm_mtp_chain_len > 0 &&
+        (!s->glm_mtp_have || first_token != s->glm_mtp_parent)) {
+        s->glm_mtp_chain_len = 0;
+        s->glm_mtp_have = 0;
+    }
+
+    int verify = width;
+    if (getenv("DS4_GLM_MTP_WIDE_MAX")) {
+        int mx = atoi(getenv("DS4_GLM_MTP_WIDE_MAX"));
+        if (mx >= 2 && mx < verify) verify = mx;
+    }
+    if (verify > s->glm_mtp_chain_len + 1) verify = s->glm_mtp_chain_len + 1;
+    if (verify > accepted_cap) verify = accepted_cap;
+    if ((uint32_t)verify > g->ctx_size - pos) verify = (int)(g->ctx_size - pos);
+    if (g->compact_cache_cap != 0 &&
+        pos + (uint32_t)verify > g->compact_cache_cap) {
+        verify = (int)(g->compact_cache_cap - pos);
+    }
+
+    const double t0 = timing ? now_sec() : 0.0;
+    if (verify < 2) {
+        /* Plain step, then seed the chain from the target hidden. */
+        s->glm_spec_inside = 1;
+        const int rc = ds4_session_eval_internal(s, first_token, false,
+                                                 err, errlen);
+        s->glm_spec_inside = 0;
+        if (rc != 0) return -1;
+        if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos) {
+            s->glm_mtp_min_pos = pos;
+        }
+        s->glm_mtp_chain_len = 0;
+        s->glm_mtp_have = 0;
+        int d = -1;
+        const int n1 = glm_session_logits_argmax(s->logits);
+        if (glm_graph_mtp_step(g, &e->model, &e->weights,
+                               n1, pos, s->glm_mtp_min_pos, &d, false)) {
+            s->glm_mtp_chain[s->glm_mtp_chain_len++] = d;
+            s->glm_mtp_draft = d;
+            s->glm_mtp_parent = n1;
+            s->glm_mtp_have = 1;
+            /* Deeper chain drafts condition on the nextn block's own
+             * hidden (raw mode); slots pos+1.. are written by these
+             * steps for the next cycle. */
+            int tok = d;
+            for (int j = 1; j < width - 1; j++) {
+                int dj = -1;
+                if (!glm_graph_mtp_step(g, &e->model, &e->weights,
+                                        tok, pos + (uint32_t)j,
+                                        s->glm_mtp_min_pos, &dj, true)) {
+                    break;
+                }
+                if (dj < 0) break;
+                s->glm_mtp_chain[s->glm_mtp_chain_len++] = dj;
+                tok = dj;
+            }
+        }
+        accepted[0] = first_token;
+        return 1;
+    }
+
+    int toks[8] = { first_token, 0 };
+    for (int i = 1; i < verify; i++) toks[i] = s->glm_mtp_chain[i - 1];
+
+    bool kda_saved = glm_graph_mtp_ensure(g) &&
+                     glm53_graph_copy_kda_state(g, true);
+    bool verified = false;
+    if (kda_saved) {
+        if (!glm53_graph_use_indexed_prefill(g) &&
+            glm_graph_span_fits_full_attention(g, pos, (uint32_t)verify)) {
+            verified = glm_graph_forward_tokens(g,
+                                                &e->model,
+                                                &e->weights,
+                                                toks,
+                                                NULL,
+                                                pos,
+                                                (uint32_t)verify,
+                                                s->glm_mtp_hc,
+                                                s->logits,
+                                                NULL,
+                                                NULL,
+                                                pos,
+                                                0,
+                                                (uint32_t)verify);
+        } else {
+            verified = glm_graph_forward_indexed_tokens(g,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        toks,
+                                                        NULL,
+                                                        pos,
+                                                        (uint32_t)verify,
+                                                        s->glm_mtp_hc,
+                                                        s->logits,
+                                                        NULL,
+                                                        NULL,
+                                                        pos,
+                                                        0,
+                                                        (uint32_t)verify);
+        }
+    }
+    if (!verified) {
+        if (kda_saved) (void)glm53_graph_copy_kda_state(g, false);
+        if (errlen) snprintf(err, errlen, "glm mtp wide: verify failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    const double t1 = timing ? now_sec() : 0.0;
+
+    /* Argmax per verified row.  Row j's logits predict token[pos+j+1];
+     * accept while argmax(row j-1) == chain[j-1]. */
+    int arg[8] = { 0 };
+    for (int j = 0; j < verify; j++) {
+        if (!glm53_session_row_argmax(s, (uint32_t)j,
+                                      hc_row_values, hc_row_bytes,
+                                      &arg[j])) {
+            if (kda_saved) (void)glm53_graph_copy_kda_state(g, false);
+            if (errlen) snprintf(err, errlen, "glm mtp wide: row head failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+    }
+    int n_match = 0; /* accepted rows beyond row 0 */
+    while (n_match < verify - 1 &&
+           arg[n_match] == toks[n_match + 1]) {
+        n_match++;
+    }
+    const int committed = 1 + n_match;
+
+    token_vec_push(&s->checkpoint, first_token);
+    for (int i = 0; i < n_match; i++) {
+        token_vec_push(&s->checkpoint, toks[i + 1]);
+    }
+    s->checkpoint_valid = true;
+    if (getenv("DS4_GLM_MTP_WIDE_DEBUG")) {
+        char *t0d = ds4_token_text(e, toks[0], NULL);
+        char *t1d = ds4_token_text(e, toks[1], NULL);
+        fprintf(stderr, "ds4: wide commit pos=%u n=%d toks=%d'%s',%d'%s' arg=%d,%d\n",
+                pos, committed, toks[0], t0d ? t0d : "?",
+                toks[1], t1d ? t1d : "?", arg[0], arg[1]);
+        free(t0d);
+        free(t1d);
+    }
+
+    const int next_first = arg[committed - 1];
+    s->glm_mtp_parent = next_first;
+    s->glm_mtp_have = 1;
+
+    if (committed < verify) {
+        /* Rejected at row `committed`: replay the accepted prefix to
+         * rebuild KDA/dense state, then rebuild the chain from the last
+         * accepted hidden. */
+        bool ok2 = glm53_graph_copy_kda_state(g, false);
+        if (ok2) {
+            if (!glm53_graph_use_indexed_prefill(g) &&
+                glm_graph_span_fits_full_attention(g, pos,
+                                                   (uint32_t)committed)) {
+                ok2 = glm_graph_forward_tokens(g,
+                                               &e->model,
+                                               &e->weights,
+                                               toks,
+                                               NULL,
+                                               pos,
+                                               (uint32_t)committed,
+                                               s->glm_mtp_hc,
+                                               s->logits,
+                                               NULL,
+                                               NULL,
+                                               pos,
+                                               0,
+                                               (uint32_t)committed);
+            } else {
+                ok2 = glm_graph_forward_indexed_tokens(g,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       toks,
+                                                       NULL,
+                                                       pos,
+                                                       (uint32_t)committed,
+                                                       s->glm_mtp_hc,
+                                                       s->logits,
+                                                       NULL,
+                                                       NULL,
+                                                       pos,
+                                                       0,
+                                                       (uint32_t)committed);
+            }
+        }
+        if (!ok2) {
+            if (errlen) snprintf(err, errlen, "glm mtp wide: replay failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        ds4_session_glm_note_dense_cache(s, pos, (uint32_t)committed);
+        s->glm_mtp_chain_len = 0;
+        s->glm_mtp_have = 0;
+        s->glm_mtp_draft = -1;
+        /* Draft rebuild needs the hidden of the last accepted row; that row
+         * is the last row of the replay batch. */
+        (void)eos_token;
+        const uint32_t pos_last = pos + (uint32_t)committed - 1u;
+        const int first_next = glm_session_logits_argmax(s->logits);
+        /* mtp_step consumes h[pos_last] + token[pos_last+1] and drafts
+         * token[pos_last+2]; the chain's first draft targets the position
+         * after next_first, i.e. we must step from pos_last with token
+         * first_next. */
+        if (!glm53_session_build_chain(s, e, arg,
+                                       hc_row_values, hc_row_bytes,
+                                       pos, committed,
+                                       s->glm_mtp_min_pos, width)) {
+            s->glm_mtp_have = 0;
+            s->glm_mtp_chain_len = 0;
+        }
+        s->glm_mtp_draft = s->glm_mtp_chain_len > 0 ?
+            s->glm_mtp_chain[0] : -1;
+        if (timing) {
+            const double t2 = now_sec();
+            fprintf(stderr,
+                    "ds4: glm mtp wide: verify%d %.1f ms, rebuild %.1f ms, "
+                    "reject at %d, committed %d\n",
+                    verify, (t1 - t0) * 1000.0,
+                    (now_sec() - t1) * 1000.0, committed, committed);
+        }
+        for (int i = 0; i < committed; i++) accepted[i] = toks[i];
+        return committed;
+    }
+
+    /* Full accept: state and hiddens already at pos..pos+verify-1. */
+    ds4_session_glm_note_dense_cache(s, pos, (uint32_t)verify);
+    const uint32_t pos_last = pos + (uint32_t)verify - 1u;
+    if (!glm53_session_build_chain(s, e, arg,
+                                   hc_row_values, hc_row_bytes,
+                                   pos, verify,
+                                   s->glm_mtp_min_pos, width)) {
+        s->glm_mtp_have = 0;
+        s->glm_mtp_chain_len = 0;
+    }
+    s->glm_mtp_draft = s->glm_mtp_chain_len > 0 ?
+        s->glm_mtp_chain[0] : -1;
+    if (timing) {
+        const double t2 = now_sec();
+        fprintf(stderr,
+                "ds4: glm mtp wide: verify%d %.1f ms, chain %d %.1f ms, "
+                "committed %d, toks=%d,%d arg=%d,%d\n",
+                verify, (t1 - t0) * 1000.0,
+                s->glm_mtp_chain_len, (t2 - t1) * 1000.0, committed,
+                toks[0], toks[1], arg[0], arg[1]);
+    }
+    if (g->glm53 && kda_saved) {
+        s->glm_mtp_rollback_pos = pos;
+        s->glm_mtp_rollback_dense_len = dense_before;
+        s->glm_mtp_rollback_first_token = first_token;
+        s->glm_mtp_rollback_valid = true;
+    }
+    for (int i = 0; i < committed; i++) accepted[i] = toks[i];
+    return committed;
+}
+
 static int ds4_session_glm_spec_cycle_impl(
         ds4_session *s,
         int          first_token,
@@ -62435,7 +62855,7 @@ static int ds4_session_glm_spec_cycle_impl(
         (uint64_t)DS4_N_EMBD * (g->glm53 ? DS4_N_HC : 1u);
     const uint64_t hc_row_bytes = hc_row_values * sizeof(float);
     if (!s->glm_mtp_hc) {
-        s->glm_mtp_hc = malloc(2ull * hc_row_bytes);
+        s->glm_mtp_hc = malloc(8ull * hc_row_bytes);
         s->glm_mtp_logits0 = malloc((size_t)DS4_N_VOCAB * sizeof(float));
         if (!s->glm_mtp_hc || !s->glm_mtp_logits0) {
             if (errlen) snprintf(err, errlen, "glm mtp: out of memory");
@@ -62443,6 +62863,19 @@ static int ds4_session_glm_spec_cycle_impl(
         }
     }
     s->glm_mtp_rollback_valid = false;
+    if (!exact_sampling && g->glm53) {
+        const int width = ds4_engine_glm_mtp_spec_width(e);
+        if (width > 2) {
+            return ds4_session_glm_spec_cycle_wide(s,
+                                                   first_token,
+                                                   eos_token,
+                                                   accepted,
+                                                   accepted_cap,
+                                                   width,
+                                                   err,
+                                                   errlen);
+        }
+    }
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) {
         s->glm_mtp_have = 0;
     }
@@ -62461,7 +62894,7 @@ static int ds4_session_glm_spec_cycle_impl(
         int d = -1;
         s->glm_mtp_have = 0;
         if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &d)) {
+                               s->glm_mtp_min_pos, &d, false)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
@@ -62630,13 +63063,13 @@ static int ds4_session_glm_spec_cycle_impl(
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+                               s->glm_mtp_min_pos, &dummy, false) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
-                               s->glm_mtp_min_pos, &nd);
+                               s->glm_mtp_min_pos, &nd, false);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n2;
@@ -62696,7 +63129,8 @@ static int ds4_session_glm_spec_cycle_impl(
                                    next,
                                    pos + 1u,
                                    s->glm_mtp_min_pos,
-                                   &nd)) {
+                                   &nd,
+                                   false)) {
                 s->glm_mtp_draft = nd;
                 s->glm_mtp_parent = next;
                 s->glm_mtp_have = 1;
@@ -62713,7 +63147,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                  hc_row_bytes) != 0;
         const bool cu = !exact_sampling && hidden_ready &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &nd);
+                               s->glm_mtp_min_pos, &nd, false);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n1;
@@ -65313,7 +65747,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (probe_min_pos == UINT32_MAX) probe_min_pos = pos;
             int draft = -1;
             if (glm_graph_mtp_step(&s->glm_graph, &e->model, &e->weights,
-                                   nmax, pos, probe_min_pos, &draft)) {
+                                   nmax, pos, probe_min_pos, &draft,
+                                   false)) {
                 probe_draft = draft;
                 probe_have = 1;
             } else {
