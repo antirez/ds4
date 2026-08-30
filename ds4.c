@@ -46715,9 +46715,10 @@ static bool glm_graph_verify_rows(
     }
     if (g->glm53) {
         /* The verify workspace mirrors only the GLM 5.2 batch scratch, so
-         * a placed (multi-GPU) GLM 5.3 graph keeps the batch fallback. The
-         * compact caches must also be the ones decode writes. */
-        if (g->placement ||
+         * a placed (multi-GPU) GLM 5.3 graph keeps the batch fallback. SSD
+         * streaming also stays on that path until this row pass maps each
+         * layer. The compact caches must be the ones decode writes. */
+        if (g->placement || g->ssd_streaming ||
             !glm_graph_decode_uses_indexed_attention(g, pos, NULL) ||
             !glm53_graph_prefill_workspace_ensure(g, n)) {
             return false;

@@ -1002,10 +1002,12 @@ kernel void kernel_glm53_indexer_pool_update(
                 (uint64_t)src_row * args.head_dim + tid];
             gate_value = ((device const float *)gate)[
                 (uint64_t)src_row * args.head_dim + tid];
-            if (!complete) {
-                tail_k[(uint64_t)r * args.head_dim + tid] = k_value;
-                tail_gate[(uint64_t)r * args.head_dim + tid] = gate_value;
-            }
+            /* Keep every supplied row, including rows that complete a pool.
+             * A speculative batch can complete the pool with an unaccepted
+             * final row; its replacement then rebuilds from these retained
+             * prefix rows plus the replacement. */
+            tail_k[(uint64_t)r * args.head_dim + tid] = k_value;
+            tail_gate[(uint64_t)r * args.head_dim + tid] = gate_value;
         } else {
             k_value = tail_k[(uint64_t)r * args.head_dim + tid];
             gate_value = tail_gate[(uint64_t)r * args.head_dim + tid];

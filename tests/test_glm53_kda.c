@@ -626,6 +626,84 @@ int main(void) {
         }
     }
 
+    /* A two-row speculative update can complete a pool with row 3 before
+     * row 3 is accepted. Replacing that row must rebuild the pool from the
+     * retained rows 0..2 plus the replacement, exactly like serial updates. */
+    require_ok(ds4_gpu_tensor_fill_f32(pool_cache, 0.0f,
+                                       (uint64_t)POOL_COUNT * D),
+               "speculative pool cache clear");
+    require_ok(ds4_gpu_tensor_fill_f32(pool_tail_k, 0.0f,
+                                       (uint64_t)POOL * D),
+               "speculative pool K tail clear");
+    require_ok(ds4_gpu_tensor_fill_f32(pool_tail_gate, 0.0f,
+                                       (uint64_t)POOL * D),
+               "speculative pool gate tail clear");
+    const uint32_t speculative_chunks[][3] = {
+        {0u, 2u, 0u},
+        {2u, 2u, 2u},
+        {3u, 1u, 4u},
+    };
+    for (uint32_t c = 0;
+         c < sizeof(speculative_chunks) / sizeof(speculative_chunks[0]); c++) {
+        const uint32_t pos = speculative_chunks[c][0];
+        const uint32_t rows = speculative_chunks[c][1];
+        const uint32_t src = speculative_chunks[c][2];
+        require_ok(ds4_gpu_tensor_write(pool_raw_gpu, 0,
+                                        pool_raw + (uint64_t)src * D,
+                                        (uint64_t)rows * D * sizeof(float)),
+                   "speculative pool raw write");
+        require_ok(ds4_gpu_tensor_write(pool_gate_gpu, 0,
+                                        pool_gate_values + (uint64_t)src * D,
+                                        (uint64_t)rows * D * sizeof(float)),
+                   "speculative pool gate write");
+        require_ok(ds4_gpu_glm53_indexer_pool_update_tensor(
+            pool_cache, pool_tail_k, pool_tail_gate,
+            pool_raw_gpu, pool_gate_gpu,
+            model, MODEL_BYTES, POOL_NORM_OFFSET, POOL_BIAS_OFFSET, POOL_APE_OFFSET,
+            pos, rows, POOL_CAP, D, POOL, 1e-6f, false),
+            "speculative GLM-5.3 indexer pool update");
+    }
+    require_ok(ds4_gpu_tensor_read(pool_cache, 0, pool_actual,
+                                   D * sizeof(float)),
+               "speculative pool cache read");
+    const uint32_t retained_rows[POOL] = {0u, 1u, 2u, 4u};
+    float retained_means[POOL], retained_invs[POOL];
+    for (uint32_t r = 0; r < POOL; r++) {
+        const float *row = pool_raw + (uint64_t)retained_rows[r] * D;
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < D; d++) sum += row[d];
+        retained_means[r] = sum / (float)D;
+        float ss = 0.0f;
+        for (uint32_t d = 0; d < D; d++) {
+            const float delta = row[d] - retained_means[r];
+            ss += delta * delta;
+        }
+        retained_invs[r] = 1.0f / sqrtf(ss / (float)D + 1e-6f);
+    }
+    for (uint32_t d = 0; d < D; d++) {
+        float logits[POOL], max_logit = -FLT_MAX, denom = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = pool_gate_values[
+                (uint64_t)retained_rows[r] * D + d] +
+                bf16_to_f32(pool_ape[r * D + d]);
+            if (logits[r] > max_logit) max_logit = logits[r];
+        }
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = expf(logits[r] - max_logit);
+            denom += logits[r];
+        }
+        float expected_pool = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            const float value =
+                (pool_raw[(uint64_t)retained_rows[r] * D + d] -
+                 retained_means[r]) * retained_invs[r] * pool_norm[d] +
+                pool_bias[d];
+            expected_pool += logits[r] / denom * value;
+        }
+        require_close("GLM-5.3 speculative pool replacement",
+                      pool_actual[d], expected_pool, 2e-5f);
+    }
+
     enum { SCORE_ROWS = 3, SCORE_TOKENS = 5, SCORE_POS0 = 4 };
     float score_q[SCORE_TOKENS * HEADS * D];
     float score_weights[SCORE_TOKENS * HEADS];
