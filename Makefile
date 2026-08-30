@@ -67,7 +67,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth dspark-indexer-threshold-boundary mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -84,6 +84,7 @@ help:
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
+	@echo "  make dspark-indexer-threshold-boundary  Check DSpark verify's indexer sparse threshold matches decode at n_comp in (512,1024]"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
 
@@ -166,6 +167,7 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
+	@echo "  make dspark-indexer-threshold-boundary  Check DSpark verify's indexer sparse threshold matches decode at n_comp in (512,1024]"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
 
@@ -572,6 +574,16 @@ dspark-verify-depth: ds4_test
 		echo "dspark-verify-depth: run ./download_model.sh ds4f-dspark or set DS4_DSPARK_SUPPORT=FILE"; \
 	else \
 		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_DSPARK="$(DS4_DSPARK_SUPPORT)" ./ds4_test --dspark-verify-depth; \
+	fi
+
+dspark-indexer-threshold-boundary: ds4_test
+	@if [ ! -f "$(DS4_TEST_MODEL)" ]; then \
+		echo "dspark-indexer-threshold-boundary: skipped, missing model $(DS4_TEST_MODEL)"; \
+	elif [ ! -f "$(DS4_DSPARK_SUPPORT)" ]; then \
+		echo "dspark-indexer-threshold-boundary: skipped, missing DSpark support $(DS4_DSPARK_SUPPORT)"; \
+		echo "dspark-indexer-threshold-boundary: run ./download_model.sh ds4f-dspark or set DS4_DSPARK_SUPPORT=FILE"; \
+	else \
+		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_DSPARK="$(DS4_DSPARK_SUPPORT)" ./ds4_test --dspark-indexer-threshold-boundary; \
 	fi
 
 mtp-verify-depth: ds4_test

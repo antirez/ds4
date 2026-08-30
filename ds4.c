@@ -29874,6 +29874,18 @@ static bool metal_graph_encode_layer_attention_batch(
             uint32_t use_comp_mask = 0;
             bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
+            /* Verify-shaped batches (DSpark/MTP suffix re-verification, never
+             * more than a few draft tokens) must pick the same dense-vs-indexed
+             * branch that single-token decode would for the same n_comp, or the
+             * verifier attends over a different candidate set than the decode
+             * path it's supposed to be reproducing.  Real multi-thousand-token
+             * prefill chunks keep the original DS4_N_INDEXER_TOP_K cutover --
+             * decode's amortization argument for going sparse earlier hasn't
+             * been separately validated at that scale. */
+            const bool verify_shaped_batch = n_tokens <= 8;
+            const uint32_t indexer_dense_threshold = verify_shaped_batch
+                ? metal_graph_decode_indexer_sparse_threshold(g)
+                : DS4_N_INDEXER_TOP_K;
 
             ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                      metal_graph_batch_kv(g),
@@ -29881,7 +29893,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM) != 0;
-            if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+            if (ok && ratio == 4 && n_comp > indexer_dense_threshold) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary(NULL,
