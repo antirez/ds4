@@ -3,6 +3,7 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
+GLM_53_FLASH_ANTIREZ_REPO="antirez/glm-5.3-flash-gguf"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -18,6 +19,9 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
+GLM_53_FLASH_ANTIREZ_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
+GLM_53_FLASH_ANTIREZ_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
+GLM_53_FLASH_ANTIREZ_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -45,6 +49,9 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
+  ./download_model.sh glm-53-flash-antirez-fp8 [--token TOKEN]
+  ./download_model.sh glm-53-flash-antirez-q2 [--token TOKEN]
+  ./download_model.sh glm-53-flash-antirez-q4 [--token TOKEN]
 
 Targets:
 
@@ -103,6 +110,18 @@ Targets:
   glm-antirez-q4
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
+
+  glm-53-flash-antirez-q2
+       GLM 5.3-flash antirez routed Q2 GGUF from antirez/glm-5.3-flash-gguf.
+       About 96 GB on disk.
+
+    glm-53-flash-antirez-q4
+       GLM 5.3-flash antirez routed Q4_K GGUF from antirez/glm-5.3-flash-gguf.
+       About 191 GB on disk.
+
+    glm-53-flash-antirez-fp8
+       GLM 5.3-flash antirez routed FP8 GGUF from antirez/glm-5.3-flash-gguf.
+       About 327 GB on disk.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -176,6 +195,21 @@ case "$MODEL" in
     glm-antirez-q4)
         REPO=$GLM_ANTIREZ_REPO
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-53-flash-antirez-q2)
+        REPO=$GLM_53_FLASH_ANTIREZ_REPO
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-53-flash-antirez-q4)
+        REPO=$GLM_53_FLASH_ANTIREZ_REPO
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm-53-flash-antirez-fp8)
+        REPO=$GLM_53_FLASH_ANTIREZ_REPO
+        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_FP8_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)
