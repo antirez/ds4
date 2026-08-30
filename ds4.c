@@ -39855,6 +39855,7 @@ static double glm_graph_memory_guard_default_reserve_gib(
 
 static uint64_t glm_graph_memory_guard_budget_bytes(
         uint64_t budget_base,
+        uint64_t device_ws,
         uint64_t wired_limit,
         double   fraction,
         double   reserve_gib) {
@@ -39866,6 +39867,18 @@ static uint64_t glm_graph_memory_guard_budget_bytes(
         reserve_bytes >= budget_base ? 0 : budget_base - reserve_bytes;
     uint64_t budget = fraction_budget;
     if (reserve_bytes != 0 && reserve_budget < budget) budget = reserve_budget;
+    if (device_ws != 0) {
+        /* The host-RAM heuristics can plan past what the device can wire:
+         * a 128 GiB Mac caps the working set near 107.5 GiB, so a 110 GiB
+         * resident-Q2 plan failed its first prefill chunk with
+         * kIOGPUCommandBufferCallbackErrorOutOfMemory (#890). A raised
+         * iogpu.wired_limit_mb is reflected in the device limit, and the
+         * explicit grant below still lifts the budget. */
+        const uint64_t margin = 2ull * 1024ull * 1024ull * 1024ull;
+        const uint64_t capped =
+            device_ws > margin ? device_ws - margin : device_ws;
+        if (capped < budget) budget = capped;
+    }
     if (wired_limit != 0) {
         /* An explicitly raised iogpu.wired_limit_mb is the user granting
          * the GPU that much wired memory; it overrides the heuristics. */
@@ -40398,6 +40411,14 @@ static bool glm_graph_memory_guard_for_compact_cap(
     }
     if (budget_base == 0) return true;
     const uint64_t wired_limit = glm_graph_wired_limit_bytes();
+#if defined(__APPLE__)
+    /* Metal reports the working set the device can actually wire; on other
+     * backends the same probe reports aggregate total VRAM, not a
+     * Metal-style working-set ceiling. */
+    const uint64_t device_ws = ds4_gpu_recommended_working_set_size();
+#else
+    const uint64_t device_ws = 0;
+#endif
 
     const uint32_t work_ctx =
         glm_graph_full_attention_cap(ctx_size, ssd_streaming);
@@ -40452,7 +40473,7 @@ static bool glm_graph_memory_guard_for_compact_cap(
                              0.0,
                              1024.0);
     const uint64_t budget = glm_graph_memory_guard_budget_bytes(
-            budget_base, wired_limit, fraction, reserve_gib);
+            budget_base, device_ws, wired_limit, fraction, reserve_gib);
 
     if (required <= budget) {
         const char *report = getenv("DS4_GLM_MEMORY_GUARD_REPORT");
@@ -40522,6 +40543,12 @@ static bool glm_graph_memory_guard_for_compact_cap(
             fraction,
             reserve_gib,
             glm_graph_bytes_to_gib(transient_extra_bytes));
+    if (device_ws != 0 && wired_limit == 0)
+        fprintf(stderr,
+                "ds4:   device working-set limit %.2f GiB; a raised "
+                "iogpu.wired_limit_mb grants plans up to it "
+                "(sudo sysctl iogpu.wired_limit_mb=<mb>, not persistent)\n",
+                glm_graph_bytes_to_gib(device_ws));
     fprintf(stderr,
             "ds4:   set DS4_GLM_MEMORY_GUARD=0 to bypass, use a smaller --ctx, "
             "tensor parallelism, or SSD streaming\n");
@@ -60871,8 +60898,10 @@ uint64_t ds4_test_glm_memory_guard_default_budget(
     const double reserve_gib =
         glm_graph_memory_guard_default_reserve_gib(
                 host_bytes, model_bytes, glm53);
+    /* Pin the host-RAM heuristic: the test asserts the host-derived
+     * budget, so the device working-set clamp stays out (device_ws = 0). */
     return glm_graph_memory_guard_budget_bytes(
-            host_bytes, 0, 0.99, reserve_gib);
+            host_bytes, 0, 0, 0.99, reserve_gib);
 }
 
 int ds4_test_glm_memory_guard_disabled(void) {
