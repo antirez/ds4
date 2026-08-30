@@ -13367,6 +13367,32 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              s->default_tokens);
 }
 
+typedef struct {
+    const char *ids[3];
+    int len;
+} server_model_catalog;
+
+static server_model_catalog server_model_catalog_for_family(bool glm53,
+                                                             bool glm_dsa) {
+    server_model_catalog catalog = {0};
+    if (glm53) {
+        catalog.ids[0] = "glm-5.3-flash";
+        catalog.ids[1] = "glm-5.3-flash-chat";
+        catalog.ids[2] = "glm-5.3-flash-reasoner";
+        catalog.len = 3;
+    } else if (glm_dsa) {
+        catalog.ids[0] = "glm-5.2";
+        catalog.ids[1] = "glm-5.2-chat";
+        catalog.ids[2] = "glm-5.2-reasoner";
+        catalog.len = 3;
+    } else {
+        catalog.ids[0] = "deepseek-v4-flash";
+        catalog.ids[1] = "deepseek-v4-pro";
+        catalog.len = 2;
+    }
+    return catalog;
+}
+
 static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
     append_model_json(&b, s, id);
@@ -13377,18 +13403,13 @@ static bool send_model(server *s, int fd, const char *id) {
 }
 
 static bool send_models(server *s, int fd) {
+    const server_model_catalog catalog = server_model_catalog_for_family(
+        ds4_engine_is_glm53(s->engine), ds4_engine_is_glm_dsa(s->engine));
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
-    } else {
-        append_model_json(&b, s, "deepseek-v4-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "deepseek-v4-pro");
+    for (int i = 0; i < catalog.len; i++) {
+        if (i) buf_putc(&b, ',');
+        append_model_json(&b, s, catalog.ids[i]);
     }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
@@ -17706,6 +17727,28 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_model_catalog_matches_loaded_family(void) {
+    const server_model_catalog glm53 =
+        server_model_catalog_for_family(true, true);
+    TEST_ASSERT(glm53.len == 3);
+    TEST_ASSERT(!strcmp(glm53.ids[0], "glm-5.3-flash"));
+    TEST_ASSERT(!strcmp(glm53.ids[1], "glm-5.3-flash-chat"));
+    TEST_ASSERT(!strcmp(glm53.ids[2], "glm-5.3-flash-reasoner"));
+
+    const server_model_catalog glm52 =
+        server_model_catalog_for_family(false, true);
+    TEST_ASSERT(glm52.len == 3);
+    TEST_ASSERT(!strcmp(glm52.ids[0], "glm-5.2"));
+    TEST_ASSERT(!strcmp(glm52.ids[1], "glm-5.2-chat"));
+    TEST_ASSERT(!strcmp(glm52.ids[2], "glm-5.2-reasoner"));
+
+    const server_model_catalog deepseek =
+        server_model_catalog_for_family(false, false);
+    TEST_ASSERT(deepseek.len == 2);
+    TEST_ASSERT(!strcmp(deepseek.ids[0], "deepseek-v4-flash"));
+    TEST_ASSERT(!strcmp(deepseek.ids[1], "deepseek-v4-pro"));
+}
+
 static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
@@ -19267,6 +19310,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_catalog_matches_loaded_family();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
