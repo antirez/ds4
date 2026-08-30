@@ -6677,18 +6677,20 @@ static ds4_engine *test_open_dspark_engine(const char *support_path) {
     return rc == 0 ? engine : NULL;
 }
 
-/* Regression for the swapped top-k arguments in metal_graph_verify_suffix_tops
- * at draft depth > 2.  Replays the committed speculative tokens through plain
- * decode and requires each to be a (near-)argmax: that is the verify invariant,
- * and unlike comparing token streams it tolerates the near-greedy tie
- * divergences.  Needs an MTP head, so it self-skips without DS4_TEST_MTP. */
+/* Replays committed speculative tokens through plain decode and requires every
+ * committed token to remain within the numerical-tie band of the target
+ * argmax. Serial and batched Metal evaluation can select different equal-best
+ * token IDs, so byte equality would make this regression flaky. */
 static void test_mtp_verify_depth(void) {
     ds4_engine *engine = test_get_engine(false);
-    if (!engine || !ds4_engine_has_mtp(engine)) {
-        fprintf(stderr, "ds4-test: mtp-verify-depth skipped (set DS4_TEST_MTP to an MTP GGUF)\n");
+    const bool glm_mtp = engine && ds4_engine_is_glm53(engine) &&
+                         test_env_bool("DS4_TEST_GLM_MTP");
+    if (!engine || (!ds4_engine_has_mtp(engine) && !glm_mtp)) {
+        fprintf(stderr, "ds4-test: mtp-verify-depth skipped (set DS4_TEST_MTP "
+                        "or DS4_TEST_GLM_MTP)\n");
         return;
     }
-    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) > 2);
+    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) >= (glm_mtp ? 2 : 3));
 
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
@@ -6703,8 +6705,9 @@ static void test_mtp_verify_depth(void) {
         const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, TEST_MTP_MAXGEN,
                                                           spec, &nspec, &max_chunk);
         TEST_ASSERT(ok_spec);
-        TEST_ASSERT(max_chunk > 1);  /* multi-token chunks committed: the multi-row path ran */
-        TEST_ASSERT(nspec > 128);    /* enough output to surface the bug, incl. a spurious-EOS truncation */
+        TEST_ASSERT(max_chunk >= 2);
+        if (glm_mtp) TEST_ASSERT(nspec == TEST_MTP_MAXGEN);
+        else TEST_ASSERT(nspec > 128);
 
         float worst_gap = 0.0f;
         int worst_at = -1;
@@ -6713,7 +6716,7 @@ static void test_mtp_verify_depth(void) {
         TEST_ASSERT(ok_check);
         fprintf(stderr, "ds4-test: mtp-verify-depth nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
                 nspec, max_chunk, worst_gap, worst_at);
-        TEST_ASSERT(worst_gap <= 2.0f);  /* correct: ~0; bug: ~21 on the reference model */
+        TEST_ASSERT(worst_gap <= 0.1f);  /* observed tie: <=0.019; reference bug: ~21 */
     }
 
     free(spec);
@@ -6807,7 +6810,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
-    {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
+    {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits target-equivalent tokens", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},

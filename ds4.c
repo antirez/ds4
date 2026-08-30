@@ -63787,6 +63787,133 @@ static int speculative_point_replacement(ds4_session *s,
                                           int draft_token,
                                           uint64_t *rng);
 
+/* A GLM-5.3 speculative verify is a transaction over two kinds of state:
+ * KDA is recurrent and must be checkpointed, while DSA caches are
+ * position-addressed.  DSA suffix rows remain semantically invisible behind
+ * glm_dense_cache_len and are overwritten when decoding resumes.  Keeping
+ * that distinction here prevents rejection handling from leaking back into
+ * the speculative policy. */
+typedef struct {
+    ds4_session *session;
+    uint32_t pos;
+    uint32_t dense_before;
+    uint32_t prefix_count;
+    bool base_saved;
+} glm53_spec_transaction;
+
+static bool glm53_spec_transaction_begin(glm53_spec_transaction *tx,
+                                         ds4_session *s,
+                                         uint32_t pos) {
+    if (!tx || !s || !s->glm_graph.glm53) return false;
+    memset(tx, 0, sizeof(*tx));
+    tx->session = s;
+    tx->pos = pos;
+    tx->dense_before = s->glm_dense_cache_len;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!glm_graph_mtp_ensure(g) || !glm53_graph_copy_kda_state(g, true)) {
+        return false;
+    }
+    tx->base_saved = true;
+    if (glm53_graph_mtp_kda_prefix_enabled() && g->mtp_kda_prefix != NULL) {
+        tx->prefix_count = 1u;
+    }
+    g->mtp_kda_snapshot_rows = tx->prefix_count;
+    return true;
+}
+
+static void glm53_spec_transaction_disarm(glm53_spec_transaction *tx) {
+    if (tx && tx->session) {
+        tx->session->glm_graph.mtp_kda_snapshot_rows = 0u;
+    }
+}
+
+static bool glm53_spec_transaction_restore_base(glm53_spec_transaction *tx) {
+    if (!tx || !tx->base_saved) return false;
+    glm53_spec_transaction_disarm(tx);
+    tx->session->glm_dense_cache_len = tx->dense_before;
+    return glm53_graph_copy_kda_state(&tx->session->glm_graph, false);
+}
+
+static bool glm53_spec_transaction_commit_prefix(glm53_spec_transaction *tx,
+                                                 uint32_t committed_rows) {
+    if (!tx || committed_rows == 0u || committed_rows > 2u) return false;
+    glm53_spec_transaction_disarm(tx);
+    if (committed_rows < 2u &&
+        (committed_rows > tx->prefix_count ||
+         !glm53_graph_restore_kda_prefix(&tx->session->glm_graph))) {
+        return false;
+    }
+    ds4_session_glm_note_dense_cache(tx->session, tx->pos, committed_rows);
+    return true;
+}
+
+static bool glm53_spec_verify(glm53_spec_transaction *tx,
+                              const int *tokens,
+                              float *output_hc,
+                              float *logits_out,
+                              const char **path_out) {
+    ds4_session *s = tx->session;
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    bool attempted_rows = false;
+    bool verified = false;
+    if (glm53_graph_mtp_fast_verify_enabled()) {
+        attempted_rows = true;
+        verified = glm_graph_verify_rows(g, &e->model, &e->weights,
+                                         tokens, tx->pos, 2u,
+                                         output_hc, logits_out);
+    }
+    if (verified) {
+        glm53_spec_transaction_disarm(tx);
+        if (path_out) *path_out = "rows";
+        return true;
+    }
+    if (attempted_rows && !glm53_spec_transaction_restore_base(tx)) {
+        return false;
+    }
+    g->mtp_kda_snapshot_rows = tx->prefix_count;
+    if (!glm53_graph_use_indexed_prefill(g) &&
+        glm_graph_span_fits_full_attention(g, tx->pos, 2u)) {
+        verified = glm_graph_forward_tokens(g,
+                                             &e->model,
+                                             &e->weights,
+                                             tokens,
+                                             NULL,
+                                             NULL,
+                                             0,
+                                             tx->pos,
+                                             2u,
+                                             output_hc,
+                                             logits_out,
+                                             NULL,
+                                             NULL,
+                                             tx->pos,
+                                             0,
+                                             2u);
+    } else {
+        verified = glm_graph_forward_indexed_tokens(g,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     tokens,
+                                                     NULL,
+                                                     NULL,
+                                                     0,
+                                                     tx->pos,
+                                                     2u,
+                                                     output_hc,
+                                                     logits_out,
+                                                     NULL,
+                                                     NULL,
+                                                     tx->pos,
+                                                     0,
+                                                     2u);
+    }
+    glm53_spec_transaction_disarm(tx);
+    if (path_out) *path_out = "batch";
+    return verified;
+}
+
+
 /* One GLM MTP speculative cycle: evaluate first_token, and when a compatible
  * pending draft exists verify [first_token, draft] in one 2-row batch pass
  * (big gates only under TP).  Greedy and opportunistic sampling accept a draft
@@ -63858,83 +63985,21 @@ static int ds4_session_glm_spec_cycle_impl(
     int toks[2] = { first_token, d };
     bool verified = false;
     bool kda_saved = false;
-    const char *verify_path = "rows";
-    /* Set when the fast verify captured the KDA state as of row 0, so a
-     * rejected draft rolls back with a copy instead of a replay decode. */
     bool kda_prefix_saved = false;
+    glm53_spec_transaction glm_tx = {0};
+    const char *verify_path = "rows";
+    double verify_t0 = t0;
     if (g->glm53) {
-        kda_saved = glm_graph_mtp_ensure(g) &&
-                    glm53_graph_copy_kda_state(g, true);
-        bool rows_attempted = false;
+        kda_saved = glm53_spec_transaction_begin(&glm_tx, s, pos);
+        if (timing) verify_t0 = now_sec();
         if (kda_saved) {
-            /* Both verify paths run the KDA rows encoder, so arming the
-             * split here covers the batch fallback beyond the dense
-             * window as well as the fast row pass. */
-            g->mtp_kda_snapshot_rows =
-                (glm53_graph_mtp_kda_prefix_enabled() &&
-                 g->mtp_kda_prefix != NULL) ? 1u : 0u;
-            /* The decode-style row pass first. On GLM 5.3 it is worth
-             * about 1 ms of the ~47 ms pair (measured, M4 Max, 45 layers):
-             * three of every four layers are KDA, and the batch encoders
-             * already take the causal-range shortcut inside the dense
-             * window, so most of the GLM 5.2 gap is not there to win. */
-            if (glm53_graph_mtp_fast_verify_enabled()) {
-                rows_attempted = true;
-                verified = glm_graph_verify_rows(g, &e->model, &e->weights,
-                                                 toks, pos, 2,
-                                                 s->glm_mtp_hc, s->logits);
-            }
-            kda_prefix_saved = verified && g->mtp_kda_snapshot_rows != 0u;
-            verify_path = verified ? "rows" : "batch";
+            verified = glm53_spec_verify(&glm_tx,
+                                         toks,
+                                         s->glm_mtp_hc,
+                                         s->logits,
+                                         &verify_path);
+            kda_prefix_saved = verified && glm_tx.prefix_count == 1u;
         }
-        if (kda_saved && !verified) {
-            /* The fast pass can bail after advancing some layers, so put
-             * the state back before the batch encoders redo the work. */
-            if (rows_attempted && !glm53_graph_copy_kda_state(g, false)) {
-                g->mtp_kda_snapshot_rows = 0u;
-                if (errlen) snprintf(err, errlen, "glm mtp: KDA rollback failed");
-                s->checkpoint_valid = false;
-                return -1;
-            }
-            if (!glm53_graph_use_indexed_prefill(g) &&
-                glm_graph_span_fits_full_attention(g, pos, 2u)) {
-                verified = glm_graph_forward_tokens(g,
-                                                     &e->model,
-                                                     &e->weights,
-                                                     toks,
-                                                     NULL,
-                                                     NULL,
-                                                     0,
-                                                     pos,
-                                                     2,
-                                                     s->glm_mtp_hc,
-                                                     s->logits,
-                                                     NULL,
-                                                     NULL,
-                                                     pos,
-                                                     0,
-                                                     2);
-            } else {
-                verified = glm_graph_forward_indexed_tokens(g,
-                                                             &e->model,
-                                                             &e->weights,
-                                                             toks,
-                                                             NULL,
-                                                             NULL,
-                                                             0,
-                                                             pos,
-                                                             2,
-                                                             s->glm_mtp_hc,
-                                                             s->logits,
-                                                             NULL,
-                                                             NULL,
-                                                             pos,
-                                                             0,
-                                                             2);
-            }
-            kda_prefix_saved = verified && g->mtp_kda_snapshot_rows != 0u;
-        }
-        g->mtp_kda_snapshot_rows = 0u;
     } else {
         /* GLM-5.2 verification must use the compact caches populated by
          * decode; its full-KV batch path would read unwritten rows. */
@@ -63955,7 +64020,7 @@ static int ds4_session_glm_spec_cycle_impl(
             return -1;
         }
     } else if (!verified) {
-        if (kda_saved) (void)glm53_graph_copy_kda_state(g, false);
+        if (kda_saved) (void)glm53_spec_transaction_restore_base(&glm_tx);
         if (errlen) snprintf(err, errlen, "glm mtp: GLM 5.3 verify failed");
         s->checkpoint_valid = false;
         return -1;
@@ -63964,7 +64029,7 @@ static int ds4_session_glm_spec_cycle_impl(
     /* Row0 logits through the shared head. */
     if (!glm_graph_mtp_ensure(g)) {
         if (g->glm53 && kda_saved) {
-            (void)glm53_graph_copy_kda_state(g, false);
+            (void)glm53_spec_transaction_restore_base(&glm_tx);
         }
         if (errlen) snprintf(err, errlen, "glm mtp: scratch alloc failed");
         s->checkpoint_valid = false;
@@ -64000,7 +64065,7 @@ static int ds4_session_glm_spec_cycle_impl(
     }
     if (!head_ok) {
         if (g->glm53 && kda_saved) {
-            (void)glm53_graph_copy_kda_state(g, false);
+            (void)glm53_spec_transaction_restore_base(&glm_tx);
         }
         if (errlen) snprintf(err, errlen, "glm mtp: row0 head failed");
         s->checkpoint_valid = false;
@@ -64009,6 +64074,8 @@ static int ds4_session_glm_spec_cycle_impl(
     const int n1 = glm_session_logits_argmax(s->glm_mtp_logits0);
     int replacement = -1;
     int accept = n1 == d;
+    double rollback_ms = 0.0;
+    double draft_ms = 0.0;
     if (exact_sampling) {
         if (!rng ||
             !sample_build_probabilities(s->glm_mtp_logits0,
@@ -64019,7 +64086,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                         min_p,
                                         s->sample_probs)) {
             if (g->glm53 && kda_saved) {
-                (void)glm53_graph_copy_kda_state(g, false);
+                (void)glm53_spec_transaction_restore_base(&glm_tx);
             }
             if (errlen) snprintf(err, errlen, "glm mtp: target distribution failed");
             s->checkpoint_valid = false;
@@ -64030,7 +64097,7 @@ static int ds4_session_glm_spec_cycle_impl(
             replacement = speculative_point_replacement(s, d, rng);
             if (replacement < 0) {
                 if (g->glm53 && kda_saved) {
-                    (void)glm53_graph_copy_kda_state(g, false);
+                    (void)glm53_spec_transaction_restore_base(&glm_tx);
                 }
                 if (errlen) snprintf(err, errlen, "glm mtp: replacement sampling failed");
                 s->checkpoint_valid = false;
@@ -64043,12 +64110,20 @@ static int ds4_session_glm_spec_cycle_impl(
     int n_committed = 1;
     if (accept) {
         token_vec_push(&s->checkpoint, d);
-        ds4_session_glm_note_dense_cache(s, pos, 2);
+        if (g->glm53 &&
+            !glm53_spec_transaction_commit_prefix(&glm_tx, 2u)) {
+            if (errlen) snprintf(err, errlen,
+                                 "glm mtp: transaction commit failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        if (!g->glm53) ds4_session_glm_note_dense_cache(s, pos, 2);
         n_committed = 2;
         /* s->logits already holds row1 (position pos+1) logits. */
         const int n2 = glm_session_logits_argmax(s->logits);
         int dummy = -1, nd = -1;
         ds4_gpu_tensor *target_hidden = g->glm53 ? g->hc_cur : g->cur;
+        const double draft_t0 = timing ? now_sec() : 0.0;
         const bool cu =
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
@@ -64060,6 +64135,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
                                s->glm_mtp_min_pos, &nd);
+        if (timing) draft_ms += (now_sec() - draft_t0) * 1000.0;
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n2;
@@ -64068,6 +64144,7 @@ static int ds4_session_glm_spec_cycle_impl(
         accepted[0] = first_token;
         accepted[1] = d;
     } else {
+        const double rollback_t0 = timing ? now_sec() : 0.0;
         bool replay_ok = true;
         if (g->glm53 && kda_prefix_saved) {
             /* The verify already computed row 0 and snapshotted the KDA
@@ -64075,13 +64152,13 @@ static int ds4_session_glm_spec_cycle_impl(
              * replay: restore that state and keep the row-0 logits. The
              * old path re-ran a whole decode here, which also let the
              * emitted token disagree with the n1 that drove the reject. */
-            replay_ok = glm53_graph_restore_kda_prefix(g);
+            replay_ok = glm53_spec_transaction_commit_prefix(&glm_tx, 1u);
             if (replay_ok) {
                 memcpy(s->logits, s->glm_mtp_logits0,
                        (size_t)DS4_N_VOCAB * sizeof(float));
             }
         } else if (g->glm53) {
-            replay_ok = glm53_graph_copy_kda_state(g, false) &&
+            replay_ok = glm53_spec_transaction_restore_base(&glm_tx) &&
                         glm_graph_forward_token(g,
                                                 &e->model,
                                                 &e->weights,
@@ -64100,6 +64177,7 @@ static int ds4_session_glm_spec_cycle_impl(
             s->checkpoint_valid = false;
             return -1;
         }
+        if (timing) rollback_ms = (now_sec() - rollback_t0) * 1000.0;
         if (exact_sampling) {
             if (!glm_graph_forward_token(g,
                                          &e->model,
@@ -64123,6 +64201,7 @@ static int ds4_session_glm_spec_cycle_impl(
             const int next = glm_session_logits_argmax(s->logits);
             int nd = -1;
             s->glm_mtp_have = 0;
+            const double draft_t0 = timing ? now_sec() : 0.0;
             if (replacement != eos_token &&
                 glm_graph_mtp_step(g,
                                    &e->model,
@@ -64135,7 +64214,8 @@ static int ds4_session_glm_spec_cycle_impl(
                 s->glm_mtp_parent = next;
                 s->glm_mtp_have = 1;
             }
-        } else {
+            if (timing) draft_ms += (now_sec() - draft_t0) * 1000.0;
+        } else if (!g->glm53 || !kda_prefix_saved) {
             ds4_session_glm_note_dense_cache(s, pos, 1);
         }
         int nd = -1;
@@ -64145,9 +64225,13 @@ static int ds4_session_glm_spec_cycle_impl(
                                  0,
                                  s->glm_mtp_hc,
                                  hc_row_bytes) != 0;
+        const double draft_t0 = timing ? now_sec() : 0.0;
         const bool cu = !exact_sampling && hidden_ready &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
                                s->glm_mtp_min_pos, &nd);
+        if (timing && !exact_sampling) {
+            draft_ms += (now_sec() - draft_t0) * 1000.0;
+        }
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n1;
@@ -64160,12 +64244,21 @@ static int ds4_session_glm_spec_cycle_impl(
         char *dt = ds4_token_text(e, d, NULL);
         char *nt = ds4_token_text(e, n1, NULL);
         fprintf(stderr,
-                "ds4: glm mtp cycle: verify2[%s] %.1f ms, head+draft %.1f ms, %s "
+                "ds4: glm mtp utility: width=2 setup=%.1f ms verify[%s]=%.1f ms "
+                "rollback=%.1f ms draft=%.1f ms other=%.1f ms result=%s "
+                "committed=%d total=%.1f ms utility=%.2f tok/s-cycle "
                 "(draft %d '%s' vs true %d '%s')\n",
+                (verify_t0 - t0) * 1000.0,
                 verify_path,
-                (t1 - t0) * 1000.0, (t2 - t1) * 1000.0,
+                (t1 - verify_t0) * 1000.0,
+                rollback_ms,
+                draft_ms,
+                (t2 - t1) * 1000.0 - rollback_ms - draft_ms,
                 accept ? (exact_sampling ? "EXACT_ACCEPT" : "ACCEPT") :
                          (exact_sampling ? "exact_reject" : "reject"),
+                n_committed,
+                (t2 - t0) * 1000.0,
+                (t2 > t0) ? n_committed / (t2 - t0) : 0.0,
                 d, dt ? dt : "?", n1, nt ? nt : "?");
         free(dt);
         free(nt);
