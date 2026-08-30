@@ -69615,6 +69615,29 @@ static int ds4_session_eval_dspark_speculative_stochastic(
         DS4_DSPARK_STOCH_FINISH();
         return n_accept;
     }
+    if (draft_n == 1) {
+        /* Position 0 just got accepted above and it's the entire draft, so
+         * there is nothing left for the batched verifier to check -- the
+         * only remaining work is committing drafts[0] and obtaining next-
+         * token logits, which a plain decode step gives at a fraction of
+         * the cost of a full multi-layer batch dispatch at n_tokens == 1
+         * (mirrors the position-0-rejection cheap path just above). */
+        if (ds4_session_eval_probe_tp(s, drafts[0], false, err, errlen) != 0) {
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        accepted[n_accept++] = drafts[0];
+        if (stats_enabled) {
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.direct_full_commits++;
+            s->dspark_stats.accepted_draft_tokens += 1;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 1);
+        }
+        ds4_session_dspark_scheduler_note(
+            s, 1, false, DS4_DSPARK_STOCH_EXTRA_MS());
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
     ds4_engine *e = s->engine;
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
