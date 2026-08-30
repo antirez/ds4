@@ -10933,6 +10933,22 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     *last_completion = completion;
 }
 
+/* A speculative eval commits the whole returned block to the backend before
+ * the server examines individual tokens.  If a stop marker, completed tool
+ * call, cancellation, or output limit consumes only the front of that block,
+ * discard the unconsumed tail.  GLM-5.3 keeps a rollback snapshot for exactly
+ * this last MTP block; leaving even one hidden token live makes the next Pi
+ * replay diverge and can force a full long-context rebuild. */
+static int speculative_tail_rewind_target(int block_start, int block_tokens,
+                                          int consumed_tokens,
+                                          bool checkpoint_preserved) {
+    if (!checkpoint_preserved || block_start < 0 || block_tokens <= 0 ||
+        consumed_tokens < 0 || consumed_tokens >= block_tokens) {
+        return -1;
+    }
+    return block_start + consumed_tokens;
+}
+
 typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
@@ -12480,6 +12496,7 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
+        const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
@@ -12511,6 +12528,8 @@ decode_again:
         }
 
         bool stop_decode = false;
+        bool block_checkpoint_preserved = true;
+        int block_consumed = 0;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
                 stop_decode = true;
@@ -12528,6 +12547,7 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+            block_consumed = ti + 1;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -12688,6 +12708,7 @@ decode_again:
                 pthread_mutex_lock(&s->inference_mu);
                 ds4_session_invalidate(slot->session);
                 pthread_mutex_unlock(&s->inference_mu);
+                block_checkpoint_preserved = false;
                 stop_decode = true;
                 break;
             }
@@ -12697,6 +12718,21 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+        }
+        const int tail_rewind_to = speculative_tail_rewind_target(
+            block_start, ntok, block_consumed, block_checkpoint_preserved);
+        if (tail_rewind_to >= 0) {
+            pthread_mutex_lock(&s->inference_mu);
+            ds4_session_rewind(slot->session, tail_rewind_to);
+            pthread_mutex_unlock(&s->inference_mu);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: discarded %d unused speculative tail token%s at generation boundary; rewound live checkpoint to %d",
+                       ntok - block_consumed,
+                       ntok - block_consumed == 1 ? "" : "s",
+                       tail_rewind_to);
+            trace_event(s, trace_id,
+                        "discarded %d unused speculative tail tokens; rewound live checkpoint to %d",
+                        ntok - block_consumed, tail_rewind_to);
         }
         if (stop_decode) break;
     }
@@ -17948,6 +17984,18 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
 }
 
+static void test_speculative_tail_rewind_target(void) {
+    /* A two-token MTP block whose first token closes a tool call must drop the
+     * second token that the backend already committed but the response never
+     * consumed. */
+    TEST_ASSERT(speculative_tail_rewind_target(119453, 2, 1, true) == 119454);
+    TEST_ASSERT(speculative_tail_rewind_target(119453, 2, 2, true) == -1);
+    TEST_ASSERT(speculative_tail_rewind_target(119453, 1, 1, true) == -1);
+    TEST_ASSERT(speculative_tail_rewind_target(119453, 2, 1, false) == -1);
+    TEST_ASSERT(speculative_tail_rewind_target(-1, 2, 1, true) == -1);
+    TEST_ASSERT(speculative_tail_rewind_target(119453, 2, -1, true) == -1);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -19503,6 +19551,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_speculative_tail_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
