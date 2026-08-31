@@ -3,15 +3,28 @@
 Date: 2026-08-31  
 Machine: Mac Studio, Apple M4 Max (16 CPU cores), 128 GiB RAM  
 OS: macOS 26.5.2 (25F84)  
-Model: `GLM-5.3-Flash-Q2.gguf`, 92,035.1 MiB, embedded width-2 MTP  
+Upstream base: `b1b4ea03645434423e5cb4f39818fdc075e49825`  
+Measured runtime revision: `48029e0`  
+Model: `antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`,
+92,035.1 MiB, embedded width-2 MTP  
+Model SHA-256: `e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32`  
 Backend/context: Metal, resident model, 8,192-token context
 
 ## Result
 
-The snapshot-aware KDA verify path improves generated throughput by **1.96%**
-in the paired aggregate, from **28.569 to 29.128 tokens/s**. All six 512-token
+The snapshot-aware KDA verify path improves generated throughput by **2.02%**
+in the paired aggregate, from **28.712 to 29.291 tokens/s**. All six 512-token
 blocks were positive. The conservative two-sided 95% lower confidence bound
-on the six paired log-speedups is **+1.65%**.
+on the six within-machine paired log-speedups is **+1.53%**. This interval
+covers one prompt, model, machine, and runtime configuration; it is not a
+cross-workload confidence claim.
+
+The complete width-2 stack reaches **29.291 tokens/s**, versus **24.563
+tokens/s** for the exact upstream base under the same harness (**+19.25%**).
+That comparison is an end-to-end result: base and final produced different
+MTP acceptance schedules, so it must not be used to attribute the gain to an
+individual change. The rollback-controlled result above isolates the final
+KDA fusion.
 
 The change is exact relative to the previous split path. Kernel tests require
 byte equality for the row-0 convolution and recurrent snapshots, row-1 final
@@ -23,7 +36,7 @@ full-vocabulary logits after every cycle.
 
 A rejected width-2 draft must keep KDA state after verifier row 0. The previous
 path therefore ran KDA once for row 0, copied convolution and recurrent state
-into the prefix buffer with two Metal blit encoders, then ran KDA again for
+into the prefix buffer with two Metal copy encoders, then ran KDA again for
 row 1. Across 34 KDA layers, every speculative cycle built 476 temporary
 tensor views, encoded 102 additional KDA dispatches, and inserted 68 state
 copy encoders.
@@ -63,23 +76,45 @@ make glm53-mtp-head-bench
 
 | Run / block | Fused t/s | Split rollback t/s | Delta |
 |---|---:|---:|---:|
-| 1 / 1 | 28.497861 | 27.889176 | +2.1825% |
-| 1 / 2 | 28.459534 | 27.913512 | +1.9561% |
-| 1 / 3 | 28.873090 | 28.454351 | +1.4716% |
-| 1 aggregate | 28.608950 | 28.083272 | +1.8719% |
-| 2 / 1 | 29.591040 | 29.053310 | +1.8508% |
-| 2 / 2 | 29.697208 | 29.020278 | +2.3326% |
-| 2 / 3 | 29.712469 | 29.143988 | +1.9506% |
-| 2 aggregate | 29.666807 | 29.072431 | +2.0445% |
-| Combined | **29.128277** | **28.569292** | **+1.9566%** |
+| 1 / 1 | 29.136657 | 28.484798 | +2.2884% |
+| 1 / 2 | 28.876846 | 28.477513 | +1.4023% |
+| 1 / 3 | 28.473334 | 28.054908 | +1.4915% |
+| 1 aggregate | 28.826356 | 28.337641 | +1.7246% |
+| 2 / 1 | 29.598591 | 28.867628 | +2.5321% |
+| 2 / 2 | 29.832179 | 29.228604 | +2.0650% |
+| 2 / 3 | 29.882952 | 29.192804 | +2.3641% |
+| 2 aggregate | 29.770724 | 29.095435 | +2.3209% |
+| Combined | **29.290900** | **28.711500** | **+2.0180%** |
 
 Every block followed the same schedule in both arms: 124 single-token cycles,
 194 double-token cycles, and 118 post-seed rejections. The combined row uses
 `3072 / sum(elapsed)` for each arm, not an arithmetic mean of rates.
 
-For the six paired block log-speedups: mean `0.01938120`, sample standard
-deviation `0.00290741`; the one-sided 95% lower bound is `+1.7135%`, and the
-more conservative two-sided 95% lower endpoint is `+1.6464%`.
+For the six paired block log-speedups: mean `0.02002799`, sample standard
+deviation `0.00463404`; the one-sided 95% lower bound is `+1.6348%`, and the
+more conservative two-sided 95% lower endpoint is `+1.5280%`.
+
+## Whole-stack and ordinary decode controls
+
+The same harness was compiled against the exact upstream base. Its two arms
+are behaviorally identical because the rollback variable does not exist there;
+together they provide 3,072 generated tokens. Base ran at `24.563300` t/s
+(108 singles, 202 doubles, 106 post-seed rejections per 512-token block).
+The two final optimized arms above also total 3,072 tokens and ran at
+`29.290900` t/s (124 singles, 194 doubles, 118 rejections per block).
+
+Ordinary non-MTP prefill/decode was measured once per revision with
+`ds4-bench`, the checked-in `speed-bench/promessi_sposi.txt`, a 2,048-token
+frontier, 128 generated tokens, and an 8,192-token allocation:
+
+| Revision | Prefill t/s | Generation t/s | Steady generation t/s |
+|---|---:|---:|---:|
+| upstream `b1b4ea0` | 236.40 | 23.45 | 23.47 |
+| final runtime `48029e0` | 237.78 | 23.54 | 23.56 |
+| delta | +0.58% | +0.38% | +0.38% |
+
+These single runs are a non-regression control, not a statistically powered
+claim of an ordinary prefill/decode speedup.
 
 ## Metal System Trace
 
@@ -91,21 +126,23 @@ environment variable above.
 xcrun xctrace record --template 'Metal System Trace' --window 8s \
   --output glm53-kda-verify2-fused.trace --launch -- ./ds4 \
   -m /path/to/GLM-5.3-Flash-Q2.gguf --metal --ctx 8192 \
-  --tokens 96 --temp 0 --nothink --mtp-timing -p PROMPT
+  --tokens 96 --temp 0 --nothink --mtp-timing \
+  -p 'Explain, in detailed numbered steps, how an append-only write-ahead log, checkpoints, and idempotent replay recover a stateful service after a crash. Continue until every invariant and edge case is covered.'
 
 xcrun xctrace record --template 'Metal System Trace' --window 8s \
   --env DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION=1 \
   --output glm53-kda-verify2-rollback.trace --launch -- ./ds4 \
   -m /path/to/GLM-5.3-Flash-Q2.gguf --metal --ctx 8192 \
-  --tokens 96 --temp 0 --nothink --mtp-timing -p PROMPT
+  --tokens 96 --temp 0 --nothink --mtp-timing \
+  -p 'Explain, in detailed numbered steps, how an append-only write-ahead log, checkpoints, and idempotent replay recover a stateful service after a crash. Continue until every invariant and edge case is covered.'
 ```
 
-The optimized trace contained 56 representative verify command buffers with
-9–13 GPU intervals each. Their weighted mean summed GPU time was `45.039 ms`
-(range `44.501–45.621 ms`). The rollback trace contained 43 representative
-verify buffers with 77–80 intervals each and a `45.872 ms` weighted mean
-(range `45.345–46.561 ms`). The change therefore removes about 68 recorded
-intervals and saves `0.833 ms` of GPU work per verify (`-1.816%`). The trace
+The optimized trace contained 62 representative verify command buffers with
+9–13 GPU intervals each. Their weighted mean summed GPU time was `45.289 ms`
+(range `44.557–46.200 ms`). The rollback trace contained 46 representative
+verify buffers with 77–80 intervals each and a `45.980 ms` weighted mean
+(range `44.898–47.150 ms`). The change therefore removes about 68 recorded
+intervals and saves `0.691 ms` of GPU work per verify (`-1.503%`). The trace
 matches the intended removal of two prefix-state copy encoders per each of 34
 KDA layers and agrees with the paired end-to-end result.
 
@@ -126,8 +163,11 @@ DS4_TEST_SSD_STREAMING_CACHE_GB=16 \
 ```
 
 Both model-backed runs completed 16 cycles as 9 singles and 7 doubles (23
-committed tokens), including eight single-token cycles after the seed and
-therefore real rejection rollback. All cycle logits were byte-identical.
+committed tokens), including eight single-token cycles after the seed. The
+resident run exercises the fused and split paths and requires byte-identical
+cycle logits. SSD streaming intentionally remains on the established batch
+fallback; its run confirms that the Apple-only fast path does not change the
+streaming result.
 
 The first automatic SSD-cache attempt was rejected during engine setup because
 the 80% working-set policy left a one-expert cache, below the required 3.80 GiB

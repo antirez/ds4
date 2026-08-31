@@ -641,6 +641,7 @@ int main(void) {
         }
     }
 
+#if defined(__APPLE__)
     /* The {3,8} update above dispatches one complete and one partial aligned
      * pool together after the leading row. Only the final threadgroup may
      * retain the shared tail used to complete pool 2 here. */
@@ -774,6 +775,7 @@ int main(void) {
         require_close("GLM-5.3 speculative pool replacement",
                       pool_actual[d], expected_pool, 2e-5f);
     }
+#endif
 
     enum { SCORE_ROWS = 3, SCORE_TOKENS = 5, SCORE_POS0 = 4 };
     float score_q[SCORE_TOKENS * HEADS * D];
