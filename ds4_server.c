@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_tp.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
@@ -13869,6 +13870,26 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        /* Local wiring: accept the shared tensor-parallel options exactly
+         * as ds4/ds4-agent do, so ds4-server can lead the two-Mac pool. */
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.engine.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       tp_parse_err[0] ? tp_parse_err :
+                       "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
@@ -14032,6 +14053,14 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char tp_adopt_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
+                                          &c.engine.distributed,
+                                          tp_adopt_err,
+                                          sizeof(tp_adopt_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_adopt_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -14109,6 +14138,40 @@ int main(int argc, char **argv) {
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+        return 1;
+    }
+
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
+        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader,
+                                tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-server: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    } else if (cfg.engine.tp.role != DS4_TP_NONE) {
+        fprintf(stderr,
+                "ds4-server: only --role coordinator is supported with "
+                "--tensor-parallel (run workers with ds4)\n");
+        ds4_engine_close(engine);
         return 1;
     }
 
