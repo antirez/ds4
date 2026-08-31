@@ -13,6 +13,7 @@
  * ds4_dist_run() directly.
  */
 typedef ds4_distributed_options ds4_dist_options;
+typedef struct ds4_dist_coordinator ds4_dist_coordinator;
 typedef struct ds4_dist_session ds4_dist_session;
 
 /* Options used by standalone `./ds4 --role coordinator -p ...` generation.
@@ -65,12 +66,23 @@ int ds4_dist_prepare_engine_options(
 /* Coordinator session backend used by ds4.c. These mirror the normal session
  * operations; callers outside the engine should not need to call them directly.
  */
-int ds4_dist_session_create(
-        ds4_dist_session **out,
+/* The listener, accept loop and worker registry describe the cluster this
+ * process joined, not any one session, so the engine opens one coordinator and
+ * every coordinator session borrows it. Opening one per session would cap the
+ * process at a single resident session: the second bind hits EADDRINUSE.
+ */
+int ds4_dist_coordinator_open(
+        ds4_dist_coordinator **out,
         ds4_engine *engine,
         const ds4_dist_options *opt,
-        ds4_session *owner,
         int ctx_size,
+        char *err,
+        size_t errlen);
+void ds4_dist_coordinator_close(ds4_dist_coordinator *c);
+
+int ds4_dist_session_create(
+        ds4_dist_session **out,
+        ds4_dist_coordinator *coord,
         char *err,
         size_t errlen);
 void ds4_dist_session_free(ds4_dist_session *d);
@@ -97,6 +109,24 @@ int ds4_dist_session_eval(
         const ds4_tokens *checkpoint,
         int token,
         float *logits,
+        char *err,
+        size_t errlen);
+
+/* Decode one token on each of several coordinator sessions, overlapping their
+ * remote waits. Every member's frame is submitted before any result is
+ * collected, so the batch costs the longest wait rather than their sum.
+ */
+typedef struct {
+    ds4_dist_session *dist;
+    ds4_session *owner;
+    const ds4_tokens *checkpoint;
+    int token;
+    float *logits;
+} ds4_dist_decode_item;
+
+int ds4_dist_sessions_eval(
+        ds4_dist_decode_item *items,
+        int count,
         char *err,
         size_t errlen);
 

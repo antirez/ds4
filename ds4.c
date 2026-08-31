@@ -36894,6 +36894,9 @@ struct ds4_engine {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     ds4_distributed_options distributed;
+    /* One coordinator endpoint per engine, opened on the first coordinator
+     * session. Sessions borrow it; it outlives all of them. */
+    ds4_dist_coordinator *dist_coordinator;
     ds4_engine_tp_state tp;
     bool metal_ready;
     bool mtp_ready;
@@ -58587,6 +58590,8 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    ds4_dist_coordinator_close(e->dist_coordinator);
+    e->dist_coordinator = NULL;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
@@ -58760,6 +58765,29 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+/* Attach a coordinator session to the engine's endpoint, opening the endpoint
+ * on first use.  ctx_size comes from the first session; every resident session
+ * on a server shares it. */
+static int ds4_session_attach_distributed(ds4_session *s, ds4_engine *e,
+                                          int ctx_size) {
+    char err[256];
+    if (!e->dist_coordinator &&
+        ds4_dist_coordinator_open(&e->dist_coordinator, e, &e->distributed,
+                                  ctx_size, err, sizeof(err)) != 0) {
+        fprintf(stderr,
+                "ds4: failed to open distributed coordinator endpoint: %s\n",
+                err[0] ? err : "unknown error");
+        return 1;
+    }
+    if (ds4_dist_session_create(&s->distributed, e->dist_coordinator,
+                                err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: failed to create distributed coordinator session: %s\n",
+                err[0] ? err : "unknown error");
+        return 1;
+    }
+    return 0;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -58865,26 +58893,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs =
             xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
-        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-            char err[256];
-            if (ds4_dist_session_create(&s->distributed,
-                                        e,
-                                        &e->distributed,
-                                        s,
-                                        ctx_size,
-                                        err,
-                                        sizeof(err)) != 0) {
-                fprintf(stderr,
-                        "ds4: failed to create distributed coordinator session: %s\n",
-                        err[0] ? err : "unknown error");
-                glm_graph_free(&s->glm_graph);
-                free(s->glm_mtp_hc);
-                free(s->glm_mtp_logits0);
-                free(s->logits);
-                free(s->sample_probs);
-                free(s);
-                return 1;
-            }
+        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+            ds4_session_attach_distributed(s, e, ctx_size) != 0) {
+            glm_graph_free(&s->glm_graph);
+            free(s->glm_mtp_hc);
+            free(s->glm_mtp_logits0);
+            free(s->logits);
+            free(s->sample_probs);
+            free(s);
+            return 1;
         }
         if (!ds4_session_tp_register(s)) {
             ds4_session_free(s);
@@ -59024,28 +59041,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
-    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-        char err[256];
-        if (ds4_dist_session_create(&s->distributed,
-                                    e,
-                                    &e->distributed,
-                                    s,
-                                    ctx_size,
-                                    err,
-                                    sizeof(err)) != 0) {
-            fprintf(stderr,
-                    "ds4: failed to create distributed coordinator session: %s\n",
-                    err[0] ? err : "unknown error");
-            metal_graph_free(&s->graph);
-            free(s->logits);
-            free(s->sample_probs);
-            free(s->mtp_logits);
-            free(s->spec_row_logits);
-            free(s->dspark_markov_bias);
-            free(s->dspark_conf_features);
-            free(s);
-            return 1;
-        }
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        ds4_session_attach_distributed(s, e, ctx_size) != 0) {
+        metal_graph_free(&s->graph);
+        free(s->logits);
+        free(s->sample_probs);
+        free(s->mtp_logits);
+        free(s->spec_row_logits);
+        free(s->dspark_markov_bias);
+        free(s->dspark_conf_features);
+        free(s);
+        return 1;
     }
     if (!ds4_session_tp_register(s)) {
         ds4_session_free(s);
@@ -61961,6 +61967,20 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
 }
 
+/* A distributed coordinator maps only its own --layers slice, but the batch
+ * encoders below build a full local decode graph per session and would walk
+ * layers this process never loaded.  Those sessions take the serialized
+ * fallback instead, which routes each token over the wire.
+ * ds4_sessions_eval_batch_metal_supported() refuses them for the same reason;
+ * the CUDA path, which ROCm also uses, needs the same exclusion. */
+static bool ds4_decode_batch_has_distributed(const ds4_decode_item *items,
+                                             int count) {
+    for (int i = 0; i < count; i++) {
+        if (items[i].session && items[i].session->distributed) return true;
+    }
+    return false;
+}
+
 #ifndef DS4_NO_GPU
 static bool ds4_sessions_eval_batch_metal_supported(
         ds4_decode_item *items,
@@ -62721,6 +62741,50 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         char *err,
         size_t errlen);
 
+/* Adapt the engine's decode batch to the distributed one.  A mixed batch, where
+ * only some members are distributed, cannot happen: every session on a
+ * coordinator engine is distributed, and ds4_sessions_eval_batch() has already
+ * rejected members belonging to a different engine. */
+static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count,
+                                               char *err, size_t errlen) {
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s->distributed) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "decode batch item %d is not a distributed session", i);
+            }
+            return 1;
+        }
+        if (!s->checkpoint_valid) {
+            if (err && errlen) {
+                snprintf(err, errlen,
+                         "distributed decode requires a valid checkpoint");
+            }
+            return 1;
+        }
+    }
+
+    ds4_dist_decode_item *dist_items =
+        xmalloc((size_t)count * sizeof(*dist_items));
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        dist_items[i].dist = s->distributed;
+        dist_items[i].owner = s;
+        dist_items[i].checkpoint = &s->checkpoint;
+        dist_items[i].token = items[i].token;
+        dist_items[i].logits = s->logits;
+    }
+    int rc = ds4_dist_sessions_eval(dist_items, count, err, errlen);
+    free(dist_items);
+    if (rc != 0) {
+        /* Members can be left at different points in the timeline, so rebuild
+         * every one rather than expose a partially committed logical batch. */
+        for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+    }
+    return rc;
+}
+
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -62769,6 +62833,14 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
             }
             return 1;
         }
+    }
+
+    /* Distributed members spend most of a decode step blocked on a socket, not
+     * on this GPU. Hand them to the distributed batch, which submits every
+     * frame before collecting any result, instead of the serialized fallback
+     * below that pays one full round trip per member. */
+    if (ds4_decode_batch_has_distributed(items, count)) {
+        return ds4_sessions_eval_batch_distributed(items, count, err, errlen);
     }
 
 #ifndef DS4_NO_GPU
@@ -66391,6 +66463,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * while preserving the exact one-token kernels and per-session KV order. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_decode_batch_has_distributed(items, count) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
@@ -66528,6 +66601,8 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         native_requested &&
         e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(prefill_session) &&
+        !prefill_session->distributed &&
+        !ds4_decode_batch_has_distributed(items, count) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prefill_prompt, start, prefill_rows,
