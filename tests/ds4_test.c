@@ -161,8 +161,14 @@ static void test_session_snapshot_roundtrip(void) {
     enum { GLM_MTP_SNAPSHOT_CYCLES = 16 };
     int reference_accepted[GLM_MTP_SNAPSHOT_CYCLES * 2] = {0};
     int reference_counts[GLM_MTP_SNAPSHOT_CYCLES] = {0};
+    int reference_positions[GLM_MTP_SNAPSHOT_CYCLES] = {0};
     int reference_total = 0;
     const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
+    char *saved_deferred_row1_head = NULL;
+    bool deferred_row1_head_env_managed = false;
+    float *reference_cycle_logits = NULL;
+    float *restored_cycle_logits = NULL;
+    int vocab = 0;
 #ifdef DS4_ROCM_BUILD
     const float continued_logit_tolerance =
         ds4_engine_is_glm53(engine) ? 1e-5f : 1e-6f;
@@ -197,6 +203,22 @@ static void test_session_snapshot_roundtrip(void) {
     if (!snapshot.ptr || snapshot.len == 0) goto cleanup;
 
     if (test_glm_mtp) {
+        saved_deferred_row1_head =
+            test_save_env("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD");
+        deferred_row1_head_env_managed = true;
+        TEST_ASSERT(unsetenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == 0);
+        vocab = ds4_engine_vocab_size(engine);
+        TEST_ASSERT(vocab > 0);
+        if (vocab <= 0) goto cleanup;
+        reference_cycle_logits = malloc(
+            (size_t)GLM_MTP_SNAPSHOT_CYCLES * vocab *
+            sizeof(reference_cycle_logits[0]));
+        restored_cycle_logits = malloc(
+            (size_t)vocab * sizeof(restored_cycle_logits[0]));
+        TEST_ASSERT(reference_cycle_logits && restored_cycle_logits);
+        if (!reference_cycle_logits || !restored_cycle_logits) {
+            goto cleanup;
+        }
         for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
             const int first = ds4_session_argmax(reference);
             const int n = ds4_session_eval_speculative_argmax(
@@ -207,6 +229,11 @@ static void test_session_snapshot_roundtrip(void) {
             if (n <= 0 || n > 2) goto cleanup;
             reference_counts[cycle] = n;
             reference_total += n;
+            reference_positions[cycle] = ds4_session_pos(reference);
+            TEST_ASSERT(ds4_session_copy_logits(
+                            reference,
+                            reference_cycle_logits + (size_t)cycle * vocab,
+                            vocab) == vocab);
         }
     } else {
         TEST_ASSERT(ds4_session_eval(reference, before[0].id,
@@ -236,6 +263,8 @@ static void test_session_snapshot_roundtrip(void) {
     }
 
     if (test_glm_mtp) {
+        TEST_ASSERT(setenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD",
+                           "1", 1) == 0);
         int restored_total = 0;
         int single_cycles = 0;
         int double_cycles = 0;
@@ -253,9 +282,17 @@ static void test_session_snapshot_roundtrip(void) {
                             reference_accepted[restored_total + i]);
             }
             restored_total += n;
+            TEST_ASSERT(ds4_session_pos(restored) == reference_positions[cycle]);
+            TEST_ASSERT(ds4_session_copy_logits(restored,
+                                                restored_cycle_logits,
+                                                vocab) == vocab);
+            TEST_ASSERT(memcmp(restored_cycle_logits,
+                               reference_cycle_logits + (size_t)cycle * vocab,
+                               (size_t)vocab * sizeof(restored_cycle_logits[0])) == 0);
             single_cycles += n == 1;
             double_cycles += n == 2;
         }
+        TEST_ASSERT(unsetenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == 0);
         TEST_ASSERT(restored_total == reference_total);
         fprintf(stderr,
                 "ds4-test: GLM MTP snapshot cycles=%d single=%d double=%d tokens=%d\n",
@@ -263,6 +300,10 @@ static void test_session_snapshot_roundtrip(void) {
                 single_cycles,
                 double_cycles,
                 restored_total);
+        /* Cycle zero seeds the draft and is always single. More than one
+         * single proves the paired run covered a real draft rejection. */
+        TEST_ASSERT(single_cycles > 1);
+        TEST_ASSERT(double_cycles > 0);
     } else {
         TEST_ASSERT(ds4_session_eval(restored, before[0].id,
                                      err, sizeof(err)) == 0);
@@ -314,6 +355,12 @@ static void test_session_snapshot_roundtrip(void) {
     }
 
 cleanup:
+    if (deferred_row1_head_env_managed) {
+        test_restore_env("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD",
+                         saved_deferred_row1_head);
+    }
+    free(restored_cycle_logits);
+    free(reference_cycle_logits);
     free(prompt_text);
     ds4_tokens_free(&prompt);
     ds4_session_snapshot_free(&snapshot);

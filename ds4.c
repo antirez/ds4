@@ -46684,6 +46684,12 @@ static bool glm_graph_forward_token(
         bool               defer_completion);
 
 
+typedef enum {
+    GLM_VERIFY_HEAD_NONE = 0,
+    GLM_VERIFY_HEAD_FIRST,
+    GLM_VERIFY_HEAD_LAST,
+} glm_verify_head_request;
+
 /* Decode-style verify pass for tiny row counts (MTP): the indexed batch
  * fn measures ~1.4ms/layer at n=2 (gate-profile: gpu-wait 1.22ms/layer)
  * while decode does the same math in 0.79ms. This pass mirrors the
@@ -46705,8 +46711,14 @@ static bool glm_graph_verify_rows(
         uint32_t           pos,
         uint32_t           n,
         float             *output_hc,
-        float             *logits_out) {
+        glm_verify_head_request head_request,
+        float             *head_logits_out) {
     if (!g || !model || !weights || !tokens || n == 0 ||
+        head_request < GLM_VERIFY_HEAD_NONE ||
+        head_request > GLM_VERIFY_HEAD_LAST ||
+        ((head_request == GLM_VERIFY_HEAD_NONE) !=
+         (head_logits_out == NULL)) ||
+        (head_request == GLM_VERIFY_HEAD_FIRST && !g->glm53) ||
         g->compact_cache_cap == 0 ||
         pos + n > g->compact_cache_cap ||
         pos + n > glm_graph_dense_compact_attention_limit(g) ||
@@ -47092,17 +47104,23 @@ glm53_verify_attention_done:
             nxt = tmp;
         }
     }
-    /* The output head takes the mHC block through its weighted sum, and it
-     * recognises only the decode hc tensors, so stage the last verified
-     * row there while the verify command batch is still open. */
-    if (ok && g->glm53 && logits_out) {
+    /* The output head recognises only the decode mHC tensors. Speculative
+     * verification can stage row 0 and encode its head in this command batch;
+     * row 1 is then computed only if the draft is accepted. Other callers
+     * retain the established last-row behaviour. */
+    if (ok && g->glm53 && head_request != GLM_VERIFY_HEAD_NONE) {
         const uint64_t row_bytes =
             (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        const uint32_t head_row =
+            head_request == GLM_VERIFY_HEAD_FIRST ? 0u : n - 1u;
         ok = ds4_gpu_tensor_copy(g->hc_cur,
                                  0,
                                  hc_cur,
-                                 (uint64_t)(n - 1u) * row_bytes,
+                                 (uint64_t)head_row * row_bytes,
                                  row_bytes) != 0;
+    }
+    if (ok && g->glm53 && head_request == GLM_VERIFY_HEAD_FIRST) {
+        ok = glm_graph_encode_output_head(g, model, weights);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -47112,17 +47130,28 @@ glm53_verify_attention_done:
                                  output_hc,
                                  g->glm53 ? hc_bytes : plain_bytes) != 0;
     }
-    if (ok && logits_out) {
+    if (ok && g->glm53 && head_request == GLM_VERIFY_HEAD_FIRST &&
+        glm_debug_hidden_dump_layer() < 0) {
+        glm_debug_dump_hidden_row(g->hc_output, 0);
+    }
+    if (ok && g->glm53 && head_request == GLM_VERIFY_HEAD_FIRST) {
+        ok = ds4_gpu_tensor_read(g->logits,
+                                 0,
+                                 head_logits_out,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok && head_request == GLM_VERIFY_HEAD_LAST) {
         if (g->glm53) {
             ok = glm_graph_forward_output_head(g, model, weights,
-                                               g->hc_cur, logits_out);
+                                               g->hc_cur, head_logits_out);
         } else {
             ds4_gpu_tensor *last = glm_graph_tensor_row_view_strided(cur,
                                                                      n - 1u,
                                                                      DS4_N_EMBD,
                                                                      DS4_N_EMBD);
             ok = last != NULL &&
-                 glm_graph_forward_output_head(g, model, weights, last, logits_out);
+                 glm_graph_forward_output_head(g, model, weights, last,
+                                               head_logits_out);
             ds4_gpu_tensor_free(last);
         }
     }
@@ -63801,6 +63830,11 @@ typedef struct {
     bool base_saved;
 } glm53_spec_transaction;
 
+typedef struct {
+    bool first;
+    bool last;
+} glm53_spec_logits_ready;
+
 static bool glm53_spec_transaction_begin(glm53_spec_transaction *tx,
                                          ds4_session *s,
                                          uint32_t pos) {
@@ -63850,20 +63884,34 @@ static bool glm53_spec_transaction_commit_prefix(glm53_spec_transaction *tx,
 static bool glm53_spec_verify(glm53_spec_transaction *tx,
                               const int *tokens,
                               float *output_hc,
+                              float *first_logits_out,
                               float *logits_out,
+                              glm53_spec_logits_ready *logits_ready,
                               const char **path_out) {
     ds4_session *s = tx->session;
     ds4_engine *e = s->engine;
     ds4_glm_gpu_graph *g = &s->glm_graph;
     bool attempted_rows = false;
     bool verified = false;
+    const bool defer_row1_head =
+        getenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == NULL;
+    if (logits_ready) *logits_ready = (glm53_spec_logits_ready){0};
     if (glm53_graph_mtp_fast_verify_enabled()) {
         attempted_rows = true;
         verified = glm_graph_verify_rows(g, &e->model, &e->weights,
                                          tokens, tx->pos, 2u,
-                                         output_hc, logits_out);
+                                         output_hc,
+                                         defer_row1_head ?
+                                             GLM_VERIFY_HEAD_FIRST :
+                                             GLM_VERIFY_HEAD_LAST,
+                                         defer_row1_head ?
+                                             first_logits_out : logits_out);
     }
     if (verified) {
+        if (logits_ready) {
+            logits_ready->first = defer_row1_head;
+            logits_ready->last = !defer_row1_head;
+        }
         glm53_spec_transaction_disarm(tx);
         if (path_out) *path_out = "rows";
         return true;
@@ -63909,10 +63957,10 @@ static bool glm53_spec_verify(glm53_spec_transaction *tx,
                                                      2u);
     }
     glm53_spec_transaction_disarm(tx);
+    if (verified && logits_ready) logits_ready->last = true;
     if (path_out) *path_out = "batch";
     return verified;
 }
-
 
 /* One GLM MTP speculative cycle: evaluate first_token, and when a compatible
  * pending draft exists verify [first_token, draft] in one 2-row batch pass
@@ -63986,6 +64034,7 @@ static int ds4_session_glm_spec_cycle_impl(
     bool verified = false;
     bool kda_saved = false;
     bool kda_prefix_saved = false;
+    glm53_spec_logits_ready verify_logits = {0};
     glm53_spec_transaction glm_tx = {0};
     const char *verify_path = "rows";
     double verify_t0 = t0;
@@ -63996,7 +64045,9 @@ static int ds4_session_glm_spec_cycle_impl(
             verified = glm53_spec_verify(&glm_tx,
                                          toks,
                                          s->glm_mtp_hc,
+                                         s->glm_mtp_logits0,
                                          s->logits,
+                                         &verify_logits,
                                          &verify_path);
             kda_prefix_saved = verified && glm_tx.prefix_count == 1u;
         }
@@ -64005,7 +64056,9 @@ static int ds4_session_glm_spec_cycle_impl(
          * decode; its full-KV batch path would read unwritten rows. */
         verified = glm_graph_verify_rows(g, &e->model, &e->weights,
                                          toks, pos, 2,
-                                         s->glm_mtp_hc, s->logits);
+                                         s->glm_mtp_hc,
+                                         GLM_VERIFY_HEAD_LAST,
+                                         s->logits);
     }
     if (!verified && !g->glm53) {
         verify_path = "batch";
@@ -64038,15 +64091,16 @@ static int ds4_session_glm_spec_cycle_impl(
     ds4_gpu_tensor *h0 = NULL;
     bool head_ok = false;
     if (g->glm53) {
-        head_ok = ds4_gpu_tensor_write(g->hc_cur,
-                                       0,
-                                       s->glm_mtp_hc,
-                                       hc_row_bytes) != 0 &&
-                  glm_graph_forward_output_head(g,
-                                                &e->model,
-                                                &e->weights,
-                                                g->hc_cur,
-                                                s->glm_mtp_logits0);
+        head_ok = verify_logits.first ||
+                  (ds4_gpu_tensor_write(g->hc_cur,
+                                        0,
+                                        s->glm_mtp_hc,
+                                        hc_row_bytes) != 0 &&
+                   glm_graph_forward_output_head(g,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 g->hc_cur,
+                                                 s->glm_mtp_logits0));
     } else {
         h0 = ds4_gpu_tensor_view(g->mtp_concat,
                                  0,
@@ -64103,6 +64157,25 @@ static int ds4_session_glm_spec_cycle_impl(
                 s->checkpoint_valid = false;
                 return -1;
             }
+        }
+    }
+    const bool row1_logits_ready = !g->glm53 || verify_logits.last;
+    if (accept && !row1_logits_ready) {
+        const bool row1_head_ok =
+            ds4_gpu_tensor_write(g->hc_cur,
+                                 0,
+                                 s->glm_mtp_hc + hc_row_values,
+                                 hc_row_bytes) != 0 &&
+            glm_graph_forward_output_head(g,
+                                          &e->model,
+                                          &e->weights,
+                                          g->hc_cur,
+                                          s->logits);
+        if (!row1_head_ok) {
+            if (kda_saved) (void)glm53_spec_transaction_restore_base(&glm_tx);
+            if (errlen) snprintf(err, errlen, "glm mtp: row1 head failed");
+            s->checkpoint_valid = false;
+            return -1;
         }
     }
     token_vec_push(&s->checkpoint, first_token);

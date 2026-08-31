@@ -1,12 +1,36 @@
 # GLM-5.3 throughput after PR #892
 
-Date: 2026-08-30  
+Date: 2026-08-30; M4 trace follow-up: 2026-08-31  
 Decision ticket: #16  
 Scope: generated tokens/s on M4 Max after private PR #13, plus production agent throughput where cache replay dominates.
 
 ## Decision
 
 Better MTP draft quality is possible, but it is **not the best next DS4 implementation pass**.
+
+The prescribed M4 Metal trace and first exact optimization are also complete.
+During the final 3.7 seconds of a 96-token width-2 run, DS4 occupied the GPU
+for `3340.107 ms` (`90.23%` of the span). The trace contained 371 command
+buffers and 4,476 compute encoders; normal two-row verify command buffers
+contained roughly 77--83 encoders and 44.8--47.3 ms of summed GPU work. This
+rules out CPU-side speculative bookkeeping as the next meaningful target.
+
+The trace did expose one avoidable output-head submission. Two-row verify now
+computes row-0 target logits inside its existing command batch and defers the
+row-1 target head until the draft is accepted. Rejected cycles therefore no
+longer compute logits that cannot be committed. The
+[paired benchmark](../../speed-bench/glm53_mtp_head_bench.c) ran two repeats of
+three 512-token blocks in two synchronized sessions, alternating execution
+order every 64 tokens and checking full-vocabulary logits after every chunk.
+Five of six blocks were positive; the two repeat aggregates were `+1.37%` and
+`+0.95%`. Across 3,072 tokens per arm, throughput was `28.390 t/s` with the
+change versus `28.066 t/s` through the exact rollback control, a `1.16%`
+improvement. Each arm followed the same 124 single-token / 194 double-token
+cycle schedule per block, and every token and logit comparison was
+bit-identical. Cycle telemetry on rejected drafts cut the post-verify `other`
+interval from about `1.7 ms` to `0.1 ms`; accepted cycles retain the row-1 head
+and its cost. The result is deliberately small, but exact and aligned with the
+traced bottleneck.
 
 The prescribed width-3 experiment is now complete. A transaction prototype
 captured KDA state after both retainable prefixes, avoided rejection replay,
@@ -180,9 +204,21 @@ Already implemented or already measured negative:
 
 ### Steady generated tokens/s, exact relative to current Q2
 
-1. Profile-led exact GLM/M4 kernel work, especially concurrent routed/shared FFN execution. Expect incremental gains; PR #12 indicates isolated projection fusion is sub-1% whole-token work.
-2. Consider a GLM DFlash2 draft adapter only if a cheaper drafter can improve Utility, not merely acceptance. PR #892 records available same-tokenizer qwen3 draft artifacts, but no GLM integration or throughput evidence.
-3. Do not expand embedded MTP beyond width 2 on the current support head. The replay-free width-3 experiment failed both required throughput controls.
+1. Build a snapshot-aware width-2 KDA prepare + recurrence path (or fuse the
+   full KDA path). The accepted prefix contains both convolution state mutated
+   during prepare and recurrent state mutated separately. Both row-0 states
+   must therefore be written in-kernel. This folds the required prefix writes
+   into the compute path and removes separate blit/encoder cadence and
+   intermediate traffic; it does not eliminate state preservation. Gate it on
+   exact KDA state, hidden-state, logits, and speculative token equivalence
+   before measuring whole-token throughput.
+2. Revisit routed/shared FFN concurrency only with a different scheduling
+   design. A same-process exact A/B of the existing full-overlap switch was
+   noise-level (`26.0630` versus `26.1061 t/s`), as was moving the first graph
+   split from layer 2 to 1 (`27.2518` versus `27.3374 t/s`). Neither is a
+   credible M4 improvement.
+3. Consider a GLM DFlash2 draft adapter only if a cheaper drafter can improve Utility, not merely acceptance. PR #892 records available same-tokenizer qwen3 draft artifacts, but no GLM integration or throughput evidence.
+4. Do not expand embedded MTP beyond width 2 on the current support head. The replay-free width-3 experiment failed both required throughput controls.
 
 ### Highest potential if target quality may change
 
@@ -198,11 +234,13 @@ Already implemented or already measured negative:
 - M5 is dispatch-bound in PR #892; M4 may be more bandwidth-bound. Use a Metal trace before choosing target-kernel fusion versus active-byte work.
 - A better trained nextn model remains possible. Reconsider only if multi-prefix rollback is cheap and corpus telemetry shows acceptance is still the dominant Utility term.
 
-## Completed experiment and next action
+## Completed experiments and next action
 
 The interleaved target-only/width-2/width-3 experiment selected width 2. The
-next implementation experiment should use a Metal trace to rank exact target
-cost, beginning with whether routed and shared FFN work can overlap on M4.
-Acceptance remains diagnostic telemetry, not a runtime gate. If target logits
-may change, the separate quality-gated active-byte artifact remains the larger
-potential project.
+M4 Metal trace then selected and validated deferred row-1 output-head work,
+adding `1.16%` across two paired 3 x 512-token runs without changing output.
+Existing full FFN overlap and graph-split cadence did not clear a performance
+gate. The next exact runtime experiment is therefore a snapshot-aware two-row
+KDA prepare + recurrence path. Acceptance remains diagnostic telemetry, not a
+runtime gate. If target logits may change, the separate quality-gated
+active-byte artifact remains the larger potential project.

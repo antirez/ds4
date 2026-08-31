@@ -54,6 +54,36 @@ legacy decode path, including token selection, use:
   --tokens 1024
 ```
 
+### GLM-5.3 MTP deferred output-head A/B
+
+Build and run the exact optimized/rollback comparison with a GLM-5.3 model:
+
+```
+make glm53-mtp-head-bench
+./speed-bench/glm53_mtp_head_bench \
+  /path/to/GLM-5.3-Flash-Q2.gguf
+```
+
+The harness uses one engine and two synchronized sessions. It runs three
+512-token blocks, reverses arm order every 64 tokens, and uses
+`DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD=1` as the rollback control. It aborts
+unless token IDs, acceptance schedules, positions, and full-vocabulary logits
+are bit-identical after every chunk.
+
+Two complete 2026-08-31 M4 Max runs recorded:
+
+| Run / block | Optimized t/s | Rollback t/s | Delta |
+|---|---:|---:|---:|
+| 1 / 1 | 29.086967 | 28.700182 | +1.3477% |
+| 1 / 2 | 28.310298 | 27.952702 | +1.2793% |
+| 1 / 3 | 29.172597 | 28.747383 | +1.4791% |
+| 1 aggregate | 28.851359 | 28.462059 | +1.3678% |
+| 2 / 1 | 26.993788 | 27.092747 | -0.3653% |
+| 2 / 2 | 29.120859 | 28.698852 | +1.4705% |
+| 2 / 3 | 27.798862 | 27.304778 | +1.8095% |
+| 2 aggregate | 27.943914 | 27.680773 | +0.9506% |
+| Combined | **28.390387** | **28.065980** | **+1.1559%** |
+
 ### Metal prefill variant A/B
 
 Build the balanced prefill comparison. To compare the default resident pre-M5

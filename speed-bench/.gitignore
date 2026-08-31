@@ -2,4 +2,5 @@ __pycache__/
 .DS_Store
 local-runs/
 metal_decode_schedule_bench
+glm53_mtp_head_bench
 metal_prefill_variant_bench
