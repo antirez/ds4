@@ -1969,11 +1969,30 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         !input_q8_scratch || input_q8_scratch_bytes == 0 ||
         !down_q8_scratch || down_q8_scratch_bytes == 0 ||
         !work_scratch || work_scratch_bytes == 0 || !down) {
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
-    const size_t down_bytes =
-        (size_t)n_tokens * (size_t)n_expert_used *
-        (size_t)out_dim * sizeof(float);
+    const size_t nt = (size_t)n_tokens;
+    const size_t nu = (size_t)n_expert_used;
+    const size_t od = (size_t)out_dim;
+    if (nt > SIZE_MAX / nu || nt * nu > SIZE_MAX / od ||
+        nt * nu * od > SIZE_MAX / sizeof(float)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t assignments = nt * nu;
+    const size_t expert_in = (size_t)expert_in_dim;
+    const size_t expert_mid = (size_t)expert_mid_dim;
+    if (assignments > SIZE_MAX / expert_in ||
+        assignments > SIZE_MAX / expert_mid) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    /* The internal MMQ producer sizes multiply these logical element counts
+     * by block structs before dividing by their values-per-block. Keep ample
+     * headroom for that multiplication and its fixed tail allocation. */
+    if (assignments * expert_in > SIZE_MAX / 512u ||
+        assignments * expert_mid > SIZE_MAX / 512u) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t down_bytes = assignments * od * sizeof(float);
     if (ds4_mmq_scratch_overlaps(
             input_q8_scratch, input_q8_scratch_bytes,
             down_q8_scratch, down_q8_scratch_bytes) ||
@@ -1989,12 +2008,20 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
             down_q8_scratch, down_q8_scratch_bytes, down, down_bytes) ||
         ds4_mmq_scratch_overlaps(
             work_scratch, work_scratch_bytes, down, down_bytes)) {
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const int64_t iq2_k_blocks = expert_in_dim / 256;
+    const int64_t q2_k_blocks = expert_mid_dim / 256;
+    if ((int64_t)n_experts > INT64_MAX / expert_mid_dim ||
+        (int64_t)n_experts * expert_mid_dim > INT64_MAX / iq2_k_blocks ||
+        (int64_t)n_experts > INT64_MAX / (out_dim / 2) ||
+        (int64_t)n_experts * (out_dim / 2) > INT64_MAX / q2_k_blocks) {
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     const int64_t iq2_blocks =
-        (int64_t)n_experts * expert_mid_dim * (expert_in_dim / 256);
+        (int64_t)n_experts * expert_mid_dim * iq2_k_blocks;
     const int64_t q2_pairs =
-        (int64_t)n_experts * (out_dim / 2) * (expert_mid_dim / 256);
+        (int64_t)n_experts * (out_dim / 2) * q2_k_blocks;
     const ds4_mmq_fused_down fused_down = {
         W_down,
         (const char *)W_down,
@@ -2014,13 +2041,17 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         input_q8_ext,
         input_q8_ext_bytes,
     };
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+    const int rc = ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",
         W_gate, W_up, X, ids, nullptr, nullptr,
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
         (const char *)W_gate, (const char *)W_up, iq2_blocks,
         /*sanitize_out=*/false, &fused_down);
+    if (rc == -1 || (rc <= -91 && rc >= -97)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    return rc;
 }
 
 extern "C" int ds4_mmq_q4_K_moe_pair(
@@ -3658,6 +3689,12 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
     return 0;
 }
 
+static int g_gb10_optimizations = 0;
+
+extern "C" void ds4_mmq_set_gb10_optimizations(int enabled) {
+    g_gb10_optimizations = enabled != 0;
+}
+
 // ---------------------------------------------------------------------------
 // Aligned-SoA Q8_0 dense decode matvec (megakernel program M1-Inc3).
 //
@@ -3705,6 +3742,96 @@ __global__ void q8_0_aligned_dense_vec_kernel(
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) out[row] = acc;
+}
+
+/* K=1024 decode specialization. Eight persistent row warps per CTA hoist the
+ * 32 Q8_1 activation blocks into registers and walk output rows at a grid
+ * stride. Each lane still owns the same single block term and the warp tree is
+ * unchanged, so output bits match q8_0_aligned_dense_vec_kernel. */
+__global__ __launch_bounds__(256, 6) void q8_0_aligned_dense_vec_k1024_persistent_kernel(
+        float             *out,
+        const int4        *qs,
+        const __half      *dq,
+        const block_q8_1  *x8,
+        int                M)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int *u = (const int *)x8[lane].qs;
+    const int u0 = u[0];
+    const int u1 = u[1];
+    const int u2 = u[2];
+    const int u3 = u[3];
+    const int u4 = u[4];
+    const int u5 = u[5];
+    const int u6 = u[6];
+    const int u7 = u[7];
+    const float dx = __low2float(x8[lane].ds);
+    const int64_t row0 = (int64_t)blockIdx.x * 8 + warp;
+    const int64_t row_stride = (int64_t)gridDim.x * 8;
+
+    for (int64_t row = row0; row < (int64_t)M; row += row_stride) {
+        const long long block = (long long)row * 32 + lane;
+        const int4 w0 = qs[block * 2 + 0];
+        const int4 w1 = qs[block * 2 + 1];
+        int s0 = ggml_cuda_dp4a(w0.x, u0, 0);
+        s0 = ggml_cuda_dp4a(w0.y, u1, s0);
+        int s1 = ggml_cuda_dp4a(w0.z, u2, 0);
+        s1 = ggml_cuda_dp4a(w0.w, u3, s1);
+        int s2 = ggml_cuda_dp4a(w1.x, u4, 0);
+        s2 = ggml_cuda_dp4a(w1.y, u5, s2);
+        int s3 = ggml_cuda_dp4a(w1.z, u6, 0);
+        s3 = ggml_cuda_dp4a(w1.w, u7, s3);
+        const int sumi = (s0 + s1) + (s2 + s3);
+        float acc = 0.0f;
+        acc += __half2float(dq[block]) * dx * (float)sumi;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) out[row] = acc;
+    }
+}
+
+/* Persistent-CTA form for the K=4096 vocabulary projection. It preserves
+ * the original lane/block assignment, per-lane term order, and warp tree;
+ * grouping eight row warps removes the one-warp CTA occupancy ceiling. */
+__global__ __launch_bounds__(256, 6) void q8_0_aligned_dense_vec_persistent_kernel(
+        float             *out,
+        const int4        *qs,
+        const __half      *dq,
+        const block_q8_1  *x8,
+        int                M,
+        int                nb)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int64_t row0 = (int64_t)blockIdx.x * 8 + warp;
+    const int64_t row_stride = (int64_t)gridDim.x * 8;
+    for (int64_t row = row0; row < (int64_t)M; row += row_stride) {
+        const long long rbase = (long long)row * nb;
+        float acc = 0.0f;
+        for (int b0 = 0; b0 < nb; b0 += 32) {
+            const int b = b0 + lane;
+            const int4 w0 = qs[(rbase + b) * 2 + 0];
+            const int4 w1 = qs[(rbase + b) * 2 + 1];
+            const int *u = (const int *)x8[b].qs;
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
+            sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
+            sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
+            sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
+            sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
+            sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
+            sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
+            sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+            acc += __half2float(dq[rbase + b]) *
+                   __low2float(x8[b].ds) * (float)sumi;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) out[row] = acc;
+    }
 }
 
 // Verify-width variant (v0.4 dense chase, proto_q8_aligned_nc): same aligned
@@ -3797,7 +3924,11 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
     cudaError_t err;
     if (!x8) {
-    if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
+    if (getenv("DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH") == NULL &&
+        g_aligned_q81_scratch_ptr &&
+        g_aligned_q81_scratch_bytes >= nbytes_q8_1) {
+        x8 = (char *)g_aligned_q81_scratch_ptr;
+    } else if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         x8 = (char *)g_q81_scratch_ptr;
     } else {
         q8_pool.alloc(ctx->pool(), nbytes_q8_1);
@@ -3823,8 +3954,26 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     const block_q8_1 *x8p = (const block_q8_1 *)x8;
     switch (N) {
     case 1:
-        q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
-            out_f32, qsp, dqp, x8p, M, K / 32);
+        if (g_gb10_optimizations &&
+            getenv("DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT") == NULL &&
+            (K == 1024 || K == 4096) && M >= 32768) {
+            const uint64_t row_blocks = ((uint64_t)(unsigned)M + 7u) / 8u;
+            /* 288 = 48 GB10 SMs x __launch_bounds__(256, 6) resident CTAs. */
+            const unsigned persistent_blocks =
+                row_blocks < 288u ? (unsigned)row_blocks : 288u;
+            if (K == 1024) {
+                q8_0_aligned_dense_vec_k1024_persistent_kernel<<<
+                    persistent_blocks, 256, 0, stream>>>(
+                        out_f32, qsp, dqp, x8p, M);
+            } else {
+                q8_0_aligned_dense_vec_persistent_kernel<<<
+                    persistent_blocks, 256, 0, stream>>>(
+                        out_f32, qsp, dqp, x8p, M, K / 32);
+            }
+        } else {
+            q8_0_aligned_dense_vec_kernel<<<(unsigned)M, 32, 0, stream>>>(
+                out_f32, qsp, dqp, x8p, M, K / 32);
+        }
         break;
     case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
     case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;

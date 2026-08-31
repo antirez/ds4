@@ -26819,7 +26819,13 @@ static DS4_MAYBE_UNUSED bool metal_graph_pre_m5_q2_decode_schedule_eligible(
 }
 
 static uint32_t metal_graph_token_split_after_layers(void) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
     uint32_t split_after_layers = 4;
+#else
+    /* Metal commits this split asynchronously. CUDA's flush is a blocking
+     * device sync, so its equivalent only stalls mid-token submission. */
+    uint32_t split_after_layers = 0;
+#endif
 #ifndef DS4_ROCM_BUILD
     const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
