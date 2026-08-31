@@ -546,7 +546,7 @@ int main(void) {
     free(batch_q);
 #endif
 
-    enum { POOL = 4, POOL_TOKENS = 11, POOL_CAP = 16, POOL_COUNT = 4 };
+    enum { POOL = 4, POOL_TOKENS = 12, POOL_CAP = 16, POOL_COUNT = 4 };
     float pool_raw[POOL_TOKENS * D];
     float pool_gate_values[POOL_TOKENS * D];
     for (uint32_t t = 0; t < POOL_TOKENS; t++) {
@@ -639,6 +639,62 @@ int main(void) {
             require_close("GLM-5.3 pool", pool_actual[p * D + d],
                           expected_pool, 2e-5f);
         }
+    }
+
+    /* The {3,8} update above dispatches one complete and one partial aligned
+     * pool together after the leading row. Only the final threadgroup may
+     * retain the shared tail used to complete pool 2 here. */
+    require_ok(ds4_gpu_tensor_write(pool_raw_gpu, 0,
+                                    pool_raw + 11u * D,
+                                    (uint64_t)D * sizeof(float)),
+               "multi-pool tail completion raw write");
+    require_ok(ds4_gpu_tensor_write(pool_gate_gpu, 0,
+                                    pool_gate_values + 11u * D,
+                                    (uint64_t)D * sizeof(float)),
+               "multi-pool tail completion gate write");
+    require_ok(ds4_gpu_glm53_indexer_pool_update_tensor(
+        pool_cache, pool_tail_k, pool_tail_gate,
+        pool_raw_gpu, pool_gate_gpu,
+        model, MODEL_BYTES, POOL_NORM_OFFSET, POOL_BIAS_OFFSET, POOL_APE_OFFSET,
+        11u, 1u, POOL_CAP, D, POOL, 1e-6f, false),
+        "GLM-5.3 multi-pool tail completion");
+    require_ok(ds4_gpu_tensor_read(pool_cache, 2u * D * sizeof(float),
+                                   pool_actual, D * sizeof(float)),
+               "multi-pool tail completion cache read");
+    float tail_means[POOL], tail_invs[POOL];
+    for (uint32_t r = 0; r < POOL; r++) {
+        const float *row = pool_raw + (uint64_t)(2u * POOL + r) * D;
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < D; d++) sum += row[d];
+        tail_means[r] = sum / (float)D;
+        float ss = 0.0f;
+        for (uint32_t d = 0; d < D; d++) {
+            const float delta = row[d] - tail_means[r];
+            ss += delta * delta;
+        }
+        tail_invs[r] = 1.0f / sqrtf(ss / (float)D + 1e-6f);
+    }
+    for (uint32_t d = 0; d < D; d++) {
+        float logits[POOL], max_logit = -FLT_MAX, denom = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = pool_gate_values[
+                (uint64_t)(2u * POOL + r) * D + d] +
+                bf16_to_f32(pool_ape[r * D + d]);
+            if (logits[r] > max_logit) max_logit = logits[r];
+        }
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = expf(logits[r] - max_logit);
+            denom += logits[r];
+        }
+        float expected_pool = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            const float value =
+                (pool_raw[(uint64_t)(2u * POOL + r) * D + d] -
+                 tail_means[r]) * tail_invs[r] * pool_norm[d] + pool_bias[d];
+            expected_pool += logits[r] / denom * value;
+        }
+        require_close("GLM-5.3 multi-pool tail completion",
+                      pool_actual[d], expected_pool, 2e-5f);
     }
 
     /* A two-row speculative update can complete a pool with row 3 before
@@ -1124,6 +1180,17 @@ int main(void) {
         require_close("verify2 prefix guard", prefix_guards[i], -1234.5f,
                       0.0f);
     }
+    ds4_gpu_tensor *misaligned_prefix = ds4_gpu_tensor_view(
+        prefix, sizeof(float), prefix_storage_bytes - sizeof(float));
+    require_ok(misaligned_prefix != NULL,
+               "verify2 misaligned prefix view allocation");
+    require_ok(!ds4_gpu_glm53_kda_verify2_snapshot(
+        pout, pconv, pstate, misaligned_prefix, 0u, pq, pk, pv, pg, pbeta,
+        poutput_gate,
+        model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
+        A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET, HEADS, -5.0f, 1e-5f),
+        "verify2 rejects an unaligned absolute prefix address");
+    ds4_gpu_tensor_free(misaligned_prefix);
     ds4_gpu_tensor_free(prefix);
     free(actual_verify_out);
     free(actual_final_recurrent);

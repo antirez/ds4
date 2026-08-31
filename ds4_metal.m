@@ -44636,7 +44636,9 @@ static int glm53_gpu_kda_prefill_impl(
         return 0;
     }
     if (prefix_state &&
-        (n_tokens != 2u || (prefix_offset & 15u) != 0u ||
+        (n_tokens != 2u ||
+         (ds4_gpu_tensor_offset(prefix_state) & 15u) != 0u ||
+         (prefix_offset & 15u) != 0u ||
          prefix_offset > ds4_gpu_tensor_bytes(prefix_state) ||
          conv_state_bytes >
              ds4_gpu_tensor_bytes(prefix_state) - prefix_offset ||

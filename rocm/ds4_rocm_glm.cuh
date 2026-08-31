@@ -2594,10 +2594,10 @@ __global__ static void glm53_rocm_indexer_pool_update_kernel(
             const uint32_t src_row = pos - pos0;
             k_value = raw_k[(uint64_t)src_row * head_dim + tid];
             gate_value = gate[(uint64_t)src_row * head_dim + tid];
-            /* Preserve accepted prefix rows even when a speculative batch
-             * completes the pool with an unaccepted final row. */
-            tail_k[(uint64_t)r * head_dim + tid] = k_value;
-            tail_gate[(uint64_t)r * head_dim + tid] = gate_value;
+            if (!complete) {
+                tail_k[(uint64_t)r * head_dim + tid] = k_value;
+                tail_gate[(uint64_t)r * head_dim + tid] = gate_value;
+            }
         } else {
             k_value = tail_k[(uint64_t)r * head_dim + tid];
             gate_value = tail_gate[(uint64_t)r * head_dim + tid];

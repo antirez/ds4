@@ -51,7 +51,7 @@ static bool advance_arm(ds4_session *session,
         int accepted[2] = {0};
         const int cap = count - generated < 2 ? 1 : 2;
         const int n = ds4_session_eval_speculative_argmax(
-            session, first, cap, -1, accepted, 2, err, sizeof(err));
+            session, first, cap, -1, accepted, cap, err, sizeof(err));
         if (n <= 0 || n > cap) {
             fprintf(stderr, "glm53-mtp-head-bench: generation failed at %d: %s\n",
                     offset + generated, err[0] ? err : "unknown error");

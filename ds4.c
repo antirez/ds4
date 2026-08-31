@@ -44541,23 +44541,31 @@ static bool glm_graph_disable_indexed_decode(void) {
  * instead of replaying the accepted token through a whole decode. Set
  * DS4_GLM_DISABLE_MTP_KDA_PREFIX=1 to measure the replay path again. */
 static bool glm53_graph_mtp_kda_prefix_enabled(void) {
+#if !defined(__APPLE__)
+    return false;
+#else
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_GLM_DISABLE_MTP_KDA_PREFIX");
         cached = (env && env[0] && env[0] != '0') ? 0 : 1;
     }
     return cached != 0;
+#endif
 }
 
 /* Verify a GLM 5.3 MTP pair with the decode-style row pass. Set
  * DS4_GLM_DISABLE_MTP_FAST_VERIFY=1 to fall back to the batch encoders. */
 static bool glm53_graph_mtp_fast_verify_enabled(void) {
+#if !defined(__APPLE__)
+    return false;
+#else
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_GLM_DISABLE_MTP_FAST_VERIFY");
         cached = (env && env[0] && env[0] != '0') ? 0 : 1;
     }
     return cached != 0;
+#endif
 }
 
 static bool glm_graph_decode_uses_indexed_attention(const ds4_glm_gpu_graph *g,
@@ -46194,12 +46202,15 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t kda_backup_bytes = glm53_graph_kda_state_bytes(g);
     if (g->glm53 && kda_backup_bytes != 0) {
         g->mtp_kda_backup = ds4_gpu_tensor_alloc(kda_backup_bytes);
-        g->mtp_kda_prefix = ds4_gpu_tensor_alloc(kda_backup_bytes);
+        if (glm53_graph_mtp_kda_prefix_enabled()) {
+            g->mtp_kda_prefix = ds4_gpu_tensor_alloc(kda_backup_bytes);
+        }
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     /* mtp_kda_prefix only speeds up rejection rollback, so a machine that
      * cannot spare it keeps MTP and falls back to the replay decode. */
-    if (g->glm53 && g->mtp_kda_backup && !g->mtp_kda_prefix) {
+    if (g->glm53 && glm53_graph_mtp_kda_prefix_enabled() &&
+        g->mtp_kda_backup && !g->mtp_kda_prefix) {
         fprintf(stderr,
                 "ds4: glm mtp: KDA prefix buffer unavailable; rejected "
                 "drafts fall back to a replay decode\n");

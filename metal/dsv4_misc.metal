@@ -991,6 +991,7 @@ kernel void kernel_glm53_indexer_pool_update(
     threadgroup float *mean = rows + args.pool_size * args.head_dim;
     threadgroup float *inv = mean + args.pool_size;
     const bool complete = pool_start + args.pool_size <= input_end;
+    const bool retains_tail = pool_start + args.pool_size >= input_end;
 
     for (uint r = 0; r < args.pool_size; r++) {
         const uint pos = pool_start + r;
@@ -1002,12 +1003,13 @@ kernel void kernel_glm53_indexer_pool_update(
                 (uint64_t)src_row * args.head_dim + tid];
             gate_value = ((device const float *)gate)[
                 (uint64_t)src_row * args.head_dim + tid];
-            /* Keep every supplied row, including rows that complete a pool.
-             * A speculative batch can complete the pool with an unaccepted
-             * final row; its replacement then rebuilds from these retained
-             * prefix rows plus the replacement. */
-            tail_k[(uint64_t)r * args.head_dim + tid] = k_value;
-            tail_gate[(uint64_t)r * args.head_dim + tid] = gate_value;
+            /* The tail is one shared pool-sized staging area. Only the last
+             * pool touched by this dispatch may update it; a completed last
+             * pool is retained so speculative replacement can rebuild it. */
+            if (retains_tail) {
+                tail_k[(uint64_t)r * args.head_dim + tid] = k_value;
+                tail_gate[(uint64_t)r * args.head_dim + tid] = gate_value;
+            }
         } else {
             k_value = tail_k[(uint64_t)r * args.head_dim + tid];
             gate_value = tail_gate[(uint64_t)r * args.head_dim + tid];
