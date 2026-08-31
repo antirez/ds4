@@ -13,7 +13,7 @@ enum {
     BENCH_CHUNK = 64,
 };
 
-static const char *const rollback_env =
+static const char *rollback_env =
     "DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD";
 
 typedef struct {
@@ -174,9 +174,13 @@ done:
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL\n", argv[0]);
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "usage: %s MODEL [ROLLBACK_ENV]\n", argv[0]);
         return 2;
+    }
+    if (argc == 3) {
+        if (!argv[2][0]) return 2;
+        rollback_env = argv[2];
     }
     const char *old_rollback = getenv(rollback_env);
     char *saved_rollback = old_rollback ? strdup(old_rollback) : NULL;
@@ -201,6 +205,7 @@ int main(int argc, char **argv) {
         "after a crash. Continue until every invariant and edge case is covered.",
         DS4_THINK_NONE, &prompt);
     if (prompt.len == 0) goto done;
+    printf("rollback_env=%s\n", rollback_env);
 
     bench_arm optimized[BENCH_BLOCKS] = {0};
     bench_arm rollback[BENCH_BLOCKS] = {0};

@@ -42737,6 +42737,11 @@ static bool glm53_graph_copy_kda_layer_state(
         uint32_t           layer,
         bool               save);
 
+static bool glm53_graph_kda_state_offset(
+        const ds4_glm_gpu_graph *g,
+        uint32_t                 layer,
+        uint64_t                *offset_out);
+
 /* Run the KDA recurrence over `rows` rows starting at row `row0` of the
  * already-projected batch scratch. Splitting the recurrence lets the MTP
  * verify snapshot the state between the accepted row and the drafted one
@@ -42880,6 +42885,38 @@ static bool glm53_graph_kda_attention_rows(
         const uint32_t snapshot_rows = g->mtp_kda_snapshot_rows;
         if (snapshot_rows != 0u && snapshot_rows < rows &&
             g->mtp_kda_prefix != NULL) {
+#if defined(__APPLE__)
+            uint64_t prefix_offset = 0;
+            if (snapshot_rows == 1u && rows == 2u &&
+                getenv("DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION") ==
+                    NULL &&
+                glm53_graph_kda_state_offset(g, il, &prefix_offset)) {
+                ok = ds4_gpu_glm53_kda_verify2_snapshot(
+                        g->batch_kda_out,
+                        g->layer_kda_conv_state[il],
+                        g->layer_kda_recurrent_state[il],
+                        g->mtp_kda_prefix,
+                        prefix_offset,
+                        g->batch_kda_q,
+                        g->batch_kda_k,
+                        g->batch_kda_v,
+                        g->batch_kda_raw_gate,
+                        g->batch_kda_raw_beta,
+                        g->batch_kda_output_gate,
+                        model->map,
+                        model->size,
+                        l->kda_q_conv->abs_offset,
+                        l->kda_k_conv->abs_offset,
+                        l->kda_v_conv->abs_offset,
+                        l->kda_a_log->abs_offset,
+                        l->kda_dt_bias->abs_offset,
+                        l->kda_o_norm->abs_offset,
+                        DS4_N_KDA_HEAD,
+                        DS4_KDA_GATE_LOWER_BOUND,
+                        DS4_RMS_EPS) != 0;
+                goto glm53_kda_recurrence_done;
+            }
+#endif
             ok = glm53_graph_kda_recurrence_slice(g, model, l, il,
                                                   0u, snapshot_rows);
             if (ok) failed_stage = "KDA prefix state snapshot";
@@ -42919,6 +42956,9 @@ static bool glm53_graph_kda_attention_rows(
                     DS4_RMS_EPS) != 0;
         }
     }
+#if defined(__APPLE__)
+glm53_kda_recurrence_done:
+#endif
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_out_ready", g->batch_kda_out,
             (uint64_t)rows * projection, il, pos0);

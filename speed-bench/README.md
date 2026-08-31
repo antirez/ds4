@@ -70,6 +70,15 @@ The harness uses one engine and two synchronized sessions. It runs three
 unless token IDs, acceptance schedules, positions, and full-vocabulary logits
 are bit-identical after every chunk.
 
+Pass a second argument to compare another dynamic rollback switch. The
+snapshot-aware width-2 KDA path uses:
+
+```
+./speed-bench/glm53_mtp_head_bench \
+  /path/to/GLM-5.3-Flash-Q2.gguf \
+  DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION
+```
+
 Two complete 2026-08-31 M4 Max runs recorded:
 
 | Run / block | Optimized t/s | Rollback t/s | Delta |

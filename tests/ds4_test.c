@@ -151,6 +151,7 @@ static void test_session_snapshot_roundtrip(void) {
 
     ds4_session *reference = NULL;
     ds4_session *restored = NULL;
+    ds4_session *kda_rollback = NULL;
     ds4_session_snapshot snapshot = {0};
     ds4_tokens prompt = {0};
     char err[192] = {0};
@@ -165,7 +166,9 @@ static void test_session_snapshot_roundtrip(void) {
     int reference_total = 0;
     const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
     char *saved_deferred_row1_head = NULL;
+    char *saved_kda_verify2_snapshot = NULL;
     bool deferred_row1_head_env_managed = false;
+    bool kda_verify2_snapshot_env_managed = false;
     float *reference_cycle_logits = NULL;
     float *restored_cycle_logits = NULL;
     int vocab = 0;
@@ -205,8 +208,13 @@ static void test_session_snapshot_roundtrip(void) {
     if (test_glm_mtp) {
         saved_deferred_row1_head =
             test_save_env("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD");
+        saved_kda_verify2_snapshot = test_save_env(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION");
         deferred_row1_head_env_managed = true;
+        kda_verify2_snapshot_env_managed = true;
         TEST_ASSERT(unsetenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == 0);
+        TEST_ASSERT(unsetenv(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION") == 0);
         vocab = ds4_engine_vocab_size(engine);
         TEST_ASSERT(vocab > 0);
         if (vocab <= 0) goto cleanup;
@@ -304,6 +312,60 @@ static void test_session_snapshot_roundtrip(void) {
          * single proves the paired run covered a real draft rejection. */
         TEST_ASSERT(single_cycles > 1);
         TEST_ASSERT(double_cycles > 0);
+
+#if defined(__APPLE__)
+        /* Isolate the KDA snapshot fusion from the deferred-head comparison.
+         * Both sessions start at the same snapshot and must produce identical
+         * speculative schedules and full-vocabulary logits cycle by cycle. */
+        TEST_ASSERT(ds4_session_create(&kda_rollback, engine, ctx) == 0);
+        if (!kda_rollback) goto cleanup;
+        TEST_ASSERT(ds4_session_load_snapshot(kda_rollback, &snapshot,
+                                              err, sizeof(err)) == 0);
+        TEST_ASSERT(setenv(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION",
+            "1", 1) == 0);
+        int kda_rollback_total = 0;
+        int kda_rollback_single = 0;
+        int kda_rollback_double = 0;
+        for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
+            int rollback_accepted[2] = {0};
+            const int first = ds4_session_argmax(kda_rollback);
+            TEST_ASSERT(first == reference_accepted[kda_rollback_total]);
+            const int n = ds4_session_eval_speculative_argmax(
+                    kda_rollback, first, 2, -1,
+                    rollback_accepted, 2, err, sizeof(err));
+            TEST_ASSERT(n == reference_counts[cycle]);
+            if (n != reference_counts[cycle]) goto cleanup;
+            for (int i = 0; i < n; i++) {
+                TEST_ASSERT(rollback_accepted[i] ==
+                            reference_accepted[kda_rollback_total + i]);
+            }
+            kda_rollback_total += n;
+            TEST_ASSERT(ds4_session_pos(kda_rollback) ==
+                        reference_positions[cycle]);
+            TEST_ASSERT(ds4_session_copy_logits(kda_rollback,
+                                                restored_cycle_logits,
+                                                vocab) == vocab);
+            TEST_ASSERT(memcmp(
+                restored_cycle_logits,
+                reference_cycle_logits + (size_t)cycle * vocab,
+                (size_t)vocab * sizeof(restored_cycle_logits[0])) == 0);
+            kda_rollback_single += n == 1;
+            kda_rollback_double += n == 2;
+        }
+        TEST_ASSERT(unsetenv(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION") == 0);
+        TEST_ASSERT(kda_rollback_total == reference_total);
+        TEST_ASSERT(kda_rollback_single > 1);
+        TEST_ASSERT(kda_rollback_double > 0);
+        fprintf(stderr,
+                "ds4-test: GLM KDA verify2 A/B single=%d double=%d tokens=%d\n",
+                kda_rollback_single,
+                kda_rollback_double,
+                kda_rollback_total);
+        ds4_session_free(kda_rollback);
+        kda_rollback = NULL;
+#endif
     } else {
         TEST_ASSERT(ds4_session_eval(restored, before[0].id,
                                      err, sizeof(err)) == 0);
@@ -355,6 +417,11 @@ static void test_session_snapshot_roundtrip(void) {
     }
 
 cleanup:
+    if (kda_verify2_snapshot_env_managed) {
+        test_restore_env(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION",
+            saved_kda_verify2_snapshot);
+    }
     if (deferred_row1_head_env_managed) {
         test_restore_env("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD",
                          saved_deferred_row1_head);
@@ -364,6 +431,7 @@ cleanup:
     free(prompt_text);
     ds4_tokens_free(&prompt);
     ds4_session_snapshot_free(&snapshot);
+    ds4_session_free(kda_rollback);
     ds4_session_free(restored);
     ds4_session_free(reference);
 }
