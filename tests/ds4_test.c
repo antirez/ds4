@@ -151,6 +151,7 @@ static void test_session_snapshot_roundtrip(void) {
 
     ds4_session *reference = NULL;
     ds4_session *restored = NULL;
+    ds4_session *kda_rollback = NULL;
     ds4_session_snapshot snapshot = {0};
     ds4_tokens prompt = {0};
     char err[192] = {0};
@@ -161,8 +162,16 @@ static void test_session_snapshot_roundtrip(void) {
     enum { GLM_MTP_SNAPSHOT_CYCLES = 16 };
     int reference_accepted[GLM_MTP_SNAPSHOT_CYCLES * 2] = {0};
     int reference_counts[GLM_MTP_SNAPSHOT_CYCLES] = {0};
+    int reference_positions[GLM_MTP_SNAPSHOT_CYCLES] = {0};
     int reference_total = 0;
     const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
+    char *saved_deferred_row1_head = NULL;
+    char *saved_kda_verify2_snapshot = NULL;
+    bool deferred_row1_head_env_managed = false;
+    bool kda_verify2_snapshot_env_managed = false;
+    float *reference_cycle_logits = NULL;
+    float *restored_cycle_logits = NULL;
+    int vocab = 0;
 #ifdef DS4_ROCM_BUILD
     const float continued_logit_tolerance =
         ds4_engine_is_glm53(engine) ? 1e-5f : 1e-6f;
@@ -197,6 +206,27 @@ static void test_session_snapshot_roundtrip(void) {
     if (!snapshot.ptr || snapshot.len == 0) goto cleanup;
 
     if (test_glm_mtp) {
+        saved_deferred_row1_head =
+            test_save_env("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD");
+        saved_kda_verify2_snapshot = test_save_env(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION");
+        deferred_row1_head_env_managed = true;
+        kda_verify2_snapshot_env_managed = true;
+        TEST_ASSERT(unsetenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == 0);
+        TEST_ASSERT(unsetenv(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION") == 0);
+        vocab = ds4_engine_vocab_size(engine);
+        TEST_ASSERT(vocab > 0);
+        if (vocab <= 0) goto cleanup;
+        reference_cycle_logits = malloc(
+            (size_t)GLM_MTP_SNAPSHOT_CYCLES * vocab *
+            sizeof(reference_cycle_logits[0]));
+        restored_cycle_logits = malloc(
+            (size_t)vocab * sizeof(restored_cycle_logits[0]));
+        TEST_ASSERT(reference_cycle_logits && restored_cycle_logits);
+        if (!reference_cycle_logits || !restored_cycle_logits) {
+            goto cleanup;
+        }
         for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
             const int first = ds4_session_argmax(reference);
             const int n = ds4_session_eval_speculative_argmax(
@@ -207,6 +237,11 @@ static void test_session_snapshot_roundtrip(void) {
             if (n <= 0 || n > 2) goto cleanup;
             reference_counts[cycle] = n;
             reference_total += n;
+            reference_positions[cycle] = ds4_session_pos(reference);
+            TEST_ASSERT(ds4_session_copy_logits(
+                            reference,
+                            reference_cycle_logits + (size_t)cycle * vocab,
+                            vocab) == vocab);
         }
     } else {
         TEST_ASSERT(ds4_session_eval(reference, before[0].id,
@@ -236,6 +271,8 @@ static void test_session_snapshot_roundtrip(void) {
     }
 
     if (test_glm_mtp) {
+        TEST_ASSERT(setenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD",
+                           "1", 1) == 0);
         int restored_total = 0;
         int single_cycles = 0;
         int double_cycles = 0;
@@ -253,9 +290,17 @@ static void test_session_snapshot_roundtrip(void) {
                             reference_accepted[restored_total + i]);
             }
             restored_total += n;
+            TEST_ASSERT(ds4_session_pos(restored) == reference_positions[cycle]);
+            TEST_ASSERT(ds4_session_copy_logits(restored,
+                                                restored_cycle_logits,
+                                                vocab) == vocab);
+            TEST_ASSERT(memcmp(restored_cycle_logits,
+                               reference_cycle_logits + (size_t)cycle * vocab,
+                               (size_t)vocab * sizeof(restored_cycle_logits[0])) == 0);
             single_cycles += n == 1;
             double_cycles += n == 2;
         }
+        TEST_ASSERT(unsetenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == 0);
         TEST_ASSERT(restored_total == reference_total);
         fprintf(stderr,
                 "ds4-test: GLM MTP snapshot cycles=%d single=%d double=%d tokens=%d\n",
@@ -263,6 +308,64 @@ static void test_session_snapshot_roundtrip(void) {
                 single_cycles,
                 double_cycles,
                 restored_total);
+        /* Cycle zero seeds the draft and is always single. More than one
+         * single proves the paired run covered a real draft rejection. */
+        TEST_ASSERT(single_cycles > 1);
+        TEST_ASSERT(double_cycles > 0);
+
+#if defined(__APPLE__)
+        /* Isolate the KDA snapshot fusion from the deferred-head comparison.
+         * Both sessions start at the same snapshot and must produce identical
+         * speculative schedules and full-vocabulary logits cycle by cycle. */
+        TEST_ASSERT(ds4_session_create(&kda_rollback, engine, ctx) == 0);
+        if (!kda_rollback) goto cleanup;
+        TEST_ASSERT(ds4_session_load_snapshot(kda_rollback, &snapshot,
+                                              err, sizeof(err)) == 0);
+        TEST_ASSERT(setenv(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION",
+            "1", 1) == 0);
+        int kda_rollback_total = 0;
+        int kda_rollback_single = 0;
+        int kda_rollback_double = 0;
+        for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
+            int rollback_accepted[2] = {0};
+            const int first = ds4_session_argmax(kda_rollback);
+            TEST_ASSERT(first == reference_accepted[kda_rollback_total]);
+            const int n = ds4_session_eval_speculative_argmax(
+                    kda_rollback, first, 2, -1,
+                    rollback_accepted, 2, err, sizeof(err));
+            TEST_ASSERT(n == reference_counts[cycle]);
+            if (n != reference_counts[cycle]) goto cleanup;
+            for (int i = 0; i < n; i++) {
+                TEST_ASSERT(rollback_accepted[i] ==
+                            reference_accepted[kda_rollback_total + i]);
+            }
+            kda_rollback_total += n;
+            TEST_ASSERT(ds4_session_pos(kda_rollback) ==
+                        reference_positions[cycle]);
+            TEST_ASSERT(ds4_session_copy_logits(kda_rollback,
+                                                restored_cycle_logits,
+                                                vocab) == vocab);
+            TEST_ASSERT(memcmp(
+                restored_cycle_logits,
+                reference_cycle_logits + (size_t)cycle * vocab,
+                (size_t)vocab * sizeof(restored_cycle_logits[0])) == 0);
+            kda_rollback_single += n == 1;
+            kda_rollback_double += n == 2;
+        }
+        TEST_ASSERT(unsetenv(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION") == 0);
+        TEST_ASSERT(kda_rollback_total == reference_total);
+        TEST_ASSERT(kda_rollback_single > 1);
+        TEST_ASSERT(kda_rollback_double > 0);
+        fprintf(stderr,
+                "ds4-test: GLM KDA verify2 A/B single=%d double=%d tokens=%d\n",
+                kda_rollback_single,
+                kda_rollback_double,
+                kda_rollback_total);
+        ds4_session_free(kda_rollback);
+        kda_rollback = NULL;
+#endif
     } else {
         TEST_ASSERT(ds4_session_eval(restored, before[0].id,
                                      err, sizeof(err)) == 0);
@@ -314,9 +417,21 @@ static void test_session_snapshot_roundtrip(void) {
     }
 
 cleanup:
+    if (kda_verify2_snapshot_env_managed) {
+        test_restore_env(
+            "DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION",
+            saved_kda_verify2_snapshot);
+    }
+    if (deferred_row1_head_env_managed) {
+        test_restore_env("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD",
+                         saved_deferred_row1_head);
+    }
+    free(restored_cycle_logits);
+    free(reference_cycle_logits);
     free(prompt_text);
     ds4_tokens_free(&prompt);
     ds4_session_snapshot_free(&snapshot);
+    ds4_session_free(kda_rollback);
     ds4_session_free(restored);
     ds4_session_free(reference);
 }
@@ -6677,18 +6792,20 @@ static ds4_engine *test_open_dspark_engine(const char *support_path) {
     return rc == 0 ? engine : NULL;
 }
 
-/* Regression for the swapped top-k arguments in metal_graph_verify_suffix_tops
- * at draft depth > 2.  Replays the committed speculative tokens through plain
- * decode and requires each to be a (near-)argmax: that is the verify invariant,
- * and unlike comparing token streams it tolerates the near-greedy tie
- * divergences.  Needs an MTP head, so it self-skips without DS4_TEST_MTP. */
+/* Replays committed speculative tokens through plain decode and requires every
+ * committed token to remain within the numerical-tie band of the target
+ * argmax. Serial and batched Metal evaluation can select different equal-best
+ * token IDs, so byte equality would make this regression flaky. */
 static void test_mtp_verify_depth(void) {
     ds4_engine *engine = test_get_engine(false);
-    if (!engine || !ds4_engine_has_mtp(engine)) {
-        fprintf(stderr, "ds4-test: mtp-verify-depth skipped (set DS4_TEST_MTP to an MTP GGUF)\n");
+    const bool glm_mtp = engine && ds4_engine_is_glm53(engine) &&
+                         test_env_bool("DS4_TEST_GLM_MTP");
+    if (!engine || (!ds4_engine_has_mtp(engine) && !glm_mtp)) {
+        fprintf(stderr, "ds4-test: mtp-verify-depth skipped (set DS4_TEST_MTP "
+                        "or DS4_TEST_GLM_MTP)\n");
         return;
     }
-    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) > 2);
+    TEST_ASSERT(ds4_engine_mtp_draft_tokens(engine) >= (glm_mtp ? 2 : 3));
 
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
@@ -6703,8 +6820,9 @@ static void test_mtp_verify_depth(void) {
         const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, TEST_MTP_MAXGEN,
                                                           spec, &nspec, &max_chunk);
         TEST_ASSERT(ok_spec);
-        TEST_ASSERT(max_chunk > 1);  /* multi-token chunks committed: the multi-row path ran */
-        TEST_ASSERT(nspec > 128);    /* enough output to surface the bug, incl. a spurious-EOS truncation */
+        TEST_ASSERT(max_chunk >= 2);
+        if (glm_mtp) TEST_ASSERT(nspec == TEST_MTP_MAXGEN);
+        else TEST_ASSERT(nspec > 128);
 
         float worst_gap = 0.0f;
         int worst_at = -1;
@@ -6713,7 +6831,9 @@ static void test_mtp_verify_depth(void) {
         TEST_ASSERT(ok_check);
         fprintf(stderr, "ds4-test: mtp-verify-depth nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
                 nspec, max_chunk, worst_gap, worst_at);
-        TEST_ASSERT(worst_gap <= 2.0f);  /* correct: ~0; bug: ~21 on the reference model */
+        /* Preserve the legacy MTP fixture tolerance; the GLM target/verify
+         * path is exact apart from equal-best numerical ties. */
+        TEST_ASSERT(worst_gap <= (glm_mtp ? 0.1f : 2.0f));
     }
 
     free(spec);
@@ -6807,7 +6927,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
-    {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
+    {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits target-equivalent tokens", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},

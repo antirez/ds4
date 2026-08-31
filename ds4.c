@@ -40030,6 +40030,14 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_concat;
     ds4_gpu_tensor *mtp_selected;
     ds4_gpu_tensor *mtp_kda_backup;
+    /* KDA state as of the first verified row, so a rejected draft rolls
+     * back without replaying the accepted token through a full decode. */
+    ds4_gpu_tensor *mtp_kda_prefix;
+    /* Rows after which the MTP verify captures mtp_kda_prefix. Zero for
+     * every pass that is not an MTP verify, so the recurrence stays one
+     * dispatch. The MTP cycle sets and clears it around the verify, which
+     * is why it reaches both the row pass and the batch encoders. */
+    uint32_t        mtp_kda_snapshot_rows;
     float          *mtp_logits_host;
     int             mtp_ready;
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
@@ -41752,12 +41760,14 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_concat);
     ds4_gpu_tensor_free(g->mtp_selected);
     ds4_gpu_tensor_free(g->mtp_kda_backup);
+    ds4_gpu_tensor_free(g->mtp_kda_prefix);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
     g->mtp_concat = NULL;
     g->mtp_selected = NULL;
     g->mtp_kda_backup = NULL;
+    g->mtp_kda_prefix = NULL;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -42721,6 +42731,72 @@ static bool glm53_graph_hc_pre_rows(
     return ok;
 }
 
+static bool glm53_graph_copy_kda_layer_state(
+        ds4_glm_gpu_graph *g,
+        ds4_gpu_tensor    *backup,
+        uint32_t           layer,
+        bool               save);
+
+static bool glm53_graph_kda_state_offset(
+        const ds4_glm_gpu_graph *g,
+        uint32_t                 layer,
+        uint64_t                *offset_out);
+
+/* Run the KDA recurrence over `rows` rows starting at row `row0` of the
+ * already-projected batch scratch. Splitting the recurrence lets the MTP
+ * verify snapshot the state between the accepted row and the drafted one
+ * at the cost of one extra dispatch per KDA layer. */
+static bool glm53_graph_kda_recurrence_slice(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 row0,
+        uint32_t                 rows) {
+    const uint64_t projection =
+        (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t beta_row = (uint64_t)DS4_N_KDA_HEAD * sizeof(float);
+    ds4_gpu_tensor *slots[7] = { NULL };
+    ds4_gpu_tensor *src[7] = {
+        g->batch_kda_out, g->batch_kda_q, g->batch_kda_k, g->batch_kda_v,
+        g->batch_kda_raw_gate, g->batch_kda_raw_beta, g->batch_kda_output_gate,
+    };
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < 7; i++) {
+        const uint64_t stride = (i == 5u) ? beta_row : projection;
+        slots[i] = ds4_gpu_tensor_view(src[i],
+                                       (uint64_t)row0 * stride,
+                                       (uint64_t)rows * stride);
+        ok = slots[i] != NULL;
+    }
+    if (ok) {
+        ok = ds4_gpu_glm53_kda_prefill(
+                slots[0],
+                g->layer_kda_conv_state[il],
+                g->layer_kda_recurrent_state[il],
+                slots[1],
+                slots[2],
+                slots[3],
+                slots[4],
+                slots[5],
+                slots[6],
+                model->map,
+                model->size,
+                l->kda_q_conv->abs_offset,
+                l->kda_k_conv->abs_offset,
+                l->kda_v_conv->abs_offset,
+                l->kda_a_log->abs_offset,
+                l->kda_dt_bias->abs_offset,
+                l->kda_o_norm->abs_offset,
+                DS4_N_KDA_HEAD,
+                rows,
+                DS4_KDA_GATE_LOWER_BOUND,
+                DS4_RMS_EPS) != 0;
+    }
+    for (uint32_t i = 0; i < 7; i++) ds4_gpu_tensor_free(slots[i]);
+    return ok;
+}
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -42805,28 +42881,84 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
-    if (ok) ok = ds4_gpu_glm53_kda_prefill(
-            g->batch_kda_out,
-            g->layer_kda_conv_state[il],
-            g->layer_kda_recurrent_state[il],
-            g->batch_kda_q,
-            g->batch_kda_k,
-            g->batch_kda_v,
-            g->batch_kda_raw_gate,
-            g->batch_kda_raw_beta,
-            g->batch_kda_output_gate,
-            model->map,
-            model->size,
-            l->kda_q_conv->abs_offset,
-            l->kda_k_conv->abs_offset,
-            l->kda_v_conv->abs_offset,
-            l->kda_a_log->abs_offset,
-            l->kda_dt_bias->abs_offset,
-            l->kda_o_norm->abs_offset,
-            DS4_N_KDA_HEAD,
-            rows,
-            DS4_KDA_GATE_LOWER_BOUND,
-            DS4_RMS_EPS) != 0;
+    if (ok) {
+        const uint32_t snapshot_rows = g->mtp_kda_snapshot_rows;
+        if (snapshot_rows != 0u && snapshot_rows < rows &&
+            g->mtp_kda_prefix != NULL) {
+#if defined(__APPLE__)
+            uint64_t prefix_offset = 0;
+            if (snapshot_rows == 1u && rows == 2u &&
+                getenv("DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION") ==
+                    NULL &&
+                glm53_graph_kda_state_offset(g, il, &prefix_offset)) {
+                ok = ds4_gpu_glm53_kda_verify2_snapshot(
+                        g->batch_kda_out,
+                        g->layer_kda_conv_state[il],
+                        g->layer_kda_recurrent_state[il],
+                        g->mtp_kda_prefix,
+                        prefix_offset,
+                        g->batch_kda_q,
+                        g->batch_kda_k,
+                        g->batch_kda_v,
+                        g->batch_kda_raw_gate,
+                        g->batch_kda_raw_beta,
+                        g->batch_kda_output_gate,
+                        model->map,
+                        model->size,
+                        l->kda_q_conv->abs_offset,
+                        l->kda_k_conv->abs_offset,
+                        l->kda_v_conv->abs_offset,
+                        l->kda_a_log->abs_offset,
+                        l->kda_dt_bias->abs_offset,
+                        l->kda_o_norm->abs_offset,
+                        DS4_N_KDA_HEAD,
+                        DS4_KDA_GATE_LOWER_BOUND,
+                        DS4_RMS_EPS) != 0;
+                goto glm53_kda_recurrence_done;
+            }
+#endif
+            ok = glm53_graph_kda_recurrence_slice(g, model, l, il,
+                                                  0u, snapshot_rows);
+            if (ok) failed_stage = "KDA prefix state snapshot";
+            if (ok) ok = glm53_graph_copy_kda_layer_state(g,
+                                                          g->mtp_kda_prefix,
+                                                          il,
+                                                          true);
+            if (ok) failed_stage = "KDA recurrence";
+            if (ok) ok = glm53_graph_kda_recurrence_slice(
+                    g, model, l, il,
+                    snapshot_rows, rows - snapshot_rows);
+        } else {
+            /* Prefill takes this branch on every layer, so it hands the
+             * base tensors straight to the kernel instead of building
+             * seven row views that would cover the whole batch anyway. */
+            ok = ds4_gpu_glm53_kda_prefill(
+                    g->batch_kda_out,
+                    g->layer_kda_conv_state[il],
+                    g->layer_kda_recurrent_state[il],
+                    g->batch_kda_q,
+                    g->batch_kda_k,
+                    g->batch_kda_v,
+                    g->batch_kda_raw_gate,
+                    g->batch_kda_raw_beta,
+                    g->batch_kda_output_gate,
+                    model->map,
+                    model->size,
+                    l->kda_q_conv->abs_offset,
+                    l->kda_k_conv->abs_offset,
+                    l->kda_v_conv->abs_offset,
+                    l->kda_a_log->abs_offset,
+                    l->kda_dt_bias->abs_offset,
+                    l->kda_o_norm->abs_offset,
+                    DS4_N_KDA_HEAD,
+                    rows,
+                    DS4_KDA_GATE_LOWER_BOUND,
+                    DS4_RMS_EPS) != 0;
+        }
+    }
+#if defined(__APPLE__)
+glm53_kda_recurrence_done:
+#endif
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_out_ready", g->batch_kda_out,
             (uint64_t)rows * projection, il, pos0);
@@ -44405,6 +44537,37 @@ static bool glm_graph_disable_indexed_decode(void) {
     return false;
 }
 
+/* Roll a rejected GLM 5.3 draft back with a mid-verify KDA state copy
+ * instead of replaying the accepted token through a whole decode. Set
+ * DS4_GLM_DISABLE_MTP_KDA_PREFIX=1 to measure the replay path again. */
+static bool glm53_graph_mtp_kda_prefix_enabled(void) {
+#if !defined(__APPLE__)
+    return false;
+#else
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_GLM_DISABLE_MTP_KDA_PREFIX");
+        cached = (env && env[0] && env[0] != '0') ? 0 : 1;
+    }
+    return cached != 0;
+#endif
+}
+
+/* Verify a GLM 5.3 MTP pair with the decode-style row pass. Set
+ * DS4_GLM_DISABLE_MTP_FAST_VERIFY=1 to fall back to the batch encoders. */
+static bool glm53_graph_mtp_fast_verify_enabled(void) {
+#if !defined(__APPLE__)
+    return false;
+#else
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_GLM_DISABLE_MTP_FAST_VERIFY");
+        cached = (env && env[0] && env[0] != '0') ? 0 : 1;
+    }
+    return cached != 0;
+#endif
+}
+
 static bool glm_graph_decode_uses_indexed_attention(const ds4_glm_gpu_graph *g,
                                                     uint32_t                 pos,
                                                     const float             *logits_out) {
@@ -45918,12 +46081,65 @@ static uint64_t glm53_graph_kda_state_bytes(const ds4_glm_gpu_graph *g) {
     return total;
 }
 
-static bool glm53_graph_copy_kda_state(
+/* Byte offset of one KDA layer inside a whole-state backup buffer. The
+ * walk order matches glm53_graph_kda_state_bytes, so the per-layer and
+ * whole-state copies address the same slots. */
+static bool glm53_graph_kda_state_offset(
+        const ds4_glm_gpu_graph *g,
+        uint32_t                 layer,
+        uint64_t                *offset_out) {
+    if (!g || !g->glm53 || !offset_out) return false;
+    uint64_t offset = 0;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        if (il == layer) {
+            *offset_out = offset;
+            return true;
+        }
+        offset += ds4_gpu_tensor_bytes(g->layer_kda_conv_state[il]);
+        offset += ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[il]);
+    }
+    return false;
+}
+
+/* Copy one KDA layer's conv+recurrent state to or from `backup`. The
+ * caller owns the command batch: this runs inside the verify encode. */
+static bool glm53_graph_copy_kda_layer_state(
         ds4_glm_gpu_graph *g,
-        bool save) {
-    if (!g || !g->glm53 || !g->mtp_kda_backup) return false;
+        ds4_gpu_tensor    *backup,
+        uint32_t           layer,
+        bool               save) {
+    if (!g || !g->glm53 || !backup || layer >= DS4_MAX_LAYER) return false;
+    uint64_t offset = 0;
+    if (!glm53_graph_kda_state_offset(g, layer, &offset)) return false;
+    ds4_gpu_tensor *state[2] = {
+        g->layer_kda_conv_state[layer],
+        g->layer_kda_recurrent_state[layer],
+    };
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < 2; i++) {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
+        if (offset > ds4_gpu_tensor_bytes(backup) ||
+            bytes > ds4_gpu_tensor_bytes(backup) - offset) {
+            return false;
+        }
+        if (save) {
+            ok = ds4_gpu_tensor_copy(backup, offset, state[i], 0, bytes) != 0;
+        } else {
+            ok = ds4_gpu_tensor_copy(state[i], 0, backup, offset, bytes) != 0;
+        }
+        offset += bytes;
+    }
+    return ok;
+}
+
+static bool glm53_graph_copy_kda_state_to(
+        ds4_glm_gpu_graph *g,
+        ds4_gpu_tensor    *backup,
+        bool               save) {
+    if (!g || !g->glm53 || !backup) return false;
     const uint64_t expected = glm53_graph_kda_state_bytes(g);
-    if (expected == 0 || ds4_gpu_tensor_bytes(g->mtp_kda_backup) < expected) {
+    if (expected == 0 || ds4_gpu_tensor_bytes(backup) < expected) {
         return false;
     }
     bool ok = glm_graph_begin_commands_if_needed();
@@ -45937,7 +46153,7 @@ static bool glm53_graph_copy_kda_state(
         for (uint32_t i = 0; ok && i < 2; i++) {
             const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
             if (save) {
-                ok = ds4_gpu_tensor_copy(g->mtp_kda_backup,
+                ok = ds4_gpu_tensor_copy(backup,
                                          offset,
                                          state[i],
                                          0,
@@ -45945,7 +46161,7 @@ static bool glm53_graph_copy_kda_state(
             } else {
                 ok = ds4_gpu_tensor_copy(state[i],
                                          0,
-                                         g->mtp_kda_backup,
+                                         backup,
                                          offset,
                                          bytes) != 0;
             }
@@ -45955,6 +46171,18 @@ static bool glm53_graph_copy_kda_state(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     return ok && offset == expected;
+}
+
+static bool glm53_graph_copy_kda_state(
+        ds4_glm_gpu_graph *g,
+        bool save) {
+    return g && glm53_graph_copy_kda_state_to(g, g->mtp_kda_backup, save);
+}
+
+/* Restore the KDA state that belongs to the verified prefix (the rows the
+ * MTP cycle keeps), captured mid-verify by glm53_graph_kda_attention_rows. */
+static bool glm53_graph_restore_kda_prefix(ds4_glm_gpu_graph *g) {
+    return g && glm53_graph_copy_kda_state_to(g, g->mtp_kda_prefix, false);
 }
 
 static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
@@ -45974,8 +46202,19 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t kda_backup_bytes = glm53_graph_kda_state_bytes(g);
     if (g->glm53 && kda_backup_bytes != 0) {
         g->mtp_kda_backup = ds4_gpu_tensor_alloc(kda_backup_bytes);
+        if (glm53_graph_mtp_kda_prefix_enabled()) {
+            g->mtp_kda_prefix = ds4_gpu_tensor_alloc(kda_backup_bytes);
+        }
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    /* mtp_kda_prefix only speeds up rejection rollback, so a machine that
+     * cannot spare it keeps MTP and falls back to the replay decode. */
+    if (g->glm53 && glm53_graph_mtp_kda_prefix_enabled() &&
+        g->mtp_kda_backup && !g->mtp_kda_prefix) {
+        fprintf(stderr,
+                "ds4: glm mtp: KDA prefix buffer unavailable; rejected "
+                "drafts fall back to a replay decode\n");
+    }
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
         !g->mtp_selected || (g->glm53 && !g->mtp_kda_backup) ||
         !g->mtp_logits_host) {
@@ -45993,12 +46232,14 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->mtp_concat);
         ds4_gpu_tensor_free(g->mtp_selected);
         ds4_gpu_tensor_free(g->mtp_kda_backup);
+        ds4_gpu_tensor_free(g->mtp_kda_prefix);
         free(g->mtp_logits_host);
         g->mtp_kv_lora_cache = NULL;
         g->mtp_k_rope_cache = NULL;
         g->mtp_concat = NULL;
         g->mtp_selected = NULL;
         g->mtp_kda_backup = NULL;
+        g->mtp_kda_prefix = NULL;
         g->mtp_logits_host = NULL;
         return false;
     }
@@ -46494,13 +46735,25 @@ static bool glm_graph_forward_token(
         bool               defer_completion);
 
 
+typedef enum {
+    GLM_VERIFY_HEAD_NONE = 0,
+    GLM_VERIFY_HEAD_FIRST,
+    GLM_VERIFY_HEAD_LAST,
+} glm_verify_head_request;
+
 /* Decode-style verify pass for tiny row counts (MTP): the indexed batch
  * fn measures ~1.4ms/layer at n=2 (gate-profile: gpu-wait 1.22ms/layer)
  * while decode does the same math in 0.79ms. This pass mirrors the
  * decode encoders at n rows over the batch scratch, attends causally
- * over the compact caches (valid while pos+n fits the indexer window),
+ * over the compact caches (valid while pos+n fits the dense window),
  * and reuses the batch FFN encoder (routed split + big-gate combine).
- * KV/indexer caches are updated exactly like the indexed batch path. */
+ * KV/indexer caches are updated exactly like the indexed batch path.
+ *
+ * GLM 5.3 runs here too: its mHC residual carries the hidden state, its
+ * KDA layers advance the conv/recurrent state through the shared row
+ * encoder, and only every fourth layer takes the DSA branch. When the MTP
+ * cycle sets g->mtp_kda_snapshot_rows, the KDA recurrence splits there and
+ * keeps the state that belongs to the accepted prefix. */
 static bool glm_graph_verify_rows(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -46509,12 +46762,30 @@ static bool glm_graph_verify_rows(
         uint32_t           pos,
         uint32_t           n,
         float             *output_hc,
-        float             *logits_out) {
-    if (!g || !model || !weights || !tokens || n == 0 || g->glm53 ||
+        glm_verify_head_request head_request,
+        float             *head_logits_out) {
+    if (!g || !model || !weights || !tokens || n == 0 ||
+        head_request < GLM_VERIFY_HEAD_NONE ||
+        head_request > GLM_VERIFY_HEAD_LAST ||
+        ((head_request == GLM_VERIFY_HEAD_NONE) !=
+         (head_logits_out == NULL)) ||
+        (head_request == GLM_VERIFY_HEAD_FIRST && !g->glm53) ||
         g->compact_cache_cap == 0 ||
         pos + n > g->compact_cache_cap ||
+        pos + n > glm_graph_dense_compact_attention_limit(g) ||
         !g->batch_cur || !g->batch_next || !g->prefill_tokens) {
         return false;
+    }
+    if (g->glm53) {
+        /* The verify workspace mirrors only the GLM 5.2 batch scratch, so
+         * a placed (multi-GPU) GLM 5.3 graph keeps the batch fallback. SSD
+         * streaming also stays on that path until this row pass maps each
+         * layer. The compact caches must be the ones decode writes. */
+        if (g->placement || g->ssd_streaming ||
+            !glm_graph_decode_uses_indexed_attention(g, pos, NULL) ||
+            !glm53_graph_prefill_workspace_ensure(g, n)) {
+            return false;
+        }
     }
     const uint32_t executable = glm_graph_normal_layer_count();
     ds4_gpu_tensor *cur = g->batch_cur;
@@ -46530,16 +46801,63 @@ static bool glm_graph_verify_rows(
     }
     cur = g->batch_cur;
     nxt = g->batch_next;
+    const uint64_t plain_bytes = (uint64_t)n * DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_bytes = plain_bytes * DS4_N_HC;
+    ds4_gpu_tensor *cur_view = g->glm53 ?
+        ds4_gpu_tensor_view(g->batch_cur, 0, plain_bytes) : NULL;
+    ds4_gpu_tensor *next_view = g->glm53 ?
+        ds4_gpu_tensor_view(g->batch_next, 0, plain_bytes) : NULL;
+    ds4_gpu_tensor *after_attn_view = g->glm53 ?
+        ds4_gpu_tensor_view(g->batch_after_attn, 0, plain_bytes) : NULL;
+    ds4_gpu_tensor *hc_cur_view = g->glm53 ?
+        ds4_gpu_tensor_view(g->batch_hc_cur, 0, hc_bytes) : NULL;
+    ds4_gpu_tensor *hc_next_view = g->glm53 ?
+        ds4_gpu_tensor_view(g->batch_hc_next, 0, hc_bytes) : NULL;
+    ds4_gpu_tensor *hc_after_attn_view = g->glm53 ?
+        ds4_gpu_tensor_view(g->batch_hc_after_attn, 0, hc_bytes) : NULL;
+    if (g->glm53 && (!cur_view || !next_view || !after_attn_view ||
+                     !hc_cur_view || !hc_next_view || !hc_after_attn_view)) {
+        ds4_gpu_tensor_free(hc_after_attn_view);
+        ds4_gpu_tensor_free(hc_next_view);
+        ds4_gpu_tensor_free(hc_cur_view);
+        ds4_gpu_tensor_free(after_attn_view);
+        ds4_gpu_tensor_free(next_view);
+        ds4_gpu_tensor_free(cur_view);
+        glm_graph_verify_ws_restore(g);
+        return false;
+    }
+    if (g->glm53) {
+        cur = cur_view;
+        nxt = next_view;
+    }
+    ds4_gpu_tensor *hc_cur = hc_cur_view;
+    ds4_gpu_tensor *hc_next = hc_next_view;
     bool ok = glm_graph_begin_commands_if_needed();
-    if (ok) ok = ds4_gpu_embed_tokens_quant_tensor(cur,
-                                                   g->prefill_tokens,
-                                                   model->map,
-                                                   model->size,
-                                                   weights->token_embd->abs_offset,
-                                                   weights->token_embd->type,
-                                                   DS4_N_VOCAB,
-                                                   n,
-                                                   DS4_N_EMBD) != 0;
+    if (ok && g->glm53 && weights->token_embd->type == DS4_TENSOR_BF16) {
+        ok = ds4_gpu_glm53_embedding_bf16(cur,
+                                          model->map,
+                                          model->size,
+                                          weights->token_embd->abs_offset,
+                                          g->prefill_tokens,
+                                          n,
+                                          DS4_N_EMBD,
+                                          DS4_N_VOCAB) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_embed_tokens_quant_tensor(cur,
+                                               g->prefill_tokens,
+                                               model->map,
+                                               model->size,
+                                               weights->token_embd->abs_offset,
+                                               weights->token_embd->type,
+                                               DS4_N_VOCAB,
+                                               n,
+                                               DS4_N_EMBD) != 0;
+    }
+    if (ok && g->glm53) ok = ds4_gpu_repeat_hc_rows_tensor(hc_cur,
+                                                           cur,
+                                                           n,
+                                                           DS4_N_EMBD,
+                                                           DS4_N_HC) != 0;
     for (uint32_t il = 0; ok && il < executable; il++) {
         if (g->placement) {
             g->batch_cur = cur;
@@ -46562,14 +46880,40 @@ static bool glm_graph_verify_rows(
             (uint32_t)l->attn_kv_a_mqa->dim[1];
         const float rope_base = layer_rope_freq_base(il);
         const float rope_scale = layer_rope_freq_scale(il);
-        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
-                                                 cur,
-                                                 model->map,
-                                                 model->size,
-                                                 l->attn_norm->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 n,
-                                                 DS4_RMS_EPS) != 0;
+        if (g->glm53) {
+            ok = glm53_graph_hc_pre_rows(g,
+                                         model,
+                                         l->hc_attn_fn,
+                                         l->hc_attn_scale,
+                                         l->hc_attn_base,
+                                         l->attn_norm,
+                                         hc_cur,
+                                         cur,
+                                         g->batch_attn_norm,
+                                         g->batch_hc_flat,
+                                         g->batch_hc_mix,
+                                         g->batch_hc_split,
+                                         n);
+        } else {
+            ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
+                                                     cur,
+                                                     model->map,
+                                                     model->size,
+                                                     l->attn_norm->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     n,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        if (ok && glm53_kda) {
+            ok = glm53_graph_kda_attention_rows(g,
+                                                model,
+                                                l,
+                                                il,
+                                                pos,
+                                                n,
+                                                g->batch_attn_out);
+            goto glm53_verify_attention_done;
+        }
         if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_q_rank,
                                                   model,
                                                   l->attn_q_a->abs_offset,
@@ -46592,7 +46936,8 @@ static bool glm_graph_verify_rows(
                                                   g->q_dim,
                                                   g->batch_q_rank_norm,
                                                   n);
-        if (ok) ok = ds4_gpu_glm_rope_tail_tensor(g->batch_q,
+        if (ok && DS4_N_ROT != 0) ok = ds4_gpu_glm_rope_tail_tensor(
+                                                  g->batch_q,
                                                   n,
                                                   DS4_N_HEAD,
                                                   DS4_N_KEY_MLA,
@@ -46606,34 +46951,72 @@ static bool glm_graph_verify_rows(
                                                   DS4_ROPE_YARN_BETA_FAST,
                                                   DS4_ROPE_YARN_BETA_SLOW) != 0;
         if (ok && glm_graph_layer_uses_full_indexer(il)) {
-            ok = glm_graph_matmul_q8_0_tensor(g->batch_indexer_k,
-                                              model,
-                                              l->indexer_attn_k->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_INDEXER_HEAD_DIM,
-                                              cur,
-                                              n);
-            if (ok) ok = ds4_gpu_glm_store_indexer_k_tensor(
-                    g->layer_indexer_key_cache[il],
-                    g->batch_indexer_k,
-                    model->map,
-                    model->size,
-                    l->indexer_k_norm->abs_offset,
-                    l->indexer_k_norm_b->abs_offset,
-                    pos,
-                    n,
-                    g->compact_cache_cap,
-                    DS4_N_INDEXER_HEAD_DIM,
-                    DS4_N_ROT,
-                    0,
-                    1.0e-6f,
-                    rope_base,
-                    rope_scale,
-                    0.0f,
-                    1.0f,
-                    DS4_ROPE_YARN_BETA_FAST,
-                    DS4_ROPE_YARN_BETA_SLOW,
-                    glm_graph_compact_cache_is_f16()) != 0;
+            ok = g->glm53 ?
+                glm53_graph_matmul_rows(g->batch_indexer_k,
+                                        model,
+                                        l->indexer_attn_k,
+                                        DS4_N_EMBD,
+                                        DS4_N_INDEXER_HEAD_DIM,
+                                        g->batch_attn_norm,
+                                        n) :
+                glm_graph_matmul_q8_0_tensor(g->batch_indexer_k,
+                                             model,
+                                             l->indexer_attn_k->abs_offset,
+                                             DS4_N_EMBD,
+                                             DS4_N_INDEXER_HEAD_DIM,
+                                             cur,
+                                             n);
+            if (ok && g->glm53) {
+                ok = glm53_graph_matmul_rows(g->batch_indexer_gate,
+                                             model,
+                                             l->indexer_compressor_gate,
+                                             DS4_N_EMBD,
+                                             DS4_N_INDEXER_HEAD_DIM,
+                                             g->batch_attn_norm,
+                                             n);
+            }
+            if (ok && g->glm53) {
+                ok = ds4_gpu_glm53_indexer_pool_update_tensor(
+                        g->layer_indexer_key_cache[il],
+                        g->layer_indexer_tail_k[il],
+                        g->layer_indexer_tail_gate[il],
+                        g->batch_indexer_k,
+                        g->batch_indexer_gate,
+                        model->map,
+                        model->size,
+                        l->indexer_k_norm->abs_offset,
+                        l->indexer_k_norm_b->abs_offset,
+                        l->indexer_compressor_ape->abs_offset,
+                        pos,
+                        n,
+                        g->compact_cache_cap,
+                        DS4_N_INDEXER_HEAD_DIM,
+                        DS4_GLM53_INDEX_POOL_SIZE,
+                        1.0e-6f,
+                        glm_graph_compact_cache_is_f16()) != 0;
+            } else if (ok) {
+                ok = ds4_gpu_glm_store_indexer_k_tensor(
+                        g->layer_indexer_key_cache[il],
+                        g->batch_indexer_k,
+                        model->map,
+                        model->size,
+                        l->indexer_k_norm->abs_offset,
+                        l->indexer_k_norm_b->abs_offset,
+                        pos,
+                        n,
+                        g->compact_cache_cap,
+                        DS4_N_INDEXER_HEAD_DIM,
+                        DS4_N_ROT,
+                        0,
+                        1.0e-6f,
+                        rope_base,
+                        rope_scale,
+                        0.0f,
+                        1.0f,
+                        DS4_ROPE_YARN_BETA_FAST,
+                        DS4_ROPE_YARN_BETA_SLOW,
+                        glm_graph_compact_cache_is_f16()) != 0;
+            }
         }
         if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_kv_raw,
                                                   model,
@@ -46713,46 +47096,129 @@ static bool glm_graph_verify_rows(
                                                   DS4_N_EMBD,
                                                   g->batch_heads,
                                                   n);
-        if (ok) ok = ds4_gpu_add_tensor(g->batch_after_attn,
-                                        cur,
-                                        g->batch_attn_out,
-                                        (uint32_t)((uint64_t)n * DS4_N_EMBD)) != 0;
+glm53_verify_attention_done:
+        if (ok && g->glm53) {
+            ok = glm_graph_apply_directional_steering_attn(
+                    g, g->batch_attn_out, il, n);
+        }
+        if (ok && g->glm53) {
+            ok = ds4_gpu_hc_expand_split_tensor(hc_after_attn_view,
+                                                g->batch_attn_out,
+                                                hc_cur,
+                                                g->batch_hc_split,
+                                                DS4_N_EMBD,
+                                                DS4_N_HC) != 0;
+            if (ok) ok = glm53_graph_hc_pre_rows(g,
+                                                 model,
+                                                 l->hc_ffn_fn,
+                                                 l->hc_ffn_scale,
+                                                 l->hc_ffn_base,
+                                                 l->ffn_norm,
+                                                 hc_after_attn_view,
+                                                 after_attn_view,
+                                                 g->batch_ffn_norm,
+                                                 g->batch_hc_flat,
+                                                 g->batch_hc_mix,
+                                                 g->batch_hc_split,
+                                                 n);
+        } else if (ok) {
+            ok = ds4_gpu_add_tensor(g->batch_after_attn,
+                                    cur,
+                                    g->batch_attn_out,
+                                    (uint32_t)((uint64_t)n * DS4_N_EMBD)) != 0;
+        }
         if (ok) ok = glm_graph_encode_ffn_batch(g,
                                                 model,
                                                 weights,
                                                 l,
                                                 il,
                                                 pos,
-                                                g->batch_after_attn,
+                                                g->glm53 ? after_attn_view :
+                                                           g->batch_after_attn,
                                                 nxt,
                                                 n,
                                                 false,
                                                 false,
                                                 false,
                                                 NULL);
-        if (ok) {
+        if (ok && g->glm53) {
+            ok = glm_graph_apply_directional_steering_ffn(g, nxt, il, n);
+        }
+        if (ok && g->glm53) {
+            ok = ds4_gpu_hc_expand_split_tensor(hc_next,
+                                                nxt,
+                                                hc_after_attn_view,
+                                                g->batch_hc_split,
+                                                DS4_N_EMBD,
+                                                DS4_N_HC) != 0;
+            if (ok) {
+                ds4_gpu_tensor *tmp = hc_cur;
+                hc_cur = hc_next;
+                hc_next = tmp;
+            }
+        } else if (ok) {
             ds4_gpu_tensor *tmp = cur;
             cur = nxt;
             nxt = tmp;
         }
     }
+    /* The output head recognises only the decode mHC tensors. Speculative
+     * verification can stage row 0 and encode its head in this command batch;
+     * row 1 is then computed only if the draft is accepted. Other callers
+     * retain the established last-row behaviour. */
+    if (ok && g->glm53 && head_request != GLM_VERIFY_HEAD_NONE) {
+        const uint64_t row_bytes =
+            (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+        const uint32_t head_row =
+            head_request == GLM_VERIFY_HEAD_FIRST ? 0u : n - 1u;
+        ok = ds4_gpu_tensor_copy(g->hc_cur,
+                                 0,
+                                 hc_cur,
+                                 (uint64_t)head_row * row_bytes,
+                                 row_bytes) != 0;
+    }
+    if (ok && g->glm53 && head_request == GLM_VERIFY_HEAD_FIRST) {
+        ok = glm_graph_encode_output_head(g, model, weights);
+    }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (ok && output_hc) {
-        ok = ds4_gpu_tensor_read(cur,
+        ok = ds4_gpu_tensor_read(g->glm53 ? hc_cur : cur,
                                  0,
                                  output_hc,
-                                 (uint64_t)n * DS4_N_EMBD * sizeof(float)) != 0;
+                                 g->glm53 ? hc_bytes : plain_bytes) != 0;
     }
-    if (ok && logits_out) {
-        ds4_gpu_tensor *last = glm_graph_tensor_row_view_strided(cur,
-                                                                 n - 1u,
-                                                                 DS4_N_EMBD,
-                                                                 DS4_N_EMBD);
-        ok = last != NULL &&
-             glm_graph_forward_output_head(g, model, weights, last, logits_out);
-        ds4_gpu_tensor_free(last);
+    if (ok && g->glm53 && head_request == GLM_VERIFY_HEAD_FIRST &&
+        glm_debug_hidden_dump_layer() < 0) {
+        glm_debug_dump_hidden_row(g->hc_output, 0);
     }
+    if (ok && g->glm53 && head_request == GLM_VERIFY_HEAD_FIRST) {
+        ok = ds4_gpu_tensor_read(g->logits,
+                                 0,
+                                 head_logits_out,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok && head_request == GLM_VERIFY_HEAD_LAST) {
+        if (g->glm53) {
+            ok = glm_graph_forward_output_head(g, model, weights,
+                                               g->hc_cur, head_logits_out);
+        } else {
+            ds4_gpu_tensor *last = glm_graph_tensor_row_view_strided(cur,
+                                                                     n - 1u,
+                                                                     DS4_N_EMBD,
+                                                                     DS4_N_EMBD);
+            ok = last != NULL &&
+                 glm_graph_forward_output_head(g, model, weights, last,
+                                               head_logits_out);
+            ds4_gpu_tensor_free(last);
+        }
+    }
+    ds4_gpu_tensor_free(hc_after_attn_view);
+    ds4_gpu_tensor_free(hc_next_view);
+    ds4_gpu_tensor_free(hc_cur_view);
+    ds4_gpu_tensor_free(after_attn_view);
+    ds4_gpu_tensor_free(next_view);
+    ds4_gpu_tensor_free(cur_view);
     glm_graph_verify_ws_restore(g);
     return ok;
 }
@@ -63408,6 +63874,152 @@ static int speculative_point_replacement(ds4_session *s,
                                           int draft_token,
                                           uint64_t *rng);
 
+/* A GLM-5.3 speculative verify is a transaction over two kinds of state:
+ * KDA is recurrent and must be checkpointed, while DSA caches are
+ * position-addressed.  DSA suffix rows remain semantically invisible behind
+ * glm_dense_cache_len and are overwritten when decoding resumes.  Keeping
+ * that distinction here prevents rejection handling from leaking back into
+ * the speculative policy. */
+typedef struct {
+    ds4_session *session;
+    uint32_t pos;
+    uint32_t dense_before;
+    uint32_t prefix_count;
+    bool base_saved;
+} glm53_spec_transaction;
+
+typedef struct {
+    bool first;
+    bool last;
+} glm53_spec_logits_ready;
+
+static bool glm53_spec_transaction_begin(glm53_spec_transaction *tx,
+                                         ds4_session *s,
+                                         uint32_t pos) {
+    if (!tx || !s || !s->glm_graph.glm53) return false;
+    memset(tx, 0, sizeof(*tx));
+    tx->session = s;
+    tx->pos = pos;
+    tx->dense_before = s->glm_dense_cache_len;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!glm_graph_mtp_ensure(g) || !glm53_graph_copy_kda_state(g, true)) {
+        return false;
+    }
+    tx->base_saved = true;
+    if (glm53_graph_mtp_kda_prefix_enabled() && g->mtp_kda_prefix != NULL) {
+        tx->prefix_count = 1u;
+    }
+    g->mtp_kda_snapshot_rows = tx->prefix_count;
+    return true;
+}
+
+static void glm53_spec_transaction_disarm(glm53_spec_transaction *tx) {
+    if (tx && tx->session) {
+        tx->session->glm_graph.mtp_kda_snapshot_rows = 0u;
+    }
+}
+
+static bool glm53_spec_transaction_restore_base(glm53_spec_transaction *tx) {
+    if (!tx || !tx->base_saved) return false;
+    glm53_spec_transaction_disarm(tx);
+    tx->session->glm_dense_cache_len = tx->dense_before;
+    return glm53_graph_copy_kda_state(&tx->session->glm_graph, false);
+}
+
+static bool glm53_spec_transaction_commit_prefix(glm53_spec_transaction *tx,
+                                                 uint32_t committed_rows) {
+    if (!tx || committed_rows == 0u || committed_rows > 2u) return false;
+    glm53_spec_transaction_disarm(tx);
+    if (committed_rows < 2u &&
+        (committed_rows > tx->prefix_count ||
+         !glm53_graph_restore_kda_prefix(&tx->session->glm_graph))) {
+        return false;
+    }
+    ds4_session_glm_note_dense_cache(tx->session, tx->pos, committed_rows);
+    return true;
+}
+
+static bool glm53_spec_verify(glm53_spec_transaction *tx,
+                              const int *tokens,
+                              float *output_hc,
+                              float *first_logits_out,
+                              float *logits_out,
+                              glm53_spec_logits_ready *logits_ready,
+                              const char **path_out) {
+    ds4_session *s = tx->session;
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    bool attempted_rows = false;
+    bool verified = false;
+    const bool defer_row1_head =
+        getenv("DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD") == NULL;
+    if (logits_ready) *logits_ready = (glm53_spec_logits_ready){0};
+    if (glm53_graph_mtp_fast_verify_enabled()) {
+        attempted_rows = true;
+        verified = glm_graph_verify_rows(g, &e->model, &e->weights,
+                                         tokens, tx->pos, 2u,
+                                         output_hc,
+                                         defer_row1_head ?
+                                             GLM_VERIFY_HEAD_FIRST :
+                                             GLM_VERIFY_HEAD_LAST,
+                                         defer_row1_head ?
+                                             first_logits_out : logits_out);
+    }
+    if (verified) {
+        if (logits_ready) {
+            logits_ready->first = defer_row1_head;
+            logits_ready->last = !defer_row1_head;
+        }
+        glm53_spec_transaction_disarm(tx);
+        if (path_out) *path_out = "rows";
+        return true;
+    }
+    if (attempted_rows && !glm53_spec_transaction_restore_base(tx)) {
+        return false;
+    }
+    g->mtp_kda_snapshot_rows = tx->prefix_count;
+    if (!glm53_graph_use_indexed_prefill(g) &&
+        glm_graph_span_fits_full_attention(g, tx->pos, 2u)) {
+        verified = glm_graph_forward_tokens(g,
+                                             &e->model,
+                                             &e->weights,
+                                             tokens,
+                                             NULL,
+                                             NULL,
+                                             0,
+                                             tx->pos,
+                                             2u,
+                                             output_hc,
+                                             logits_out,
+                                             NULL,
+                                             NULL,
+                                             tx->pos,
+                                             0,
+                                             2u);
+    } else {
+        verified = glm_graph_forward_indexed_tokens(g,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     tokens,
+                                                     NULL,
+                                                     NULL,
+                                                     0,
+                                                     tx->pos,
+                                                     2u,
+                                                     output_hc,
+                                                     logits_out,
+                                                     NULL,
+                                                     NULL,
+                                                     tx->pos,
+                                                     0,
+                                                     2u);
+    }
+    glm53_spec_transaction_disarm(tx);
+    if (verified && logits_ready) logits_ready->last = true;
+    if (path_out) *path_out = "batch";
+    return verified;
+}
+
 /* One GLM MTP speculative cycle: evaluate first_token, and when a compatible
  * pending draft exists verify [first_token, draft] in one 2-row batch pass
  * (big gates only under TP).  Greedy and opportunistic sampling accept a draft
@@ -63479,55 +64091,35 @@ static int ds4_session_glm_spec_cycle_impl(
     int toks[2] = { first_token, d };
     bool verified = false;
     bool kda_saved = false;
+    bool kda_prefix_saved = false;
+    glm53_spec_logits_ready verify_logits = {0};
+    glm53_spec_transaction glm_tx = {0};
+    const char *verify_path = "rows";
+    double verify_t0 = t0;
     if (g->glm53) {
-        kda_saved = glm_graph_mtp_ensure(g) &&
-                    glm53_graph_copy_kda_state(g, true);
+        kda_saved = glm53_spec_transaction_begin(&glm_tx, s, pos);
+        if (timing) verify_t0 = now_sec();
         if (kda_saved) {
-            if (!glm53_graph_use_indexed_prefill(g) &&
-                glm_graph_span_fits_full_attention(g, pos, 2u)) {
-                verified = glm_graph_forward_tokens(g,
-                                                     &e->model,
-                                                     &e->weights,
-                                                     toks,
-                                                     NULL,
-                                                     NULL,
-                                                     0,
-                                                     pos,
-                                                     2,
-                                                     s->glm_mtp_hc,
-                                                     s->logits,
-                                                     NULL,
-                                                     NULL,
-                                                     pos,
-                                                     0,
-                                                     2);
-            } else {
-                verified = glm_graph_forward_indexed_tokens(g,
-                                                             &e->model,
-                                                             &e->weights,
-                                                             toks,
-                                                             NULL,
-                                                             NULL,
-                                                             0,
-                                                             pos,
-                                                             2,
-                                                             s->glm_mtp_hc,
-                                                             s->logits,
-                                                             NULL,
-                                                             NULL,
-                                                             pos,
-                                                             0,
-                                                             2);
-            }
+            verified = glm53_spec_verify(&glm_tx,
+                                         toks,
+                                         s->glm_mtp_hc,
+                                         s->glm_mtp_logits0,
+                                         s->logits,
+                                         &verify_logits,
+                                         &verify_path);
+            kda_prefix_saved = verified && glm_tx.prefix_count == 1u;
         }
-    } else if (pos + 2u <= glm_graph_indexer_top_k_limit()) {
+    } else {
         /* GLM-5.2 verification must use the compact caches populated by
          * decode; its full-KV batch path would read unwritten rows. */
         verified = glm_graph_verify_rows(g, &e->model, &e->weights,
                                          toks, pos, 2,
-                                         s->glm_mtp_hc, s->logits);
+                                         s->glm_mtp_hc,
+                                         GLM_VERIFY_HEAD_LAST,
+                                         s->logits);
     }
     if (!verified && !g->glm53) {
+        verify_path = "batch";
         if (!glm_graph_indexed_prefill_batch_ready(g, pos) ||
             glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) < 2u ||
             !glm_graph_forward_indexed_tokens(g, &e->model, &e->weights,
@@ -63539,7 +64131,7 @@ static int ds4_session_glm_spec_cycle_impl(
             return -1;
         }
     } else if (!verified) {
-        if (kda_saved) (void)glm53_graph_copy_kda_state(g, false);
+        if (kda_saved) (void)glm53_spec_transaction_restore_base(&glm_tx);
         if (errlen) snprintf(err, errlen, "glm mtp: GLM 5.3 verify failed");
         s->checkpoint_valid = false;
         return -1;
@@ -63548,7 +64140,7 @@ static int ds4_session_glm_spec_cycle_impl(
     /* Row0 logits through the shared head. */
     if (!glm_graph_mtp_ensure(g)) {
         if (g->glm53 && kda_saved) {
-            (void)glm53_graph_copy_kda_state(g, false);
+            (void)glm53_spec_transaction_restore_base(&glm_tx);
         }
         if (errlen) snprintf(err, errlen, "glm mtp: scratch alloc failed");
         s->checkpoint_valid = false;
@@ -63557,15 +64149,16 @@ static int ds4_session_glm_spec_cycle_impl(
     ds4_gpu_tensor *h0 = NULL;
     bool head_ok = false;
     if (g->glm53) {
-        head_ok = ds4_gpu_tensor_write(g->hc_cur,
-                                       0,
-                                       s->glm_mtp_hc,
-                                       hc_row_bytes) != 0 &&
-                  glm_graph_forward_output_head(g,
-                                                &e->model,
-                                                &e->weights,
-                                                g->hc_cur,
-                                                s->glm_mtp_logits0);
+        head_ok = verify_logits.first ||
+                  (ds4_gpu_tensor_write(g->hc_cur,
+                                        0,
+                                        s->glm_mtp_hc,
+                                        hc_row_bytes) != 0 &&
+                   glm_graph_forward_output_head(g,
+                                                 &e->model,
+                                                 &e->weights,
+                                                 g->hc_cur,
+                                                 s->glm_mtp_logits0));
     } else {
         h0 = ds4_gpu_tensor_view(g->mtp_concat,
                                  0,
@@ -63584,7 +64177,7 @@ static int ds4_session_glm_spec_cycle_impl(
     }
     if (!head_ok) {
         if (g->glm53 && kda_saved) {
-            (void)glm53_graph_copy_kda_state(g, false);
+            (void)glm53_spec_transaction_restore_base(&glm_tx);
         }
         if (errlen) snprintf(err, errlen, "glm mtp: row0 head failed");
         s->checkpoint_valid = false;
@@ -63593,6 +64186,8 @@ static int ds4_session_glm_spec_cycle_impl(
     const int n1 = glm_session_logits_argmax(s->glm_mtp_logits0);
     int replacement = -1;
     int accept = n1 == d;
+    double rollback_ms = 0.0;
+    double draft_ms = 0.0;
     if (exact_sampling) {
         if (!rng ||
             !sample_build_probabilities(s->glm_mtp_logits0,
@@ -63603,7 +64198,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                         min_p,
                                         s->sample_probs)) {
             if (g->glm53 && kda_saved) {
-                (void)glm53_graph_copy_kda_state(g, false);
+                (void)glm53_spec_transaction_restore_base(&glm_tx);
             }
             if (errlen) snprintf(err, errlen, "glm mtp: target distribution failed");
             s->checkpoint_valid = false;
@@ -63614,7 +64209,7 @@ static int ds4_session_glm_spec_cycle_impl(
             replacement = speculative_point_replacement(s, d, rng);
             if (replacement < 0) {
                 if (g->glm53 && kda_saved) {
-                    (void)glm53_graph_copy_kda_state(g, false);
+                    (void)glm53_spec_transaction_restore_base(&glm_tx);
                 }
                 if (errlen) snprintf(err, errlen, "glm mtp: replacement sampling failed");
                 s->checkpoint_valid = false;
@@ -63622,17 +64217,44 @@ static int ds4_session_glm_spec_cycle_impl(
             }
         }
     }
+    const bool row1_logits_ready = !g->glm53 || verify_logits.last;
+    if (accept && !row1_logits_ready) {
+        const bool row1_head_ok =
+            ds4_gpu_tensor_write(g->hc_cur,
+                                 0,
+                                 s->glm_mtp_hc + hc_row_values,
+                                 hc_row_bytes) != 0 &&
+            glm_graph_forward_output_head(g,
+                                          &e->model,
+                                          &e->weights,
+                                          g->hc_cur,
+                                          s->logits);
+        if (!row1_head_ok) {
+            if (kda_saved) (void)glm53_spec_transaction_restore_base(&glm_tx);
+            if (errlen) snprintf(err, errlen, "glm mtp: row1 head failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+    }
     token_vec_push(&s->checkpoint, first_token);
     s->checkpoint_valid = true;
     int n_committed = 1;
     if (accept) {
         token_vec_push(&s->checkpoint, d);
-        ds4_session_glm_note_dense_cache(s, pos, 2);
+        if (g->glm53 &&
+            !glm53_spec_transaction_commit_prefix(&glm_tx, 2u)) {
+            if (errlen) snprintf(err, errlen,
+                                 "glm mtp: transaction commit failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        if (!g->glm53) ds4_session_glm_note_dense_cache(s, pos, 2);
         n_committed = 2;
         /* s->logits already holds row1 (position pos+1) logits. */
         const int n2 = glm_session_logits_argmax(s->logits);
         int dummy = -1, nd = -1;
         ds4_gpu_tensor *target_hidden = g->glm53 ? g->hc_cur : g->cur;
+        const double draft_t0 = timing ? now_sec() : 0.0;
         const bool cu =
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
@@ -63644,6 +64266,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
                                s->glm_mtp_min_pos, &nd);
+        if (timing) draft_ms += (now_sec() - draft_t0) * 1000.0;
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n2;
@@ -63652,9 +64275,21 @@ static int ds4_session_glm_spec_cycle_impl(
         accepted[0] = first_token;
         accepted[1] = d;
     } else {
+        const double rollback_t0 = timing ? now_sec() : 0.0;
         bool replay_ok = true;
-        if (g->glm53) {
-            replay_ok = glm53_graph_copy_kda_state(g, false) &&
+        if (g->glm53 && kda_prefix_saved) {
+            /* The verify already computed row 0 and snapshotted the KDA
+             * state that follows it, so the accepted token needs no
+             * replay: restore that state and keep the row-0 logits. The
+             * old path re-ran a whole decode here, which also let the
+             * emitted token disagree with the n1 that drove the reject. */
+            replay_ok = glm53_spec_transaction_commit_prefix(&glm_tx, 1u);
+            if (replay_ok) {
+                memcpy(s->logits, s->glm_mtp_logits0,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
+            }
+        } else if (g->glm53) {
+            replay_ok = glm53_spec_transaction_restore_base(&glm_tx) &&
                         glm_graph_forward_token(g,
                                                 &e->model,
                                                 &e->weights,
@@ -63673,6 +64308,7 @@ static int ds4_session_glm_spec_cycle_impl(
             s->checkpoint_valid = false;
             return -1;
         }
+        if (timing) rollback_ms = (now_sec() - rollback_t0) * 1000.0;
         if (exact_sampling) {
             if (!glm_graph_forward_token(g,
                                          &e->model,
@@ -63696,6 +64332,7 @@ static int ds4_session_glm_spec_cycle_impl(
             const int next = glm_session_logits_argmax(s->logits);
             int nd = -1;
             s->glm_mtp_have = 0;
+            const double draft_t0 = timing ? now_sec() : 0.0;
             if (replacement != eos_token &&
                 glm_graph_mtp_step(g,
                                    &e->model,
@@ -63708,7 +64345,8 @@ static int ds4_session_glm_spec_cycle_impl(
                 s->glm_mtp_parent = next;
                 s->glm_mtp_have = 1;
             }
-        } else {
+            if (timing) draft_ms += (now_sec() - draft_t0) * 1000.0;
+        } else if (!g->glm53 || !kda_prefix_saved) {
             ds4_session_glm_note_dense_cache(s, pos, 1);
         }
         int nd = -1;
@@ -63718,9 +64356,13 @@ static int ds4_session_glm_spec_cycle_impl(
                                  0,
                                  s->glm_mtp_hc,
                                  hc_row_bytes) != 0;
+        const double draft_t0 = timing ? now_sec() : 0.0;
         const bool cu = !exact_sampling && hidden_ready &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
                                s->glm_mtp_min_pos, &nd);
+        if (timing && !exact_sampling) {
+            draft_ms += (now_sec() - draft_t0) * 1000.0;
+        }
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n1;
@@ -63733,11 +64375,21 @@ static int ds4_session_glm_spec_cycle_impl(
         char *dt = ds4_token_text(e, d, NULL);
         char *nt = ds4_token_text(e, n1, NULL);
         fprintf(stderr,
-                "ds4: glm mtp cycle: verify2 %.1f ms, head+draft %.1f ms, %s "
+                "ds4: glm mtp utility: width=2 setup=%.1f ms verify[%s]=%.1f ms "
+                "rollback=%.1f ms draft=%.1f ms other=%.1f ms result=%s "
+                "committed=%d total=%.1f ms utility=%.2f tok/s-cycle "
                 "(draft %d '%s' vs true %d '%s')\n",
-                (t1 - t0) * 1000.0, (t2 - t1) * 1000.0,
+                (verify_t0 - t0) * 1000.0,
+                verify_path,
+                (t1 - verify_t0) * 1000.0,
+                rollback_ms,
+                draft_ms,
+                (t2 - t1) * 1000.0 - rollback_ms - draft_ms,
                 accept ? (exact_sampling ? "EXACT_ACCEPT" : "ACCEPT") :
                          (exact_sampling ? "exact_reject" : "reject"),
+                n_committed,
+                (t2 - t0) * 1000.0,
+                (t2 > t0) ? n_committed / (t2 - t0) : 0.0,
                 d, dt ? dt : "?", n1, nt ? nt : "?");
         free(dt);
         free(nt);

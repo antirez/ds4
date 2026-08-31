@@ -61,6 +61,21 @@ static void require_close(const char *what, float actual, float expected, float 
     }
 }
 
+static void require_bytes_equal(const char *what,
+                                const void *actual,
+                                const void *expected,
+                                size_t bytes) {
+    if (memcmp(actual, expected, bytes) == 0) return;
+    const uint8_t *a = actual;
+    const uint8_t *e = expected;
+    size_t first = 0;
+    while (first < bytes && a[first] == e[first]) first++;
+    fprintf(stderr,
+            "%s differs at byte %zu: got 0x%02x, expected 0x%02x\n",
+            what, first, (unsigned)a[first], (unsigned)e[first]);
+    exit(1);
+}
+
 static uint16_t f32_to_bf16(float value) {
     union { float f; uint32_t u; } bits = { .f = value };
     const uint32_t rounding = 0x7fffu + ((bits.u >> 16) & 1u);
@@ -531,7 +546,7 @@ int main(void) {
     free(batch_q);
 #endif
 
-    enum { POOL = 4, POOL_TOKENS = 11, POOL_CAP = 16, POOL_COUNT = 4 };
+    enum { POOL = 4, POOL_TOKENS = 12, POOL_CAP = 16, POOL_COUNT = 4 };
     float pool_raw[POOL_TOKENS * D];
     float pool_gate_values[POOL_TOKENS * D];
     for (uint32_t t = 0; t < POOL_TOKENS; t++) {
@@ -625,6 +640,142 @@ int main(void) {
                           expected_pool, 2e-5f);
         }
     }
+
+#if defined(__APPLE__)
+    /* The {3,8} update above dispatches one complete and one partial aligned
+     * pool together after the leading row. Only the final threadgroup may
+     * retain the shared tail used to complete pool 2 here. */
+    require_ok(ds4_gpu_tensor_write(pool_raw_gpu, 0,
+                                    pool_raw + 11u * D,
+                                    (uint64_t)D * sizeof(float)),
+               "multi-pool tail completion raw write");
+    require_ok(ds4_gpu_tensor_write(pool_gate_gpu, 0,
+                                    pool_gate_values + 11u * D,
+                                    (uint64_t)D * sizeof(float)),
+               "multi-pool tail completion gate write");
+    require_ok(ds4_gpu_glm53_indexer_pool_update_tensor(
+        pool_cache, pool_tail_k, pool_tail_gate,
+        pool_raw_gpu, pool_gate_gpu,
+        model, MODEL_BYTES, POOL_NORM_OFFSET, POOL_BIAS_OFFSET, POOL_APE_OFFSET,
+        11u, 1u, POOL_CAP, D, POOL, 1e-6f, false),
+        "GLM-5.3 multi-pool tail completion");
+    require_ok(ds4_gpu_tensor_read(pool_cache, 2u * D * sizeof(float),
+                                   pool_actual, D * sizeof(float)),
+               "multi-pool tail completion cache read");
+    float tail_means[POOL], tail_invs[POOL];
+    for (uint32_t r = 0; r < POOL; r++) {
+        const float *row = pool_raw + (uint64_t)(2u * POOL + r) * D;
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < D; d++) sum += row[d];
+        tail_means[r] = sum / (float)D;
+        float ss = 0.0f;
+        for (uint32_t d = 0; d < D; d++) {
+            const float delta = row[d] - tail_means[r];
+            ss += delta * delta;
+        }
+        tail_invs[r] = 1.0f / sqrtf(ss / (float)D + 1e-6f);
+    }
+    for (uint32_t d = 0; d < D; d++) {
+        float logits[POOL], max_logit = -FLT_MAX, denom = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = pool_gate_values[
+                (uint64_t)(2u * POOL + r) * D + d] +
+                bf16_to_f32(pool_ape[r * D + d]);
+            if (logits[r] > max_logit) max_logit = logits[r];
+        }
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = expf(logits[r] - max_logit);
+            denom += logits[r];
+        }
+        float expected_pool = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            const float value =
+                (pool_raw[(uint64_t)(2u * POOL + r) * D + d] -
+                 tail_means[r]) * tail_invs[r] * pool_norm[d] + pool_bias[d];
+            expected_pool += logits[r] / denom * value;
+        }
+        require_close("GLM-5.3 multi-pool tail completion",
+                      pool_actual[d], expected_pool, 2e-5f);
+    }
+
+    /* A two-row speculative update can complete a pool with row 3 before
+     * row 3 is accepted. Replacing that row must rebuild the pool from the
+     * retained rows 0..2 plus the replacement, exactly like serial updates. */
+    require_ok(ds4_gpu_tensor_fill_f32(pool_cache, 0.0f,
+                                       (uint64_t)POOL_COUNT * D),
+               "speculative pool cache clear");
+    require_ok(ds4_gpu_tensor_fill_f32(pool_tail_k, 0.0f,
+                                       (uint64_t)POOL * D),
+               "speculative pool K tail clear");
+    require_ok(ds4_gpu_tensor_fill_f32(pool_tail_gate, 0.0f,
+                                       (uint64_t)POOL * D),
+               "speculative pool gate tail clear");
+    const uint32_t speculative_chunks[][3] = {
+        {0u, 2u, 0u},
+        {2u, 2u, 2u},
+        {3u, 1u, 4u},
+    };
+    for (uint32_t c = 0;
+         c < sizeof(speculative_chunks) / sizeof(speculative_chunks[0]); c++) {
+        const uint32_t pos = speculative_chunks[c][0];
+        const uint32_t rows = speculative_chunks[c][1];
+        const uint32_t src = speculative_chunks[c][2];
+        require_ok(ds4_gpu_tensor_write(pool_raw_gpu, 0,
+                                        pool_raw + (uint64_t)src * D,
+                                        (uint64_t)rows * D * sizeof(float)),
+                   "speculative pool raw write");
+        require_ok(ds4_gpu_tensor_write(pool_gate_gpu, 0,
+                                        pool_gate_values + (uint64_t)src * D,
+                                        (uint64_t)rows * D * sizeof(float)),
+                   "speculative pool gate write");
+        require_ok(ds4_gpu_glm53_indexer_pool_update_tensor(
+            pool_cache, pool_tail_k, pool_tail_gate,
+            pool_raw_gpu, pool_gate_gpu,
+            model, MODEL_BYTES, POOL_NORM_OFFSET, POOL_BIAS_OFFSET, POOL_APE_OFFSET,
+            pos, rows, POOL_CAP, D, POOL, 1e-6f, false),
+            "speculative GLM-5.3 indexer pool update");
+    }
+    require_ok(ds4_gpu_tensor_read(pool_cache, 0, pool_actual,
+                                   D * sizeof(float)),
+               "speculative pool cache read");
+    const uint32_t retained_rows[POOL] = {0u, 1u, 2u, 4u};
+    float retained_means[POOL], retained_invs[POOL];
+    for (uint32_t r = 0; r < POOL; r++) {
+        const float *row = pool_raw + (uint64_t)retained_rows[r] * D;
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < D; d++) sum += row[d];
+        retained_means[r] = sum / (float)D;
+        float ss = 0.0f;
+        for (uint32_t d = 0; d < D; d++) {
+            const float delta = row[d] - retained_means[r];
+            ss += delta * delta;
+        }
+        retained_invs[r] = 1.0f / sqrtf(ss / (float)D + 1e-6f);
+    }
+    for (uint32_t d = 0; d < D; d++) {
+        float logits[POOL], max_logit = -FLT_MAX, denom = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = pool_gate_values[
+                (uint64_t)retained_rows[r] * D + d] +
+                bf16_to_f32(pool_ape[r * D + d]);
+            if (logits[r] > max_logit) max_logit = logits[r];
+        }
+        for (uint32_t r = 0; r < POOL; r++) {
+            logits[r] = expf(logits[r] - max_logit);
+            denom += logits[r];
+        }
+        float expected_pool = 0.0f;
+        for (uint32_t r = 0; r < POOL; r++) {
+            const float value =
+                (pool_raw[(uint64_t)retained_rows[r] * D + d] -
+                 retained_means[r]) * retained_invs[r] * pool_norm[d] +
+                pool_bias[d];
+            expected_pool += logits[r] / denom * value;
+        }
+        require_close("GLM-5.3 speculative pool replacement",
+                      pool_actual[d], expected_pool, 2e-5f);
+    }
+#endif
 
     enum { SCORE_ROWS = 3, SCORE_TOKENS = 5, SCORE_POS0 = 4 };
     float score_q[SCORE_TOKENS * HEADS * D];
@@ -856,6 +1007,204 @@ int main(void) {
                "prefill output read");
     for (uint32_t i = 0; i < TOKENS * PROJECTION; i++)
         require_close("KDA prefill/decode", prefill_outputs[i], decode_outputs[i], 5e-5f);
+
+#if defined(__APPLE__)
+    /* The width-2 verifier must retain the state after row 0 without
+     * splitting KDA into two prefill calls. Use the split path as the exact
+     * oracle: the prefix, final state, and outputs must all match bytewise. */
+    for (uint32_t channel = 0; channel < PROJECTION; channel++) {
+        for (uint32_t tap = 0; tap < 4u; tap++) {
+            q_conv[channel * 4u + tap] =
+                0.11f + 0.03f * (float)tap + 0.0001f * (float)(channel % 7u);
+            k_conv[channel * 4u + tap] =
+                -0.07f + 0.02f * (float)tap - 0.0001f * (float)(channel % 5u);
+            v_conv[channel * 4u + tap] =
+                0.09f - 0.015f * (float)tap + 0.0001f * (float)(channel % 3u);
+        }
+    }
+    const uint64_t conv_values = 9u * PROJECTION;
+    const uint64_t recurrent_values = (uint64_t)HEADS * D * D;
+    const uint64_t conv_bytes = conv_values * sizeof(float);
+    const uint64_t recurrent_bytes = recurrent_values * sizeof(float);
+    const uint64_t prefix_bytes = conv_bytes + recurrent_bytes;
+    const uint64_t row_bytes = (uint64_t)PROJECTION * sizeof(float);
+    const uint64_t beta_row_bytes = (uint64_t)HEADS * sizeof(float);
+    float *initial_conv = malloc((size_t)conv_bytes);
+    float *initial_recurrent = malloc((size_t)recurrent_bytes);
+    float *expected_prefix = malloc((size_t)prefix_bytes);
+    float *expected_final_conv = malloc((size_t)conv_bytes);
+    float *expected_final_recurrent = malloc((size_t)recurrent_bytes);
+    float *expected_verify_out = malloc(2u * (size_t)row_bytes);
+    float *actual_prefix = malloc((size_t)prefix_bytes);
+    float *actual_final_conv = malloc((size_t)conv_bytes);
+    float *actual_final_recurrent = malloc((size_t)recurrent_bytes);
+    float *actual_verify_out = malloc(2u * (size_t)row_bytes);
+    require_ok(initial_conv && initial_recurrent && expected_prefix &&
+                   expected_final_conv && expected_final_recurrent &&
+                   expected_verify_out && actual_prefix && actual_final_conv &&
+                   actual_final_recurrent && actual_verify_out,
+               "verify2 host allocation");
+    for (uint64_t i = 0; i < conv_values; i++) {
+        initial_conv[i] = 0.0003f * (float)((int)(i % 43u) - 21);
+    }
+    for (uint64_t i = 0; i < recurrent_values; i++) {
+        initial_recurrent[i] = 0.00002f * (float)((int)(i % 97u) - 48);
+    }
+
+    require_ok(ds4_gpu_tensor_write(pconv, 0, initial_conv, conv_bytes),
+               "split verify2 conv seed");
+    require_ok(ds4_gpu_tensor_write(pstate, 0, initial_recurrent,
+                                    recurrent_bytes),
+               "split verify2 recurrent seed");
+    require_ok(ds4_gpu_tensor_write(pq, 0, qs, 2u * row_bytes),
+               "split verify2 Q write");
+    require_ok(ds4_gpu_tensor_write(pk, 0, ks, 2u * row_bytes),
+               "split verify2 K write");
+    require_ok(ds4_gpu_tensor_write(pv, 0, vs, 2u * row_bytes),
+               "split verify2 V write");
+    require_ok(ds4_gpu_tensor_write(pg, 0, gates, 2u * row_bytes),
+               "split verify2 gate write");
+    require_ok(ds4_gpu_tensor_write(poutput_gate, 0, output_gates,
+                                    2u * row_bytes),
+               "split verify2 output-gate write");
+    require_ok(ds4_gpu_tensor_write(pbeta, 0, betas,
+                                    2u * beta_row_bytes),
+               "split verify2 beta write");
+    for (uint32_t row = 0; row < 2u; row++) {
+        ds4_gpu_tensor *q_row = ds4_gpu_tensor_view(pq, row * row_bytes,
+                                                    row_bytes);
+        ds4_gpu_tensor *k_row = ds4_gpu_tensor_view(pk, row * row_bytes,
+                                                    row_bytes);
+        ds4_gpu_tensor *v_row = ds4_gpu_tensor_view(pv, row * row_bytes,
+                                                    row_bytes);
+        ds4_gpu_tensor *gate_row = ds4_gpu_tensor_view(pg, row * row_bytes,
+                                                       row_bytes);
+        ds4_gpu_tensor *beta_row = ds4_gpu_tensor_view(
+            pbeta, row * beta_row_bytes, beta_row_bytes);
+        ds4_gpu_tensor *output_gate_row = ds4_gpu_tensor_view(
+            poutput_gate, row * row_bytes, row_bytes);
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(pout, row * row_bytes,
+                                                      row_bytes);
+        require_ok(q_row && k_row && v_row && gate_row && beta_row &&
+                       output_gate_row && out_row,
+                   "split verify2 row views");
+        require_ok(ds4_gpu_glm53_kda_prefill(
+            out_row, pconv, pstate, q_row, k_row, v_row, gate_row, beta_row,
+            output_gate_row, model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET,
+            V_CONV_OFFSET, A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
+            HEADS, 1, -5.0f, 1e-5f), "split verify2 KDA");
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(output_gate_row);
+        ds4_gpu_tensor_free(beta_row);
+        ds4_gpu_tensor_free(gate_row);
+        ds4_gpu_tensor_free(v_row);
+        ds4_gpu_tensor_free(k_row);
+        ds4_gpu_tensor_free(q_row);
+        if (row == 0u) {
+            require_ok(ds4_gpu_tensor_read(pconv, 0, expected_prefix,
+                                            conv_bytes),
+                       "split verify2 prefix conv read");
+            require_ok(ds4_gpu_tensor_read(pstate, 0,
+                                            (uint8_t *)expected_prefix +
+                                                conv_bytes,
+                                            recurrent_bytes),
+                       "split verify2 prefix recurrent read");
+        }
+    }
+    require_ok(ds4_gpu_tensor_read(pconv, 0, expected_final_conv, conv_bytes),
+               "split verify2 final conv read");
+    require_ok(ds4_gpu_tensor_read(pstate, 0, expected_final_recurrent,
+                                    recurrent_bytes),
+               "split verify2 final recurrent read");
+    require_ok(ds4_gpu_tensor_read(pout, 0, expected_verify_out,
+                                    2u * row_bytes),
+               "split verify2 output read");
+
+    const uint64_t prefix_offset = 16u * sizeof(float);
+    const uint64_t prefix_storage_bytes = prefix_bytes + 2u * prefix_offset;
+    ds4_gpu_tensor *prefix = ds4_gpu_tensor_alloc(prefix_storage_bytes);
+    require_ok(prefix != NULL, "verify2 prefix allocation");
+    require_ok(ds4_gpu_tensor_fill_f32(prefix, -1234.5f,
+                                       prefix_storage_bytes / sizeof(float)),
+               "verify2 prefix poison");
+    require_ok(ds4_gpu_tensor_write(pconv, 0, initial_conv, conv_bytes),
+               "verify2 conv seed");
+    require_ok(ds4_gpu_tensor_write(pstate, 0, initial_recurrent,
+                                    recurrent_bytes),
+               "verify2 recurrent seed");
+    require_ok(ds4_gpu_tensor_write(pq, 0, qs, 2u * row_bytes),
+               "verify2 Q write");
+    require_ok(ds4_gpu_tensor_write(pk, 0, ks, 2u * row_bytes),
+               "verify2 K write");
+    require_ok(ds4_gpu_tensor_write(pv, 0, vs, 2u * row_bytes),
+               "verify2 V write");
+    require_ok(ds4_gpu_tensor_write(pg, 0, gates, 2u * row_bytes),
+               "verify2 gate write");
+    require_ok(ds4_gpu_tensor_write(poutput_gate, 0, output_gates,
+                                    2u * row_bytes),
+               "verify2 output-gate write");
+    require_ok(ds4_gpu_tensor_write(pbeta, 0, betas,
+                                    2u * beta_row_bytes),
+               "verify2 beta write");
+    require_ok(ds4_gpu_glm53_kda_verify2_snapshot(
+        pout, pconv, pstate, prefix, prefix_offset, pq, pk, pv, pg, pbeta,
+        poutput_gate,
+        model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
+        A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET, HEADS, -5.0f, 1e-5f),
+        "snapshot-aware verify2 KDA");
+    require_ok(ds4_gpu_tensor_read(prefix, prefix_offset, actual_prefix,
+                                    prefix_bytes),
+               "verify2 prefix read");
+    require_ok(ds4_gpu_tensor_read(pconv, 0, actual_final_conv, conv_bytes),
+               "verify2 final conv read");
+    require_ok(ds4_gpu_tensor_read(pstate, 0, actual_final_recurrent,
+                                    recurrent_bytes),
+               "verify2 final recurrent read");
+    require_ok(ds4_gpu_tensor_read(pout, 0, actual_verify_out,
+                                    2u * row_bytes),
+               "verify2 output read");
+    require_bytes_equal("verify2 prefix", actual_prefix, expected_prefix,
+                        prefix_bytes);
+    require_bytes_equal("verify2 final convolution state", actual_final_conv,
+                        expected_final_conv, conv_bytes);
+    require_bytes_equal("verify2 final recurrent state",
+                        actual_final_recurrent, expected_final_recurrent,
+                        recurrent_bytes);
+    require_bytes_equal("verify2 output", actual_verify_out,
+                        expected_verify_out, 2u * row_bytes);
+    float prefix_guards[32];
+    require_ok(ds4_gpu_tensor_read(prefix, 0, prefix_guards, prefix_offset),
+               "verify2 leading guard read");
+    require_ok(ds4_gpu_tensor_read(prefix, prefix_offset + prefix_bytes,
+                                    prefix_guards + 16, prefix_offset),
+               "verify2 trailing guard read");
+    for (uint32_t i = 0; i < 32u; i++) {
+        require_close("verify2 prefix guard", prefix_guards[i], -1234.5f,
+                      0.0f);
+    }
+    ds4_gpu_tensor *misaligned_prefix = ds4_gpu_tensor_view(
+        prefix, sizeof(float), prefix_storage_bytes - sizeof(float));
+    require_ok(misaligned_prefix != NULL,
+               "verify2 misaligned prefix view allocation");
+    require_ok(!ds4_gpu_glm53_kda_verify2_snapshot(
+        pout, pconv, pstate, misaligned_prefix, 0u, pq, pk, pv, pg, pbeta,
+        poutput_gate,
+        model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
+        A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET, HEADS, -5.0f, 1e-5f),
+        "verify2 rejects an unaligned absolute prefix address");
+    ds4_gpu_tensor_free(misaligned_prefix);
+    ds4_gpu_tensor_free(prefix);
+    free(actual_verify_out);
+    free(actual_final_recurrent);
+    free(actual_final_conv);
+    free(actual_prefix);
+    free(expected_verify_out);
+    free(expected_final_recurrent);
+    free(expected_final_conv);
+    free(expected_prefix);
+    free(initial_recurrent);
+    free(initial_conv);
+#endif
 
     ds4_gpu_tensor_free(pstate);
     ds4_gpu_tensor_free(pconv);

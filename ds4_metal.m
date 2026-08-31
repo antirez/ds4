@@ -44581,7 +44581,7 @@ int ds4_gpu_glm53_kda_decode(
     }
 }
 
-int ds4_gpu_glm53_kda_prefill(
+static int glm53_gpu_kda_prefill_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *recurrent_state,
@@ -44602,7 +44602,9 @@ int ds4_gpu_glm53_kda_prefill(
         uint32_t              n_heads,
         uint32_t              n_tokens,
         float                 gate_lower_bound,
-        float                 norm_eps) {
+        float                 norm_eps,
+        ds4_gpu_tensor       *prefix_state,
+        uint64_t              prefix_offset) {
     enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3 };
     if (!g_initialized && !ds4_gpu_init()) return 0;
     uint64_t projection = 0, activation_elements = 0;
@@ -44624,6 +44626,27 @@ int ds4_gpu_glm53_kda_prefill(
         !glm53_gpu_tensor_has(conv_state, conv_elements, sizeof(float)) ||
         !glm53_gpu_tensor_has(recurrent_state, state_elements, sizeof(float))) {
         fprintf(stderr, "ds4: GLM-5.3 KDA prefill received invalid buffers\n");
+        return 0;
+    }
+
+    uint64_t conv_state_bytes = 0, recurrent_state_bytes = 0;
+    if (!glm53_gpu_mul_u64(conv_elements, sizeof(float), &conv_state_bytes) ||
+        !glm53_gpu_mul_u64(state_elements, sizeof(float),
+                           &recurrent_state_bytes)) {
+        return 0;
+    }
+    if (prefix_state &&
+        (n_tokens != 2u ||
+         (ds4_gpu_tensor_offset(prefix_state) & 15u) != 0u ||
+         (prefix_offset & 15u) != 0u ||
+         prefix_offset > ds4_gpu_tensor_bytes(prefix_state) ||
+         conv_state_bytes >
+             ds4_gpu_tensor_bytes(prefix_state) - prefix_offset ||
+         recurrent_state_bytes >
+             ds4_gpu_tensor_bytes(prefix_state) - prefix_offset -
+                 conv_state_bytes)) {
+        fprintf(stderr,
+                "ds4: GLM-5.3 KDA verify2 received invalid prefix buffer\n");
         return 0;
     }
 
@@ -44656,10 +44679,12 @@ int ds4_gpu_glm53_kda_prefill(
         id<MTLBuffer> output_norm = glm53_gpu_weight_buffer(
             model_map, model_size, output_norm_offset, norm_bytes,
             &norm_inner, "KDA output norm");
-        id<MTLComputePipelineState> prep_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare");
-        id<MTLComputePipelineState> recurrence_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_recurrence");
+        id<MTLComputePipelineState> prep_pipeline = ds4_gpu_get_pipeline(
+            prefix_state ? "kernel_glm53_kda_verify2_prepare_snapshot" :
+                           "kernel_glm53_kda_prefill_prepare");
+        id<MTLComputePipelineState> recurrence_pipeline = ds4_gpu_get_pipeline(
+            prefix_state ? "kernel_glm53_kda_verify2_recurrence_snapshot" :
+                           "kernel_glm53_kda_prefill_recurrence");
         id<MTLComputePipelineState> output_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_output");
         if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
@@ -44695,6 +44720,12 @@ int ds4_gpu_glm53_kda_prefill(
         [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
                 offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
+        if (prefix_state) {
+            [enc setBuffer:ds4_gpu_tensor_buffer(prefix_state)
+                    offset:ds4_gpu_tensor_offset(prefix_state) +
+                           (NSUInteger)prefix_offset
+                   atIndex:11];
+        }
         [enc setThreadgroupMemoryLength:264u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -44715,6 +44746,12 @@ int ds4_gpu_glm53_kda_prefill(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:7];
+        if (prefix_state) {
+            [enc setBuffer:ds4_gpu_tensor_buffer(prefix_state)
+                    offset:ds4_gpu_tensor_offset(prefix_state) +
+                           (NSUInteger)(prefix_offset + conv_state_bytes)
+                   atIndex:8];
+        }
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
@@ -44731,8 +44768,71 @@ int ds4_gpu_glm53_kda_prefill(
 
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
-            cb, owned, "GLM-5.3 KDA layer-major prefill");
+            cb, owned, prefix_state ?
+                "GLM-5.3 KDA verify2 snapshot" :
+                "GLM-5.3 KDA layer-major prefill");
     }
+}
+
+int ds4_gpu_glm53_kda_prefill(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_tokens,
+        float                 gate_lower_bound,
+        float                 norm_eps) {
+    return glm53_gpu_kda_prefill_impl(
+        out, conv_state, recurrent_state, q, k, v, raw_gate, raw_beta,
+        output_gate, model_map, model_size, q_conv_offset, k_conv_offset,
+        v_conv_offset, a_log_offset, dt_bias_offset, output_norm_offset,
+        n_heads, n_tokens, gate_lower_bound, norm_eps, NULL, 0u);
+}
+
+int ds4_gpu_glm53_kda_verify2_snapshot(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *prefix_state,
+        uint64_t              prefix_offset,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        float                 gate_lower_bound,
+        float                 norm_eps) {
+    if (!prefix_state) return 0;
+    return glm53_gpu_kda_prefill_impl(
+        out, conv_state, recurrent_state, q, k, v, raw_gate, raw_beta,
+        output_gate, model_map, model_size, q_conv_offset, k_conv_offset,
+        v_conv_offset, a_log_offset, dt_bias_offset, output_norm_offset,
+        n_heads, 2u, gate_lower_bound, norm_eps,
+        prefix_state, prefix_offset);
 }
 
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
