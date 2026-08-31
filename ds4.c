@@ -47047,6 +47047,10 @@ static bool glm_graph_verify_rows(
                                                   n);
 glm53_verify_attention_done:
         if (ok && g->glm53) {
+            ok = glm_graph_apply_directional_steering_attn(
+                    g, g->batch_attn_out, il, n);
+        }
+        if (ok && g->glm53) {
             ok = ds4_gpu_hc_expand_split_tensor(hc_after_attn_view,
                                                 g->batch_attn_out,
                                                 hc_cur,
@@ -47086,6 +47090,9 @@ glm53_verify_attention_done:
                                                 false,
                                                 false,
                                                 NULL);
+        if (ok && g->glm53) {
+            ok = glm_graph_apply_directional_steering_ffn(g, nxt, il, n);
+        }
         if (ok && g->glm53) {
             ok = ds4_gpu_hc_expand_split_tensor(hc_next,
                                                 nxt,
