@@ -65544,7 +65544,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
-        if (s->graph.dspark_capture_enabled) {
+        /* Diagnostic, not news: the capture configuration is decided by the
+         * build and the weights, not by anything the caller did, and an
+         * embedder prints it in the middle of the user's screen on every
+         * session it creates. Opt in with DS4_DSPARK_VERBOSE, matching the
+         * other DS4_* diagnostics. */
+        if (s->graph.dspark_capture_enabled &&
+            getenv("DS4_DSPARK_VERBOSE") != NULL) {
             fprintf(stderr, "ds4: DSpark target-hidden capture enabled: layers=");
             for (uint32_t i = 0; i < s->graph.dspark_target_layer_count; i++) {
                 fprintf(stderr,
