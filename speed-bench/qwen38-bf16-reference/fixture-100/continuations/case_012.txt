@@ -1,0 +1,4 @@
+# Confronto: `mmap` dei pesi vs. Copia completa su macOS
+
+## Contesto
+

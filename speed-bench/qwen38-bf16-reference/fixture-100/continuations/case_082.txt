@@ -1,0 +1,1 @@
+Il vantaggio principale della cache è **ridurre i tempi di accesso ai dati frequentemente utilizzati, migliorando così le prestazioni compless

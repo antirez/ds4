@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ds4_qwen4.h"
 #include "ds4_ssd.h"
 
 /* Public engine boundary.
@@ -126,12 +127,15 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
+    const char *ple_path;
     const char *mtp_path;
     const char *vision_path;
     ds4_backend backend;
     int n_threads;
     int context_size;
     uint32_t prefill_chunk;
+    ds4_qwen4_prefill_mode qwen4_prefill_mode;
+    bool qwen4_prefill_mode_set;
     int mtp_draft_tokens;
     float mtp_margin;
     float dspark_confidence_threshold;
@@ -184,6 +188,10 @@ typedef struct {
     uint32_t height;
     uint32_t content_width;
     uint32_t content_height;
+    /* Raw patch grid before the 2x2 spatial merger.  Multimodal Qwen uses
+     * this geometry to build its per-request (t,h,w) M-RoPE table. */
+    uint32_t grid_width;
+    uint32_t grid_height;
     uint8_t fingerprint[32];
 } ds4_vision_embedding;
 
@@ -302,6 +310,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_is_qwen4(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);

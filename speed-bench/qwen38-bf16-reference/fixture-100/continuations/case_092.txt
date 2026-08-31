@@ -1,0 +1,5 @@
+```sql
+SELECT category, COUNT(*) AS row_count
+FROM your_table
+GROUP BY category;
+```<|im_end|>

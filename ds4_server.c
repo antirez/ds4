@@ -671,6 +671,7 @@ typedef enum {
 typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK,
     SERVER_MODEL_SYNTAX_GLM,
+    SERVER_MODEL_SYNTAX_QWEN,
 } server_model_syntax;
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -1109,6 +1110,8 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
 static bool model_alias_disables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-chat") ||
+            !strcmp(model, "qwen3.8-flash-next-chat") ||
+            !strcmp(model, "qwen3.8-flash-next-no-think") ||
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
@@ -1122,6 +1125,7 @@ static bool model_alias_disables_thinking(const char *model) {
 static bool model_alias_enables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-reasoner") ||
+            !strcmp(model, "qwen3.8-flash-next-reasoner") ||
             !strcmp(model, "glm-5.2-reasoner") ||
             !strcmp(model, "zai/glm-5.2-reasoner") ||
             !strcmp(model, "glm-5.3-flash-reasoner") ||
@@ -1129,11 +1133,13 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
+    return ds4_engine_is_glm_dsa(engine) ? SERVER_MODEL_SYNTAX_GLM
+                                         : SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next-q4";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
@@ -1143,6 +1149,10 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
+            !strcmp(id, "qwen3.8-flash-next-q4") ||
+            !strcmp(id, "qwen3.8-flash-next-chat") ||
+            !strcmp(id, "qwen3.8-flash-next-reasoner") ||
+            !strcmp(id, "qwen3.8-flash-next-no-think") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -2853,12 +2863,30 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
     buf_putc(b, '\n');
 }
 
+static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(b, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        buf_puts(b, "<tool_call>\n{\"name\":");
+        json_escape(b, tc->name ? tc->name : "");
+        buf_puts(b, ",\"arguments\":");
+        append_json_object_or_empty(b, tc->arguments);
+        buf_puts(b, "}\n</tool_call>\n");
+    }
+}
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
                                               const tool_schema_orders *tool_orders) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         append_glm_tool_calls_text(b, calls, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        append_qwen_tool_calls_text(b, calls);
     } else {
         append_dsml_tool_calls_text(b, calls);
     }
@@ -3065,6 +3093,95 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static void append_qwen_tools_prompt_text(buf *out,
+                                          const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(out,
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "Function signatures are provided inside <tools></tools> tags:\n"
+        "<tools>\n");
+    const char *p = tool_schemas;
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        bool emitted = false;
+        if (!append_glm_tool_schema_json(out, raw, &emitted)) {
+            buf_puts(out, raw);
+            emitted = true;
+        }
+        free(raw);
+        if (emitted) buf_putc(out, '\n');
+        json_ws(&p);
+    }
+    buf_puts(out,
+        "</tools>\n\n"
+        "For each function call, output a JSON object with name and arguments "
+        "inside <tool_call></tool_call> tags. Tool calls must follow a closed "
+        "</think> tag.\n");
+}
+
+static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
+                                          const char *tool_schemas,
+                                          ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    if (tool_schemas && tool_schemas[0]) {
+        buf_puts(&out, "<|im_start|>system\n");
+        append_qwen_tools_prompt_text(&out, tool_schemas);
+        buf_puts(&out, "<|im_end|>\n");
+    }
+    bool pending_assistant = false;
+    bool tool_response_open = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            tool_response_open = false;
+            buf_puts(&out, "<|im_start|>system\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "user")) {
+            tool_response_open = false;
+            buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") ||
+                   !strcmp(m->role, "function")) {
+            if (!tool_response_open) buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, "<tool_response>\n");
+            append_tool_result_text(&out, m->content);
+            buf_puts(&out, "\n</tool_response>\n");
+            const bool more = i + 1 < msgs->len &&
+                (!strcmp(msgs->v[i + 1].role, "tool") ||
+                 !strcmp(msgs->v[i + 1].role, "function"));
+            if (!more) buf_puts(&out, "<|im_end|>\n");
+            tool_response_open = more;
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            tool_response_open = false;
+            buf_puts(&out, "<|im_start|>assistant\n");
+            if (think) {
+                buf_puts(&out, "<think>\n");
+                buf_puts(&out, m->reasoning ? m->reasoning : "");
+                buf_puts(&out, "</think>\n\n");
+            } else {
+                buf_puts(&out, "</think>\n\n");
+            }
+            append_trimmed_text(&out, m->content);
+            append_qwen_tool_calls_text(&out, &m->calls);
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = false;
+        }
+    }
+    if (pending_assistant) {
+        buf_puts(&out, "<|im_start|>assistant\n");
+        buf_puts(&out, think ? "<think>\n" : "</think>\n\n");
+    }
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3073,6 +3190,9 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return render_qwen_chat_prompt_text(msgs, tool_schemas, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
@@ -3274,12 +3394,66 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
+static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
+                                        ds4_think_mode think_mode) {
+    const bool think = ds4_think_mode_enabled(think_mode);
+    buf out = {0};
+    buf_puts(&out, "<|im_end|>\n");
+    bool pending_assistant = false;
+    bool tool_response_open = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) continue;
+        if (!strcmp(m->role, "user")) {
+            tool_response_open = false;
+            buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, m->content ? m->content : "");
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "tool") ||
+                   !strcmp(m->role, "function")) {
+            if (!tool_response_open) buf_puts(&out, "<|im_start|>user\n");
+            buf_puts(&out, "<tool_response>\n");
+            append_tool_result_text(&out, m->content);
+            buf_puts(&out, "\n</tool_response>\n");
+            const bool more = i + 1 < msgs->len &&
+                (!strcmp(msgs->v[i + 1].role, "tool") ||
+                 !strcmp(msgs->v[i + 1].role, "function"));
+            if (!more) buf_puts(&out, "<|im_end|>\n");
+            tool_response_open = more;
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            tool_response_open = false;
+            buf_puts(&out, "<|im_start|>assistant\n");
+            if (think) {
+                buf_puts(&out, "<think>\n");
+                buf_puts(&out, m->reasoning ? m->reasoning : "");
+                buf_puts(&out, "</think>\n\n");
+            } else {
+                buf_puts(&out, "</think>\n\n");
+            }
+            append_trimmed_text(&out, m->content);
+            append_qwen_tool_calls_text(&out, &m->calls);
+            buf_puts(&out, "<|im_end|>\n");
+            pending_assistant = false;
+        }
+    }
+    if (pending_assistant) {
+        buf_puts(&out, "<|im_start|>assistant\n");
+        buf_puts(&out, think ? "<think>\n" : "</think>\n\n");
+    }
+    return buf_take(&out);
+}
+
 static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
                                               const chat_msgs *msgs, int start,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return render_qwen_live_tool_tail(msgs, start, think_mode);
     }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
@@ -5072,6 +5246,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!parse_ignore_eos_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -5109,10 +5288,24 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         request_free(r);
         return false;
     }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        free(prompt);
+        request_free(r);
+        return false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    /* OpenAI's legacy completions endpoint is a literal prompt interface.
+     * Qwen acceptance depends on feeding both runtimes the same tokenizer-level
+     * sequence, without silently adding system/user chat wrappers. */
+    if (e && ds4_engine_is_qwen4(e)) {
+        r->prompt_text = prompt;
+        prompt = NULL;
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        return true;
+    }
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -5847,6 +6040,113 @@ static bool parse_glm_generated_message_ex(const char *text,
     return true;
 }
 
+static bool parse_qwen_tool_object(const char *text, size_t len,
+                                   tool_call *call) {
+    char *copy = xstrndup(text, len);
+    const char *p = copy;
+    bool ok = false;
+    json_ws(&p);
+    if (*p++ != '{') goto done;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        if (!strcmp(key, "name")) {
+            if (!json_string_replace(&p, &call->name)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "arguments")) {
+            if (!json_raw_value_replace(&p, &call->arguments)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p++ != '}') goto done;
+    json_ws(&p);
+    if (*p != '\0' || !call->name || !call->name[0]) goto done;
+    if (!call->arguments) call->arguments = xstrdup("{}");
+    ok = true;
+done:
+    free(copy);
+    if (!ok) tool_call_free(call);
+    return ok;
+}
+
+static bool parse_qwen_generated_message_ex(const char *text,
+                                            bool require_thinking_closed,
+                                            char **content_out,
+                                            char **reasoning_out,
+                                            tool_calls *calls) {
+    static const char tool_start[] = "<tool_call>";
+    static const char tool_end[] = "</tool_call>";
+    text = text ? text : "";
+    const char *tool_search = text;
+    bool recovered_unclosed_think = false;
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                ds4_local_unterminated_reasoning(text, content_out,
+                                                 reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_think = true;
+        } else {
+            tool_search = think_end + 8;
+        }
+    }
+    const char *start = strstr(tool_search, tool_start);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        return true;
+    }
+    const char *raw_start = start;
+    if (start > text && start[-1] == '\n') raw_start--;
+    const size_t content_len = trim_tool_separator_ws(
+        text, 0, (size_t)(raw_start - text));
+    const char *p = start;
+    while (true) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
+        p += strlen(tool_start);
+        const char *close = strstr(p, tool_end);
+        if (!close) return false;
+        tool_call call = {0};
+        if (!parse_qwen_tool_object(p, (size_t)(close - p), &call)) {
+            return false;
+        }
+        tool_calls_push(calls, call);
+        p = close + strlen(tool_end);
+    }
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(raw_start, (size_t)(p - raw_start));
+    if (recovered_unclosed_think) {
+        ds4_unterminated_reasoning_before_tool(text, content_len,
+                                               content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
+    return true;
+}
+
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
                                                   bool require_thinking_closed,
@@ -5857,6 +6157,11 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
                                               calls);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return parse_qwen_generated_message_ex(text, require_thinking_closed,
+                                               content_out, reasoning_out,
+                                               calls);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -11112,11 +11417,44 @@ static char *build_invalid_glm_tool_error_suffix(const request *r,
     return buf_take(&suffix);
 }
 
+static char *build_invalid_qwen_tool_error_suffix(
+        const request *r, const thinking_state *thinking,
+        const char *detail) {
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid Qwen tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(&tool_error,
+             "\nThe previous assistant output was not executed. Emit a JSON "
+             "object with name and arguments inside <tool_call></tool_call>, "
+             "or answer normally if no tool is needed.");
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode) &&
+        thinking && thinking->inside) {
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix,
+             "<|im_end|>\n<|im_start|>user\n<tool_response>\n");
+    append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
+    buf_puts(&suffix,
+             "\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n");
+    buf_puts(&suffix,
+             r && ds4_think_mode_enabled(r->think_mode) ?
+             "<think>\n" : "</think>\n\n");
+    buf_free(&tool_error);
+    return buf_take(&suffix);
+}
+
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
         return build_invalid_glm_tool_error_suffix(r, thinking, detail);
+    }
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        return build_invalid_qwen_tool_error_suffix(r, thinking, detail);
     }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
@@ -11528,6 +11866,15 @@ static void send_prefill_failure_response(server *s, const job *j,
     http_error(j->fd, s->enable_cors, 500, err);
 }
 
+static void append_assistant_eos_for_syntax(buf *out,
+                                            server_model_syntax syntax) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(out, "<|im_end|>\n");
+    } else if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK) {
+        buf_puts(out, "<｜end▁of▁sentence｜>");
+    }
+}
+
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     const server_model_syntax syntax =
@@ -11540,9 +11887,7 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
-        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    }
+    append_assistant_eos_for_syntax(&suffix, syntax);
     return buf_take(&suffix);
 }
 
@@ -11570,9 +11915,7 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
-        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    }
+    append_assistant_eos_for_syntax(&suffix, syntax);
     return buf_take(&suffix);
 }
 
@@ -11595,7 +11938,8 @@ static char *build_toolless_thinking_visible_text(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
-    const char *think_tag = "<think>";
+    const bool qwen = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN;
+    const char *think_tag = qwen ? "<think>\n" : "<think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -11604,9 +11948,9 @@ static char *build_toolless_thinking_visible_text(const request *r,
 
     buf visible = {0};
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
+    buf_puts(&visible, qwen ? "</think>\n\n" : "</think>");
     buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    append_assistant_eos_for_syntax(&visible, r->model_syntax);
     return buf_take(&visible);
 }
 
@@ -12103,7 +12447,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     } else if (cached == 0 && live_vision_match) {
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
+            ds4_engine_is_glm_dsa(s->engine) ||
+                ds4_engine_is_qwen4(s->engine), old_pos,
             j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
@@ -13625,7 +13970,13 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_glm_dsa(s->engine)) {
+    if (ds4_engine_is_qwen4(s->engine)) {
+        append_model_json(&b, s, "qwen3.8-flash-next-q4");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen3.8-flash-next-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
+    } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-chat");
@@ -14094,6 +14445,8 @@ static server_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.engine.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -14197,7 +14550,18 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            const char *value = need_arg(&i, argc, argv, arg);
+            char mode_error[128];
+            if (ds4_qwen4_parse_prefill_mode(value,
+                                              &c.engine.qwen4_prefill_mode,
+                                              mode_error,
+                                              sizeof(mode_error))) {
+                c.engine.qwen4_prefill_mode_set = true;
+                c.engine.prefill_chunk =
+                    (uint32_t)c.engine.qwen4_prefill_mode;
+                continue;
+            }
+            int v = parse_int_arg(value, arg);
             if (v <= 0) {
                 server_log(DS4_LOG_DEFAULT,
                            "ds4-server: --prefill-chunk must be positive");
@@ -16009,6 +16373,23 @@ static void test_chat_ignore_eos_contract(void) {
         128, 32768, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+
+    memset(err, 0, sizeof(err));
+    ok = parse_completion_request(
+        NULL,
+        "{\"prompt\":\"hello\",\"ignore_eos\":true}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "temperature") != NULL);
+
+    memset(err, 0, sizeof(err));
+    ok = parse_completion_request(
+        NULL,
+        "{\"prompt\":\"hello\",\"temperature\":0,"
+        "\"ignore_eos\":\"yes\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
 static void test_reasoning_effort_mapping(void) {
@@ -16348,6 +16729,47 @@ static void test_render_glm_groups_tool_results(void) {
     chat_msgs_free(&anthropic);
 }
 
+static void test_render_qwen_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("where am I?");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("use a tool");
+    assistant.content = xstrdup("");
+    tool_call call = {0};
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    const char *schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"}}";
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, schemas, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>system\n# Tools") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\nwhere am I?<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nuse a tool</think>\n\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}\n"
+        "</tool_call>\n<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\n<tool_response>\n/tmp\n</tool_response>\n"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "<arg_key>") == NULL);
+    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_dsml_tool_args_preserve_call_order(void) {
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -16470,6 +16892,41 @@ static void test_parse_glm_tool_call_message(void) {
                 !strncmp(calls.raw_tool_text, "\n\n<tool_call>bash",
                          strlen("\n\n<tool_call>bash")));
 
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_parse_qwen_tool_call_message(void) {
+    const char *generated =
+        "<think>need bash</think>OK\n"
+        "<tool_call>\n"
+        "{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\",\"timeout\":10}}\n"
+        "</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, generated, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need bash"));
+    TEST_ASSERT(content && !strcmp(content, "OK"));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+    TEST_ASSERT(calls.v[0].arguments &&
+                strstr(calls.v[0].arguments, "\"command\":\"pwd\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\":10") != NULL);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.think_mode = DS4_THINK_HIGH;
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    TEST_ASSERT(strstr(suffix, "</think>OK") != NULL);
+    TEST_ASSERT(strstr(suffix, "<tool_call>") != NULL);
+    TEST_ASSERT(strstr(suffix, "<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
+    free(suffix);
+    request_free(&r);
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -19760,6 +20217,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_render_glm_groups_tool_results();
+    test_render_qwen_chat_prompt_text();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
@@ -19795,6 +20253,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
+    test_parse_qwen_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();

@@ -1,0 +1,5 @@
+# Derivazione della RMSNorm
+
+## Definizione
+
+Data una vettore di input $\mathbf{x} =

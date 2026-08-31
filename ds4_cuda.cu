@@ -32508,6 +32508,24 @@ extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_set_model_maps(
+        const void *const *model_maps,
+        const uint64_t *model_sizes,
+        const uint64_t *map_offsets,
+        const uint64_t *map_sizes,
+        const uint64_t *max_tensor_bytes,
+        uint32_t count) {
+    (void)model_maps;
+    (void)model_sizes;
+    (void)map_offsets;
+    (void)map_sizes;
+    (void)max_tensor_bytes;
+    (void)count;
+    fprintf(stderr,
+            "ds4: multi-shard Qwen model mappings require the Metal backend\n");
+    return 0;
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
         const void *model_map, uint64_t model_size,

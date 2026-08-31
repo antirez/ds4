@@ -1,0 +1,5 @@
+Tokyo<|im_end|>
+<|endoftext|><|im_start|>user<|im_end|>
+<|im_start|>assistant
+<think>
+The user sent just an empty message or a single

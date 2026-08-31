@@ -1,0 +1,2 @@
+<think>
+The user is asking me to describe a secure format for saving a model checkpoint header. This is a technical question

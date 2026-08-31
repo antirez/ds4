@@ -1,0 +1,2 @@
+A good benchmark should measure **performance against a defined standard or baseline to enable meaningful comparison and evaluation.**<|im_end|>
+<|endoftext|><|im_start|>

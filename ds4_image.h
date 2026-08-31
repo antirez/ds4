@@ -82,6 +82,17 @@ int ds4_image_preprocess_glm53(
         char              *error,
         size_t             error_cap);
 
+/* Qwen3.8-Flash-Next preprocessing: Qwen2-VL smart-resize on a 32-pixel
+ * factor, [-1,1] RGB normalization, temporal duplication, and block-major
+ * 2x2 patch order.  Pixel limits are those of the official processor. */
+int ds4_image_preprocess_qwen4(
+        ds4_image_patches *out,
+        const ds4_image   *image,
+        uint64_t           min_pixels,
+        uint64_t           max_pixels,
+        char              *error,
+        size_t             error_cap);
+
 void ds4_image_patches_free(ds4_image_patches *patches);
 
 int ds4_image_preprocess_deepseek4(

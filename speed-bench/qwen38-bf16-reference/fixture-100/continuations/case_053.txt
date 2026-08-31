@@ -1,0 +1,6 @@
+```json
+{
+  "name": "tool_name",
+  "arguments": {}
+}
+```<|im_end|>

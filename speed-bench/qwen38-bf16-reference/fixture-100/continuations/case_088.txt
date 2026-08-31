@@ -1,0 +1,1 @@
+A tokenizer should treat special tags (such as `<|endoftext|>`, `<|endoftext|>`, `<|im_start|>`, or

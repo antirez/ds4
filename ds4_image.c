@@ -564,6 +564,156 @@ int ds4_image_preprocess_glm53(
     return 1;
 }
 
+static int ds4_qwen4_smart_resize(
+        uint32_t height,
+        uint32_t width,
+        uint64_t min_pixels,
+        uint64_t max_pixels,
+        uint32_t *target_height,
+        uint32_t *target_width) {
+    const uint32_t factor = 32u;
+    if (!height || !width || !target_height || !target_width ||
+        min_pixels == 0u || max_pixels < min_pixels) return 0;
+
+    /* Match the Qwen2/3-VL processor: choose the nearest factor-aligned
+     * geometry first, then contract/expand while preserving aspect ratio. */
+    uint32_t h = (uint32_t)llround((double)height / factor) * factor;
+    uint32_t w = (uint32_t)llround((double)width / factor) * factor;
+    if (h < factor) h = factor;
+    if (w < factor) w = factor;
+    uint64_t pixels = (uint64_t)h * w;
+    if (pixels > max_pixels) {
+        const double beta = sqrt((double)height * width / max_pixels);
+        h = (uint32_t)floor((double)height / beta / factor) * factor;
+        w = (uint32_t)floor((double)width / beta / factor) * factor;
+        if (h < factor) h = factor;
+        if (w < factor) w = factor;
+    } else if (pixels < min_pixels) {
+        const double beta = sqrt(min_pixels / ((double)height * width));
+        h = (uint32_t)ceil((double)height * beta / factor) * factor;
+        w = (uint32_t)ceil((double)width * beta / factor) * factor;
+    }
+    if ((uint64_t)h * w > max_pixels ||
+        (uint64_t)h * w < min_pixels ||
+        h > DS4_IMAGE_MAX_DIMENSION || w > DS4_IMAGE_MAX_DIMENSION) return 0;
+    *target_height = h;
+    *target_width = w;
+    return 1;
+}
+
+int ds4_image_preprocess_qwen4(
+        ds4_image_patches *out,
+        const ds4_image *image,
+        uint64_t min_pixels,
+        uint64_t max_pixels,
+        char *error,
+        size_t error_cap) {
+    enum { PATCH = 16, TEMPORAL = 2, MERGE = 2 };
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!image || !image->rgb || image->width == 0u || image->height == 0u ||
+        min_pixels == 0u || max_pixels < min_pixels ||
+        max_pixels > DS4_IMAGE_MAX_PIXELS) {
+        ds4_image_error(error, error_cap,
+                        "invalid Qwen image preprocessing parameters");
+        return 0;
+    }
+
+    uint32_t target_height = 0u, target_width = 0u;
+    if (!ds4_qwen4_smart_resize(image->height, image->width,
+                                min_pixels, max_pixels,
+                                &target_height, &target_width)) {
+        ds4_image_error(error, error_cap,
+                        "Qwen image cannot fit the configured pixel budget");
+        return 0;
+    }
+    if ((uint64_t)target_height * target_width > SIZE_MAX / (3u * sizeof(float))) {
+        ds4_image_error(error, error_cap, "Qwen resized image is too large");
+        return 0;
+    }
+    const size_t canvas_values = (size_t)target_height * target_width * 3u;
+    float *canvas = malloc(canvas_values * sizeof(float));
+    if (!canvas) {
+        ds4_image_error(error, error_cap, "unable to allocate Qwen resized image");
+        return 0;
+    }
+    if (target_width == image->width && target_height == image->height) {
+        for (size_t i = 0; i < canvas_values; i++)
+            canvas[i] = (float)image->rgb[i];
+    } else {
+        ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                               canvas, target_width, target_height,
+                               target_width);
+    }
+    for (size_t i = 0; i < canvas_values; i++)
+        canvas[i] = canvas[i] * (2.0f / 255.0f) - 1.0f;
+
+    const uint32_t grid_height = target_height / PATCH;
+    const uint32_t grid_width = target_width / PATCH;
+    if ((grid_height % MERGE) != 0u || (grid_width % MERGE) != 0u ||
+        grid_height > UINT32_MAX / grid_width) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "invalid Qwen patch grid");
+        return 0;
+    }
+    const uint32_t patch_count = grid_height * grid_width;
+    const uint64_t values = (uint64_t)patch_count * 3u * TEMPORAL * PATCH * PATCH;
+    if (values > SIZE_MAX / sizeof(float)) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "Qwen patch tensor is too large");
+        return 0;
+    }
+    float *patches = malloc((size_t)values * sizeof(float));
+    if (!patches) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "unable to allocate Qwen vision patches");
+        return 0;
+    }
+
+    size_t index = 0u;
+    for (uint32_t block_y = 0; block_y < grid_height / MERGE; block_y++) {
+        for (uint32_t block_x = 0; block_x < grid_width / MERGE; block_x++) {
+            for (uint32_t merge_y = 0; merge_y < MERGE; merge_y++) {
+                for (uint32_t merge_x = 0; merge_x < MERGE; merge_x++) {
+                    const uint32_t patch_y = block_y * MERGE + merge_y;
+                    const uint32_t patch_x = block_x * MERGE + merge_x;
+                    for (uint32_t channel = 0; channel < 3u; channel++) {
+                        for (uint32_t temporal = 0; temporal < TEMPORAL; temporal++) {
+                            (void)temporal; /* A still image is duplicated in time. */
+                            for (uint32_t y = 0; y < PATCH; y++) {
+                                for (uint32_t x = 0; x < PATCH; x++) {
+                                    const float *pixel = canvas +
+                                        ((size_t)(patch_y * PATCH + y) * target_width +
+                                         patch_x * PATCH + x) * 3u;
+                                    patches[index++] = pixel[channel];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    free(canvas);
+    if (index != (size_t)values) {
+        free(patches);
+        ds4_image_error(error, error_cap,
+                        "internal Qwen patch layout mismatch");
+        return 0;
+    }
+
+    out->content_width = target_width;
+    out->content_height = target_height;
+    out->padded_width = target_width;
+    out->padded_height = target_height;
+    out->grid_width = grid_width;
+    out->grid_height = grid_height;
+    out->patch_count = patch_count;
+    out->image_token_count = patch_count / (MERGE * MERGE);
+    out->patches = patches;
+    return 1;
+}
+
 void ds4_image_patches_free(ds4_image_patches *patches) {
     if (!patches) return;
     free(patches->patches);

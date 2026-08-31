@@ -82,13 +82,18 @@ if [ -x ./ds4-eval ]; then
     ./ds4-eval --help runtime > "$LOG" 2>&1 || true
     assert_grep "ds4-eval --help runtime mentions --mtp-model" \
         "--mtp-model" "$LOG"
-    ./ds4-eval --mtp-model /dev/null -m /dev/null --questions 1 \
+    assert_grep "ds4-eval --help runtime mentions --mtp-draft" \
+        "--mtp-draft" "$LOG"
+    assert_grep "ds4-eval --help runtime mentions --mtp-timing" \
+        "--mtp-timing" "$LOG"
+    ./ds4-eval --mtp-model /dev/null --mtp-draft 4 --mtp-margin 3 \
+        --mtp-timing -m /dev/null --questions 1 \
         > "$LOG" 2>&1
     rc=$?
     if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
-        ok "ds4-eval parses --mtp-model"
+        ok "ds4-eval parses Qwen MTP controls"
     else
-        fail "ds4-eval rejected --mtp-model in option parsing"
+        fail "ds4-eval rejected Qwen MTP controls in option parsing"
     fi
     ./ds4-eval --mtp /dev/null -m /dev/null --questions 1 > "$LOG" 2>&1
     rc=$?

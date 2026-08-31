@@ -1,0 +1,4 @@
+Quantization reduces memory usage but can alter the logits.<|im_end|>
+<|endoftext|><|im_start|><|im_start|><|im_end|>
+<|im_start|>user<|im_end|>
+<|im_start|>assistant

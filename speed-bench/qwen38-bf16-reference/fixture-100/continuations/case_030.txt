@@ -1,0 +1,5 @@
+# Ricerca Binaria del Punto di Inserimento
+
+## Concetto Fondamentale
+
+La **ricerca binaria del

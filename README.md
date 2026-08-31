@@ -213,6 +213,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 ## Detailed Guides
 
+- [Qwen3.8 Flash Next](QWEN38_FLASH_NEXT.md): pack format, Metal integration, and native-kernel tests.
 - [Models and vision](docs/MODELS.md): Flash, PRO, GLM, and matching encoders.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.

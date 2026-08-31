@@ -1,0 +1,1 @@
+La differenza tra **righe KV raw** (grezze) e **righe KV compresse** risiede principalmente

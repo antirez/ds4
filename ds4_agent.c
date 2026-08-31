@@ -385,8 +385,8 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 static int agent_read_default_lines(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
-                                         : AGENT_TOOL_SYNTAX_DSML;
+    return (ds4_engine_is_glm_dsa(engine) || ds4_engine_is_qwen4(engine))
+        ? AGENT_TOOL_SYNTAX_GLM : AGENT_TOOL_SYNTAX_DSML;
 }
 
 static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) {
@@ -394,7 +394,8 @@ static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) 
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
-    if (agent_tool_syntax_assistant_turn_uses_eos(
+    if (ds4_engine_is_qwen4(w->engine) ||
+        agent_tool_syntax_assistant_turn_uses_eos(
             agent_tool_syntax_for_engine(w->engine)))
         ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
 }
@@ -772,6 +773,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.engine.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -877,7 +880,18 @@ static agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            const char *value = need_arg(&i, argc, argv, arg);
+            char mode_error[128];
+            if (ds4_qwen4_parse_prefill_mode(value,
+                                              &c.engine.qwen4_prefill_mode,
+                                              mode_error,
+                                              sizeof(mode_error))) {
+                c.engine.qwen4_prefill_mode_set = true;
+                c.engine.prefill_chunk =
+                    (uint32_t)c.engine.qwen4_prefill_mode;
+                continue;
+            }
+            int v = parse_int(value, arg);
             if (v <= 0) {
                 fprintf(stderr, "ds4-agent: --prefill-chunk must be positive\n");
                 exit(2);
@@ -951,7 +965,8 @@ static agent_config parse_options(int argc, char **argv) {
 static void agent_apply_model_sampling_defaults(
         ds4_engine               *engine,
         agent_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen ||
+        (!ds4_engine_is_glm_dsa(engine) && !ds4_engine_is_qwen4(engine))) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -9098,7 +9113,8 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     if (target < sys_len) target = sys_len;
 
     int user_id = agent_special_token_id(w->engine,
-        ds4_engine_is_glm_dsa(w->engine) ? "<|user|>" : "<｜User｜>");
+        ds4_engine_is_qwen4(w->engine) ? "<|im_start|>" :
+        (ds4_engine_is_glm_dsa(w->engine) ? "<|user|>" : "<｜User｜>"));
     if (user_id < 0) return target;
 
     for (int i = target; i < bottom; i++) {

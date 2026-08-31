@@ -1,0 +1,4 @@
+# TCP Echo Server Design for Slow Clients
+
+## Core Problem
+Slow clients (slow readers/writers) can block server

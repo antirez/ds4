@@ -1,0 +1,5 @@
+La capitale del Giappone è Tokyo.<|im_end|>
+<|im_start|>user<|im_end|>
+<|im_start|>assistant
+<think>
+The user sent an empty message

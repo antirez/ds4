@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4_qwen4.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -47,6 +49,7 @@ void ds4_gpu_cleanup(void);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
+
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
@@ -176,6 +179,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* DS4_METAL_GPU_STAGE_PROFILE: print the per-dispatch-label GPU
+ * command-buffer time accumulated since the previous report (one graph
+ * forward), then reset the table.  No effect without the environment
+ * variable; safe to call unconditionally. */
+void ds4_gpu_stage_profile_report(void);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
@@ -184,6 +193,12 @@ int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+int ds4_gpu_set_model_maps(const void *const *model_maps,
+                           const uint64_t *model_sizes,
+                           const uint64_t *map_offsets,
+                           const uint64_t *map_sizes,
+                           const uint64_t *max_tensor_bytes,
+                           uint32_t count);
 /* Add a secondary GGUF mapping without replacing the primary model mapping. */
 int ds4_gpu_set_aux_model_map_range(const void *model_map,
                                     uint64_t model_size,
@@ -3196,7 +3211,8 @@ int ds4_gpu_deepseek4_vision_encode(
         const ds4_deepseek4_vision_weights *weights);
 
 /* Replace token rows with projected image embeddings and repeat each row into
- * every GLM hyperconnection stream. Must be called in an active command batch. */
+ * every hyperconnection stream.  The helper joins an active command batch or
+ * owns and commits a short command buffer when called independently. */
 int ds4_gpu_glm53_scatter_image_hc(
         ds4_gpu_tensor       *hc,
         const ds4_gpu_tensor *image,
@@ -3253,6 +3269,792 @@ int ds4_gpu_glm53_kda_prefill(
         uint32_t              n_tokens,
         float                 gate_lower_bound,
         float                 norm_eps);
+
+/* Qwen3.8-Flash-Next GGML-block projections, row-blocked Gated DeltaNet,
+ * and exact M=1 QSA scoring.  Q8_0 tensors are ordinary interleaved
+ * block_q8_0 rows: one FP16 delta followed by 32 signed codes. */
+int ds4_gpu_qwen4_query_fast_path_caps(ds4_qwen4_fast_path_caps *caps);
+
+int ds4_gpu_qwen4_q8_0_matmul(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows);
+
+int ds4_gpu_qwen4_q8_0_matmul_model(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows);
+
+/* Scope control for the wide split-K M=1 SiLU kernel: the MTP draft layer
+ * runs better on the classic four-simdgroup layout, so the graph disables
+ * the wide path around draft-model passes. */
+void ds4_gpu_qwen4_silu_wide_scope(int enable);
+
+/* Q8_0 projection with the SiLU activation applied before the result is
+ * written.  Row one retains its decode-specialized kernel; tiny verifier
+ * batches use the row-aware counterpart. */
+int ds4_gpu_qwen4_q8_0_silu_model(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows);
+
+/* Q8_0 gate/up projections fused with SwiGLU for decode and tiny verifier
+ * batches. */
+int ds4_gpu_qwen4_q8_0_swiglu_model(
+        ds4_gpu_tensor       *out,
+        const void           *gate_model_map,
+        uint64_t              gate_model_size,
+        uint64_t              gate_weight_offset,
+        const void           *up_model_map,
+        uint64_t              up_model_size,
+        uint64_t              up_weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows);
+
+/* Decode-only pair of equal-width Q8_0 projections. */
+int ds4_gpu_qwen4_q8_0_pair_model(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_a_map,
+        uint64_t              model_a_size,
+        uint64_t              weight_a_offset,
+        const void           *model_b_map,
+        uint64_t              model_b_size,
+        uint64_t              weight_b_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim);
+
+/* Decode-only Q8_0 projections with a shared input and different output
+ * widths, encoded as one output-row grid. */
+int ds4_gpu_qwen4_q8_0_concat_model(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_a_map,
+        uint64_t              model_a_size,
+        uint64_t              weight_a_offset,
+        uint32_t              out_a_dim,
+        const void           *model_b_map,
+        uint64_t              model_b_size,
+        uint64_t              weight_b_offset,
+        uint32_t              out_b_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim);
+
+/* Q8_0 projection fused with the hyper-connection stream write.  Injection
+ * gates are reduced from the ordered partials produced by HC read. */
+int ds4_gpu_qwen4_q8_0_hc_write_model(
+        ds4_gpu_tensor       *streams,
+        const ds4_gpu_tensor *inject_partials,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows,
+        uint32_t              stream_count);
+
+/* Model-backed Q8_0 projection whose activation rows are staged BF16.
+ * Used by the SSD-backed PLE path to avoid expanding the gathered n-gram
+ * rows into a second F32 input buffer. */
+int ds4_gpu_qwen4_q8_0_matmul_model_bf16(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows);
+
+int ds4_gpu_qwen4_q8_0_embedding_model(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *token_ids,
+        uint32_t              hidden_dim,
+        uint32_t              vocab_size,
+        uint32_t              n_tokens);
+
+#ifndef DS4_QWEN4_VISION_TYPES_DEFINED
+#define DS4_QWEN4_VISION_TYPES_DEFINED
+#define DS4_QWEN4_VISION_LAYER_COUNT 27u
+
+typedef struct {
+    uint64_t norm1_weight;
+    uint64_t norm1_bias;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t projection_weight;
+    uint64_t projection_bias;
+    uint64_t norm2_weight;
+    uint64_t norm2_bias;
+    uint64_t fc1_weight;
+    uint64_t fc1_bias;
+    uint64_t fc2_weight;
+    uint64_t fc2_bias;
+} ds4_qwen4_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t position_embedding;
+    ds4_qwen4_vision_layer_weights layer[DS4_QWEN4_VISION_LAYER_COUNT];
+    uint64_t merger_norm_weight;
+    uint64_t merger_norm_bias;
+    uint64_t merger_fc1_weight;
+    uint64_t merger_fc1_bias;
+    uint64_t merger_fc2_weight;
+    uint64_t merger_fc2_bias;
+} ds4_qwen4_vision_weights;
+#endif
+
+/* Encode official Qwen block-major 3x2x16x16 patches into 2560-wide image
+ * rows.  Transformer and merger matrices use standard Q8_0 rows; norms,
+ * biases, patch kernel, and position table are BF16. */
+int ds4_gpu_qwen4_vision_encode(
+        float                          *out,
+        const float                    *patches,
+        uint32_t                        grid_h,
+        uint32_t                        grid_w,
+        const void                     *model_map,
+        uint64_t                        model_size,
+        const ds4_qwen4_vision_weights *weights);
+
+/* The vision MLP FC2 tensor has 4304 logical activations padded with sixteen
+ * zeros to the GGML Q8_0 physical row width of 4320 (135 blocks).  The full
+ * vision graph and its focused stride fixture share this dispatch entry. */
+int ds4_gpu_qwen4_vision_fc2_q8_0_model(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
+/* Exposed for the small Metal correctness fixture used to guard the
+ * gelu_pytorch_tanh negative tail used by the Qwen vision MLP. */
+int ds4_gpu_qwen4_vision_gelu_tanh(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *bias,
+        uint32_t              elements);
+
+/* Dense BF16 model-backed projection used by the hyper-connection injection
+ * and shared-expert gates.  Weights are row-major [out_dim, in_dim]. */
+int ds4_gpu_qwen4_bf16_matmul_model(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *x,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_rows);
+
+int ds4_gpu_qwen4_rms_norm_bf16_model(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              width,
+        uint32_t              rows,
+        uint32_t              weight_rows,
+        float                 eps);
+
+/* Normalize all hyper-connection streams and compute their dense injection
+ * partials in one dispatch.  When inject is non-NULL, reduce the partials to
+ * gates as well.  FP32 RMS and BF16-dot reduction orders match the standalone
+ * reference kernels. */
+int ds4_gpu_qwen4_hc_norm_inject_model(
+        ds4_gpu_tensor       *normalized_streams,
+        ds4_gpu_tensor       *inject_partials,
+        ds4_gpu_tensor       *inject,
+        const ds4_gpu_tensor *streams,
+        const void           *norm_model_map,
+        uint64_t              norm_model_size,
+        uint64_t              norm_weight_offset,
+        const void           *inject_model_map,
+        uint64_t              inject_model_size,
+        uint64_t              inject_weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              hidden_dim,
+        uint32_t              stream_count,
+        float                 eps);
+
+int ds4_gpu_qwen4_silu(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint64_t              elements);
+
+int ds4_gpu_qwen4_swiglu(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint64_t              elements);
+
+int ds4_gpu_qwen4_repeat_streams(
+        ds4_gpu_tensor       *streams,
+        const ds4_gpu_tensor *hidden,
+        uint32_t              n_tokens,
+        uint32_t              hidden_dim,
+        uint32_t              stream_count);
+
+int ds4_gpu_qwen4_hc_mix(
+        ds4_gpu_tensor       *mixed,
+        const ds4_gpu_tensor *normalized_streams,
+        const ds4_gpu_tensor *mix_gate,
+        uint32_t              n_tokens,
+        uint32_t              hidden_dim,
+        uint32_t              stream_count);
+
+/* Decode-only BF16 hyper-connection up projection fused with the four-stream
+ * sigmoid mix.  Its per-output reduction matches the standalone BF16 M=1
+ * projection while avoiding the materialized gate tensor. */
+int ds4_gpu_qwen4_bf16_hc_up_mix_model(
+        ds4_gpu_tensor       *mixed,
+        const ds4_gpu_tensor *normalized_streams,
+        const ds4_gpu_tensor *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              low_dim,
+        uint32_t              hidden_dim,
+        uint32_t              stream_count);
+
+/* Q8_0 hyper-connection up projection fused with the four-stream sigmoid mix.
+ * The projection reductions match the standalone Q8_0 reference for each
+ * decode or tiny-verifier row. */
+int ds4_gpu_qwen4_q8_0_hc_up_mix_model(
+        ds4_gpu_tensor       *mixed,
+        const ds4_gpu_tensor *normalized_streams,
+        const ds4_gpu_tensor *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              low_dim,
+        uint32_t              hidden_dim,
+        uint32_t              n_rows,
+        uint32_t              stream_count);
+
+int ds4_gpu_qwen4_hc_inject(
+        ds4_gpu_tensor       *inject,
+        const ds4_gpu_tensor *raw_inject,
+        uint32_t              n_tokens,
+        uint32_t              stream_count);
+
+int ds4_gpu_qwen4_hc_write(
+        ds4_gpu_tensor       *streams,
+        const ds4_gpu_tensor *block_output,
+        const ds4_gpu_tensor *inject,
+        uint32_t              n_tokens,
+        uint32_t              hidden_dim,
+        uint32_t              stream_count);
+
+/* Decode/prefill graph path: reduce ordered injection partials inside the
+ * existing stream-write dispatch, avoiding a separate gate-reduction pass. */
+int ds4_gpu_qwen4_hc_write_partials(
+        ds4_gpu_tensor       *streams,
+        const ds4_gpu_tensor *block_output,
+        const ds4_gpu_tensor *inject_partials,
+        uint32_t              n_tokens,
+        uint32_t              hidden_dim,
+        uint32_t              stream_count);
+
+int ds4_gpu_qwen4_moe_topk(
+        ds4_gpu_tensor       *selected_experts,
+        ds4_gpu_tensor       *selected_weights,
+        const ds4_gpu_tensor *router_logits,
+        uint32_t              n_rows,
+        uint32_t              n_experts,
+        uint32_t              top_k);
+
+/* Q4_K routed experts.  Gate/up are [expert, 640, 2560] without output
+ * padding.  Down is [expert, 2560, 768]; only the first 640 activation
+ * values are logical and the 128-value physical tail is supplied as zero. */
+int ds4_gpu_qwen4_moe_q4_k_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected_experts,
+        const ds4_gpu_tensor *selected_weights,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_weight_offset,
+        uint64_t              up_weight_offset,
+        uint64_t              down_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              expert_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              top_k,
+        uint32_t              n_rows);
+
+/* Experimental source-derived Q4_0 routed experts with the same logical and
+ * physical geometry as the Q4_K pack. */
+int ds4_gpu_qwen4_moe_q4_0_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected_experts,
+        const ds4_gpu_tensor *selected_weights,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_weight_offset,
+        uint64_t              up_weight_offset,
+        uint64_t              down_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              expert_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              top_k,
+        uint32_t              n_rows);
+
+/* Mixed low-bit routed experts. Gate/up are ordinary IQ2_XXS GGML blocks
+ * with logical shape [expert, 640, 2560]. Down is ordinary Q2_K with shape
+ * [expert, 2560, 768]; the logical activation width remains 640 and the
+ * 128-value physical alignment tail is supplied as zero. */
+int ds4_gpu_qwen4_moe_iq2_xxs_q2_k_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected_experts,
+        const ds4_gpu_tensor *selected_weights,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_weight_offset,
+        uint64_t              up_weight_offset,
+        uint64_t              down_weight_offset,
+        uint32_t              in_dim,
+        uint32_t              expert_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              top_k,
+        uint32_t              n_rows);
+
+int ds4_gpu_qwen4_shared_expert_add(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *routed,
+        const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *raw_gate,
+        uint32_t              n_rows,
+        uint32_t              hidden_dim);
+
+/* Fuse the one-output BF16 shared-expert router with its gated residual add.
+ * The router reduction intentionally matches kernel_qwen4_bf16_matmul_f32. */
+int ds4_gpu_qwen4_shared_expert_add_model(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *routed,
+        const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              router_weight_offset,
+        uint32_t              n_rows,
+        uint32_t              hidden_dim);
+
+/* Prepare a Qwen Gated DeltaNet block after its four dense input
+ * projections.  The model-backed BF16 convolution is causal and updates
+ * conv_state in place.  Q/K are L2-normalized in FP32 (Q additionally gets
+ * the required 1/sqrt(head_dim) scale), while beta and decay are computed
+ * from the raw projection outputs and the BF16 model parameters.  Q/K are
+ * kept at key_heads rather than physically repeated to value_heads. */
+int ds4_gpu_qwen4_gdn_prepare_model(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *decay,
+        ds4_gpu_tensor       *beta,
+        ds4_gpu_tensor       *conv_state,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *raw_decay,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *mask,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint32_t              n_tokens,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_width);
+
+int ds4_gpu_qwen4_gdn_prepare_capture_model(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *decay,
+        ds4_gpu_tensor       *beta,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *conv_state_seq,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *raw_decay,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *mask,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint32_t              n_tokens,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_width,
+        uint32_t              capture_slots);
+
+int ds4_gpu_qwen4_gdn_prefill(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *decay,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *mask,
+        uint32_t              n_tokens,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              rows_per_thread);
+
+/* Ordinary-decode variant with BF16 recurrent-state storage.  Arithmetic and
+ * outputs remain FP32; only the persistent state is rounded at call
+ * boundaries.  MTP capture deliberately continues to use the FP32 API. */
+int ds4_gpu_qwen4_gdn_prefill_bf16_state(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *decay,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *mask,
+        uint32_t              n_tokens,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              rows_per_thread);
+
+/* Verifier variant of the BF16-state recurrence.  It writes the state after
+ * each partial-commit row directly into a BF16 state sequence. */
+int ds4_gpu_qwen4_gdn_prefill_capture_bf16_state(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        ds4_gpu_tensor       *state_seq,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *decay,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *mask,
+        uint32_t              n_tokens,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              rows_per_thread,
+        uint32_t              capture_slots);
+
+/* Decode-only BF16-state path that keeps convolution as one dispatch and
+ * fuses Q/K normalization plus decay/beta transforms into recurrence. */
+int ds4_gpu_qwen4_gdn_decode_bf16_state_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *conv_state,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *raw_decay,
+        const ds4_gpu_tensor *raw_beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_width);
+
+/* Experimental decode path that also fuses the output RMS normalization and
+ * sigmoid gate into a one-threadgroup-per-value-head recurrent kernel. */
+int ds4_gpu_qwen4_gdn_decode_output_bf16_state_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *conv_state,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *raw_decay,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *raw_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              conv_width);
+
+int ds4_gpu_qwen4_gdn_prefill_capture(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        ds4_gpu_tensor       *state_seq,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *decay,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *mask,
+        uint32_t              n_tokens,
+        uint32_t              key_heads,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        uint32_t              rows_per_thread,
+        uint32_t              capture_slots);
+
+/* Apply the per-value-head Qwen Gated DeltaNet output RMS normalization.
+ * The BF16 norm weight is read directly from the authenticated model map;
+ * the output gate is sigmoid(raw_gate), matching output_gate_type. */
+int ds4_gpu_qwen4_gdn_output_norm_model(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *core,
+        const ds4_gpu_tensor *raw_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              norm_weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              value_heads,
+        uint32_t              head_dim,
+        float                 eps);
+
+/* Split and normalize the four QSA projection outputs, apply Qwen's
+ * first-dim partial RoPE, append BF16 K/V and raw index-key caches, and
+ * extend the BF16 pooled index cache for newly completed ratio-sized
+ * blocks.  cache_pos and lengths remain runtime values. */
+int ds4_gpu_qwen4_qsa_prepare_model(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *index_q,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        ds4_gpu_tensor       *raw_index_cache,
+        ds4_gpu_tensor       *pooled_index_cache,
+        const ds4_gpu_tensor *q_gate_raw,
+        const ds4_gpu_tensor *key_raw,
+        const ds4_gpu_tensor *value_raw,
+        const ds4_gpu_tensor *index_qk_raw,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint64_t              index_q_norm_offset,
+        uint64_t              index_k_norm_offset,
+        const ds4_gpu_tensor *mrope_positions,
+        uint32_t              mrope_len,
+        uint32_t              cache_pos,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              query_heads,
+        uint32_t              kv_heads,
+        uint32_t              head_dim,
+        uint32_t              index_heads,
+        uint32_t              index_head_dim,
+        uint32_t              ratio,
+        uint32_t              rope_dim,
+        float                 rope_theta,
+        float                 rms_eps);
+
+/* Sparse QSA over BF16 K/V caches. selected_blocks is the ordered block
+ * top-k produced by the streaming scorer.  The incomplete causal tail is
+ * added inside the kernel, so no [query, context] score sheet or mask is
+ * materialized.  The sigmoid query gate is fused into the output. */
+int ds4_gpu_qwen4_qsa_attention_bf16(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *selected_blocks,
+        const ds4_gpu_tensor *selected_counts,
+        const ds4_gpu_tensor *visible_tokens,
+        uint32_t              queries,
+        uint32_t              cache_cap,
+        uint32_t              query_heads,
+        uint32_t              kv_heads,
+        uint32_t              head_dim,
+        uint32_t              top_k,
+        uint32_t              ratio);
+
+/* Diagnostic readback of the GQA MMA attention's per-tile softmax stats
+ * (16 rows of [max, sum] per processed tile, query 0 / KV head 0 only).
+ * Returns zero when the debug snapshot is unavailable. */
+int ds4_gpu_qwen4_qsa_mma_debug_stats(float *dst, uint32_t floats);
+
+/* Dense-causal QSA used for multimodal requests.  Q/K still populate the
+ * ordinary caches and the indexer still advances, but sparse selection is
+ * deliberately bypassed to match the Qwen M-RoPE reference path. */
+int ds4_gpu_qwen4_qsa_dense_attention_bf16(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        const ds4_gpu_tensor *visible_tokens,
+        uint32_t              queries,
+        uint32_t              cache_cap,
+        uint32_t              query_heads,
+        uint32_t              kv_heads,
+        uint32_t              head_dim);
+
+/* Fuse PLE key/query normalization, signed-sqrt gating, value injection,
+ * convolution normalization, and the stateful dilation-3 short convolution.
+ * The output and convolution state are updated in place without materializing
+ * normalized key/query tensors. */
+int ds4_gpu_qwen4_ple_gate_conv_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gated_norm,
+        ds4_gpu_tensor       *conv_state,
+        const ds4_gpu_tensor *hidden_streams,
+        const ds4_gpu_tensor *key_raw,
+        const ds4_gpu_tensor *value_raw,
+        const ds4_gpu_tensor *mask,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              key_norm_offset,
+        uint64_t              query_norm_offset,
+        uint64_t              conv_norm_offset,
+        uint64_t              conv_weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              stream_count,
+        uint32_t              hidden_dim,
+        uint32_t              conv_width,
+        uint32_t              dilation,
+        float                 eps);
+
+int ds4_gpu_qwen4_ple_gate_conv_capture_model(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gated_norm,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *state_seq,
+        const ds4_gpu_tensor *hidden_streams,
+        const ds4_gpu_tensor *key_raw,
+        const ds4_gpu_tensor *value_raw,
+        const ds4_gpu_tensor *mask,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              key_norm_offset,
+        uint64_t              query_norm_offset,
+        uint64_t              conv_norm_offset,
+        uint64_t              conv_weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              stream_count,
+        uint32_t              hidden_dim,
+        uint32_t              conv_width,
+        uint32_t              dilation,
+        uint32_t              capture_slots,
+        float                 eps);
+
+int ds4_gpu_qwen4_qsa_score_m1(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pooled_k,
+        uint32_t              blocks,
+        uint32_t              valid_blocks,
+        uint32_t              heads,
+        uint32_t              head_dim);
+
+int ds4_gpu_qwen4_qsa_score_m1_f16(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pooled_k,
+        uint32_t              blocks,
+        uint32_t              valid_blocks,
+        uint32_t              heads,
+        uint32_t              head_dim);
+
+int ds4_gpu_qwen4_qsa_score_m1_bf16(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pooled_k,
+        uint32_t              blocks,
+        uint32_t              valid_blocks,
+        uint32_t              heads,
+        uint32_t              head_dim);
+
+/* Decode specialization: FP32 query produced by QSA preparation against the
+ * persistent BF16 pooled-key cache, preserving the M=1 reduction order. */
+int ds4_gpu_qwen4_qsa_score_m1_f32_bf16(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pooled_k,
+        uint32_t              blocks,
+        uint32_t              valid_blocks,
+        uint32_t              heads,
+        uint32_t              head_dim);
+
+int ds4_gpu_qwen4_qsa_topk_scores(
+        ds4_gpu_tensor       *ordered_scores,
+        ds4_gpu_tensor       *ordered_indices,
+        ds4_gpu_tensor       *heap_counts,
+        const ds4_gpu_tensor *scores,
+        uint32_t              blocks,
+        uint32_t              top_k);
+
+int ds4_gpu_qwen4_qsa_stream_topk(
+        ds4_gpu_tensor       *ordered_scores,
+        ds4_gpu_tensor       *ordered_indices,
+        ds4_gpu_tensor       *heap_counts,
+        ds4_gpu_tensor       *tile_scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pooled_k,
+        const ds4_gpu_tensor *visible_blocks,
+        uint32_t              n_queries,
+        uint32_t              blocks,
+        uint32_t              heads,
+        uint32_t              head_dim,
+        uint32_t              top_k,
+        uint32_t              block_tile);
+
+/* Streaming top-k variant reading the persistent pooled-key cache as BF16. */
+int ds4_gpu_qwen4_qsa_stream_topk_bf16(
+        ds4_gpu_tensor       *ordered_scores,
+        ds4_gpu_tensor       *ordered_indices,
+        ds4_gpu_tensor       *heap_counts,
+        ds4_gpu_tensor       *tile_scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *pooled_k,
+        const ds4_gpu_tensor *visible_blocks,
+        uint32_t              n_queries,
+        uint32_t              blocks,
+        uint32_t              heads,
+        uint32_t              head_dim,
+        uint32_t              top_k,
+        uint32_t              block_tile);
 
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving

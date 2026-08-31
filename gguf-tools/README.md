@@ -1,14 +1,17 @@
 # DS4 GGUF Tools
 
 This directory contains the offline tools used to build and evaluate DeepSeek
-V4 Flash GGUF files for `ds4`.
+V4 Flash, GLM-5.3 Flash, and Qwen3.8-Flash-Next packs for `ds4`.
 
 The important pieces are:
 
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
+- `glm53_quantize.py`: GLM converter backed by the local quantization library.
+- `qwen4_pack.py`: Qwen fast-pack converter backed by the same GGML-compatible
+  block quantizers used by the DeepSeek and GLM conversion paths.
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
-  `q8_0`, `q8_K`, `q4_K`, `q2_K`, and `iq2_xxs`.
+  `q8_0`, `q8_K`, `q4_1`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants

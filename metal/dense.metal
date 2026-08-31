@@ -2913,3 +2913,25 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+/* BF16-weight twin of the Q8_0 tile kernel for the Qwen control tensors
+ * (MoE router, GDN decay/beta).  The staging cast rounds each BF16 weight
+ * and each F32 activation to F16 exactly once before the F32-accumulating
+ * matrix products, matching the batched-kernel parity policy of the other
+ * mul_mm variants. */
+struct ds4_dense_block_bf16 {
+    ushort qs[32];
+};
+
+template <typename type4x4>
+void dequantize_dense_bf16(device const ds4_dense_block_bf16 *xb, short il, thread type4x4 & reg) {
+    float4x4 reg_f;
+
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = as_type<float>((uint32_t)xb->qs[i + 16*il] << 16);
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template [[host_name("kernel_mul_mm_bf16_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_bf16, 2, dequantize_dense_bf16, float, float4x4, float, float2x4>;

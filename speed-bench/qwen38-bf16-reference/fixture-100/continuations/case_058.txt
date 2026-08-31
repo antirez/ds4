@@ -1,0 +1,2 @@
+<think>
+The user is asking me to write a checklist to validate that a quantized model still follows instructions. This is
