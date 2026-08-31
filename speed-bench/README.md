@@ -54,7 +54,7 @@ legacy decode path, including token selection, use:
   --tokens 1024
 ```
 
-### GLM-5.3 MTP deferred output-head A/B
+### GLM-5.3 width-2 MTP verification A/B
 
 Build and run the exact optimized/rollback comparison with a GLM-5.3 model:
 
@@ -83,15 +83,18 @@ Two complete 2026-08-31 M4 Max runs recorded:
 
 | Run / block | Optimized t/s | Rollback t/s | Delta |
 |---|---:|---:|---:|
-| 1 / 1 | 29.086967 | 28.700182 | +1.3477% |
-| 1 / 2 | 28.310298 | 27.952702 | +1.2793% |
-| 1 / 3 | 29.172597 | 28.747383 | +1.4791% |
-| 1 aggregate | 28.851359 | 28.462059 | +1.3678% |
-| 2 / 1 | 26.993788 | 27.092747 | -0.3653% |
-| 2 / 2 | 29.120859 | 28.698852 | +1.4705% |
-| 2 / 3 | 27.798862 | 27.304778 | +1.8095% |
-| 2 aggregate | 27.943914 | 27.680773 | +0.9506% |
-| Combined | **28.390387** | **28.065980** | **+1.1559%** |
+| 1 / 1 | 29.136657 | 28.484798 | +2.2884% |
+| 1 / 2 | 28.876846 | 28.477513 | +1.4023% |
+| 1 / 3 | 28.473334 | 28.054908 | +1.4915% |
+| 1 aggregate | 28.826356 | 28.337641 | +1.7246% |
+| 2 / 1 | 29.598591 | 28.867628 | +2.5321% |
+| 2 / 2 | 29.832179 | 29.228604 | +2.0650% |
+| 2 / 3 | 29.882952 | 29.192804 | +2.3641% |
+| 2 aggregate | 29.770724 | 29.095435 | +2.3209% |
+| Combined | **29.290900** | **28.711500** | **+2.0180%** |
+
+See `docs/research/glm53_kda_verify2_snapshot.md` for the exact model,
+runtime revision, confidence calculation, whole-stack control, and Metal trace.
 
 ### Metal prefill variant A/B
 

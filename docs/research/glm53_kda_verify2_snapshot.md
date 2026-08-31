@@ -1,14 +1,15 @@
 # GLM-5.3 width-2 KDA snapshot fusion
 
-Date: 2026-08-31  
-Machine: Mac Studio, Apple M4 Max (16 CPU cores), 128 GiB RAM  
-OS: macOS 26.5.2 (25F84)  
-Upstream base: `b1b4ea03645434423e5cb4f39818fdc075e49825`  
-Measured runtime revision: `48029e0`  
-Model: `antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`,
-92,035.1 MiB, embedded width-2 MTP  
-Model SHA-256: `e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32`  
-Backend/context: Metal, resident model, 8,192-token context
+| Item | Value |
+|---|---|
+| Date | 2026-08-31 |
+| Machine | Mac Studio, Apple M4 Max (16 CPU cores), 128 GiB RAM |
+| OS | macOS 26.5.2 (25F84) |
+| Upstream base | `b1b4ea03645434423e5cb4f39818fdc075e49825` |
+| Measured runtime revision | `48029e0` |
+| Model | `antirez/glm-5.3-flash-gguf/GLM-5.3-Flash-Q2.gguf`, 92,035.1 MiB, embedded width-2 MTP |
+| Model SHA-256 | `e81fd6241c6e55a64e1e14e47a3eab61a173fa8d7e4b5c1d1848827119705b32` |
+| Backend/context | Metal, resident model, 8,192-token context |
 
 ## Result
 
@@ -32,6 +33,12 @@ states, and both output rows. Model-backed resident and SSD-streaming tests
 also require identical token IDs, speculative cycle sizes, positions, and
 full-vocabulary logits after every cycle.
 
+This deliberately keeps the model's native width of two. [PR
+#892](https://github.com/antirez/ds4/pull/892) explores wider drafts and reports
+that its tested widths above two reduce acceptance and throughput. This pass
+takes the orthogonal runtime opportunity: make the useful width-2 transaction
+cheaper without changing the draft distribution or acceptance rule.
+
 ## Change
 
 A rejected width-2 draft must keep KDA state after verifier row 0. The previous
@@ -52,10 +59,17 @@ The live state finishes after row 1. The packed prefix layout remains
 convolution state followed by recurrent state for each KDA layer. A rejected
 draft restores that prefix through the existing speculative transaction; an
 accepted pair keeps the live row-1 state. Ordinary prefill, CUDA, ROCm, and CPU
-paths do not call the new Metal primitive. The dynamic diagnostic rollback is:
+paths do not call the new Metal primitive. On Apple, the transaction allocates
+about 145.6 MiB of packed KDA prefix state per session; that allocation is
+disabled on other backends.
+
+Each part of the optimized stack has a dynamic diagnostic rollback:
 
 ```sh
 DS4_METAL_DISABLE_GLM53_KDA_VERIFY2_SNAPSHOT_FUSION=1
+DS4_GLM_MTP_DISABLE_DEFERRED_ROW1_HEAD=1
+DS4_GLM_DISABLE_MTP_FAST_VERIFY=1
+DS4_GLM_DISABLE_MTP_KDA_PREFIX=1
 ```
 
 ## Paired throughput benchmark
@@ -168,6 +182,30 @@ resident run exercises the fused and split paths and requires byte-identical
 cycle logits. SSD streaming intentionally remains on the established batch
 fallback; its run confirms that the Apple-only fast path does not change the
 streaming result.
+
+The remaining release checks were:
+
+| Check | Result |
+|---|---|
+| `make clean && make` | pass, no compiler warnings |
+| `make cpu` | pass; the fast verifier and snapshot operation compile out on non-Apple builds |
+| `make test-glm53-kda` | pass, including exact snapshots, offset guards, and unaligned-view rejection |
+| `DS4_TEST_GLM_MTP=1 ./ds4_test --mtp-verify-depth` | pass; 256 speculative cycles, maximum chunk 2, zero argmax gap |
+| resident `--session-snapshot` | pass; exact cycle schedule, positions, token IDs, and logits |
+| 16 GiB SSD `--session-snapshot` | pass through the established fallback |
+| model-backed `make test` | non-zero: 39 assertions, all accounted for below |
+| five checks after `ds4_test` in the `make test` recipe | pass when run separately: layer pack, multi-GPU placement, GPU arguments, CLI arguments, and sampling |
+
+The full target was also run with this GLM Q2 file supplied through
+`DS4_TEST_MODEL`. Ten assertions are reference-fixture mismatches: the checked-in
+log-probability vectors and `long_story_4096` golden output were not generated
+from this model/quantization, and the SSD pressure case reuses those vectors.
+The other 29 are two M4 feature-selection families in `--metal-kernels`:
+23 compressor pair state-store assertions and six gathered-KV staging
+assertions. Running `--metal-kernels` against the exact upstream base
+`b1b4ea0` reports the same 29 assertions with the same cases; the branch adds
+none. The full target's five model-backed Metal tensor-equivalence cases all
+pass with zero logit, ranking, or greedy-token difference.
 
 The first automatic SSD-cache attempt was rejected during engine setup because
 the 80% working-set policy left a one-expert cache, below the required 3.80 GiB
