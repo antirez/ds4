@@ -1000,10 +1000,14 @@ static void test_metal_q8_0_decode_pair_exact_case(
 }
 
 static void test_metal_q8_0_decode_pair_exact(void) {
+#if defined(DS4_ROCM_BUILD)
+    fprintf(stderr, "ds4-test: Metal paired Q8_0 exactness skipped on ROCm\n");
+#else
     /* Cover both possible one-bank tail directions. Distinct seeds ensure a
      * mistaken A-for-B weight binding cannot compare equal by construction. */
     test_metal_q8_0_decode_pair_exact_case(77, 19, 11, 97);
     test_metal_q8_0_decode_pair_exact_case(19, 77, 23, 131);
+#endif
 }
 
 #if defined(__APPLE__)

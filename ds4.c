@@ -40640,7 +40640,7 @@ static double glm_graph_bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 static uint64_t g_glm_rocm_guard_available_baseline;
 #endif
 
@@ -62390,7 +62390,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     g_glm_rocm_guard_available_baseline =
         glm_graph_host_available_memory_bytes();
 #endif
