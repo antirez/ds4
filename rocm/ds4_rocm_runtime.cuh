@@ -6215,6 +6215,12 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" uint64_t ds4_gpu_model_views_generation(void) {
+    /* The ROCm backend never clears registered model views, so the
+     * generation is constant. */
+    return 0;
+}
+
 extern "C" int ds4_gpu_set_aux_model_map_range(
         const void *model_map,
         uint64_t model_size,
