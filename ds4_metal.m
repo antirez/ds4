@@ -9506,6 +9506,13 @@ static uint64_t g_tp_batch_seq;
 static int32_t g_tp_split_rank;
 static int32_t g_tp_split_world = 1;
 static int32_t g_tp_session_batch_mode;
+/* Boot-time placement hint; the setter runs before the TP service starts. */
+static int32_t g_tp_resident_session_count = 1;
+static bool g_tp_gate_split;
+static bool g_tp_gate_split_env;
+static bool g_tp_gate_fused_env;
+static bool g_tp_gate_mode_parsed;
+static bool g_tp_resident_session_count_set;
 
 static int ds4_gpu_tp_world_is_two(void) {
     return g_tp_split_world == 2;
@@ -9581,6 +9588,8 @@ static pthread_cond_t g_tp_cond = PTHREAD_COND_INITIALIZER;
 static ds4_gpu_tp_request g_tp_queue[DS4_GPU_TP_QUEUE];
 static uint32_t g_tp_queue_head;
 static uint32_t g_tp_queue_count;
+static uint64_t g_tp_done_seq;
+static uint64_t g_tp_batch_done_seq;
 
 static uint64_t g_tp_stat_gates;
 static double g_tp_stat_gpu_wait_ms;
@@ -9604,6 +9613,13 @@ void ds4_gpu_tp_keepalive_pause(int paused) {
 
 void ds4_gpu_tp_set_session_batch_mode(int enabled) {
     g_tp_session_batch_mode = enabled ? 1 : 0;
+}
+void ds4_gpu_tp_set_resident_session_count(int count) {
+    /* The engine writes this boot-time hint before starting the service
+     * thread; gate packaging is then immutable for the process lifetime. */
+    if (g_tp_thread_running || g_tp_resident_session_count_set) return;
+    g_tp_resident_session_count = count > 1 ? count : 1;
+    g_tp_resident_session_count_set = true;
 }
 
 static uint32_t ds4_gpu_tp_keepalive_tgs_from_env(void) {
@@ -9711,7 +9727,10 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         }
         const double t1 = profile ? ds4_gpu_now_ms() : 0.0;
         int ok = 0;
-        if (!g_tp_shutdown && !g_tp_failed_flag) {
+        pthread_mutex_lock(&g_tp_mutex);
+        const int can_exchange = !g_tp_shutdown && !g_tp_failed_flag;
+        pthread_mutex_unlock(&g_tp_mutex);
+        if (can_exchange) {
             if (req.big_bytes > 0) {
                 if (g_tp_big_exchange_fn)
                     ok = g_tp_big_exchange_fn(g_tp_exchange_ud, req.layer,
@@ -9726,15 +9745,27 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                                       req.seq);
             }
         }
-        if (!ok && !g_tp_shutdown) {
-            if (!g_tp_failed_flag)
-                fprintf(stderr, "ds4: TP gate exchange failed (layer %u gate %u seq %llu)\n",
-                        req.layer, req.gate, (unsigned long long)req.seq);
-            g_tp_failed_flag = 1;
+        if (!ok) {
+            pthread_mutex_lock(&g_tp_mutex);
+            if (!g_tp_shutdown) {
+                if (!g_tp_failed_flag)
+                    fprintf(stderr, "ds4: TP gate exchange failed (layer %u gate %u seq %llu)\n",
+                            req.layer, req.gate, (unsigned long long)req.seq);
+                g_tp_failed_flag = 1;
+            }
+            pthread_mutex_unlock(&g_tp_mutex);
         }
         /* Release the GPU even on failure so end_commands can drain. */
         if (req.rows > 0) g_tp_batch_cpu_event.signaledValue = req.seq;
         else g_tp_cpu_event.signaledValue = req.seq;
+        pthread_mutex_lock(&g_tp_mutex);
+        if (req.rows > 0) {
+            if (req.seq > g_tp_batch_done_seq) g_tp_batch_done_seq = req.seq;
+        } else if (req.seq > g_tp_done_seq) {
+            g_tp_done_seq = req.seq;
+        }
+        pthread_cond_broadcast(&g_tp_cond);
+        pthread_mutex_unlock(&g_tp_mutex);
         if (profile) {
             g_tp_stat_gpu_wait_ms += t1 - t0;
             g_tp_stat_exchange_ms += ds4_gpu_now_ms() - t1;
@@ -9749,6 +9780,25 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
     }
     return NULL;
 }
+static int ds4_gpu_tp_wait_service(uint32_t rows, uint64_t seq) {
+    pthread_mutex_lock(&g_tp_mutex);
+    uint64_t *done = rows > 0 ? &g_tp_batch_done_seq : &g_tp_done_seq;
+    while (*done < seq && !g_tp_shutdown)
+        pthread_cond_wait(&g_tp_cond, &g_tp_mutex);
+    const int ok = *done >= seq && !g_tp_failed_flag;
+    pthread_mutex_unlock(&g_tp_mutex);
+    return ok;
+}
+
+/* Split only after the arrival marker is queued: the committed buffer has
+ * local compute plus a signal, never a peer-dependent event wait. */
+static int ds4_gpu_tp_split_command_batch(uint32_t rows, uint64_t seq) {
+    const int ended = ds4_gpu_end_commands();
+    const int released = ds4_gpu_tp_wait_service(rows, seq);
+    const int began = ds4_gpu_begin_commands();
+    return ended && released && began;
+}
+
 
 int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
@@ -9767,6 +9817,22 @@ int ds4_gpu_tp_init(uint32_t rank,
      * (A/B 2026-07-06, byte-identical output).  DS4_TP_EVENT_GATES falls
      * back to the shared-event arrival path. */
     g_tp_flag_gates = g_tp_gpu_flags != NULL && getenv("DS4_TP_EVENT_GATES") == NULL;
+    if (!g_tp_gate_mode_parsed) {
+        const char *split_env = getenv("DS4_TP_GATE_SPLIT");
+        const char *fused_env = getenv("DS4_TP_GATE_FUSED");
+        g_tp_gate_split_env = split_env && strcmp(split_env, "1") == 0;
+        g_tp_gate_fused_env = fused_env && strcmp(fused_env, "1") == 0;
+        g_tp_gate_mode_parsed = true;
+    }
+    g_tp_gate_split = !g_tp_gate_fused_env &&
+                      (g_tp_gate_split_env || g_tp_resident_session_count > 1);
+    fprintf(stderr,
+            "ds4: TP gate mode=%s resident_sessions=%d "
+            "(DS4_TP_GATE_SPLIT=%d DS4_TP_GATE_FUSED=%d)\n",
+            g_tp_gate_split ? "split" : "fused",
+            g_tp_resident_session_count,
+            g_tp_gate_split_env ? 1 : 0,
+            g_tp_gate_fused_env ? 1 : 0);
     g_tp_gpu_event = [g_device newSharedEvent];
     g_tp_cpu_event = [g_device newSharedEvent];
     g_tp_batch_gpu_event = [g_device newSharedEvent];
@@ -9780,6 +9846,8 @@ int ds4_gpu_tp_init(uint32_t rank,
     g_tp_exchange_ud = ud;
     g_tp_seq = 0;
     g_tp_batch_seq = 0;
+    g_tp_done_seq = 0;
+    g_tp_batch_done_seq = 0;
     g_tp_shutdown = 0;
     g_tp_failed_flag = 0;
     g_tp_queue_head = 0;
@@ -9836,6 +9904,44 @@ void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     if (!g_tp_thread_running) return;
     g_tp_split_world = suspend ? 1 : 2;
 }
+/*
+ * P0 from misc/WATCHDOG-RESEARCH.md: Apple timeout semantics count an
+ * MTLEvent wait against the GPU watchdog, so split TP mode commits before
+ * the peer-dependent release and lets the service thread complete it on CPU.
+ * DS4_TP_GATE_FUSED=1 restores the old fused encoding; DS4_TP_GATE_SPLIT=1
+ * forces split, otherwise only resident_sessions > 1 selects split mode.
+ * If both overrides are set, FUSED wins for an explicit A/B rollback.
+ * A 43-layer, two-gate token is 2*43+1 = 87 split buffers (or 3*43 = 129
+ * when an existing per-layer callback boundary is also present), not 86
+ * wait-only buffers.  CB packaging may differ by rank safely; only seq/wire
+ * lockstep must match, so asymmetry is protocol-safe but merely suboptimal.
+ */
+
+static int ds4_gpu_tp_enqueue_request(uint32_t layer, uint32_t gate,
+                                      uint32_t rows, uint32_t event_arrival,
+                                      uint64_t seq, const void *big_out,
+                                      void *big_in, uint64_t big_bytes) {
+    pthread_mutex_lock(&g_tp_mutex);
+    if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
+        pthread_mutex_unlock(&g_tp_mutex);
+        fprintf(stderr, "ds4: TP gate queue overflow\n");
+        return 0;
+    }
+    const uint32_t tail =
+        (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
+    g_tp_queue[tail].layer = layer;
+    g_tp_queue[tail].gate = gate;
+    g_tp_queue[tail].rows = rows;
+    g_tp_queue[tail].event_arrival = event_arrival;
+    g_tp_queue[tail].seq = seq;
+    g_tp_queue[tail].big_out = big_out;
+    g_tp_queue[tail].big_in = big_in;
+    g_tp_queue[tail].big_bytes = big_bytes;
+    g_tp_queue_count++;
+    pthread_cond_signal(&g_tp_cond);
+    pthread_mutex_unlock(&g_tp_mutex);
+    return 1;
+}
 
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (!g_batch_cb) {
@@ -9874,26 +9980,18 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         ds4_gpu_close_batch_encoder();
         [g_batch_cb encodeSignalEvent:g_tp_gpu_event value:seq];
     }
-    [g_batch_cb encodeWaitForEvent:g_tp_cpu_event value:seq];
-    pthread_mutex_lock(&g_tp_mutex);
-    if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
-        pthread_mutex_unlock(&g_tp_mutex);
-        fprintf(stderr, "ds4: TP gate queue overflow\n");
+    if (!g_tp_gate_split) {
+        [g_batch_cb encodeWaitForEvent:g_tp_cpu_event value:seq];
+        return ds4_gpu_tp_enqueue_request(layer, gate, 0,
+                                          event_arrival ? 1u : 0u,
+                                          seq, NULL, NULL, 0);
+    }
+    if (!ds4_gpu_tp_enqueue_request(layer, gate, 0,
+                                    event_arrival ? 1u : 0u,
+                                    seq, NULL, NULL, 0)) {
         return 0;
     }
-    uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
-    g_tp_queue[tail].layer = layer;
-    g_tp_queue[tail].gate = gate;
-    g_tp_queue[tail].rows = 0;
-    g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
-    g_tp_queue[tail].seq = seq;
-    g_tp_queue[tail].big_out = NULL;
-    g_tp_queue[tail].big_in = NULL;
-    g_tp_queue[tail].big_bytes = 0;
-    g_tp_queue_count++;
-    pthread_cond_signal(&g_tp_cond);
-    pthread_mutex_unlock(&g_tp_mutex);
-    return 1;
+    return ds4_gpu_tp_split_command_batch(0, seq);
 }
 
 void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
@@ -9932,42 +10030,26 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
         ds4_gpu_close_batch_encoder();
         [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
     }
-    [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
-    pthread_mutex_lock(&g_tp_mutex);
-    if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
-        pthread_mutex_unlock(&g_tp_mutex);
-        fprintf(stderr, "ds4: TP gate queue overflow\n");
+    if (!g_tp_gate_split) {
+        [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
+        return ds4_gpu_tp_enqueue_request(layer, 1u, rows,
+                                          event_arrival ? 1u : 0u,
+                                          seq, NULL, NULL, 0);
+    }
+    if (!ds4_gpu_tp_enqueue_request(layer, 1u, rows,
+                                    event_arrival ? 1u : 0u,
+                                    seq, NULL, NULL, 0)) {
         return 0;
     }
-    uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
-    g_tp_queue[tail].layer = layer;
-    g_tp_queue[tail].gate = 1u; /* FFN */
-    g_tp_queue[tail].rows = rows;
-    g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
-    g_tp_queue[tail].seq = seq;
-    g_tp_queue[tail].big_out = NULL;
-    g_tp_queue[tail].big_in = NULL;
-    g_tp_queue[tail].big_bytes = 0;
-    g_tp_queue_count++;
-    pthread_cond_signal(&g_tp_cond);
-    pthread_mutex_unlock(&g_tp_mutex);
-    return 1;
+    return ds4_gpu_tp_split_command_batch(rows, seq);
 }
 
 /* Prefill batch gate kick: same seq space and release event as the verify
  * batch gate, but the service thread exchanges big_bytes directly between
- * the two shared bounce buffers instead of slab slots.  The kick only
- * publishes the GPU arrival marker and queues the exchange; the caller
- * encodes the release wait later through ds4_gpu_tp_big_gate_wait, which
- * lets it interleave more GPU work with the wire exchange.  Arrival always
- * uses the batch shared event, NOT the flag word: a flag write carries no
- * memory-visibility guarantee for the payload buffer, and once the GPU
- * keeps running past the kick (no event wait right behind it) the service
- * thread can observe the flag before the producing kernels' stores reach
- * CPU-visible memory (measured: stale rows in the first sub-kick).  The
- * shared-event signal only fires after every preceding command completes,
- * which is exactly the payload ordering the exchange needs; the ~10 us
- * slower arrival detection is noise against a multi-ms exchange. */
+ * the two shared bounce buffers instead of slab slots.  The kick publishes
+ * arrival and queues the exchange; fused wait encodes a GPU release, while
+ * split wait commits the local work before reopening the batch.  Arrival
+ * stays on the batch shared event so bounce payload stores are visible. */
 uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,
@@ -9983,36 +10065,23 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     const uint64_t seq = ++g_tp_batch_seq;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
-    pthread_mutex_lock(&g_tp_mutex);
-    if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
-        pthread_mutex_unlock(&g_tp_mutex);
-        fprintf(stderr, "ds4: TP gate queue overflow\n");
+    if (!ds4_gpu_tp_enqueue_request(layer, 1u, rows, 1u, seq,
+                                     out_ptr, in_ptr, bytes)) {
         return 0;
     }
-    uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
-    g_tp_queue[tail].layer = layer;
-    g_tp_queue[tail].gate = 1u;
-    g_tp_queue[tail].rows = rows;
-    g_tp_queue[tail].event_arrival = 1u;
-    g_tp_queue[tail].seq = seq;
-    g_tp_queue[tail].big_out = out_ptr;
-    g_tp_queue[tail].big_in = in_ptr;
-    g_tp_queue[tail].big_bytes = bytes;
-    g_tp_queue_count++;
-    pthread_cond_signal(&g_tp_cond);
-    pthread_mutex_unlock(&g_tp_mutex);
     return seq;
 }
 
-/* Encode the GPU-side release wait for a previously kicked big gate.  The
- * batch release event is monotonic and the service thread completes queued
- * exchanges in kick order, so waiting on the LAST kicked seq of a stage
- * also covers every earlier kick. */
+/* A fused gate keeps the legacy GPU wait.  Split mode commits the kicked
+ * buffer and waits for the CPU service completion before reopening it. */
 int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
     if (!g_batch_cb || seq == 0) return 0;
-    ds4_gpu_close_batch_encoder();
-    [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
-    return 1;
+    if (!g_tp_gate_split) {
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
+        return 1;
+    }
+    return ds4_gpu_tp_split_command_batch(1, seq);
 }
 
 int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
@@ -10025,7 +10094,10 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 }
 
 int ds4_gpu_tp_failed(void) {
-    return g_tp_failed_flag;
+    pthread_mutex_lock(&g_tp_mutex);
+    const int failed = g_tp_failed_flag;
+    pthread_mutex_unlock(&g_tp_mutex);
+    return failed;
 }
 
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
