@@ -145,6 +145,70 @@ static void test_close_engine(bool quality) {
     *slot = NULL;
 }
 
+static bool test_tokens_match(const ds4_tokens *a, const ds4_tokens *b) {
+    if (!a || !b || a->len != b->len) return false;
+    for (int i = 0; i < a->len; i++) {
+        if (a->v[i] != b->v[i]) return false;
+    }
+    return true;
+}
+
+static void test_raw_completion_prompt_tokenization(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    const char *raw = "Raw completion text <think> remains direct.";
+    request r;
+    char err[160] = {0};
+    bool ok = parse_completion_request(
+        engine,
+        "{\"prompt\":\"Raw completion text <think> remains direct.\",\"max_tokens\":0,\"thinking\":true,\"think\":true,\"reasoning_effort\":\"max\"}",
+        128, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    if (ok) {
+        ds4_tokens expected = {0};
+        ds4_chat_begin(engine, &expected);
+        ds4_tokenize_rendered_chat(engine, raw, &expected);
+        TEST_ASSERT(r.prompt_text && !strcmp(r.prompt_text, raw));
+        TEST_ASSERT(test_tokens_match(&r.prompt, &expected));
+        TEST_ASSERT(r.max_tokens == 0);
+        TEST_ASSERT(r.think_mode == DS4_THINK_NONE);
+        ds4_tokens_free(&expected);
+        request_free(&r);
+    }
+
+    ok = parse_completion_request(
+        engine, "{\"prompt\":\"<think>\",\"max_tokens\":0}",
+        128, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    if (ok) {
+        ds4_tokens start = {0};
+        ds4_chat_begin(engine, &start);
+        TEST_ASSERT(r.prompt.len == start.len + 1);
+        ds4_tokens_free(&start);
+        request_free(&r);
+    }
+
+    const int vocab_size = ds4_engine_vocab_size(engine);
+    char body[128];
+    snprintf(body, sizeof(body), "{\"prompt\":[%d],\"max_tokens\":0}",
+             vocab_size - 1);
+    ok = parse_completion_request(
+        engine, body, 128, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    if (ok) {
+        TEST_ASSERT(r.prompt.len == 1 && r.prompt.v[0] == vocab_size - 1);
+        request_free(&r);
+    }
+
+    snprintf(body, sizeof(body), "{\"prompt\":[%d],\"max_tokens\":0}",
+             vocab_size);
+    ok = parse_completion_request(
+        engine, body, 128, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+}
+
 static void test_session_snapshot_roundtrip(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -1000,10 +1064,14 @@ static void test_metal_q8_0_decode_pair_exact_case(
 }
 
 static void test_metal_q8_0_decode_pair_exact(void) {
+#if defined(DS4_ROCM_BUILD)
+    fprintf(stderr, "ds4-test: Metal paired Q8_0 exactness skipped on ROCm\n");
+#else
     /* Cover both possible one-bank tail directions. Distinct seeds ensure a
      * mistaken A-for-B weight binding cannot compare equal by construction. */
     test_metal_q8_0_decode_pair_exact_case(77, 19, 11, 97);
     test_metal_q8_0_decode_pair_exact_case(19, 77, 23, 131);
+#endif
 }
 
 #if defined(__APPLE__)
@@ -6795,6 +6863,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
+    {"--raw-completions", "raw-completions", "raw Completion string, special-token, and token-ID prompt construction", test_raw_completion_prompt_tokenization},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},

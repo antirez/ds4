@@ -1238,6 +1238,8 @@ not select a different model.
 Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
 tool calls are mapped back to OpenAI tool calls.
 
+`/v1/completions` performs raw prefix completion without applying a chat template. `prompt` accepts either one string or one non-empty flat array of integer token IDs; batches, nested arrays, string arrays, mixed arrays, and out-of-range IDs are rejected. String prompts receive the model-family start sequence and recognize explicitly spelled special tokens, while token arrays are used exactly as supplied. The compatibility fields `thinking`, `think`, and `reasoning_effort` are validated but ignored because they cannot alter a raw Completion prompt.
+
 `/v1/responses` accepts OpenAI Responses-style `input`, `instructions`,
 `tools`, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`, `stream`,
 and `reasoning`. It is the preferred endpoint for Codex CLI. The server keeps
