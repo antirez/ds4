@@ -38182,10 +38182,10 @@ static void embed_prompt(
  * =========================================================================
  *
  * DeepSeek V4 Flash stores a GPT-2 style byte-level BPE tokenizer in GGUF.
- * The implementation below is intentionally small.  It loads token strings
- * and merge ranks from the mmaped file, builds two open-addressed hash tables,
- * and applies BPE to user text.  Chat special tokens are inserted directly by
- * ID; user text goes through BPE.
+ * The implementation below is intentionally small.  It copies token strings
+ * and merge keys into one compact owned arena, builds two open-addressed hash
+ * tables, and applies BPE to user text. Tensor data remains mmap-backed. Chat
+ * special tokens are inserted directly by ID; user text goes through BPE.
  */
 
 typedef struct {
@@ -38288,6 +38288,7 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
 
 struct ds4_vocab {
     ds4_str *token;
+    char *string_storage;       /* Owns token strings and hash table keys. */
     int n_vocab;
     int bos_id;
     int eos_id;
@@ -39199,6 +39200,71 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+static size_t vocab_array_storage_bytes(const ds4_model *model,
+                                        ds4_array_ref array) {
+    size_t total = 0;
+    ds4_cursor c = cursor_at(model, array.data_pos);
+    for (uint64_t i = 0; i < array.len; i++) {
+        ds4_str s;
+        if (!cursor_string(&c, &s)) ds4_die(c.error);
+        if (s.len > SIZE_MAX - total) {
+            ds4_die("GGUF tokenizer string data is too large");
+        }
+        total += (size_t)s.len;
+    }
+    return total;
+}
+
+static ds4_str vocab_copy_string(ds4_cursor *c, char **dst,
+                                 size_t *remaining) {
+    ds4_str borrowed;
+    if (!cursor_string(c, &borrowed)) ds4_die(c->error);
+    if (borrowed.len > *remaining) {
+        ds4_die("GGUF tokenizer string data changed while loading");
+    }
+    memcpy(*dst, borrowed.ptr, (size_t)borrowed.len);
+    ds4_str owned = { *dst, borrowed.len };
+    *dst += (size_t)borrowed.len;
+    *remaining -= (size_t)borrowed.len;
+    return owned;
+}
+
+static void vocab_load_string_storage(ds4_vocab *vocab,
+                                      const ds4_model *model,
+                                      ds4_array_ref tokens,
+                                      ds4_array_ref merges) {
+    const size_t token_bytes = vocab_array_storage_bytes(model, tokens);
+    const size_t merge_bytes = vocab_array_storage_bytes(model, merges);
+    if (merge_bytes > SIZE_MAX - token_bytes) {
+        ds4_die("GGUF tokenizer string data is too large");
+    }
+
+    const size_t storage_bytes = token_bytes + merge_bytes;
+    vocab->string_storage = xmalloc(storage_bytes ? storage_bytes : 1);
+    char *dst = vocab->string_storage;
+    size_t remaining = storage_bytes;
+
+    vocab->n_vocab = (int)tokens.len;
+    vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
+    table_init(&vocab->token_to_id, tokens.len);
+
+    ds4_cursor c = cursor_at(model, tokens.data_pos);
+    for (int i = 0; i < vocab->n_vocab; i++) {
+        vocab->token[i] = vocab_copy_string(&c, &dst, &remaining);
+        table_put(&vocab->token_to_id, vocab->token[i], i);
+    }
+
+    table_init(&vocab->merge_rank, merges.len);
+    c = cursor_at(model, merges.data_pos);
+    for (uint64_t i = 0; i < merges.len; i++) {
+        ds4_str merge = vocab_copy_string(&c, &dst, &remaining);
+        table_put(&vocab->merge_rank, merge, (int)i);
+    }
+    if (remaining != 0) {
+        ds4_die("GGUF tokenizer string data changed while loading");
+    }
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
@@ -39216,23 +39282,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         ds4_die("GGUF tokenizer merge table is missing or invalid");
     }
 
-    vocab->n_vocab = (int)tokens.len;
-    vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
-    table_init(&vocab->token_to_id, tokens.len);
-
-    ds4_cursor c = cursor_at(model, tokens.data_pos);
-    for (int i = 0; i < vocab->n_vocab; i++) {
-        if (!cursor_string(&c, &vocab->token[i])) ds4_die(c.error);
-        table_put(&vocab->token_to_id, vocab->token[i], i);
-    }
-
-    table_init(&vocab->merge_rank, merges.len);
-    c = cursor_at(model, merges.data_pos);
-    for (uint64_t i = 0; i < merges.len; i++) {
-        ds4_str merge;
-        if (!cursor_string(&c, &merge)) ds4_die(c.error);
-        table_put(&vocab->merge_rank, merge, (int)i);
-    }
+    vocab_load_string_storage(vocab, model, tokens, merges);
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
@@ -39284,6 +39334,7 @@ static void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
+    free(vocab->string_storage);
     memset(vocab, 0, sizeof(*vocab));
 }
 
@@ -39620,6 +39671,129 @@ static bool vocab_token_is_literal_special(ds4_str s) {
     }
     return false;
 }
+
+#ifdef DS4_TEST_HOOKS
+static size_t ds4_test_write_gguf_string(uint8_t *dst, size_t pos,
+                                         const char *s) {
+    const uint64_t len = (uint64_t)strlen(s);
+    memcpy(dst + pos, &len, sizeof(len));
+    pos += sizeof(len);
+    memcpy(dst + pos, s, (size_t)len);
+    return pos + (size_t)len;
+}
+
+static bool ds4_test_vocab_keys_are_detached(const str_i32_table *table,
+                                             uintptr_t map_begin,
+                                             uintptr_t map_end) {
+    for (uint64_t i = 0; i < table->cap; i++) {
+        if (!table->entry[i].used) continue;
+        const uintptr_t ptr = (uintptr_t)table->entry[i].key.ptr;
+        if (ptr >= map_begin && ptr < map_end) return false;
+    }
+    return true;
+}
+
+int ds4_test_vocab_storage_detached(void) {
+    static const char *tokens[] = {
+        "a",
+        "b",
+        "ab",
+        "<\xef\xbd\x9c" "special" "\xef\xbd\x9c>",
+    };
+    static const char *merges[] = { "a b" };
+
+    size_t map_size = 0;
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        map_size += sizeof(uint64_t) + strlen(tokens[i]);
+    }
+    for (size_t i = 0; i < sizeof(merges) / sizeof(merges[0]); i++) {
+        map_size += sizeof(uint64_t) + strlen(merges[i]);
+    }
+
+#if defined(MAP_ANONYMOUS)
+    const int map_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#elif defined(MAP_ANON)
+    const int map_flags = MAP_PRIVATE | MAP_ANON;
+#else
+    return 0;
+#endif
+    uint8_t *mapping = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                            map_flags, -1, 0);
+    if (mapping == MAP_FAILED) return 0;
+
+    size_t pos = 0;
+    const uint64_t token_pos = pos;
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        pos = ds4_test_write_gguf_string(mapping, pos, tokens[i]);
+    }
+    const uint64_t merge_pos = pos;
+    for (size_t i = 0; i < sizeof(merges) / sizeof(merges[0]); i++) {
+        pos = ds4_test_write_gguf_string(mapping, pos, merges[i]);
+    }
+
+    ds4_model model = {
+        .fd = -1,
+        .map = mapping,
+        .size = pos,
+    };
+    const ds4_array_ref token_array = {
+        .type = GGUF_VALUE_STRING,
+        .len = sizeof(tokens) / sizeof(tokens[0]),
+        .data_pos = token_pos,
+    };
+    const ds4_array_ref merge_array = {
+        .type = GGUF_VALUE_STRING,
+        .len = sizeof(merges) / sizeof(merges[0]),
+        .data_pos = merge_pos,
+    };
+    ds4_vocab vocab = {0};
+    vocab_load_string_storage(&vocab, &model, token_array, merge_array);
+
+    const uintptr_t map_begin = (uintptr_t)mapping;
+    const uintptr_t map_end = map_begin + pos;
+    bool detached = vocab.string_storage != NULL;
+    for (int i = 0; detached && i < vocab.n_vocab; i++) {
+        const uintptr_t ptr = (uintptr_t)vocab.token[i].ptr;
+        detached = ptr < map_begin || ptr >= map_end;
+    }
+    detached = detached &&
+        ds4_test_vocab_keys_are_detached(&vocab.token_to_id,
+                                         map_begin, map_end) &&
+        ds4_test_vocab_keys_are_detached(&vocab.merge_rank,
+                                         map_begin, map_end);
+
+    if (munmap(mapping, map_size) != 0 || !detached) {
+        vocab_free(&vocab);
+        return 0;
+    }
+
+    int token = -1;
+    int rank = -1;
+    bool ok = table_get(&vocab.token_to_id, "ab", 2, &token) &&
+              token == 2 &&
+              table_get(&vocab.merge_rank, "a b", 3, &rank) &&
+              rank == 0 &&
+              vocab.token[2].len == 2 &&
+              memcmp(vocab.token[2].ptr, "ab", 2) == 0;
+
+    ds4_engine *engine = xcalloc(1, sizeof(*engine));
+    engine->vocab = vocab;
+    size_t text_len = 0;
+    char *text = ds4_token_text(engine, 3, &text_len);
+    ok = ok && text_len == vocab.token[3].len &&
+         memcmp(text, vocab.token[3].ptr, text_len) == 0;
+    free(text);
+    free(engine);
+
+    token_vec encoded = {0};
+    bpe_emit_piece(&vocab, (ds4_str){ "ab", 2 }, &encoded);
+    ok = ok && encoded.len == 1 && encoded.v[0] == 2;
+
+    token_vec_free(&encoded);
+    vocab_free(&vocab);
+    return ok ? 1 : 0;
+}
+#endif
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     ds4_vocab *vocab = &e->vocab;
