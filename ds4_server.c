@@ -6332,6 +6332,7 @@ typedef struct {
     bool active;
     bool checked_think_prefix;
     bool guard_second_reasoning;
+    bool guard_second_reasoning_probed;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
@@ -7199,7 +7200,15 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
             } else if (!tool && !final) {
-                return true;
+                /* A malformed second reasoning pass has no opening marker, so
+                 * give it one sampling update to reveal its closing marker.
+                 * Never hold an ordinary tool-enabled answer for the entire
+                 * generation: after that single probe, stream it normally. */
+                if (!st->guard_second_reasoning_probed) {
+                    st->guard_second_reasoning_probed = true;
+                    return true;
+                }
+                st->guard_second_reasoning = false;
             } else {
                 st->guard_second_reasoning = false;
             }
@@ -15208,9 +15217,16 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     const char *raw1 = "<think>need a tool</think>Hello.\n\n";
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
                                          raw1, strlen(raw1), false));
+    TEST_ASSERT(!st.sent_content);
+
+    const char *raw2 =
+        "<think>need a tool</think>Hello from the live stream.\n\n";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
+                                         raw2, strlen(raw2), false));
+    TEST_ASSERT(st.sent_content);
 
     const char *raw =
-        "<think>need a tool</think>Hello.\n\n"
+        "<think>need a tool</think>Hello from the live stream.\n\n"
         DS4_TOOL_CALLS_START "\n";
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_test", &st,
                                          raw, strlen(raw), false));
@@ -15224,7 +15240,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     const char *role = strstr(out, "\"role\":\"assistant\"");
     const char *thinking = strstr(out, "\"reasoning_content\":\"need a tool\"");
-    const char *text = strstr(out, "\"content\":\"Hello.\"");
+    const char *text = strstr(out, "\"content\":\"Hello from the live stream.\"");
     const char *tool = strstr(out, "\"tool_calls\"");
     const char *done = strstr(out, "data: [DONE]");
     TEST_ASSERT(role != NULL);
@@ -15241,6 +15257,47 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     free(out);
     tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_sends_answer_before_finish(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *first = "<think>consider it</think>I love";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_live_answer",
+                                         &st, first, strlen(first), false));
+    TEST_ASSERT(!st.sent_content);
+
+    const char *second =
+        "<think>consider it</think>I love answers that stream while they are generated.";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_live_answer",
+                                         &st, second, strlen(second), false));
+    TEST_ASSERT(st.sent_content);
+
+    char live[4096];
+    ssize_t live_len = recv(sv[1], live, sizeof(live) - 1u, MSG_DONTWAIT);
+    TEST_ASSERT(live_len > 0);
+    if (live_len > 0) {
+        live[live_len] = '\0';
+        TEST_ASSERT(strstr(live,
+            "\"content\":\"I love answers that stream while they are generated.\"") != NULL);
+        TEST_ASSERT(strstr(live, "data: [DONE]") == NULL);
+    }
+
+    openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -19442,6 +19499,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_tool_stream_sends_answer_before_finish();
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
