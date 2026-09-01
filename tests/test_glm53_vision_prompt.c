@@ -44,8 +44,10 @@ int main(int argc, char **argv) {
     options.context_size = 4096;
     options.quality = true;
 #ifdef DS4_ROCM_BUILD
-    options.ssd_streaming = true;
-    options.ssd_streaming_cache_bytes = UINT64_C(32) << 30;
+    if (getenv("DS4_TEST_SSD_STREAMING") != NULL) {
+        options.ssd_streaming = true;
+        options.ssd_streaming_cache_bytes = UINT64_C(32) << 30;
+    }
 #endif
 
     ds4_engine *engine = NULL;
