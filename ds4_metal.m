@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach-o/dyld.h>
 
 #include <stdint.h>
 #include <inttypes.h>
@@ -4359,6 +4360,20 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
     ];
 
+    /* Shader sources resolve against the current directory first, then against
+     * the directory containing the executable, so the binary can be launched
+     * from any working directory (e.g. inside another project). */
+    NSString *exe_dir = nil;
+    {
+        char exe_path[4096];
+        uint32_t exe_len = sizeof(exe_path);
+        if (_NSGetExecutablePath(exe_path, &exe_len) == 0) {
+            NSString *resolved = [[NSString stringWithUTF8String:exe_path]
+                                     stringByResolvingSymlinksInPath];
+            exe_dir = [resolved stringByDeletingLastPathComponent];
+        }
+    }
+
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
@@ -4368,6 +4383,8 @@ static NSString *ds4_gpu_full_source(void) {
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        if (exe_dir)
+            [paths addObject:[exe_dir stringByAppendingPathComponent:spec[1]]];
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;
