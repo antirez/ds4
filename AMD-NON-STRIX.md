@@ -6,11 +6,11 @@ systemd-boot and a smaller RDNA3 part. The reference machine is a Radeon 780M
 (`gfx1103`, Ryzen 7 8845HS) with 58 GiB of usable system RAM, ROCm 7.2.4 and
 kernel 7.2.0.
 
-What was verified here: `make rocm` builds, `make test-mxfp4-rocm` passes, and
-`make cpu` still builds. What was not: `make test`, which needs a model file.
-No supported model has been run end to end on this machine, because none of the
-published GGUFs fit in 58 GiB resident. The build carries one pre-existing
-warning in `ds4_server.c`, unrelated to anything described here.
+What was verified here: `make rocm` builds, `make test-mxfp4-rocm` passes,
+`make cpu` still builds, and DeepSeek V4 Flash IQ2XXS answers prompts through
+`--ssd-streaming` (section 7). What was not: `make test`, which needs a model
+file. The build carries one pre-existing warning in `ds4_server.c`, unrelated
+to anything described here.
 
 ## 1. ROCm packages
 
@@ -191,9 +191,82 @@ model reaches the device cache in 0.392 s, about 8.1 GiB/s. That is a
 host-to-device staging path, not the device-side read above, and the two are
 not comparable.
 
-## 7. Limits
+## 7. DeepSeek V4 Flash through SSD streaming
+
+README.md documents SSD streaming on Metal and for GLM 5.2 on ROCm, and says
+the two-host Strix Halo split "does not add ROCm SSD streaming support for
+Flash". Nothing in the code refuses it:
+`ds4_backend_supports_ssd_streaming` returns true for any ROCm build without
+looking at the model family. On this machine Flash does run, so I read those
+lines as a statement about what has been tested rather than a limit.
+
+The credit for the idea goes to jhohertz, who reported it on the pull request
+that carries this file. What I add is that the `gfx1100` substitution his
+recipe uses is not required to get a run.
+
+```text
+Radeon 780M (gfx1103), Ryzen 7 8845HS, 58 GiB RAM, 4 GiB VRAM, 46 GiB GTT
+CachyOS, kernel 7.2.0, ROCm 7.2.4
+DeepSeek-V4-Flash-IQ2XXS-...-imatrix-0731.gguf, 80.76 GiB, on the NVMe drive
+```
+
+```sh
+DS4_ROCM_STREAM_FREE_RESERVE_GB=2 ./ds4 --ssd-streaming -m ./ds4flash.gguf \
+  -p "What is the capital of France? Answer with just the city name."
+```
+
+The startup accounting is what decides whether it fits:
+
+```text
+non-routed weights: 8.20 GiB
+routed expert size: 6.75 MiB
+total expert budget 28.60 GiB = 3.38 GiB prefill headroom
+                              + 25.23 GiB dynamic cache (3827 experts)
+memory: KV 0.78 + buffers 0.25 + resident model 0.99
+      + expert cache 25.23 + prefill reserve 3.38 = 30.62 GiB planned
+```
+
+The 8.20 GiB of non-routed weights is the number to look at first, because that
+part stays resident by construction. It leaves room on a 58 GiB machine.
+
+`DS4_ROCM_STREAM_FREE_RESERVE_GB` defaults to 16 GiB and is clamped to 2..64.
+On a 46 GiB aperture the default withholds a third of the memory from the
+expert cache, so it is worth lowering.
+
+### Native gfx1103 against a gfx1100 build
+
+I built the same tree twice, kept the first binary aside, and alternated the
+two. Decode rate on the prompt above, in t/s, with the execution order inside
+each pair noted:
+
+| | gfx1103, no override | gfx1100 + `HSA_OVERRIDE_GFX_VERSION=11.0.0` |
+|---|---|---|
+| gfx1103 first | 2.19 · 2.50 · 4.48 | 3.00 · 4.18 · (run lost) |
+| gfx1100 first | 2.48 · 2.41 · 2.63 | 2.84 · 3.04 · 2.72 |
+
+The `gfx1100` build wins in both orders, so the gap is not an artifact of
+position: roughly 2.9 against 2.45 t/s. I cannot explain the two 4.x readings,
+one per architecture. Prefill was 0.33 t/s in every run.
+
+The native `gfx1103` build needs no `HSA_OVERRIDE_GFX_VERSION`. It is slower,
+not broken.
+
+### Long generations collapse
+
+"What is the capital of France?" is answered correctly by both builds, with
+sensible reasoning. "Please write me a single-page HTML flappy bird game" is
+not. The `gfx1100` build emits valid HTML, CSS and JavaScript and then repeats
+one block of variable declarations until the context runs out. The `gfx1103`
+build degrades further, through broken grammar into single letters.
+
+That is one run per build, so I would not read the difference in severity as
+real. Nothing here tells a 2-bit quantization effect apart from a sampling one,
+and I have no second AMD part to check against.
+
+## 8. Limits
 
 Memory is the binding constraint, not compute. STRIXHALO.md sizes the DeepSeek
 V4 Flash IQ2XXS GGUF at 80.76 GiB and README.md sizes GLM 5.2 IQ2_XXS at
-188 GiB, so a 64 GB machine holds neither resident. SSD streaming is the only
-route, and README.md states it is not supported for Flash on ROCm.
+188 GiB, so a 64 GB machine holds neither resident. Streaming makes Flash run
+at 2.5 to 3 t/s, which serves short answers and not code generation. GLM 5.2
+was not tried.
