@@ -32,6 +32,10 @@
 /tests/test_sampling
 /tests/test_glm53_kda
 /tests/test_deepseek4_vision_image
+/tests/test_ssd_admission
+/tests/test_dspark_readiness
+/tests/test_dspark_session_admission
+/tests/test_dspark_startup_guards
 *.o
 *.dSYM/
 __pycache__/

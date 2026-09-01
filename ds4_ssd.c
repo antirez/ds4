@@ -134,6 +134,93 @@ bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
     return out->cache_experts != 0;
 }
 
+static bool ds4_ssd_add_checked(uint64_t *total, uint64_t add) {
+    if (!total || *total > UINT64_MAX - add) return false;
+    *total += add;
+    return true;
+}
+
+static bool ds4_ssd_mul_checked(uint64_t value,
+                                uint32_t count,
+                                uint64_t *out) {
+    if (!out || (count != 0 && value > UINT64_MAX / count)) return false;
+    *out = value * count;
+    return true;
+}
+
+bool ds4_ssd_admission_plan(const ds4_ssd_admission_request *request,
+                            ds4_ssd_admission_result        *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!request || request->capacity_bytes == 0) return false;
+
+    const uint32_t session_count =
+        request->session_count != 0 ? request->session_count : 1u;
+    uint64_t total_session_kv_bytes = 0;
+    uint64_t total_session_context_scratch_bytes = 0;
+    uint64_t total_session_graph_bytes = 0;
+    uint64_t total_session_speculative_bytes = 0;
+    uint64_t total_session_host_bytes = 0;
+    uint64_t total_session_prefill_workspace_bytes = 0;
+    if (!ds4_ssd_mul_checked(request->session_kv_bytes,
+                             session_count,
+                             &total_session_kv_bytes) ||
+        !ds4_ssd_mul_checked(request->session_context_scratch_bytes,
+                             session_count,
+                             &total_session_context_scratch_bytes) ||
+        !ds4_ssd_mul_checked(request->session_graph_bytes,
+                             session_count,
+                             &total_session_graph_bytes) ||
+        !ds4_ssd_mul_checked(request->session_speculative_bytes,
+                             session_count,
+                             &total_session_speculative_bytes) ||
+        !ds4_ssd_mul_checked(request->session_host_bytes,
+                             session_count,
+                             &total_session_host_bytes) ||
+        !ds4_ssd_mul_checked(request->session_prefill_workspace_bytes,
+                             session_count,
+                             &total_session_prefill_workspace_bytes)) {
+        return false;
+    }
+
+    uint64_t required = 0;
+    if (!ds4_ssd_add_checked(&required, request->prelocked_bytes) ||
+        !ds4_ssd_add_checked(&required, request->target_mapped_bytes) ||
+        !ds4_ssd_add_checked(&required, request->support_bytes) ||
+        !ds4_ssd_add_checked(&required, request->expert_cache_bytes) ||
+        !ds4_ssd_add_checked(&required, request->prefill_reserve_bytes) ||
+        !ds4_ssd_add_checked(&required, total_session_kv_bytes) ||
+        !ds4_ssd_add_checked(&required,
+                             total_session_context_scratch_bytes) ||
+        !ds4_ssd_add_checked(&required, total_session_graph_bytes) ||
+        !ds4_ssd_add_checked(&required,
+                             total_session_speculative_bytes) ||
+        !ds4_ssd_add_checked(&required, total_session_host_bytes) ||
+        !ds4_ssd_add_checked(&required,
+                             total_session_prefill_workspace_bytes) ||
+        !ds4_ssd_add_checked(&required,
+                             request->shared_prefill_workspace_bytes) ||
+        !ds4_ssd_add_checked(&required, request->safety_headroom_bytes)) {
+        return false;
+    }
+
+    if (out) {
+        out->required_bytes = required;
+        out->budget_bytes = request->capacity_bytes;
+        out->total_session_kv_bytes = total_session_kv_bytes;
+        out->total_session_context_scratch_bytes =
+            total_session_context_scratch_bytes;
+        out->total_session_graph_bytes = total_session_graph_bytes;
+        out->total_session_speculative_bytes =
+            total_session_speculative_bytes;
+        out->total_session_host_bytes = total_session_host_bytes;
+        out->total_session_prefill_workspace_bytes =
+            total_session_prefill_workspace_bytes;
+        out->shared_prefill_workspace_bytes =
+            request->shared_prefill_workspace_bytes;
+    }
+    return required <= request->capacity_bytes;
+}
+
 bool ds4_ssd_memory_lock_acquire(ds4_ssd_memory_lock *lock,
                                  uint64_t             bytes) {
     if (!lock) return false;

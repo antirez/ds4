@@ -1260,6 +1260,23 @@ extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint
     return 1;
 }
 
+/* SSD+DSpark's persistent no-copy support view is Metal-only. Keep CUDA from
+ * accepting the Metal-specific registration contract by accident; CUDA's
+ * multi-tier route continues to use ds4_gpu_register_support_map with its
+ * required non-zero offset bias above. */
+extern "C" int ds4_gpu_register_persistent_support_map(const void *map,
+                                                        uint64_t size) {
+    (void)map;
+    (void)size;
+    return 0;
+}
+
+extern "C" void ds4_gpu_release_persistent_support_map(void) {
+    g_support_host_base = NULL;
+    g_support_host_size = 0;
+    g_support_offset_bias = 0;
+}
+
 static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t offset,
                                             uint64_t bytes,
@@ -2776,6 +2793,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     g_current_logical_tier = -1;
+    ds4_gpu_release_persistent_support_map();
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */

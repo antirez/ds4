@@ -370,6 +370,9 @@ static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
 static uint64_t g_model_mapped_max_tensor_bytes;
+static const void *g_support_model_map_ptr;
+static uint64_t g_support_model_map_size;
+static id<MTLBuffer> g_support_model_buffer;
 static uint64_t g_tensor_alloc_live_bytes;
 static uint64_t g_tensor_alloc_peak_bytes;
 static pthread_mutex_t g_tensor_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -10467,6 +10470,9 @@ void ds4_gpu_cleanup(void) {
         g_model_mapped_offset = 0;
         g_model_mapped_size = 0;
         g_model_mapped_max_tensor_bytes = 0;
+        g_support_model_buffer = nil;
+        g_support_model_map_ptr = NULL;
+        g_support_model_map_size = 0;
         ds4_gpu_tensor_tracking_reset();
         g_flash_attn_mask_bytes = 0;
         g_flash_attn_zero_mask_bytes = 0;
@@ -11465,6 +11471,107 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return 1;
 }
 
+int ds4_gpu_register_persistent_support_map(
+        const void *model_map,
+        uint64_t    model_size) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0) return 0;
+
+    @autoreleasepool {
+        if (g_support_model_buffer) {
+            if (g_support_model_map_ptr == model_map &&
+                g_support_model_map_size == model_size) {
+                return 1;
+            }
+            fprintf(stderr,
+                    "ds4: Metal support model map is already registered\n");
+            return 0;
+        }
+
+        const uint64_t page = (uint64_t)getpagesize();
+        const uintptr_t addr = (uintptr_t)model_map;
+        if ((addr & (uintptr_t)(page - 1)) != 0 ||
+            model_size > UINT64_MAX - (page - 1)) {
+            fprintf(stderr,
+                    "ds4: Metal support model mapping is not page-safe\n");
+            return 0;
+        }
+        const uint64_t buffer_bytes = round_up_u64(model_size, page);
+        if (buffer_bytes == 0 ||
+            buffer_bytes > (uint64_t)[g_device maxBufferLength] ||
+            buffer_bytes > NSUIntegerMax) {
+            fprintf(stderr,
+                    "ds4: Metal support model %.2f GiB exceeds maxBufferLength %.2f GiB\n",
+                    ds4_gpu_gib(buffer_bytes),
+                    ds4_gpu_gib((uint64_t)[g_device maxBufferLength]));
+            return 0;
+        }
+
+        id<MTLBuffer> buffer =
+            [g_device newBufferWithBytesNoCopy:(void *)model_map
+                                         length:(NSUInteger)buffer_bytes
+                                        options:ds4_gpu_model_resource_options()
+                                    deallocator:nil];
+        if (!buffer) {
+            fprintf(stderr,
+                    "ds4: Metal could not wrap the persistent support model view\n");
+            return 0;
+        }
+        buffer.label = @"ds4_support_model_view";
+        g_support_model_buffer = buffer;
+        g_support_model_map_ptr = model_map;
+        g_support_model_map_size = model_size;
+        g_model_wrap_count++;
+        g_model_wrap_bytes += buffer_bytes;
+        if (buffer_bytes > g_model_wrap_max_bytes) {
+            g_model_wrap_max_bytes = buffer_bytes;
+        }
+        fprintf(stderr,
+                "ds4: Metal registered persistent DSpark support view (%.2f GiB)\n",
+                ds4_gpu_gib(buffer_bytes));
+        return 1;
+    }
+}
+
+/* CUDA's multi-tier cache uses a distinct biased-offset support registry.
+ * Metal has no compatible multi-tier implementation; retain the symbol for
+ * shared engine linkage and fail closed if a caller reaches it. */
+int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
+    (void)map;
+    (void)size;
+    (void)bias;
+    fprintf(stderr,
+            "ds4: biased support-map registration is unavailable on Metal\n");
+    return 0;
+}
+
+void ds4_gpu_release_persistent_support_map(void) {
+    /* newBufferWithBytesNoCopy does not extend the mmap lifetime. Drain all
+     * queued work, then evict every cache class that can retain a support-map
+     * view. Residency sets must leave the queue before their tables release
+     * owned exact views; the persistent whole-map owner is released last,
+     * before model_close() unmaps the support GGUF. */
+    if (!g_initialized) {
+        g_support_model_buffer = nil;
+        g_support_model_map_ptr = NULL;
+        g_support_model_map_size = 0;
+        return;
+    }
+    if (!ds4_gpu_synchronize()) {
+        fprintf(stderr,
+                "ds4: Metal support-view synchronization failed during teardown\n");
+    }
+    @autoreleasepool {
+        [g_q4_expert_layer_residency_cache removeAllObjects];
+        [g_q4_expert_table_cache removeAllObjects];
+        ds4_gpu_model_buffer_cache_clear("support-unmap");
+        [g_transient_buffers removeAllObjects];
+        g_support_model_buffer = nil;
+        g_support_model_map_ptr = NULL;
+        g_support_model_map_size = 0;
+    }
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
@@ -11489,6 +11596,13 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
             *inner_offset = offset - view_start;
             return g_model_views[i].buffer;
         }
+    }
+
+    if (g_support_model_buffer &&
+        g_support_model_map_ptr == model_map &&
+        g_support_model_map_size == model_size) {
+        if (inner_offset) *inner_offset = offset;
+        return g_support_model_buffer;
     }
 
     fprintf(stderr,

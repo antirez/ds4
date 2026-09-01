@@ -67,7 +67,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch test-ssd-admission test-dspark-readiness test-dspark-session-admission test-dspark-startup-guards test-dspark-final-wiring test-dspark-final-remediation test-persistent-support-lifecycle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -83,6 +83,12 @@ help:
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
+	@echo "  make test-ssd-admission  Run no-model SSD streaming admission accounting tests"
+	@echo "  make test-dspark-readiness  Run no-model explicit DSpark readiness gate tests"
+	@echo "  make test-dspark-session-admission  Run shared-workspace admission race tests"
+	@echo "  make test-dspark-startup-guards  Run no-model DSpark startup refusal tests"
+	@echo "  make test-dspark-final-wiring  Check the actual ordinary test wiring"
+	@echo "  make test-persistent-support-lifecycle  Check persistent Metal support teardown order"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -480,6 +486,40 @@ tests/test_sampling.o: tests/test_sampling.c ds4.h
 tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_dspark_readiness.o: tests/test_dspark_readiness.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dspark_readiness: tests/test_dspark_readiness.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-dspark-readiness: tests/test_dspark_readiness
+	./tests/test_dspark_readiness
+
+test-dspark-session-admission: tests/test_dspark_session_admission
+	./tests/test_dspark_session_admission
+
+test-dspark-startup-guards: tests/test_dspark_startup_guards
+	./tests/test_dspark_startup_guards
+
+test-dspark-final-wiring:
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_dspark_final_wiring.py
+
+tests/test_dspark_session_admission.o: tests/test_dspark_session_admission.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dspark_session_admission: tests/test_dspark_session_admission.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_dspark_startup_guards.o: tests/test_dspark_startup_guards.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dspark_startup_guards: tests/test_dspark_startup_guards.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-dspark-final-remediation: test-ssd-admission test-dspark-readiness \
+	test-dspark-session-admission test-dspark-startup-guards \
+	test-persistent-support-lifecycle test-dspark-final-wiring
+
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
@@ -555,9 +595,18 @@ endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image \
+	tests/test_ssd_admission tests/test_dspark_readiness \
+	tests/test_dspark_session_admission tests/test_dspark_startup_guards \
+	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
+	./tests/test_ssd_admission
+	./tests/test_dspark_readiness
+	./tests/test_dspark_session_admission
+	./tests/test_dspark_startup_guards
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_persistent_support_lifecycle.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_dspark_final_wiring.py
 	./ds4_test
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
@@ -599,5 +648,17 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot
 
+tests/test_ssd_admission.o: tests/test_ssd_admission.c ds4_ssd.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_ssd_admission: tests/test_ssd_admission.o ds4_ssd.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-ssd-admission: tests/test_ssd_admission
+	./tests/test_ssd_admission
+
+test-persistent-support-lifecycle:
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test_persistent_support_lifecycle.py
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_ssd_admission tests/test_dspark_readiness tests/test_dspark_session_admission tests/test_dspark_startup_guards tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
