@@ -5554,7 +5554,8 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
      *
      * Keep GLM on its existing allocation policy.
      */
-    if (!g_glm_model && need > default_bytes / 2u) return need;
+    if (g_glm_model) return need;
+    if (need > default_bytes / 2u) return need;
 
     uint64_t bytes = default_bytes;
     if (bytes < need) {
@@ -6418,11 +6419,18 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
         return;
     }
     const uint64_t used_b = (uint64_t)total_b - (uint64_t)free_b;
+    uint64_t arena_allocated_bytes = 0;
+    uint64_t arena_used_bytes = 0;
+    for (const cuda_model_arena &arena : g_model_arenas) {
+        arena_allocated_bytes += arena.bytes;
+        arena_used_bytes += arena.used;
+    }
     const char *placement = cuda_model_image_bytes() ? "device_copy" : "mapped/range_cache";
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
             "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
-            "q8_f16_cache=%.2f GiB scratch=%.2f GiB",
+            "model_arenas=%zu arena_allocated=%.2f GiB arena_used=%.2f GiB "
+            "arena_stranded=%.2f GiB q8_f16_cache=%.2f GiB scratch=%.2f GiB",
             label ? label : "",
             (double)used_b / 1073741824.0,
             (double)free_b / 1073741824.0,
@@ -6430,6 +6438,10 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             placement,
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
+            g_model_arenas.size(),
+            (double)arena_allocated_bytes / 1073741824.0,
+            (double)arena_used_bytes / 1073741824.0,
+            (double)(arena_allocated_bytes - arena_used_bytes) / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
             (double)g_cuda_tmp_bytes / 1073741824.0);
     fprintf(stderr, "\n");

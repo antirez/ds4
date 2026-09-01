@@ -843,6 +843,179 @@ bool run_moe_pair_generic(
     return ok;
 }
 
+// GLM-5.3-Flash production-topology verifier for the IQ2_XXS paired MMQ
+// prefill path.  The generic verifier above deliberately keeps its expert
+// population small because it also constructs a full dequantized CPU
+// reference.  Here the reference is the two single-W MMQ entries, so we can
+// exercise the real 288-expert/top-8 address arithmetic without allocating a
+// pointless ~9 GiB F32 copy of the weights.  Guard regions catch output
+// under/overwrites and every candidate stage is synchronized immediately.
+bool run_glm53_iq2_pair_shape(int n_tokens, uint32_t seed) {
+    constexpr int M = 2048;
+    constexpr int K = 4096;
+    constexpr int n_experts = 288;
+    constexpr int n_expert_used = 8;
+    constexpr size_t guard_count = 256;
+    constexpr uint32_t guard_bits = 0x4b7fffffu;
+
+    fprintf(stderr,
+            "=== IQ2_XXS/GLM53_PAIR M=%d K=%d ntok=%d nexp=%d nused=%d seed=%u ===\n",
+            M, K, n_tokens, n_experts, n_expert_used, seed);
+    if (n_tokens < 1 || n_tokens > 2048) {
+        fprintf(stderr, "invalid GLM53 token count: %d\n", n_tokens);
+        return false;
+    }
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const int blocks_per_row = K / QK_K_LOCAL;
+    const size_t blocks_per_expert = (size_t)M * blocks_per_row;
+    const size_t weight_blocks = (size_t)n_experts * blocks_per_expert;
+
+    // A moderately varied block pool makes generation fast enough for a
+    // production-size test while keeping every fp16 scale finite.
+    std::vector<block_iq2_xxs> pool_a(4096), pool_b(4096);
+    for (auto & block : pool_a) generate_random_block_iq2_xxs(&block, rng);
+    for (auto & block : pool_b) generate_random_block_iq2_xxs(&block, rng);
+    std::vector<block_iq2_xxs> W_a(weight_blocks), W_b(weight_blocks);
+    for (size_t i = 0; i < weight_blocks; i++) {
+        W_a[i] = pool_a[i % pool_a.size()];
+        W_b[i] = pool_b[(i * 17u + 3u) % pool_b.size()];
+    }
+
+    std::vector<int32_t> ids((size_t)n_tokens * n_expert_used);
+    for (int t = 0; t < n_tokens; t++) {
+        for (int s = 0; s < n_expert_used; s++) {
+            ids[(size_t)t * n_expert_used + s] = (t * 13 + s * 31) % n_experts;
+        }
+    }
+    std::vector<float> X((size_t)n_tokens * K);
+    for (auto & value : X) value = nd(rng);
+
+    const size_t out_count = (size_t)M * n_tokens * n_expert_used;
+    const size_t guarded_count = out_count + 2 * guard_count;
+    float guard_value;
+    std::memcpy(&guard_value, &guard_bits, sizeof(guard_value));
+    std::vector<float> initialized(guarded_count, guard_value);
+    std::vector<float> ya_single(guarded_count), yb_single(guarded_count);
+    std::vector<float> ya_pair(guarded_count), yb_pair(guarded_count);
+
+    cudaStream_t stream = nullptr;
+    void * dWa = nullptr;
+    void * dWb = nullptr;
+    float * dX = nullptr;
+    int32_t * dIds = nullptr;
+    float * dYa_single_base = nullptr;
+    float * dYb_single_base = nullptr;
+    float * dYa_pair_base = nullptr;
+    float * dYb_pair_base = nullptr;
+    bool ok = true;
+
+#define GLM53_CUDA(call) do {                                                   \
+        const cudaError_t err_ = (call);                                        \
+        if (err_ != cudaSuccess) {                                              \
+            fprintf(stderr, "%s failed: %s\n", #call, cudaGetErrorString(err_)); \
+            ok = false;                                                         \
+            goto cleanup;                                                       \
+        }                                                                       \
+    } while (0)
+
+    GLM53_CUDA(cudaStreamCreate(&stream));
+    GLM53_CUDA(cudaMalloc(&dWa, W_a.size() * sizeof(block_iq2_xxs)));
+    GLM53_CUDA(cudaMalloc(&dWb, W_b.size() * sizeof(block_iq2_xxs)));
+    GLM53_CUDA(cudaMalloc(&dX, X.size() * sizeof(float)));
+    GLM53_CUDA(cudaMalloc(&dIds, ids.size() * sizeof(int32_t)));
+    GLM53_CUDA(cudaMalloc(&dYa_single_base, guarded_count * sizeof(float)));
+    GLM53_CUDA(cudaMalloc(&dYb_single_base, guarded_count * sizeof(float)));
+    GLM53_CUDA(cudaMalloc(&dYa_pair_base, guarded_count * sizeof(float)));
+    GLM53_CUDA(cudaMalloc(&dYb_pair_base, guarded_count * sizeof(float)));
+    GLM53_CUDA(cudaMemcpyAsync(dWa, W_a.data(), W_a.size() * sizeof(block_iq2_xxs), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dWb, W_b.data(), W_b.size() * sizeof(block_iq2_xxs), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dIds, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dYa_single_base, initialized.data(), guarded_count * sizeof(float), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dYb_single_base, initialized.data(), guarded_count * sizeof(float), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dYa_pair_base, initialized.data(), guarded_count * sizeof(float), cudaMemcpyHostToDevice, stream));
+    GLM53_CUDA(cudaMemcpyAsync(dYb_pair_base, initialized.data(), guarded_count * sizeof(float), cudaMemcpyHostToDevice, stream));
+
+    {
+        float * dYa_single = dYa_single_base + guard_count;
+        float * dYb_single = dYb_single_base + guard_count;
+        float * dYa_pair = dYa_pair_base + guard_count;
+        float * dYb_pair = dYb_pair_base + guard_count;
+        GLM53_CUDA(cudaMemsetAsync(dYa_single, 0, out_count * sizeof(float), stream));
+        GLM53_CUDA(cudaMemsetAsync(dYb_single, 0, out_count * sizeof(float), stream));
+        GLM53_CUDA(cudaMemsetAsync(dYa_pair, 0, out_count * sizeof(float), stream));
+        GLM53_CUDA(cudaMemsetAsync(dYb_pair, 0, out_count * sizeof(float), stream));
+
+        const int rc_sa = ds4_mmq_iq2_xxs_moe(dWa, dX, dIds, dYa_single,
+                                               M, K, n_tokens, n_experts,
+                                               n_expert_used, stream);
+        GLM53_CUDA(cudaStreamSynchronize(stream));
+        const int rc_sb = ds4_mmq_iq2_xxs_moe(dWb, dX, dIds, dYb_single,
+                                               M, K, n_tokens, n_experts,
+                                               n_expert_used, stream);
+        GLM53_CUDA(cudaStreamSynchronize(stream));
+        const int rc_pair = ds4_mmq_iq2_xxs_moe_pair(
+            dWa, dWb, dX, dIds, dYa_pair, dYb_pair, M, K, n_tokens,
+            n_experts, n_expert_used, stream);
+        GLM53_CUDA(cudaStreamSynchronize(stream));
+        if (rc_sa != 0 || rc_sb != 0 || rc_pair != 0) {
+            fprintf(stderr, "GLM53 entries returned single_a=%d single_b=%d pair=%d\n",
+                    rc_sa, rc_sb, rc_pair);
+            ok = false;
+            goto cleanup;
+        }
+    }
+
+    GLM53_CUDA(cudaMemcpyAsync(ya_single.data(), dYa_single_base, guarded_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    GLM53_CUDA(cudaMemcpyAsync(yb_single.data(), dYb_single_base, guarded_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    GLM53_CUDA(cudaMemcpyAsync(ya_pair.data(), dYa_pair_base, guarded_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    GLM53_CUDA(cudaMemcpyAsync(yb_pair.data(), dYb_pair_base, guarded_count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    GLM53_CUDA(cudaStreamSynchronize(stream));
+
+    for (const auto * guarded : {&ya_single, &yb_single, &ya_pair, &yb_pair}) {
+        for (size_t i = 0; i < guard_count; i++) {
+            if ((*guarded)[i] != guard_value ||
+                (*guarded)[guard_count + out_count + i] != guard_value) {
+                fprintf(stderr, "GLM53 output canary corrupted at guard index %zu\n", i);
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        std::vector<float> ya_single_out(ya_single.begin() + guard_count,
+                                         ya_single.begin() + guard_count + out_count);
+        std::vector<float> yb_single_out(yb_single.begin() + guard_count,
+                                         yb_single.begin() + guard_count + out_count);
+        std::vector<float> ya_pair_out(ya_pair.begin() + guard_count,
+                                       ya_pair.begin() + guard_count + out_count);
+        std::vector<float> yb_pair_out(yb_pair.begin() + guard_count,
+                                       yb_pair.begin() + guard_count + out_count);
+        // The production x16 tile may change the final F32 reduction order
+        // between a standalone and paired launch.  The observed envelope is
+        // sub-millifloat, so require a tight 1e-3 absolute / 1e-5 relative
+        // bound over the complete output instead of bit identity.
+        ok = check_close(ya_pair_out, ya_single_out, 1.0e-3f, 1.0e-5f) &&
+             check_close(yb_pair_out, yb_single_out, 1.0e-3f, 1.0e-5f);
+    }
+
+cleanup:
+    if (dWa) cudaFree(dWa);
+    if (dWb) cudaFree(dWb);
+    if (dX) cudaFree(dX);
+    if (dIds) cudaFree(dIds);
+    if (dYa_single_base) cudaFree(dYa_single_base);
+    if (dYb_single_base) cudaFree(dYb_single_base);
+    if (dYa_pair_base) cudaFree(dYa_pair_base);
+    if (dYb_pair_base) cudaFree(dYb_pair_base);
+    if (stream) cudaStreamDestroy(stream);
+#undef GLM53_CUDA
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool run_q4_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
     auto fn = [](block_q4_K * blk, float * out,
                  int n_experts, int M, int K, int blocks_per_expert,
@@ -1145,9 +1318,12 @@ bool run_q8_0_dense_vec(int M, int N, int K, uint32_t seed) {
 } // namespace
 
 int main(int argc, char ** argv) {
-    (void)argc; (void)argv;
     int rc = ds4_mmq_init(0);
     if (rc != 0) { fprintf(stderr, "ds4_mmq_init failed: %d\n", rc); return 1; }
+
+    if (argc == 3 && std::strcmp(argv[1], "--glm53-iq2-pair") == 0) {
+        return run_glm53_iq2_pair_shape(std::atoi(argv[2]), 0x53F1A500) ? 0 : 1;
+    }
 
     bool all_ok = true;
 

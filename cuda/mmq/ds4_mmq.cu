@@ -57,6 +57,38 @@ static bool ds4_mmq_gfx1151_flag(const char *name, int cc) {
     return env ? env[0] != '0' : cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
 }
 
+#if defined(GGML_USE_HIP)
+static int ds4_mmq_positive_int_env(const char *name) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return 0;
+    char *end = nullptr;
+    const long value = strtol(env, &end, 10);
+    return end != env && value > 0 && value <= INT_MAX ? (int)value : 0;
+}
+#endif
+
+static int ds4_mmq_glm_iq2_x_max(
+        ggml_type type, int cc, int n_tokens,
+        int n_experts, int n_expert_used) {
+#if defined(GGML_USE_HIP)
+    const char *env = getenv("DS4_ROCM_GLM_IQ2_X_MAX");
+    if (env) return ds4_mmq_positive_int_env("DS4_ROCM_GLM_IQ2_X_MAX");
+    if (type == GGML_TYPE_IQ2_XXS &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        n_experts == 288 && n_expert_used == 8 &&
+        n_tokens >= 128 && n_tokens <= 512) {
+        return 24;
+    }
+#else
+    (void)type;
+    (void)cc;
+    (void)n_tokens;
+    (void)n_experts;
+    (void)n_expert_used;
+#endif
+    return 0;
+}
+
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
@@ -1720,6 +1752,8 @@ int ds4_mmq_moe_pair_impl(
         /*ncols_max=*/routed_ncols_max,
         /*x_soa=*/xa_soa,
         /*soa_blocks=*/soa_blocks,
+        /*mmq_x_max=*/ds4_mmq_glm_iq2_x_max(
+            type, cc, n_tokens, n_experts, n_expert_used),
     };
 
     {

@@ -400,7 +400,19 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
         &beta,
         out->ptr, CUDA_R_32F, (int)out_dim,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    return cublas_ok(status, "GLM-5.3 BF16 matmul");
+    if (!cublas_ok(status, "GLM-5.3 BF16 matmul")) return 0;
+    /* The 16384 -> 24 mHC projection consumes the single reusable BF16
+     * activation scratch above.  On ROCm 10/gfx1151, returning while that
+     * consumer is still live lets a following graph stage recycle the scratch
+     * and can corrupt the next layer.  Fence the 2048-row production prefill
+     * chunk that exposes the reuse race; short prefill and one-token decode
+     * stay on their existing asynchronous paths. */
+    if (in_dim == 16384u && out_dim == 24u && n_rows >= 2048u &&
+        !cuda_ok(cudaDeviceSynchronize(),
+                 "GLM-5.3 mHC BF16 scratch lifetime fence")) {
+        return 0;
+    }
+    return 1;
 }
 
 __global__ static void glm53_rocm_matmul_q4_K_q8_K_kernel(
@@ -457,6 +469,25 @@ extern "C" int ds4_gpu_matmul_q4_K_tensor(
     const char *weight = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "GLM-5.3 Q4_K matrix");
     if (!weight) return 0;
+    const char *mmq_env = getenv("DS4_ROCM_GLM_Q4_MMQ");
+    const bool use_mmq = mmq_env ? mmq_env[0] != '0'
+                                 : ds4_gpu_dspark_gfx1151_fast_path() != 0;
+    if (n_rows > 8u && use_mmq) {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr,
+                    "ds4: ROCm GLM Q4_K prefill using tiled MMQ\n");
+        }
+        const int rc = ds4_mmq_q4_K_dense(
+            weight, (const float *)x->ptr, (float *)out->ptr,
+            (int)out_dim, (int)n_rows, (int)in_dim, (cudaStream_t)0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: ROCm GLM Q4_K MMQ failed (%d)\n", rc);
+            return 0;
+        }
+        return 1;
+    }
     cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc(
         xq_bytes,
         "GLM-5.3 Q4_K activations");
@@ -4331,6 +4362,19 @@ static int glm_attention_indexed_lora_selected_gemm(
     return 1;
 }
 
+extern "C" int ds4_rocm_glm_selected_multihead_launch(
+        float *lora_out,
+        const float *qk_low,
+        const char *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        bool cache_f16,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope);
+
 static int glm_attention_indexed_lora_launch(
         ds4_gpu_tensor *lora_out,
         const ds4_gpu_tensor *q,
@@ -4386,6 +4430,35 @@ static int glm_attention_indexed_lora_launch(
         (qk_rope != 0u &&
          !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
+    }
+    const char *selected_attn_multihead_env =
+        getenv("DS4_ROCM_GLM_SELECTED_ATTN_MULTIHEAD");
+    if (!causal_range && has_selected && qk_rope == 0u &&
+        (selected_attn_multihead_env == NULL ||
+         cuda_env_present(selected_attn_multihead_env))) {
+        if (!ds4_rocm_glm_selected_multihead_launch(
+                (float *)lora_out->ptr,
+                (const float *)qk_low->ptr,
+                (const char *)kv_lora_cache->ptr,
+                (const int32_t *)selected->ptr,
+                n_tokens,
+                n_selected,
+                cache_cap,
+                cache_f16,
+                n_head,
+                kv_lora_dim,
+                qk_nope)) {
+            return 0;
+        }
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "GLM selected indexed prefill using arithmetic-preserving "
+                    "4-head attention tiles\n");
+            notice_printed = 1;
+        }
+        return 1;
     }
     /* Once the visible context exceeds the indexer's top-k, each token carries
      * its own selected row list.  Gather those rows into per-token FP16
@@ -4535,6 +4608,203 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
                                              n_ctx_orig, false, true, freq_base,
                                              freq_scale, ext_factor, attn_factor,
                                              beta_fast, beta_slow);
+}
+
+__global__ static void glm_dense_compact_pack_q_f16_kernel(
+        __half *packed,
+        const float *q,
+        uint32_t n_q,
+        uint32_t n_head,
+        uint32_t head0,
+        uint32_t group_heads,
+        uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)group_heads * n_q * dim;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % dim);
+    const uint64_t row = i / dim;
+    const uint32_t token = (uint32_t)(row % n_q);
+    const uint32_t head = head0 + (uint32_t)(row / n_q);
+    packed[i] = __float2half(q[((uint64_t)token * n_head + head) * dim + d]);
+}
+
+__global__ static void glm_dense_compact_causal_softmax_f16_kernel(
+        __half *prob,
+        const float *scores,
+        uint32_t n_q,
+        uint32_t n_kv,
+        uint32_t q_row0,
+        float scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t group_head = blockIdx.y;
+    if (token >= n_q) return;
+    const uint32_t visible = min(n_kv, q_row0 + token + 1u);
+    const uint64_t row = ((uint64_t)group_head * n_q + token) * n_kv;
+
+    float local_max = -FLT_MAX;
+    for (uint32_t col = threadIdx.x; col < visible; col += blockDim.x) {
+        local_max = fmaxf(local_max, scores[row + col] * scale);
+    }
+    __shared__ float reduce[256];
+    reduce[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x],
+                                         reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+
+    float local_sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < visible; col += blockDim.x) {
+        local_sum += expf(scores[row + col] * scale - max_score);
+    }
+    reduce[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv_sum = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    for (uint32_t col = threadIdx.x; col < n_kv; col += blockDim.x) {
+        const float p = col < visible
+            ? expf(scores[row + col] * scale - max_score) * inv_sum : 0.0f;
+        prob[row + col] = __float2half(p);
+    }
+}
+
+__global__ static void glm_dense_compact_unpack_f32_kernel(
+        float *out,
+        const float *packed,
+        uint32_t n_q,
+        uint32_t n_head,
+        uint32_t head0,
+        uint32_t group_heads,
+        uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)group_heads * n_q * dim;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % dim);
+    const uint64_t row = i / dim;
+    const uint32_t token = (uint32_t)(row % n_q);
+    const uint32_t head = head0 + (uint32_t)(row / n_q);
+    out[((uint64_t)token * n_head + head) * dim + d] = packed[i];
+}
+
+extern "C" int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t              q_row0,
+        uint32_t              n_q,
+        uint32_t              n_kv,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_dim) {
+    if (!lora_out || !qk_low || !kv_lora_cache || !g_cublas_ready ||
+        n_q == 0u || n_kv == 0u || n_kv > cache_cap ||
+        q_row0 >= n_kv || n_q > n_kv - q_row0 || !cache_f16 ||
+        n_q > INT_MAX || n_kv > INT_MAX || n_head == 0u ||
+        kv_lora_dim != 512u || qk_dim == 0u ||
+        qk_low->bytes < (uint64_t)n_q * n_head * kv_lora_dim * sizeof(float) ||
+        kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * sizeof(__half) ||
+        lora_out->bytes < (uint64_t)n_q * n_head * kv_lora_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint32_t visible_kv = min(n_kv, q_row0 + n_q);
+    const uint32_t max_group_heads = min(n_head, 8u);
+    if ((uint64_t)n_q > UINT64_MAX / max_group_heads / visible_kv) return 0;
+    const uint64_t q_count =
+        (uint64_t)max_group_heads * n_q * kv_lora_dim;
+    const uint64_t score_count =
+        (uint64_t)max_group_heads * n_q * visible_kv;
+    const uint64_t q_bytes = q_count * sizeof(__half);
+    const uint64_t score_off = (q_bytes + 255u) & ~255ull;
+    const uint64_t score_bytes = score_count * sizeof(float);
+    const uint64_t prob_off = (score_off + score_bytes + 255u) & ~255ull;
+    const uint64_t prob_bytes = score_count * sizeof(__half);
+    const uint64_t out_off = (prob_off + prob_bytes + 255u) & ~255ull;
+    const uint64_t out_bytes = q_count * sizeof(float);
+    if (score_off < q_bytes || prob_off < score_off || out_off < prob_off ||
+        out_off > UINT64_MAX - out_bytes) return 0;
+
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc(
+        out_off + out_bytes, "GLM dense compact attention");
+    if (!scratch) return 0;
+    __half *q_half = (__half *)scratch;
+    float *scores = (float *)(scratch + score_off);
+    __half *prob = (__half *)(scratch + prob_off);
+    float *packed_out = (float *)(scratch + out_off);
+    const __half *kv = (const __half *)kv_lora_cache->ptr;
+    const float attn_scale = 1.0f / sqrtf((float)qk_dim);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    for (uint32_t head0 = 0; head0 < n_head; head0 += max_group_heads) {
+        const uint32_t group_heads = min(max_group_heads, n_head - head0);
+        const uint64_t group_q_count =
+            (uint64_t)group_heads * n_q * kv_lora_dim;
+        glm_dense_compact_pack_q_f16_kernel<<<
+            (group_q_count + 255u) / 256u, 256>>>(
+                q_half, (const float *)qk_low->ptr, n_q, n_head, head0,
+                group_heads, kv_lora_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM dense attention Q pack launch")) return 0;
+
+        cublasStatus_t st = cublasGemmStridedBatchedEx(
+            g_cublas,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)visible_kv, (int)n_q, (int)kv_lora_dim,
+            &alpha,
+            kv, CUDA_R_16F, (int)kv_lora_dim, 0,
+            q_half, CUDA_R_16F, (int)kv_lora_dim,
+            (long long)n_q * kv_lora_dim,
+            &beta,
+            scores, CUDA_R_32F, (int)visible_kv,
+            (long long)n_q * visible_kv,
+            (int)group_heads,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "GLM dense attention score GEMM")) return 0;
+
+        const dim3 softmax_grid(n_q, group_heads, 1u);
+        glm_dense_compact_causal_softmax_f16_kernel<<<
+            softmax_grid, 256>>>(
+                prob, scores, n_q, visible_kv, q_row0, attn_scale);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM dense attention softmax launch")) return 0;
+
+        st = cublasGemmStridedBatchedEx(
+            g_cublas,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            (int)kv_lora_dim, (int)n_q, (int)visible_kv,
+            &alpha,
+            kv, CUDA_R_16F, (int)kv_lora_dim, 0,
+            prob, CUDA_R_16F, (int)visible_kv,
+            (long long)n_q * visible_kv,
+            &beta,
+            packed_out, CUDA_R_32F, (int)kv_lora_dim,
+            (long long)n_q * kv_lora_dim,
+            (int)group_heads,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "GLM dense attention value GEMM")) return 0;
+
+        glm_dense_compact_unpack_f32_kernel<<<
+            (group_q_count + 255u) / 256u, 256>>>(
+                (float *)lora_out->ptr, packed_out, n_q, n_head, head0,
+                group_heads, kv_lora_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM dense attention output unpack launch")) return 0;
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(

@@ -57,6 +57,9 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
 extern "C" int ds4_mmq_q8_0_dense_vec(
     const void *W, const float *X_f32, float *out_f32,
     int M, int N, int K, cudaStream_t stream);
+extern "C" int ds4_mmq_q4_K_dense(
+    const void *W, const float *X_f32, float *out_f32,
+    int M, int N, int K, cudaStream_t stream);
 extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
     const void *W, const float *X, const int32_t *ids, float *out,
     int M, int K, int n_tokens, int n_experts, int n_expert_used,

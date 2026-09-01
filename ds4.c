@@ -45280,6 +45280,9 @@ static DS4_MAYBE_UNUSED bool glm_graph_use_dense_compact_attention_prefill(
     /* The CUDA GEMM setup crosses over the scalar online kernel near 256
      * tokens on GB10. Keep short prompts on the lower-latency path. */
     return g_n_gpus == 1 && n_tokens >= 256u;
+#elif defined(DS4_ROCM_BUILD)
+    /* The grouped hipBLAS path has the same setup/throughput crossover. */
+    return n_tokens >= 256u;
 #else
     return true;
 #endif
@@ -50024,7 +50027,7 @@ static bool glm_graph_forward_indexed_tokens(
                 }
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
-#if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
+#if !defined(DS4_NO_GPU)
                     if (slice_causal &&
                         glm_graph_use_dense_compact_attention_prefill(slice) &&
                         !tp_attn_head_split) {

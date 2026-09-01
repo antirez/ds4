@@ -813,9 +813,20 @@ static int routed_moe_launch(
             mxfp4_path && use_expert_tiles && !use_mxfp4_tile32 && !use_mxfp4_ldsB &&
             !use_mxfp4_tile4 && n_tokens >= 8u &&
             getenv("DS4_ROCM_ENABLE_MXFP4_ROW64") != NULL;
+        const char *glm53_iq2_mmq_288_env =
+            getenv("DS4_ROCM_GLM53_IQ2_MMQ_288");
+        const uint32_t use_glm53_iq2_mmq_288 =
+            g_glm_model &&
+            n_total_expert == DS4_ROCM_GLM53_N_EXPERT &&
+            n_expert == DS4_ROCM_N_EXPERT_USED &&
+            expert_in_dim == 4096u &&
+            expert_mid_dim == 2048u &&
+            out_dim == 4096u &&
+            (glm53_iq2_mmq_288_env == NULL ||
+             cuda_env_present(glm53_iq2_mmq_288_env));
         const uint32_t use_rocm_mmq_gateup =
             ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
-            n_total_expert <= 256u &&
+            (n_total_expert <= 256u || use_glm53_iq2_mmq_288) &&
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&

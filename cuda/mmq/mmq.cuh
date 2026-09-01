@@ -4187,6 +4187,10 @@ struct mmq_args {
     // ignored; soa_blocks = pair count (Q2_K) or block count (IQ2_XXS).
     // Trailing fields so existing aggregate initializers value-init them.
     const char * x_soa; int64_t soa_blocks;
+    // Optional per-call cap for the output-column tile. Zero preserves the
+    // backend-wide selector. This lets a measured routed short-prefill shape
+    // avoid changing unrelated dense MMQ calls in the same process.
+    int mmq_x_max;
 };
 
 template<ggml_type type>
@@ -4323,7 +4327,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    const int hardware_mmq_x_max = get_mmq_x_max_host(cc);
+    const int mmq_x_max = args.mmq_x_max > 0
+        ? std::min(args.mmq_x_max, hardware_mmq_x_max)
+        : hardware_mmq_x_max;
     const int mmq_y = get_mmq_y_host(cc);
 
     int mmq_x_best  = 0;
