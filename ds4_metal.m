@@ -40606,14 +40606,18 @@ int ds4_gpu_router_select_tensor_devtoken(
                                                       hash_set_offset,
                                                       tokenbuf,
                                                       ds4_gpu_tensor_offset(token_dev),
+                                                      nil,
+                                                      0,
                                                       NULL,
                                                       hash_rows,
+                                                      0,
                                                       1,
                                                       n_expert,
                                                       n_expert_used,
                                                       expert_weight_scale,
                                                       has_bias && !hash_mode,
-                                                      hash_mode);
+                                                      hash_mode,
+                                                      false);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
