@@ -331,8 +331,10 @@ library is required.
 `ds4-server` accepts ordered image blocks in OpenAI Chat, Responses, and
 Anthropic requests. HTTP images must be inline: use a PNG/JPEG data URI for
 OpenAI or base64 image source for Anthropic. File paths and remote URLs are
-rejected. A request may contain up to 16 images and the HTTP body is limited to
-64 MiB.
+rejected. OpenAI `role=tool` / `role=function` messages may carry the same
+inline image blocks (coding agents attach tool-result screenshots that way).
+Assistant and system images are rejected. A request may contain up to 16
+images and the HTTP body is limited to 64 MiB.
 
 Vision runs on Metal, single-GPU CUDA, and ROCm. On a DGX Spark, use the CUDA
 command above and add `--vision FILE`. On the 128 GB Strix Halo reference host,
