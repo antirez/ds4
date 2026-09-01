@@ -82,7 +82,7 @@ def run_capture(
     ]
     if system:
         cmd += ["--system", system]
-    cmd.append("--think-high" if think else "--nothink")
+    cmd.append("--think" if think else "--nothink")
     result = subprocess.run(cmd, cwd=ds4.parent, env=env, check=False,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
