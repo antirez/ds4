@@ -344,6 +344,27 @@ A 2051-token prefix followed across the row-513 transition also matched three
 full-vocabulary rows and two selected token IDs exactly.  Performance was
 measured on M3 Ultra; the guarded path covers resident single-device M1-M4.
 
+### M5 Max port of batch indexer-query pruning
+
+The pruning eligibility now uses the shared M5 port helper, so resident
+single-device M5 decode graphs take the same skip while the compressed cache
+stays at or below top-k.  The M5 rollback is
+`DS4_METAL_DISABLE_M5_BATCH_INDEXER_QUERY_PRUNE` (the pre-M5 name still
+controls M1-M4 together with the aggregate `DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS`
+switch).  Balanced M5 Max A/B (IQ2_XXS/Q2_K `ds4flash.gguf`) for the pruned
+path versus rollback was 753.62/732.83 tok/s at 2048 tokens (+2.84%); all 8
+runs and 1,034,240 compared full-vocabulary logits were bit-identical.  The
+standard Prometti-sposi sweep's virgin first frontier measured 790.3 vs
+727.1 tok/s (+8.7%) with decode unchanged; frontiers past the eligibility
+window stayed within the ±1-2% noise band.
+
+Two other pre-M5 wins were measured on M5 Max and rejected: the indexed
+prefill RB4/heads16-dual-RB4 kernels (bit-exact, -0.27% to -1.56% versus the
+MPP dual-heads default across two balanced sessions — M5 neural accelerators
+keep the MPP path ahead), and the Q2 2/32 decode command-buffer split
+(bit-exact, -0.62%/-0.79% versus the 4/none default at 512 and 1024 tokens).
+Do not re-port these without new evidence.
+
 ### Metal batch Q/KV finalizer A/B
 
 The M3 resident Flash prefill path now follows vLLM's horizontal Q/KV
