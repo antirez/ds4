@@ -3692,14 +3692,21 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
-    // Invalid columns must be zero before the matrix instruction. Masking
-    // only write-back is too late: stale or NaN tail blocks can contaminate
-    // other values in the same hardware matrix fragment.
+    // Keep complete tiles on the direct load path. For a partial tile, zero its invalid suffix once and refresh only the valid prefix below so no stale or NaN tail value can enter a hardware matrix fragment.
+    const bool full_y_tile = tile_y_max_j >= mmq_x - 1;
     const int valid_y_words = min(mmq_x, tile_y_max_j + 1) * MMQ_TILE_Y_K;
+    const int linear_tid = threadIdx.y*warp_size + threadIdx.x;
+    constexpr int nthreads = nwarps * warp_size;
 
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+
+    if (!full_y_tile) {
+        for (int l = valid_y_words + linear_tid; l < mmq_x * MMQ_TILE_Y_K; l += nthreads) {
+            tile_y[l] = 0;
+        }
+    }
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         // ds4 (P4 Inc3): when the caller supplies an aligned-SoA weight
@@ -3725,11 +3732,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            if (full_y_tile) {
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = l < valid_y_words ? by0[l] : 0;
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
+            } else {
+#pragma unroll
+                for (int l = linear_tid; l < valid_y_words; l += nthreads) {
+                    tile_y[l] = by0[l];
+                }
             }
         }
 
@@ -3741,11 +3754,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            if (full_y_tile) {
 #pragma unroll
-            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = l < valid_y_words ? by0[l] : 0;
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[l];
+                }
+            } else {
+#pragma unroll
+                for (int l = linear_tid; l < valid_y_words; l += nthreads) {
+                    tile_y[l] = by0[l];
+                }
             }
         }
 
