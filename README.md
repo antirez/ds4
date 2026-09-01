@@ -334,13 +334,10 @@ OpenAI or base64 image source for Anthropic. File paths and remote URLs are
 rejected. A request may contain up to 16 images and the HTTP body is limited to
 64 MiB.
 
-Vision runs on Metal, single-GPU CUDA, and ROCm. On a DGX Spark, use the CUDA
-command above and add `--vision FILE`. On the 128 GB Strix Halo reference host,
-Q2 needs the same SSD-streaming options as text inference:
+Vision runs on Metal, single-GPU CUDA, and ROCm. On a DGX Spark, use the CUDA command above and add `--vision FILE`. On the 128 GB Strix Halo reference host, Q2 runs fully resident by default:
 
 ```sh
-./ds4 --rocm --ssd-streaming --ssd-streaming-cache-experts 32GB \
-  -m gguf/GLM-5.3-Flash-Q2.gguf \
+./ds4 --rocm -m gguf/GLM-5.3-Flash-Q2.gguf \
   --vision gguf/GLM-5.3-Flash-Vision-Encoder.gguf
 ```
 
