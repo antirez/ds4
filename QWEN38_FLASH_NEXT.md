@@ -517,6 +517,63 @@ networks; each keeps an environment kill switch and deterministic output.
    the pre-session `f6c2a929...` remains reachable with the kill
    switch and reproduces exactly.
 
+9. The M5 TensorOps route now covers the Qwen prefill projections.  On
+   M5-class devices — and, for fixture coverage, on any Metal 4 GPU via
+   `DS4_METAL_ENABLE_TENSOR=1` (on pre-M5 silicon this selects the portable
+   fallback: kernel-fixture parity, not a throughput path) — the dense Q8_0
+   prefill dispatch takes the retained direct-RHS NAX kernels shared with
+   the DeepSeek/GLM dense path (`kernel_mul_mm_q8_0_f32_nax_direct_rhs{,_n64,
+   _n128}`) under the DeepSeek split-prefix contract: the widest
+   128/64/32-token tile dividing the aligned rows, an unaligned >=192-row
+   tail keeping the boundary-checked tiled kernel, and in_dim/out_dim
+   multiples of 64.  Threshold/kill switch: `DS4_QWEN4_Q8_0_MPP_MIN_ROWS`
+   (default 32, 0 disables).  The grouped routed-expert tiles additionally
+   swap gate/up/down onto `kernel_mul_mm_id_q4_0_f32_mpp` /
+   `kernel_mul_mm_id_q4_K_f32_mpp` at the identical route map, work tiles,
+   and dispatch geometry (`DS4_QWEN4_MOE_MUL_MM_ID_MPP=0` restores the
+   simdgroup id kernels; the v4 mixed-Q2 pack keeps its scalar expert
+   kernels).
+
+   Both routes also have F32-staged quality twins selected by
+   `DS4_QWEN4_Q8_0_MPP_F32STAGE=1` and
+   `DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE=1` (the latter also honors the shared
+   `DS4_METAL_MPP_MOE_F32STAGE`): the operand tiles stage as fp32 instead
+   of binary16 — the same technique as the GLM/DeepSeek routed-MoE
+   f32stage arms on exp/m5-tensor-precision (`kernel_mul_mm_id_*_mpp_
+   f32stage`, measured ~2.5x tighter rms there; 16 KiB dense / 12 KiB MoE
+   tile budgets here).  Measured on the M3 Ultra portable fallback vs the
+   exact CPU dequant reference: the dense NAX f32stage route is BIT-EXACT
+   (binary16-staged: 4.2e-3 max); the grouped tiles of the STANDARD
+   Q4_0-routed pack drop to 6.0e-8 mid and output (from 3.4e-4 / 2.9e-4)
+   and the v3 Q4_K tiles to 1.9e-6 mid / 6.1e-5 output (from 2.0e-3 /
+   3.9e-2).  Like the exp branch's arms these are quality routes, not
+   speed routes; the binary16 tiles remain the defaults.
+
+   An earlier `nax_direct_rhs` probe on this same dispatch had measured
+   exactly neutral and was removed — pre-M5 devices map matmul2d to
+   portable fallbacks, so the route is now gated to the M5 TensorOps
+   enable rather than the shared mul_mm threshold.  Fixtures:
+   `test_model_q8_0_mpp_rows` pins the dense route (all three token tiles,
+   the split-prefix tail, and the below-threshold/unaligned fallbacks) and
+   `test_model_q8_0_mpp_f32stage_rows` pins the F32-staged twin at tight
+   bounds; `test_moe_q4_0_mul_mm_id` (the standard Q4_0-routed geometry)
+   and `test_moe_q4_k_mul_mm_id` (the v3 Q4_K geometry at 600 rows) each
+   end with their own f32stage pass; the whole metal fixture suite runs
+   with the opt-in so every route stays parity-pinned on every machine
+   (`DS4_QWEN4_TEST_DISABLE_TENSOR_ROUTE=1`
+   keeps a run legacy-only).  M5 throughput is not yet measured on
+   hardware.  On the M3 Ultra the forced route passes every Qwen fixture,
+   and `DS4_METAL_ENABLE_TENSOR=1 ./ds4_test --metal-tensor-equivalence`
+   reproduces the accumulate drift locally on the portable fallback as
+   well — short-prompt cases are bit-exact, while the long-prompt case
+   drifts (long_memory_archive: rms 1.25, max_abs 6.5, greedy token flip),
+   matching the `OUT/drift-check` finding that the matmul2d accumulate
+   diverges from the reference kernels at long prefills.  The kernel
+   fixtures pin tolerance classes, not bit parity; until the driver
+   accumulate matches the reference kernels, quality-sensitive M5 runs
+   should keep the kill switches above (and the drift PR's auto-withhold)
+   in mind, or opt the Qwen routes into their F32-staged twins.
+
 Measured on the reference M3 Ultra with the experimental
 `q4dense-q40routed-exp2` profile (2048/8192-token chunks, 64-token greedy
 decode); the last row is the session-fifteen full-chunk MoE tiling measured

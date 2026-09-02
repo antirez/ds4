@@ -150,7 +150,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
     }
-    opt(fp, c, "--ple FILE", "Qwen3.8-Flash-Next Q4 PLE table sidecar.");
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -177,20 +176,17 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk auto|2048|4096|8192", "Qwen auto selects admitted 8K cold prefill or 2K fallback; legacy models retain numeric defaults.");
+    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
-        }
-        if (tool == DS4_HELP_EVAL) {
-            opt(fp, c, "--mtp-draft N", "Maximum Qwen autoregressive MTP draft tokens, 1..16. Default: 1");
-            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
-            opt(fp, c, "--mtp-timing", "Print Qwen MTP draft acceptance and cycle timing counters.");
+            opt(fp, c, "--ple FILE", "External PLE n-gram table GGUF (Qwen3.8-Flash-Next; CPU-side reads).");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp", "Enable model-embedded MTP speculation.");
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens (Qwen block verifier: 1..16). Default: 1");
+            opt(fp, c, "--ple FILE", "External PLE n-gram table GGUF (Qwen3.8-Flash-Next; CPU-side reads).");
+            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--mtp-timing", "Enable embedded MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");
@@ -398,8 +394,6 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--teacher-forced-decode", "Decode the following prompt tokens instead of each predicted argmax.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
-    opt(fp, c, "--dump-frontier-state-dir DIR", "Write one complete session-state payload per frontier.");
-    opt(fp, c, "--dump-frontier-generation-dir DIR", "Write greedy token IDs and pieces per frontier.");
     fputc('\n', fp);
 }
 

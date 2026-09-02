@@ -1335,6 +1335,151 @@ static void test_model_q8_0_mul_mm_rows(void) {
     free(allocation);
 }
 
+static void test_model_q8_0_mpp_rows(void) {
+    /* Prefill-sized batches take the Metal4 TensorOps direct-RHS NAX route
+     * when the session compiled it (M5-class automatic enable, or the
+     * DS4_METAL_ENABLE_TENSOR opt-in this suite sets in main, which covers
+     * pre-M5 machines through the portable fallback).  The 128/64/96-row
+     * cases pin the n128/n64/n32 token tiles, 200 rows exercises the
+     * split-prefix dispatch (192-row NAX prefix plus an 8-row boundary-checked
+     * tail), and 33 rows stays under the split threshold so the whole
+     * projection keeps the tiled kernel.  out_dim 67 is not 64-aligned and
+     * must route entirely through the tiled kernel even at aligned row
+     * counts.  The NAX kernel dequantizes Q8_0 weights to F16 tiles and
+     * multiplies against the direct F32 activation tile, so the reference
+     * tolerance covers the same F16 weight rounding as the tiled fixture. */
+    if (!ds4_gpu_metal4_tensor_route_enabled()) {
+        puts("Qwen Q8_0 TensorOps route not compiled; MPP fixture skipped");
+        return;
+    }
+    enum { IN = 512 };
+    const uint32_t row_cases[] = {128u, 64u, 96u, 200u, 33u};
+    const uint32_t out_cases[] = {128u, 67u};
+    const size_t weight_offset = 4096u;
+    for (uint32_t oc = 0u; oc < 2u; oc++) {
+        const uint32_t out_dim = out_cases[oc];
+        const size_t weight_bytes =
+            (size_t)out_dim * (IN / 32u) * sizeof(test_block_q8_0);
+        const size_t model_size = weight_offset + weight_bytes + 256u;
+        void *allocation = NULL;
+        require_ok(posix_memalign(&allocation, 4096u,
+                                  align_size(model_size, 4096u)) == 0,
+                   "Q8_0 MPP model allocation");
+        memset(allocation, 0, align_size(model_size, 4096u));
+        uint8_t *model = allocation;
+        test_block_q8_0 *weights =
+            (test_block_q8_0 *)(model + weight_offset);
+        fill_q8_0_matrix(weights, out_dim, IN, 173u);
+        require_ok(ds4_gpu_set_model_map(model, model_size),
+                   "Q8_0 MPP model registration");
+
+        for (uint32_t c = 0u; c < sizeof(row_cases) / sizeof(row_cases[0]);
+             c++) {
+            const uint32_t rows = row_cases[c];
+            float *input = malloc((size_t)rows * IN * sizeof(float));
+            float *expected = malloc((size_t)rows * out_dim * sizeof(float));
+            float *actual = malloc((size_t)rows * out_dim * sizeof(float));
+            require_ok(input && expected && actual,
+                       "Q8_0 MPP host allocations");
+            for (uint32_t i = 0; i < rows * IN; i++)
+                input[i] = cosf((float)(i + 13u) * 0.007f) * 0.35f;
+            q8_0_matmul_reference(expected, weights, input, IN, out_dim, rows);
+            ds4_gpu_tensor *x = tensor_from(
+                input, (size_t)rows * IN * sizeof(float));
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+                (size_t)rows * out_dim * sizeof(float));
+            require_ok(x && out, "Q8_0 MPP tensor allocation");
+            require_ok(ds4_gpu_qwen4_q8_0_matmul_model(
+                           out, model, model_size, weight_offset,
+                           x, IN, out_dim, rows),
+                       "Q8_0 MPP dispatch");
+            require_ok(ds4_gpu_tensor_read(out, 0, actual,
+                                           (size_t)rows * out_dim * sizeof(float)),
+                       "Q8_0 MPP readback");
+            char label[64];
+            snprintf(label, sizeof(label),
+                     "Qwen Q8_0 MPP rows=%u out=%u", rows, out_dim);
+            require_array_close(label, actual, expected,
+                                (size_t)rows * out_dim, 2e-1f, 4e-3f);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(x);
+            free(actual);
+            free(expected);
+            free(input);
+        }
+        free(allocation);
+    }
+}
+
+static void test_model_q8_0_mpp_f32stage_rows(void) {
+    /* The F32-staged NAX quality route (DS4_QWEN4_Q8_0_MPP_F32STAGE=1)
+     * stages the Q8_0 weight tile as fp32, so the only remaining deviation
+     * from the exact CPU dequant reference is the TensorOps accumulate
+     * order.  On the portable fallback that measures bit-exact; the bound
+     * below keeps headroom for the M5 hardware accumulate (the
+     * exp/m5-tensor-precision GT sweep measured ~1.7e-4 rms there) while
+     * staying far tighter than the binary16-staged fixture. */
+    if (!ds4_gpu_metal4_tensor_route_enabled()) {
+        puts("Qwen Q8_0 TensorOps route not compiled; MPP f32stage fixture skipped");
+        return;
+    }
+    enum { IN = 512, OUT = 128 };
+    const uint32_t row_cases[] = {128u, 96u};
+    const size_t weight_offset = 4096u;
+    const size_t weight_bytes =
+        (size_t)OUT * (IN / 32u) * sizeof(test_block_q8_0);
+    const size_t model_size = weight_offset + weight_bytes + 256u;
+    void *allocation = NULL;
+    require_ok(posix_memalign(&allocation, 4096u,
+                              align_size(model_size, 4096u)) == 0,
+               "Q8_0 MPP f32stage model allocation");
+    memset(allocation, 0, align_size(model_size, 4096u));
+    uint8_t *model = allocation;
+    test_block_q8_0 *weights =
+        (test_block_q8_0 *)(model + weight_offset);
+    fill_q8_0_matrix(weights, OUT, IN, 211u);
+    require_ok(ds4_gpu_set_model_map(model, model_size),
+               "Q8_0 MPP f32stage model registration");
+
+    setenv("DS4_QWEN4_Q8_0_MPP_F32STAGE", "1", 1);
+    for (uint32_t c = 0u; c < sizeof(row_cases) / sizeof(row_cases[0]);
+         c++) {
+        const uint32_t rows = row_cases[c];
+        float *input = malloc((size_t)rows * IN * sizeof(float));
+        float *expected = malloc((size_t)rows * OUT * sizeof(float));
+        float *actual = malloc((size_t)rows * OUT * sizeof(float));
+        require_ok(input && expected && actual,
+                   "Q8_0 MPP f32stage host allocations");
+        for (uint32_t i = 0; i < rows * IN; i++)
+            input[i] = cosf((float)(i + 17u) * 0.009f) * 0.3f;
+        q8_0_matmul_reference(expected, weights, input, IN, OUT, rows);
+        ds4_gpu_tensor *x = tensor_from(
+            input, (size_t)rows * IN * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+            (size_t)rows * OUT * sizeof(float));
+        require_ok(x && out, "Q8_0 MPP f32stage tensor allocation");
+        require_ok(ds4_gpu_qwen4_q8_0_matmul_model(
+                       out, model, model_size, weight_offset,
+                       x, IN, OUT, rows),
+                   "Q8_0 MPP f32stage dispatch");
+        require_ok(ds4_gpu_tensor_read(out, 0, actual,
+                                       (size_t)rows * OUT * sizeof(float)),
+                   "Q8_0 MPP f32stage readback");
+        char label[64];
+        snprintf(label, sizeof(label),
+                 "Qwen Q8_0 MPP f32stage rows=%u", rows);
+        require_array_close(label, actual, expected,
+                            (size_t)rows * OUT, 4e-3f, 4e-3f);
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(x);
+        free(actual);
+        free(expected);
+        free(input);
+    }
+    unsetenv("DS4_QWEN4_Q8_0_MPP_F32STAGE");
+    free(allocation);
+}
+
 static void test_model_bf16_matmul_rows(void) {
     /* Prefill-sized BF16 control projections (MoE router, GDN decay/beta)
      * route through the tiled tensor-core kernel_mul_mm_bf16_f32.  The
@@ -1916,6 +2061,37 @@ static void test_moe_q4_0_mul_mm_id(void) {
     free(retiled_out);
     free(retiled_mid);
 
+    /* F32-staged quality route for the STANDARD Q4_0-routed pack
+     * (DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE=1 or the shared
+     * DS4_METAL_MPP_MOE_F32STAGE), the same pass the Q4_K fixture pins:
+     * fp32 operand staging removes the binary16 tile rounding, leaving
+     * only the TensorOps accumulate order.  Measured on the portable
+     * fallback at 6.0e-8 mid/output (vs 3.4e-4 / 2.9e-4 binary16-staged);
+     * bounds keep headroom for the M5 hardware accumulate.  Skipped when
+     * the TensorOps route is not compiled. */
+    if (ds4_gpu_metal4_tensor_route_enabled()) {
+        setenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS", "512", 1);
+        setenv("DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE", "1", 1);
+        require_ok(ds4_gpu_qwen4_moe_q4_0_model(
+            out, mid, xt, st, rt, model, cursor,
+            gate_offset, up_offset, down_offset,
+            IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+            "Qwen Q4_0 grouped MoE f32stage dispatch");
+        require_ok(ds4_gpu_tensor_read(mid, 0, actual_mid,
+                                       (size_t)ROWS * TOP_K * FF * sizeof(float)) &&
+                   ds4_gpu_tensor_read(out, 0, actual_out,
+                                       (size_t)ROWS * OUT * sizeof(float)),
+                   "Q4_0 MoE f32stage readback");
+        require_array_close("Qwen Q4_0 grouped MoE f32stage mid",
+                            actual_mid, expected_mid,
+                            (size_t)ROWS * TOP_K * FF, 4e-3f, 4e-3f);
+        require_array_close("Qwen Q4_0 grouped MoE f32stage output",
+                            actual_out, expected_out,
+                            (size_t)ROWS * OUT, 2e-2f, 4e-3f);
+        unsetenv("DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE");
+        unsetenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS");
+    }
+
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(rt);
@@ -1932,6 +2108,205 @@ static void test_moe_q4_0_mul_mm_id(void) {
         require_ok(ds4_gpu_set_model_map(model_fixture_allocation,
                                          model_fixture_size),
                    "restore Q8_0 model fixture after Q4_0 MoE mul_mm_id");
+    free(allocation);
+}
+
+static void test_moe_q4_k_mul_mm_id(void) {
+    /* The v3 standard pack's grouped Q4_K routed path at prefill rows: same
+     * dispatch contract as the Q4_0 fixture, at the production geometry
+     * (640-wide expert FF, zero-padded 768-wide down rows).  With the
+     * TensorOps route compiled this exercises kernel_mul_mm_id_q4_K_f32_mpp;
+     * otherwise the simdgroup id kernel.  The reference is the exact scalar
+     * CPU dot product, with the F16 tile-staging tolerance of the grouped
+     * family. */
+    enum {
+        IN = 256, FF = 640, DOWN = 768, OUT = 33,
+        EXPERTS = 12, TOP_K = 10, ROWS = 600,
+    };
+    const size_t gate_bytes = (size_t)EXPERTS * FF * (IN / 256u) *
+        sizeof(test_block_q4_k);
+    const size_t down_bytes = (size_t)EXPERTS * OUT * (DOWN / 256u) *
+        sizeof(test_block_q4_k);
+    size_t cursor = 0u;
+    const size_t gate_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t up_offset = cursor;
+    cursor = align_size(cursor + gate_bytes, 64u);
+    const size_t down_offset = cursor;
+    cursor = align_size(cursor + down_bytes, 4096u);
+    void *allocation = NULL;
+    require_ok(posix_memalign(&allocation, 4096u, cursor) == 0,
+               "Q4_K MoE mul_mm_id model allocation");
+    uint8_t *model = allocation;
+    memset(model, 0, cursor);
+    test_block_q4_k *gate = (test_block_q4_k *)(model + gate_offset);
+    test_block_q4_k *up = (test_block_q4_k *)(model + up_offset);
+    test_block_q4_k *down = (test_block_q4_k *)(model + down_offset);
+    fill_q4_k_matrix(gate, EXPERTS * FF, IN, 11u);
+    fill_q4_k_matrix(up, EXPERTS * FF, IN, 29u);
+    fill_q4_k_matrix(down, EXPERTS * OUT, DOWN, 43u);
+    require_ok(ds4_gpu_set_model_map(model, cursor),
+               "Q4_K MoE mul_mm_id model fixture registration");
+
+    float *input = malloc((size_t)ROWS * IN * sizeof(float));
+    int32_t *selected = malloc((size_t)ROWS * TOP_K * sizeof(int32_t));
+    float *route = malloc((size_t)ROWS * TOP_K * sizeof(float));
+    float *expected_mid = malloc((size_t)ROWS * TOP_K * FF * sizeof(float));
+    float *expected_out = malloc((size_t)ROWS * OUT * sizeof(float));
+    require_ok(input && selected && route && expected_mid && expected_out,
+               "Q4_K MoE mul_mm_id host allocations");
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t i = 0; i < IN; i++)
+            input[(size_t)row * IN + i] =
+                cosf((float)(row * 29u + i + 3u) * 0.013f) * 0.2f;
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            selected[(size_t)row * TOP_K + slot] =
+                (int32_t)((slot * 5u + row) % EXPERTS);
+            route[(size_t)row * TOP_K + slot] =
+                (float)(slot + 1u) / 55.0f;
+        }
+    }
+    for (uint32_t row = 0; row < ROWS; row++) {
+        for (uint32_t slot = 0; slot < TOP_K; slot++) {
+            const uint32_t expert =
+                (uint32_t)selected[(size_t)row * TOP_K + slot];
+            for (uint32_t output = 0; output < FF; output++) {
+                const uint32_t weight_row = expert * FF + output;
+                float g = 0.0f, u = 0.0f;
+                for (uint32_t k = 0; k < IN; k++) {
+                    g = fmaf(q4_k_value(gate, IN, weight_row, k),
+                             input[(size_t)row * IN + k], g);
+                    u = fmaf(q4_k_value(up, IN, weight_row, k),
+                             input[(size_t)row * IN + k], u);
+                }
+                expected_mid[((size_t)row * TOP_K + slot) * FF + output] =
+                    (g / (1.0f + expf(-g))) * u;
+            }
+        }
+        for (uint32_t output = 0; output < OUT; output++) {
+            float total = 0.0f;
+            for (uint32_t slot = 0; slot < TOP_K; slot++) {
+                const uint32_t expert =
+                    (uint32_t)selected[(size_t)row * TOP_K + slot];
+                const uint32_t weight_row = expert * OUT + output;
+                float sum = 0.0f;
+                for (uint32_t k = 0; k < FF; k++)
+                    sum = fmaf(q4_k_value(down, DOWN, weight_row, k),
+                               expected_mid[
+                                   ((size_t)row * TOP_K + slot) * FF + k],
+                               sum);
+                total = fmaf(sum, route[(size_t)row * TOP_K + slot], total);
+            }
+            expected_out[(size_t)row * OUT + output] = total;
+        }
+    }
+
+    ds4_gpu_tensor *xt = tensor_from(input, (size_t)ROWS * IN * sizeof(float));
+    ds4_gpu_tensor *st = tensor_from(selected,
+                                     (size_t)ROWS * TOP_K * sizeof(int32_t));
+    ds4_gpu_tensor *rt = tensor_from(route,
+                                     (size_t)ROWS * TOP_K * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(
+        (size_t)ROWS * TOP_K * FF * sizeof(float));
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+        (size_t)ROWS * OUT * sizeof(float));
+    float *actual_mid = malloc((size_t)ROWS * TOP_K * FF * sizeof(float));
+    float *actual_out = malloc((size_t)ROWS * OUT * sizeof(float));
+    require_ok(mid && out && actual_mid && actual_out,
+               "Q4_K MoE mul_mm_id tensor allocations");
+    setenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS", "512", 1);
+    setenv("DS4_QWEN4_MOE_MUL_MM_TILE_ROWS", "512", 1);
+    require_ok(ds4_gpu_qwen4_moe_q4_k_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+        "Qwen Q4_K grouped MoE dispatch");
+    require_ok(ds4_gpu_tensor_read(mid, 0, actual_mid,
+                                   (size_t)ROWS * TOP_K * FF * sizeof(float)) &&
+               ds4_gpu_tensor_read(out, 0, actual_out,
+                                   (size_t)ROWS * OUT * sizeof(float)),
+               "Q4_K MoE mul_mm_id readback");
+    require_array_close("Qwen Q4_K grouped MoE mid", actual_mid,
+                        expected_mid, (size_t)ROWS * TOP_K * FF,
+                        2e-2f, 4e-3f);
+    require_array_close("Qwen Q4_K grouped MoE output", actual_out,
+                        expected_out, (size_t)ROWS * OUT, 5e-2f, 8e-3f);
+
+    /* Tile regrouping must stay byte-identical exactly as on the Q4_0
+     * route: work-tile granularity only regroups (token, slot) assignments. */
+    float *retiled_mid = malloc((size_t)ROWS * TOP_K * FF * sizeof(float));
+    float *retiled_out = malloc((size_t)ROWS * OUT * sizeof(float));
+    require_ok(retiled_mid && retiled_out,
+               "Q4_K MoE retile host allocations");
+    setenv("DS4_QWEN4_MOE_MUL_MM_TILE_ROWS", "600", 1);
+    require_ok(ds4_gpu_qwen4_moe_q4_k_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+        "Qwen Q4_K grouped MoE single-tile dispatch");
+    require_ok(ds4_gpu_tensor_read(mid, 0, retiled_mid,
+                                   (size_t)ROWS * TOP_K * FF * sizeof(float)) &&
+               ds4_gpu_tensor_read(out, 0, retiled_out,
+                                   (size_t)ROWS * OUT * sizeof(float)),
+               "Q4_K MoE single-tile readback");
+    require_ok(memcmp(retiled_mid, actual_mid,
+                      (size_t)ROWS * TOP_K * FF * sizeof(float)) == 0 &&
+               memcmp(retiled_out, actual_out,
+                      (size_t)ROWS * OUT * sizeof(float)) == 0,
+               "Q4_K MoE tile-size byte identity (512 vs 600 rows)");
+    unsetenv("DS4_QWEN4_MOE_MUL_MM_TILE_ROWS");
+    unsetenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS");
+    free(retiled_out);
+
+    /* F32-staged quality route (DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE=1 or the
+     * shared DS4_METAL_MPP_MOE_F32STAGE): fp32 operand staging removes the
+     * binary16 tile rounding, leaving only the TensorOps accumulate order.
+     * Measured on the portable fallback at ~1.9e-6 mid / 6.1e-5 output
+     * (vs 2.0e-3 / 3.9e-2 binary16-staged); the bounds keep headroom for
+     * the M5 hardware accumulate (exp/m5-tensor-precision measured ~1.7e-4
+     * rms there on iq2_xxs) while staying far tighter than the binary16
+     * fixture above.  Skipped when the TensorOps route is not compiled —
+     * the env would otherwise just relabel the simdgroup tiles. */
+    if (ds4_gpu_metal4_tensor_route_enabled()) {
+    setenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS", "512", 1);
+    setenv("DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE", "1", 1);
+    require_ok(ds4_gpu_qwen4_moe_q4_k_model(
+        out, mid, xt, st, rt, model, cursor,
+        gate_offset, up_offset, down_offset,
+        IN, FF, OUT, EXPERTS, TOP_K, ROWS),
+        "Qwen Q4_K grouped MoE f32stage dispatch");
+    require_ok(ds4_gpu_tensor_read(mid, 0, actual_mid,
+                                   (size_t)ROWS * TOP_K * FF * sizeof(float)) &&
+               ds4_gpu_tensor_read(out, 0, actual_out,
+                                   (size_t)ROWS * OUT * sizeof(float)),
+               "Q4_K MoE f32stage readback");
+    require_array_close("Qwen Q4_K grouped MoE f32stage mid", actual_mid,
+                        expected_mid, (size_t)ROWS * TOP_K * FF,
+                        4e-3f, 4e-3f);
+    require_array_close("Qwen Q4_K grouped MoE f32stage output", actual_out,
+                        expected_out, (size_t)ROWS * OUT, 2e-2f, 4e-3f);
+    unsetenv("DS4_QWEN4_MOE_MUL_MM_ID_F32STAGE");
+    unsetenv("DS4_QWEN4_MOE_MUL_MM_ID_MIN_ROWS");
+    }
+    free(retiled_mid);
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(rt);
+    ds4_gpu_tensor_free(st);
+    ds4_gpu_tensor_free(xt);
+    free(actual_out);
+    free(actual_mid);
+    free(expected_out);
+    free(expected_mid);
+    free(route);
+    free(selected);
+    free(input);
+    if (model_fixture_allocation != NULL)
+        require_ok(ds4_gpu_set_model_map(model_fixture_allocation,
+                                         model_fixture_size),
+                   "restore Q8_0 model fixture after Q4_K MoE mul_mm_id");
     free(allocation);
 }
 
@@ -6154,6 +6529,19 @@ static void test_qsa_streaming_topk_score_mm(void) {
 }
 
 int main(void) {
+    /* Opt the fixture suite into the Metal 4 TensorOps route wherever the
+     * platform can compile it: M5-class GPUs get the real TensorOps units
+     * and pre-M5 machines exercise the portable fallback, so the mul_mm and
+     * grouped-MoE fixtures pin parity for the accelerated prefill kernels on
+     * every machine.  An explicit DS4_METAL_ENABLE_TENSOR value (including
+     * =0) is respected; DS4_QWEN4_TEST_DISABLE_TENSOR_ROUTE=1 also keeps
+     * this run on the legacy kernels only. */
+    if (getenv("DS4_QWEN4_TEST_DISABLE_TENSOR_ROUTE") == NULL) {
+        const char *raw = getenv("DS4_METAL_ENABLE_TENSOR");
+        if (!raw || raw[0] == '\0') {
+            setenv("DS4_METAL_ENABLE_TENSOR", "1", 1);
+        }
+    }
     require_ok(ds4_gpu_init(), "Metal initialization");
     test_fast_path_capabilities();
     if (getenv("DS4_QWEN4_DENSE_MATVEC_BENCH") != NULL) {
@@ -6199,12 +6587,15 @@ int main(void) {
     test_q8_0_matmul();
     test_model_q8_0_paths();
     test_model_q8_0_mul_mm_rows();
+    test_model_q8_0_mpp_rows();
+    test_model_q8_0_mpp_f32stage_rows();
     test_model_bf16_matmul_rows();
     test_vision_fc2_q8_0_stride();
     test_moe_topk();
     test_moe_q4_k();
     test_moe_q4_0();
     test_moe_q4_0_mul_mm_id();
+    test_moe_q4_k_mul_mm_id();
     test_moe_iq2_xxs_q2_k();
     test_ple_gate_conv();
     test_ple_long_tiled_schedule();

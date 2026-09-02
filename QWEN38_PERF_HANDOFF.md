@@ -1553,6 +1553,36 @@ only.  Build and the full Metal fixture suite pass after the removal.
       fixtures (speed-bench/qwen38-bf16-reference/, the repackers, the
       proto benches' SOURCES, the MTP sweep driver, and this handoff)
       are added; built bench BINARIES stay out via .gitignore.
+      (The branch was later renamed to `qwen3.8-flash-next`.)
+   e. MANIFEST RECIPE FIX (follow-up, owner-directed): the standard
+      pack's manifest still carried the CONVERTER's recipe text
+      `quantization.routed_experts: {qtype: Q4_K}` — stale prose from
+      the original v3 conversion that the repacker had deliberately
+      left; with the profile standardized this invited exactly the
+      "are we sure this is Q4_0?" question (the FILENAME
+      Q4KExperts-...gguf and the profile-name-driven startup line
+      "Q4_K/Q4_K routed" read the same way).  BYTE-LEVEL CONFIRMATION
+      (independent GGUF tensor-directory parse, on BOTH the Studio and
+      the MacBookIvan Thunderbolt copy): the base file declares exactly
+      144 tensors of ggml type 2 (Q4_0) = 48 layers x 3 routed
+      gate/up/down, 315 Q8_0, 752 BF16, ZERO Q4_K; the only Q4_K
+      tensors in the pack are the MTP sidecar's three (strict by
+      design); the loader never parses the recipe block (verified by
+      grep and by ds4 --inspect accepting the edited manifest with
+      tensor_manifest_sha256 unchanged).  The manifest now records
+      routed_experts {qtype: Q4_0, block_size: 32, note: ...} plus the
+      `source_derived_q4_0_routed` provenance key; the same bytes were
+      synced to the MacBookIvan copy (sha-verified) and UPLOADED to the
+      HF repo ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4 (commit b617e1e4;
+      the pre-upload remote manifest was verified byte-identical to the
+      pre-fix local one first, and the post-upload download re-verified
+      sha 61334043...).  The repacker now rewrites the recipe block for
+      future repacks so this cannot regress.  Two Q4_K-looking artifacts
+      deliberately remain: the base file's historical NAME (the loader
+      binds via GGUF-internal ds4.pack.artifact metadata) and the
+      startup bind line (it prints the pack PROFILE's declared routed
+      names, not the bound tensor types — a known logging wart, fix
+      offered but not requested).
 
 
 ## Complete source checkpoint

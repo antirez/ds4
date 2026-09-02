@@ -7821,7 +7821,6 @@ kernel void kernel_mul_mm_id_map0(
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
 
-
 // Host-visible map builders for the routed-expert counts used by DS4 graph
 // shapes. Some arities are generic leftovers retained for nearby batch sizes.
 template [[host_name("kernel_mul_mm_id_map0_ne20_1" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1>;
@@ -7960,8 +7959,8 @@ kernel void kernel_mul_mm_id(
     const int r0 = tgpig.y*NR0;
     const int r1 = (int)item.y;
 
-    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
-    device const int32_t  * ids_i32 = (device const int32_t  *) hids;
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
     const int32_t neh1 = tpe_u32[im];
 
@@ -8003,10 +8002,14 @@ kernel void kernel_mul_mm_id(
 
     short il = il0;
 
-    const short iy = 8*(tiitg % NL1);
+    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+    const short i13 = 0;
 
     const uint64_t offset0 = EXPERT_ADDRESSES ? 0 :
-        (uint64_t)(im - args.tp_expert_base)*args.nb02;
+        (uint64_t)(im - args.tp_expert_base)*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
     if (EXPERT_ADDRESSES) {
@@ -8015,12 +8018,10 @@ kernel void kernel_mul_mm_id(
     }
     device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
-
-    const short i11 = (id % args.ne20) % args.ne11;
-    const short i12 = (id / args.ne20);
+    const short iy = 8*(tiitg % NL1);
 
     device const T1 * y = (device const T1 *)(src1
+        + args.nb13*i13
         + args.nb12*i12
         + args.nb11*i11
         + args.nb10*iy);
@@ -8859,10 +8860,6 @@ template [[host_name("kernel_mul_mm_id_addr_mxfp4_f32")]]   kernel mul_mm_id_add
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mxfp4_f16")]]   kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
-
-// Qwen3.8 routed Q4_0 experts share the standard GGML nibble layout with the
-// dense block decoder, so the generic mapped grouped matmul covers them.
-template [[host_name("kernel_mul_mm_id_q4_0_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill. It uses

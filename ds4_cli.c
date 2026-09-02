@@ -534,8 +534,7 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen ||
-        (!ds4_engine_is_glm_dsa(engine) && !ds4_engine_is_qwen4(engine))) return;
+    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -1392,6 +1391,8 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
 
 static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -1402,9 +1403,7 @@ static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
 static void repl_chat_build_think_prefix(ds4_engine *engine,
                                          ds4_think_mode mode,
                                          ds4_tokens *prefix) {
-    if (ds4_engine_is_qwen4(engine)) {
-        return;
-    } else if (ds4_engine_is_glm_dsa(engine)) {
+    if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
     } else if (mode == DS4_THINK_MAX) {
@@ -2022,14 +2021,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--ple")) {
-            c.engine.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.engine.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -2100,18 +2099,7 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            const char *value = need_arg(&i, argc, argv, arg);
-            char mode_error[128];
-            if (ds4_qwen4_parse_prefill_mode(value,
-                                              &c.engine.qwen4_prefill_mode,
-                                              mode_error,
-                                              sizeof(mode_error))) {
-                c.engine.qwen4_prefill_mode_set = true;
-                c.engine.prefill_chunk =
-                    (uint32_t)c.engine.qwen4_prefill_mode;
-                continue;
-            }
-            int v = parse_int(value, arg);
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
                 fprintf(stderr, "ds4: --prefill-chunk must be positive\n");
                 exit(2);

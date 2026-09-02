@@ -1,4770 +1,2431 @@
-// Qwen3.8-Flash-Next native kernels. Quantized matrices use the ordinary
-// GGML block payloads emitted by GGUF: Q8_0 for dense projections and either
-// Q4_K or mixed IQ2_XXS gate/up plus Q2_K down for routed experts. Inputs,
-// outputs remain FP32.  The ordinary-decode path may keep recurrent state in
-// BF16 (matching the reference MLX implementation); the verifier path retains
-// the original FP32 state for byte-exact partial commits.
+/* Qwen3.8-Flash-Next kernels: hyper-connection mix/combine, gated delta net
+ * (conv, scan, gated norm), PLE n-gram gate + dilated conv, softmax top-k
+ * router, QSA indexer, gated GQA attention, routed/dense expert matmuls and
+ * the MTP input.  Transients are f32; the GDN state is f32 [head][dv][dk]
+ * so each simdgroup lane owns a contiguous dk slice.  Math mirrors the
+ * qwen4_ref_* scalar reference in ds4.c. */
 
-static inline float qwen4_bf16_to_f32(ushort value) {
-    return as_type<float>((uint)value << 16);
+static inline float qwen4_sigmoid(float x) {
+    if (x >= 0.0f) {
+        const float e = exp(-x);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = exp(x);
+    return e / (1.0f + e);
 }
 
-static inline ushort qwen4_f32_to_bf16(float value) {
-    uint bits = as_type<uint>(value);
-    bits += 0x7fffu + ((bits >> 16u) & 1u);
-    return (ushort)(bits >> 16u);
+static inline float qwen4_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return exp(x);
+    return log(1.0f + exp(x));
 }
 
-struct qwen4_q8_0_args {
-    uint in_dim;
-    uint out_dim;
-    uint n_rows;
+static inline float qwen4_silu(float x) {
+    return x * qwen4_sigmoid(x);
+}
+
+static inline float qwen4_row_dot(device const char *row, device const float *x,
+                                  uint weight_type, uint in_dim, ushort tiisg);
+
+/* --- hyper-connections -------------------------------------------------- */
+
+struct ds4_metal_args_qwen4_hc_norm {
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_inject;     /* 0 or n_hc: inject rows dotted with this stream's xn */
+    float    eps;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
 };
 
-struct qwen4_block_q4_0 {
-    half d;
-    uchar qs[16];
+#define QWEN4_HC_CHUNKS 8   /* threadgroups per stream; each recomputes the stream RMS */
+
+/* element readers for the hc mixer weights: f16, f32 and q8_0 rows */
+struct qwen4_w_f16 {
+    device const half *p;
+    qwen4_w_f16(device const char *base) : p((device const half *)base) {}
+    float at(uint64_t i) const { return (float)p[i]; }
+};
+struct qwen4_w_f32 {
+    device const float *p;
+    qwen4_w_f32(device const char *base) : p((device const float *)base) {}
+    float at(uint64_t i) const { return p[i]; }
+};
+struct qwen4_w_q8 {
+    device const char *p;
+    qwen4_w_q8(device const char *base) : p(base) {}
+    float at(uint64_t i) const {
+        device const char *b = p + (i >> 5) * 34;
+        return (float)(*(device const half *)b) * (float)b[2 + (i & 31u)];
+    }
 };
 
-static inline float4 qwen4_q4_0_values4(
-        device const qwen4_block_q4_0 *block,
-        uint within) {
-    const uint packed = within & 15u;
-    const bool high = within >= 16u;
-    const uchar4 codes = uchar4(
-        block->qs[packed + 0u], block->qs[packed + 1u],
-        block->qs[packed + 2u], block->qs[packed + 3u]);
-    return float4(high ? codes >> 4u : codes & uchar4(15u)) - 8.0f;
-}
-
-/* Q4_0 decode traversal: each lane owns four contiguous values.  The 32
- * lanes therefore issue one coalesced 128-value sweep per loop iteration. */
-static inline float qwen4_q4_0_dot_f32(
-        device const qwen4_block_q4_0 *row,
-        device const float *x,
-        uint in_dim,
-        ushort lane) {
-    float sum = 0.0f;
-    for (uint base = (uint)lane * 4u; base < in_dim; base += 128u) {
-        device const qwen4_block_q4_0 *block = row + base / 32u;
-        const float4 q = qwen4_q4_0_values4(block, base & 31u);
-        const float4 xv = *((device const float4 *)(x + base));
-        sum = fma((float)block->d, dot(q, xv), sum);
-    }
-    return simd_sum(sum);
-}
-
-static inline float2 qwen4_q4_0_pair_dot_f32(
-        device const qwen4_block_q4_0 *a,
-        device const qwen4_block_q4_0 *b,
-        device const float *x,
-        uint in_dim,
-        ushort lane) {
-    float2 sum = 0.0f;
-    for (uint base = (uint)lane * 4u; base < in_dim; base += 128u) {
-        const uint block_index = base / 32u;
-        const uint within = base & 31u;
-        const float4 xv = *((device const float4 *)(x + base));
-        device const qwen4_block_q4_0 *ab = a + block_index;
-        device const qwen4_block_q4_0 *bb = b + block_index;
-        sum.x = fma((float)ab->d,
-                    dot(qwen4_q4_0_values4(ab, within), xv), sum.x);
-        sum.y = fma((float)bb->d,
-                    dot(qwen4_q4_0_values4(bb, within), xv), sum.y);
-    }
-    return float2(simd_sum(sum.x), simd_sum(sum.y));
-}
-
-static inline float qwen4_q8_0_value(
-        device const block_q8_0 *row,
-        uint k) {
-    device const block_q8_0 *block = row + k / QK8_0;
-    return (float)block->d * (float)block->qs[k & (QK8_0 - 1u)];
-}
-
-/* One SIMDgroup owns one output row. Lanes walk 8-value slices so the block
- * delta is loaded once for each slice, matching the decode-friendly GGML
- * Q8_0 traversal without materializing dequantized weights. */
-static inline float qwen4_q8_0_dot_f32(
-        device const block_q8_0 *row,
-        device const float *x,
-        uint in_dim,
-        ushort lane) {
-    float sum = 0.0f;
-    for (uint base = (uint)lane * 8u; base < in_dim;
-         base += 32u * 8u) {
-        float dotq = 0.0f;
-        const uint block_index = base / QK8_0;
-        const uint in_block = base & (QK8_0 - 1u);
-        device const block_q8_0 *block = row + block_index;
-        for (uint i = 0u; i < 8u; i++)
-            dotq = fma((float)block->qs[in_block + i], x[base + i], dotq);
-        sum = fma((float)block->d, dotq, sum);
-    }
-    return simd_sum(sum);
-}
-
-static inline float qwen4_q8_0_dot_bf16(
-        device const block_q8_0 *row,
-        device const ushort *x,
-        uint in_dim,
-        ushort lane) {
-    float sum = 0.0f;
-    for (uint base = (uint)lane * 8u; base < in_dim;
-         base += 32u * 8u) {
-        float dotq = 0.0f;
-        const uint block_index = base / QK8_0;
-        const uint in_block = base & (QK8_0 - 1u);
-        device const block_q8_0 *block = row + block_index;
-        for (uint i = 0u; i < 8u; i++) {
-            dotq = fma((float)block->qs[in_block + i],
-                       qwen4_bf16_to_f32(x[base + i]), dotq);
-        }
-        sum = fma((float)block->d, dotq, sum);
-    }
-    return simd_sum(sum);
-}
-
-kernel void kernel_qwen4_q8_0_f32(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgpig.x * (uint)nsg + (uint)sg;
-    const uint token = tgpig.y;
-    if (out_row >= args.out_dim || token >= args.n_rows) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    device const block_q8_0 *wr = weights + (ulong)out_row * row_blocks;
-    device const float *xr = x + (ulong)token * args.in_dim;
-    const float sum = qwen4_q8_0_dot_f32(wr, xr, args.in_dim, lane);
-    if (lane == 0u)
-        out[(ulong)token * args.out_dim + out_row] = sum;
-}
-
-kernel void kernel_qwen4_q8_0_f32_m1(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgroup * (uint)nsg + (uint)sg;
-    if (out_row >= args.out_dim) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    const float sum = qwen4_q8_0_dot_f32(
-        weights + (ulong)out_row * row_blocks, x, args.in_dim, lane);
-    if (lane == 0u) out[out_row] = sum;
-}
-
-/* Expert-independent wide-prefill specialization. Each SIMDgroup owns one
- * output row and advances eight token rows together, decoding each Q8_0
- * block slice once and retaining an independent FP32 reduction per token. */
-kernel void kernel_qwen4_q8_0_f32_rows8(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgpig.x * (uint)nsg + (uint)sg;
-    const uint token0 = tgpig.y * 8u;
-    if (out_row >= args.out_dim || token0 >= args.n_rows) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    device const block_q8_0 *wr = weights + (ulong)out_row * row_blocks;
-    float4 sum0 = 0.0f;
-    float4 sum1 = 0.0f;
-    for (uint base = (uint)lane * 8u; base < args.in_dim;
-         base += 32u * 8u) {
-        const uint block_index = base / QK8_0;
-        const uint in_block = base & (QK8_0 - 1u);
-        device const block_q8_0 *block = wr + block_index;
-        const float delta = (float)block->d;
-        for (uint i = 0u; i < 8u; i++) {
-            const uint k = base + i;
-            const float q = (float)block->qs[in_block + i] * delta;
-            float4 xv0 = 0.0f;
-            float4 xv1 = 0.0f;
-            if (token0 + 0u < args.n_rows) xv0.x = x[((ulong)token0 + 0u) * args.in_dim + k];
-            if (token0 + 1u < args.n_rows) xv0.y = x[((ulong)token0 + 1u) * args.in_dim + k];
-            if (token0 + 2u < args.n_rows) xv0.z = x[((ulong)token0 + 2u) * args.in_dim + k];
-            if (token0 + 3u < args.n_rows) xv0.w = x[((ulong)token0 + 3u) * args.in_dim + k];
-            if (token0 + 4u < args.n_rows) xv1.x = x[((ulong)token0 + 4u) * args.in_dim + k];
-            if (token0 + 5u < args.n_rows) xv1.y = x[((ulong)token0 + 5u) * args.in_dim + k];
-            if (token0 + 6u < args.n_rows) xv1.z = x[((ulong)token0 + 6u) * args.in_dim + k];
-            if (token0 + 7u < args.n_rows) xv1.w = x[((ulong)token0 + 7u) * args.in_dim + k];
-            sum0 = fma(float4(q), xv0, sum0);
-            sum1 = fma(float4(q), xv1, sum1);
-        }
-    }
-    sum0.x = simd_sum(sum0.x); sum0.y = simd_sum(sum0.y);
-    sum0.z = simd_sum(sum0.z); sum0.w = simd_sum(sum0.w);
-    sum1.x = simd_sum(sum1.x); sum1.y = simd_sum(sum1.y);
-    sum1.z = simd_sum(sum1.z); sum1.w = simd_sum(sum1.w);
-    if (lane != 0u) return;
-    if (token0 + 0u < args.n_rows) out[((ulong)token0 + 0u) * args.out_dim + out_row] = sum0.x;
-    if (token0 + 1u < args.n_rows) out[((ulong)token0 + 1u) * args.out_dim + out_row] = sum0.y;
-    if (token0 + 2u < args.n_rows) out[((ulong)token0 + 2u) * args.out_dim + out_row] = sum0.z;
-    if (token0 + 3u < args.n_rows) out[((ulong)token0 + 3u) * args.out_dim + out_row] = sum0.w;
-    if (token0 + 4u < args.n_rows) out[((ulong)token0 + 4u) * args.out_dim + out_row] = sum1.x;
-    if (token0 + 5u < args.n_rows) out[((ulong)token0 + 5u) * args.out_dim + out_row] = sum1.y;
-    if (token0 + 6u < args.n_rows) out[((ulong)token0 + 6u) * args.out_dim + out_row] = sum1.z;
-    if (token0 + 7u < args.n_rows) out[((ulong)token0 + 7u) * args.out_dim + out_row] = sum1.w;
-}
-
-kernel void kernel_qwen4_q8_0_bf16(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const ushort      *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgpig.x * (uint)nsg + (uint)sg;
-    const uint token = tgpig.y;
-    if (out_row >= args.out_dim || token >= args.n_rows) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    const float sum = qwen4_q8_0_dot_bf16(
-        weights + (ulong)out_row * row_blocks,
-        x + (ulong)token * args.in_dim,
-        args.in_dim, lane);
-    if (lane == 0u)
-        out[(ulong)token * args.out_dim + out_row] = sum;
-}
-
-kernel void kernel_qwen4_q8_0_f32_m1_silu(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgroup * (uint)nsg + (uint)sg;
-    if (out_row >= args.out_dim) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    const float value = qwen4_q8_0_dot_f32(
-        weights + (ulong)out_row * row_blocks, x, args.in_dim, lane);
-    if (lane == 0u) out[out_row] = value / (1.0f + exp(-value));
-}
-
-/* Wide split-K M=1 variant for narrow-output projections (the hyper-
- * connection down projection is N=320, K=10240): one 512-thread threadgroup
- * owns each output row and partitions K across sixteen simdgroups, giving
- * the GPU sixteen times the thread-level parallelism of the four-group
- * layout.  The cross-simdgroup reduction goes through threadgroup memory;
- * the accumulation order therefore differs from the four-group kernel by
- * construction, matching the batched-kernel parity policy. */
-kernel void kernel_qwen4_q8_0_f32_m1_silu_wide(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgroup;
-    if (out_row >= args.out_dim) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    device const block_q8_0 *wr = weights + (ulong)out_row * row_blocks;
-    float sum = 0.0f;
-    for (uint base = ((uint)sg * 32u + (uint)lane) * 8u;
-         base < args.in_dim;
-         base += (uint)nsg * 32u * 8u) {
-        const uint block_index = base / QK8_0;
-        const uint in_block = base & (QK8_0 - 1u);
-        device const block_q8_0 *block = wr + block_index;
-        const float delta = (float)block->d;
-        float dotq = 0.0f;
-        for (uint i = 0u; i < 8u; i++)
-            dotq = fma((float)block->qs[in_block + i], x[base + i], dotq);
-        sum = fma(delta, dotq, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partials[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u && lane == 0u) {
-        float total = 0.0f;
-        for (uint group = 0u; group < (uint)nsg; group++)
-            total += partials[group];
-        out[out_row] = total / (1.0f + exp(-total));
-    }
-}
-
-/* Wide split-K verifier-batch variant for narrow-output projections.
- * The generic per-row grid launches only (N/4)*rows groups — 320 for the
- * hyper-connection down projection at four rows — so each output row
- * instead gets a full 512-thread group that partitions K across sixteen
- * simdgroups and keeps the (up to eight) verifier rows in registers.
- * Unlike the wide-N rows-inner experiment, this multiplies the thread
- * count rather than dividing it. */
-kernel void kernel_qwen4_q8_0_f32_silu_wide_rows(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgroup;
-    if (out_row >= args.out_dim) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    device const block_q8_0 *wr = weights + (ulong)out_row * row_blocks;
-    float4 sum0 = 0.0f;
-    float4 sum1 = 0.0f;
-    for (uint base = ((uint)sg * 32u + (uint)lane) * 8u;
-         base < args.in_dim;
-         base += (uint)nsg * 32u * 8u) {
-        const uint block_index = base / QK8_0;
-        const uint in_block = base & (QK8_0 - 1u);
-        device const block_q8_0 *block = wr + block_index;
-        const float delta = (float)block->d;
-        for (uint i = 0u; i < 8u; i++) {
-            const uint k = base + i;
-            const float q = (float)block->qs[in_block + i] * delta;
-            float4 xv0 = 0.0f;
-            float4 xv1 = 0.0f;
-            if (args.n_rows > 0u) xv0.x = x[(ulong)0u * args.in_dim + k];
-            if (args.n_rows > 1u) xv0.y = x[(ulong)1u * args.in_dim + k];
-            if (args.n_rows > 2u) xv0.z = x[(ulong)2u * args.in_dim + k];
-            if (args.n_rows > 3u) xv0.w = x[(ulong)3u * args.in_dim + k];
-            if (args.n_rows > 4u) xv1.x = x[(ulong)4u * args.in_dim + k];
-            if (args.n_rows > 5u) xv1.y = x[(ulong)5u * args.in_dim + k];
-            if (args.n_rows > 6u) xv1.z = x[(ulong)6u * args.in_dim + k];
-            if (args.n_rows > 7u) xv1.w = x[(ulong)7u * args.in_dim + k];
-            sum0 = fma(float4(q), xv0, sum0);
-            sum1 = fma(float4(q), xv1, sum1);
-        }
-    }
-    sum0.x = simd_sum(sum0.x); sum0.y = simd_sum(sum0.y);
-    sum0.z = simd_sum(sum0.z); sum0.w = simd_sum(sum0.w);
-    sum1.x = simd_sum(sum1.x); sum1.y = simd_sum(sum1.y);
-    sum1.z = simd_sum(sum1.z); sum1.w = simd_sum(sum1.w);
-    /* partials layout: [simdgroup][token]. */
-    if (lane == 0u) {
-        partials[(uint)sg * 8u + 0u] = sum0.x;
-        partials[(uint)sg * 8u + 1u] = sum0.y;
-        partials[(uint)sg * 8u + 2u] = sum0.z;
-        partials[(uint)sg * 8u + 3u] = sum0.w;
-        partials[(uint)sg * 8u + 4u] = sum1.x;
-        partials[(uint)sg * 8u + 5u] = sum1.y;
-        partials[(uint)sg * 8u + 6u] = sum1.z;
-        partials[(uint)sg * 8u + 7u] = sum1.w;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg != 0u || lane != 0u) return;
-    for (uint token = 0u; token < args.n_rows && token < 8u; token++) {
-        float total = 0.0f;
-        for (uint group = 0u; group < (uint)nsg; group++)
-            total += partials[group * 8u + token];
-        out[(ulong)token * args.out_dim + out_row] =
-            total / (1.0f + exp(-total));
-    }
-}
-
-/* Tiny verifier-batch counterpart to the M=1 fusion above.  Keeping token
- * rows in the grid avoids materializing the down projection solely for a
- * following elementwise SiLU pass. */
-kernel void kernel_qwen4_q8_0_f32_silu(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0  *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgpig.x * (uint)nsg + (uint)sg;
-    const uint token = tgpig.y;
-    if (out_row >= args.out_dim || token >= args.n_rows) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    const float value = qwen4_q8_0_dot_f32(
-        weights + (ulong)out_row * row_blocks,
-        x + (ulong)token * args.in_dim, args.in_dim, lane);
-    if (lane == 0u) {
-        out[(ulong)token * args.out_dim + out_row] =
-            value / (1.0f + exp(-value));
-    }
-}
-
-kernel void kernel_qwen4_q8_0_f32_m1_swiglu(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0 *gate_weight [[buffer(1)]],
-        device const block_q8_0 *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgroup * (uint)nsg + (uint)sg;
-    if (out_row >= args.out_dim) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    const float gate = qwen4_q8_0_dot_f32(
-        gate_weight + (ulong)out_row * row_blocks, x, args.in_dim, lane);
-    const float up = qwen4_q8_0_dot_f32(
-        up_weight + (ulong)out_row * row_blocks, x, args.in_dim, lane);
-    if (lane == 0u) out[out_row] = (gate / (1.0f + exp(-gate))) * up;
-}
-
-kernel void kernel_qwen4_q8_0_f32_swiglu(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0 *gate_weight [[buffer(1)]],
-        device const block_q8_0 *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgpig.x * (uint)nsg + (uint)sg;
-    const uint token = tgpig.y;
-    if (out_row >= args.out_dim || token >= args.n_rows) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    device const float *xr = x + (ulong)token * args.in_dim;
-    const float gate = qwen4_q8_0_dot_f32(
-        gate_weight + (ulong)out_row * row_blocks, xr, args.in_dim, lane);
-    const float up = qwen4_q8_0_dot_f32(
-        up_weight + (ulong)out_row * row_blocks, xr, args.in_dim, lane);
-    if (lane == 0u) {
-        out[(ulong)token * args.out_dim + out_row] =
-            (gate / (1.0f + exp(-gate))) * up;
-    }
-}
-
-kernel void kernel_qwen4_q8_0_f32_m1_pair(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const block_q8_0 *weight_a [[buffer(1)]],
-        device const block_q8_0 *weight_b [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device float *out_a [[buffer(4)]],
-        device float *out_b [[buffer(5)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgroup * (uint)nsg + (uint)sg;
-    if (out_row >= args.out_dim) return;
-    const uint row_blocks = args.in_dim / QK8_0;
-    const float a = qwen4_q8_0_dot_f32(
-        weight_a + (ulong)out_row * row_blocks, x, args.in_dim, lane);
-    const float b = qwen4_q8_0_dot_f32(
-        weight_b + (ulong)out_row * row_blocks, x, args.in_dim, lane);
-    if (lane == 0u) { out_a[out_row] = a; out_b[out_row] = b; }
-}
-
-kernel void kernel_qwen4_q8_0_f32_m1_concat(
-        constant qwen4_q8_0_args &args_a [[buffer(0)]],
-        constant qwen4_q8_0_args &args_b [[buffer(1)]],
-        device const block_q8_0 *weight_a [[buffer(2)]],
-        device const block_q8_0 *weight_b [[buffer(3)]],
-        device const float *x [[buffer(4)]],
-        device float *out_a [[buffer(5)]],
-        device float *out_b [[buffer(6)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint global_row = tgroup * (uint)nsg + (uint)sg;
-    if (global_row >= args_a.out_dim + args_b.out_dim) return;
-    const bool second = global_row >= args_a.out_dim;
-    const uint out_row = second ? global_row - args_a.out_dim : global_row;
-    const uint row_blocks = args_a.in_dim / QK8_0;
-    device const block_q8_0 *weights = second ? weight_b : weight_a;
-    const float sum = qwen4_q8_0_dot_f32(
-        weights + (ulong)out_row * row_blocks, x, args_a.in_dim, lane);
-    if (lane == 0u) {
-        if (second) out_b[out_row] = sum;
-        else out_a[out_row] = sum;
-    }
-}
-
-kernel void kernel_qwen4_bf16_matmul_f32(
-        constant qwen4_q8_0_args &args [[buffer(0)]],
-        device const ushort      *weights [[buffer(1)]],
-        device const float       *x [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint out_row = tgpig.x * (uint)nsg + (uint)sg;
-    const uint token = tgpig.y;
-    if (out_row >= args.out_dim || token >= args.n_rows) return;
-    device const ushort *wr = weights + (ulong)out_row * args.in_dim;
-    device const float *xr = x + (ulong)token * args.in_dim;
-    float sum = 0.0f;
-    for (uint k = lane; k < args.in_dim; k += 32u)
-        sum = fma(qwen4_bf16_to_f32(wr[k]), xr[k], sum);
-    sum = simd_sum(sum);
-    if (lane == 0u) out[(ulong)token * args.out_dim + out_row] = sum;
-}
-
-struct qwen4_embedding_args {
-    uint hidden_dim;
-    uint vocab_size;
-    uint n_tokens;
-};
-
-kernel void kernel_qwen4_q8_0_embedding_f32(
-        constant qwen4_embedding_args &args [[buffer(0)]],
-        device const block_q8_0       *weights [[buffer(1)]],
-        device const int              *token_ids [[buffer(2)]],
-        device float                  *out [[buffer(3)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint dim = gid.x;
-    const uint token_row = gid.y;
-    if (dim >= args.hidden_dim || token_row >= args.n_tokens) return;
-    const int token = token_ids[token_row];
-    if (token < 0 || (uint)token >= args.vocab_size) {
-        out[(ulong)token_row * args.hidden_dim + dim] = 0.0f;
-        return;
-    }
-    const uint row_blocks = args.hidden_dim / QK8_0;
-    device const block_q8_0 *row = weights + (ulong)(uint)token * row_blocks;
-    out[(ulong)token_row * args.hidden_dim + dim] = qwen4_q8_0_value(row, dim);
-}
-
-struct qwen4_rows_args {
-    uint width;
-    uint rows;
-    uint weight_rows;
-    float eps;
-};
-
-kernel void kernel_qwen4_rms_norm_bf16_f32(
-        constant qwen4_rows_args &args [[buffer(0)]],
-        device const float       *x [[buffer(1)]],
-        device const ushort      *weight [[buffer(2)]],
-        device float             *out [[buffer(3)]],
-        threadgroup float        *partial [[threadgroup(0)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    if (row >= args.rows) return;
-    const ulong base = (ulong)row * args.width;
-    float sum = 0.0f;
-    for (uint col = tid; col < args.width; col += (uint)nsg * 32u) {
-        const float value = x[base + col];
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u) partial[0] = rsqrt(sum / (float)args.width + args.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = partial[0];
-    const ulong weight_base =
-        (ulong)(row % args.weight_rows) * args.width;
-    for (uint col = tid; col < args.width; col += (uint)nsg * 32u) {
-        out[base + col] = x[base + col] * scale *
-            qwen4_bf16_to_f32(weight[weight_base + col]);
-    }
-}
-
-struct qwen4_hc_norm_inject_args {
-    uint n_tokens;
-    uint hidden_dim;
-    uint stream_count;
-    float eps;
-};
-
-kernel void kernel_qwen4_hc_norm_inject_f32(
-        constant qwen4_hc_norm_inject_args &args [[buffer(0)]],
-        device const float *streams [[buffer(1)]],
-        device const ushort *norm_weight [[buffer(2)]],
-        device const ushort *inject_weight [[buffer(3)]],
-        device float *normalized [[buffer(4)]],
-        device float *inject_partials [[buffer(5)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint total_rows = args.n_tokens * args.stream_count;
-    if (row >= total_rows) return;
-    const uint token = row / args.stream_count;
-    const uint stream = row % args.stream_count;
-    const ulong base = (ulong)row * args.hidden_dim;
-    float sum = 0.0f;
-    for (uint col = tid; col < args.hidden_dim; col += (uint)nsg * 32u) {
-        const float value = streams[base + col];
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u)
-            partial[0] = rsqrt(sum / (float)args.hidden_dim + args.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = partial[0];
-    const ulong norm_weight_base = (ulong)stream * args.hidden_dim;
-    for (uint col = tid; col < args.hidden_dim; col += (uint)nsg * 32u) {
-        normalized[base + col] = streams[base + col] * scale *
-            qwen4_bf16_to_f32(norm_weight[norm_weight_base + col]);
-    }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    if (sg >= args.stream_count) return;
-    const uint output = sg;
-    const uint hc_dim = args.stream_count * args.hidden_dim;
-    device const ushort *wr = inject_weight +
-        (ulong)output * hc_dim + (ulong)stream * args.hidden_dim;
-    device const float *xr = normalized + base;
-    float dot = 0.0f;
-    for (uint k = lane; k < args.hidden_dim; k += 32u)
-        dot = fma(qwen4_bf16_to_f32(wr[k]), xr[k], dot);
-    dot = simd_sum(dot);
-    if (lane == 0u)
-        inject_partials[((ulong)token * args.stream_count + stream) *
-                        args.stream_count + output] = dot;
-}
-
-kernel void kernel_qwen4_hc_inject_reduce_f32(
-        constant qwen4_hc_norm_inject_args &args [[buffer(0)]],
-        device const float *inject_partials [[buffer(1)]],
-        device float *inject [[buffer(2)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint output = gid.x;
-    const uint token = gid.y;
-    if (output >= args.stream_count || token >= args.n_tokens) return;
-    float sum = 0.0f;
-    for (uint stream = 0; stream < args.stream_count; stream++)
-        sum += inject_partials[((ulong)token * args.stream_count + stream) *
-                               args.stream_count + output];
-    inject[(ulong)token * args.stream_count + output] =
-        2.0f / (1.0f + exp(-sum));
-}
-
-kernel void kernel_qwen4_silu_f32(
-        device const float *x [[buffer(0)]],
-        device float *out [[buffer(1)]],
-        constant ulong &elements [[buffer(2)]],
-        uint gid [[thread_position_in_grid]]) {
-    if ((ulong)gid >= elements) return;
-    const float value = x[gid];
-    out[gid] = value / (1.0f + exp(-value));
-}
-
-kernel void kernel_qwen4_swiglu_f32(
-        device const float *gate [[buffer(0)]],
-        device const float *up [[buffer(1)]],
-        device float *out [[buffer(2)]],
-        constant ulong &elements [[buffer(3)]],
-        uint gid [[thread_position_in_grid]]) {
-    if ((ulong)gid >= elements) return;
-    const float value = gate[gid];
-    out[gid] = (value / (1.0f + exp(-value))) * up[gid];
-}
-
-struct qwen4_hc_args {
-    uint n_tokens;
-    uint hidden_dim;
-    uint stream_count;
-};
-
-struct qwen4_hc_up_mix_args {
-    uint low_dim;
-    uint hidden_dim;
-    uint stream_count;
-    uint n_tokens;
-};
-
-kernel void kernel_qwen4_repeat_streams_f32(
-        constant qwen4_hc_args &args [[buffer(0)]],
-        device const float *hidden [[buffer(1)]],
-        device float *streams [[buffer(2)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint dim = gid.x;
-    const uint token = gid.y;
-    if (dim >= args.hidden_dim || token >= args.n_tokens) return;
-    const float value = hidden[(ulong)token * args.hidden_dim + dim];
-    for (uint stream = 0; stream < args.stream_count; stream++) {
-        streams[((ulong)token * args.stream_count + stream) *
-                args.hidden_dim + dim] = value;
-    }
-}
-
-kernel void kernel_qwen4_hc_mix_f32(
-        constant qwen4_hc_args &args [[buffer(0)]],
-        device const float *normalized [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device float *mixed [[buffer(3)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint dim = gid.x;
-    const uint token = gid.y;
-    if (dim >= args.hidden_dim || token >= args.n_tokens) return;
-    float sum = 0.0f;
-    for (uint stream = 0; stream < args.stream_count; stream++) {
-        const ulong index = ((ulong)token * args.stream_count + stream) *
-                            args.hidden_dim + dim;
-        const float gate = 1.0f / (1.0f + exp(-raw_gate[index]));
-        sum = fma(normalized[index], gate, sum);
-    }
-    mixed[(ulong)token * args.hidden_dim + dim] =
-        sum / (float)args.stream_count;
-}
-
-kernel void kernel_qwen4_hc_up_mix_bf16_m1_f32(
-        constant qwen4_hc_up_mix_args &args [[buffer(0)]],
-        device const ushort *weights [[buffer(1)]],
-        device const float *low [[buffer(2)]],
-        device const float *normalized [[buffer(3)]],
-        device float *mixed [[buffer(4)]],
-        threadgroup float *raw_gate [[threadgroup(0)]],
-        uint dim [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    if (dim >= args.hidden_dim || sg >= args.stream_count) return;
-    const uint output = (uint)sg * args.hidden_dim + dim;
-    device const ushort *wr = weights + (ulong)output * args.low_dim;
-    float sum = 0.0f;
-    for (uint k = lane; k < args.low_dim; k += 32u) {
-        sum = fma(qwen4_bf16_to_f32(wr[k]), low[k], sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) raw_gate[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u && lane == 0u) {
-        float value = 0.0f;
-        for (uint stream = 0; stream < args.stream_count; stream++) {
-            const float gate = 1.0f / (1.0f + exp(-raw_gate[stream]));
-            value = fma(normalized[(ulong)stream * args.hidden_dim + dim],
-                        gate, value);
-        }
-        mixed[dim] = value / (float)args.stream_count;
-    }
-}
-
-kernel void kernel_qwen4_hc_up_mix_q8_0_m1_f32(
-        constant qwen4_hc_up_mix_args &args [[buffer(0)]],
-        device const block_q8_0 *weights [[buffer(1)]],
-        device const float *low [[buffer(2)]],
-        device const float *normalized [[buffer(3)]],
-        device float *mixed [[buffer(4)]],
-        threadgroup float *raw_gate [[threadgroup(0)]],
-        uint dim [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    if (dim >= args.hidden_dim || sg >= args.stream_count) return;
-    const uint output = (uint)sg * args.hidden_dim + dim;
-    const uint row_blocks = args.low_dim / QK8_0;
-    const float sum = qwen4_q8_0_dot_f32(
-        weights + (ulong)output * row_blocks, low, args.low_dim, lane);
-    if (lane == 0u) raw_gate[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u && lane == 0u) {
-        float value = 0.0f;
-        for (uint stream = 0; stream < args.stream_count; stream++) {
-            const float gate = 1.0f / (1.0f + exp(-raw_gate[stream]));
-            value = fma(normalized[(ulong)stream * args.hidden_dim + dim],
-                        gate, value);
-        }
-        mixed[dim] = value / (float)args.stream_count;
-    }
-}
-
-kernel void kernel_qwen4_hc_up_mix_q8_0_f32(
-        constant qwen4_hc_up_mix_args &args [[buffer(0)]],
-        device const block_q8_0 *weights [[buffer(1)]],
-        device const float *low [[buffer(2)]],
-        device const float *normalized [[buffer(3)]],
-        device float *mixed [[buffer(4)]],
-        threadgroup float *raw_gate [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint dim = tgpig.x;
-    const uint token = tgpig.y;
-    if (dim >= args.hidden_dim || token >= args.n_tokens ||
-        sg >= args.stream_count) return;
-    const uint output = (uint)sg * args.hidden_dim + dim;
-    const uint row_blocks = args.low_dim / QK8_0;
-    const float sum = qwen4_q8_0_dot_f32(
-        weights + (ulong)output * row_blocks,
-        low + (ulong)token * args.low_dim, args.low_dim, lane);
-    if (lane == 0u) raw_gate[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u && lane == 0u) {
-        float value = 0.0f;
-        for (uint stream = 0; stream < args.stream_count; stream++) {
-            const float gate = 1.0f / (1.0f + exp(-raw_gate[stream]));
-            const ulong index =
-                ((ulong)token * args.stream_count + stream) *
-                args.hidden_dim + dim;
-            value = fma(normalized[index], gate, value);
-        }
-        mixed[(ulong)token * args.hidden_dim + dim] =
-            value / (float)args.stream_count;
-    }
-}
-
-kernel void kernel_qwen4_hc_inject_f32(
-        constant qwen4_hc_args &args [[buffer(0)]],
-        device const float *raw_inject [[buffer(1)]],
-        device float *inject [[buffer(2)]],
-        uint gid [[thread_position_in_grid]]) {
-    const ulong elements = (ulong)args.n_tokens * args.stream_count;
-    if ((ulong)gid >= elements) return;
-    inject[gid] = 2.0f / (1.0f + exp(-raw_inject[gid]));
-}
-
-kernel void kernel_qwen4_hc_write_f32(
-        constant qwen4_hc_args &args [[buffer(0)]],
-        device const float *block_output [[buffer(1)]],
-        device const float *inject [[buffer(2)]],
-        device float *streams [[buffer(3)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint dim = gid.x;
-    const uint token = gid.y;
-    if (dim >= args.hidden_dim || token >= args.n_tokens) return;
-    const float value = block_output[(ulong)token * args.hidden_dim + dim];
-    for (uint stream = 0; stream < args.stream_count; stream++) {
-        const ulong index = ((ulong)token * args.stream_count + stream) *
-                            args.hidden_dim + dim;
-        streams[index] = fma(value,
-                             inject[(ulong)token * args.stream_count + stream],
-                             streams[index]);
-    }
-}
-
-kernel void kernel_qwen4_hc_write_partials_f32(
-        constant qwen4_hc_args &args [[buffer(0)]],
-        device const float *block_output [[buffer(1)]],
-        device const float *inject_partials [[buffer(2)]],
-        device float *streams [[buffer(3)]],
-        threadgroup float *inject [[threadgroup(0)]],
-        uint2 tgroup [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]]) {
-    const uint token = tgroup.y;
-    if (token >= args.n_tokens) return;
-    if (tid < args.stream_count) {
-        float sum = 0.0f;
-        for (uint stream = 0; stream < args.stream_count; stream++)
-            sum += inject_partials[
-                ((ulong)token * args.stream_count + stream) *
-                args.stream_count + tid];
-        inject[tid] = 2.0f / (1.0f + exp(-sum));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint dim = tgroup.x * 256u + tid;
-    if (dim >= args.hidden_dim) return;
-    const float value = block_output[(ulong)token * args.hidden_dim + dim];
-    for (uint stream = 0; stream < args.stream_count; stream++) {
-        const ulong index = ((ulong)token * args.stream_count + stream) *
-                            args.hidden_dim + dim;
-        streams[index] = fma(value, inject[stream], streams[index]);
-    }
-}
-
-/* Decode Gated DeltaNet output projection plus its hyper-connection write./* Decode Gated DeltaNet output projection plus its hyper-connection write.
- * The Q8_0 reduction and injection-partial reduction keep the same orders
- * as their standalone kernels; only the intermediate block write/read and a
- * second dispatch are removed. */
-kernel void kernel_qwen4_q8_0_f32_m1_hc_write(
-        constant qwen4_q8_0_args &projection [[buffer(0)]],
-        constant qwen4_hc_args &hc [[buffer(1)]],
-        device const block_q8_0 *weights [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const float *inject_partials [[buffer(4)]],
-        device float *streams [[buffer(5)]],
-        threadgroup float *inject [[threadgroup(0)]],
-        uint tgroup [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    if (tid < hc.stream_count) {
-        float partial = 0.0f;
-        for (uint stream = 0; stream < hc.stream_count; stream++)
-            partial += inject_partials[
-                (ulong)stream * hc.stream_count + tid];
-        inject[tid] = 2.0f / (1.0f + exp(-partial));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint out_row = tgroup * (uint)nsg + sg;
-    if (out_row >= projection.out_dim) return;
-    const uint row_blocks = projection.in_dim / QK8_0;
-    const float sum = qwen4_q8_0_dot_f32(
-        weights + (ulong)out_row * row_blocks,
-        x, projection.in_dim, lane);
-    if (lane == 0u) {
-        for (uint stream = 0; stream < hc.stream_count; stream++) {
-            const ulong at = (ulong)stream * hc.hidden_dim + out_row;
-            streams[at] = fma(sum, inject[stream], streams[at]);
-        }
-    }
-}
-
-kernel void kernel_qwen4_q8_0_f32_hc_write(
-        constant qwen4_q8_0_args &projection [[buffer(0)]],
-        constant qwen4_hc_args &hc [[buffer(1)]],
-        device const block_q8_0 *weights [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const float *inject_partials [[buffer(4)]],
-        device float *streams [[buffer(5)]],
-        threadgroup float *inject [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint token = tgpig.y;
-    if (token >= projection.n_rows || token >= hc.n_tokens) return;
-    if (tid < hc.stream_count) {
-        float partial = 0.0f;
-        for (uint stream = 0; stream < hc.stream_count; stream++) {
-            partial += inject_partials[
-                ((ulong)token * hc.stream_count + stream) *
-                hc.stream_count + tid];
-        }
-        inject[tid] = 2.0f / (1.0f + exp(-partial));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint out_row = tgpig.x * (uint)nsg + sg;
-    if (out_row >= projection.out_dim) return;
-    const uint row_blocks = projection.in_dim / QK8_0;
-    const float sum = qwen4_q8_0_dot_f32(
-        weights + (ulong)out_row * row_blocks,
-        x + (ulong)token * projection.in_dim, projection.in_dim, lane);
-    if (lane == 0u) {
-        for (uint stream = 0; stream < hc.stream_count; stream++) {
-            const ulong at =
-                ((ulong)token * hc.stream_count + stream) *
-                hc.hidden_dim + out_row;
-            streams[at] = fma(sum, inject[stream], streams[at]);
-        }
-    }
-}
-
-struct qwen4_ple_args {
-    uint n_tokens;
-    uint stream_count;
-    uint hidden_dim;
-    uint conv_width;
-    uint dilation;
-    uint state_len;
-    uint has_mask;
-    uint capture_slots;
-    float eps;
-};
-
-kernel void kernel_qwen4_ple_gate_norm_f32(
-        constant qwen4_ple_args &args [[buffer(0)]],
-        device const float *hidden_streams [[buffer(1)]],
-        device const float *key_raw [[buffer(2)]],
-        device const float *value_raw [[buffer(3)]],
-        device const ushort *key_weight [[buffer(4)]],
-        device const ushort *query_weight [[buffer(5)]],
-        device const ushort *conv_norm_weight [[buffer(6)]],
-        device const uchar *mask [[buffer(7)]],
-        device float *gated [[buffer(8)]],
-        device float *gated_norm [[buffer(9)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint token = group.x;
-    const uint stream = group.y;
-    if (token >= args.n_tokens || stream >= args.stream_count) return;
-    const ulong stream_base =
-        ((ulong)token * args.stream_count + stream) * args.hidden_dim;
-    const ulong value_base = (ulong)token * args.hidden_dim;
-    const ulong weight_base = (ulong)stream * args.hidden_dim;
-    float key_sum = 0.0f;
-    float query_sum = 0.0f;
-    float value_sum = 0.0f;
-    for (uint dim = tid; dim < args.hidden_dim; dim += (uint)nsg * 32u) {
-        const float key = key_raw[stream_base + dim];
-        const float query = hidden_streams[stream_base + dim];
-        const float value = value_raw[value_base + dim];
-        key_sum = fma(key, key, key_sum);
-        query_sum = fma(query, query, query_sum);
-        value_sum = fma(value, value, value_sum);
-    }
-    key_sum = simd_sum(key_sum);
-    query_sum = simd_sum(query_sum);
-    value_sum = simd_sum(value_sum);
-    if (lane == 0u) {
-        partial[3u * sg] = key_sum;
-        partial[3u * sg + 1u] = query_sum;
-        partial[3u * sg + 2u] = value_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        key_sum = lane < nsg ? partial[3u * lane] : 0.0f;
-        query_sum = lane < nsg ? partial[3u * lane + 1u] : 0.0f;
-        value_sum = lane < nsg ? partial[3u * lane + 2u] : 0.0f;
-        key_sum = simd_sum(key_sum);
-        query_sum = simd_sum(query_sum);
-        value_sum = simd_sum(value_sum);
-        if (lane == 0u) {
-            partial[3u * nsg] = rsqrt(
-                key_sum / (float)args.hidden_dim + args.eps);
-            partial[3u * nsg + 1u] = rsqrt(
-                query_sum / (float)args.hidden_dim + args.eps);
-            partial[3u * nsg + 2u] = value_sum / (float)args.hidden_dim;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float key_scale = partial[3u * nsg];
-    const float query_scale = partial[3u * nsg + 1u];
-    float dot = 0.0f;
-    for (uint dim = tid; dim < args.hidden_dim; dim += (uint)nsg * 32u) {
-        const float key = key_raw[stream_base + dim] * key_scale *
-            qwen4_bf16_to_f32(key_weight[weight_base + dim]);
-        const float query = hidden_streams[stream_base + dim] * query_scale *
-            qwen4_bf16_to_f32(query_weight[weight_base + dim]);
-        dot = fma(key, query, dot);
-    }
-    dot = simd_sum(dot);
-    if (lane == 0u) partial[sg] = dot;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        dot = lane < nsg ? partial[lane] : 0.0f;
-        dot = simd_sum(dot) * rsqrt((float)args.hidden_dim);
-        if (lane == 0u) {
-            const float sign = dot > 0.0f ? 1.0f :
-                               (dot < 0.0f ? -1.0f : 0.0f);
-            const float transformed = sign * sqrt(max(abs(dot), 1.0e-6f));
-            partial[0] = 1.0f / (1.0f + exp(-transformed));
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float gate = partial[0];
-    const float norm_scale = rsqrt(
-        gate * gate * partial[3u * nsg + 2u] + args.eps);
-    const bool active = args.has_mask == 0u || mask[token] != 0u;
-    for (uint dim = tid; dim < args.hidden_dim; dim += (uint)nsg * 32u) {
-        const float value = active ? gate * value_raw[value_base + dim] : 0.0f;
-        gated[stream_base + dim] = value;
-        gated_norm[stream_base + dim] = active
-            ? value * norm_scale *
-              qwen4_bf16_to_f32(conv_norm_weight[weight_base + dim])
-            : 0.0f;
-    }
-}
-
-template <bool Capture>
-static inline void qwen4_ple_dilated_conv(
-        constant qwen4_ple_args &args,
-        device const float *gated_norm,
-        device const ushort *conv_weight,
-        device float *conv_state,
-        device float *out,
-        device float *state_seq,
-        uint channel) {
-    const uint channels = args.stream_count * args.hidden_dim;
-    if (channel >= channels || args.state_len != 9u ||
-        args.conv_width != 4u || args.dilation != 3u) return;
-    float history[9];
-    for (uint i = 0; i < 9u; i++)
-        history[i] = conv_state[(ulong)channel * 9u + i];
-    for (uint token = 0; token < args.n_tokens; token++) {
-        const ulong at = (ulong)token * channels + channel;
-        const float current = gated_norm[at];
-        float sum = current * qwen4_bf16_to_f32(
-            conv_weight[(ulong)channel * 4u + 3u]);
-        sum = fma(history[0], qwen4_bf16_to_f32(
-                      conv_weight[(ulong)channel * 4u]), sum);
-        sum = fma(history[3], qwen4_bf16_to_f32(
-                      conv_weight[(ulong)channel * 4u + 1u]), sum);
-        sum = fma(history[6], qwen4_bf16_to_f32(
-                      conv_weight[(ulong)channel * 4u + 2u]), sum);
-        for (uint i = 0; i < 8u; i++) history[i] = history[i + 1u];
-        history[8] = current;
-        if (Capture && token < args.capture_slots) {
-            const ulong capture_base =
-                ((ulong)token * channels + channel) * 9u;
-            for (uint i = 0; i < 9u; i++)
-                state_seq[capture_base + i] = history[i];
-        }
-        const float activated = sum / (1.0f + exp(-sum));
-        out[at] += activated;
-    }
-    for (uint i = 0; i < 9u; i++)
-        conv_state[(ulong)channel * 9u + i] = history[i];
-}
-
-kernel void kernel_qwen4_ple_dilated_conv_f32(
-        constant qwen4_ple_args &args [[buffer(0)]],
-        device const float *gated_norm [[buffer(1)]],
-        device const ushort *conv_weight [[buffer(2)]],
-        device float *conv_state [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        uint channel [[thread_position_in_grid]]) {
-    qwen4_ple_dilated_conv<false>(
-        args, gated_norm, conv_weight, conv_state, out, conv_state, channel);
-}
-
-kernel void kernel_qwen4_ple_dilated_conv_capture_f32(
-        constant qwen4_ple_args &args [[buffer(0)]],
-        device const float *gated_norm [[buffer(1)]],
-        device const ushort *conv_weight [[buffer(2)]],
-        device float *conv_state [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        device float *state_seq [[buffer(5)]],
-        uint channel [[thread_position_in_grid]]) {
-    qwen4_ple_dilated_conv<true>(
-        args, gated_norm, conv_weight, conv_state, out, state_seq, channel);
-}
-
-struct qwen4_moe_args {
-    uint n_rows;
-    uint n_experts;
-    uint top_k;
-    uint in_dim;
-    uint expert_dim;
-    uint out_dim;
-    uint down_dim;
-};
-
-kernel void kernel_qwen4_moe_topk_f32(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const float *router_logits [[buffer(1)]],
-        device int *selected [[buffer(2)]],
-        device float *weights [[buffer(3)]],
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    if (row >= args.n_rows || args.top_k > 16u ||
-        args.n_experts > 512u || nsg > 8u) return;
-    device const float *scores =
-        router_logits + (ulong)row * args.n_experts;
-    threadgroup float *partial_score = scratch;
-    threadgroup int *partial_id = (threadgroup int *)(scratch + 8u);
-    threadgroup float *chosen_score = scratch + 16u;
-    threadgroup int *chosen_id = (threadgroup int *)(scratch + 32u);
-    float local_score[2] = {-INFINITY, -INFINITY};
-    int local_id[2] = {INT_MAX, INT_MAX};
-    for (uint i = 0; i < 2u; i++) {
-        const uint expert = tid + i * 256u;
-        if (expert < args.n_experts) {
-            local_score[i] = scores[expert];
-            local_id[i] = (int)expert;
-        }
-    }
-
-    for (uint slot = 0; slot < args.top_k; slot++) {
-        float best = local_score[0];
-        int id = local_id[0];
-        if (local_score[1] > best ||
-            (local_score[1] == best && local_id[1] < id)) {
-            best = local_score[1];
-            id = local_id[1];
-        }
-        for (ushort offset = 16u; offset != 0u; offset >>= 1u) {
-            const float other = simd_shuffle_down(best, offset);
-            const int other_id = simd_shuffle_down(id, offset);
-            if (lane + offset < 32u &&
-                (other > best || (other == best && other_id < id))) {
-                best = other;
-                id = other_id;
-            }
-        }
-        if (lane == 0u) {
-            partial_score[sg] = best;
-            partial_id[sg] = id;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0u) {
-            best = lane < nsg ? partial_score[lane] : -INFINITY;
-            id = lane < nsg ? partial_id[lane] : INT_MAX;
-            for (ushort offset = 16u; offset != 0u; offset >>= 1u) {
-                const float other = simd_shuffle_down(best, offset);
-                const int other_id = simd_shuffle_down(id, offset);
-                if (lane + offset < 32u &&
-                    (other > best || (other == best && other_id < id))) {
-                    best = other;
-                    id = other_id;
-                }
-            }
-            if (lane == 0u) {
-                chosen_score[slot] = best;
-                chosen_id[slot] = id;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const int remove = chosen_id[slot];
-        if (local_id[0] == remove) {
-            local_score[0] = -INFINITY;
-            local_id[0] = INT_MAX;
-        }
-        if (local_id[1] == remove) {
-            local_score[1] = -INFINITY;
-            local_id[1] = INT_MAX;
-        }
-    }
-    if (tid == 0u) {
-        const float max_score = chosen_score[0];
-        float selected_sum = 0.0f;
-        for (uint slot = 0; slot < args.top_k; slot++) {
-            chosen_score[slot] = exp(
-                chosen_score[slot] - max_score);
-            selected_sum += chosen_score[slot];
-        }
-        const float inv = 1.0f / selected_sum;
-        for (uint slot = 0; slot < args.top_k; slot++) {
-            const ulong at = (ulong)row * args.top_k + slot;
-            selected[at] = chosen_id[slot];
-            weights[at] = chosen_score[slot] * inv;
-        }
-    }
-}
-
-/* Deterministic token-major to expert-major map for the exact rows8 path.
- * Each expert scans the same staged route order, so hids remains stable across
- * runs and every work item names up to eight original token/slot assignments. */
-kernel void kernel_qwen4_moe_map_rows8(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const int *selected [[buffer(1)]],
-        device uint *counts [[buffer(2)]],
-        device uint *hids [[buffer(3)]],
-        device char *work [[buffer(4)]],
-        threadgroup int *staged [[threadgroup(0)]],
-        ushort tid [[thread_position_in_threadgroup]],
-        ushort ntg [[threads_per_threadgroup]]) {
-    const uint expert = (uint)tid;
-    uint count = 0u;
-    device uint *expert_hids = hids + (ulong)expert * args.n_rows;
-
-    for (uint row0 = 0u; row0 < args.n_rows; row0 += (uint)ntg) {
-        const uint row = row0 + expert;
-        if (row < args.n_rows) {
-            for (uint slot = 0u; slot < args.top_k; slot++) {
-                staged[(ulong)expert * args.top_k + slot] =
-                    selected[(ulong)row * args.top_k + slot];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        const uint rows = min((uint)ntg, args.n_rows - row0);
-        for (uint local = 0u; local < rows; local++) {
-            for (uint slot = 0u; slot < args.top_k; slot++) {
-                if (staged[(ulong)local * args.top_k + slot] == (int)expert)
-                    expert_hids[count++] = (row0 + local) * args.top_k + slot;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    counts[expert] = count;
-    threadgroup int *tile_counts = staged;
-    tile_counts[expert] = (int)((count + 7u) / 8u);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint work_base = 0u;
-    for (uint i = 0u; i < expert; i++) work_base += tile_counts[i];
-    device uint *work_count = (device uint *)work;
-    device uint2 *work_items = (device uint2 *)(work + 8);
-    for (uint tile = 0u; tile < (uint)tile_counts[expert]; tile++)
-        work_items[work_base + tile] = uint2(expert, tile * 8u);
-    if (expert + 1u == args.n_experts)
-        work_count[0] = work_base + (uint)tile_counts[expert];
-}
-
-/* IQ2_XXS gate/up and Q2_K down rows use the ordinary GGML block payloads.
- * Keep the IQ2 reduction order aligned with the established generic kernel:
- * one lane owns a 32-value group, applies its block delta after the 32-value
- * dot, then the SIMD group performs the final reduction and 1/4 scale. */
-static inline float2 qwen4_iq2_xxs_pair_dot(
-        device const block_iq2_xxs *gate_row,
-        device const block_iq2_xxs *up_row,
-        device const float *x,
-        uint logical_dim,
-        ushort lane) {
-    const uint groups32 = logical_dim / 32u;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    for (uint group32 = (uint)lane; group32 < groups32; group32 += 32u) {
-        const uint block = group32 / 8u;
-        const uint group = group32 & 7u;
-        device const block_iq2_xxs *gb = gate_row + block;
-        device const block_iq2_xxs *ub = up_row + block;
-        device const ushort *gq = gb->qs + 4u * group;
-        device const ushort *uq = ub->qs + 4u * group;
-        device const uchar *gaux = (device const uchar *)gq;
-        device const uchar *uaux = (device const uchar *)uq;
-        const uint gs = (uint)gq[2] | ((uint)gq[3] << 16u);
-        const uint us = (uint)uq[2] | ((uint)uq[3] << 16u);
-        const float gd = (float)gb->d * (0.5f + (float)(gs >> 28u));
-        const float ud = (float)ub->d * (0.5f + (float)(us >> 28u));
-        float gate_group = 0.0f;
-        float up_group = 0.0f;
-        const uint xbase = group32 * 32u;
-        for (uint sub = 0u; sub < 4u; sub++) {
-            constant const uchar *ggrid =
-                (constant const uchar *)(ds4_metal_iq2xxs_grid + gaux[sub]);
-            constant const uchar *ugrid =
-                (constant const uchar *)(ds4_metal_iq2xxs_grid + uaux[sub]);
-            const uchar gsign = ds4_metal_ksigns_iq2xs[
-                (gs >> (7u * sub)) & 127u];
-            const uchar usign = ds4_metal_ksigns_iq2xs[
-                (us >> (7u * sub)) & 127u];
-            for (uint j = 0u; j < 8u; j++) {
-                const float xv = x[xbase + sub * 8u + j];
-                const float gv = (float)ggrid[j] *
-                    ((gsign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
-                const float uv = (float)ugrid[j] *
-                    ((usign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
-                gate_group = fma(gv, xv, gate_group);
-                up_group = fma(uv, xv, up_group);
-            }
-        }
-        gate_sum = fma(gd, gate_group, gate_sum);
-        up_sum = fma(ud, up_group, up_sum);
-    }
-    return float2(simd_sum(gate_sum) * 0.25f,
-                  simd_sum(up_sum) * 0.25f);
-}
-
-static inline float qwen4_q2_k_dot(
-        device const block_q2_K *row,
-        device const float *x,
-        uint logical_dim,
-        ushort lane) {
-    float sum = 0.0f;
-    for (uint k = (uint)lane; k < logical_dim; k += 32u)
-        sum = fma(ds4_glm_q2_K_value(row, k), x[k], sum);
-    return simd_sum(sum);
-}
-
-kernel void kernel_qwen4_moe_iq2_xxs_gate_up_rows8(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_iq2_xxs *gate_weight [[buffer(1)]],
-        device const block_iq2_xxs *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const uint *counts [[buffer(4)]],
-        device const uint *hids [[buffer(5)]],
-        device const char *work [[buffer(6)]],
-        device float *mid [[buffer(7)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    device const uint *work_count = (device const uint *)work;
-    if (tgpig.x >= work_count[0]) return;
-    device const uint2 *work_items = (device const uint2 *)(work + 8);
-    const uint2 item = work_items[tgpig.x];
-    const uint expert = item.x;
-    const uint local0 = item.y;
-    const uint output = tgpig.y * (uint)nsg + (uint)sg;
-    if (expert >= args.n_experts || output >= args.expert_dim) return;
-
-    const uint valid = min(8u, counts[expert] - local0);
-    uint assignments[8];
-    uint tokens[8];
-    device const uint *expert_hids = hids + (ulong)expert * args.n_rows;
-    for (uint r = 0u; r < valid; r++) {
-        assignments[r] = expert_hids[local0 + r];
-        tokens[r] = assignments[r] / args.top_k;
-    }
-
-    const uint row_blocks = args.in_dim / 256u;
-    const ulong weight_row = (ulong)expert * args.expert_dim + output;
-    device const block_iq2_xxs *gwr = gate_weight + weight_row * row_blocks;
-    device const block_iq2_xxs *uwr = up_weight + weight_row * row_blocks;
-    float4 gate0 = 0.0f, gate1 = 0.0f;
-    float4 up0 = 0.0f, up1 = 0.0f;
-    const uint groups32 = args.in_dim / 32u;
-    for (uint group32 = (uint)lane; group32 < groups32; group32 += 32u) {
-        const uint block = group32 / 8u;
-        const uint group = group32 & 7u;
-        device const block_iq2_xxs *gb = gwr + block;
-        device const block_iq2_xxs *ub = uwr + block;
-        device const ushort *gq = gb->qs + 4u * group;
-        device const ushort *uq = ub->qs + 4u * group;
-        device const uchar *gaux = (device const uchar *)gq;
-        device const uchar *uaux = (device const uchar *)uq;
-        const uint gs = (uint)gq[2] | ((uint)gq[3] << 16u);
-        const uint us = (uint)uq[2] | ((uint)uq[3] << 16u);
-        const float gd = (float)gb->d * (0.5f + (float)(gs >> 28u));
-        const float ud = (float)ub->d * (0.5f + (float)(us >> 28u));
-        float4 gate_group0 = 0.0f, gate_group1 = 0.0f;
-        float4 up_group0 = 0.0f, up_group1 = 0.0f;
-        const uint xbase = group32 * 32u;
-        for (uint sub = 0u; sub < 4u; sub++) {
-            constant const uchar *ggrid =
-                (constant const uchar *)(ds4_metal_iq2xxs_grid + gaux[sub]);
-            constant const uchar *ugrid =
-                (constant const uchar *)(ds4_metal_iq2xxs_grid + uaux[sub]);
-            const uchar gsign = ds4_metal_ksigns_iq2xs[
-                (gs >> (7u * sub)) & 127u];
-            const uchar usign = ds4_metal_ksigns_iq2xs[
-                (us >> (7u * sub)) & 127u];
-            for (uint j = 0u; j < 8u; j++) {
-                const uint k = xbase + sub * 8u + j;
-                const float gv = (float)ggrid[j] *
-                    ((gsign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
-                const float uv = (float)ugrid[j] *
-                    ((usign & ds4_metal_kmask_iq2xs[j]) ? -1.0f : 1.0f);
-                for (uint r = 0u; r < valid; r++) {
-                    const float xv = x[(ulong)tokens[r] * args.in_dim + k];
-                    if (r < 4u) {
-                        gate_group0[r] = fma(gv, xv, gate_group0[r]);
-                        up_group0[r] = fma(uv, xv, up_group0[r]);
-                    } else {
-                        gate_group1[r - 4u] =
-                            fma(gv, xv, gate_group1[r - 4u]);
-                        up_group1[r - 4u] =
-                            fma(uv, xv, up_group1[r - 4u]);
-                    }
-                }
-            }
-        }
-        gate0 = fma(float4(gd), gate_group0, gate0);
-        gate1 = fma(float4(gd), gate_group1, gate1);
-        up0 = fma(float4(ud), up_group0, up0);
-        up1 = fma(float4(ud), up_group1, up1);
-    }
-    for (uint r = 0u; r < valid; r++) {
-        const float gate =
-            simd_sum(r < 4u ? gate0[r] : gate1[r - 4u]) * 0.25f;
-        const float up =
-            simd_sum(r < 4u ? up0[r] : up1[r - 4u]) * 0.25f;
-        if (lane == 0u)
-            mid[(ulong)assignments[r] * args.expert_dim + output] =
-                (gate / (1.0f + exp(-gate))) * up;
-    }
-}
-
-kernel void kernel_qwen4_moe_q2_k_down_rows8(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q2_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const uint *counts [[buffer(3)]],
-        device const uint *hids [[buffer(4)]],
-        device const char *work [[buffer(5)]],
-        device float *contributions [[buffer(6)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    device const uint *work_count = (device const uint *)work;
-    if (tgpig.x >= work_count[0]) return;
-    device const uint2 *work_items = (device const uint2 *)(work + 8);
-    const uint2 item = work_items[tgpig.x];
-    const uint expert = item.x;
-    const uint local0 = item.y;
-    const uint output = tgpig.y * (uint)nsg + (uint)sg;
-    if (expert >= args.n_experts || output >= args.out_dim) return;
-    const uint valid = min(8u, counts[expert] - local0);
-    uint assignments[8];
-    device const uint *expert_hids = hids + (ulong)expert * args.n_rows;
-    for (uint r = 0u; r < valid; r++) assignments[r] = expert_hids[local0 + r];
-
-    const uint row_blocks = args.down_dim / 256u;
-    const ulong weight_row = (ulong)expert * args.out_dim + output;
-    device const block_q2_K *wr = down_weight + weight_row * row_blocks;
-    float4 sum0 = 0.0f, sum1 = 0.0f;
-    /* k=[640,768) is the physical Q2_K alignment tail and is exactly zero. */
-    for (uint k = (uint)lane; k < args.expert_dim; k += 32u) {
-        const float w = ds4_glm_q2_K_value(wr, k);
-        for (uint r = 0u; r < valid; r++) {
-            const float xv = mid[(ulong)assignments[r] * args.expert_dim + k];
-            if (r < 4u) sum0[r] = fma(w, xv, sum0[r]);
-            else sum1[r - 4u] = fma(w, xv, sum1[r - 4u]);
-        }
-    }
-    for (uint r = 0u; r < valid; r++) {
-        const float sum = simd_sum(r < 4u ? sum0[r] : sum1[r - 4u]);
-        if (lane == 0u)
-            contributions[(ulong)assignments[r] * args.out_dim + output] = sum;
-    }
-}
-
-kernel void kernel_qwen4_moe_iq2_xxs_gate_up(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_iq2_xxs *gate_weight [[buffer(1)]],
-        device const block_iq2_xxs *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const int *selected [[buffer(4)]],
-        device float *mid [[buffer(5)]],
+/* Grouped RMSNorm of one (stream chunk, token): xn = R * rsqrt(mean(R^2)
+ * + eps) * gamma over the chunk, plus the chunk's partial dot with each
+ * inject row (consumers sum the hc*chunks partials and apply
+ * 2*sigmoid(./hc)).  The low-rank projection itself is a GEMV on xn. */
+template <typename W>
+kernel void kernel_qwen4_hc_norm(
+        constant ds4_metal_args_qwen4_hc_norm & args,
+        device const float *R,          /* [T][hc*E] */
+        device const float *gamma,      /* [hc*E] */
+        device const char  *w_inject,   /* [n_inject][hc*E] */
+        device float       *xn,         /* [T][hc*E] */
+        device float       *inj_part,   /* [T][hc*chunks][n_inject] */
         uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint output = tgpig.x * (uint)nsg + (uint)sg;
-    const uint row = tgpig.y;
-    const uint slot = tgpig.z;
-    if (output >= args.expert_dim || row >= args.n_rows || slot >= args.top_k) return;
-    const ulong assignment = (ulong)row * args.top_k + slot;
-    const int expert = selected[assignment];
-    if (expert < 0 || (uint)expert >= args.n_experts) return;
-    const uint row_blocks = args.in_dim / 256u;
-    const ulong weight_row = (ulong)(uint)expert * args.expert_dim + output;
-    const float2 pair = qwen4_iq2_xxs_pair_dot(
-        gate_weight + weight_row * row_blocks,
-        up_weight + weight_row * row_blocks,
-        x + (ulong)row * args.in_dim, args.in_dim, lane);
-    if (lane == 0u)
-        mid[assignment * args.expert_dim + output] =
-            (pair.x / (1.0f + exp(-pair.x))) * pair.y;
-}
-
-kernel void kernel_qwen4_moe_q2_k_down(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q2_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint output = tgpig.x * (uint)nsg + (uint)sg;
-    const uint row = tgpig.y;
-    if (output >= args.out_dim || row >= args.n_rows) return;
-    const uint row_blocks = args.down_dim / 256u;
-    float total = 0.0f;
-    for (uint slot = 0u; slot < args.top_k; slot++) {
-        const ulong assignment = (ulong)row * args.top_k + slot;
-        const int expert = selected[assignment];
-        if (expert < 0 || (uint)expert >= args.n_experts) continue;
-        const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
-        const float sum = qwen4_q2_k_dot(
-            down_weight + weight_row * row_blocks,
-            mid + assignment * args.expert_dim,
-            args.expert_dim, lane);
-        total = fma(sum, selected_weights[assignment], total);
-    }
-    if (lane == 0u) out[(ulong)row * args.out_dim + output] = total;
-}
-
-kernel void kernel_qwen4_moe_q2_k_down_split(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q2_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint output = tgpig.x;
-    const uint row = tgpig.y;
-    if (sg < args.top_k) {
-        const ulong assignment = (ulong)row * args.top_k + (uint)sg;
-        const int expert = selected[assignment];
-        float sum = 0.0f;
-        if (output < args.out_dim && row < args.n_rows &&
-            expert >= 0 && (uint)expert < args.n_experts) {
-            const uint row_blocks = args.down_dim / 256u;
-            const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
-            sum = qwen4_q2_k_dot(
-                down_weight + weight_row * row_blocks,
-                mid + assignment * args.expert_dim,
-                args.expert_dim, lane);
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint s = tgpig.x / QWEN4_HC_CHUNKS;
+    const uint chunk = tgpig.x % QWEN4_HC_CHUNKS;
+    const uint tok = tgpig.y;
+    if (s >= args.n_hc || tok >= args.n_tokens) return;
+    const uint E = args.n_embd, dim = E * args.n_hc;
+    const uint nth = ntg.x, nsg = nth / 32;
+    threadgroup float red[5][32];
+    device const float *r = R + ((uint64_t)tok * args.n_hc + s) * E;
+    device const float *g = gamma + s * E;
+    device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
+    const W w(w_inject);
+    float ss = 0.0f;
+    for (uint i = tid; i < E; i += nth) ss += r[i] * r[i];
+    ss = simd_sum(ss);
+    if (tiisg == 0) red[0][sgitg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint q = 0; q < nsg; q++) tot += red[0][q];
+    const float inv = rsqrt(tot / (float)E + args.eps);
+    const uint per = (E + QWEN4_HC_CHUNKS - 1) / QWEN4_HC_CHUNKS;
+    const uint i0 = chunk * per, i1 = min(E, i0 + per);
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint i = i0 + tid; i < i1; i += nth) {
+        const float v = r[i] * inv * g[i];
+        o[i] = v;
+        for (uint j = 0; j < 4; j++) {
+            if (j < args.n_inject) acc[j] += w.at((uint64_t)j * dim + s * E + i) * v;
         }
-        if (lane == 0u) partials[sg] = sum;
+    }
+    for (uint j = 0; j < 4; j++) {
+        if (j >= args.n_inject) break;
+        const float a = simd_sum(acc[j]);
+        if (tiisg == 0) red[1 + j][sgitg] = a;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u && output < args.out_dim && row < args.n_rows) {
-        float total = 0.0f;
-        for (uint slot = 0u; slot < args.top_k; slot++) {
-            const ulong assignment = (ulong)row * args.top_k + slot;
-            total = fma(partials[slot], selected_weights[assignment], total);
-        }
-        out[(ulong)row * args.out_dim + output] = total;
+    if (tid < args.n_inject) {
+        float a = 0.0f;
+        for (uint q = 0; q < nsg; q++) a += red[1 + tid][q];
+        inj_part[((uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS + s * QWEN4_HC_CHUNKS + chunk) * args.n_inject + tid] = a;
     }
 }
 
-/* M=1 variant that retains one SIMDgroup per selected expert but evaluates
- * two adjacent output rows per group.  This preserves top-k parallelism while
- * halving threadgroup scheduling and reusing the expert activation. */
-kernel void kernel_qwen4_moe_q2_k_down_split_rows2(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q2_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint output0 = tgpig.x * 2u;
-    const uint token = tgpig.y;
-    if (sg < args.top_k) {
-        const ulong assignment = (ulong)token * args.top_k + (uint)sg;
-        const int expert = selected[assignment];
-        float2 sums = 0.0f;
-        if (output0 < args.out_dim && token < args.n_rows &&
-            expert >= 0 && (uint)expert < args.n_experts) {
-            const uint row_blocks = args.down_dim / 256u;
-            const ulong expert_row =
-                (ulong)(uint)expert * args.out_dim + output0;
-            device const block_q2_K *weight0 =
-                down_weight + expert_row * row_blocks;
-            device const block_q2_K *weight1 = weight0 + row_blocks;
-            device const float *activation =
-                mid + assignment * args.expert_dim;
-            float2 lane_sums = 0.0f;
-            for (uint k = (uint)lane; k < args.expert_dim; k += 32u) {
-                const float xv = activation[k];
-                lane_sums[0] = fma(ds4_glm_q2_K_value(weight0, k),
-                                   xv, lane_sums[0]);
-                if (output0 + 1u < args.out_dim)
-                    lane_sums[1] = fma(ds4_glm_q2_K_value(weight1, k),
-                                       xv, lane_sums[1]);
-            }
-            sums = float2(simd_sum(lane_sums[0]),
-                          simd_sum(lane_sums[1]));
-        }
-        if (lane == 0u) {
-            partials[(uint)sg * 2u] = sums[0];
-            partials[(uint)sg * 2u + 1u] = sums[1];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < 2u && output0 + tid < args.out_dim && token < args.n_rows) {
-        float total = 0.0f;
-        for (uint slot = 0u; slot < args.top_k; slot++) {
-            const ulong assignment = (ulong)token * args.top_k + slot;
-            total = fma(partials[slot * 2u + tid],
-                        selected_weights[assignment], total);
-        }
-        out[(ulong)token * args.out_dim + output0 + tid] = total;
-    }
+#define QWEN4_HC_NORM_INSTANCE(SUFFIX, W) \
+template [[host_name("kernel_qwen4_hc_norm_" #SUFFIX)]] \
+kernel void kernel_qwen4_hc_norm<W>(constant ds4_metal_args_qwen4_hc_norm &, device const float *, \
+        device const float *, device const char *, device float *, device float *, uint3, ushort, ushort3, ushort, ushort);
+QWEN4_HC_NORM_INSTANCE(f16, qwen4_w_f16)
+QWEN4_HC_NORM_INSTANCE(f32, qwen4_w_f32)
+QWEN4_HC_NORM_INSTANCE(q8, qwen4_w_q8)
+
+/* 2*sigmoid(inj/hc) with inj[s] = sum of the hc*chunks norm partials for s */
+static inline float qwen4_hc_inject_weight(device const float *inj_part, uint hc, uint s) {
+    float a = 0.0f;
+    for (uint src = 0; src < hc * QWEN4_HC_CHUNKS; src++) a += inj_part[src * hc + s];
+    return 2.0f * qwen4_sigmoid(a / (float)hc);
 }
 
-kernel void kernel_qwen4_moe_q2_k_down_split_rows4(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q2_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint output0 = tgpig.x * 4u;
-    const uint token = tgpig.y;
-    if (sg < args.top_k) {
-        const ulong assignment = (ulong)token * args.top_k + (uint)sg;
-        const int expert = selected[assignment];
-        float4 sums = 0.0f;
-        if (output0 < args.out_dim && token < args.n_rows &&
-            expert >= 0 && (uint)expert < args.n_experts) {
-            const uint row_blocks = args.down_dim / 256u;
-            const ulong expert_row =
-                (ulong)(uint)expert * args.out_dim + output0;
-            device const block_q2_K *weight0 =
-                down_weight + expert_row * row_blocks;
-            device const block_q2_K *weight1 = weight0 + row_blocks;
-            device const block_q2_K *weight2 = weight1 + row_blocks;
-            device const block_q2_K *weight3 = weight2 + row_blocks;
-            device const float *activation =
-                mid + assignment * args.expert_dim;
-            float4 lane_sums = 0.0f;
-            for (uint k = (uint)lane; k < args.expert_dim; k += 32u) {
-                const float xv = activation[k];
-                lane_sums[0] = fma(ds4_glm_q2_K_value(weight0, k),
-                                   xv, lane_sums[0]);
-                if (output0 + 1u < args.out_dim)
-                    lane_sums[1] = fma(ds4_glm_q2_K_value(weight1, k),
-                                       xv, lane_sums[1]);
-                if (output0 + 2u < args.out_dim)
-                    lane_sums[2] = fma(ds4_glm_q2_K_value(weight2, k),
-                                       xv, lane_sums[2]);
-                if (output0 + 3u < args.out_dim)
-                    lane_sums[3] = fma(ds4_glm_q2_K_value(weight3, k),
-                                       xv, lane_sums[3]);
-            }
-            sums = float4(simd_sum(lane_sums[0]),
-                          simd_sum(lane_sums[1]),
-                          simd_sum(lane_sums[2]),
-                          simd_sum(lane_sums[3]));
-        }
-        if (lane == 0u) {
-            for (uint r = 0u; r < 4u; r++)
-                partials[(uint)sg * 4u + r] = sums[r];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < 4u && output0 + tid < args.out_dim && token < args.n_rows) {
-        float total = 0.0f;
-        for (uint slot = 0u; slot < args.top_k; slot++) {
-            const ulong assignment = (ulong)token * args.top_k + slot;
-            total = fma(partials[slot * 4u + tid],
-                        selected_weights[assignment], total);
-        }
-        out[(ulong)token * args.out_dim + output0 + tid] = total;
-    }
-}
+struct ds4_metal_args_qwen4_hc_gate_mix {
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_rank;
+};
 
-/* Decode-specialized Q2_K down projection.  Two SIMDgroups share each
- * threadgroup and each SIMDgroup evaluates four adjacent output rows.  This
- * keeps the GGML block decoder vectorized while reducing the M=1 launch from
- * one 320-thread threadgroup per output row to one 64-thread threadgroup per
- * eight rows.  The 640-value logical expert activation is handled explicitly;
- * the final half of its third physical 256-value block is zero padding. */
-kernel void kernel_qwen4_moe_q2_k_down_rows8_m1(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q2_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr short rows_per_simd = 4;
-    const uint row0 = (tgpig.x * 2u + (uint)sg) * (uint)rows_per_simd;
-    const uint token = tgpig.y;
-    if (row0 >= args.out_dim || token >= args.n_rows) return;
-
-    const short ix = lane / 8;
-    const short it = lane % 8;
-    const short iq = it / 4;
-    const short ir = it % 4;
-    const short scale_column = (8 * ir) / 16;
-    const uint row_blocks = args.down_dim / 256u;
-    const ulong selected_base = (ulong)token * args.top_k;
-    float total[rows_per_simd] = {0.0f};
-
-    for (uint slot = 0u; slot < args.top_k; slot++) {
-        const ulong assignment = selected_base + slot;
-        const int expert = selected[assignment];
-        if (expert < 0 || (uint)expert >= args.n_experts) continue;
-        device const float *activation =
-            mid + assignment * args.expert_dim;
-        device const block_q2_K *expert_rows =
-            down_weight +
-            ((ulong)(uint)expert * args.out_dim + row0) * row_blocks;
-        float partial[rows_per_simd] = {0.0f};
-
-        for (uint block = (uint)ix; block < row_blocks; block += 4u) {
-            float values[32];
-            float4 sums = 0.0f;
-            const uint block_base = block * 256u;
-            const uint lane_base = 128u * (uint)iq + 8u * (uint)ir;
-            for (short i = 0; i < 8; i++) {
-                const uint p0 = lane_base + (uint)i;
-                const uint p1 = p0 + 32u;
-                const uint p2 = p0 + 64u;
-                const uint p3 = p0 + 96u;
-                values[i + 0] = block_base + p0 < args.expert_dim
-                    ? activation[block_base + p0] : 0.0f;
-                values[i + 8] = block_base + p1 < args.expert_dim
-                    ? activation[block_base + p1] : 0.0f;
-                values[i + 16] = block_base + p2 < args.expert_dim
-                    ? activation[block_base + p2] : 0.0f;
-                values[i + 24] = block_base + p3 < args.expert_dim
-                    ? activation[block_base + p3] : 0.0f;
-                sums[0] += values[i + 0];
-                sums[1] += values[i + 8];
-                sums[2] += values[i + 16];
-                sums[3] += values[i + 24];
-            }
-
-            for (short r = 0; r < rows_per_simd &&
-                            row0 + (uint)r < args.out_dim; r++) {
-                device const block_q2_K *weight =
-                    expert_rows + (ulong)r * row_blocks + block;
-                device const uchar *scales =
-                    (device const uchar *)weight->scales +
-                    8 * iq + scale_column;
-                device const ushort *quants =
-                    (device const ushort *)weight->qs +
-                    16 * iq + 4 * ir;
-                float4 acc_low = 0.0f;
-                float4 acc_high = 0.0f;
-                for (short i = 0; i < 8; i += 2) {
-                    const ushort packed = quants[i / 2];
-                    acc_low[0] += values[i + 0] * (packed & 0x0003u);
-                    acc_high[0] += values[i + 1] * (packed & 0x0300u);
-                    acc_low[1] += values[i + 8] * (packed & 0x000cu);
-                    acc_high[1] += values[i + 9] * (packed & 0x0c00u);
-                    acc_low[2] += values[i + 16] * (packed & 0x0030u);
-                    acc_high[2] += values[i + 17] * (packed & 0x3000u);
-                    acc_low[3] += values[i + 24] * (packed & 0x00c0u);
-                    acc_high[3] += values[i + 25] * (packed & 0xc000u);
-                }
-                const float d = (float)weight->d;
-                const float m = (float)weight->dmin * (1.0f / 16.0f);
-                partial[r] +=
-                    d * ((acc_low[0] + acc_high[0] * (1.0f / 256.0f)) *
-                             (float)(scales[0] & 0x0fu) +
-                         (acc_low[1] + acc_high[1] * (1.0f / 256.0f)) *
-                             (float)(scales[2] & 0x0fu) * (1.0f / 4.0f) +
-                         (acc_low[2] + acc_high[2] * (1.0f / 256.0f)) *
-                             (float)(scales[4] & 0x0fu) * (1.0f / 16.0f) +
-                         (acc_low[3] + acc_high[3] * (1.0f / 256.0f)) *
-                             (float)(scales[6] & 0x0fu) * (1.0f / 64.0f)) -
-                    m * (sums[0] * (float)(scales[0] & 0xf0u) +
-                         sums[1] * (float)(scales[2] & 0xf0u) +
-                         sums[2] * (float)(scales[4] & 0xf0u) +
-                         sums[3] * (float)(scales[6] & 0xf0u));
-            }
-        }
-
-        const float route = selected_weights[assignment];
-        for (short r = 0; r < rows_per_simd &&
-                        row0 + (uint)r < args.out_dim; r++) {
-            total[r] = fma(simd_sum(partial[r]), route, total[r]);
-        }
-    }
-
-    if (lane == 0u) {
-        for (short r = 0; r < rows_per_simd &&
-                        row0 + (uint)r < args.out_dim; r++) {
-            out[(ulong)token * args.out_dim + row0 + (uint)r] = total[r];
-        }
-    }
-}
-
-/* Q4_K expert rows use the same GGML decoder as the established GLM path.
- * Qwen differs in routing width (512/top-10), so the fused scheduling remains
- * local while the block interpretation is shared. */
-static inline float qwen4_q4_k_dot(
-        device const block_q4_K *row,
-        device const float *x,
-        uint logical_dim,
-        ushort lane) {
-    float sum = 0.0f;
-    for (uint k = (uint)lane; k < logical_dim; k += 32u)
-        sum = fma(ds4_glm_q4_K_value(row, k), x[k], sum);
-    return simd_sum(sum);
-}
-
-kernel void kernel_qwen4_moe_q4_k_gate_up_rows8(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q4_K *gate_weight [[buffer(1)]],
-        device const block_q4_K *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const uint *counts [[buffer(4)]],
-        device const uint *hids [[buffer(5)]],
-        device const char *work [[buffer(6)]],
-        device float *mid [[buffer(7)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    device const uint *work_count = (device const uint *)work;
-    if (tgpig.x >= work_count[0]) return;
-    device const uint2 *work_items = (device const uint2 *)(work + 8);
-    const uint2 item = work_items[tgpig.x];
-    const uint expert = item.x;
-    const uint local0 = item.y;
-    const uint output = tgpig.y * (uint)nsg + (uint)sg;
-    if (expert >= args.n_experts || output >= args.expert_dim) return;
-
-    const uint valid = min(8u, counts[expert] - local0);
-    uint assignments[8];
-    uint tokens[8];
-    device const uint *expert_hids = hids + (ulong)expert * args.n_rows;
-    for (uint r = 0u; r < valid; r++) {
-        assignments[r] = expert_hids[local0 + r];
-        tokens[r] = assignments[r] / args.top_k;
-    }
-
-    const uint row_blocks = args.in_dim / 256u;
-    const ulong weight_row = (ulong)expert * args.expert_dim + output;
-    device const block_q4_K *gwr = gate_weight + weight_row * row_blocks;
-    device const block_q4_K *uwr = up_weight + weight_row * row_blocks;
-    float4 gate0 = 0.0f, gate1 = 0.0f;
-    float4 up0 = 0.0f, up1 = 0.0f;
-    for (uint k = (uint)lane; k < args.in_dim; k += 32u) {
-        const float gw = ds4_glm_q4_K_value(gwr, k);
-        const float uw = ds4_glm_q4_K_value(uwr, k);
-        for (uint r = 0u; r < valid; r++) {
-            const float xv = x[(ulong)tokens[r] * args.in_dim + k];
-            if (r < 4u) {
-                gate0[r] = fma(gw, xv, gate0[r]);
-                up0[r] = fma(uw, xv, up0[r]);
-            } else {
-                gate1[r - 4u] = fma(gw, xv, gate1[r - 4u]);
-                up1[r - 4u] = fma(uw, xv, up1[r - 4u]);
-            }
-        }
-    }
-    for (uint r = 0u; r < valid; r++) {
-        const float gate = simd_sum(r < 4u ? gate0[r] : gate1[r - 4u]);
-        const float up = simd_sum(r < 4u ? up0[r] : up1[r - 4u]);
-        if (lane == 0u)
-            mid[(ulong)assignments[r] * args.expert_dim + output] =
-                (gate / (1.0f + exp(-gate))) * up;
-    }
-}
-
-kernel void kernel_qwen4_moe_q4_k_down_rows8(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q4_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const uint *counts [[buffer(3)]],
-        device const uint *hids [[buffer(4)]],
-        device const char *work [[buffer(5)]],
-        device float *contributions [[buffer(6)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    device const uint *work_count = (device const uint *)work;
-    if (tgpig.x >= work_count[0]) return;
-    device const uint2 *work_items = (device const uint2 *)(work + 8);
-    const uint2 item = work_items[tgpig.x];
-    const uint expert = item.x;
-    const uint local0 = item.y;
-    const uint output = tgpig.y * (uint)nsg + (uint)sg;
-    if (expert >= args.n_experts || output >= args.out_dim) return;
-    const uint valid = min(8u, counts[expert] - local0);
-    uint assignments[8];
-    device const uint *expert_hids = hids + (ulong)expert * args.n_rows;
-    for (uint r = 0u; r < valid; r++) assignments[r] = expert_hids[local0 + r];
-
-    const uint row_blocks = args.down_dim / 256u;
-    const ulong weight_row = (ulong)expert * args.out_dim + output;
-    device const block_q4_K *wr = down_weight + weight_row * row_blocks;
-    float4 sum0 = 0.0f, sum1 = 0.0f;
-    /* k=[640,768) is the Q4_K alignment tail. Its activation is defined as
-     * zero, so omitting those FMAs is exact and keeps mid physically 640-wide. */
-    for (uint k = (uint)lane; k < args.expert_dim; k += 32u) {
-        const float w = ds4_glm_q4_K_value(wr, k);
-        for (uint r = 0u; r < valid; r++) {
-            const float xv = mid[(ulong)assignments[r] * args.expert_dim + k];
-            if (r < 4u) sum0[r] = fma(w, xv, sum0[r]);
-            else sum1[r - 4u] = fma(w, xv, sum1[r - 4u]);
-        }
-    }
-    for (uint r = 0u; r < valid; r++) {
-        const float sum = simd_sum(r < 4u ? sum0[r] : sum1[r - 4u]);
-        if (lane == 0u)
-            contributions[(ulong)assignments[r] * args.out_dim + output] = sum;
-    }
-}
-
-/* Keep the top-10 reduction token-major and strictly slot ordered.  The
- * rows8 kernels only change how expert contributions are produced; this
- * final accumulation must match decode and the scalar reference exactly. */
-kernel void kernel_qwen4_moe_weighted_sum10_f32(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const int *selected [[buffer(1)]],
-        device const float *selected_weights [[buffer(2)]],
-        device const float *contributions [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        uint2 tpig [[thread_position_in_grid]]) {
-    const uint output = tpig.x;
-    const uint row = tpig.y;
-    if (output >= args.out_dim || row >= args.n_rows) return;
-    float total = 0.0f;
-    for (uint slot = 0u; slot < 10u; slot++) {
-        const ulong assignment = (ulong)row * args.top_k + slot;
-        const int expert = selected[assignment];
-        if (expert < 0 || (uint)expert >= args.n_experts) continue;
-        total = fma(contributions[assignment * args.out_dim + output],
-                    selected_weights[assignment], total);
-    }
-    out[(ulong)row * args.out_dim + output] = total;
-}
-
-kernel void kernel_qwen4_moe_q4_k_gate_up(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q4_K *gate_weight [[buffer(1)]],
-        device const block_q4_K *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const int *selected [[buffer(4)]],
-        device float *mid [[buffer(5)]],
+/* mixed[d] = mean over streams of sigmoid(w_up[s*E+d] . silu(lo/hc)) *
+ * xn[s*E+d], lo being the raw low-rank projection.  One simdgroup per d:
+ * the four 8-lane groups stream the four stream rows (contiguous n_rank
+ * weights each) and shuffle-reduce, first within the group, then across
+ * the streams. */
+template <typename W>
+kernel void kernel_qwen4_hc_gate_mix(
+        constant ds4_metal_args_qwen4_hc_gate_mix & args,
+        device const float *xn,       /* [T][hc*E] */
+        device const float *lo,       /* [T][n_rank] raw */
+        device const char  *w_up,     /* [hc*E][n_rank] */
+        device float       *mixed,    /* [T][E] */
         uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint output = tgpig.x * (uint)nsg + (uint)sg;
-    const uint row = tgpig.y;
-    const uint slot = tgpig.z;
-    if (output >= args.expert_dim || row >= args.n_rows || slot >= args.top_k) return;
-    const ulong assignment = (ulong)row * args.top_k + slot;
-    const int expert = selected[assignment];
-    if (expert < 0 || (uint)expert >= args.n_experts) return;
-    const uint row_blocks = args.in_dim / 256u;
-    const ulong weight_row = (ulong)(uint)expert * args.expert_dim + output;
-    const float gate = qwen4_q4_k_dot(
-        gate_weight + weight_row * row_blocks,
-        x + (ulong)row * args.in_dim, args.in_dim, lane);
-    const float up = qwen4_q4_k_dot(
-        up_weight + weight_row * row_blocks,
-        x + (ulong)row * args.in_dim, args.in_dim, lane);
-    if (lane == 0u)
-        mid[assignment * args.expert_dim + output] =
-            (gate / (1.0f + exp(-gate))) * up;
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint hc = args.n_hc;
+    const uint E = args.n_embd;
+    const uint nsg = ntg.x / 32;
+    const uint d = tgpig.x * nsg + sgitg;
+    const uint tok = tgpig.y;
+    if (d >= E || tok >= args.n_tokens) return;
+    const uint s = tiisg / 8, lane = tiisg % 8;
+    device const float *l = lo + (uint64_t)tok * args.n_rank;
+    const W w(w_up);
+    const uint64_t row = (uint64_t)(s * E + d) * args.n_rank;
+    float acc = 0.0f;
+    for (uint r = lane; r < args.n_rank; r += 8) acc += w.at(row + r) * qwen4_silu(l[r] / (float)hc);
+    acc += simd_shuffle_xor(acc, 1);
+    acc += simd_shuffle_xor(acc, 2);
+    acc += simd_shuffle_xor(acc, 4);
+    float g = qwen4_sigmoid(acc) * xn[(uint64_t)tok * E * hc + s * E + d];
+    g += simd_shuffle_xor(g, 8);
+    g += simd_shuffle_xor(g, 16);
+    if (tiisg == 0) mixed[(uint64_t)tok * E + d] = g / (float)hc;
 }
 
-kernel void kernel_qwen4_moe_q4_k_down(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q4_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint output = tgpig.x * (uint)nsg + (uint)sg;
-    const uint row = tgpig.y;
-    if (output >= args.out_dim || row >= args.n_rows) return;
-    const uint row_blocks = args.down_dim / 256u;
-    float total = 0.0f;
-    for (uint slot = 0u; slot < args.top_k; slot++) {
-        const ulong assignment = (ulong)row * args.top_k + slot;
-        const int expert = selected[assignment];
-        if (expert < 0 || (uint)expert >= args.n_experts) continue;
-        const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
-        const float sum = qwen4_q4_k_dot(
-            down_weight + weight_row * row_blocks,
-            mid + assignment * args.expert_dim,
-            args.expert_dim, lane);
-        total = fma(sum, selected_weights[assignment], total);
-    }
-    if (lane == 0u) out[(ulong)row * args.out_dim + output] = total;
-}
+#define QWEN4_HC_MIX_INSTANCE(SUFFIX, W) \
+template [[host_name("kernel_qwen4_hc_gate_mix_" #SUFFIX)]] \
+kernel void kernel_qwen4_hc_gate_mix<W>(constant ds4_metal_args_qwen4_hc_gate_mix &, device const float *, \
+        device const float *, device const char *, device float *, uint3, ushort3, ushort, ushort);
+QWEN4_HC_MIX_INSTANCE(f16, qwen4_w_f16)
+QWEN4_HC_MIX_INSTANCE(f32, qwen4_w_f32)
+QWEN4_HC_MIX_INSTANCE(q8, qwen4_w_q8)
 
-kernel void kernel_qwen4_moe_q4_k_down_split(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const block_q4_K *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint output = tgpig.x;
-    const uint row = tgpig.y;
-    if (sg < args.top_k) {
-        const ulong assignment = (ulong)row * args.top_k + (uint)sg;
-        const int expert = selected[assignment];
-        float sum = 0.0f;
-        if (output < args.out_dim && row < args.n_rows &&
-            expert >= 0 && (uint)expert < args.n_experts) {
-            const uint row_blocks = args.down_dim / 256u;
-            const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
-            sum = qwen4_q4_k_dot(
-                down_weight + weight_row * row_blocks,
-                mid + assignment * args.expert_dim,
-                args.expert_dim, lane);
-        }
-        if (lane == 0u) partials[sg] = sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u && output < args.out_dim && row < args.n_rows) {
-        float total = 0.0f;
-        for (uint slot = 0u; slot < args.top_k; slot++) {
-            const ulong assignment = (ulong)row * args.top_k + slot;
-            total = fma(partials[slot], selected_weights[assignment], total);
-        }
-        out[(ulong)row * args.out_dim + output] = total;
-    }
-}
+struct ds4_metal_args_qwen4_hc_combine {
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t pad0;
+};
 
-kernel void kernel_qwen4_moe_q4_0_gate_up(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const qwen4_block_q4_0 *gate_weight [[buffer(1)]],
-        device const qwen4_block_q4_0 *up_weight [[buffer(2)]],
-        device const float *x [[buffer(3)]],
-        device const int *selected [[buffer(4)]],
-        device float *mid [[buffer(5)]],
+/* R[s][d] += 2*sigmoid(inj[s]/hc) * out[d]; the inject weights are reduced
+ * once per threadgroup. */
+kernel void kernel_qwen4_hc_combine(
+        constant ds4_metal_args_qwen4_hc_combine & args,
+        device float       *R,        /* [T][hc*E] */
+        device const float *out,      /* [T][E] */
+        device const float *inj,      /* [T][hc*chunks][hc] norm partials */
         uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint output = tgpig.x * (uint)nsg + (uint)sg;
-    const uint row = tgpig.y;
-    const uint slot = tgpig.z;
-    if (output >= args.expert_dim || row >= args.n_rows || slot >= args.top_k)
-        return;
-    const ulong assignment = (ulong)row * args.top_k + slot;
-    const int expert = selected[assignment];
-    if (expert < 0 || (uint)expert >= args.n_experts) return;
-    const uint row_blocks = args.in_dim / 32u;
-    const ulong weight_row = (ulong)(uint)expert * args.expert_dim + output;
-    const float2 values = qwen4_q4_0_pair_dot_f32(
-        gate_weight + weight_row * row_blocks,
-        up_weight + weight_row * row_blocks,
-        x + (ulong)row * args.in_dim, args.in_dim, lane);
-    if (lane == 0u)
-        mid[assignment * args.expert_dim + output] =
-            (values.x / (1.0f + exp(-values.x))) * values.y;
-}
-
-kernel void kernel_qwen4_moe_q4_0_down(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const qwen4_block_q4_0 *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint output = tgpig.x * (uint)nsg + (uint)sg;
-    const uint row = tgpig.y;
-    if (output >= args.out_dim || row >= args.n_rows) return;
-    const uint row_blocks = args.down_dim / 32u;
-    float total = 0.0f;
-    for (uint slot = 0u; slot < args.top_k; slot++) {
-        const ulong assignment = (ulong)row * args.top_k + slot;
-        const int expert = selected[assignment];
-        if (expert < 0 || (uint)expert >= args.n_experts) continue;
-        const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
-        const float sum = qwen4_q4_0_dot_f32(
-            down_weight + weight_row * row_blocks,
-            mid + assignment * args.expert_dim,
-            args.expert_dim, lane);
-        total = fma(sum, selected_weights[assignment], total);
-    }
-    if (lane == 0u) out[(ulong)row * args.out_dim + output] = total;
-}
-
-kernel void kernel_qwen4_moe_q4_0_down_split(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const qwen4_block_q4_0 *down_weight [[buffer(1)]],
-        device const float *mid [[buffer(2)]],
-        device const int *selected [[buffer(3)]],
-        device const float *selected_weights [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        threadgroup float *partials [[threadgroup(0)]],
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint output = tgpig.x;
-    const uint row = tgpig.y;
-    if (sg < args.top_k) {
-        const ulong assignment = (ulong)row * args.top_k + (uint)sg;
-        const int expert = selected[assignment];
-        float sum = 0.0f;
-        if (output < args.out_dim && row < args.n_rows &&
-            expert >= 0 && (uint)expert < args.n_experts) {
-            const uint row_blocks = args.down_dim / 32u;
-            const ulong weight_row = (ulong)(uint)expert * args.out_dim + output;
-            sum = qwen4_q4_0_dot_f32(
-                down_weight + weight_row * row_blocks,
-                mid + assignment * args.expert_dim,
-                args.expert_dim, lane);
-        }
-        if (lane == 0u) partials[sg] = sum;
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint d = tgpig.x * ntg.x + tid;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    threadgroup float wgt[8];
+    if (tid < args.n_hc) {
+        wgt[tid] = qwen4_hc_inject_weight(inj + (uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS * args.n_hc, args.n_hc, tid);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u && output < args.out_dim && row < args.n_rows) {
-        float total = 0.0f;
-        for (uint slot = 0u; slot < args.top_k; slot++) {
-            const ulong assignment = (ulong)row * args.top_k + slot;
-            total = fma(partials[slot], selected_weights[assignment], total);
-        }
-        out[(ulong)row * args.out_dim + output] = total;
-    }
+    if (d >= args.n_embd) return;
+    const float o = out[(uint64_t)tok * args.n_embd + d];
+    device float *r = R + (uint64_t)tok * args.n_embd * args.n_hc;
+    for (uint s = 0; s < args.n_hc; s++) r[s * args.n_embd + d] += wgt[s] * o;
 }
 
-kernel void kernel_qwen4_shared_expert_add_f32(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const float *routed [[buffer(1)]],
-        device const float *shared [[buffer(2)]],
-        device const float *raw_gate [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint dim = gid.x;
-    const uint row = gid.y;
-    if (dim >= args.out_dim || row >= args.n_rows) return;
-    const ulong at = (ulong)row * args.out_dim + dim;
-    const float gate = 1.0f / (1.0f + exp(-raw_gate[row]));
-    out[at] = fma(shared[at], gate, routed[at]);
-}
+/* --- gated delta net ---------------------------------------------------- */
 
-kernel void kernel_qwen4_shared_expert_add_model_f32(
-        constant qwen4_moe_args &args [[buffer(0)]],
-        device const ushort *router_weight [[buffer(1)]],
-        device const float *routed [[buffer(2)]],
-        device const float *shared [[buffer(3)]],
-        device const float *hidden [[buffer(4)]],
-        device float *out [[buffer(5)]],
-        threadgroup float *gate_value [[threadgroup(0)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    // The unfused BF16 router assigns its only valid output to SIMD group 0.
-    // Keep that exact 32-lane FMA and reduction order, then let the full
-    // threadgroup apply the resulting scalar gate across the hidden row.
-    if (sg == 0u) {
-        device const float *xr = hidden + (ulong)row * args.out_dim;
-        float sum = 0.0f;
-        for (uint dim = lane; dim < args.out_dim; dim += 32u)
-            sum = fma(qwen4_bf16_to_f32(router_weight[dim]), xr[dim], sum);
-        sum = simd_sum(sum);
-        if (lane == 0u) gate_value[0] = 1.0f / (1.0f + exp(-sum));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float gate = gate_value[0];
-    const ulong base = (ulong)row * args.out_dim;
-    for (uint dim = tid; dim < args.out_dim; dim += 256u) {
-        const ulong at = base + dim;
-        out[at] = fma(shared[at], gate, routed[at]);
-    }
-}
-
-struct qwen4_gdn_args {
-    uint n_tokens;
-    uint key_heads;
-    uint value_heads;
-    uint head_dim;
-    uint has_mask;
-    uint capture_slots;
+struct ds4_metal_args_qwen4_conv_stream {
+    uint32_t n_tokens;
+    uint32_t n_channels;
+    uint32_t conv_kernel;   /* <= 4 */
+    uint32_t apply_silu;
 };
 
-struct qwen4_gdn_prepare_args {
-    uint n_tokens;
-    uint key_heads;
-    uint value_heads;
-    uint head_dim;
-    uint conv_width;
-    uint has_mask;
-    uint capture_slots;
-    float l2_eps;
+/* Depthwise causal conv over the token axis.  x holds the raw inputs for
+ * all tokens and is overwritten with the (optionally silu'd) output; state
+ * holds the K-1 previous raw inputs oldest first and is advanced past the
+ * processed tokens.  One thread per channel, tokens sequential. */
+kernel void kernel_qwen4_conv_stream(
+        constant ds4_metal_args_qwen4_conv_stream & args,
+        device float       *x,        /* [T][C] */
+        device float       *state,    /* [K-1][C] */
+        device const float *weight,   /* [C][K] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint c = tgpig.x * ntg.x + tid;
+    if (c >= args.n_channels) return;
+    const uint C = args.n_channels;
+    const uint K = args.conv_kernel;
+
+    float win[3];
+    for (uint t = 0; t + 1 < K; t++) win[t] = state[t * C + c];
+    float taps[4];
+    for (uint t = 0; t < K; t++) taps[t] = weight[c * K + t];
+
+    for (uint tok = 0; tok < args.n_tokens; tok++) {
+        const float raw = x[tok * C + c];
+        float acc = taps[K - 1] * raw;
+        for (uint t = 0; t + 1 < K; t++) acc += taps[t] * win[t];
+        for (uint t = 0; t + 2 < K; t++) win[t] = win[t + 1];
+        win[K - 2] = raw;
+        x[tok * C + c] = args.apply_silu ? qwen4_silu(acc) : acc;
+    }
+    for (uint t = 0; t + 1 < K; t++) state[t * C + c] = win[t];
+}
+
+struct ds4_metal_args_qwen4_gdn_prep {
+    uint32_t n_tokens;
+    uint32_t n_k_head;
+    uint32_t n_v_head;
+    uint32_t head_dim;
 };
 
-// One thread owns one depthwise-convolution channel and walks the outer
-// chunk in token order.  This preserves the exact causal state transition
-// while keeping only four FP32 values live for the supported Qwen geometry.
-template <bool Capture>
-static inline void qwen4_gdn_conv_split(
-        constant qwen4_gdn_prepare_args &args,
-        device const float *mixed_qkv,
-        device const ushort *conv_weight,
-        device const uchar *mask,
-        device float *conv_state,
-        device float *q,
-        device float *k,
-        device float *v,
-        device float *state_seq,
-        uint channel) {
-    const uint key_dim = args.key_heads * args.head_dim;
-    const uint value_dim = args.value_heads * args.head_dim;
-    const uint conv_dim = 2u * key_dim + value_dim;
-    if (channel >= conv_dim || args.conv_width != 4u) return;
+/* After the conv: L2-normalize each q and k head (q also scaled by
+ * 1/sqrt(D)), turn the alpha/beta projections into the decay g =
+ * exp(ssm_a * softplus(a + dt_bias)) and beta = sigmoid(b).  One simdgroup
+ * per (token, k-head); the v-head scalars are handled by the first head. */
+kernel void kernel_qwen4_gdn_prep(
+        constant ds4_metal_args_qwen4_gdn_prep & args,
+        device float       *qkv,      /* [T][2*Hk*D + Hv*D], conv output, q/k normalized in place */
+        device float       *a,        /* [T][Hv]: alpha in, g out */
+        device float       *b,        /* [T][Hv]: b in, beta out */
+        device const float *ssm_a,    /* [Hv] = -exp(A_log) */
+        device const float *dt_bias,  /* [Hv] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint tok = tgpig.y;
+    if (h >= args.n_k_head || tok >= args.n_tokens) return;
+    const uint D = args.head_dim;
+    const uint npt = D / 32;
+    const uint conv_dim = 2 * args.n_k_head * D + args.n_v_head * D;
+    device float *q = qkv + (uint64_t)tok * conv_dim + h * D + tiisg * npt;
+    device float *k = q + args.n_k_head * D;
 
-    float history[4];
-    for (uint tap = 0; tap < 4u; tap++)
-        history[tap] = conv_state[(ulong)channel * 4u + tap];
-
-    for (uint token = 0; token < args.n_tokens; token++) {
-        history[0] = history[1];
-        history[1] = history[2];
-        history[2] = history[3];
-        const bool active = args.has_mask == 0u || mask[token] != 0u;
-        history[3] = active
-            ? mixed_qkv[(ulong)token * conv_dim + channel]
-            : 0.0f;
-        if (Capture && token < args.capture_slots) {
-            const ulong capture_base =
-                ((ulong)token * conv_dim + channel) * 4u;
-            for (uint tap = 0; tap < 4u; tap++)
-                state_seq[capture_base + tap] = history[tap];
-        }
-        float sum = 0.0f;
-        for (uint tap = 0; tap < 4u; tap++)
-            sum = fma(history[tap],
-                      qwen4_bf16_to_f32(
-                          conv_weight[(ulong)channel * 4u + tap]),
-                      sum);
-        const float activated = sum / (1.0f + exp(-sum));
-        if (channel < key_dim) {
-            q[(ulong)token * key_dim + channel] = activated;
-        } else if (channel < 2u * key_dim) {
-            k[(ulong)token * key_dim + channel - key_dim] = activated;
-        } else {
-            v[(ulong)token * value_dim + channel - 2u * key_dim] =
-                activated;
+    float sq = 0.0f, sk = 0.0f;
+    for (uint i = 0; i < npt; i++) {
+        sq += q[i] * q[i];
+        sk += k[i] * k[i];
+    }
+    sq = simd_sum(sq);
+    sk = simd_sum(sk);
+    const float qs = rsqrt(sq + 1e-6f) * rsqrt((float)D);
+    const float ks = rsqrt(sk + 1e-6f);
+    for (uint i = 0; i < npt; i++) {
+        q[i] *= qs;
+        k[i] *= ks;
+    }
+    if (h == 0) {
+        device float *ga = a + (uint64_t)tok * args.n_v_head;
+        device float *gb = b + (uint64_t)tok * args.n_v_head;
+        for (uint j = tiisg; j < args.n_v_head; j += 32) {
+            ga[j] = exp(ssm_a[j] * qwen4_softplus(ga[j] + dt_bias[j]));
+            gb[j] = qwen4_sigmoid(gb[j]);
         }
     }
-    for (uint tap = 0; tap < 4u; tap++)
-        conv_state[(ulong)channel * 4u + tap] = history[tap];
 }
 
-kernel void kernel_qwen4_gdn_conv_split_f32(
-        constant qwen4_gdn_prepare_args &args [[buffer(0)]],
-        device const float *mixed_qkv [[buffer(1)]],
-        device const ushort *conv_weight [[buffer(2)]],
-        device const uchar *mask [[buffer(3)]],
-        device float *conv_state [[buffer(4)]],
-        device float *q [[buffer(5)]],
-        device float *k [[buffer(6)]],
-        device float *v [[buffer(7)]],
-        uint channel [[thread_position_in_grid]]) {
-    qwen4_gdn_conv_split<false>(
-        args, mixed_qkv, conv_weight, mask, conv_state,
-        q, k, v, conv_state, channel);
-}
-
-kernel void kernel_qwen4_gdn_conv_split_capture_f32(
-        constant qwen4_gdn_prepare_args &args [[buffer(0)]],
-        device const float *mixed_qkv [[buffer(1)]],
-        device const ushort *conv_weight [[buffer(2)]],
-        device const uchar *mask [[buffer(3)]],
-        device float *conv_state [[buffer(4)]],
-        device float *q [[buffer(5)]],
-        device float *k [[buffer(6)]],
-        device float *v [[buffer(7)]],
-        device float *state_seq [[buffer(8)]],
-        uint channel [[thread_position_in_grid]]) {
-    qwen4_gdn_conv_split<true>(
-        args, mixed_qkv, conv_weight, mask, conv_state,
-        q, k, v, state_seq, channel);
-}
-
-kernel void kernel_qwen4_gdn_qk_l2norm_f32(
-        constant qwen4_gdn_prepare_args &args [[buffer(0)]],
-        device float *q [[buffer(1)]],
-        device float *k [[buffer(2)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint token = group.x;
-    const uint head = group.y;
-    if (token >= args.n_tokens || head >= args.key_heads) return;
-    const ulong base = ((ulong)token * args.key_heads + head) * args.head_dim;
-    float qsum = 0.0f;
-    float ksum = 0.0f;
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        const float qv = q[base + dim];
-        const float kv = k[base + dim];
-        qsum = fma(qv, qv, qsum);
-        ksum = fma(kv, kv, ksum);
-    }
-    qsum = simd_sum(qsum);
-    ksum = simd_sum(ksum);
-    if (lane == 0u) {
-        partial[2u * sg] = qsum;
-        partial[2u * sg + 1u] = ksum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        qsum = lane < nsg ? partial[2u * lane] : 0.0f;
-        ksum = lane < nsg ? partial[2u * lane + 1u] : 0.0f;
-        qsum = simd_sum(qsum);
-        ksum = simd_sum(ksum);
-        if (lane == 0u) {
-            partial[0] = rsqrt(qsum + args.l2_eps) *
-                         rsqrt((float)args.head_dim);
-            partial[1] = rsqrt(ksum + args.l2_eps);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        q[base + dim] *= partial[0];
-        k[base + dim] *= partial[1];
-    }
-}
-
-kernel void kernel_qwen4_gdn_gates_f32(
-        constant qwen4_gdn_prepare_args &args [[buffer(0)]],
-        device const float *raw_decay [[buffer(1)]],
-        device const float *raw_beta [[buffer(2)]],
-        device const ushort *a_log [[buffer(3)]],
-        device const ushort *dt_bias [[buffer(4)]],
-        device const uchar *mask [[buffer(5)]],
-        device float *decay [[buffer(6)]],
-        device float *beta [[buffer(7)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint head = gid.x;
-    const uint token = gid.y;
-    if (head >= args.value_heads || token >= args.n_tokens) return;
-    const ulong at = (ulong)token * args.value_heads + head;
-    const bool active = args.has_mask == 0u || mask[token] != 0u;
-    const float a = active ? raw_decay[at] : 0.0f;
-    const float b = active ? raw_beta[at] : 0.0f;
-    const float shifted = a + qwen4_bf16_to_f32(dt_bias[head]);
-    const float softplus = shifted > 20.0f
-        ? shifted
-        : log(1.0f + exp(shifted));
-    const float rate = exp(qwen4_bf16_to_f32(a_log[head]));
-    decay[at] = exp(-rate * softplus);
-    beta[at] = 1.0f / (1.0f + exp(-b));
-}
-
-struct qwen4_gdn_output_args {
-    uint rows;
-    uint head_dim;
-    float eps;
+struct ds4_metal_args_qwen4_gdn_scan {
+    uint32_t n_tokens;
+    uint32_t n_k_head;
+    uint32_t n_v_head;
+    uint32_t head_dim;
+    uint32_t snap_tok;     /* copy the state after this token into snap_state (UINT32_MAX: never) */
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
 };
 
-kernel void kernel_qwen4_gdn_output_norm_f32(
-        constant qwen4_gdn_output_args &args [[buffer(0)]],
-        device const float *core [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device const ushort *weight [[buffer(3)]],
-        device float *out [[buffer(4)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    if (row >= args.rows) return;
-    const ulong base = (ulong)row * args.head_dim;
-    float sum = 0.0f;
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        const float value = core[base + dim];
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u)
-            partial[0] = rsqrt(sum / (float)args.head_dim + args.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_rms = partial[0];
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        const float gate = 1.0f /
-            (1.0f + exp(-raw_gate[base + dim]));
-        out[base + dim] = core[base + dim] * inv_rms *
-                          qwen4_bf16_to_f32(weight[dim]) * gate;
-    }
-}
+/* Sequential gated delta scan.  One simdgroup per (v-head, dv) state row;
+ * lane j owns S[dk = j*npt .. +npt-1] in registers for the whole token
+ * loop.  Value head h reads key head h % Hk (tiled GGUF order).  Per token:
+ * S *= g, u = S k, delta = beta (v - u), S += k delta, o = S q. */
+kernel void kernel_qwen4_gdn_scan(
+        constant ds4_metal_args_qwen4_gdn_scan & args,
+        device const float *qkv,      /* [T][2*Hk*D + Hv*D], q/k normalized */
+        device const float *ga,       /* [T][Hv] decay g */
+        device const float *gb,       /* [T][Hv] beta */
+        device float       *state,    /* [Hv][D][D] as [dv][dk] */
+        device float       *out,      /* [T][Hv*D] */
+        device float       *snap_state,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint dv = tgpig.x;
+    const uint h = tgpig.y;
+    if (dv >= args.head_dim || h >= args.n_v_head) return;
+    const uint D = args.head_dim;
+    const uint npt = D / 32;
+    const uint dk0 = tiisg * npt;
+    const uint kh = h % args.n_k_head;
+    const uint conv_dim = 2 * args.n_k_head * D + args.n_v_head * D;
 
-static inline float qwen4_gdn_state_load(
-        device const float *state,
-        ulong index) {
-    return state[index];
-}
+    float s[4];
+    device float *srow = state + ((uint64_t)h * D + dv) * D + dk0;
+    device float *snaprow = snap_state + ((uint64_t)h * D + dv) * D + dk0;
+    for (uint i = 0; i < npt; i++) s[i] = srow[i];
 
-static inline float qwen4_gdn_state_load(
-        device const ushort *state,
-        ulong index) {
-    return qwen4_bf16_to_f32(state[index]);
-}
+    for (uint tok = 0; tok < args.n_tokens; tok++) {
+        device const float *q = qkv + (uint64_t)tok * conv_dim + kh * D + dk0;
+        device const float *k = q + args.n_k_head * D;
+        device const float *v = qkv + (uint64_t)tok * conv_dim + 2 * args.n_k_head * D + h * D;
+        const float g = ga[(uint64_t)tok * args.n_v_head + h];
+        const float beta = gb[(uint64_t)tok * args.n_v_head + h];
 
-static inline void qwen4_gdn_state_store(
-        device float *state,
-        ulong index,
-        float value) {
-    state[index] = value;
-}
-
-static inline void qwen4_gdn_state_store(
-        device ushort *state,
-        ulong index,
-        float value) {
-    state[index] = qwen4_f32_to_bf16(value);
-}
-
-template <typename StateT, uint R, bool Capture>
-static inline void qwen4_gdn_rows(
-        constant qwen4_gdn_args &args,
-        device const float      *q,
-        device const float      *k,
-        device const float      *v,
-        device const float      *decay,
-        device const float      *beta,
-        device const uchar      *mask,
-        device StateT           *state,
-        device float            *out,
-        device StateT           *state_seq,
-        uint3 gid,
-        ushort lane) {
-    const uint row0 = gid.y * R;
-    const uint hv = gid.z;
-    if (lane >= 32u || row0 >= args.head_dim || hv >= args.value_heads) return;
-    const uint hk = hv / (args.value_heads / args.key_heads);
-    constexpr uint per_lane = 4u; // supported geometry has Dk=128.
-    float local[R][per_lane];
-    for (uint r = 0; r < R; r++) {
-        for (uint i = 0; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            const ulong index = ((ulong)hv * args.head_dim + row0 + r) *
-                                args.head_dim + dk;
-            local[r][i] = qwen4_gdn_state_load(state, index);
+        float u = 0.0f;
+        for (uint i = 0; i < npt; i++) {
+            s[i] *= g;
+            u += s[i] * k[i];
+        }
+        u = simd_sum(u);
+        const float delta = (v[dv] - u) * beta;
+        float o = 0.0f;
+        for (uint i = 0; i < npt; i++) {
+            s[i] += k[i] * delta;
+            o += s[i] * q[i];
+        }
+        o = simd_sum(o);
+        if (tiisg == 0) out[((uint64_t)tok * args.n_v_head + h) * D + dv] = o;
+        if (tok == args.snap_tok) {
+            for (uint i = 0; i < npt; i++) snaprow[i] = s[i];
         }
     }
-    for (uint t = 0; t < args.n_tokens; t++) {
-        const bool active = args.has_mask == 0u || mask[t] != 0u;
-        if (active) {
-            const float d = decay[(ulong)t * args.value_heads + hv];
-            const float b = beta[(ulong)t * args.value_heads + hv];
-            for (uint r = 0; r < R; r++) {
-                float kv = 0.0f;
-                for (uint i = 0; i < per_lane; i++) {
-                    const uint dk = lane * per_lane + i;
-                    const float kk = k[((ulong)t * args.key_heads + hk) *
-                                       args.head_dim + dk];
-                    local[r][i] *= d;
-                    kv = fma(local[r][i], kk, kv);
-                }
-                kv = simd_sum(kv);
-                const float delta =
-                    (v[((ulong)t * args.value_heads + hv) * args.head_dim +
-                       row0 + r] - kv) * b;
-                float y = 0.0f;
-                for (uint i = 0; i < per_lane; i++) {
-                    const uint dk = lane * per_lane + i;
-                    const ulong qk_index =
-                        ((ulong)t * args.key_heads + hk) * args.head_dim + dk;
-                    local[r][i] = fma(k[qk_index], delta, local[r][i]);
-                    y = fma(local[r][i], q[qk_index], y);
-                }
-                y = simd_sum(y);
-                if (lane == 0u)
-                    out[((ulong)t * args.value_heads + hv) * args.head_dim +
-                        row0 + r] = y;
-            }
-        } else if (lane == 0u) {
-            for (uint r = 0; r < R; r++)
-                out[((ulong)t * args.value_heads + hv) * args.head_dim +
-                    row0 + r] = 0.0f;
-        }
-        if (Capture && t < args.capture_slots) {
-            const ulong state_elements =
-                (ulong)args.value_heads * args.head_dim * args.head_dim;
-            for (uint r = 0; r < R; r++) {
-                for (uint i = 0; i < per_lane; i++) {
-                    const uint dk = lane * per_lane + i;
-                    const ulong index =
-                        ((ulong)hv * args.head_dim + row0 + r) *
-                        args.head_dim + dk;
-                    qwen4_gdn_state_store(
-                        state_seq, (ulong)t * state_elements + index,
-                        local[r][i]);
-                }
-            }
-        }
-    }
-    for (uint r = 0; r < R; r++) {
-        for (uint i = 0; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            const ulong index = ((ulong)hv * args.head_dim + row0 + r) *
-                                args.head_dim + dk;
-            qwen4_gdn_state_store(state, index, local[r][i]);
-        }
-    }
+    for (uint i = 0; i < npt; i++) srow[i] = s[i];
 }
 
-#define QWEN4_GDN_KERNEL(NAME, R)                                               \
-kernel void NAME(                                                              \
-        constant qwen4_gdn_args &args [[buffer(0)]],                           \
-        device const float *q [[buffer(1)]],                                   \
-        device const float *k [[buffer(2)]],                                   \
-        device const float *v [[buffer(3)]],                                   \
-        device const float *decay [[buffer(4)]],                               \
-        device const float *beta [[buffer(5)]],                                \
-        device const uchar *mask [[buffer(6)]],                                \
-        device float *state [[buffer(7)]],                                     \
-        device float *out [[buffer(8)]],                                       \
-        uint3 gid [[thread_position_in_grid]],                                 \
-        ushort lane [[thread_index_in_simdgroup]]) {                           \
-    qwen4_gdn_rows<float, R, false>(                                            \
-        args, q, k, v, decay, beta, mask, state, out, state, gid, lane);        \
-}
+/* Prefill scan for head_dim 128: one simdgroup per (v-head, 4 consecutive dv
+ * rows), so k/q/g/beta are loaded once per four state rows and the eight
+ * reductions per token overlap.  Same math and state layout as above. */
+kernel void kernel_qwen4_gdn_scan_r4(
+        constant ds4_metal_args_qwen4_gdn_scan & args,
+        device const float *qkv,
+        device const float *ga,
+        device const float *gb,
+        device float       *state,
+        device float       *out,
+        device float       *snap_state,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint dv0 = tgpig.x * 4;
+    const uint h = tgpig.y;
+    if (dv0 >= args.head_dim || h >= args.n_v_head) return;
+    const uint D = 128, dk0 = tiisg * 4;
+    const uint kh = h % args.n_k_head;
+    const uint conv_dim = 2 * args.n_k_head * D + args.n_v_head * D;
 
-#define QWEN4_GDN_CAPTURE_KERNEL(NAME, R)                                       \
-kernel void NAME(                                                              \
-        constant qwen4_gdn_args &args [[buffer(0)]],                           \
-        device const float *q [[buffer(1)]],                                   \
-        device const float *k [[buffer(2)]],                                   \
-        device const float *v [[buffer(3)]],                                   \
-        device const float *decay [[buffer(4)]],                               \
-        device const float *beta [[buffer(5)]],                                \
-        device const uchar *mask [[buffer(6)]],                                \
-        device float *state [[buffer(7)]],                                     \
-        device float *out [[buffer(8)]],                                       \
-        device float *state_seq [[buffer(9)]],                                 \
-        uint3 gid [[thread_position_in_grid]],                                 \
-        ushort lane [[thread_index_in_simdgroup]]) {                           \
-    qwen4_gdn_rows<float, R, true>(                                             \
-        args, q, k, v, decay, beta, mask, state, out, state_seq, gid, lane);    \
-}
+    float4 s[4];
+    device float *srow = state + ((uint64_t)h * D + dv0) * D + dk0;
+    device float *snaprow = snap_state + ((uint64_t)h * D + dv0) * D + dk0;
+    for (uint r = 0; r < 4; r++) s[r] = *(device const float4 *)(srow + r * D);
 
-QWEN4_GDN_KERNEL(kernel_qwen4_gdn_r4_f32, 4)
-QWEN4_GDN_KERNEL(kernel_qwen4_gdn_r2_f32, 2)
-QWEN4_GDN_KERNEL(kernel_qwen4_gdn_r1_f32, 1)
-QWEN4_GDN_CAPTURE_KERNEL(kernel_qwen4_gdn_r4_capture_f32, 4)
-QWEN4_GDN_CAPTURE_KERNEL(kernel_qwen4_gdn_r2_capture_f32, 2)
-QWEN4_GDN_CAPTURE_KERNEL(kernel_qwen4_gdn_r1_capture_f32, 1)
-
-#define QWEN4_GDN_BF16_KERNEL(NAME, R)                                          \
-kernel void NAME(                                                              \
-        constant qwen4_gdn_args &args [[buffer(0)]],                           \
-        device const float *q [[buffer(1)]],                                   \
-        device const float *k [[buffer(2)]],                                   \
-        device const float *v [[buffer(3)]],                                   \
-        device const float *decay [[buffer(4)]],                               \
-        device const float *beta [[buffer(5)]],                                \
-        device const uchar *mask [[buffer(6)]],                                \
-        device ushort *state [[buffer(7)]],                                    \
-        device float *out [[buffer(8)]],                                       \
-        uint3 gid [[thread_position_in_grid]],                                 \
-        ushort lane [[thread_index_in_simdgroup]]) {                           \
-    qwen4_gdn_rows<ushort, R, false>(                                           \
-        args, q, k, v, decay, beta, mask, state, out, state, gid, lane);        \
-}
-
-QWEN4_GDN_BF16_KERNEL(kernel_qwen4_gdn_r4_bf16_f32, 4)
-
-#define QWEN4_GDN_BF16_CAPTURE_KERNEL(NAME, R)                                  \
-kernel void NAME(                                                              \
-        constant qwen4_gdn_args &args [[buffer(0)]],                           \
-        device const float *q [[buffer(1)]],                                   \
-        device const float *k [[buffer(2)]],                                   \
-        device const float *v [[buffer(3)]],                                   \
-        device const float *decay [[buffer(4)]],                               \
-        device const float *beta [[buffer(5)]],                                \
-        device const uchar *mask [[buffer(6)]],                                \
-        device ushort *state [[buffer(7)]],                                    \
-        device float *out [[buffer(8)]],                                       \
-        device ushort *state_seq [[buffer(9)]],                                \
-        uint3 gid [[thread_position_in_grid]],                                 \
-        ushort lane [[thread_index_in_simdgroup]]) {                           \
-    qwen4_gdn_rows<ushort, R, true>(                                            \
-        args, q, k, v, decay, beta, mask, state, out, state_seq, gid, lane);    \
-}
-
-QWEN4_GDN_BF16_CAPTURE_KERNEL(kernel_qwen4_gdn_r4_bf16_capture_f32, 4)
-
-/* Decode-only fusion of Q/K normalization and gate transforms into the BF16
- * recurrent update. The preceding convolution still writes raw activated
- * Q/K/V, but this removes two dispatches and avoids materializing decay/beta.
- * The two-level norm reduction mirrors kernel_qwen4_gdn_qk_l2norm_f32. */
-kernel void kernel_qwen4_gdn_r4_bf16_raw_f32(
-        constant qwen4_gdn_prepare_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *k [[buffer(2)]],
-        device const float *v [[buffer(3)]],
-        device const float *raw_decay [[buffer(4)]],
-        device const float *raw_beta [[buffer(5)]],
-        device const ushort *a_log [[buffer(6)]],
-        device const ushort *dt_bias [[buffer(7)]],
-        device ushort *state [[buffer(8)]],
-        device float *out [[buffer(9)]],
-        uint3 gid [[thread_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]]) {
-    constexpr uint R = 4u;
-    constexpr uint per_lane = 4u;
-    const uint row0 = gid.y * R;
-    const uint hv = gid.z;
-    if (args.n_tokens != 1u || args.head_dim != 128u || lane >= 32u ||
-        row0 >= args.head_dim || hv >= args.value_heads) return;
-    const uint hk = hv / (args.value_heads / args.key_heads);
-    const ulong qk_base = (ulong)hk * args.head_dim;
-
-    float qpart[per_lane];
-    float kpart[per_lane];
-    for (uint i = 0u; i < per_lane; i++) {
-        const uint dk = i * 32u + lane;
-        const float qv = q[qk_base + dk];
-        const float kv = k[qk_base + dk];
-        qpart[i] = simd_sum(qv * qv);
-        kpart[i] = simd_sum(kv * kv);
-    }
-    float qsum = lane < per_lane ? qpart[lane] : 0.0f;
-    float ksum = lane < per_lane ? kpart[lane] : 0.0f;
-    qsum = simd_sum(qsum);
-    ksum = simd_sum(ksum);
-    const float qscale = rsqrt(qsum + args.l2_eps) *
-                         rsqrt((float)args.head_dim);
-    const float kscale = rsqrt(ksum + args.l2_eps);
-
-    const float shifted = raw_decay[hv] +
-        qwen4_bf16_to_f32(dt_bias[hv]);
-    const float softplus = shifted > 20.0f
-        ? shifted : log(1.0f + exp(shifted));
-    const float rate = exp(qwen4_bf16_to_f32(a_log[hv]));
-    const float d = exp(-rate * softplus);
-    const float b = 1.0f / (1.0f + exp(-raw_beta[hv]));
-
-    float local[R][per_lane];
-    for (uint r = 0u; r < R; r++) {
-        for (uint i = 0u; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            const ulong index =
-                ((ulong)hv * args.head_dim + row0 + r) *
-                args.head_dim + dk;
-            local[r][i] = qwen4_gdn_state_load(state, index) * d;
+    for (uint tok = 0; tok < args.n_tokens; tok++) {
+        device const float *base = qkv + (uint64_t)tok * conv_dim;
+        const float4 q = *(device const float4 *)(base + kh * D + dk0);
+        const float4 k = *(device const float4 *)(base + (args.n_k_head + kh) * D + dk0);
+        const float4 v = *(device const float4 *)(base + 2 * args.n_k_head * D + h * D + dv0);
+        const float g = ga[(uint64_t)tok * args.n_v_head + h];
+        const float beta = gb[(uint64_t)tok * args.n_v_head + h];
+        float u[4], o[4];
+        for (uint r = 0; r < 4; r++) { s[r] *= g; u[r] = dot(s[r], k); }
+        for (uint r = 0; r < 4; r++) u[r] = simd_sum(u[r]);
+        for (uint r = 0; r < 4; r++) { s[r] += k * ((v[r] - u[r]) * beta); o[r] = dot(s[r], q); }
+        for (uint r = 0; r < 4; r++) o[r] = simd_sum(o[r]);
+        if (tiisg == 0) {
+            *(device float4 *)(out + ((uint64_t)tok * args.n_v_head + h) * D + dv0) = float4(o[0], o[1], o[2], o[3]);
+        }
+        if (tok == args.snap_tok) {
+            for (uint r = 0; r < 4; r++) *(device float4 *)(snaprow + r * D) = s[r];
         }
     }
-    for (uint r = 0u; r < R; r++) {
-        float kv = 0.0f;
-        for (uint i = 0u; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            kv = fma(local[r][i], k[qk_base + dk] * kscale, kv);
-        }
-        kv = simd_sum(kv);
-        const float delta =
-            (v[(ulong)hv * args.head_dim + row0 + r] - kv) * b;
-        float y = 0.0f;
-        for (uint i = 0u; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            const ulong index =
-                ((ulong)hv * args.head_dim + row0 + r) *
-                args.head_dim + dk;
-            local[r][i] = fma(k[qk_base + dk] * kscale,
-                              delta, local[r][i]);
-            y = fma(local[r][i], q[qk_base + dk] * qscale, y);
-            qwen4_gdn_state_store(state, index, local[r][i]);
-        }
-        y = simd_sum(y);
-        if (lane == 0u)
-            out[(ulong)hv * args.head_dim + row0 + r] = y;
-    }
+    for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
 }
 
-/* Experimental full decode fusion. One 512-thread group owns a complete
- * value head: sixteen SIMDgroups update eight recurrent rows each, then the
- * group performs the exact four-SIMDgroup RMS reduction used by the standalone
- * output kernel and applies the sigmoid gate in place. */
-kernel void kernel_qwen4_gdn_r8_bf16_raw_output_f32(
-        constant qwen4_gdn_prepare_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *k [[buffer(2)]],
-        device const float *v [[buffer(3)]],
-        device const float *raw_decay [[buffer(4)]],
-        device const float *raw_beta [[buffer(5)]],
-        device const ushort *a_log [[buffer(6)]],
-        device const ushort *dt_bias [[buffer(7)]],
-        device ushort *state [[buffer(8)]],
-        device const float *raw_gate [[buffer(9)]],
-        device const ushort *norm_weight [[buffer(10)]],
-        device float *out [[buffer(11)]],
-        threadgroup float *shared [[threadgroup(0)]],
-        uint3 gid [[thread_position_in_grid]],
-        uint3 tgid [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint R = 8u;
-    constexpr uint per_lane = 4u;
-    const uint row0 = gid.y * R;
-    const uint hv = tgid.z;
-    if (args.n_tokens != 1u || args.head_dim != 128u || lane >= 32u ||
-        row0 >= args.head_dim || hv >= args.value_heads) return;
-    const uint hk = hv / (args.value_heads / args.key_heads);
-    const ulong qk_base = (ulong)hk * args.head_dim;
-
-    float qpart[per_lane];
-    float kpart[per_lane];
-    for (uint i = 0u; i < per_lane; i++) {
-        const uint dk = i * 32u + lane;
-        const float qv = q[qk_base + dk];
-        const float kv = k[qk_base + dk];
-        qpart[i] = simd_sum(qv * qv);
-        kpart[i] = simd_sum(kv * kv);
-    }
-    float qsum = lane < per_lane ? qpart[lane] : 0.0f;
-    float ksum = lane < per_lane ? kpart[lane] : 0.0f;
-    qsum = simd_sum(qsum);
-    ksum = simd_sum(ksum);
-    const float qscale = rsqrt(qsum + args.l2_eps) *
-                         rsqrt((float)args.head_dim);
-    const float kscale = rsqrt(ksum + args.l2_eps);
-
-    const float shifted = raw_decay[hv] +
-        qwen4_bf16_to_f32(dt_bias[hv]);
-    const float softplus = shifted > 20.0f
-        ? shifted : log(1.0f + exp(shifted));
-    const float rate = exp(qwen4_bf16_to_f32(a_log[hv]));
-    const float d = exp(-rate * softplus);
-    const float b = 1.0f / (1.0f + exp(-raw_beta[hv]));
-
-    float local[R][per_lane];
-    for (uint r = 0u; r < R; r++) {
-        for (uint i = 0u; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            const ulong index =
-                ((ulong)hv * args.head_dim + row0 + r) *
-                args.head_dim + dk;
-            local[r][i] = qwen4_gdn_state_load(state, index) * d;
-        }
-    }
-    for (uint r = 0u; r < R; r++) {
-        float kv = 0.0f;
-        for (uint i = 0u; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            kv = fma(local[r][i], k[qk_base + dk] * kscale, kv);
-        }
-        kv = simd_sum(kv);
-        const float delta =
-            (v[(ulong)hv * args.head_dim + row0 + r] - kv) * b;
-        float y = 0.0f;
-        for (uint i = 0u; i < per_lane; i++) {
-            const uint dk = lane * per_lane + i;
-            const ulong index =
-                ((ulong)hv * args.head_dim + row0 + r) *
-                args.head_dim + dk;
-            local[r][i] = fma(k[qk_base + dk] * kscale,
-                              delta, local[r][i]);
-            y = fma(local[r][i], q[qk_base + dk] * qscale, y);
-            qwen4_gdn_state_store(state, index, local[r][i]);
-        }
-        y = simd_sum(y);
-        if (lane == 0u) shared[row0 + r] = y;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float square = tid < args.head_dim
-        ? shared[tid] * shared[tid] : 0.0f;
-    square = simd_sum(square);
-    if (lane == 0u && sg < 4u) shared[128u + sg] = square;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        float total = lane < 4u ? shared[128u + lane] : 0.0f;
-        total = simd_sum(total);
-        if (lane == 0u)
-            shared[132u] = rsqrt(
-                total / (float)args.head_dim + args.l2_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < args.head_dim) {
-        const ulong index = (ulong)hv * args.head_dim + tid;
-        const float gate = 1.0f / (1.0f + exp(-raw_gate[index]));
-        out[index] = shared[tid] * shared[132u] *
-            qwen4_bf16_to_f32(norm_weight[tid]) * gate;
-    }
-}
-
-struct qwen4_qsa_prepare_args {
-    uint cache_pos;
-    uint n_tokens;
-    uint cache_cap;
-    uint query_heads;
-    uint kv_heads;
-    uint head_dim;
-    uint index_heads;
-    uint index_head_dim;
-    uint ratio;
-    uint rope_dim;
-    uint pool_block_start;
-    uint has_mrope;
-    uint mrope_len;
-    float rope_theta;
-    float rms_eps;
+struct ds4_metal_args_qwen4_gdn_out {
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t head_dim;
+    float    eps;
 };
 
-static inline float qwen4_partial_rope(
-        float current,
-        float paired,
-        uint dim,
-        uint rope_dim,
-        uint position,
-        float theta) {
-    if (dim >= rope_dim) return current;
-    const uint half_dim = rope_dim / 2u;
-    const uint freq = dim < half_dim ? dim : dim - half_dim;
-    const float inv_freq = pow(theta,
-        -2.0f * (float)freq / (float)rope_dim);
-    const float angle = (float)position * inv_freq;
-    const float c = cos(angle);
-    const float s = sin(angle);
-    return dim < half_dim ? fma(-paired, s, current * c)
-                          : fma(paired, s, current * c);
-}
-
-static inline uint qwen4_rope_position(
-        constant qwen4_qsa_prepare_args &args,
-        device const int *mrope_positions,
-        uint absolute,
-        uint dim) {
-    if (args.has_mrope == 0u) return absolute;
-    const uint frequency = dim < args.rope_dim / 2u
-        ? dim : dim - args.rope_dim / 2u;
-    const uint axis = frequency % 3u;
-    return (uint)mrope_positions[(ulong)axis * args.mrope_len + absolute];
-}
-
-kernel void kernel_qwen4_qsa_main_q_prepare_f32(
-        constant qwen4_qsa_prepare_args &args [[buffer(0)]],
-        device const float *q_gate_raw [[buffer(1)]],
-        device const ushort *norm_weight [[buffer(2)]],
-        device float *q [[buffer(3)]],
-        device float *gate [[buffer(4)]],
-        device const int *mrope_positions [[buffer(5)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint token = group.x;
-    const uint head = group.y;
-    if (token >= args.n_tokens || head >= args.query_heads) return;
-    const ulong raw_base =
-        (ulong)token * args.query_heads * args.head_dim * 2u +
-        (ulong)head * args.head_dim * 2u;
-    const ulong out_base =
-        ((ulong)token * args.query_heads + head) * args.head_dim;
-    float sum = 0.0f;
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        const float value = q_gate_raw[raw_base + dim];
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u)
-            partial[0] = rsqrt(sum / (float)args.head_dim + args.rms_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = partial[0];
-    const uint half_dim = args.rope_dim / 2u;
-    const uint absolute = args.cache_pos + token;
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        float value = q_gate_raw[raw_base + dim] * scale *
-            qwen4_bf16_to_f32(norm_weight[dim]);
-        float paired = 0.0f;
-        if (dim < args.rope_dim) {
-            const uint pair = dim < half_dim
-                ? dim + half_dim : dim - half_dim;
-            paired = q_gate_raw[raw_base + pair] * scale *
-                qwen4_bf16_to_f32(norm_weight[pair]);
-        }
-        q[out_base + dim] = qwen4_partial_rope(
-            value, paired, dim, args.rope_dim,
-            qwen4_rope_position(args, mrope_positions, absolute, dim),
-            args.rope_theta);
-        gate[out_base + dim] = q_gate_raw[raw_base + args.head_dim + dim];
+/* Per-head RMSNorm of the scan output, scaled by ssm_norm and gated by
+ * sigmoid(z). */
+kernel void kernel_qwen4_gdn_out(
+        constant ds4_metal_args_qwen4_gdn_out & args,
+        device float       *o,        /* [T][H*D], in place */
+        device const float *z,        /* [T][H*D] */
+        device const float *weight,   /* [D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint tok = tgpig.y;
+    if (h >= args.n_head || tok >= args.n_tokens) return;
+    const uint D = args.head_dim;
+    const uint npt = D / 32;
+    const uint64_t base = ((uint64_t)tok * args.n_head + h) * D + tiisg * npt;
+    float ss = 0.0f;
+    for (uint i = 0; i < npt; i++) ss += o[base + i] * o[base + i];
+    ss = simd_sum(ss);
+    const float r = rsqrt(ss / (float)D + args.eps);
+    for (uint i = 0; i < npt; i++) {
+        o[base + i] = o[base + i] * r * weight[tiisg * npt + i] * qwen4_sigmoid(z[base + i]);
     }
 }
 
-kernel void kernel_qwen4_qsa_main_kv_prepare_f32(
-        constant qwen4_qsa_prepare_args &args [[buffer(0)]],
-        device const float *key_raw [[buffer(1)]],
-        device const float *value_raw [[buffer(2)]],
-        device const ushort *norm_weight [[buffer(3)]],
-        device ushort *key_cache [[buffer(4)]],
-        device ushort *value_cache [[buffer(5)]],
-        device const int *mrope_positions [[buffer(6)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint token = group.x;
-    const uint head = group.y;
-    if (token >= args.n_tokens || head >= args.kv_heads) return;
-    const ulong raw_base =
-        ((ulong)token * args.kv_heads + head) * args.head_dim;
-    const ulong cache_base =
-        ((ulong)(args.cache_pos + token) * args.kv_heads + head) *
-        args.head_dim;
-    float sum = 0.0f;
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        const float value = key_raw[raw_base + dim];
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u)
-            partial[0] = rsqrt(sum / (float)args.head_dim + args.rms_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = partial[0];
-    const uint half_dim = args.rope_dim / 2u;
-    const uint absolute = args.cache_pos + token;
-    for (uint dim = tid; dim < args.head_dim; dim += (uint)nsg * 32u) {
-        float value = key_raw[raw_base + dim] * scale *
-            qwen4_bf16_to_f32(norm_weight[dim]);
-        float paired = 0.0f;
-        if (dim < args.rope_dim) {
-            const uint pair = dim < half_dim
-                ? dim + half_dim : dim - half_dim;
-            paired = key_raw[raw_base + pair] * scale *
-                qwen4_bf16_to_f32(norm_weight[pair]);
-        }
-        value = qwen4_partial_rope(
-            value, paired, dim, args.rope_dim,
-            qwen4_rope_position(args, mrope_positions, absolute, dim),
-            args.rope_theta);
-        key_cache[cache_base + dim] = qwen4_f32_to_bf16(value);
-        value_cache[cache_base + dim] =
-            qwen4_f32_to_bf16(value_raw[raw_base + dim]);
-    }
-}
+/* --- PLE ---------------------------------------------------------------- */
 
-kernel void kernel_qwen4_qsa_index_q_prepare_f32(
-        constant qwen4_qsa_prepare_args &args [[buffer(0)]],
-        device const float *index_qk_raw [[buffer(1)]],
-        device const ushort *norm_weight [[buffer(2)]],
-        device float *index_q [[buffer(3)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint token = group.x;
-    const uint head = group.y;
-    if (token >= args.n_tokens || head >= args.index_heads) return;
-    const ulong raw_base =
-        (ulong)token * (args.index_heads + 1u) * args.index_head_dim +
-        (ulong)head * args.index_head_dim;
-    const ulong out_base =
-        ((ulong)token * args.index_heads + head) * args.index_head_dim;
-    float sum = 0.0f;
-    for (uint dim = tid; dim < args.index_head_dim;
-         dim += (uint)nsg * 32u) {
-        const float value = index_qk_raw[raw_base + dim];
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u)
-            partial[0] = rsqrt(
-                sum / (float)args.index_head_dim + args.rms_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = partial[0];
-    const uint half_dim = args.rope_dim / 2u;
-    const uint position = args.cache_pos + token;
-    for (uint dim = tid; dim < args.index_head_dim;
-         dim += (uint)nsg * 32u) {
-        float value = index_qk_raw[raw_base + dim] * scale *
-            qwen4_bf16_to_f32(norm_weight[dim]);
-        float paired = 0.0f;
-        if (dim < args.rope_dim) {
-            const uint pair = dim < half_dim
-                ? dim + half_dim : dim - half_dim;
-            paired = index_qk_raw[raw_base + pair] * scale *
-                qwen4_bf16_to_f32(norm_weight[pair]);
-        }
-        index_q[out_base + dim] = qwen4_partial_rope(
-            value, paired, dim, args.rope_dim, position, args.rope_theta);
-    }
-}
-
-kernel void kernel_qwen4_qsa_index_key_store_f32(
-        constant qwen4_qsa_prepare_args &args [[buffer(0)]],
-        device const float *index_qk_raw [[buffer(1)]],
-        device ushort *raw_index_cache [[buffer(2)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const uint dim = gid.x;
-    const uint token = gid.y;
-    if (dim >= args.index_head_dim || token >= args.n_tokens) return;
-    const ulong raw_at =
-        (ulong)token * (args.index_heads + 1u) * args.index_head_dim +
-        (ulong)args.index_heads * args.index_head_dim + dim;
-    raw_index_cache[(ulong)(args.cache_pos + token) *
-                    args.index_head_dim + dim] =
-        qwen4_f32_to_bf16(index_qk_raw[raw_at]);
-}
-
-static inline float qwen4_qsa_pooled_raw(
-        device const ushort *raw_index_cache,
-        uint block,
-        uint ratio,
-        uint head_dim,
-        uint dim) {
-    float sum = 0.0f;
-    for (uint item = 0; item < ratio; item++)
-        sum += qwen4_bf16_to_f32(
-            raw_index_cache[((ulong)block * ratio + item) * head_dim + dim]);
-    const float mean = sum / (float)ratio;
-    return qwen4_bf16_to_f32(qwen4_f32_to_bf16(mean));
-}
-
-kernel void kernel_qwen4_qsa_index_pool_f32(
-        constant qwen4_qsa_prepare_args &args [[buffer(0)]],
-        device const ushort *raw_index_cache [[buffer(1)]],
-        device const ushort *norm_weight [[buffer(2)]],
-        device ushort *pooled_index_cache [[buffer(3)]],
-        threadgroup float *partial [[threadgroup(0)]],
-        uint local_block [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint block = args.pool_block_start + local_block;
-    float sum = 0.0f;
-    for (uint dim = tid; dim < args.index_head_dim;
-         dim += (uint)nsg * 32u) {
-        const float value = qwen4_qsa_pooled_raw(
-            raw_index_cache, block, args.ratio, args.index_head_dim, dim);
-        sum = fma(value, value, sum);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0u) partial[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        sum = lane < nsg ? partial[lane] : 0.0f;
-        sum = simd_sum(sum);
-        if (lane == 0u)
-            partial[0] = rsqrt(
-                sum / (float)args.index_head_dim + args.rms_eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = partial[0];
-    const uint half_dim = args.rope_dim / 2u;
-    const uint position = block * args.ratio;
-    for (uint dim = tid; dim < args.index_head_dim;
-         dim += (uint)nsg * 32u) {
-        float value = qwen4_qsa_pooled_raw(
-            raw_index_cache, block, args.ratio, args.index_head_dim, dim) *
-            scale * qwen4_bf16_to_f32(norm_weight[dim]);
-        float paired = 0.0f;
-        if (dim < args.rope_dim) {
-            const uint pair = dim < half_dim
-                ? dim + half_dim : dim - half_dim;
-            paired = qwen4_qsa_pooled_raw(
-                raw_index_cache, block, args.ratio,
-                args.index_head_dim, pair) * scale *
-                qwen4_bf16_to_f32(norm_weight[pair]);
-        }
-        value = qwen4_partial_rope(
-            value, paired, dim, args.rope_dim, position, args.rope_theta);
-        pooled_index_cache[(ulong)block * args.index_head_dim + dim] =
-            qwen4_f32_to_bf16(value);
-    }
-}
-
-struct qwen4_qsa_attention_args {
-    uint queries;
-    uint cache_cap;
-    uint query_heads;
-    uint kv_heads;
-    uint head_dim;
-    uint top_k;
-    uint ratio;
-    uint max_selected;
-    uint debug;   /* GQA MMA only: dump softmax stats to buffer(9) */
+struct ds4_metal_args_qwen4_ple_gate {
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    float    eps;
 };
 
-template <bool MEMOIZE_NUMERATORS>
-static inline void qwen4_qsa_attention_bf16_f32(
-        constant qwen4_qsa_attention_args &args,
-        device const float *q,
-        device const float *raw_gate,
-        device const ushort *key_cache,
-        device const ushort *value_cache,
-        device const uint *selected_blocks,
-        device const uint *selected_counts,
-        device const uint *visible_tokens,
-        device float *out,
-        threadgroup float *scratch,
-        uint2 group,
-        uint tid,
-        ushort lane,
-        ushort sg,
-        ushort nsg) {
-    /* head_dim is pinned to 256 by the dispatch, so each simd lane owns one
-     * contiguous eight-dim slice: 128-bit K/V loads and register value
-     * accumulators replace the scratch score sheet and the serial per-token
-     * output pass.  MEMOIZE_NUMERATORS no longer changes arithmetic (each
-     * simdgroup consumes its own scores immediately); the template stays so
-     * both pipeline names keep their bitwise-identical contract. */
-    (void)tid;
-    const uint query = group.x;
-    const uint head = group.y;
-    if (query >= args.queries || head >= args.query_heads) return;
-    const uint visible = min(visible_tokens[query], args.cache_cap);
-    const uint complete = visible / args.ratio;
-    const uint block_count = min(
-        min(selected_counts[query], args.top_k), complete);
-    const uint tail = visible - complete * args.ratio;
-    const uint selected = block_count * args.ratio + tail;
-    const ulong qbase =
-        ((ulong)query * args.query_heads + head) * args.head_dim;
-    const uint kv_head = head / (args.query_heads / args.kv_heads);
-    if (selected == 0u) {
-        for (uint dim = lane; dim < args.head_dim; dim += 32u)
-            out[qbase + dim] = 0.0f;
-        return;
-    }
+/* Per token: grouped norms of the projected n-gram key and of the residual,
+ * per-stream signed-sqrt sigmoid gate, gated value (kept raw for the
+ * residual) and its grouped norm (conv input). */
+kernel void kernel_qwen4_ple_gate(
+        constant ds4_metal_args_qwen4_ple_gate & args,
+        device const float *R,          /* [T][hc*E] */
+        device const float *key,        /* [T][hc*E] raw key projection */
+        device const float *value,      /* [T][E] */
+        device const float *g_key,      /* [hc*E] */
+        device const float *g_query,    /* [hc*E] */
+        device const float *g_conv,     /* [hc*E] */
+        device float       *gated,      /* [T][hc*E] */
+        device float       *normed,     /* [T][hc*E] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint tok = tgpig.x;
+    if (tok >= args.n_tokens) return;
+    const uint E = args.n_embd;
+    const uint nth = ntg.x;
+    const uint nsg = nth / 32;
+    threadgroup float red[3][32];
 
-    const uint dim0 = (uint)lane * 8u;
-    const device const float *qrow = q + qbase + dim0;
-    const float4 q0 = *((device const float4 *)(qrow));
-    const float4 q1 = *((device const float4 *)(qrow + 4u));
-
-    float4 acc0 = 0.0f;
-    float4 acc1 = 0.0f;
-    float max_score = -INFINITY;
-    float sum_exp = 0.0f;
-
-    for (uint rank = sg; rank < selected; rank += (uint)nsg) {
-        uint token;
-        if (rank < block_count * args.ratio) {
-            const uint block = selected_blocks[
-                (ulong)query * args.top_k + rank / args.ratio];
-            token = block * args.ratio + rank % args.ratio;
-        } else {
-            token = complete * args.ratio +
-                    rank - block_count * args.ratio;
+    for (uint s = 0; s < args.n_hc; s++) {
+        device const float *kr = key + ((uint64_t)tok * args.n_hc + s) * E;
+        device const float *rr = R + ((uint64_t)tok * args.n_hc + s) * E;
+        device const float *gk = g_key + s * E;
+        device const float *gq = g_query + s * E;
+        float sk = 0.0f, sr = 0.0f;
+        for (uint i = tid; i < E; i += nth) {
+            sk += kr[i] * kr[i];
+            sr += rr[i] * rr[i];
         }
-        if (token >= visible) continue;
-        const ulong kbase =
-            ((ulong)token * args.kv_heads + kv_head) * args.head_dim;
-        const uint4 kraw = *((device const uint4 *)(
-            key_cache + kbase + dim0));
-        thread const ushort *kq = (thread const ushort *)&kraw;
-        float dot = q0.x * qwen4_bf16_to_f32(kq[0]) +
-                    q0.y * qwen4_bf16_to_f32(kq[1]) +
-                    q0.z * qwen4_bf16_to_f32(kq[2]) +
-                    q0.w * qwen4_bf16_to_f32(kq[3]);
-        dot += q1.x * qwen4_bf16_to_f32(kq[4]) +
-               q1.y * qwen4_bf16_to_f32(kq[5]) +
-               q1.z * qwen4_bf16_to_f32(kq[6]) +
-               q1.w * qwen4_bf16_to_f32(kq[7]);
-        dot = simd_sum(dot) * rsqrt((float)args.head_dim);
-
-        /* The score is uniform across the simdgroup after simd_sum, so the
-         * online softmax state and the rescale factor stay uniform too. */
-        const float new_max = max(max_score, dot);
-        const float factor = exp(max_score - new_max);
-        const float p = exp(dot - new_max);
-        max_score = new_max;
-        sum_exp = sum_exp * factor + p;
-        acc0 *= factor;
-        acc1 *= factor;
-
-        const uint4 vraw = *((device const uint4 *)(
-            value_cache + kbase + dim0));
-        thread const ushort *vq = (thread const ushort *)&vraw;
-        acc0 = float4(
-            fma(p, qwen4_bf16_to_f32(vq[0]), acc0.x),
-            fma(p, qwen4_bf16_to_f32(vq[1]), acc0.y),
-            fma(p, qwen4_bf16_to_f32(vq[2]), acc0.z),
-            fma(p, qwen4_bf16_to_f32(vq[3]), acc0.w));
-        acc1 = float4(
-            fma(p, qwen4_bf16_to_f32(vq[4]), acc1.x),
-            fma(p, qwen4_bf16_to_f32(vq[5]), acc1.y),
-            fma(p, qwen4_bf16_to_f32(vq[6]), acc1.z),
-            fma(p, qwen4_bf16_to_f32(vq[7]), acc1.w));
-    }
-
-    /* Cross-simdgroup combine: partials in threadgroup memory, then every
-     * lane rescales its own dim slice by exp(group_max - global_max). */
-    threadgroup float *partials = scratch;
-    threadgroup float *gmax = scratch + (uint)nsg * args.head_dim;
-    threadgroup float *gsum = gmax + nsg;
-    *((threadgroup float4 *)(partials +
-        (ulong)sg * args.head_dim + dim0)) = acc0;
-    *((threadgroup float4 *)(partials +
-        (ulong)sg * args.head_dim + dim0 + 4u)) = acc1;
-    if (lane == 0u) {
-        gmax[sg] = max_score;
-        gsum[sg] = sum_exp;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float maximum = -INFINITY;
-    for (uint g = 0u; g < (uint)nsg; g++)
-        maximum = max(maximum, gmax[g]);
-    if (!isfinite(maximum)) {
-        for (uint dim = lane; dim < args.head_dim; dim += 32u)
-            out[qbase + dim] = 0.0f;
-        return;
-    }
-    float total = 0.0f;
-    for (uint g = 0u; g < (uint)nsg; g++)
-        total += gsum[g] * exp(gmax[g] - maximum);
-
-    float4 r0 = 0.0f;
-    float4 r1 = 0.0f;
-    for (uint g = 0u; g < (uint)nsg; g++) {
-        const float weight = gmax[g] == -INFINITY
-            ? 0.0f : exp(gmax[g] - maximum);
-        r0 += weight * *((threadgroup float4 *)(
-            partials + (ulong)g * args.head_dim + dim0));
-        r1 += weight * *((threadgroup float4 *)(
-            partials + (ulong)g * args.head_dim + dim0 + 4u));
-    }
-    const float inv_sum = total > 0.0f ? 1.0f / total : 0.0f;
-    const float4 inv0 = float4(inv_sum);
-    const float4 inv1 = float4(inv_sum);
-    float4 gated0 = r0 * inv0;
-    float4 gated1 = r1 * inv1;
-    gated0 *= float4(
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 0u])),
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 1u])),
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 2u])),
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 3u])));
-    gated1 *= float4(
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 4u])),
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 5u])),
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 6u])),
-        1.0f / (1.0f + exp(-raw_gate[qbase + dim0 + 7u])));
-    *((device float4 *)(out + qbase + dim0)) = gated0;
-    *((device float4 *)(out + qbase + dim0 + 4u)) = gated1;
-}
-
-kernel void kernel_qwen4_qsa_attention_bf16_f32(
-        constant qwen4_qsa_attention_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device const ushort *key_cache [[buffer(3)]],
-        device const ushort *value_cache [[buffer(4)]],
-        device const uint *selected_blocks [[buffer(5)]],
-        device const uint *selected_counts [[buffer(6)]],
-        device const uint *visible_tokens [[buffer(7)]],
-        device float *out [[buffer(8)]],
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    qwen4_qsa_attention_bf16_f32<true>(
-        args, q, raw_gate, key_cache, value_cache, selected_blocks,
-        selected_counts, visible_tokens, out, scratch, group, tid, lane, sg,
-        nsg);
-}
-
-kernel void kernel_qwen4_qsa_attention_bf16_f32_legacy(
-        constant qwen4_qsa_attention_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device const ushort *key_cache [[buffer(3)]],
-        device const ushort *value_cache [[buffer(4)]],
-        device const uint *selected_blocks [[buffer(5)]],
-        device const uint *selected_counts [[buffer(6)]],
-        device const uint *visible_tokens [[buffer(7)]],
-        device float *out [[buffer(8)]],
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    qwen4_qsa_attention_bf16_f32<false>(
-        args, q, raw_gate, key_cache, value_cache, selected_blocks,
-        selected_counts, visible_tokens, out, scratch, group, tid, lane, sg,
-        nsg);
-}
-
-/* GQA tile-sharing matrix-core variant of the sparse QSA attention.
- *
- * Role-split organization (validated in speed-bench/gqa_mma_proto.metal):
- * one 192-thread threadgroup with six simdgroups owns one (query row,
- * KV head) pair.  simdgroups 0/1 are SCORE groups (eight head rows each:
- * full-width QK^T on the matrix units plus the online softmax, no O
- * accumulators); simdgroups 2..5 are PV groups owning eight rows x 128
- * dims each, so per-thread accumulator registers halve versus a
- * monolithic design and the matrix units can be fed at a far higher
- * rate.  Every gathered K/V tile is staged once in shared threadgroup
- * memory (dim-major for K so no operand load transposes), Q/K/V use F16
- * operands with F32 accumulation (the batched-kernel parity policy; Q
- * rounds F32->F16 and the BF16 cache converts losslessly to F16 outside
- * the subnormal tail), and the softmax, lazy running-max rescale, and
- * sigmoid gate stay F32 through threadgroup tiles.  The rescale tile
- * overlays the dead K/S staging regions.  The rank-to-token mapping,
- * masking, and selected-count semantics are identical to
- * kernel_qwen4_qsa_attention_bf16_f32; only the reduction order differs.
- */
-template <bool QSPLIT>
-static inline void qwen4_qsa_attention_gqa_mma_body(
-        constant qwen4_qsa_attention_args &args,
-        device const float *q,
-        device const float *raw_gate,
-        device const ushort *key_cache,
-        device const ushort *value_cache,
-        device const uint *selected_blocks,
-        device const uint *selected_counts,
-        device const uint *visible_tokens,
-        device float *out,
-        device float *dbg,
-        threadgroup uchar *scratch,
-        uint2 group,
-        ushort lane,
-        ushort sg) {
-    /* Compiled geometry: 12 query heads per KV head as two padded 8-row
-     * halves, head_dim 256, ratio-4 blocks, 64-token gather tiles with
-     * 8-dim staging chunks.  The dispatch guards these. */
-    constexpr uint GQA = 12u;
-    constexpr uint D = 256u;
-    constexpr uint BK = 64u;
-    constexpr uint DC = 8u;
-    constexpr uint DCHUNKS = D / DC;
-    constexpr uint TK = BK / 8u;
-    constexpr uint OD = (D / 2u) / 8u;   /* per PV simdgroup */
-    constexpr uint TPT = 192u;
-
-    threadgroup half *qs = (threadgroup half *)scratch;            /* 16*D */
-    threadgroup half *qs_lo = qs + 16u * D;   /* 16*D, QSPLIT only */
-    threadgroup half *kvs = qs + 16u * D * (QSPLIT ? 2u : 1u);     /* BK*DC */
-    threadgroup float *s_tile =
-        (threadgroup float *)(kvs + BK * DC);                      /* 16*BK */
-    threadgroup half *p_tile = (threadgroup half *)(s_tile + 16u * BK);
-    threadgroup int *sel = (threadgroup int *)(p_tile + 16u * BK);
-    threadgroup float *stats = (threadgroup float *)(sel + BK);    /* 16*2 */
-    threadgroup float *rfac = stats + 16u * 2u;                    /* 16   */
-    threadgroup int *vote = (threadgroup int *)(rfac + 16u);
-    /* One explicit 8x128 float O block (4 KB): each PV simdgroup passes
-     * its accumulators through it in four barrier-separated phases for
-     * the rare rescale and the final emit. */
-    threadgroup float *oblock = (threadgroup float *)(vote + 2u);
-
-    const uint query = group.x;
-    const uint kv_head = group.y;
-    if (query >= args.queries || kv_head >= args.kv_heads) return;
-    const uint lane32 = (uint)lane;
-    const uint tid = (uint)sg * 32u + lane32;
-    const bool is_score = sg < 2u;
-    const uint row_half = is_score ? (uint)sg : ((uint)sg - 2u) / 2u;
-    const uint row_base = row_half * 8u;
-    const uint dim_half = ((uint)sg - 2u) % 2u;   /* PV simdgroups only */
-
-    const uint visible = min(visible_tokens[query], args.cache_cap);
-    const uint complete = visible / args.ratio;
-    const uint block_count =
-        min(min(selected_counts[query], args.top_k), complete);
-    const uint tail = visible - complete * args.ratio;
-    const uint selected = block_count * args.ratio + tail;
-
-    if (selected == 0u) {
-        for (uint i = tid; i < GQA * D; i += TPT)
-            out[((ulong)query * args.query_heads + kv_head * GQA + i / D) *
-                args.head_dim + (i % D)] = 0.0f;
-        return;
-    }
-
-    /* Stage the 12 query-head rows (+ zero padding) once as F16. */
-    for (uint i = tid; i < 16u * (D / 8u); i += TPT) {
-        const uint row = i / (D / 8u);
-        const uint d8 = i % (D / 8u);
-        float4 f0 = 0.0f;
-        float4 f1 = 0.0f;
-        if (row < GQA) {
-            const device const float *qrow = q +
-                ((ulong)query * args.query_heads + kv_head * GQA + row) *
-                    args.head_dim +
-                d8 * 8u;
-            f0 = *((device const float4 *)qrow);
-            f1 = *((device const float4 *)(qrow + 4u));
-        }
-        qs[row * D + d8 * 8u + 0u] = half(f0.x);
-        qs[row * D + d8 * 8u + 1u] = half(f0.y);
-        qs[row * D + d8 * 8u + 2u] = half(f0.z);
-        qs[row * D + d8 * 8u + 3u] = half(f0.w);
-        qs[row * D + d8 * 8u + 4u] = half(f1.x);
-        qs[row * D + d8 * 8u + 5u] = half(f1.y);
-        qs[row * D + d8 * 8u + 6u] = half(f1.z);
-        qs[row * D + d8 * 8u + 7u] = half(f1.w);
-        if (QSPLIT) {
-            qs_lo[row * D + d8 * 8u + 0u] =
-                half(f0.x - (float)half(f0.x));
-            qs_lo[row * D + d8 * 8u + 1u] =
-                half(f0.y - (float)half(f0.y));
-            qs_lo[row * D + d8 * 8u + 2u] =
-                half(f0.z - (float)half(f0.z));
-            qs_lo[row * D + d8 * 8u + 3u] =
-                half(f0.w - (float)half(f0.w));
-            qs_lo[row * D + d8 * 8u + 4u] =
-                half(f1.x - (float)half(f1.x));
-            qs_lo[row * D + d8 * 8u + 5u] =
-                half(f1.y - (float)half(f1.y));
-            qs_lo[row * D + d8 * 8u + 6u] =
-                half(f1.z - (float)half(f1.z));
-            qs_lo[row * D + d8 * 8u + 7u] =
-                half(f1.w - (float)half(f1.w));
-        }
-    }
-    for (uint r = tid; r < 16u; r += TPT) {
-        stats[r * 2u] = -INFINITY;
-        stats[r * 2u + 1u] = 0.0f;
-    }
-
-    simdgroup_float8x8 ofrag[OD];
-    if (!is_score)
-        for (uint dd = 0u; dd < OD; dd++)
-            ofrag[dd] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-
-    const float scale = rsqrt((float)args.head_dim);
-    const uint n_tiles = (selected + BK - 1u) / BK;
-    const ulong kv_base = (ulong)kv_head * args.head_dim;
-    const ulong kv_token_stride = (ulong)args.kv_heads * args.head_dim;
-
-    for (uint ktile = 0u; ktile < n_tiles; ktile++) {
-        /* Resolve this tile's 128 ranks to token positions (-1 invalid).
-         * The mapping matches kernel_qwen4_qsa_attention_bf16_f32. */
-        for (uint k = tid; k < BK; k += TPT) {
-            const uint rank = ktile * BK + k;
-            uint token = UINT_MAX; /* sentinel for invalid */
-            if (rank < block_count * args.ratio) {
-                const uint block = selected_blocks[
-                    (ulong)query * args.top_k + rank / args.ratio];
-                token = block * args.ratio + rank % args.ratio;
-            } else if (rank < selected) {
-                token = complete * args.ratio +
-                        rank - block_count * args.ratio;
-            }
-            sel[k] = (token == UINT_MAX || token >= visible)
-                ? -1 : (int)token;
-        }
+        sk = simd_sum(sk);
+        sr = simd_sum(sr);
+        if (tiisg == 0) { red[0][sgitg] = sk; red[1][sgitg] = sr; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        /* QK^T: every simdgroup cooperates on staging the shared dim-
-         * major K tile (no transpose loads); only the score simdgroups
-         * run the matrix products. */
-        {
-            simdgroup_float8x8 sfrag[TK];
-            if (is_score)
-                for (uint ik = 0u; ik < TK; ik++)
-                    sfrag[ik] =
-                        make_filled_simdgroup_matrix<float, 8>(0.0f);
-            for (uint chunk = 0u; chunk < DCHUNKS; chunk++) {
-                for (uint i = tid; i < BK * (DC / 8u); i += TPT) {
-                    const uint k = i / (DC / 8u);
-                    const uint d8 = i % (DC / 8u);
-                    uint4 raw = 0u;
-                    if (sel[k] >= 0) {
-                        raw = *((device const uint4 *)(
-                            key_cache +
-                            (ulong)sel[k] * kv_token_stride + kv_base +
-                            chunk * DC + d8 * 8u));
-                    }
-                    thread const ushort *elements =
-                        (thread const ushort *)&raw;
-                    for (uint e = 0u; e < 8u; e++)
-                        kvs[(d8 * 8u + e) * BK + k] =
-                            half(qwen4_bf16_to_f32(elements[e]));
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint dd8 = 0u; dd8 < DC / 8u && is_score; dd8++) {
-                    simdgroup_half8x8 qf;
-                    simdgroup_load(qf, qs + row_base * D + chunk * DC +
-                                       dd8 * 8u, D, 0, false);
-                    simdgroup_half8x8 qfl;
-                    if (QSPLIT)
-                        simdgroup_load(qfl,
-                                       qs_lo + row_base * D + chunk * DC +
-                                           dd8 * 8u,
-                                       D, 0, false);
-                    for (uint ik = 0u; ik < TK; ik++) {
-                        simdgroup_half8x8 kt;
-                        simdgroup_load(kt,
-                                       kvs + (dd8 * 8u) * BK + ik * 8u,
-                                       BK, 0, false);
-                        simdgroup_multiply_accumulate(
-                            sfrag[ik], qf, kt, sfrag[ik]);
-                        if (QSPLIT)
-                            simdgroup_multiply_accumulate(
-                                sfrag[ik], qfl, kt, sfrag[ik]);
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            /* Only the score simdgroups own populated sfrag fragments;
-             * the PV groups share row_base row halves, so an unguarded
-             * store would clobber the real scores with uninitialized
-             * fragments (this exact bug shipped the kernel computing a
-             * uniform softmax: it passed every small-magnitude fixture
-             * because uniform weights approximate true weights there). */
-            if (is_score)
-                for (uint ik = 0u; ik < TK; ik++)
-                    simdgroup_store(sfrag[ik],
-                                    s_tile + row_base * BK + ik * 8u,
-                                    BK, 0, false);
-        }
+        float tk = 0.0f, tr = 0.0f;
+        for (uint g = 0; g < nsg; g++) { tk += red[0][g]; tr += red[1][g]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        /* Softmax on the score simdgroups.  Shuffle the UNMUTATED
-         * per-lane partial: broadcasting from a lane whose accumulator
-         * already absorbed an earlier iteration double-counts that
-         * neighbor (max survives only by idempotence). */
-        if (is_score) {
-            const uint row = lane32 / 4u;
-            /* Each of the row's four lanes covers BK/4 columns. */
-            const uint col0 = (lane32 % 4u) * (BK / 4u);
-            float local_max = -INFINITY;
-            for (uint c = 0u; c < BK / 4u; c++) {
-                float s = -INFINITY;
-                if (sel[col0 + c] >= 0)
-                    s = s_tile[(row_base + row) * BK + col0 + c] * scale;
-                s_tile[(row_base + row) * BK + col0 + c] = s;
-                local_max = max(local_max, s);
-            }
-            float row_max = local_max;
-            for (uint j = 1u; j < 4u; j++)
-                row_max = max(row_max,
-                              simd_shuffle(local_max, row * 4u + j));
-            const float old_max = stats[(row_base + row) * 2u];
-            const float old_sum = stats[(row_base + row) * 2u + 1u];
-            const float new_max = max(old_max, row_max);
-            const bool grows = isfinite(old_max) && new_max > old_max;
-            float local_sum = 0.0f;
-            for (uint c = 0u; c < BK / 4u; c++) {
-                const float s = s_tile[(row_base + row) * BK + col0 + c];
-                const float p = isfinite(s) ? exp(s - new_max) : 0.0f;
-                p_tile[(row_base + row) * BK + col0 + c] = half(p);
-                local_sum += p;
-            }
-            float row_sum = local_sum;
-            for (uint j = 1u; j < 4u; j++)
-                row_sum += simd_shuffle(local_sum, row * 4u + j);
-            if (lane32 % 4u == 0u) {
-                const float factor = isfinite(old_max)
-                    ? exp(old_max - new_max) : 1.0f;
-                rfac[row_base + row] = factor;
-                stats[(row_base + row) * 2u] = new_max;
-                stats[(row_base + row) * 2u + 1u] =
-                    old_sum * factor + row_sum;
-            }
-            if (lane32 == 0u) vote[sg] = grows ? 1 : 0;
-            if (args.debug != 0u && query == 0u && kv_head == 0u &&
-                sg == 0u && lane32 == 0u) {
-                for (uint r = 0u; r < 8u; r++) {
-                    dbg[(ulong)ktile * 2u * 8u + r * 2u] = stats[r * 2u];
-                    dbg[(ulong)ktile * 2u * 8u + r * 2u + 1u] =
-                        stats[r * 2u + 1u];
-                }
-                if (ktile == 0u) {
-                    for (uint k = 0u; k < BK; k++)
-                        dbg[2048u + k] = (float)sel[k];
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (vote[0] != 0 || vote[1] != 0) {
-            /* Lazy rescale: each PV simdgroup in turn brings its 8x128 O
-             * block through the shared oblock; the other simdgroups wait
-             * at the barriers. */
-            for (uint phase = 0u; phase < 4u; phase++) {
-                if (!is_score && (uint)sg == 2u + phase) {
-                    for (uint dd = 0u; dd < OD; dd++)
-                        simdgroup_store(ofrag[dd], oblock + dd * 8u,
-                                        128u, 0, false);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (!is_score && (uint)sg == 2u + phase) {
-                    const uint r = lane32 / 4u;
-                    const float factor = rfac[row_base + r];
-                    const uint col = (lane32 % 4u) * 32u;
-                    for (uint c = 0u; c < 32u; c++)
-                        oblock[r * 128u + col + c] *= factor;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (!is_score && (uint)sg == 2u + phase) {
-                    for (uint dd = 0u; dd < OD; dd++)
-                        simdgroup_load(ofrag[dd], oblock + dd * 8u,
-                                       128u, 0, false);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        /* O += P @ V: every simdgroup cooperates on staging the shared V
-         * tile; each PV simdgroup runs its dim half's products. */
-        {
-            for (uint chunk = 0u; chunk < DCHUNKS; chunk++) {
-                const bool pv_chunk =
-                    !is_score &&
-                    chunk >= dim_half * (DCHUNKS / 2u) &&
-                    chunk < (dim_half + 1u) * (DCHUNKS / 2u);
-                for (uint i = tid; i < BK * (DC / 8u); i += TPT) {
-                    const uint k = i / (DC / 8u);
-                    const uint d8 = i % (DC / 8u);
-                    uint4 raw = 0u;
-                    if (sel[k] >= 0) {
-                        raw = *((device const uint4 *)(
-                            value_cache +
-                            (ulong)sel[k] * kv_token_stride + kv_base +
-                            chunk * DC + d8 * 8u));
-                    }
-                    thread const ushort *elements =
-                        (thread const ushort *)&raw;
-                    for (uint e = 0u; e < 8u; e++)
-                        kvs[k * DC + d8 * 8u + e] =
-                            half(qwen4_bf16_to_f32(elements[e]));
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (pv_chunk) {
-                    for (uint ik = 0u; ik < TK; ik++) {
-                        simdgroup_half8x8 pf;
-                        simdgroup_load(pf,
-                                       p_tile + row_base * BK + ik * 8u,
-                                       BK, 0, false);
-                        for (uint dd = 0u; dd < DC / 8u; dd++) {
-                            simdgroup_half8x8 vf;
-                            simdgroup_load(vf, kvs + ik * 8u * DC + dd * 8u,
-                                           DC, 0, false);
-                            simdgroup_multiply_accumulate(
-                                ofrag[(chunk % (DCHUNKS / 2u)) *
-                                          (DC / 8u) +
-                                      dd],
-                                pf, vf,
-                                ofrag[(chunk % (DCHUNKS / 2u)) *
-                                          (DC / 8u) +
-                                      dd]);
-                        }
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-    }
-
-    /* Emit: each PV simdgroup normalizes and gates its 8x128 block.
-     * Row half 1 owns only GQA-8 valid heads; its pad rows must not be
-     * written (they alias the next KV group's heads and, at the last
-     * group, run past the output buffer). */
-    for (uint phase = 0u; phase < 4u; phase++) {
-        if (!is_score && (uint)sg == 2u + phase) {
-            const uint emit_rows = row_half == 0u ? 8u : GQA - 8u;
-            for (uint dd = 0u; dd < OD; dd++)
-                simdgroup_store(ofrag[dd], oblock + dd * 8u, 128u, 0,
-                                false);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!is_score && (uint)sg == 2u + phase) {
-            const uint emit_rows = row_half == 0u ? 8u : GQA - 8u;
-            for (uint i = lane32; i < emit_rows * (128u / 8u); i += 32u) {
-                const uint r = i / (128u / 8u);
-                const uint d8 = i % (128u / 8u);
-                const uint head = kv_head * GQA + row_base + r;
-                const ulong base =
-                    ((ulong)query * args.query_heads + head) *
-                    args.head_dim;
-                const float m = stats[(row_base + r) * 2u];
-                const float s = stats[(row_base + r) * 2u + 1u];
-                const float inv =
-                    isfinite(m) && s > 0.0f ? 1.0f / s : 0.0f;
-                for (uint e = 0u; e < 8u; e++) {
-                    const uint d = dim_half * 128u + d8 * 8u + e;
-                    const float g =
-                        1.0f / (1.0f + exp(-raw_gate[base + d]));
-                    out[base + d] =
-                        oblock[r * 128u + d8 * 8u + e] * inv * g;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-/* F16 hi/lo Q-split instantiation: the score simdgroups run a second QK
- * product per K chunk from the staged F16 rounding residual, restoring Q
- * to ~22 mantissa bits (K is already value-exact as BF16 -> F16), so the
- * scores match the scalar kernel's F32-Q numerics instead of drifting
- * with F16's 11-bit rounding at production score magnitudes.  Costs one
- * extra 16x256 F16 threadgroup tile (+8 KB) and doubles the score groups'
- * matrix-product count. */
-kernel void kernel_qwen4_qsa_attention_gqa_mma_f32(
-        constant qwen4_qsa_attention_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device const ushort *key_cache [[buffer(3)]],
-        device const ushort *value_cache [[buffer(4)]],
-        device const uint *selected_blocks [[buffer(5)]],
-        device const uint *selected_counts [[buffer(6)]],
-        device const uint *visible_tokens [[buffer(7)]],
-        device float *out [[buffer(8)]],
-        device float *dbg [[buffer(9)]],
-        threadgroup uchar *scratch [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    qwen4_qsa_attention_gqa_mma_body<false>(
-        args, q, raw_gate, key_cache, value_cache, selected_blocks,
-        selected_counts, visible_tokens, out, dbg, scratch, group, lane,
-        sg);
-}
-
-kernel void kernel_qwen4_qsa_attention_gqa_mma_qsplit_f32(
-        constant qwen4_qsa_attention_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device const ushort *key_cache [[buffer(3)]],
-        device const ushort *value_cache [[buffer(4)]],
-        device const uint *selected_blocks [[buffer(5)]],
-        device const uint *selected_counts [[buffer(6)]],
-        device const uint *visible_tokens [[buffer(7)]],
-        device float *out [[buffer(8)]],
-        device float *dbg [[buffer(9)]],
-        threadgroup uchar *scratch [[threadgroup(0)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    qwen4_qsa_attention_gqa_mma_body<true>(
-        args, q, raw_gate, key_cache, value_cache, selected_blocks,
-        selected_counts, visible_tokens, out, dbg, scratch, group, lane,
-        sg);
-}
-
-
-
-kernel void kernel_qwen4_qsa_dense_attention_bf16_f32(
-        constant qwen4_qsa_attention_args &args [[buffer(0)]],
-        device const float *q [[buffer(1)]],
-        device const float *raw_gate [[buffer(2)]],
-        device const ushort *key_cache [[buffer(3)]],
-        device const ushort *value_cache [[buffer(4)]],
-        device const uint *visible_tokens [[buffer(5)]],
-        device float *out [[buffer(6)]],
-        uint2 group [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]]) {
-    const uint query = group.x;
-    const uint head = group.y;
-    if (query >= args.queries || head >= args.query_heads) return;
-    const uint visible = min(visible_tokens[query], args.cache_cap);
-    const uint kv_head = head / (args.query_heads / args.kv_heads);
-    const ulong qbase =
-        ((ulong)query * args.query_heads + head) * args.head_dim;
-    float qv[8];
-    float acc[8];
-    for (uint i = 0; i < 8u; i++) {
-        qv[i] = q[qbase + (uint)lane + i * 32u];
-        acc[i] = 0.0f;
-    }
-    float maximum = -INFINITY;
-    float denominator = 0.0f;
-    const float scale = rsqrt((float)args.head_dim);
-    for (uint token = 0; token < visible; token++) {
-        const ulong base =
-            ((ulong)token * args.kv_heads + kv_head) * args.head_dim;
+        const float ik = rsqrt(tk / (float)E + args.eps);
+        const float ir = rsqrt(tr / (float)E + args.eps);
         float dot = 0.0f;
-        for (uint i = 0; i < 8u; i++)
-            dot = fma(qv[i], qwen4_bf16_to_f32(
-                key_cache[base + (uint)lane + i * 32u]), dot);
-        dot = simd_sum(dot) * scale;
-        const float next = max(maximum, dot);
-        const float old_scale = maximum == -INFINITY
-            ? 0.0f : exp(maximum - next);
-        const float new_scale = exp(dot - next);
-        denominator = denominator * old_scale + new_scale;
-        for (uint i = 0; i < 8u; i++) {
-            const uint d = (uint)lane + i * 32u;
-            acc[i] = acc[i] * old_scale + new_scale *
-                qwen4_bf16_to_f32(value_cache[base + d]);
-        }
-        maximum = next;
-    }
-    for (uint i = 0; i < 8u; i++) {
-        const uint d = (uint)lane + i * 32u;
-        const float value = visible == 0u ? 0.0f : acc[i] / denominator;
-        out[qbase + d] = value /
-            (1.0f + exp(-raw_gate[qbase + d]));
-    }
-}
-
-struct qwen4_qsa_score_args {
-    uint blocks;
-    uint heads;
-    uint head_dim;
-    uint valid_blocks;
-};
-
-// Exact single-query QSA block scoring: one simdgroup owns one pooled key,
-// retaining the same 32-lane FP32 reduction tree for every context length.
-kernel void kernel_qwen4_qsa_score_m1_f32(
-        constant qwen4_qsa_score_args &args [[buffer(0)]],
-        device const float            *q [[buffer(1)]],
-        device const float            *pooled_k [[buffer(2)]],
-        device float                  *scores [[buffer(3)]],
-        uint tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint block = tgp * (uint)nsg + sg;
-    if (block >= args.blocks) return;
-    float score = 0.0f;
-    for (uint h = 0; h < args.heads; h++) {
-        float dot_value = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            dot_value = fma(q[(ulong)h * args.head_dim + d],
-                            pooled_k[(ulong)block * args.head_dim + d],
-                            dot_value);
-        }
-        dot_value = simd_sum(dot_value);
-        if (lane == 0u) score += max(dot_value, 0.0f);
-    }
-    if (lane == 0u) {
-        scores[block] = block < args.valid_blocks
-            ? score * rsqrt((float)args.head_dim)
-            : -INFINITY;
-    }
-}
-
-// Low-precision cache variants retain FP32 products and the identical
-// lane/reduction order used by the F32 reference specialization.
-kernel void kernel_qwen4_qsa_score_m1_f16(
-        constant qwen4_qsa_score_args &args [[buffer(0)]],
-        device const half             *q [[buffer(1)]],
-        device const half             *pooled_k [[buffer(2)]],
-        device float                  *scores [[buffer(3)]],
-        uint tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint block = tgp * (uint)nsg + sg;
-    if (block >= args.blocks) return;
-    float score = 0.0f;
-    for (uint h = 0; h < args.heads; h++) {
-        float dot_value = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            dot_value = fma((float)q[(ulong)h * args.head_dim + d],
-                            (float)pooled_k[(ulong)block * args.head_dim + d],
-                            dot_value);
-        }
-        dot_value = simd_sum(dot_value);
-        if (lane == 0u) score += max(dot_value, 0.0f);
-    }
-    if (lane == 0u) {
-        scores[block] = block < args.valid_blocks
-            ? score * rsqrt((float)args.head_dim)
-            : -INFINITY;
-    }
-}
-
-kernel void kernel_qwen4_qsa_score_m1_bf16(
-        constant qwen4_qsa_score_args &args [[buffer(0)]],
-        device const ushort           *q [[buffer(1)]],
-        device const ushort           *pooled_k [[buffer(2)]],
-        device float                  *scores [[buffer(3)]],
-        uint tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint block = tgp * (uint)nsg + sg;
-    if (block >= args.blocks) return;
-    float score = 0.0f;
-    for (uint h = 0; h < args.heads; h++) {
-        float dot_value = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            dot_value = fma(qwen4_bf16_to_f32(
-                                q[(ulong)h * args.head_dim + d]),
-                            qwen4_bf16_to_f32(
-                                pooled_k[(ulong)block * args.head_dim + d]),
-                            dot_value);
-        }
-        dot_value = simd_sum(dot_value);
-        if (lane == 0u) score += max(dot_value, 0.0f);
-    }
-    if (lane == 0u) {
-        scores[block] = block < args.valid_blocks
-            ? score * rsqrt((float)args.head_dim)
-            : -INFINITY;
-    }
-}
-
-kernel void kernel_qwen4_qsa_score_m1_f32_bf16(
-        constant qwen4_qsa_score_args &args [[buffer(0)]],
-        device const float            *q [[buffer(1)]],
-        device const ushort           *pooled_k [[buffer(2)]],
-        device float                  *scores [[buffer(3)]],
-        uint tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint block = tgp * (uint)nsg + sg;
-    if (block >= args.blocks) return;
-    float score = 0.0f;
-    for (uint h = 0; h < args.heads; h++) {
-        float dot_value = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u)
-            dot_value = fma(q[(ulong)h * args.head_dim + d],
-                            qwen4_bf16_to_f32(
-                                pooled_k[(ulong)block * args.head_dim + d]),
-                            dot_value);
-        dot_value = simd_sum(dot_value);
-        if (lane == 0u) score += max(dot_value, 0.0f);
-    }
-    if (lane == 0u) {
-        scores[block] = block < args.valid_blocks
-            ? score * rsqrt((float)args.head_dim)
-            : -INFINITY;
-    }
-}
-
-struct qwen4_qsa_tile_args {
-    uint queries;
-    uint blocks;
-    uint block_start;
-    uint tile_blocks;
-    uint heads;
-    uint head_dim;
-    uint top_k;
-};
-
-// Score one pooled-key tile.  The controller folds it into a persistent
-// per-query heap immediately, bounding scratch to queries * tile_blocks.
-// visible_blocks carries causal lengths as runtime data, replacing a full
-// [queries, context] boolean mask.
-kernel void kernel_qwen4_qsa_score_tile_f32(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device const float           *q [[buffer(1)]],
-        device const float           *pooled_k [[buffer(2)]],
-        device const uint            *visible_blocks [[buffer(3)]],
-        device float                 *tile_scores [[buffer(4)]],
-        uint2 tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint local_block = tgp.x * (uint)nsg + sg;
-    const uint query = tgp.y;
-    if (query >= args.queries || local_block >= args.tile_blocks) return;
-    const uint block = args.block_start + local_block;
-    float score = 0.0f;
-    if (block < args.blocks && block < visible_blocks[query]) {
-        for (uint h = 0; h < args.heads; ++h) {
-            float dot = 0.0f;
-            const ulong qbase = ((ulong)query * args.heads + h) * args.head_dim;
-            const ulong kbase = (ulong)block * args.head_dim;
-            for (uint d = lane; d < args.head_dim; d += 32u)
-                dot = fma(q[qbase + d], pooled_k[kbase + d], dot);
-            dot = simd_sum(dot);
-            if (lane == 0u) score += max(dot, 0.0f);
-        }
-        if (lane == 0u) score *= rsqrt((float)args.head_dim);
-    } else if (lane == 0u) {
-        score = -INFINITY;
-    }
-    if (lane == 0u)
-        tile_scores[(ulong)query * args.tile_blocks + local_block] = score;
-}
-
-kernel void kernel_qwen4_qsa_score_tile_bf16(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device const float           *q [[buffer(1)]],
-        device const ushort          *pooled_k [[buffer(2)]],
-        device const uint            *visible_blocks [[buffer(3)]],
-        device float                 *tile_scores [[buffer(4)]],
-        uint2 tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    const uint local_block = tgp.x * (uint)nsg + sg;
-    const uint query = tgp.y;
-    if (query >= args.queries || local_block >= args.tile_blocks) return;
-    const uint block = args.block_start + local_block;
-    float score = 0.0f;
-    if (block < args.blocks && block < visible_blocks[query]) {
-        for (uint h = 0; h < args.heads; ++h) {
-            float dot = 0.0f;
-            const ulong qbase = ((ulong)query * args.heads + h) * args.head_dim;
-            const ulong kbase = (ulong)block * args.head_dim;
-            for (uint d = lane; d < args.head_dim; d += 32u)
-                dot = fma(q[qbase + d],
-                          qwen4_bf16_to_f32(pooled_k[kbase + d]), dot);
-            dot = simd_sum(dot);
-            if (lane == 0u) score += max(dot, 0.0f);
-        }
-        if (lane == 0u) score *= rsqrt((float)args.head_dim);
-    } else if (lane == 0u) {
-        score = -INFINITY;
-    }
-    if (lane == 0u)
-        tile_scores[(ulong)query * args.tile_blocks + local_block] = score;
-}
-
-/* Long-context restaging of the BF16 tile scorer.  The original grid gives
- * every four-block threadgroup its own full re-read of the query's index
- * vectors (2 KB of q per 1 KB of pooled keys), which at tens of thousands
- * of visible blocks makes q re-reads the dominant L2 traffic.  This
- * variant loads the query vectors into registers once per threadgroup and
- * scans eight blocks per simdgroup, keeping each (query, block) score's
- * lane arithmetic — fma chain order, simdgroup reduction, head max/sum,
- * rsqrt scaling, causal masking, and output placement — bit-identical to
- * kernel_qwen4_qsa_score_tile_bf16, so the selection and every downstream
- * consumer are unchanged. */
-kernel void kernel_qwen4_qsa_score_tile_batch_bf16(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device const float           *q [[buffer(1)]],
-        device const ushort          *pooled_k [[buffer(2)]],
-        device const uint            *visible_blocks [[buffer(3)]],
-        device float                 *tile_scores [[buffer(4)]],
-        uint2 tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
-    constexpr uint BLOCKS_PER_SIMDGROUP = 8u;
-    const uint group_blocks = (uint)nsg * BLOCKS_PER_SIMDGROUP;
-    const uint local_base = tgp.x * group_blocks;
-    const uint query = tgp.y;
-    if (query >= args.queries) return;
-    const uint visible = visible_blocks[query];
-
-    /* Per lane: q[head][lane + j*32] for j = 0..3 — exactly the lanes'
-    * strided slice of the original d-loop. */
-    float qv[4][4];
-    for (uint h = 0; h < 4u; ++h) {
-        const ulong qbase = ((ulong)query * args.heads + h) * args.head_dim;
-        for (uint j = 0; j < 4u; ++j)
-            qv[h][j] = q[qbase + j * 32u + lane];
-    }
-
-    for (uint b = 0; b < BLOCKS_PER_SIMDGROUP; ++b) {
-        const uint local_block = local_base + (uint)sg *
-            BLOCKS_PER_SIMDGROUP + b;
-        float score = 0.0f;
-        if (local_block < args.tile_blocks) {
-            const uint block = args.block_start + local_block;
-            if (block < args.blocks && block < visible) {
-                const ulong kbase = (ulong)block * args.head_dim;
-                for (uint h = 0; h < 4u; ++h) {
-                    float dot = 0.0f;
-                    dot = fma(qv[h][0], qwen4_bf16_to_f32(
-                                  pooled_k[kbase + lane]), dot);
-                    dot = fma(qv[h][1], qwen4_bf16_to_f32(
-                                  pooled_k[kbase + 32u + lane]), dot);
-                    dot = fma(qv[h][2], qwen4_bf16_to_f32(
-                                  pooled_k[kbase + 64u + lane]), dot);
-                    dot = fma(qv[h][3], qwen4_bf16_to_f32(
-                                  pooled_k[kbase + 96u + lane]), dot);
-                    dot = simd_sum(dot);
-                    if (lane == 0u) score += max(dot, 0.0f);
-                }
-                if (lane == 0u) score *= rsqrt((float)args.head_dim);
-            } else if (lane == 0u) {
-                score = -INFINITY;
-            }
-            if (lane == 0u)
-                tile_scores[(ulong)query * args.tile_blocks + local_block] =
-                    score;
-        }
-    }
-}
-
-/* Tensor-core restaging of the BF16 tile scorer (drift-gated, NOT
- * byte-exact): the four index heads of one query fold into the rows of a
- * single GEMM A[queries*4, 128] @ B^T[128, tile_blocks] where B is the
- * shared pooled-key row of each block.  F32 query vectors and the BF16
- * pooled keys are staged to F16 threadgroup tiles exactly once (the
- * kernel_mul_mm operand-rounding policy) and the products accumulate in
- * F32 on the simdgroup matrix units.  Each 128-thread threadgroup owns a
- * 64x64 output tile (16 queries x 64 blocks); A and B^T are staged one
- * 64-wide K-chunk at a time into 16 KB of threadgroup memory (occupancy
- * is the lever — 32 KB variants measured 1.6x slower), four simdgroups
- * each compute a 32x32 subtile through 16 accumulator fragments, and the
- * results pass through a C tile overlaid on the dead staging region
- * (fragment element ownership is never indexed directly) into a
- * cooperative epilogue that reduces every query's four head rows with
- * the production max/sum/rsqrt arithmetic and causal masking.  Score
- * values differ from the scalar kernels only by the F16 operand
- * rounding; the selection order can flip at rounding-scale score ties. */
-kernel void kernel_qwen4_qsa_score_tile_mm_bf16(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device const float           *q [[buffer(1)]],
-        device const ushort          *pooled_k [[buffer(2)]],
-        device const uint            *visible_blocks [[buffer(3)]],
-        device float                 *tile_scores [[buffer(4)]],
-        threadgroup uchar            *scratch [[threadgroup(0)]],
-        uint2 tgp [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint BM = 64u;   /* 16 queries x 4 head rows */
-    constexpr uint BN = 64u;
-    constexpr uint K = 128u;
-    constexpr uint BK = 64u;
-    constexpr uint TPT = 128u;
-
-    /* One K-chunk of A and B^T is staged at a time (8 KB + 8 KB); the C
-     * tile overlays the dead staging region after the MMA loop. */
-    threadgroup half *sa = (threadgroup half *)scratch;       /* BM x BK */
-    threadgroup half *sb = sa + BM * BK;                      /* BK x BN, K-major */
-    threadgroup float *ctile = (threadgroup float *)sa;
-
-    const uint m0 = tgp.x * BM;
-    const uint n0 = tgp.y * BN;
-    const uint tid = (uint)sg * 32u + (uint)lane;
-    const uint rows = args.queries * 4u;
-
-    simdgroup_half8x8 ma[BM / 16u];
-    simdgroup_half8x8 mb[BN / 16u];
-    simdgroup_float8x8 mc[(BM / 16u) * (BN / 16u)];
-    for (uint i = 0u; i < (BM / 16u) * (BN / 16u); i++)
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
-    const uint m_half = ((uint)sg & 1u) * (BM / 2u);
-    const uint n_half = ((uint)sg >> 1) * (BN / 2u);
-    for (uint chunk = 0u; chunk < K / BK; chunk++) {
-        for (uint i = tid; i < BM * (BK / 4u); i += TPT) {
-            const uint row = i / (BK / 4u);
-            const uint c4 = i % (BK / 4u);
-            float4 v = 0.0f;
-            if (m0 + row < rows)
-                v = *((device const float4 *)q +
-                      (ulong)(m0 + row) * (K / 4u) + chunk * (BK / 4u) + c4);
-            *(threadgroup half4 *)(sa + row * BK + c4 * 4u) = (half4)v;
-        }
-        for (uint i = tid; i < BN * (BK / 8u); i += TPT) {
-            const uint n = i / (BK / 8u);
-            const uint k8 = i % (BK / 8u);
-            const uint block = args.block_start + n0 + n;
-            uint4 raw = 0u;
-            if (n0 + n < args.tile_blocks && block < args.blocks)
-                raw = *((device const uint4 *)pooled_k +
-                        (ulong)block * (K / 8u) +
-                        chunk * (BK / 8u) + k8);
-            thread const ushort *el = (thread const ushort *)&raw;
-            for (uint e = 0u; e < 8u; e++)
-                sb[(k8 * 8u + e) * BN + n] =
-                    half(qwen4_bf16_to_f32(el[e]));
-        }
+        for (uint i = tid; i < E; i += nth) dot += (kr[i] * ik * gk[i]) * (rr[i] * ir * gq[i]);
+        dot = simd_sum(dot);
+        if (tiisg == 0) red[2][sgitg] = dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0u; kk < BK; kk += 8u) {
-            simdgroup_barrier(mem_flags::mem_none);
-            for (uint i = 0u; i < BM / 16u; i++)
-                simdgroup_load(ma[i], sa + (m_half + i * 8u) * BK + kk,
-                               BK, 0, false);
-            for (uint j = 0u; j < BN / 16u; j++)
-                simdgroup_load(mb[j], sb + kk * BN + n_half + j * 8u,
-                               BN, 0, false);
-            simdgroup_barrier(mem_flags::mem_none);
-            for (uint i = 0u; i < BM / 16u; i++)
-                for (uint j = 0u; j < BN / 16u; j++)
-                    simdgroup_multiply_accumulate(mc[j * (BM / 16u) + i],
-                                                  ma[i], mb[j],
-                                                  mc[j * (BM / 16u) + i]);
-        }
+        float td = 0.0f;
+        for (uint g = 0; g < nsg; g++) td += red[2][g];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint j = 0u; j < BN / 16u; j++)
-        for (uint i = 0u; i < BM / 16u; i++)
-            simdgroup_store(mc[j * (BM / 16u) + i],
-                            ctile + (m_half + i * 8u) * BN + n_half + j * 8u,
-                            BN, 0, false);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        float gsc = td * rsqrt((float)E);
+        const float mag = sqrt(max(fabs(gsc), 1e-6f));
+        gsc = qwen4_sigmoid(gsc > 0.0f ? mag : (gsc < 0.0f ? -mag : 0.0f));
 
-    const float scale = rsqrt((float)args.head_dim);
-    for (uint o = tid; o < (BM / 4u) * BN; o += TPT) {
-        const uint q_local = o / BN;
-        const uint n = o % BN;
-        const uint query = tgp.x * (BM / 4u) + q_local;
-        if (query >= args.queries || n0 + n >= args.tile_blocks) continue;
-        const uint block = args.block_start + n0 + n;
-        float score = 0.0f;
-        for (uint h = 0u; h < 4u; h++)
-            score += max(ctile[(q_local * 4u + h) * BN + n], 0.0f);
-        score *= scale;
-        tile_scores[(ulong)query * args.tile_blocks + n0 + n] =
-            (block < args.blocks && block < visible_blocks[query])
-                ? score
-                : -INFINITY;
-    }
-}
-
-static inline bool qwen4_qsa_worse(float as, uint ai, float bs, uint bi) {
-    return as < bs || (as == bs && ai > bi);
-}
-
-static inline void qwen4_qsa_heap_down(
-        device float *scores,
-        device uint *indices,
-        uint count,
-        uint root) {
-    while (true) {
-        const uint left = root * 2u + 1u;
-        if (left >= count) return;
-        uint worse = left;
-        const uint right = left + 1u;
-        if (right < count &&
-            qwen4_qsa_worse(scores[right], indices[right],
-                            scores[left], indices[left])) worse = right;
-        if (!qwen4_qsa_worse(scores[worse], indices[worse],
-                             scores[root], indices[root])) return;
-        const float ts = scores[root];
-        const uint ti = indices[root];
-        scores[root] = scores[worse];
-        indices[root] = indices[worse];
-        scores[worse] = ts;
-        indices[worse] = ti;
-        root = worse;
-    }
-}
-
-kernel void kernel_qwen4_qsa_heap_init_f32(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device float                 *heap_scores [[buffer(1)]],
-        device uint                  *heap_indices [[buffer(2)]],
-        device uint                  *heap_counts [[buffer(3)]],
-        uint gid [[thread_position_in_grid]]) {
-    const ulong total = (ulong)args.queries * args.top_k;
-    if ((ulong)gid < total) {
-        heap_scores[gid] = -INFINITY;
-        heap_indices[gid] = 0xffffffffu;
-    }
-    if (gid < args.queries) heap_counts[gid] = 0u;
-}
-
-// Dot products above are parallel; only the compact top-k structure is
-// serialized per query.  A min-heap makes each candidate O(log(top_k)).
-kernel void kernel_qwen4_qsa_heap_merge_f32(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device const float           *tile_scores [[buffer(1)]],
-        device float                 *heap_scores [[buffer(2)]],
-        device uint                  *heap_indices [[buffer(3)]],
-        device uint                  *heap_counts [[buffer(4)]],
-        uint query [[thread_position_in_grid]]) {
-    if (query >= args.queries) return;
-    device float *hs = heap_scores + (ulong)query * args.top_k;
-    device uint *hi = heap_indices + (ulong)query * args.top_k;
-    uint count = heap_counts[query];
-    for (uint i = 0; i < args.tile_blocks; ++i) {
-        const float score = tile_scores[(ulong)query * args.tile_blocks + i];
-        if (!isfinite(score)) continue;
-        const uint index = args.block_start + i;
-        if (count < args.top_k) {
-            uint child = count++;
-            hs[child] = score;
-            hi[child] = index;
-            while (child != 0u) {
-                const uint parent = (child - 1u) / 2u;
-                if (!qwen4_qsa_worse(hs[child], hi[child], hs[parent], hi[parent])) break;
-                const float ts = hs[parent];
-                const uint ti = hi[parent];
-                hs[parent] = hs[child]; hi[parent] = hi[child];
-                hs[child] = ts; hi[child] = ti;
-                child = parent;
-            }
-        } else if (!qwen4_qsa_worse(score, index, hs[0], hi[0]) &&
-                   !(score == hs[0] && index == hi[0])) {
-            hs[0] = score;
-            hi[0] = index;
-            qwen4_qsa_heap_down(hs, hi, count, 0u);
+        device float *gd = gated + ((uint64_t)tok * args.n_hc + s) * E;
+        device const float *val = value + (uint64_t)tok * E;
+        float sg = 0.0f;
+        for (uint i = tid; i < E; i += nth) {
+            const float v = gsc * val[i];
+            gd[i] = v;
+            sg += v * v;
         }
-    }
-    heap_counts[query] = count;
-}
-
-// In-place heap sort leaves score/index pairs in descending score order with
-// ascending block index as the deterministic tie break.
-kernel void kernel_qwen4_qsa_heap_sort_f32(
-        constant qwen4_qsa_tile_args &args [[buffer(0)]],
-        device float                 *heap_scores [[buffer(1)]],
-        device uint                  *heap_indices [[buffer(2)]],
-        device const uint            *heap_counts [[buffer(3)]],
-        uint query [[thread_position_in_grid]]) {
-    if (query >= args.queries) return;
-    device float *hs = heap_scores + (ulong)query * args.top_k;
-    device uint *hi = heap_indices + (ulong)query * args.top_k;
-    const uint count = heap_counts[query];
-    for (uint end = count; end > 1u; --end) {
-        const float ts = hs[0];
-        const uint ti = hi[0];
-        hs[0] = hs[end - 1u]; hi[0] = hi[end - 1u];
-        hs[end - 1u] = ts; hi[end - 1u] = ti;
-        qwen4_qsa_heap_down(hs, hi, end - 1u, 0u);
+        sg = simd_sum(sg);
+        if (tiisg == 0) red[0][sgitg] = sg;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tg = 0.0f;
+        for (uint g = 0; g < nsg; g++) tg += red[0][g];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float ig = rsqrt(tg / (float)E + args.eps);
+        device float *nd = normed + ((uint64_t)tok * args.n_hc + s) * E;
+        device const float *gc = g_conv + s * E;
+        for (uint i = tid; i < E; i += nth) nd[i] = gd[i] * ig * gc[i];
     }
 }
 
-struct qwen4_qsa_bitonic_args {
-    uint src_entries;      /* scores/indices readable in the source */
-    uint keep;             /* entries each chunk forwards (== top_k) */
-    uint final_pass;       /* write the ordered output and count instead */
-    uint src_implicit_index; /* level 0 derives the index from position */
+struct ds4_metal_args_qwen4_ple_conv {
+    uint32_t n_tokens;
+    uint32_t n_channels;
+    uint32_t conv_kernel;
+    uint32_t dilation;
+    uint32_t weight_f16;   /* taps stored as half */
+    uint32_t snap_tok;     /* copy the history after this token into snap_history */
+    uint32_t pad1;
+    uint32_t pad2;
 };
 
-struct qwen4_qsa_bitonic_stream_args {
-    uint tile_blocks;   /* blocks scored into this tile */
-    uint block_start;   /* absolute index of tile block zero */
-    uint keep;          /* running candidate width (== top_k) */
-    uint first_tile;    /* candidate slots start empty */
-};
-
-/* Streaming companion of the bitonic M=1 top-k for multi-query batches (the
- * verifier rows and prefill microtiles).  Each query owns one threadgroup
- * that merges its running top-k candidates with the freshly scored tile and
- * re-sorts, replacing the one-thread-per-query heap sift over every tile.
- * Candidates stay ordered after every invocation, so the last pass has
- * already produced the ordered output; the comparator and tie-breaks match
- * the heap path exactly. */
-kernel void kernel_qwen4_qsa_bitonic_stream_f32(
-        constant qwen4_qsa_bitonic_stream_args &args [[buffer(0)]],
-        device const float *tile_scores [[buffer(1)]],
-        device float       *cand_scores [[buffer(2)]],
-        device uint        *cand_indices [[buffer(3)]],
-        device uint        *counts [[buffer(4)]],
-        threadgroup float  *tscores [[threadgroup(0)]],
-        threadgroup uint   *tindices [[threadgroup(1)]],
-        uint tgp [[threadgroup_position_in_grid]],
+/* R += gated + silu(dilated depthwise conv of normed).  history holds the
+ * (K-1)*dilation previous normed rows oldest first and is advanced.  One
+ * thread per channel, tokens sequential. */
+kernel void kernel_qwen4_ple_conv(
+        constant ds4_metal_args_qwen4_ple_conv & args,
+        device float       *R,          /* [T][C] */
+        device const float *gated,      /* [T][C] */
+        device const float *normed,     /* [T][C] */
+        device float       *history,    /* [(K-1)*dil][C] */
+        device const char  *weight,     /* [C][K] taps, f32 or f16 */
+        device float       *snap_history,
+        uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
-        ushort nthreads [[threads_per_threadgroup]]) {
-    constexpr uint CHUNK = 2048u;
-    for (uint i = tid; i < CHUNK; i += (uint)nthreads) {
-        float score;
-        uint index;
-        if (i < args.keep) {
-            if (args.first_tile) {
-                score = -INFINITY;
-                index = 0xFFFFFFFFu;
-            } else {
-                score = cand_scores[(ulong)tgp * args.keep + i];
-                index = cand_indices[(ulong)tgp * args.keep + i];
-            }
-        } else if (i < args.keep + args.tile_blocks) {
-            const uint t = i - args.keep;
-            score = tile_scores[(ulong)tgp * args.tile_blocks + t];
-            index = args.block_start + t;
-        } else {
-            score = -INFINITY;
-            index = 0xFFFFFFFFu;
-        }
-        tscores[i] = score;
-        tindices[i] = index;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint size = 2u; size <= CHUNK; size <<= 1u) {
-        for (uint stride = size >> 1; stride > 0u; stride >>= 1u) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint k = tid; k < CHUNK; k += (uint)nthreads) {
-                const uint j = k ^ stride;
-                if (j <= k) continue;
-                const bool ascending = (k & size) == 0u;
-                if (ascending
-                        ? qwen4_qsa_worse(tscores[k], tindices[k],
-                                          tscores[j], tindices[j])
-                        : qwen4_qsa_worse(tscores[j], tindices[j],
-                                          tscores[k], tindices[k])) {
-                    const float score = tscores[k];
-                    const uint index = tindices[k];
-                    tscores[k] = tscores[j];
-                    tindices[k] = tindices[j];
-                    tscores[j] = score;
-                    tindices[j] = index;
-                }
-            }
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint c = tgpig.x * ntg.x + tid;
+    if (c >= args.n_channels) return;
+    const uint C = args.n_channels;
+    const uint K = args.conv_kernel;
+    const uint dil = args.dilation;
+    const uint H = (K - 1) * dil;   /* <= 9 */
+
+    float hist[9];
+    for (uint t = 0; t < H; t++) hist[t] = history[t * C + c];
+    float taps[4];
+    for (uint t = 0; t < K; t++) taps[t] = (args.weight_f16 ? (float)((device const half *)weight)[c * K + t] : ((device const float *)weight)[c * K + t]);
+
+    for (uint tok = 0; tok < args.n_tokens; tok++) {
+        const float cur = normed[tok * C + c];
+        float acc = taps[K - 1] * cur;
+        for (uint k = 0; k + 1 < K; k++) acc += taps[k] * hist[H - (K - 1 - k) * dil];
+        for (uint t = 0; t + 1 < H; t++) hist[t] = hist[t + 1];
+        hist[H - 1] = cur;
+        R[tok * C + c] += gated[tok * C + c] + qwen4_silu(acc);
+        if (tok == args.snap_tok) {
+            for (uint t = 0; t < H; t++) snap_history[t * C + c] = hist[t];
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < args.keep; i += (uint)nthreads) {
-        cand_scores[(ulong)tgp * args.keep + i] = tscores[i];
-        cand_indices[(ulong)tgp * args.keep + i] = tindices[i];
-    }
-    threadgroup uint finite_count[1];
-    if (tid == 0u) finite_count[0] = 0u;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < args.keep; i += (uint)nthreads) {
-        if (isfinite(tscores[i]))
-            atomic_fetch_add_explicit(
-                (threadgroup atomic_uint *)finite_count, 1u,
-                memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) counts[tgp] = finite_count[0];
+    for (uint t = 0; t < H; t++) history[t * C + c] = hist[t];
 }
 
-/* Threshold-filtered merge-select for the streaming top-k at the
- * production geometry (keep = 512, tile <= 1024).  The full-sort merge
- * above orders all 2048 slots on every tile; this kernel instead drops
- * every tile entry that cannot reach the final top-512 — anything worse
- * than the running 512th-best is beaten by all 512 candidates and is
- * provably out — and only then sorts, so late tiles sort a handful of
- * survivors instead of 2048 slots.  The filter is exact, block indices
- * are unique, and the comparator is qwen4_qsa_worse, so the ordered
- * output is bit-identical to kernel_qwen4_qsa_bitonic_stream_f32.
- * Tiles that arrive before the threshold exists (more survivors than
- * fit) fall back to the full 2048-wide sort in-kernel. */
-kernel void kernel_qwen4_qsa_merge_select_f32(
-        constant qwen4_qsa_bitonic_stream_args &args [[buffer(0)]],
-        device const float *tile_scores [[buffer(1)]],
-        device float       *cand_scores [[buffer(2)]],
-        device uint        *cand_indices [[buffer(3)]],
-        device uint        *counts [[buffer(4)]],
-        threadgroup float  *tscores [[threadgroup(0)]],
-        threadgroup uint   *tindices [[threadgroup(1)]],
-        threadgroup uint   *counter [[threadgroup(2)]],
-        uint tgp [[threadgroup_position_in_grid]],
+/* --- router ------------------------------------------------------------- */
+
+struct ds4_metal_args_qwen4_router {
+    uint32_t n_tokens;
+    uint32_t n_expert;
+    uint32_t n_used;
+    uint32_t gate_type;    /* shared-expert gate row type; in_dim 0 disables */
+    uint32_t in_dim;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+#define QWEN4_ROUTER_MAX_EXPERT 512
+#define QWEN4_ROUTER_MAX_USED 16
+#define QWEN4_ROUTER_LANE_MAX 2      /* experts per lane: 512 / (8 simdgroups * 32) */
+
+/* softmax over the router logits, top-k by probability (lower index wins
+ * ties), renormalized weights, plus the shared expert's gate logit (one row
+ * dotted with x).  One 256-thread threadgroup per token; every lane keeps
+ * its LANE_MAX logits in registers, each simdgroup ranks its own experts by
+ * repeated simd argmax and simdgroup 0 merges the candidates. */
+kernel void kernel_qwen4_router_topk(
+        constant ds4_metal_args_qwen4_router & args,
+        device const float *logits,     /* [T][n_expert] */
+        device int32_t     *selected,   /* [T][n_used] */
+        device float       *weights,    /* [T][n_used] */
+        device const float *x,          /* [T][in_dim] */
+        device const char  *w_gate,     /* [in_dim] shared gate row */
+        device float       *shared_gate,/* [T] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
-        ushort nthreads [[threads_per_threadgroup]]) {
-    constexpr uint CHUNK = 2048u;
-    constexpr uint KEEP = 512u;
-    const bool production = args.keep == KEEP &&
-        args.tile_blocks <= 1024u && !args.first_tile;
-    /* Load the legacy layout: sorted running candidates (empty on the
-     * first tile), then this tile's entries, then -INF padding. */
-    for (uint i = tid; i < CHUNK; i += (uint)nthreads) {
-        float score;
-        uint index;
-        if (i < args.keep) {
-            if (args.first_tile) {
-                score = -INFINITY;
-                index = 0xFFFFFFFFu;
-            } else {
-                score = cand_scores[(ulong)tgp * args.keep + i];
-                index = cand_indices[(ulong)tgp * args.keep + i];
-            }
-        } else if (i < args.keep + args.tile_blocks) {
-            const uint t = i - args.keep;
-            score = tile_scores[(ulong)tgp * args.tile_blocks + t];
-            index = args.block_start + t;
-        } else {
-            score = -INFINITY;
-            index = 0xFFFFFFFFu;
-        }
-        tscores[i] = score;
-        tindices[i] = index;
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint tok = tgpig.x;
+    if (tok >= args.n_tokens) return;
+    const uint NE = args.n_expert;
+    const uint nth = ntg.x;
+    const uint nsg = nth / 32;
+    threadgroup float redf[32];
+    threadgroup float redg[32];
+    threadgroup float cand_v[8 * QWEN4_ROUTER_MAX_USED];
+    threadgroup int cand_i[8 * QWEN4_ROUTER_MAX_USED];
+    device const float *lg = logits + (uint64_t)tok * NE;
+    /* shared gate logit: f32 rows as float4 over the whole threadgroup, other
+     * types through the generic row dot on the last simdgroup */
+    float gpart = 0.0f;
+    if (args.in_dim && args.gate_type == 0 && (args.in_dim % 4) == 0) {
+        device const float4 *w4 = (device const float4 *)w_gate;
+        device const float4 *x4 = (device const float4 *)(x + (uint64_t)tok * args.in_dim);
+        const uint n4 = args.in_dim / 4;
+        float4 acc4 = 0.0f;
+        for (uint i = tid; i < n4; i += nth) acc4 += w4[i] * x4[i];
+        gpart = acc4.x + acc4.y + acc4.z + acc4.w;
+        gpart = simd_sum(gpart);
+    } else if (args.in_dim && sgitg == nsg - 1) {
+        gpart = qwen4_row_dot(w_gate, x + (uint64_t)tok * args.in_dim, args.gate_type, args.in_dim, tiisg);
     }
-    if (tid == 0u) counter[0] = 0u;
+    if (args.in_dim && tiisg == 0) redg[sgitg] = gpart;
+
+    /* lane-owned logits: e = sgitg*32 + tiisg + 32*nsg*k */
+    float mine[QWEN4_ROUTER_LANE_MAX];
+    float mx = -3.0e38f;
+    for (uint k = 0; k < QWEN4_ROUTER_LANE_MAX; k++) {
+        const uint e = (uint)sgitg * 32 + tiisg + 32 * nsg * k;
+        mine[k] = e < NE ? lg[e] : -3.0e38f;
+        mx = max(mx, mine[k]);
+    }
+    mx = simd_max(mx);
+    if (tiisg == 0) redf[sgitg] = mx;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = redf[0];
+    for (uint g = 1; g < nsg; g++) mx = max(mx, redf[g]);
+    if (args.in_dim && tid == 0) {
+        float gl = 0.0f;
+        for (uint g = 0; g < nsg; g++) gl += redg[g];
+        shared_gate[tok] = gl;
+    }
+    float sum = 0.0f;
+    for (uint k = 0; k < QWEN4_ROUTER_LANE_MAX; k++) {
+        const uint e = (uint)sgitg * 32 + tiisg + 32 * nsg * k;
+        mine[k] = e < NE ? exp(mine[k] - mx) : -1.0f;
+        if (e < NE) sum += mine[k];
+    }
+    sum = simd_sum(sum);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) redf[sgitg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.0f;
+    for (uint g = 0; g < nsg; g++) sum += redf[g];
+    const float inv = 1.0f / sum;
+    for (uint k = 0; k < QWEN4_ROUTER_LANE_MAX; k++) if (mine[k] >= 0.0f) mine[k] *= inv;
 
-    uint survivors = CHUNK + 1u;  /* force the fallback unless proven fast */
-    if (production) {
-        /* Survivor region [KEEP, 1024) starts empty; passing tile entries
-         * compact into it in arbitrary order (the survivor sort below is
-         * independent of input order because every key is unique). */
-        for (uint i = tid; i < 512u; i += (uint)nthreads) {
-            tscores[KEEP + i] = -INFINITY;
-            tindices[KEEP + i] = 0xFFFFFFFFu;
+    /* local ranking per simdgroup */
+    for (uint r = 0; r < args.n_used; r++) {
+        float bv = -1.0f;
+        int bi = 0x7fffffff;
+        for (uint k = 0; k < QWEN4_ROUTER_LANE_MAX; k++) {
+            if (mine[k] > bv) { bv = mine[k]; bi = (int)((uint)sgitg * 32 + tiisg + 32 * nsg * k); }
+        }
+        for (uint off = 16; off > 0; off >>= 1) {
+            const float ov = simd_shuffle_xor(bv, off);
+            const int oi = simd_shuffle_xor(bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (tiisg == 0) { cand_v[sgitg * args.n_used + r] = bv; cand_i[sgitg * args.n_used + r] = bi; }
+        for (uint k = 0; k < QWEN4_ROUTER_LANE_MAX; k++) {
+            if ((int)((uint)sgitg * 32 + tiisg + 32 * nsg * k) == bi) mine[k] = -1.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_cand = nsg * args.n_used;
+        float cv[4];
+        int ci[4];
+        for (uint j = 0; j < 4; j++) {
+            const uint c = tiisg + 32 * j;
+            cv[j] = c < n_cand ? cand_v[c] : -1.0f;
+            ci[j] = c < n_cand ? cand_i[c] : 0x7fffffff;
+        }
+        float wsum = 0.0f;
+        for (uint r = 0; r < args.n_used; r++) {
+            float bv = -1.0f;
+            int bi = 0x7fffffff;
+            for (uint j = 0; j < 4; j++) {
+                if (cv[j] > bv || (cv[j] == bv && ci[j] < bi)) { bv = cv[j]; bi = ci[j]; }
+            }
+            for (uint off = 16; off > 0; off >>= 1) {
+                const float ov = simd_shuffle_xor(bv, off);
+                const int oi = simd_shuffle_xor(bi, off);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            for (uint j = 0; j < 4; j++) if (ci[j] == bi) cv[j] = -1.0f;
+            if (tiisg == 0) {
+                selected[(uint64_t)tok * args.n_used + r] = bi;
+                weights[(uint64_t)tok * args.n_used + r] = bv;
+            }
+            wsum += bv;
+        }
+        if (tiisg < args.n_used) weights[(uint64_t)tok * args.n_used + tiisg] /= wsum;
+    }
+}
+
+/* --- gated GQA attention + QSA indexer ---------------------------------- */
+
+struct ds4_metal_args_qwen4_attn_prep {
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t n_idx_head;
+    uint32_t idx_dim;
+    uint32_t pos0;
+    uint32_t cache_cap;
+    float    rope_base;
+    float    eps;
+    uint32_t pad0;
+    float    rope_mscale;      /* YaRN magnitude scale on cos/sin (1 without) */
+    float    rope_freq[32];    /* per-pair inverse frequencies (YaRN-adjusted) */
+};
+
+/* Interleaved multimodal NeoX rope: pair i takes the (t, h, w) position
+ * component i % 3.  Text tokens carry one position in all three lanes. */
+static inline void qwen4_rope_neox(thread float *x, uint n_rot, uint4 p3, constant float *freq, float mscale) {
+    const uint nh = n_rot / 2;
+    for (uint i = 0; i < nh; i++) {
+        const uint m = i % 3;
+        const uint pos = m == 0 ? p3.x : (m == 1 ? p3.y : p3.z);
+        const float theta = (float)pos * freq[i];
+        const float c = cos(theta) * mscale, s = sin(theta) * mscale;
+        const float x0 = x[i], x1 = x[i + nh];
+        x[i] = x0 * c - x1 * s;
+        x[i + nh] = x0 * s + x1 * c;
+    }
+}
+
+/* Per (token, head) simdgroup: RMSNorm + NeoX rope of one query head (from
+ * the [q|gate] interleaved projection, gate copied out raw), of one kv head
+ * (written to the f16 cache at pos0+tok) or of one indexer query head; the
+ * raw indexer key is copied to its cache.  Heads are enumerated
+ * q(0..H-1), k(H..H+Hkv-1), iq(H+Hkv..+Hi-1), ik(last). */
+kernel void kernel_qwen4_attn_prep(
+        constant ds4_metal_args_qwen4_attn_prep & args,
+        device const float *qg,        /* [T][H*2*D] */
+        device const float *kproj,     /* [T][Hkv*D] */
+        device const float *vproj,     /* [T][Hkv*D] */
+        device const float *iq,        /* [T][Hi*Di] */
+        device const float *ik,        /* [T][Di] */
+        device const float *g_q,       /* [D] */
+        device const float *g_k,       /* [D] */
+        device const float *g_iq,      /* [Di] */
+        device float       *q_out,     /* [T][H*D] */
+        device float       *gate_out,  /* [T][H*D] */
+        device half        *k_cache,   /* [cap][Hkv*D] */
+        device half        *v_cache,   /* [cap][Hkv*D] */
+        device float       *iq_out,    /* [T][Hi*Di] */
+        device float       *ik_cache,  /* [cap][Di] raw */
+        device const uint4 *pos3,      /* [cap] rope positions (t, h, w) */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint slot = tgpig.x;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    const uint H = args.n_head, Hkv = args.n_head_kv, D = args.head_dim;
+    const uint Hi = args.n_idx_head, Di = args.idx_dim;
+    const uint pos = args.pos0 + tok;
+    const uint4 p3 = pos3[pos];
+    float v[8];   /* D/32 <= 8 */
+    threadgroup float row[576];
+    float tmp[64];
+
+    if (slot < H) {
+        const uint npt = D / 32;
+        device const float *src = qg + ((uint64_t)tok * H + slot) * 2 * D;
+        float ss = 0.0f;
+        for (uint i = 0; i < npt; i++) { v[i] = src[tiisg * npt + i]; ss += v[i] * v[i]; }
+        ss = simd_sum(ss);
+        const float r = rsqrt(ss / (float)D + args.eps);
+        for (uint i = 0; i < npt; i++) v[i] = v[i] * r * g_q[tiisg * npt + i];
+        /* rope needs the pairs (i, i+n_rot/2): stage through threadgroup memory */
+        for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
+            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
+            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        device float *dq = q_out + ((uint64_t)tok * H + slot) * D;
+        device float *dg = gate_out + ((uint64_t)tok * H + slot) * D;
+        for (uint i = 0; i < npt; i++) {
+            dq[tiisg * npt + i] = row[tiisg * npt + i];
+            dg[tiisg * npt + i] = src[D + tiisg * npt + i];
+        }
+        return;
+    }
+    if (slot < H + Hkv) {
+        const uint h = slot - H;
+        const uint npt = D / 32;
+        device const float *src = kproj + ((uint64_t)tok * Hkv + h) * D;
+        device const float *vs = vproj + ((uint64_t)tok * Hkv + h) * D;
+        float ss = 0.0f;
+        for (uint i = 0; i < npt; i++) { v[i] = src[tiisg * npt + i]; ss += v[i] * v[i]; }
+        ss = simd_sum(ss);
+        const float r = rsqrt(ss / (float)D + args.eps);
+        for (uint i = 0; i < npt; i++) v[i] = v[i] * r * g_k[tiisg * npt + i];
+        for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
+            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
+            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        device half *dk = k_cache + ((uint64_t)pos * Hkv + h) * D;
+        device half *dv = v_cache + ((uint64_t)pos * Hkv + h) * D;
+        for (uint i = 0; i < npt; i++) {
+            dk[tiisg * npt + i] = (half)row[tiisg * npt + i];
+            dv[tiisg * npt + i] = (half)vs[tiisg * npt + i];
+        }
+        return;
+    }
+    if (slot < H + Hkv + Hi) {
+        const uint h = slot - H - Hkv;
+        const uint npt = Di / 32;
+        device const float *src = iq + ((uint64_t)tok * Hi + h) * Di;
+        float ss = 0.0f;
+        for (uint i = 0; i < npt; i++) { v[i] = src[tiisg * npt + i]; ss += v[i] * v[i]; }
+        ss = simd_sum(ss);
+        const float r = rsqrt(ss / (float)Di + args.eps);
+        for (uint i = 0; i < npt; i++) v[i] = v[i] * r * g_iq[tiisg * npt + i];
+        for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
+            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
+            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        device float *dq = iq_out + ((uint64_t)tok * Hi + h) * Di;
+        for (uint i = 0; i < npt; i++) dq[tiisg * npt + i] = row[tiisg * npt + i];
+        return;
+    }
+    {
+        const uint npt = Di / 32;
+        device const float *src = ik + (uint64_t)tok * Di;
+        device float *dst = ik_cache + (uint64_t)pos * Di;
+        for (uint i = 0; i < npt; i++) dst[tiisg * npt + i] = src[tiisg * npt + i];
+    }
+}
+
+struct ds4_metal_args_qwen4_idx_block {
+    uint32_t block0;      /* first block to (re)build */
+    uint32_t n_blocks;
+    uint32_t ratio;
+    uint32_t idx_dim;
+    uint32_t n_rot;
+    float    rope_base;
+    float    eps;
+    uint32_t pad0;
+    float    rope_mscale;
+    float    rope_freq[32];
+};
+
+/* Block key b: mean of its ratio raw indexer keys, RMSNorm (gamma), NeoX
+ * rope at the block's first token position.  One simdgroup per block. */
+kernel void kernel_qwen4_idx_block_key(
+        constant ds4_metal_args_qwen4_idx_block & args,
+        device const float *ik_cache,   /* [cap][Di] */
+        device const float *g_ik,       /* [Di] */
+        device const uint4 *pos3,       /* [cap] */
+        device half        *block_key,  /* [n_blocks_cap][Di] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint b = args.block0 + tgpig.x;
+    if (tgpig.x >= args.n_blocks) return;
+    const uint Di = args.idx_dim;
+    const uint npt = Di / 32;
+    float v[4];
+    float tmp[64];
+    threadgroup float row[128];
+    for (uint i = 0; i < npt; i++) {
+        float acc = 0.0f;
+        for (uint t = 0; t < args.ratio; t++) acc += ik_cache[((uint64_t)b * args.ratio + t) * Di + tiisg * npt + i];
+        v[i] = acc / (float)args.ratio;
+    }
+    float ss = 0.0f;
+    for (uint i = 0; i < npt; i++) ss += v[i] * v[i];
+    ss = simd_sum(ss);
+    const float r = rsqrt(ss / (float)Di + args.eps);
+    for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i] * r * g_ik[tiisg * npt + i];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
+        qwen4_rope_neox(tmp, args.n_rot, pos3[b * args.ratio], args.rope_freq, args.rope_mscale);
+        for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    device half *dst = block_key + (uint64_t)b * Di;
+    for (uint i = 0; i < npt; i++) dst[tiisg * npt + i] = (half)row[tiisg * npt + i];
+}
+
+struct ds4_metal_args_qwen4_idx_score {
+    uint32_t n_tokens;
+    uint32_t n_blocks;    /* scored per token: blocks < n_visible(tok) */
+    uint32_t n_idx_head;
+    uint32_t idx_dim;
+    uint32_t pos0;
+    uint32_t ratio;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+/* score[tok][b] = sum over indexer heads of relu(q_h . key_b); blocks not
+ * yet complete for the token's position score -inf.  One lane per block. */
+kernel void kernel_qwen4_idx_score(
+        constant ds4_metal_args_qwen4_idx_score & args,
+        device const float *iq,          /* [T][Hi*Di] */
+        device const half  *block_key,   /* [n_blocks][Di] */
+        device float       *score,       /* [T][n_blocks] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint b = tgpig.x * ntg.x + tid;
+    const uint tok = tgpig.y;
+    if (b >= args.n_blocks || tok >= args.n_tokens) return;
+    const uint Di = args.idx_dim;
+    const uint visible = (args.pos0 + tok + 1) / args.ratio;
+    if (b >= visible) {
+        score[(uint64_t)tok * args.n_blocks + b] = -3.0e38f;
+        return;
+    }
+    device const half *key = block_key + (uint64_t)b * Di;
+    device const float *q = iq + (uint64_t)tok * args.n_idx_head * Di;
+    float sum = 0.0f;
+    for (uint h = 0; h < args.n_idx_head; h++) {
+        float dot = 0.0f;
+        for (uint d = 0; d < Di; d++) dot += q[h * Di + d] * (float)key[d];
+        sum += max(dot, 0.0f);
+    }
+    score[(uint64_t)tok * args.n_blocks + b] = sum;
+}
+
+/* Matrix-unit block scorer for 4 heads x 128 dims: a threadgroup scores 16
+ * tokens x 64 blocks.  Per K half the 64 keys and the 64 query rows (16
+ * tokens x 4 heads, rounded to half, stored transposed) are staged so both
+ * operands load straight; each simdgroup accumulates a 32 x 32 quarter of
+ * the blocks x rows product, then the relu'd head rows are summed per
+ * token.  Same output as kernel_qwen4_idx_score. */
+kernel void kernel_qwen4_idx_score_mm(
+        constant ds4_metal_args_qwen4_idx_score & args,
+        device const float *iq,          /* [T][4*128] */
+        device const half  *block_key,   /* [n_blocks][128] */
+        device float       *score,       /* [T][n_blocks] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint b0 = tgpig.x * 64, t0 = tgpig.y * 16;
+    if (b0 >= args.n_blocks || t0 >= args.n_tokens) return;
+    threadgroup uint4 buf[1040];
+    threadgroup half *Bk = (threadgroup half *)buf;          /* [block][k half] */
+    threadgroup half *Qt = Bk + 64 * 64;                     /* [k half][row], stride 66 */
+    threadgroup float *C = (threadgroup float *)buf;         /* [row][block] after the loop */
+    const uint sb = (sgitg >> 1) * 32, sr = (sgitg & 1) * 32;
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 4; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint k0 = 0; k0 < 128; k0 += 64) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 64 * 8; i += 128) {
+            const uint blk = i >> 3, seg = i & 7, gb = b0 + blk;
+            const uint4 v = gb < args.n_blocks ? ((device const uint4 *)(block_key + (uint64_t)gb * 128 + k0))[seg] : uint4(0u);
+            ((threadgroup uint4 *)(Bk + blk * 64))[seg] = v;
+        }
+        for (uint i = tid; i < 64 * 64; i += 128) {
+            const uint kx = i >> 6, r = i & 63, tok = t0 + (r >> 2), h = r & 3;
+            Qt[kx * 66 + r] = tok < args.n_tokens ? (half)iq[(uint64_t)tok * 512 + h * 128 + k0 + kx] : (half)0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float thr_s = tscores[KEEP - 1u];
-        const uint thr_i = tindices[KEEP - 1u];
-        for (uint t = tid; t < args.tile_blocks; t += (uint)nthreads) {
-            const float s =
-                tile_scores[(ulong)tgp * args.tile_blocks + t];
-            const uint idx = args.block_start + t;
-            if (!(s < thr_s || (s == thr_s && idx > thr_i))) {
-                const uint slot = KEEP + atomic_fetch_add_explicit(
-                    (threadgroup atomic_uint *)counter, 1u,
-                    memory_order_relaxed);
-                tscores[slot] = s;
-                tindices[slot] = idx;
+        for (uint kk = 0; kk < 64; kk += 8) {
+            simdgroup_half8x8 a[4], b[4];
+            for (uint i = 0; i < 4; i++) simdgroup_load(a[i], Bk + (sb + i * 8) * 64 + kk, 64, 0, false);
+            for (uint j = 0; j < 4; j++) simdgroup_load(b[j], Qt + kk * 66 + sr + j * 8, 66, 0, false);
+            for (uint i = 0; i < 4; i++) {
+                for (uint j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) simdgroup_store(acc[i][j], C + (sr + j * 8) * 64 + sb + i * 8, 64, 0, true);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 16 * 64; i += 128) {
+        const uint lt = i >> 6, lb = i & 63, tok = t0 + lt, gb = b0 + lb;
+        if (tok >= args.n_tokens || gb >= args.n_blocks) continue;
+        const uint visible = (args.pos0 + tok + 1) / args.ratio;
+        float sum = -3.0e38f;
+        if (gb < visible) {
+            sum = 0.0f;
+            for (uint h = 0; h < 4; h++) sum += max(C[(lt * 4 + h) * 64 + lb], 0.0f);
+        }
+        score[(uint64_t)tok * args.n_blocks + gb] = sum;
+    }
+}
+
+struct ds4_metal_args_qwen4_idx_select {
+    uint32_t n_tokens;
+    uint32_t n_blocks;    /* row stride of score */
+    uint32_t top_k;
+    uint32_t pad0;
+};
+
+/* Exact top-k per token row without sorting: scores are >= 0 or -inf, so
+ * their float bits order them and a 4-pass radix select over 8-bit digits
+ * finds the k-th largest key and how many of its equals to take.  The gather
+ * then keeps every block above that key and, among equals, the lowest block
+ * indices (invisible blocks score -inf and sit above every visible one, so
+ * they never win a tie).  One threadgroup per token; blocks above the key
+ * come out in ascending block order, the equals after them. */
+kernel void kernel_qwen4_idx_select(
+        constant ds4_metal_args_qwen4_idx_select & args,
+        device const float *score,     /* [T][n_blocks] */
+        device int32_t     *sel,       /* [T][top_k] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint tok = tgpig.x;
+    if (tok >= args.n_tokens) return;
+    const uint nth = ntg.x;
+    device const float *row = score + (uint64_t)tok * args.n_blocks;
+    device int32_t *out = sel + (uint64_t)tok * args.top_k;
+    const uint n = args.n_blocks;
+    threadgroup atomic_uint hist[256];
+    threadgroup uint scan[32];
+    threadgroup uint found[2];
+    uint prefix = 0, need = args.top_k;
+    for (uint pass = 0; pass < 4; pass++) {
+        const uint shift = 24 - 8 * pass;
+        const uint mask_hi = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
+        for (uint i = tid; i < 256; i += nth) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        /* 16 loads per thread in flight before the counting */
+        for (uint b = tid; b < n; b += 16u * nth) {
+            float v[16];
+            for (uint u = 0; u < 16; u++) { const uint i = b + u * nth; v[u] = i < n ? row[i] : -1.0f; }
+            for (uint u = 0; u < 16; u++) {
+                if (b + u * nth >= n) break;
+                const uint key = as_type<uint>(max(v[u], 0.0f));
+                if ((key & mask_hi) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        survivors = counter[0];
+        /* suffix sums from the top digit down: the first 256 threads hold one
+         * digit each, higher threads contribute zeros */
+        const uint c = tid < 256 ? atomic_load_explicit(&hist[255 - tid], memory_order_relaxed) : 0u;
+        const uint p = simd_prefix_inclusive_sum(c);
+        if (tiisg == 31 && sgitg < 8) scan[sgitg] = p;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 256) {
+            uint above = p - c;                     /* elements in digits above this one */
+            for (uint g = 0; g < sgitg; g++) above += scan[g];
+            if (above < need && above + c >= need) {
+                found[0] = prefix | ((255u - tid) << shift);
+                found[1] = need - above;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = found[0]; need = found[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    /* gather: contiguous chunk per thread, ranks by exclusive scan */
+    const uint chunk = (n + nth - 1) / nth;
+    const uint b0 = min((uint)tid * chunk, n), b1 = min(b0 + chunk, n);
+    uint n_gt = 0, n_eq = 0;
+    for (uint b = b0; b < b1; b += 8) {
+        float v[8];
+        for (uint u = 0; u < 8; u++) v[u] = b + u < b1 ? row[b + u] : -1.0f;
+        for (uint u = 0; u < 8 && b + u < b1; u++) {
+            const uint key = as_type<uint>(max(v[u], 0.0f));
+            n_gt += key > prefix; n_eq += key == prefix;
+        }
+    }
+    uint r_gt, r_eq;
+    for (uint which = 0; which < 2; which++) {
+        const uint v = which == 0 ? n_gt : n_eq;
+        const uint p = simd_prefix_exclusive_sum(v);
+        if (tiisg == 31) scan[sgitg] = p + v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            const uint nsg = (nth + 31) / 32;
+            const uint sv = tiisg < nsg ? scan[tiisg] : 0u;
+            const uint sp = simd_prefix_exclusive_sum(sv);
+            if (tiisg < nsg) scan[tiisg] = sp;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (which == 0) r_gt = p + scan[sgitg]; else r_eq = p + scan[sgitg];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint eq_base = args.top_k - need;
+    for (uint b = b0; b < b1; b += 8) {
+        float v[8];
+        for (uint u = 0; u < 8; u++) v[u] = b + u < b1 ? row[b + u] : -1.0f;
+        for (uint u = 0; u < 8 && b + u < b1; u++) {
+            const uint key = as_type<uint>(max(v[u], 0.0f));
+            if (key > prefix) out[r_gt++] = (int32_t)(b + u);
+            else if (key == prefix) { if (r_eq < need) out[eq_base + r_eq] = (int32_t)(b + u); r_eq++; }
+        }
+    }
+}
+
+struct ds4_metal_args_qwen4_idx_expand {
+    uint32_t n_tokens;
+    uint32_t n_sel_blocks;   /* k_eff */
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t sel_stride;     /* row stride of sel_tokens */
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/* Selected blocks -> token list (block tokens, then the incomplete tail up
+ * to and including the query position); n_sel[tok] gets the count.  The
+ * host only routes tokens with more complete blocks than the budget here. */
+kernel void kernel_qwen4_idx_expand(
+        constant ds4_metal_args_qwen4_idx_expand & args,
+        device const int32_t *sel_blocks,   /* [T][n_sel_blocks] */
+        device int32_t       *sel_tokens,   /* [T][sel_stride] */
+        device uint32_t      *n_sel,        /* [T] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint tok = tgpig.x;
+    if (tok >= args.n_tokens) return;
+    const uint pos = args.pos0 + tok;
+    const uint n_blk = args.n_sel_blocks;
+    const uint tail_start = ((pos + 1) / args.ratio) * args.ratio;
+    device int32_t *dst = sel_tokens + (uint64_t)tok * args.sel_stride;
+    device const int32_t *blk = sel_blocks + (uint64_t)tok * n_blk;
+    for (uint i = tid; i < n_blk * args.ratio; i += ntg.x) {
+        dst[i] = blk[i / args.ratio] * (int32_t)args.ratio + (int32_t)(i % args.ratio);
+    }
+    for (uint t = tail_start + tid; t <= pos; t += ntg.x) {
+        dst[n_blk * args.ratio + (t - tail_start)] = (int32_t)t;
+    }
+    if (tid == 0) n_sel[tok] = n_blk * args.ratio + (pos + 1 - tail_start);
+}
+
+struct ds4_metal_args_qwen4_attn_decode {
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t pos0;        /* dense mode: token attends positions 0..pos0+tok */
+    uint32_t use_sel;     /* 1: read sel_tokens/n_sel */
+    uint32_t sel_stride;
+    float    scale;
+    uint32_t n_splits;    /* key ranges per (token, kv head); > 1 writes partials */
+    uint32_t keys_per_split;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+#define QWEN4_ATTN_NSG 4          /* simdgroups per threadgroup, each owning a slice of the q-head group */
+#define QWEN4_ATTN_HPS 3          /* q heads per simdgroup: group <= NSG * HPS */
+
+/* Decode attention for one (key split, kv head, token).  The simdgroups of
+ * a threadgroup share the K/V rows but own disjoint query heads, so every
+ * lane keeps at most HPS heads in registers; lane j owns dims j*NPT..+NPT-1
+ * (NPT = D/32 is a template constant so the per-lane arrays stay in
+ * registers).  With one split the gated output is written directly;
+ * otherwise each head leaves (m, l, acc) partials for the merge kernel. */
+template <uint NPT>
+kernel void kernel_qwen4_attn_decode(
+        constant ds4_metal_args_qwen4_attn_decode & args,
+        device const float   *q,          /* [T][H*D] */
+        device const float   *gate,       /* [T][H*D] */
+        device const half    *k_cache,    /* [cap][Hkv*D] */
+        device const half    *v_cache,    /* [cap][Hkv*D] */
+        device const int32_t *sel_tokens, /* [T][sel_stride] */
+        device const uint32_t *n_sel,     /* [T] */
+        device float         *out,        /* [T][H*D] */
+        device float         *part,       /* [T][Hkv][n_splits][group][2+D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint split = tgpig.x;
+    const uint kvh = tgpig.y;
+    const uint tok = tgpig.z;
+    if (split >= args.n_splits || kvh >= args.n_head_kv || tok >= args.n_tokens) return;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    constexpr uint D = NPT * 32;
+    const uint group = H / Hkv;
+    const uint hps = (group + QWEN4_ATTN_NSG - 1) / QWEN4_ATTN_NSG;
+    const uint g0 = (uint)sgitg * hps;
+    if (g0 >= group) return;
+    const uint ng = min(hps, group - g0);
+    const uint n = args.use_sel ? n_sel[tok] : args.pos0 + tok + 1;
+    const uint k0 = split * args.keys_per_split;
+    const uint k1 = min(n, k0 + args.keys_per_split);
+    device const int32_t *sel = sel_tokens + (uint64_t)tok * args.sel_stride;
+
+    float qv[QWEN4_ATTN_HPS][NPT];
+    float m[QWEN4_ATTN_HPS], l[QWEN4_ATTN_HPS], acc[QWEN4_ATTN_HPS][NPT];
+#pragma unroll
+    for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+        const uint h = kvh * group + g0 + min(g, ng - 1u);
+        device const float *qh = q + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) qv[g][i] = qh[i] * args.scale;
+        m[g] = -3.0e38f;
+        l[g] = 0.0f;
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) acc[g][i] = 0.0f;
+    }
+    for (uint idx = k0; idx < k1; idx++) {
+        const uint p = args.use_sel ? (uint)sel[idx] : idx;
+        device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+        device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+        float kv[NPT], vv[NPT];
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+#pragma unroll
+        for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+            if (g < ng) {
+                float s = 0.0f;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) s += qv[g][i] * kv[i];
+                s = simd_sum(s);
+                const float m_new = max(m[g], s);
+                const float corr = exp(m[g] - m_new);
+                const float w = exp(s - m_new);
+                l[g] = l[g] * corr + w;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) acc[g][i] = acc[g][i] * corr + w * vv[i];
+                m[g] = m_new;
+            }
+        }
+    }
+#pragma unroll
+    for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+        if (g >= ng) break;
+        const uint h = kvh * group + g0 + g;
+        if (args.n_splits == 1) {
+            device float *dst = out + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+            device const float *gt = gate + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+            const float inv = l[g] > 0.0f ? 1.0f / l[g] : 0.0f;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) dst[i] = acc[g][i] * inv * qwen4_sigmoid(gt[i]);
+        } else {
+            device float *dst = part + ((((uint64_t)tok * Hkv + kvh) * args.n_splits + split) * group + g0 + g) * (2u + D);
+            if (tiisg == 0) { dst[0] = m[g]; dst[1] = l[g]; }
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) dst[2u + tiisg * NPT + i] = acc[g][i];
+        }
+    }
+}
+
+/* Merge the split partials of one (token, head) and apply the gate. */
+template <uint NPT>
+kernel void kernel_qwen4_attn_merge(
+        constant ds4_metal_args_qwen4_attn_decode & args,
+        device const float *part,
+        device const float *gate,
+        device float       *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint tok = tgpig.y;
+    if (h >= args.n_head || tok >= args.n_tokens) return;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    constexpr uint D = NPT * 32;
+    const uint group = H / Hkv;
+    const uint kvh = h / group, g = h % group;
+    const uint64_t stride = (uint64_t)group * (2u + D);
+    device const float *base = part + (((uint64_t)tok * Hkv + kvh) * args.n_splits * group + g) * (2u + D);
+    float mm = -3.0e38f;
+    for (uint s = 0; s < args.n_splits; s++) mm = max(mm, base[s * stride]);
+    float ll = 0.0f;
+    float o[NPT];
+#pragma unroll
+    for (uint i = 0; i < NPT; i++) o[i] = 0.0f;
+    for (uint s = 0; s < args.n_splits; s++) {
+        device const float *p = base + s * stride;
+        const float c = p[1] > 0.0f ? exp(p[0] - mm) : 0.0f;
+        ll += p[1] * c;
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) o[i] += p[2u + tiisg * NPT + i] * c;
+    }
+    const float inv = ll > 0.0f ? 1.0f / ll : 0.0f;
+    device float *dst = out + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+    device const float *gt = gate + ((uint64_t)tok * H + h) * D + tiisg * NPT;
+#pragma unroll
+    for (uint i = 0; i < NPT; i++) dst[i] = o[i] * inv * qwen4_sigmoid(gt[i]);
+}
+
+#define QWEN4_ATTN_INSTANCE(NPT_) \
+template [[host_name("kernel_qwen4_attn_decode_npt" #NPT_)]] \
+kernel void kernel_qwen4_attn_decode<NPT_>(constant ds4_metal_args_qwen4_attn_decode &, device const float *, \
+        device const float *, device const half *, device const half *, device const int32_t *, device const uint32_t *, \
+        device float *, device float *, uint3, ushort, ushort); \
+template [[host_name("kernel_qwen4_attn_merge_npt" #NPT_)]] \
+kernel void kernel_qwen4_attn_merge<NPT_>(constant ds4_metal_args_qwen4_attn_decode &, device const float *, \
+        device const float *, device float *, uint3, ushort);
+QWEN4_ATTN_INSTANCE(8)
+QWEN4_ATTN_INSTANCE(4)
+QWEN4_ATTN_INSTANCE(1)
+
+#define QWEN4_AMM_KT 16
+
+/* Prefill attention on simdgroup matrices: one (kv head, token) per
+ * threadgroup, the query heads of the group as two 8-row tiles, keys in
+ * tiles of 16 staged from the selected positions (dense mode: every causal
+ * position).  Simdgroup s owns row tile s & 1 and dim half s >> 1 (16
+ * accumulators); the two simdgroups of a row tile each score one key half,
+ * exchange the scores and run the same online softmax.  Same output as
+ * kernel_qwen4_attn_decode without key splits, with the queries rounded to
+ * half. */
+kernel void kernel_qwen4_attn_mm(
+        constant ds4_metal_args_qwen4_attn_decode & args,
+        device const float   *q,          /* [T][H*D] */
+        device const float   *gate,       /* [T][H*D] */
+        device const half    *k_cache,    /* [cap][Hkv*D] */
+        device const half    *v_cache,    /* [cap][Hkv*D] */
+        device const int32_t *sel_tokens, /* [T][sel_stride] */
+        device const uint32_t *n_sel,     /* [T] */
+        device float         *out,        /* [T][H*D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint kvh = tgpig.x, tok = tgpig.y;
+    if (kvh >= args.n_head_kv || tok >= args.n_tokens) return;
+    constexpr uint D = 256;
+    const uint H = args.n_head, Hkv = args.n_head_kv, group = H / Hkv;
+    const uint qpos = args.pos0 + tok;
+    const uint n = args.use_sel ? n_sel[tok] : qpos + 1;
+    device const int32_t *sel = sel_tokens + (uint64_t)tok * args.sel_stride;
+    const uint rt = sgitg & 1u, dh = sgitg >> 1;
+    const uint lr = tiisg >> 2, lc = (tiisg & 3u) * 4;   /* this lane's row and first of four key columns */
+
+    threadgroup half KV[2 * QWEN4_AMM_KT * D];           /* keys, then values; the epilogue reuses it as floats */
+    threadgroup half *Ks = KV, *Vs = KV + QWEN4_AMM_KT * D;
+    threadgroup half Qs[16 * D];                          /* scaled queries as half */
+    threadgroup float Sx[2][2][64];                       /* [row tile][key half] scores */
+    threadgroup half  Ps[4][128];                         /* per simdgroup 8 x 16 probabilities */
+    threadgroup float Dg[4][64];                          /* per simdgroup diagonal factors */
+    threadgroup float Id[64];
+    threadgroup int   kpos[QWEN4_AMM_KT];
+
+    for (uint i = tid; i < 16 * D; i += 128) {
+        const uint r = i / D, d = i % D;
+        Qs[i] = r < group ? (half)(q[((uint64_t)tok * H + kvh * group + r) * D + d] * args.scale) : (half)0.0h;
+    }
+    if (tid < 64) Id[tid] = (tid >> 3) == (tid & 7u) ? 1.0f : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 I;
+    simdgroup_load(I, Id, 8, 0, false);
+    simdgroup_float8x8 O[16];
+#pragma unroll
+    for (uint j = 0; j < 16; j++) O[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float m_row = -3.0e38f, l_row = 0.0f;
+
+    for (uint t0 = 0; t0 < n; t0 += QWEN4_AMM_KT) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < QWEN4_AMM_KT) {
+            const uint idx = t0 + tid;
+            const int p = idx < n ? (args.use_sel ? sel[idx] : (int)idx) : -1;
+            kpos[tid] = p > (int)qpos ? -1 : p;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {   /* 16 rows of K and V, 64 bytes per thread each */
+            const uint key = tid >> 3, seg = tid & 7u;
+            const int p = kpos[key];
+            const uint64_t row = ((uint64_t)max(p, 0) * Hkv + kvh) * D;
+            device const uint4 *kr = (device const uint4 *)(k_cache + row) + seg * 4;
+            device const uint4 *vr = (device const uint4 *)(v_cache + row) + seg * 4;
+            threadgroup uint4 *kd = (threadgroup uint4 *)(Ks + key * D) + seg * 4;
+            threadgroup uint4 *vd = (threadgroup uint4 *)(Vs + key * D) + seg * 4;
+#pragma unroll
+            for (uint u = 0; u < 4; u++) { kd[u] = p >= 0 ? kr[u] : uint4(0u); vd[u] = p >= 0 ? vr[u] : uint4(0u); }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* scores of this row tile against key half dh, four independent chains */
+        simdgroup_float8x8 S[4];
+#pragma unroll
+        for (uint i = 0; i < 4; i++) S[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma unroll
+        for (uint kk = 0; kk < 8; kk++) {
+#pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_half8x8 Qt, Kt;
+                simdgroup_load(Qt, Qs + (rt * 8) * D + (kk * 4 + i) * 8, D, 0, false);
+                simdgroup_load(Kt, Ks + (dh * 8) * D + (kk * 4 + i) * 8, D, 0, true);
+                simdgroup_multiply_accumulate(S[i], Qt, Kt, S[i]);
+            }
+        }
+#pragma unroll
+        for (uint i = 1; i < 4; i++) simdgroup_multiply_accumulate(S[0], I, S[i], S[0]);
+        simdgroup_store(S[0], Sx[rt][dh], 8, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float sv[4], pv[4];
+        bool valid[4];
+        float mx = -3.0e38f;
+#pragma unroll
+        for (uint c = 0; c < 4; c++) {
+            const uint key = lc + c;
+            valid[c] = kpos[key] >= 0;
+            sv[c] = valid[c] ? Sx[rt][key >> 3][lr * 8 + (key & 7u)] : -3.0e38f;
+            mx = max(mx, sv[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float m_new = max(m_row, mx);
+        const float corr = exp(m_row - m_new);
+        float rs = 0.0f;
+#pragma unroll
+        for (uint c = 0; c < 4; c++) {
+            pv[c] = valid[c] ? exp(sv[c] - m_new) : 0.0f;
+            rs += pv[c];
+            Ps[sgitg][lr * 16 + lc + c] = (half)pv[c];
+        }
+        rs += simd_shuffle_xor(rs, 1);
+        rs += simd_shuffle_xor(rs, 2);
+        l_row = l_row * corr + rs;
+        m_row = m_new;
+        const bool rescale = simd_any(corr != 1.0f);
+        if (rescale) {
+            for (uint i = tiisg; i < 64; i += 32) Dg[sgitg][i] = (i >> 3) == (i & 7u) ? simd_shuffle(corr, (ushort)((i >> 3) * 4)) : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (rescale) {
+            simdgroup_float8x8 Dm;
+            simdgroup_load(Dm, Dg[sgitg], 8, 0, false);
+#pragma unroll
+            for (uint j = 0; j < 16; j++) { simdgroup_float8x8 t; simdgroup_multiply(t, Dm, O[j]); O[j] = t; }
+        }
+        simdgroup_half8x8 P0, P1;
+        simdgroup_load(P0, Ps[sgitg], 16, 0, false);
+        simdgroup_load(P1, Ps[sgitg] + 8, 16, 0, false);
+#pragma unroll
+        for (uint j = 0; j < 16; j++) {
+            simdgroup_half8x8 V0, V1;
+            simdgroup_load(V0, Vs + dh * 128 + j * 8, D, 0, false);
+            simdgroup_load(V1, Vs + 8 * D + dh * 128 + j * 8, D, 0, false);
+            simdgroup_multiply_accumulate(O[j], P0, V0, O[j]);
+            simdgroup_multiply_accumulate(O[j], P1, V1, O[j]);
+        }
     }
 
-    if (survivors <= 512u) {
-        /* Sort only the survivor span [KEEP, KEEP + W).  Padding beyond W
-         * stays -INF at the tail of the descending order, so the whole
-         * [KEEP, 1024) region is sorted when this finishes. */
-        uint width = 2u;
-        while (width < survivors) width <<= 1u;
-        for (uint size = 2u; size <= width; size <<= 1u) {
-            for (uint stride = size >> 1; stride > 0u; stride >>= 1u) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint k = tid; k < width; k += (uint)nthreads) {
-                    const uint j = k ^ stride;
-                    if (j <= k) continue;
-                    const uint ka = KEEP + k;
-                    const uint ja = KEEP + j;
-                    const bool ascending = (k & size) == 0u;
-                    if (ascending
-                            ? qwen4_qsa_worse(tscores[ka], tindices[ka],
-                                              tscores[ja], tindices[ja])
-                            : qwen4_qsa_worse(tscores[ja], tindices[ja],
-                                              tscores[ka], tindices[ka])) {
-                        const float ts = tscores[ka];
-                        const uint ti = tindices[ka];
-                        tscores[ka] = tscores[ja];
-                        tindices[ka] = tindices[ja];
-                        tscores[ja] = ts;
-                        tindices[ja] = ti;
-                    }
-                }
-            }
+    /* normalize, then hand the tile to the epilogue through the K/V area */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        const float inv = l_row > 0.0f ? 1.0f / l_row : 0.0f;
+        for (uint i = tiisg; i < 64; i += 32) Dg[sgitg][i] = (i >> 3) == (i & 7u) ? simd_shuffle(inv, (ushort)((i >> 3) * 4)) : 0.0f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 Dm;
+        simdgroup_load(Dm, Dg[sgitg], 8, 0, false);
+        threadgroup float *Osc = (threadgroup float *)KV + (rt * 8) * D + dh * 128;
+#pragma unroll
+        for (uint j = 0; j < 16; j++) {
+            simdgroup_float8x8 t;
+            simdgroup_multiply(t, Dm, O[j]);
+            simdgroup_store(t, Osc + j * 8, D, 0, false);
         }
-        /* [K descending][reverse of [KEEP,1024)] is one bitonic sequence:
-         * reversing puts every -INF pad at the block's front and the
-         * survivors ascending behind it.  Ten merge stages over [0,1024)
-         * then yield the fully descending order with the top 512 first.
-         * Every (k, k^stride) pair has k < 1024, so the legacy ascending
-         * term is constant here. */
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < 256u; i += (uint)nthreads) {
-            const uint a = KEEP + i;
-            const uint b = 1023u - i;
-            const float ts = tscores[a];
-            const uint ti = tindices[a];
-            tscores[a] = tscores[b];
-            tindices[a] = tindices[b];
-            tscores[b] = ts;
-            tindices[b] = ti;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 16 * D; i += 128) {
+        const uint r = i / D, d = i % D;
+        if (r >= group) continue;
+        const uint64_t o = ((uint64_t)tok * H + kvh * group + r) * D + d;
+        out[o] = ((threadgroup float *)KV)[r * D + d] * qwen4_sigmoid(gate[o]);
+    }
+}
+
+/* --- routed experts ----------------------------------------------------- */
+
+#define QWEN4_MOE_NSG 4
+#define QWEN4_MOE_NR0 2
+
+struct ds4_metal_args_qwen4_moe {
+    uint32_t n_tokens;
+    uint32_t n_slots;      /* routed slots; slot n_slots is the shared expert when has_shared */
+    uint32_t in_dim;       /* row length of the expert matrix */
+    uint32_t out_rows;     /* rows per expert */
+    uint32_t weight_type;  /* 0 f32, 1 f16, 8 q8_0, 10 q2_K, 12 q4_K, 16 iq2_xxs, 39 mxfp4 */
+    uint32_t row_bytes;
+    uint64_t expert_bytes;
+    uint32_t has_shared;
+    uint32_t shared_type;
+    uint32_t shared_row_bytes;
+    uint32_t pad0;
+};
+
+/* dot of one quantized expert row with x, lanes split as in the K3 kernels:
+ * ix = block stride, it = element pair inside the block */
+static inline float qwen4_row_dot(device const char *row, device const float *x,
+                                  uint weight_type, uint in_dim, ushort tiisg) {
+    float acc = 0.0f;
+    if (weight_type == 8) {
+        const short ix = tiisg / 8, it = tiisg % 8;
+        const uint nb = in_dim / 32;
+        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+            device const char *b = row + (uint64_t)ib * 34;
+            device const float *y = x + ib * 32 + (uint)it * 2;
+            const float d = (float)(*(device const half *)b);
+            device const char *q = b + 2 + it * 2;
+            acc += d * (y[0] * (float)q[0] + y[1] * (float)q[1] +
+                        y[16] * (float)q[16] + y[17] * (float)q[17]);
         }
-        for (uint stride = 512u; stride > 0u; stride >>= 1u) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint k = tid; k < 1024u; k += (uint)nthreads) {
-                const uint j = k ^ stride;
-                if (j <= k) continue;
-                if (qwen4_qsa_worse(tscores[k], tindices[k],
-                                    tscores[j], tindices[j])) {
-                    const float ts = tscores[k];
-                    const uint ti = tindices[k];
-                    tscores[k] = tscores[j];
-                    tindices[k] = tindices[j];
-                    tscores[j] = ts;
-                    tindices[j] = ti;
-                }
-            }
+    } else if (weight_type == 39) {
+        const short ix = tiisg / 8, it = tiisg % 8;
+        const uint nb = in_dim / 32;
+        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 17);
+            device const float *y = x + ib * 32 + (uint)it * 2;
+            const float d = ds4_metal_e8m0_to_f32(b[0]);
+            const uint q0 = b[1 + it * 2], q1 = b[2 + it * 2];
+            acc += d * (y[0] * ds4_metal_mxfp4_values[q0 & 0xfu] +
+                        y[1] * ds4_metal_mxfp4_values[q1 & 0xfu] +
+                        y[16] * ds4_metal_mxfp4_values[q0 >> 4] +
+                        y[17] * ds4_metal_mxfp4_values[q1 >> 4]);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (weight_type == 2) {
+        const short ix = tiisg / 8, it = tiisg % 8;
+        const uint nb = in_dim / 32;
+        for (uint ib = (uint)ix; ib < nb; ib += 4) {
+            device const uchar *b = (device const uchar *)(row + (uint64_t)ib * 18);
+            device const float *y = x + ib * 32 + (uint)it * 2;
+            const float d = (float)(*(device const half *)b);
+            const uint q0 = b[2 + it * 2], q1 = b[3 + it * 2];
+            acc += d * (y[0] * ((float)(q0 & 0xfu) - 8.0f) + y[1] * ((float)(q1 & 0xfu) - 8.0f) +
+                        y[16] * ((float)(q0 >> 4) - 8.0f) + y[17] * ((float)(q1 >> 4) - 8.0f));
+        }
+    } else if (weight_type == 12) {
+        /* q4_K: 256-element super-blocks (d, dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes);
+         * lane owns 8 consecutive elements of every block: group = lane/4, l = (lane%4)*8 */
+        const uint nb = in_dim / 256;
+        const uint group = tiisg / 4, l = (tiisg % 4) * 8;
+        for (uint ib = 0; ib < nb; ib++) {
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 144);
+            const float d = (float)(*(device const half *)blk);
+            const float dmin = (float)(*(device const half *)(blk + 2));
+            device const uchar *sc = blk + 4;
+            uint s, mn;
+            if (group < 4) { s = sc[group] & 63u; mn = sc[group + 4] & 63u; }
+            else { s = (sc[group + 4] & 0xFu) | ((sc[group - 4] & 0xC0u) >> 2); mn = (sc[group + 4] >> 4) | ((sc[group] & 0xC0u) >> 2); }
+            const float ds = d * (float)s, dm = dmin * (float)mn;
+            device const uchar *qs = blk + 16 + (group >> 1) * 32 + l;
+            const uint shift = (group & 1u) * 4u;
+            device const float *y = x + ib * 256 + group * 32 + l;
+            for (uint i = 0; i < 8; i++) acc += (ds * (float)((qs[i] >> shift) & 0xFu) - dm) * y[i];
+        }
+    } else if (weight_type == 10) {
+        /* q2_K: 84-byte super-blocks of 256 (16 scale/min nibble pairs, 64 packed 2-bit bytes, d, dmin);
+         * lane owns 8 consecutive elements: group = lane/2 (16 per block), l = (lane%2)*8 */
+        const uint nb = in_dim / 256;
+        const uint group = tiisg / 2, l = (tiisg % 2) * 8;
+        const uint q_base = 32u * (group / 8u) + 16u * (group & 1u), shift = ((group / 2u) & 3u) * 2u;
+        for (uint ib = 0; ib < nb; ib++) {
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 84);
+            const float d = (float)(*(device const half *)(blk + 80));
+            const float dmin = (float)(*(device const half *)(blk + 82));
+            const uint sc = blk[group];
+            const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
+            device const uchar *qs = blk + 16 + q_base + l;
+            device const float *y = x + ib * 256 + group * 16 + l;
+            for (uint i = 0; i < 8; i++) acc += (ds * (float)((qs[i] >> shift) & 3u) - dm) * y[i];
+        }
+    } else if (weight_type == 16) {
+        /* iq2_xxs: 66-byte super-blocks of 256 (d, 8 x 4 u16: 4 grid bytes + 28 sign bits + 4-bit
+         * scale per 32); lane owns one 8-value grid entry: sub-block = lane/4, entry = lane%4 */
+        const uint nb = in_dim / 256;
+        const uint ib32 = tiisg / 4, j = tiisg % 4;
+        for (uint ib = 0; ib < nb; ib++) {
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 66);
+            const float d = (float)(*(device const half *)blk);
+            device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
+            const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+            const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+            const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((aux_g >> (8 * j)) & 0xFFu));
+            const uint signs = ds4_metal_ksigns_iq2xs[(aux_s >> (7 * j)) & 127u];
+            device const float *y = x + ib * 256 + ib32 * 32 + j * 8;
+            float part = 0.0f;
+            for (uint i = 0; i < 8; i++) part += (float)grid[i] * ((signs >> i) & 1u ? -y[i] : y[i]);
+            acc += dl * part;
+        }
+    } else if (weight_type == 30) {
+        device const ushort *w = (device const ushort *)row;
+        for (uint i = tiisg * 4; i < in_dim; i += 128) {
+            acc += as_type<float>((uint)w[i] << 16) * x[i] + as_type<float>((uint)w[i + 1] << 16) * x[i + 1] +
+                   as_type<float>((uint)w[i + 2] << 16) * x[i + 2] + as_type<float>((uint)w[i + 3] << 16) * x[i + 3];
+        }
+    } else if (weight_type == 1) {
+        device const half *w = (device const half *)row;
+        for (uint i = tiisg * 4; i < in_dim; i += 128) {
+            acc += (float)w[i] * x[i] + (float)w[i + 1] * x[i + 1] + (float)w[i + 2] * x[i + 2] + (float)w[i + 3] * x[i + 3];
+        }
     } else {
-        /* Early tiles (threshold missing or too many survivors) and any
-         * non-production geometry: rebuild the legacy tile region from
-         * global memory — the fast-path compaction may have copied
-         * survivors over their own originals, so stale tail entries must
-         * not survive into the sort — then run the full 2048-wide bitonic
-         * network exactly like kernel_qwen4_qsa_bitonic_stream_f32. */
-        for (uint i = tid; i < CHUNK - args.keep; i += (uint)nthreads) {
-            float score;
-            uint index;
-            if (i < args.tile_blocks) {
-                score = tile_scores[(ulong)tgp * args.tile_blocks + i];
-                index = args.block_start + i;
-            } else {
-                score = -INFINITY;
-                index = 0xFFFFFFFFu;
-            }
-            tscores[args.keep + i] = score;
-            tindices[args.keep + i] = index;
+        device const float *w = (device const float *)row;
+        for (uint i = tiisg * 4; i < in_dim; i += 128) {
+            acc += w[i] * x[i] + w[i + 1] * x[i + 1] + w[i + 2] * x[i + 2] + w[i + 3] * x[i + 3];
         }
-        for (uint size = 2u; size <= CHUNK; size <<= 1u) {
-            for (uint stride = size >> 1; stride > 0u; stride >>= 1u) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint k = tid; k < CHUNK; k += (uint)nthreads) {
-                    const uint j = k ^ stride;
-                    if (j <= k) continue;
-                    const bool ascending = (k & size) == 0u;
-                    if (ascending
-                            ? qwen4_qsa_worse(tscores[k], tindices[k],
-                                              tscores[j], tindices[j])
-                            : qwen4_qsa_worse(tscores[j], tindices[j],
-                                              tscores[k], tindices[k])) {
-                        const float ts = tscores[k];
-                        const uint ti = tindices[k];
-                        tscores[k] = tscores[j];
-                        tindices[k] = tindices[j];
-                        tscores[j] = ts;
-                        tindices[j] = ti;
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    for (uint i = tid; i < args.keep; i += (uint)nthreads) {
-        cand_scores[(ulong)tgp * args.keep + i] = tscores[i];
-        cand_indices[(ulong)tgp * args.keep + i] = tindices[i];
-    }
-    threadgroup uint finite_count[1];
-    if (tid == 0u) finite_count[0] = 0u;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < args.keep; i += (uint)nthreads) {
-        if (isfinite(tscores[i]))
-            atomic_fetch_add_explicit(
-                (threadgroup atomic_uint *)finite_count, 1u,
-                memory_order_relaxed);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) counts[tgp] = finite_count[0];
+    return simd_sum(acc);
 }
 
+/* --- small multi-output GEMV (rows via the generic row dot) ------------- */
 
-/* Parallel ordered top-k for the single-query decode path.  The single-thread
- * heap controller above serializes roughly blocks*log(top_k) global-memory
- * sift steps on one lane; this network sorts 2048-entry chunks in threadgroup
- * memory across the whole GPU and keeps each chunk's top_k, so the global
- * top-k survives every merge level.  The comparator is exactly
- * qwen4_qsa_worse (score descending, index ascending), and block indices are
- * unique, so the ordered result matches the heap path bit for bit. */
-kernel void kernel_qwen4_qsa_bitonic_topk_f32(
-        constant qwen4_qsa_bitonic_args &args [[buffer(0)]],
-        device const float *src_scores [[buffer(1)]],
-        device const uint  *src_indices [[buffer(2)]],
-        device float       *dst_scores [[buffer(3)]],
-        device uint        *dst_indices [[buffer(4)]],
-        device uint        *out_count [[buffer(5)]],
-        threadgroup float  *tscores [[threadgroup(0)]],
-        threadgroup uint   *tindices [[threadgroup(1)]],
-        uint tgp [[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort nthreads [[threads_per_threadgroup]]) {
-    constexpr uint CHUNK = 2048u;
-    const uint base = tgp * CHUNK;
-    for (uint i = tid; i < CHUNK; i += (uint)nthreads) {
-        const uint src = base + i;
-        if (src < args.src_entries) {
-            tscores[i] = src_scores[src];
-            tindices[i] = args.src_implicit_index ? src : src_indices[src];
-        } else {
-            tscores[i] = -INFINITY;
-            tindices[i] = 0xFFFFFFFFu;
+struct ds4_metal_args_qwen4_gemv {
+    uint32_t n_tokens;
+    uint32_t in_dim;
+    uint32_t n_out;
+    uint32_t pad0;
+    uint32_t out_rows[4];
+    uint32_t types[4];
+    uint32_t row_bytes[4];
+};
+
+/* Up to four projections of the same input in one dispatch (e.g. the
+ * attention k/v/indexer-q/indexer-k rows); also the fallback for weight types
+ * the tuned dense GEMV lacks (bf16).  One simdgroup per two rows. */
+kernel void kernel_qwen4_multi_gemv(
+        constant ds4_metal_args_qwen4_gemv & args,
+        device const float *x,          /* [T][in_dim] */
+        device const char  *w0,
+        device const char  *w1,
+        device const char  *w2,
+        device const char  *w3,
+        device float       *o0,         /* [T][out_rows[i]] */
+        device float       *o1,
+        device float       *o2,
+        device float       *o3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    const uint total = args.out_rows[0] + args.out_rows[1] + args.out_rows[2] + args.out_rows[3];
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    const uint r0 = (tgpig.x * 4 + (uint)sgitg) * 2;
+    for (uint r = r0; r < r0 + 2 && r < total; r++) {
+        uint i = 0, local = r;
+        while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
+        device const char *w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;
+        device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
+        const float v = qwen4_row_dot(w + (uint64_t)local * args.row_bytes[i], xt, args.types[i], args.in_dim, tiisg);
+        if (tiisg == 0) o[(uint64_t)tok * args.out_rows[i] + local] = v;
+    }
+}
+
+/* mid[t][s][r] = silu(gate_row . x) * (up_row . x) for the selected expert;
+ * slot n_slots (when has_shared) is the shared expert from its own bases. */
+kernel void kernel_qwen4_moe_mid(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,   /* [T][n_slots] */
+        device const float   *x,          /* [T][in_dim] */
+        device float         *mid,        /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_gate,    /* shared expert gate rows */
+        device const char    *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * QWEN4_MOE_NSG + (uint)sgitg) * QWEN4_MOE_NR0;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const bool shared = slot == args.n_slots;
+    const uint type = shared ? args.shared_type : args.weight_type;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    device const char *gb = shared ? sh_gate : gate_base;
+    device const char *ub = shared ? sh_up : up_base;
+    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    for (uint r = row0; r < row0 + QWEN4_MOE_NR0 && r < args.out_rows; r++) {
+        const uint64_t off = ebase + (uint64_t)r * row_bytes;
+        const float g = qwen4_row_dot(gb + off, xt, type, args.in_dim, tiisg);
+        const float u = qwen4_row_dot(ub + off, xt, type, args.in_dim, tiisg);
+        if (tiisg == 0) {
+            mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
         }
     }
+}
+
+/* part[t][s][r] = down_row . mid[t][s]; slot n_slots is the shared expert */
+kernel void kernel_qwen4_moe_down(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,   /* [T][n_slots] */
+        device const float   *mid,        /* [T][n_slots+has_shared][in_dim] */
+        device float         *part,       /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_down,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * QWEN4_MOE_NSG + (uint)sgitg) * QWEN4_MOE_NR0;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const bool shared = slot == args.n_slots;
+    const uint type = shared ? args.shared_type : args.weight_type;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    device const char *db = shared ? sh_down : down_base;
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const float *m = mid + pair * args.in_dim;
+    for (uint r = row0; r < row0 + QWEN4_MOE_NR0 && r < args.out_rows; r++) {
+        const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, args.in_dim, tiisg);
+        if (tiisg == 0) part[pair * args.out_rows + r] = v;
+    }
+}
+
+struct ds4_metal_args_qwen4_moe_reduce {
+    uint32_t n_tokens;
+    uint32_t n_slots;
+    uint32_t dim;
+    uint32_t shared_src;    /* 0 none, 1 part slot n_slots, 2 shared buffer */
+    uint32_t n_hc;          /* > 0: also R[s][d] += 2*sigmoid(inj[s]/hc) * out[d] */
+    uint32_t part_stride;   /* slots per token in part */
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/* out = sum_s weights[s] * part[s] (+ sigmoid(shared_gate) * shared), with
+ * the hyper-connection combine folded in when n_hc is set. */
+kernel void kernel_qwen4_moe_reduce(
+        constant ds4_metal_args_qwen4_moe_reduce & args,
+        device const float *part,        /* [T][part_stride][dim] */
+        device const float *weights,     /* [T][n_slots] */
+        device const float *shared_gate, /* [T] raw logit */
+        device float       *out,         /* [T][dim] */
+        device float       *R,           /* [T][n_hc*dim] */
+        device const float *inj,         /* [T][n_hc*chunks][n_hc] norm partials */
+        device const float *shared,      /* [T][dim] when shared_src == 2 */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint d = tgpig.x * ntg.x + tid;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    threadgroup float wgt[8];
+    if (args.n_hc && tid < args.n_hc) {
+        wgt[tid] = qwen4_hc_inject_weight(inj + (uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS * args.n_hc, args.n_hc, tid);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint size = 2u; size <= CHUNK; size <<= 1u) {
-        for (uint stride = size >> 1; stride > 0u; stride >>= 1u) {
+    if (d >= args.dim) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < args.n_slots; s++) {
+        acc += weights[(uint64_t)tok * args.n_slots + s] *
+               part[((uint64_t)tok * args.part_stride + s) * args.dim + d];
+    }
+    if (args.shared_src == 1) {
+        acc += qwen4_sigmoid(shared_gate[tok]) * part[((uint64_t)tok * args.part_stride + args.n_slots) * args.dim + d];
+    } else if (args.shared_src == 2) {
+        acc += qwen4_sigmoid(shared_gate[tok]) * shared[(uint64_t)tok * args.dim + d];
+    }
+    out[(uint64_t)tok * args.dim + d] = acc;
+    if (args.n_hc) {
+        device float *r = R + (uint64_t)tok * args.dim * args.n_hc;
+        for (uint s = 0; s < args.n_hc; s++) r[s * args.dim + d] += wgt[s] * acc;
+    }
+}
+
+/* --- prefill: expert-grouped GEMMs -------------------------------------- */
+
+struct ds4_metal_args_qwen4_moe_mm {
+    uint32_t n_tokens;
+    uint32_t n_slots;
+    uint32_t n_out;        /* slots per token in the mid/part layout */
+    uint32_t in_dim;
+    uint32_t out_rows;
+    uint32_t weight_type;  /* 8 q8_0, 10 q2_K, 12 q4_K, 16 iq2_xxs, 39 mxfp4 */
+    uint32_t row_bytes;
+    uint32_t list_cap;
+    uint64_t expert_bytes;
+    uint32_t n_expert;
+    uint32_t tiles_per_launch;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+#define QWEN4_MM_ROWS 32
+#define QWEN4_MM_TOKS 8
+
+/* Per-expert (token, slot) lists from the router selection.  One threadgroup
+ * per dispatch; counts live in threadgroup memory until the end. */
+kernel void kernel_qwen4_moe_build_lists(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const int32_t *selected,   /* [T][n_slots] */
+        device int32_t       *lists,      /* [n_expert][list_cap]: t*n_slots + slot */
+        device int32_t       *counts,     /* [n_expert] */
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    threadgroup atomic_int cnt[QWEN4_ROUTER_MAX_EXPERT];
+    const uint nth = ntg.x;
+    for (uint e = tid; e < args.n_expert; e += nth) atomic_store_explicit(&cnt[e], 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n_pairs = args.n_tokens * args.n_slots;
+    for (uint p = tid; p < n_pairs; p += nth) {
+        const uint e = (uint)selected[p];
+        if (e >= args.n_expert) continue;
+        const int slot = atomic_fetch_add_explicit(&cnt[e], 1, memory_order_relaxed);
+        if ((uint)slot < args.list_cap) lists[(uint64_t)e * args.list_cap + (uint)slot] = (int32_t)p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < args.n_expert; e += nth) {
+        int c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+        counts[e] = c < (int)args.list_cap ? c : (int)args.list_cap;
+    }
+}
+
+/* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
+template <typename D>
+static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
+    if (type == 2) {
+        /* q4_0: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2 + (q & 1u) * 8;
+        const bool hi = q >= 2;
+        for (uint i = 0; i < 8; i++) {
+            const uint nib = hi ? (qs[i] >> 4) : (qs[i] & 0xFu);
+            dst[i] = (D)(d * ((float)nib - 8.0f));
+        }
+        return;
+    }
+    if (type == 12) {
+        const uint sb = b / 8, group = b % 8, l = q * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 144);
+        const float d = (float)(*(device const half *)blk);
+        const float dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar *sc = blk + 4;
+        uint s, mn;
+        if (group < 4) { s = sc[group] & 63u; mn = sc[group + 4] & 63u; }
+        else { s = (sc[group + 4] & 0xFu) | ((sc[group - 4] & 0xC0u) >> 2); mn = (sc[group + 4] >> 4) | ((sc[group] & 0xC0u) >> 2); }
+        const float ds = d * (float)s, dm = dmin * (float)mn;
+        device const uchar *qs = blk + 16 + (group >> 1) * 32 + l;
+        const uint shift = (group & 1u) * 4u;
+        for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 0xFu) - dm);
+        return;
+    }
+    if (type == 10) {
+        const uint sb = b / 8, group = (b % 8) * 2 + q / 2, l = (q % 2) * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
+        const float d = (float)(*(device const half *)(blk + 80));
+        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint sc = blk[group];
+        const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
+        device const uchar *qs = blk + 16 + 32u * (group / 8u) + 16u * (group & 1u) + l;
+        const uint shift = ((group / 2u) & 3u) * 2u;
+        for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 3u) - dm);
+        return;
+    }
+    if (type == 16) {
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 66);
+        const float d = (float)(*(device const half *)blk);
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
+        const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+        const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((aux_g >> (8 * q)) & 0xFFu));
+        const uint signs = ds4_metal_ksigns_iq2xs[(aux_s >> (7 * q)) & 127u];
+        for (uint i = 0; i < 8; i++) dst[i] = (D)(dl * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
+        return;
+    }
+    if (type == 8) {
+        device const char *blk = row + (uint64_t)b * 34;
+        const float d = (float)(*(device const half *)blk);
+        const packed_char4 q0 = *(device const packed_char4 *)(blk + 2 + q * 8);   /* 2-byte aligned */
+        const packed_char4 q1 = *(device const packed_char4 *)(blk + 6 + q * 8);
+        dst[0] = (D)(d * (float)q0.x); dst[1] = (D)(d * (float)q0.y); dst[2] = (D)(d * (float)q0.z); dst[3] = (D)(d * (float)q0.w);
+        dst[4] = (D)(d * (float)q1.x); dst[5] = (D)(d * (float)q1.y); dst[6] = (D)(d * (float)q1.z); dst[7] = (D)(d * (float)q1.w);
+    } else {
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 17);
+        const float d = ds4_metal_e8m0_to_f32(blk[0]);
+        const uint base = (q & 1u) * 8;
+        const bool hi = q >= 2;
+        for (uint i = 0; i < 8; i++) {
+            const uint byte = blk[1 + base + i];
+            dst[i] = (D)(d * ds4_metal_mxfp4_values[hi ? (byte >> 4) : (byte & 0xfu)]);
+        }
+    }
+}
+
+/* dequantize 16 consecutive values (quarters q0 and q0 + 1 of block b, q0
+ * even): the K-quant scales are unpacked once and the nibbles read as one
+ * 16-byte word; other types take two 8-value steps */
+template <typename D>
+static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uint type, threadgroup D *dst) {
+    if (type == 12) {
+        const uint sb = b / 8, group = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 144);
+        const float d = (float)(*(device const half *)blk);
+        const float dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar *sc = blk + 4;
+        uint s, mn;
+        if (group < 4) { s = sc[group] & 63u; mn = sc[group + 4] & 63u; }
+        else { s = (sc[group + 4] & 0xFu) | ((sc[group - 4] & 0xC0u) >> 2); mn = (sc[group + 4] >> 4) | ((sc[group] & 0xC0u) >> 2); }
+        const float ds = d * (float)s, dm = dmin * (float)mn;
+        const uint4 v = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
+        const uint shift = (group & 1u) * 4u;
+        for (uint i = 0; i < 16; i++) dst[i] = (D)(ds * (float)((v[i >> 2] >> (8u * (i & 3u) + shift)) & 0xFu) - dm);
+        return;
+    }
+    if (type == 10) {
+        const uint sb = b / 8, group = (b % 8) * 2 + q0 / 2;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
+        const float d = (float)(*(device const half *)(blk + 80));
+        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint sc = blk[group];
+        const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
+        device const uint *qs = (device const uint *)(blk + 16 + 32u * (group / 8u) + 16u * (group & 1u));
+        const uint shift = ((group / 2u) & 3u) * 2u;
+        for (uint i = 0; i < 16; i++) dst[i] = (D)(ds * (float)((qs[i >> 2] >> (8u * (i & 3u) + shift)) & 3u) - dm);
+        return;
+    }
+    qwen4_mm_stage8(row, b, q0, type, dst);
+    qwen4_mm_stage8(row, b, q0 + 1, type, dst + 8);
+}
+
+#define QWEN4_MM_KS 64   /* K per staging step (two 32-blocks) */
+#define QWEN4_MM_NT 4    /* 8-token tiles per staged weight tile */
+#define QWEN4_MM_TT (QWEN4_MM_TOKS * QWEN4_MM_NT)
+
+/* mid[t][slot][r] = silu(gate . x) * (up . x) for every (token, slot) routed
+ * to expert e, as 32-row x 32-token tiles: A (weights, half) and B
+ * (activations, half) are staged in threadgroup memory per 64-wide K step
+ * and multiplied with simdgroup matrices into float accumulators, so each
+ * expert row is read once per token tile. */
+kernel void kernel_qwen4_moe_mm_mid(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const float   *x,          /* [T][in_dim] */
+        device float         *mid,        /* [T][n_out][out_rows] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint rb = tgpig.x, e = tgpig.y;
+    if (e >= args.n_expert) return;
+    const uint count = (uint)counts[e];
+    threadgroup half Ag[QWEN4_MM_ROWS * QWEN4_MM_KS];
+    threadgroup half Au[QWEN4_MM_ROWS * QWEN4_MM_KS];
+    threadgroup half Bs[QWEN4_MM_KS * QWEN4_MM_TT];
+    threadgroup float Cs[4][2][64];
+    device const char *gbase = gate_base + (uint64_t)e * args.expert_bytes;
+    device const char *ubase = up_base + (uint64_t)e * args.expert_bytes;
+    device const int32_t *list = lists + (uint64_t)e * args.list_cap;
+    const uint row0 = rb * QWEN4_MM_ROWS;
+    const uint nk = args.in_dim / QWEN4_MM_KS;
+    for (uint tile = tgpig.z; tile * QWEN4_MM_TT < count; tile += args.tiles_per_launch) {
+        const uint t0 = tile * QWEN4_MM_TT;
+        const uint n_tile = min((uint)QWEN4_MM_TT, count - t0);
+        simdgroup_float8x8 Cg[QWEN4_MM_NT], Cu[QWEN4_MM_NT];
+        for (uint nt = 0; nt < QWEN4_MM_NT; nt++) {
+            Cg[nt] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            Cu[nt] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        const uint my_tok = tid % QWEN4_MM_TT;
+        const int my_pair = my_tok < n_tile ? list[t0 + my_tok] : -1;
+        const uint my_t = my_pair >= 0 ? (uint)my_pair / args.n_slots : 0;
+        for (uint kb = 0; kb < nk; kb++) {
+            /* A: 32 rows x 64 k; thread = (row, 16-wide slice) */
+            {
+                const uint r = tid / 4, q = tid % 4;   /* q: 16-value half of one of the two 32-blocks */
+                threadgroup half *dg = Ag + r * QWEN4_MM_KS + q * 16;
+                threadgroup half *du = Au + r * QWEN4_MM_KS + q * 16;
+                if (row0 + r < args.out_rows) {
+                    device const char *grow = gbase + (uint64_t)(row0 + r) * args.row_bytes;
+                    device const char *urow = ubase + (uint64_t)(row0 + r) * args.row_bytes;
+                    const uint b = kb * 2 + (q >> 1), quarter0 = (q & 1) * 2;
+                    qwen4_mm_stage16(grow, b, quarter0, args.weight_type, dg);
+                    qwen4_mm_stage16(urow, b, quarter0, args.weight_type, du);
+                } else {
+                    for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
+                }
+            }
+            /* B: 64 k x 32 tokens; thread = (token, 16 k values) */
+            {
+                const uint tok = tid % QWEN4_MM_TT, kq = tid / QWEN4_MM_TT;
+                device const float *xr = x + (uint64_t)my_t * args.in_dim + kb * QWEN4_MM_KS + kq * 16;
+                for (uint j = 0; j < 16; j += 4) {
+                    const float4 v = my_pair >= 0 ? *(device const float4 *)(xr + j) : float4(0.0f);
+                    Bs[(kq * 16 + j + 0) * QWEN4_MM_TT + tok] = (half)v.x;
+                    Bs[(kq * 16 + j + 1) * QWEN4_MM_TT + tok] = (half)v.y;
+                    Bs[(kq * 16 + j + 2) * QWEN4_MM_TT + tok] = (half)v.z;
+                    Bs[(kq * 16 + j + 3) * QWEN4_MM_TT + tok] = (half)v.w;
+                }
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint k = tid; k < CHUNK; k += (uint)nthreads) {
-                const uint j = k ^ stride;
-                if (j <= k) continue;
-                const bool ascending = (k & size) == 0u;
-                if (ascending
-                        ? qwen4_qsa_worse(tscores[k], tindices[k],
-                                          tscores[j], tindices[j])
-                        : qwen4_qsa_worse(tscores[j], tindices[j],
-                                          tscores[k], tindices[k])) {
-                    const float score = tscores[k];
-                    const uint index = tindices[k];
-                    tscores[k] = tscores[j];
-                    tindices[k] = tindices[j];
-                    tscores[j] = score;
-                    tindices[j] = index;
+            for (uint sub = 0; sub < QWEN4_MM_KS / 8; sub++) {
+                simdgroup_half8x8 ag, au, b;
+                simdgroup_load(ag, Ag + (sgitg * 8) * QWEN4_MM_KS + sub * 8, QWEN4_MM_KS, 0, false);
+                simdgroup_load(au, Au + (sgitg * 8) * QWEN4_MM_KS + sub * 8, QWEN4_MM_KS, 0, false);
+                for (uint nt = 0; nt < QWEN4_MM_NT; nt++) {
+                    simdgroup_load(b, Bs + sub * 8 * QWEN4_MM_TT + nt * 8, QWEN4_MM_TT, 0, false);
+                    simdgroup_multiply_accumulate(Cg[nt], ag, b, Cg[nt]);
+                    simdgroup_multiply_accumulate(Cu[nt], au, b, Cu[nt]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint nt = 0; nt < QWEN4_MM_NT; nt++) {
+            simdgroup_store(Cg[nt], Cs[sgitg][0], 8, 0, false);
+            simdgroup_store(Cu[nt], Cs[sgitg][1], 8, 0, false);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint idx = tid; idx < 4 * 64; idx += 128) {
+                const uint sg = idx / 64, el = idx % 64, r = el / 8, tok = nt * 8 + el % 8;
+                const uint row = row0 + sg * 8 + r;
+                if (tok >= n_tile || row >= args.out_rows) continue;
+                const int pair = list[t0 + tok];
+                const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
+                const float g = Cs[sg][0][el], u = Cs[sg][1][el];
+                mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = qwen4_silu(g) * u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+/* part[t][slot][r] = down . mid[t][slot], same tiling with mid as B */
+kernel void kernel_qwen4_moe_mm_down(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *down_base,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const float   *midv,       /* [T][n_out][in_dim] */
+        device float         *part,       /* [T][n_out][out_rows] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint rb = tgpig.x, e = tgpig.y;
+    if (e >= args.n_expert) return;
+    const uint count = (uint)counts[e];
+    threadgroup half As[QWEN4_MM_ROWS * QWEN4_MM_KS];
+    threadgroup half Bs[QWEN4_MM_KS * QWEN4_MM_TT];
+    threadgroup float Cs[4][64];
+    device const char *dbase = down_base + (uint64_t)e * args.expert_bytes;
+    device const int32_t *list = lists + (uint64_t)e * args.list_cap;
+    const uint row0 = rb * QWEN4_MM_ROWS;
+    const uint nk = args.in_dim / QWEN4_MM_KS;
+    for (uint tile = tgpig.z; tile * QWEN4_MM_TT < count; tile += args.tiles_per_launch) {
+        const uint t0 = tile * QWEN4_MM_TT;
+        const uint n_tile = min((uint)QWEN4_MM_TT, count - t0);
+        simdgroup_float8x8 C[QWEN4_MM_NT];
+        for (uint nt = 0; nt < QWEN4_MM_NT; nt++) C[nt] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        const uint my_tok = tid % QWEN4_MM_TT;
+        const int my_pair = my_tok < n_tile ? list[t0 + my_tok] : -1;
+        const uint64_t my_row = my_pair >= 0 ?
+            ((uint64_t)((uint)my_pair / args.n_slots) * args.n_out + (uint)my_pair % args.n_slots) : 0;
+        for (uint kb = 0; kb < nk; kb++) {
+            {
+                const uint r = tid / 4, q = tid % 4;
+                threadgroup half *dd = As + r * QWEN4_MM_KS + q * 16;
+                if (row0 + r < args.out_rows) {
+                    device const char *drow = dbase + (uint64_t)(row0 + r) * args.row_bytes;
+                    const uint b = kb * 2 + (q >> 1), quarter0 = (q & 1) * 2;
+                    qwen4_mm_stage16(drow, b, quarter0, args.weight_type, dd);
+                } else {
+                    for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
+                }
+            }
+            {
+                const uint tok = tid % QWEN4_MM_TT, kq = tid / QWEN4_MM_TT;
+                device const float *mr = midv + my_row * args.in_dim + kb * QWEN4_MM_KS + kq * 16;
+                for (uint j = 0; j < 16; j += 4) {
+                    const float4 v = my_pair >= 0 ? *(device const float4 *)(mr + j) : float4(0.0f);
+                    Bs[(kq * 16 + j + 0) * QWEN4_MM_TT + tok] = (half)v.x;
+                    Bs[(kq * 16 + j + 1) * QWEN4_MM_TT + tok] = (half)v.y;
+                    Bs[(kq * 16 + j + 2) * QWEN4_MM_TT + tok] = (half)v.z;
+                    Bs[(kq * 16 + j + 3) * QWEN4_MM_TT + tok] = (half)v.w;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint sub = 0; sub < QWEN4_MM_KS / 8; sub++) {
+                simdgroup_half8x8 a, b;
+                simdgroup_load(a, As + (sgitg * 8) * QWEN4_MM_KS + sub * 8, QWEN4_MM_KS, 0, false);
+                for (uint nt = 0; nt < QWEN4_MM_NT; nt++) {
+                    simdgroup_load(b, Bs + sub * 8 * QWEN4_MM_TT + nt * 8, QWEN4_MM_TT, 0, false);
+                    simdgroup_multiply_accumulate(C[nt], a, b, C[nt]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint nt = 0; nt < QWEN4_MM_NT; nt++) {
+            simdgroup_store(C[nt], Cs[sgitg], 8, 0, false);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint idx = tid; idx < 4 * 64; idx += 128) {
+                const uint sg = idx / 64, el = idx % 64, r = el / 8, tok = nt * 8 + el % 8;
+                const uint row = row0 + sg * 8 + r;
+                if (tok >= n_tile || row >= args.out_rows) continue;
+                const int pair = list[t0 + tok];
+                const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
+                part[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = Cs[sg][el];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+/* --- prefill: dense tiled GEMM for f32/f16/q8_0 weights ----------------- */
+
+struct ds4_metal_args_qwen4_dense_mm {
+    uint32_t n_tokens;
+    uint32_t in_dim;
+    uint32_t out_rows;
+    uint32_t weight_type;   /* 0 f32, 1 f16, 8 q8_0 */
+    uint32_t row_bytes;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+#define QWEN4_DM_TOKS 32
+#define QWEN4_DM_K 32
+
+/* 8 consecutive weights of row `row` starting at element k0 (k0 % 8 == 0);
+ * f32/f16 rows may end mid-tile (in_dim % 32 != 0), q8_0 rows cannot */
+static inline void qwen4_dm_stage8(device const char *row, uint k0, uint k_end, uint type, threadgroup float *dst) {
+    if (type == 8) {
+        qwen4_mm_stage8<float>(row, k0 / 32, (k0 % 32) / 8, 8u, dst);
+    } else if (type == 1) {
+        device const half *w = (device const half *)row + k0;
+        for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? (float)w[i] : 0.0f;
+    } else {
+        device const float *w = (device const float *)row + k0;
+        for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? w[i] : 0.0f;
+    }
+}
+
+/* out[t][r] = w[r] . x[t] as 32-row x 32-token tiles; weights are read once
+ * per 32 tokens.  Grid (rows/32, tokens/32), 128 threads. */
+kernel void kernel_qwen4_dense_mm(
+        constant ds4_metal_args_qwen4_dense_mm & args,
+        device const char  *w,          /* [out_rows] rows */
+        device const float *x,          /* [T][in_dim] */
+        device float       *out,        /* [T][out_rows] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = tgpig.x * QWEN4_MM_ROWS;
+    const uint t0 = tgpig.y * QWEN4_DM_TOKS;
+    if (row0 >= args.out_rows || t0 >= args.n_tokens) return;
+    threadgroup float As[QWEN4_MM_ROWS * QWEN4_DM_K];
+    threadgroup float Bs[QWEN4_DM_K * QWEN4_DM_TOKS];
+    threadgroup float Cs[4][4][64];
+    simdgroup_float8x8 C[4];
+    for (uint j = 0; j < 4; j++) C[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint nk = (args.in_dim + QWEN4_DM_K - 1) / QWEN4_DM_K;
+    for (uint kb = 0; kb < nk; kb++) {
+        {
+            const uint r = tid / 4, q = tid % 4;
+            if (row0 + r < args.out_rows) {
+                qwen4_dm_stage8(w + (uint64_t)(row0 + r) * args.row_bytes, kb * QWEN4_DM_K + q * 8, args.in_dim,
+                                args.weight_type, As + r * QWEN4_DM_K + q * 8);
+            } else {
+                for (uint i = 0; i < 8; i++) As[r * QWEN4_DM_K + q * 8 + i] = 0.0f;
+            }
+        }
+        {
+            /* B: 32 k x 32 tokens, thread = (token, 8 k values) */
+            const uint tok = tid % QWEN4_DM_TOKS, kq = tid / QWEN4_DM_TOKS;
+            const uint t = t0 + tok;
+            for (uint i = 0; i < 8; i++) {
+                const uint k = kq * 8 + i;
+                Bs[k * QWEN4_DM_TOKS + tok] = t < args.n_tokens && kb * QWEN4_DM_K + k < args.in_dim ?
+                                              x[(uint64_t)t * args.in_dim + kb * QWEN4_DM_K + k] : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint sub = 0; sub < QWEN4_DM_K / 8; sub++) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, As + (sgitg * 8) * QWEN4_DM_K + sub * 8, QWEN4_DM_K, 0, false);
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_float8x8 b;
+                simdgroup_load(b, Bs + sub * 8 * QWEN4_DM_TOKS + j * 8, QWEN4_DM_TOKS, 0, false);
+                simdgroup_multiply_accumulate(C[j], a, b, C[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = 0; j < 4; j++) simdgroup_store(C[j], Cs[sgitg][j], 8, 0, false);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < 4 * 4 * 64; idx += 128) {
+        const uint sg = idx / 256, rem = idx % 256, j = rem / 64, el = rem % 64, r = el / 8, tok = el % 8;
+        const uint row = row0 + sg * 8 + r;
+        const uint t = t0 + j * 8 + tok;
+        if (row < args.out_rows && t < args.n_tokens) out[(uint64_t)t * args.out_rows + row] = Cs[sg][j][el];
+    }
+}
+
+struct ds4_metal_args_qwen4_hc_mix_rows {
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t n_rank;
+};
+
+/* prefill hc: lo_act = silu(lo/hc) (per token, n_rank) */
+kernel void kernel_qwen4_hc_lo_act(
+        constant ds4_metal_args_qwen4_hc_mix_rows & args,
+        device const float *lo,
+        device float       *lo_act,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_tokens * args.n_rank) return;
+    lo_act[gid] = qwen4_silu(lo[gid] / (float)args.n_hc);
+}
+
+/* prefill hc: mixed[t][d] = mean_s sigmoid(u[t][s*E+d]) * xn[t][s*E+d] */
+kernel void kernel_qwen4_hc_mix_rows(
+        constant ds4_metal_args_qwen4_hc_mix_rows & args,
+        device const float *u,          /* [T][hc*E] */
+        device const float *xn,         /* [T][hc*E] */
+        device float       *mixed,      /* [T][E] */
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint d = gid.x, t = gid.y;
+    if (d >= args.n_embd || t >= args.n_tokens) return;
+    const uint64_t base = (uint64_t)t * args.n_embd * args.n_hc;
+    float acc = 0.0f;
+    for (uint s = 0; s < args.n_hc; s++) acc += qwen4_sigmoid(u[base + s * args.n_embd + d]) * xn[base + s * args.n_embd + d];
+    mixed[(uint64_t)t * args.n_embd + d] = acc / (float)args.n_hc;
+}
+
+/* --- multi-token prediction input --------------------------------------- */
+
+struct ds4_metal_args_qwen4_mtp_stage {
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t pad0;
+    float    eps;
+};
+
+/* Rows of the concat input for the fused [W_e | W_h] projection: row 0 is
+ * [e/rms(e) * g_e | 0], row 1+s is [0 | R_s/rms(R) * g_h[s]] with one RMS
+ * over all hc streams.  One threadgroup per row. */
+kernel void kernel_qwen4_mtp_stage(
+        constant ds4_metal_args_qwen4_mtp_stage & args,
+        device const float *e,          /* [E] next-token embedding */
+        device const float *R,          /* [hc*E] pre-mixer streams */
+        device const float *g_e,        /* [E] */
+        device const float *g_h,        /* [hc*E] */
+        device float       *cat,        /* [1+hc][2E] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint row = tgpig.x;
+    if (row > args.n_hc) return;
+    const uint E = args.n_embd;
+    const uint nth = ntg.x;
+    const uint nsg = nth / 32;
+    threadgroup float red[32];
+    const bool emb = row == 0;
+    device const float *src = emb ? e : R + (uint64_t)(row - 1u) * E;
+    device const float *g = emb ? g_e : g_h + (uint64_t)(row - 1u) * E;
+    device const float *rs = emb ? src : R;
+    const uint n_red = emb ? E : E * args.n_hc;
+    float ss = 0.0f;
+    for (uint i = tid; i < n_red; i += nth) ss += rs[i] * rs[i];
+    ss = simd_sum(ss);
+    if (tiisg == 0) red[sgitg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint q = 0; q < nsg; q++) tot += red[q];
+    const float inv = rsqrt(tot / (float)n_red + args.eps);
+    device float *o = cat + (uint64_t)row * 2u * E;
+    const uint lo = emb ? 0u : E;
+    const uint hi = emb ? E : 0u;
+    for (uint i = tid; i < E; i += nth) {
+        o[lo + i] = src[i] * inv * g[i];
+        o[hi + i] = 0.0f;
+    }
+}
+
+struct ds4_metal_args_qwen4_mtp_combine {
+    uint32_t n_embd;
+    uint32_t n_hc;
+};
+
+/* R_out[s][d] = proj[0][d] + proj[1+s][d] */
+kernel void kernel_qwen4_mtp_combine(
+        constant ds4_metal_args_qwen4_mtp_combine & args,
+        device const float *proj,       /* [1+hc][E] */
+        device float       *R_out,      /* [hc*E] */
+        uint gid [[thread_position_in_grid]]) {
+    const uint E = args.n_embd;
+    if (gid >= E * args.n_hc) return;
+    const uint s = gid / E;
+    const uint d = gid - s * E;
+    R_out[gid] = proj[d] + proj[(uint64_t)(s + 1u) * E + d];
+}
+
+/* --- decode-path fusions ------------------------------------------------ */
+
+struct ds4_metal_args_qwen4_gdn_front {
+    uint32_t n_tokens;
+    uint32_t n_k_head;
+    uint32_t n_v_head;
+    uint32_t head_dim;
+    uint32_t conv_kernel;
+    uint32_t weight_type;
+    uint32_t in_dim;
+    uint32_t row_bytes;
+    uint32_t snap_tok;     /* copy the conv history after this token into snap_state */
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/* conv_stream + alpha/beta projections + gdn_prep for a few tokens.  One
+ * threadgroup per k-head owns q_h, k_h and the value heads tiled onto it
+ * (j % Hk == h): its threads run the conv over those channels, then
+ * simdgroups 0/1 normalize q/k and the others take the alpha/beta rows.
+ * Tokens are walked in order; the conv history is advanced in place. */
+kernel void kernel_qwen4_gdn_front(
+        constant ds4_metal_args_qwen4_gdn_front & args,
+        device float       *qkv,      /* [T][C] raw in; conv'd, q/k normalized out */
+        device float       *state,    /* [K-1][C] */
+        device const float *conv_w,   /* [C][K] */
+        device const float *mixed,    /* [T][in_dim] */
+        device const char  *w_alpha,  /* [Hv] rows */
+        device const char  *w_beta,   /* [Hv] rows */
+        device const float *ssm_a,    /* [Hv] */
+        device const float *dt_bias,  /* [Hv] */
+        device float       *ga,       /* [T][Hv] decay out */
+        device float       *gb,       /* [T][Hv] beta out */
+        device float       *snap_state,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint Hk = args.n_k_head, Hv = args.n_v_head, D = args.head_dim, K = args.conv_kernel;
+    if (h >= Hk) return;
+    const uint C = 2 * Hk * D + Hv * D;
+    const uint per_k = Hv / Hk;
+    const uint n_ch = (2 + per_k) * D;
+    const uint nth = ntg.x;
+    const uint nsg = nth / 32;
+    const uint npt = D / 32;
+    for (uint tok = 0; tok < args.n_tokens; tok++) {
+        device float *row = qkv + (uint64_t)tok * C;
+        for (uint cl = tid; cl < n_ch; cl += nth) {
+            const uint grp = cl / D, i = cl - grp * D;
+            const uint c = (grp == 0 ? h * D : grp == 1 ? Hk * D + h * D : 2 * Hk * D + (h + (grp - 2) * Hk) * D) + i;
+            const float raw = row[c];
+            float acc = conv_w[c * K + K - 1] * raw;
+            for (uint t = 0; t + 1 < K; t++) acc += conv_w[c * K + t] * state[t * C + c];
+            for (uint t = 0; t + 2 < K; t++) state[t * C + c] = state[(t + 1) * C + c];
+            state[(K - 2) * C + c] = raw;
+            row[c] = qwen4_silu(acc);
+            if (tok == args.snap_tok) {
+                for (uint t = 0; t + 1 < K; t++) snap_state[t * C + c] = state[t * C + c];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (sgitg < 2) {
+            device float *v = row + (sgitg == 0 ? h * D : Hk * D + h * D);
+            float ss = 0.0f;
+            for (uint r = 0; r < npt; r++) ss += v[tiisg + 32 * r] * v[tiisg + 32 * r];
+            ss = simd_sum(ss);
+            const float sc = rsqrt(ss + 1e-6f) * (sgitg == 0 ? rsqrt((float)D) : 1.0f);
+            for (uint r = 0; r < npt; r++) v[tiisg + 32 * r] *= sc;
+        } else {
+            device const float *x = mixed + (uint64_t)tok * args.in_dim;
+            for (uint rr = (uint)sgitg - 2u; rr < 2 * per_k; rr += nsg - 2u) {
+                const uint j = h + (rr / 2) * Hk;
+                device const char *wrow = (rr & 1u) ? w_beta : w_alpha;
+                const float v = qwen4_row_dot(wrow + (uint64_t)j * args.row_bytes, x, args.weight_type, args.in_dim, tiisg);
+                if (tiisg == 0) {
+                    if (rr & 1u) gb[(uint64_t)tok * Hv + j] = qwen4_sigmoid(v);
+                    else ga[(uint64_t)tok * Hv + j] = exp(ssm_a[j] * qwen4_softplus(v + dt_bias[j]));
                 }
             }
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < args.keep; i += (uint)nthreads) {
-        const uint dst = args.final_pass ? i : tgp * args.keep + i;
-        dst_scores[dst] = tscores[i];
-        dst_indices[dst] = tindices[i];
-    }
-    if (args.final_pass && tgp == 0u) {
-        threadgroup uint finite_count[1];
-        if (tid == 0u) finite_count[0] = 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < args.keep; i += (uint)nthreads) {
-            if (isfinite(tscores[i]))
-                atomic_fetch_add_explicit(
-                    (threadgroup atomic_uint *)finite_count, 1u,
-                    memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0u) out_count[0] = finite_count[0];
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }

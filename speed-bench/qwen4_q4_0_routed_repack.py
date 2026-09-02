@@ -176,6 +176,21 @@ def patch_manifest(path: Path, base: Path, digests: dict[str, str]) -> None:
             pack.fail(f"{path}: {name} is not a manifest Q4_K tensor")
         record["qtype"] = "Q4_0"
         record["sha256"] = digest
+    quantization = manifest.get("quantization")
+    if isinstance(quantization, dict):
+        # The converter wrote the recipe for its Q4_K output; the repacked
+        # pack's routed experts are source-derived Q4_0, and leaving the
+        # stale recipe text behind invites exactly the "is this really
+        # Q4_0?" question.  The loader never parses this block (per-tensor
+        # records and tensor_manifest_sha256 are authoritative).
+        quantization["routed_experts"] = {
+            "qtype": "Q4_0",
+            "block_size": 32,
+            "note": "source-derived Q4_0 repacked in place over the "
+                    "original Q4_K byte extents "
+                    f"({len(digests)} routed tensors); per-tensor qtype "
+                    "records and tensor_manifest_sha256 are authoritative",
+        }
     manifest["source_derived_q4_0_routed"] = {
         "tensor_count": len(digests),
         "base_layout": "Q4_K-equal-byte-slots",

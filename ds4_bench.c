@@ -23,7 +23,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 /* CUDA builds resolve these weak symbols through libcudart; other builds
  * remain independent of CUDA headers and libraries. */
@@ -37,9 +36,8 @@ extern int cudaProfilerStop(void) __attribute__((weak));
 
 typedef struct {
     const char *model_path;
-    const char *ple_path;
     const char *mtp_path;
-    const char *vision_path;
+    const char *ple_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -56,8 +54,6 @@ typedef struct {
     int gen_tokens;
     int power_percent;
     uint32_t prefill_chunk;
-    ds4_qwen4_prefill_mode qwen4_prefill_mode;
-    bool qwen4_prefill_mode_set;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
@@ -65,8 +61,6 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
-    const char *dump_frontier_state_dir;
-    const char *dump_frontier_generation_dir;
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
@@ -275,12 +269,10 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--ple")) {
-            c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--vision")) {
-            c.vision_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark")) {
             c.dspark = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
@@ -314,10 +306,6 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--dump-frontier-state-dir")) {
-            c.dump_frontier_state_dir = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--dump-frontier-generation-dir")) {
-            c.dump_frontier_generation_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -377,22 +365,7 @@ static bench_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            const char *value = need_arg(&i, argc, argv, arg);
-            char mode_error[128];
-            if (ds4_qwen4_parse_prefill_mode(value,
-                                              &c.qwen4_prefill_mode,
-                                              mode_error,
-                                              sizeof(mode_error))) {
-                c.qwen4_prefill_mode_set = true;
-                c.prefill_chunk = (uint32_t)c.qwen4_prefill_mode;
-                continue;
-            }
-            int v = parse_int(value, arg);
-            if (v <= 0) {
-                fprintf(stderr, "ds4-bench: --prefill-chunk must be positive\n");
-                exit(2);
-            }
-            c.prefill_chunk = (uint32_t)v;
+            c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--power")) {
             c.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.power_percent < 1 || c.power_percent > 100) {
@@ -467,12 +440,11 @@ static bench_config parse_options(int argc, char **argv) {
     return c;
 }
 
-static void json_write_bytes(FILE *fp, const char *s, size_t len) {
+static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
     if (s) {
-        for (size_t i = 0; i < len; i++) {
-            const unsigned char ch = (unsigned char)s[i];
-            switch (ch) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            switch (*p) {
             case '"':  fputs("\\\"", fp); break;
             case '\\': fputs("\\\\", fp); break;
             case '\b': fputs("\\b", fp); break;
@@ -481,17 +453,13 @@ static void json_write_bytes(FILE *fp, const char *s, size_t len) {
             case '\r': fputs("\\r", fp); break;
             case '\t': fputs("\\t", fp); break;
             default:
-                if (ch < 0x20) fprintf(fp, "\\u%04x", (unsigned)ch);
-                else fputc((char)ch, fp);
+                if (*p < 0x20) fprintf(fp, "\\u%04x", (unsigned)*p);
+                else fputc((char)*p, fp);
                 break;
             }
         }
     }
     fputc('"', fp);
-}
-
-static void json_write_string(FILE *fp, const char *s) {
-    json_write_bytes(fp, s, s ? strlen(s) : 0u);
 }
 
 static int write_frontier_logits_json(
@@ -565,96 +533,6 @@ static int write_frontier_logits_json(
         return 1;
     }
     free(logits);
-    return 0;
-}
-
-static int write_frontier_state(
-        const bench_config *cfg,
-        ds4_session *session,
-        int frontier) {
-    if (!cfg->dump_frontier_state_dir) return 0;
-    char path[PATH_MAX];
-    const int n = snprintf(path, sizeof(path),
-                           "%s/frontier_%06d.state.bin",
-                           cfg->dump_frontier_state_dir, frontier);
-    if (n <= 0 || (size_t)n >= sizeof(path)) {
-        fprintf(stderr, "ds4-bench: frontier state path is too long\n");
-        return 1;
-    }
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
-                path, strerror(errno));
-        return 1;
-    }
-    char err[256] = {0};
-    int rc = ds4_session_save_payload(session, fp, err, sizeof(err));
-    if (fclose(fp) != 0 && rc == 0) {
-        snprintf(err, sizeof(err), "failed to close state file");
-        rc = 1;
-    }
-    if (rc != 0) {
-        fprintf(stderr, "ds4-bench: state dump at %d failed: %s\n",
-                frontier, err[0] ? err : "unknown error");
-        unlink(path);
-        return 1;
-    }
-    return 0;
-}
-
-static int write_frontier_generation(
-        const bench_config *cfg,
-        ds4_engine *engine,
-        int frontier,
-        const int *tokens,
-        int token_count) {
-    if (!cfg->dump_frontier_generation_dir) return 0;
-    char path[PATH_MAX];
-    const int n = snprintf(path, sizeof(path),
-                           "%s/frontier_%06d.generation.json",
-                           cfg->dump_frontier_generation_dir, frontier);
-    if (n <= 0 || (size_t)n >= sizeof(path)) {
-        fprintf(stderr, "ds4-bench: frontier generation path is too long\n");
-        return 1;
-    }
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
-                path, strerror(errno));
-        return 1;
-    }
-    fprintf(fp, "{\n  \"source\":\"ds4-bench\",\n  \"model\":");
-    json_write_string(fp, cfg->model_path);
-    fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"frontier_tokens\":%d,"
-            "\n  \"generation_tokens\":%d,\n  \"token_ids\":[",
-            ds4_backend_name(cfg->backend), frontier, token_count);
-    for (int i = 0; i < token_count; i++) {
-        if (i) fputc(',', fp);
-        if ((i % 16) == 0) fputs("\n    ", fp);
-        fprintf(fp, "%d", tokens[i]);
-    }
-    fputs("\n  ],\n  \"token_piece_hex\":[", fp);
-    for (int i = 0; i < token_count; i++) {
-        if (i) fputc(',', fp);
-        if ((i % 8) == 0) fputs("\n    ", fp);
-        size_t piece_len = 0;
-        char *piece = ds4_token_text(engine, tokens[i], &piece_len);
-        if (piece) {
-            fputc('"', fp);
-            for (size_t j = 0; j < piece_len; j++)
-                fprintf(fp, "%02x", (unsigned char)piece[j]);
-            fputc('"', fp);
-            free(piece);
-        } else {
-            fputs("null", fp);
-        }
-    }
-    fputs("\n  ]\n}\n", fp);
-    if (fclose(fp) != 0) {
-        fprintf(stderr, "ds4-bench: failed to close %s\n", path);
-        return 1;
-    }
     return 0;
 }
 
@@ -772,15 +650,12 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
-        .ple_path = cfg.ple_path,
         .mtp_path = cfg.mtp_path,
-        .vision_path = cfg.vision_path,
+        .ple_path = cfg.ple_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
         .prefill_chunk = cfg.prefill_chunk,
-        .qwen4_prefill_mode = cfg.qwen4_prefill_mode,
-        .qwen4_prefill_mode_set = cfg.qwen4_prefill_mode_set,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
@@ -971,10 +846,6 @@ int main(int argc, char **argv) {
             rc = 1;
             break;
         }
-        if (write_frontier_state(&cfg, session, frontier) != 0) {
-            rc = 1;
-            break;
-        }
 
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
@@ -1008,18 +879,9 @@ int main(int argc, char **argv) {
         double gen_steady_sec = 0.0;
         int gen_first_tokens = 0;
         int gen_done = 0;
-        int *gen_token_buf =
-            (cfg.show_output || cfg.dump_frontier_generation_dir) &&
-            cfg.gen_tokens > 0
+        int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
-        if ((cfg.show_output || cfg.dump_frontier_generation_dir) &&
-            cfg.gen_tokens > 0 && !gen_token_buf) {
-            fprintf(stderr,
-                    "ds4-bench: out of memory recording generation\n");
-            rc = 1;
-            break;
-        }
         int gen_token_count = 0;
         int cuda_profile_start = -1;
         int cuda_profile_tokens = 0;
@@ -1136,13 +998,6 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "\"\n");
             fflush(stderr);
-        }
-        if (write_frontier_generation(
-                &cfg, engine, frontier,
-                gen_token_buf, gen_token_count) != 0) {
-            free(gen_token_buf);
-            rc = 1;
-            break;
         }
         free(gen_token_buf);
         if (rc != 0) break;

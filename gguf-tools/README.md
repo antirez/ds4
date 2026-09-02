@@ -1,17 +1,14 @@
 # DS4 GGUF Tools
 
 This directory contains the offline tools used to build and evaluate DeepSeek
-V4 Flash, GLM-5.3 Flash, and Qwen3.8-Flash-Next packs for `ds4`.
+V4 Flash GGUF files for `ds4`.
 
 The important pieces are:
 
 - `deepseek4-quantize.c`: C HF-safetensors to GGUF quantizer.
-- `glm53_quantize.py`: GLM converter backed by the local quantization library.
-- `qwen4_pack.py`: Qwen fast-pack converter backed by the same GGML-compatible
-  block quantizers used by the DeepSeek and GLM conversion paths.
 - `quants.[ch]`: the deliberately small local quantization implementation used
   by the quantizer.  It implements the DS4 output formats we actually ship:
-  `q8_0`, `q8_K`, `q4_1`, `q4_K`, `q2_K`, and `iq2_xxs`.
+  `q8_0`, `q8_K`, `q4_K`, `q2_K`, and `iq2_xxs`.
 - `imatrix/`: dataset and instructions for collecting routed-MoE activation
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
@@ -194,3 +191,32 @@ make -C gguf-tools quality-score
 gguf-tools/quality-testing/score_official MODEL.gguf gguf-tools/quality-testing/data/manifest.tsv /tmp/model.tsv 4096
 python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
+
+## Qwen3.8 Flash Next
+
+`qwen4_exp_convert.py` wraps llama.cpp's `convert_hf_to_gguf.py` and writes
+the `qwen4exp` schema DS4 loads, including the MTP block as `blk.<n>.nextn.*`.
+It needs a llama.cpp master checkout (b96806d96 or newer, found through
+`--llama-cpp` or `$LLAMA_CPP`) and a Python with torch, safetensors and
+transformers, such as llama.cpp's own venv:
+
+```sh
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out Qwen3.8-Flash-Next-Q8.gguf --outtype q8_0
+python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
+  --out Qwen3.8-Flash-Next-MXFP4.gguf --outtype q8_0 --experts mxfp4
+```
+
+Options: `--outtype q8_0|f32` (dense projections), `--experts
+q8_0|mxfp4|q4_k|f32` (routed experts; `--experts-down` picks the 640-wide down
+projection type when the gate/up type needs 256-wide rows), `--ngram
+q8_0|mxfp4|q4_0|f32` (the per-layer n-gram table), `--hc-type f16|f32|q8_0`
+(hyper-connection mixers), `--indexer bf16|f16|q8_0|f32` (the QSA indexer
+projections, kept at the released BF16 by default), `--no-mtp` and
+`--dry-run`. Norms, conv kernels, `ssm_a`, dt biases and the routers stay F32.
+`gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
+pre-tokenizer from a current `regex` release.
+
+`make test-qwen4-kernels` runs the Metal kernel tests and
+`make test-qwen4-vision` checks the vision tower against the HF implementation
+(`tests/qwen4_vision_ref.py`).

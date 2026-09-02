@@ -1173,8 +1173,8 @@ typedef struct {
 
 typedef struct {
     const char *model_path;
-    const char *ple_path;
     const char *mtp_path;
+    const char *ple_path;
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
@@ -1187,8 +1187,6 @@ typedef struct {
     int ctx_size;
     int max_tokens;
     int question_limit;
-    int mtp_draft_tokens;
-    float mtp_margin;
     float temperature;
     float top_p;
     float min_p;
@@ -1196,8 +1194,6 @@ typedef struct {
     int pause_ms;
     int power_percent;
     uint32_t prefill_chunk;
-    ds4_qwen4_prefill_mode qwen4_prefill_mode;
-    bool qwen4_prefill_mode_set;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
@@ -1210,7 +1206,6 @@ typedef struct {
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool plain;
-    bool mtp_timing;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -1610,8 +1605,6 @@ static eval_config parse_options(int argc, char **argv) {
         .backend = default_backend(),
         .max_tokens = 16000,
         .suite_mask = EVAL_SUITE_CORE,
-        .mtp_draft_tokens = 1,
-        .mtp_margin = 3.0f,
         .top_p = DS4_DEFAULT_TOP_P,
         .min_p = DS4_DEFAULT_MIN_P,
         .pause_ms = 350,
@@ -1665,23 +1658,10 @@ static eval_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--ple")) {
-            c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp-draft")) {
-            c.mtp_draft_tokens = parse_int_arg(
-                need_arg(&i, argc, argv, arg), arg);
-            if (c.mtp_draft_tokens < 1 || c.mtp_draft_tokens > 16) {
-                fprintf(stderr,
-                        "ds4-eval: --mtp-draft must be between 1 and 16\n");
-                exit(2);
-            }
-        } else if (!strcmp(arg, "--mtp-margin")) {
-            c.mtp_margin = parse_float_arg(
-                need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
-        } else if (!strcmp(arg, "--mtp-timing")) {
-            c.mtp_timing = true;
+        } else if (!strcmp(arg, "--ple")) {
+            c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -1776,17 +1756,7 @@ static eval_config parse_options(int argc, char **argv) {
                 exit(2);
             }
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            const char *value = need_arg(&i, argc, argv, arg);
-            char mode_error[128];
-            if (ds4_qwen4_parse_prefill_mode(value,
-                                              &c.qwen4_prefill_mode,
-                                              mode_error,
-                                              sizeof(mode_error))) {
-                c.qwen4_prefill_mode_set = true;
-                c.prefill_chunk = (uint32_t)c.qwen4_prefill_mode;
-                continue;
-            }
-            int v = parse_int_arg(value, arg);
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
                 fprintf(stderr, "ds4-eval: --prefill-chunk must be positive\n");
                 exit(2);
@@ -4803,18 +4773,15 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
-        .ple_path = cfg.ple_path,
         .mtp_path = cfg.mtp_path,
+        .ple_path = cfg.ple_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,
-        .mtp_draft_tokens = cfg.mtp_draft_tokens,
-        .mtp_margin = cfg.mtp_margin,
-        .glm_mtp_timing = cfg.mtp_timing,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
         .power_percent = cfg.power_percent,
         .prefill_chunk = cfg.prefill_chunk,
-        .qwen4_prefill_mode = cfg.qwen4_prefill_mode,
-        .qwen4_prefill_mode_set = cfg.qwen4_prefill_mode_set,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_full_layers = cfg.ssd_streaming_full_layers,
