@@ -11,10 +11,17 @@
 # the TensorOps multiply_accumulate path and the explicit-add schedule is a
 # candidate kernel-side fix.  If muladd still drifts, the per-tile product
 # itself is lossy and the automatic tensor route must stay withheld.
-#
-# Usage:  ./m5-tensor-precision-probe.sh [model.gguf]
-set -e
 
+LOCK=${DS4_LOCK_FILE:-/tmp/ds4.lock}
+wait_lock() {
+    i=0
+    while [ $i -lt 90 ]; do
+        flock -n "$LOCK" true 2>/dev/null && return 0
+        [ $i -eq 0 ] && echo "waiting for ds4 instance lock ($LOCK)..."
+        sleep 10; i=$((i+1))
+    done
+    return 1
+}
 MODEL=${1:-gguf/GLM-5.3-Flash-Q2.gguf}
 PROMPT=tests/test-vectors/glm-openrouter/prompts/long_code_audit.txt
 OUT=/tmp/ds4-mpp-probe
@@ -29,11 +36,13 @@ head -c 1500 "$PROMPT" > "$OUT/p1500.txt"
 
 run_dump() { # label envflag promptfile
     label=$1; envflag=$2; pf=$3
+    wait_lock || { echo "ds4 lock stayed busy for 15 min; aborting"; exit 1; }
     # shellcheck disable=SC2086
     env $envflag ./ds4 -m "$MODEL" --metal --nothink -sys "" --temp 0 \
         -n 2 --ctx 32768 --prompt-file "$pf" \
         --dump-logprobs "$OUT/${label}_$(basename "$pf" .txt).json" \
-        --logprobs-top-k 20 > "$OUT/${label}_$(basename "$pf" .txt).log" 2>&1
+        --logprobs-top-k 20 > "$OUT/${label}_$(basename "$pf" .txt).log" 2>&1 \
+        || { echo "run $label failed:"; tail -3 "$OUT/${label}_$(basename "$pf" .txt).log"; exit 1; }
 }
 
 echo "== GPU check =="
