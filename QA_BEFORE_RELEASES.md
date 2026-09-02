@@ -292,6 +292,16 @@ Run these gates whenever session scheduling, batched decode, mixed
 prefill/decode, QKV projection, shared or routed experts, tensor parallelism,
 or backend fallback selection changes.
 
+- On M5-class hardware, run the Metal 4 tensor-route gate with a checkpoint
+  whose prompts exercise multi-token prefill:
+  `DS4_TEST_MODEL=gguf/GLM-5.3-Flash-Q2.gguf
+  DS4_TEST_VECTOR_FILE=tests/test-vectors/glm-openrouter/official.vec
+  ./ds4_test --metal-tensor-equivalence`.
+  The `auto` route must pass; the `tensor-optin` report line documents the
+  still-lossy `matmul2d` accumulate that keeps the automatic enable withheld.
+  M5 prefill throughput references in this file predate the withhold and need
+  re-baselining when quoted.
+
 - On a single Metal machine, run the full-vocabulary exact-logit oracle with
   2, 4, 8, and 16 sessions:
   `DS4_TEST_MODEL=/path/to/ds4flash.gguf DS4_TEST_SESSION_COUNT=N make test-metal-session-batch`.

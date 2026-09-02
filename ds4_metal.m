@@ -2498,17 +2498,36 @@ static void ds4_gpu_detect_metal4_features(void) {
 
             /*
              * Metal 4 TensorOps are portable in source, but on pre-M5 hardware
-             * they can map to ordinary shader fallbacks.  Keep the automatic
-             * fast path restricted to hardware generations where the Neural
+             * they can map to ordinary shader fallbacks.  Keep the fast path
+             * restricted to hardware generations where the Neural
              * Accelerator/TensorOps path is expected to pay off; older Metal
              * machines continue to use the established kernels unless a future
              * device is explicitly added here.
+             *
+             * The automatic enable is currently withheld even on M5-class
+             * devices: measured against the simdgroup reference kernels on an
+             * M5 Max (GLM-5.3-Flash-Q2, macOS 27.0), the hardware matmul2d
+             * accumulate is visibly lossy for both the staged routed-MoE tiles
+             * and the direct-RHS dense prefill tiles.  Prompt logits drift by
+             * whole units, greedy streams diverge, and
+             * ./ds4_test --metal-tensor-equivalence fails on M5 hardware,
+             * while the identical runs with DS4_METAL_DISABLE_METAL4=1 stay
+             * bit-identical to an M3 Ultra.  Operand precision (half or float
+             * staging) and matmul2d_descriptor::relaxed_precision do not move
+             * the error.  Until the driver's accumulation matches the
+             * reference kernels, DS4_METAL_ENABLE_TENSOR=1 opts back in for
+             * performance comparisons.
              */
             if (default_enable) {
                 g_metal4_tensor_api_compile_supported = ds4_gpu_compile_tensor_probe();
-                g_metal4_tensor_api_enabled = g_metal4_tensor_api_compile_supported;
-                if (!g_metal4_tensor_api_enabled) {
+                const int forced = ds4_gpu_env_bool("DS4_METAL_ENABLE_TENSOR") > 0;
+                g_metal4_tensor_api_enabled =
+                    g_metal4_tensor_api_compile_supported && forced;
+                if (!g_metal4_tensor_api_compile_supported) {
                     fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
+                } else if (!g_metal4_tensor_api_enabled) {
+                    fprintf(stderr, "ds4: Metal 4 tensor API available but not enabled (numerics); "
+                                    "set DS4_METAL_ENABLE_TENSOR=1 to override\n");
                 }
             } else {
                 fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
