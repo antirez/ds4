@@ -59894,8 +59894,8 @@ int ds4_engine_metal_moe_gt_test(ds4_engine *e) {
         return 1;
     }
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) {
-        fprintf(stderr, "ds4: MoE ground-truth test currently supports GLM models only\n");
-        return 1;
+        fprintf(stderr, "ds4: MoE ground-truth test skipped (GLM models only)\n");
+        return 0;
     }
 
 
@@ -60039,8 +60039,10 @@ int ds4_engine_metal_moe_gt_test(ds4_engine *e) {
         cmp_ok &= glm_metal_compare_f32(label, cpu_moe, cpu_q8_moe,
                                         n_tokens * DS4_N_EMBD, 5.0f) != 0;
         snprintf(label, sizeof(label), "layer%u_gpu_vs_cpu_f32", il);
+        /* Half- and fp32-staged GPU routes measure max_abs ~1.9e-3 and
+         * ~8e-4; anything q8_K-class (1e-2) or worse is a regression. */
         cmp_ok &= glm_metal_compare_f32(label, cpu_moe, gpu_read,
-                                        n_tokens * DS4_N_EMBD, 5.0f) != 0;
+                                        n_tokens * DS4_N_EMBD, 5.0e-3f) != 0;
     }
 
     ds4_gpu_tensor_free(scr_down);
