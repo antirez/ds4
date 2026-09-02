@@ -46486,14 +46486,14 @@ static bool glm_graph_encode_ffn_batch(
     (void)up_in;
     (void)down_in;
 
-    ok = ds4_gpu_matmul_f32_tensor(g->batch_router_logits,
-                                   model->map,
-                                   model->size,
-                                   l->ffn_gate_inp->abs_offset,
-                                   DS4_N_EMBD,
-                                   DS4_N_EXPERT,
-                                   g->batch_ffn_norm,
-                                   n_tokens) != 0;
+    ok = ds4_gpu_matmul_f32_mm_tensor(g->batch_router_logits,
+                                      model->map,
+                                      model->size,
+                                      l->ffn_gate_inp->abs_offset,
+                                      DS4_N_EMBD,
+                                      DS4_N_EXPERT,
+                                      g->batch_ffn_norm,
+                                      n_tokens) != 0;
     if (!ok) {
         fprintf(stderr,
                 "ds4: GLM sparse FFN router projection failed at layer %u "
@@ -59878,6 +59878,192 @@ int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
     (void)e;
     (void)prompt;
     fprintf(stderr, "ds4: graph test requested but this build has no graph backend support\n");
+    return 1;
+#endif
+}
+
+/* Surgical routed-MoE ground truth: identical synthetic unit-RMS activations
+ * through the CPU f32 reference and the GPU batch dispatch (the prefill path
+ * the precision arms select via env), so the only variable is the kernel
+ * route.  GLM-only; layer defaults to 8, DS4_TEST_MOE_GT_LAYER overrides. */
+int ds4_engine_metal_moe_gt_test(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    if (!e->metal_ready) {
+        fprintf(stderr, "ds4: %s MoE ground-truth test requested but backend is unavailable\n",
+                ds4_backend_name(e->backend));
+        return 1;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) {
+        fprintf(stderr, "ds4: MoE ground-truth test skipped (GLM models only)\n");
+        return 0;
+    }
+
+
+    const uint32_t normal_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint32_t il = 8;
+    const char *layer_env = getenv("DS4_TEST_MOE_GT_LAYER");
+    if (layer_env && layer_env[0]) {
+        char *endp = NULL;
+        const long v = strtol(layer_env, &endp, 10);
+        if (endp == layer_env || v < (long)DS4_N_LEADING_DENSE || v >= (long)normal_layers) {
+            fprintf(stderr, "ds4: DS4_TEST_MOE_GT_LAYER must be %d..%u\n",
+                    (int)DS4_N_LEADING_DENSE, normal_layers - 1u);
+            return 1;
+        }
+        il = (uint32_t)v;
+    }
+    const uint32_t n_tokens = 32;  /* >= 32 so the batch takes the mul_mm_id route */
+    const ds4_model *model = &e->model;
+    const ds4_weights *weights = &e->weights;
+    const ds4_layer_weights *l = &weights->layer[il];
+
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        l->ffn_gate_exps->type != l->ffn_up_exps->type ||
+        !glm_graph_gate_pair_type_supported(l->ffn_gate_exps->type, l->ffn_up_exps->type) ||
+        !glm_graph_down_type_supported(l->ffn_down_exps->type)) {
+        fprintf(stderr, "ds4: MoE ground-truth test found unsupported layer-%u expert types\n", il);
+        return 1;
+    }
+
+    uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
+    uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
+    uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
+    (void)tensor_expert_bytes(model, l->ffn_gate_exps, 0, &gate_in, &gate_out, &gate_row_bytes);
+    (void)tensor_expert_bytes(model, l->ffn_up_exps, 0, &up_in, &up_out, &up_row_bytes);
+    (void)tensor_expert_bytes(model, l->ffn_down_exps, 0, &down_in, &down_out, &down_row_bytes);
+    if (gate_in != DS4_N_EMBD || up_in != DS4_N_EMBD ||
+        down_in != DS4_N_FF_EXP || gate_out != DS4_N_FF_EXP ||
+        up_out != DS4_N_FF_EXP || down_out != DS4_N_EMBD) {
+        fprintf(stderr, "ds4: MoE ground-truth test found unexpected layer-%u expert strides\n", il);
+        return 1;
+    }
+
+    const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t batch_emb_bytes = (uint64_t)n_tokens * emb_bytes;
+    const uint64_t routed_mid_elems = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t batch_mid_elems = (uint64_t)n_tokens * routed_mid_elems;
+    const uint64_t batch_sel_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+
+    float *x = xmalloc(batch_emb_bytes);
+    float *cpu_moe = xmalloc(batch_emb_bytes);
+    float *cpu_q8_moe = xmalloc(batch_emb_bytes);
+    float *cpu_mid = xmalloc(batch_mid_elems * sizeof(float));
+    float *gpu_read = xmalloc(batch_emb_bytes);
+    int32_t *sel = xmalloc(batch_sel_elems * sizeof(int32_t));
+    float *selw = xmalloc(batch_sel_elems * sizeof(float));
+
+    /* Deterministic unit-RMS pseudo activations, representative of the
+     * post-RMSNorm hidden state that feeds the routed MoE. */
+    glm_metal_q8_diag_fill_input(x, n_tokens, DS4_N_EMBD);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float *row = x + (uint64_t)t * DS4_N_EMBD;
+        double ss = 0.0;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) ss += (double)row[i] * row[i];
+        const float inv = (float)(1.0 / sqrt(ss / DS4_N_EMBD));
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) row[i] *= inv;
+    }
+
+    int ok = 1;
+    int cmp_ok = 1;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int selected_t[DS4_MAX_EXPERT_USED];
+        float weight_t[DS4_MAX_EXPERT_USED];
+        layer_glm_router_selected_experts(selected_t, weight_t, model, l,
+                                          x + (uint64_t)t * DS4_N_EMBD);
+        for (uint32_t s = 0; s < DS4_N_EXPERT_USED; s++) {
+            sel[t * DS4_N_EXPERT_USED + s] = (int32_t)selected_t[s];
+            selw[t * DS4_N_EXPERT_USED + s] = weight_t[s];
+        }
+        layer_glm_routed_moe_one_f32_ref(cpu_moe + (uint64_t)t * DS4_N_EMBD,
+                                         cpu_mid + (uint64_t)t * routed_mid_elems,
+                                         model, l,
+                                         x + (uint64_t)t * DS4_N_EMBD,
+                                         selected_t, weight_t);
+        layer_glm_routed_moe_one(cpu_q8_moe + (uint64_t)t * DS4_N_EMBD,
+                                 model, l,
+                                 x + (uint64_t)t * DS4_N_EMBD,
+                                 il);
+    }
+
+    ds4_gpu_tensor *tn_x = ds4_gpu_tensor_alloc(batch_emb_bytes);
+    ds4_gpu_tensor *tn_out = ds4_gpu_tensor_alloc(batch_emb_bytes);
+    ds4_gpu_tensor *tn_mid = ds4_gpu_tensor_alloc(batch_mid_elems * sizeof(float));
+    ds4_gpu_tensor *tn_sel = ds4_gpu_tensor_alloc(batch_sel_elems * sizeof(int32_t));
+    ds4_gpu_tensor *tn_selw = ds4_gpu_tensor_alloc(batch_sel_elems * sizeof(float));
+    ds4_gpu_tensor *scr_gate = ds4_gpu_tensor_alloc(batch_mid_elems * sizeof(float));
+    ds4_gpu_tensor *scr_up = ds4_gpu_tensor_alloc(batch_mid_elems * sizeof(float));
+    ds4_gpu_tensor *scr_down =
+        ds4_gpu_tensor_alloc((uint64_t)n_tokens * DS4_N_EXPERT_USED * emb_bytes);
+    if (!tn_x || !tn_out || !tn_mid || !tn_sel || !tn_selw ||
+        !scr_gate || !scr_up || !scr_down) {
+        fprintf(stderr, "ds4: MoE ground-truth test could not allocate GPU tensors\n");
+        ok = 0;
+    }
+
+    if (ok) ok = ds4_gpu_tensor_write(tn_x, 0, x, batch_emb_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(tn_sel, 0, sel, batch_sel_elems * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(tn_selw, 0, selw, batch_sel_elems * sizeof(float)) != 0;
+
+    if (ok) {
+        ds4_glm_gpu_graph route_g;
+        memset(&route_g, 0, sizeof(route_g));
+        route_g.batch_routed_gate = scr_gate;
+        route_g.batch_routed_up = scr_up;
+        route_g.batch_routed_down = scr_down;
+        route_g.ssd_streaming = e->ssd_streaming;
+        route_g.glm53 = ds4_model_is_glm53();
+
+        ok = glm_graph_routed_moe_batch_dispatch(&route_g, model, l, il,
+                                                 tn_out, tn_mid,
+                                                 gate_out * gate_row_bytes, gate_row_bytes,
+                                                 up_out * up_row_bytes, up_row_bytes,
+                                                 down_out * down_row_bytes, down_row_bytes,
+                                                 tn_sel, tn_selw, tn_x,
+                                                 n_tokens,
+                                                 (uint32_t)routed_mid_elems,
+                                                 false, false) != 0;
+    }
+    if (ok) ok = ds4_gpu_tensor_read(tn_out, 0, gpu_read, batch_emb_bytes) != 0;
+
+    if (ok) {
+        char label[96];
+        printf("moe_ground_truth layer=%u tokens=%u "
+               "route=[disable_metal4=%d f32stage=%d mpp_f32stage=%d muladd=%d k16=%d]\n",
+               il, n_tokens,
+               getenv("DS4_METAL_DISABLE_METAL4") != NULL,
+               getenv("DS4_METAL_MOE_F32STAGE") != NULL,
+               getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL,
+               getenv("DS4_METAL_MPP_MOE_MULADD") != NULL,
+               getenv("DS4_METAL_MPP_MOE_K16") != NULL);
+        snprintf(label, sizeof(label), "layer%u_cpu_q8K_vs_f32", il);
+        cmp_ok &= glm_metal_compare_f32(label, cpu_moe, cpu_q8_moe,
+                                        n_tokens * DS4_N_EMBD, 5.0f) != 0;
+        snprintf(label, sizeof(label), "layer%u_gpu_vs_cpu_f32", il);
+        /* Half- and fp32-staged GPU routes measure max_abs ~1.9e-3 and
+         * ~8e-4; anything q8_K-class (1e-2) or worse is a regression. */
+        cmp_ok &= glm_metal_compare_f32(label, cpu_moe, gpu_read,
+                                        n_tokens * DS4_N_EMBD, 5.0e-3f) != 0;
+    }
+
+    ds4_gpu_tensor_free(scr_down);
+    ds4_gpu_tensor_free(scr_up);
+    ds4_gpu_tensor_free(scr_gate);
+    ds4_gpu_tensor_free(tn_selw);
+    ds4_gpu_tensor_free(tn_sel);
+    ds4_gpu_tensor_free(tn_mid);
+    ds4_gpu_tensor_free(tn_out);
+    ds4_gpu_tensor_free(tn_x);
+    free(selw);
+    free(sel);
+    free(gpu_read);
+    free(cpu_mid);
+    free(cpu_q8_moe);
+    free(cpu_moe);
+    free(x);
+    return (ok && cmp_ok) ? 0 : 1;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: MoE ground-truth test requested but this build has no graph backend support\n");
     return 1;
 #endif
 }
