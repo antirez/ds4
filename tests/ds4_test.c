@@ -6120,35 +6120,62 @@ static void test_metal_moe_ground_truth(void) {
     char *saved_f32stage = test_save_env("DS4_METAL_MOE_F32STAGE");
     char *saved_muladd = test_save_env("DS4_METAL_MPP_MOE_MULADD");
     char *saved_mpp_f32stage = test_save_env("DS4_METAL_MPP_MOE_F32STAGE");
+    char *saved_mpp_w32stage = test_save_env("DS4_METAL_MPP_MOE_W32STAGE");
+    char *saved_mpp_a32stage = test_save_env("DS4_METAL_MPP_MOE_A32STAGE");
 
-    static const char *const arm_names[5] =
-        {"legacy", "auto", "f32stage", "muladd", "mpp-f32stage"};
-    for (int a = 0; a < 5; a++) {
+    static const char *const arm_names[7] =
+        {"legacy", "auto", "f32stage", "muladd", "mpp-f32stage",
+         "mpp-w32stage", "mpp-a32stage"};
+    for (int a = 0; a < 7; a++) {
         if (a == 0) {            /* legacy simdgroup reference route */
             setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
             unsetenv("DS4_METAL_MOE_F32STAGE");
             unsetenv("DS4_METAL_MPP_MOE_MULADD");
             unsetenv("DS4_METAL_MPP_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_W32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_A32STAGE");
         } else if (a == 1) {     /* shipped MPP tensor route */
             unsetenv("DS4_METAL_DISABLE_METAL4");
             unsetenv("DS4_METAL_MOE_F32STAGE");
             unsetenv("DS4_METAL_MPP_MOE_MULADD");
             unsetenv("DS4_METAL_MPP_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_W32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_A32STAGE");
         } else if (a == 2) {     /* legacy engine, fp32-staged operands */
             setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
             setenv("DS4_METAL_MOE_F32STAGE", "1", 1);
             unsetenv("DS4_METAL_MPP_MOE_MULADD");
             unsetenv("DS4_METAL_MPP_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_W32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_A32STAGE");
         } else if (a == 3) {     /* MPP with mode::multiply + explicit adds */
             unsetenv("DS4_METAL_DISABLE_METAL4");
             unsetenv("DS4_METAL_MOE_F32STAGE");
             setenv("DS4_METAL_MPP_MOE_MULADD", "1", 1);
             unsetenv("DS4_METAL_MPP_MOE_F32STAGE");
-        } else {                 /* MPP accumulate route, fp32-staged tiles */
+            unsetenv("DS4_METAL_MPP_MOE_W32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_A32STAGE");
+        } else if (a == 4) {     /* MPP accumulate route, fp32-staged tiles */
             unsetenv("DS4_METAL_DISABLE_METAL4");
             unsetenv("DS4_METAL_MOE_F32STAGE");
             unsetenv("DS4_METAL_MPP_MOE_MULADD");
             setenv("DS4_METAL_MPP_MOE_F32STAGE", "1", 1);
+            unsetenv("DS4_METAL_MPP_MOE_W32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_A32STAGE");
+        } else if (a == 5) {     /* MPP, fp32 weight tile / binary16 act tile */
+            unsetenv("DS4_METAL_DISABLE_METAL4");
+            unsetenv("DS4_METAL_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_MULADD");
+            unsetenv("DS4_METAL_MPP_MOE_F32STAGE");
+            setenv("DS4_METAL_MPP_MOE_W32STAGE", "1", 1);
+            unsetenv("DS4_METAL_MPP_MOE_A32STAGE");
+        } else {                 /* MPP, binary16 weight tile / fp32 act tile */
+            unsetenv("DS4_METAL_DISABLE_METAL4");
+            unsetenv("DS4_METAL_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_MULADD");
+            unsetenv("DS4_METAL_MPP_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_W32STAGE");
+            setenv("DS4_METAL_MPP_MOE_A32STAGE", "1", 1);
         }
         fprintf(stderr, "ds4-test: MoE ground-truth arm=%s\n", arm_names[a]);
         ds4_engine *engine = test_open_engine(false);
@@ -6161,6 +6188,8 @@ static void test_metal_moe_ground_truth(void) {
         TEST_ASSERT(rc == 0);
     }
 
+    test_restore_env("DS4_METAL_MPP_MOE_A32STAGE", saved_mpp_a32stage);
+    test_restore_env("DS4_METAL_MPP_MOE_W32STAGE", saved_mpp_w32stage);
     test_restore_env("DS4_METAL_MPP_MOE_F32STAGE", saved_mpp_f32stage);
     test_restore_env("DS4_METAL_MPP_MOE_MULADD", saved_muladd);
     test_restore_env("DS4_METAL_MOE_F32STAGE", saved_f32stage);

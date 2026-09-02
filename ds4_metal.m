@@ -29983,11 +29983,18 @@ static int ds4_gpu_routed_mm_mpp_mask(void) {
 }
 
 /* Threadgroup tile budget for the routed-MoE mm_id kernels.  Half-staged
- * tiles need 8 KiB; the DS4_METAL_MOE_F32STAGE and DS4_METAL_MPP_MOE_F32STAGE
- * measurement routes stage both operands as fp32 and need 12 KiB. */
+ * tiles need 8 KiB.  The fp32-staged measurement routes need more: both
+ * operands fp32 12 KiB, weight-only fp32 10 KiB (8192+2048), activation-
+ * only fp32 8 KiB (the staged tile offsets are type-aware via SA_BYTES). */
 static NSUInteger ds4_gpu_mm_id_moe_threadgroup_bytes(void) {
-    return (getenv("DS4_METAL_MOE_F32STAGE") != NULL ||
-            getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL) ? 12288u : 8192u;
+    if (getenv("DS4_METAL_MOE_F32STAGE") != NULL ||
+        getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL) {
+        return 12288u;
+    }
+    if (getenv("DS4_METAL_MPP_MOE_W32STAGE") != NULL) {
+        return 10240u;
+    }
+    return 8192u;
 }
 
 static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
@@ -41409,10 +41416,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         if (getenv("DS4_METAL_MOE_ROUTE_DEBUG")) {
             fprintf(stderr,
-                    "ds4: [moe-route] layer=%u n_tokens=%u mm_id=%d addr=%d q4tbl=%d mpp_f32stage=%d\n",
+                    "ds4: [moe-route] layer=%u n_tokens=%u mm_id=%d addr=%d q4tbl=%d mpp_f32stage=%d mpp_w32stage=%d mpp_a32stage=%d\n",
                     layer_index, n_tokens, use_mm_id, use_iq2_batch_selected_addr,
                     use_q4_batch_expert_table,
-                    getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL);
+                    getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL,
+                    getenv("DS4_METAL_MPP_MOE_W32STAGE") != NULL,
+                    getenv("DS4_METAL_MPP_MOE_A32STAGE") != NULL);
         }
         /*
          * MTP verification is neither normal decode nor large prefill: the
@@ -41617,15 +41626,20 @@ int ds4_gpu_routed_moe_batch_tensor(
              * TensorOps accumulate drift.  DS4_METAL_MPP_MOE_F32STAGE=1 keeps
              * the accumulate route but stages the operand tiles as fp32
              * (measured ~2.5x tighter than binary16 staging vs the exact CPU
-             * reference).  Not shipped defaults. */
+             * reference); DS4_METAL_MPP_MOE_W32STAGE/A32STAGE stage only the
+             * weight/activation tile fp32.  Not shipped defaults. */
             const bool mpp_muladd = getenv("DS4_METAL_MPP_MOE_MULADD") != NULL;
             const bool mpp_k16 = getenv("DS4_METAL_MPP_MOE_K16") != NULL;
             const bool mpp_f32stage = getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL;
+            const bool mpp_w32stage = getenv("DS4_METAL_MPP_MOE_W32STAGE") != NULL;
+            const bool mpp_a32stage = getenv("DS4_METAL_MPP_MOE_A32STAGE") != NULL;
             if (mpp_mask && gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
                 const char *gate_fn =
                     mpp_k16 ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd_k16" :
                     mpp_muladd ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd" :
                     mpp_f32stage ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_f32stage" :
+                    mpp_w32stage ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_w32stage" :
+                    mpp_a32stage ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_a32stage" :
                     "kernel_mul_mm_id_iq2_xxs_f32_mpp";
                 id<MTLComputePipelineState> mpp =
                     ds4_gpu_get_mul_mm_id_pipeline(gate_fn, false);
@@ -41641,10 +41655,14 @@ int ds4_gpu_routed_moe_batch_tensor(
                         (mpp_k16 ? "kernel_mul_mm_id_q2_K_f16_mpp_muladd_k16" :
                          mpp_muladd ? "kernel_mul_mm_id_q2_K_f16_mpp_muladd" :
                          mpp_f32stage ? "kernel_mul_mm_id_q2_K_f16_mpp_f32stage" :
+                         mpp_w32stage ? "kernel_mul_mm_id_q2_K_f16_mpp_w32stage" :
+                         mpp_a32stage ? "kernel_mul_mm_id_q2_K_f16_mpp_a32stage" :
                          "kernel_mul_mm_id_q2_K_f16_mpp") :
                         (mpp_k16 ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd_k16" :
                          mpp_muladd ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd" :
                          mpp_f32stage ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_f32stage" :
+                         mpp_w32stage ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_w32stage" :
+                         mpp_a32stage ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_a32stage" :
                          "kernel_mul_mm_id_iq2_xxs_f16_mpp");
                 id<MTLComputePipelineState> mpp =
                     ds4_gpu_get_mul_mm_id_pipeline(down_fn, false);
