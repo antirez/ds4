@@ -41586,16 +41586,20 @@ int ds4_gpu_routed_moe_batch_tensor(
                     ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
                     ds4_gpu_routed_mm_pipeline(down_type);
             const int mpp_mask = ds4_gpu_routed_mm_mpp_mask();
-            /* Experimental precision route: DS4_METAL_MPP_MOE_MULADD=1 swaps
+            /* Experimental precision routes: DS4_METAL_MPP_MOE_MULADD=1 swaps
              * the routed-MoE MPP kernels for the mode::multiply + explicit
-             * fp32-add variants, to localize the M5 TensorOps accumulate
-             * drift.  Not a shipped configuration. */
+             * fp32-add variants; DS4_METAL_MPP_MOE_K16=1 further splits each
+             * staged K tile into two K=16 op runs.  Both localize the M5
+             * TensorOps accumulate drift.  Not a shipped configuration. */
             const bool mpp_muladd = getenv("DS4_METAL_MPP_MOE_MULADD") != NULL;
+            const bool mpp_k16 = getenv("DS4_METAL_MPP_MOE_K16") != NULL;
             if (mpp_mask && gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
-                id<MTLComputePipelineState> mpp = ds4_gpu_get_mul_mm_id_pipeline(
-                    mpp_muladd ?
-                        "kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd" :
-                        "kernel_mul_mm_id_iq2_xxs_f32_mpp", false);
+                const char *gate_fn =
+                    mpp_k16 ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd_k16" :
+                    mpp_muladd ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd" :
+                    "kernel_mul_mm_id_iq2_xxs_f32_mpp";
+                id<MTLComputePipelineState> mpp =
+                    ds4_gpu_get_mul_mm_id_pipeline(gate_fn, false);
                 if (mpp) {
                     if (mpp_mask & 1) gate_mm_pipeline = mpp;
                     if (mpp_mask & 2) up_mm_pipeline = mpp;
@@ -41603,14 +41607,16 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
             if ((mpp_mask & 4) && request_mid_f16 &&
                 (down_type == DS4_METAL_TENSOR_Q2_K || down_type == DS4_METAL_TENSOR_IQ2_XXS)) {
-                id<MTLComputePipelineState> mpp = ds4_gpu_get_mul_mm_id_pipeline(
+                const char *down_fn =
                     down_type == DS4_METAL_TENSOR_Q2_K ?
-                        (mpp_muladd ?
-                            "kernel_mul_mm_id_q2_K_f16_mpp_muladd" :
-                            "kernel_mul_mm_id_q2_K_f16_mpp") :
-                        (mpp_muladd ?
-                            "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd" :
-                            "kernel_mul_mm_id_iq2_xxs_f16_mpp"), false);
+                        (mpp_k16 ? "kernel_mul_mm_id_q2_K_f16_mpp_muladd_k16" :
+                         mpp_muladd ? "kernel_mul_mm_id_q2_K_f16_mpp_muladd" :
+                         "kernel_mul_mm_id_q2_K_f16_mpp") :
+                        (mpp_k16 ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd_k16" :
+                         mpp_muladd ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd" :
+                         "kernel_mul_mm_id_iq2_xxs_f16_mpp");
+                id<MTLComputePipelineState> mpp =
+                    ds4_gpu_get_mul_mm_id_pipeline(down_fn, false);
                 if (mpp) down_mm_pipeline = mpp;
             }
             if (use_mm_id_pair_swiglu) {

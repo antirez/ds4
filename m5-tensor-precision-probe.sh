@@ -53,7 +53,11 @@ for pf in "$OUT/p250.txt" "$OUT/p1500.txt"; do
     run_dump reference  "DS4_METAL_DISABLE_METAL4=1" "$pf"
     run_dump accumulate ""                         "$pf"
     run_dump muladd     "DS4_METAL_MPP_MOE_MULADD=1" "$pf"
+    run_dump k16        "DS4_METAL_MPP_MOE_K16=1"    "$pf"
 done
+
+# fast-math lowering check on the shipped accumulate route (env only)
+run_dump mathsafe "DS4_METAL_MATH_SAFE=1" "$OUT/p250.txt"
 
 echo
 echo "== results (vs reference; max |logit delta| over common top-k, argmax match) =="
@@ -75,7 +79,7 @@ def compare(a_path, b_path):
 for stem in ("p250", "p1500"):
     ref = os.path.join(out, f"reference_{stem}.json")
     row = [stem]
-    for label in ("accumulate", "muladd"):
+    for label in ("accumulate", "muladd", "k16"):
         p = os.path.join(out, f"{label}_{stem}.json")
         if not os.path.exists(p):
             row.append(f"{label}: MISSING"); continue
@@ -83,9 +87,19 @@ for stem in ("p250", "p1500"):
         verdict = "MATCH" if (maxd == 0 and div == 0) else ("close" if maxd < 0.01 else "DRIFT")
         row.append(f"{label}: max|d|={maxd:.6g} argmax_div={div}/{n} [{verdict}]")
     print("  ".join(row))
+
+ref = os.path.join(out, "reference_p250.json")
+p = os.path.join(out, "mathsafe_p250.json")
+if os.path.exists(ref) and os.path.exists(p):
+    maxd, div, n = compare(ref, p)
+    verdict = "MATCH" if (maxd == 0 and div == 0) else ("close" if maxd < 0.01 else "DRIFT")
+    print(f"p250  mathsafe: max|d|={maxd:.6g} argmax_div={div}/{n} [{verdict}]")
 EOF
 echo
 echo "Verdict guide:"
 echo "  muladd MATCH + accumulate DRIFT -> cross-tile accumulate is the loss; explicit-add schedule is a viable kernel fix."
-echo "  both DRIFT                    -> per-tile product is lossy; keep the tensor route withheld."
+echo "  k16 ~ 2x muladd drift           -> per-op-run truncation; larger K tiles reduce it but parity needs huge K."
+echo "  k16 ~ muladd drift              -> per-multiply/per-add internal precision; not fixable from MSL."
+echo "  mathsafe MATCH                  -> shader fast-math lowering was the loss."
+echo "  all DRIFT                       -> keep the tensor route withheld."
 echo "Raw dumps and logs: $OUT"
