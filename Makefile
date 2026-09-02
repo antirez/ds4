@@ -570,6 +570,12 @@ tests/bench_q8_krow_rocm.o: tests/bench_q8_krow_rocm.c ds4_gpu.h
 
 tests/bench_q8_krow_rocm: tests/bench_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+tests/bench_matvec_poc_rocm.o: tests/bench_matvec_poc_rocm.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/bench_matvec_poc_rocm: tests/bench_matvec_poc_rocm.o ds4_rocm.o ds4_rocm_compat.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h ds4_rocm_memory.h ds4_linux_memory.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 
