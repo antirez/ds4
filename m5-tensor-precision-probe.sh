@@ -16,7 +16,9 @@ LOCK=${DS4_LOCK_FILE:-/tmp/ds4.lock}
 wait_lock() {
     i=0
     while [ $i -lt 90 ]; do
-        flock -n "$LOCK" true 2>/dev/null && return 0
+        if /usr/bin/python3 -c "import fcntl,sys; fcntl.flock(open('$LOCK','a'), fcntl.LOCK_EX|fcntl.LOCK_NB)" 2>/dev/null; then
+            return 0
+        fi
         [ $i -eq 0 ] && echo "waiting for ds4 instance lock ($LOCK)..."
         sleep 10; i=$((i+1))
     done
