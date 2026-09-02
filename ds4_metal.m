@@ -5469,7 +5469,9 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
         NSUInteger                  src1_off,
         id<MTLBuffer>               dst,
         NSUInteger                  dst_off,
-        NSUInteger                  threadgroup_bytes);
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  threads_per_tg,
+        NSUInteger                  nr0_tile);
 static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> mm_pipeline,
@@ -29985,7 +29987,8 @@ static int ds4_gpu_routed_mm_mpp_mask(void) {
 /* Threadgroup tile budget for the routed-MoE mm_id kernels.  Half-staged
  * tiles need 8 KiB.  The fp32-staged measurement routes need more: both
  * operands fp32 12 KiB, weight-only fp32 10 KiB (8192+2048), activation-
- * only fp32 8 KiB (the staged tile offsets are type-aware via SA_BYTES). */
+ * only fp32 8 KiB (the staged tile offsets are type-aware via SA_BYTES).
+ * The deep-K half-staged tile stages NK=64 columns (8192+4096 = 12 KiB). */
 static NSUInteger ds4_gpu_mm_id_moe_threadgroup_bytes(void) {
     if (getenv("DS4_METAL_MOE_F32STAGE") != NULL ||
         getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL) {
@@ -29993,6 +29996,10 @@ static NSUInteger ds4_gpu_mm_id_moe_threadgroup_bytes(void) {
     }
     if (getenv("DS4_METAL_MPP_MOE_W32STAGE") != NULL) {
         return 10240u;
+    }
+    if (getenv("DS4_METAL_MPP_MOE_TILE") != NULL &&
+        strcmp(getenv("DS4_METAL_MPP_MOE_TILE"), "deepk") == 0) {
+        return 12288u;
     }
     return 8192u;
 }
@@ -31506,7 +31513,9 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
         NSUInteger                  src1_off,
         id<MTLBuffer>               dst,
         NSUInteger                  dst_off,
-        NSUInteger                  threadgroup_bytes) {
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  threads_per_tg,
+        NSUInteger                  nr0_tile) {
     if (!cb || !mm_pipeline || !mm_args || !src0 || !src1 || !dst ||
         !g_moe_id_map_buffer ||
         mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
@@ -31556,9 +31565,9 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
     }
     [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
-                                          ((NSUInteger)mm_args->ne0 + 63u) / 64u,
+                                          ((NSUInteger)mm_args->ne0 + (nr0_tile - 1u)) / nr0_tile,
                                           1)
-         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+     threadsPerThreadgroup:MTLSizeMake(threads_per_tg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -31708,7 +31717,9 @@ static int ds4_gpu_encode_mul_mm_id_mapped(
                                                   src1_off,
                                                   dst,
                                                   dst_off,
-                                                  8192u);
+                                                  8192u,
+                                                  128u,
+                                                  64u);
 }
 
 static int ds4_gpu_encode_attn_out_low_mpp(
@@ -37200,7 +37211,9 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        ds4_gpu_tensor_offset(x),
                                                        g_moe_gate_scratch_buffer,
                                                        0,
-                                                       mm_id_threadgroup_bytes);
+                                                       mm_id_threadgroup_bytes,
+                                                       128u,
+                                                       64u);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("gate");
         if (ok) {
@@ -37213,7 +37226,9 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        ds4_gpu_tensor_offset(x),
                                                        g_moe_gate_scratch_buffer,
                                                        (NSUInteger)gate_scratch_bytes,
-                                                       mm_id_threadgroup_bytes);
+                                                       mm_id_threadgroup_bytes,
+                                                       128u,
+                                                       64u);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("up");
         if (ok) {
@@ -37245,7 +37260,9 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        ds4_gpu_tensor_offset(mid),
                                                        down_dst,
                                                        down_dst_off,
-                                                       mm_id_threadgroup_bytes);
+                                                       mm_id_threadgroup_bytes,
+                                                       128u,
+                                                       64u);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("down");
         if (ok && n_expert > 1) {
@@ -41414,14 +41431,20 @@ int ds4_gpu_routed_moe_batch_tensor(
             !use_iq2_batch_selected_addr &&
             n_tokens >= 32u &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
+        /* Threadgroup width for the routed mm_id tile dispatch.  Only the
+         * deep-K MPP tile variant (8 simdgroups) needs 256; the override
+         * block below raises this when its deep-K pipelines engage. */
+        NSUInteger mpp_tile_threads = 128u;
         if (getenv("DS4_METAL_MOE_ROUTE_DEBUG")) {
             fprintf(stderr,
-                    "ds4: [moe-route] layer=%u n_tokens=%u mm_id=%d addr=%d q4tbl=%d mpp_f32stage=%d mpp_w32stage=%d mpp_a32stage=%d\n",
+                    "ds4: [moe-route] layer=%u n_tokens=%u mm_id=%d addr=%d q4tbl=%d mpp_f32stage=%d mpp_w32stage=%d mpp_a32stage=%d mpp_tile=%s threads=%zu\n",
                     layer_index, n_tokens, use_mm_id, use_iq2_batch_selected_addr,
                     use_q4_batch_expert_table,
                     getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL,
                     getenv("DS4_METAL_MPP_MOE_W32STAGE") != NULL,
-                    getenv("DS4_METAL_MPP_MOE_A32STAGE") != NULL);
+                    getenv("DS4_METAL_MPP_MOE_A32STAGE") != NULL,
+                    getenv("DS4_METAL_MPP_MOE_TILE") ? getenv("DS4_METAL_MPP_MOE_TILE") : "-",
+                    (size_t)mpp_tile_threads);
         }
         /*
          * MTP verification is neither normal decode nor large prefill: the
@@ -41581,6 +41604,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_down_half_lut_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT) != 0u);
+        /* Threadgroup width for the routed mm_id tile dispatch.  Only the
+         * deep-K MPP tile variant (8 simdgroups) needs 256. */
         if (use_mm_id) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
@@ -41633,6 +41658,15 @@ int ds4_gpu_routed_moe_batch_tensor(
             const bool mpp_f32stage = getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL;
             const bool mpp_w32stage = getenv("DS4_METAL_MPP_MOE_W32STAGE") != NULL;
             const bool mpp_a32stage = getenv("DS4_METAL_MPP_MOE_A32STAGE") != NULL;
+            /* DS4_METAL_MPP_MOE_TILE=deepk swaps in the NK=64 / 8-simdgroup
+             * half-staged tile (256 dispatch threads); TILE=sg8 probes the
+             * shipped 64x32x32 tile across 8 simdgroups.  Only applies when
+             * no explicit staging/muladd override picked different kernels. */
+            const char *mpp_tile = getenv("DS4_METAL_MPP_MOE_TILE");
+            const bool mpp_deepk = mpp_tile != NULL && strcmp(mpp_tile, "deepk") == 0 &&
+                !mpp_muladd && !mpp_k16 && !mpp_f32stage && !mpp_w32stage && !mpp_a32stage;
+            const bool mpp_sg8 = mpp_tile != NULL && strcmp(mpp_tile, "sg8") == 0 &&
+                !mpp_muladd && !mpp_k16 && !mpp_f32stage && !mpp_w32stage && !mpp_a32stage;
             if (mpp_mask && gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
                 const char *gate_fn =
                     mpp_k16 ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd_k16" :
@@ -41640,12 +41674,20 @@ int ds4_gpu_routed_moe_batch_tensor(
                     mpp_f32stage ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_f32stage" :
                     mpp_w32stage ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_w32stage" :
                     mpp_a32stage ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_a32stage" :
+                    mpp_deepk ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_deepk" :
+                    mpp_sg8 ? "kernel_mul_mm_id_iq2_xxs_f32_mpp_8sg" :
                     "kernel_mul_mm_id_iq2_xxs_f32_mpp";
                 id<MTLComputePipelineState> mpp =
                     ds4_gpu_get_mul_mm_id_pipeline(gate_fn, false);
                 if (mpp) {
                     if (mpp_mask & 1) gate_mm_pipeline = mpp;
                     if (mpp_mask & 2) up_mm_pipeline = mpp;
+                    mpp_tile_threads = (mpp_deepk || mpp_sg8) ? 256u : 128u;
+                    if (getenv("DS4_METAL_MOE_ROUTE_DEBUG")) {
+                        fprintf(stderr,
+                                "ds4: [moe-route] mpp gate/up override fn=%s threads=%zu\n",
+                                gate_fn, (size_t)mpp_tile_threads);
+                    }
                 }
             }
             if ((mpp_mask & 4) && request_mid_f16 &&
@@ -41657,12 +41699,16 @@ int ds4_gpu_routed_moe_batch_tensor(
                          mpp_f32stage ? "kernel_mul_mm_id_q2_K_f16_mpp_f32stage" :
                          mpp_w32stage ? "kernel_mul_mm_id_q2_K_f16_mpp_w32stage" :
                          mpp_a32stage ? "kernel_mul_mm_id_q2_K_f16_mpp_a32stage" :
+                         mpp_deepk ? "kernel_mul_mm_id_q2_K_f16_mpp_deepk" :
+                         mpp_sg8 ? "kernel_mul_mm_id_q2_K_f16_mpp_8sg" :
                          "kernel_mul_mm_id_q2_K_f16_mpp") :
                         (mpp_k16 ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd_k16" :
                          mpp_muladd ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd" :
                          mpp_f32stage ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_f32stage" :
                          mpp_w32stage ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_w32stage" :
                          mpp_a32stage ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_a32stage" :
+                         mpp_deepk ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_deepk" :
+                         mpp_sg8 ? "kernel_mul_mm_id_iq2_xxs_f16_mpp_8sg" :
                          "kernel_mul_mm_id_iq2_xxs_f16_mpp");
                 id<MTLComputePipelineState> mpp =
                     ds4_gpu_get_mul_mm_id_pipeline(down_fn, false);
@@ -42088,7 +42134,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                            ds4_gpu_tensor_offset(x),
                                                            gatebuf,
                                                            ds4_gpu_tensor_offset(gate),
-                                                           ds4_gpu_mm_id_moe_threadgroup_bytes());
+                                                           ds4_gpu_mm_id_moe_threadgroup_bytes(),
+                                                           mpp_tile_threads,
+                                                           64u);
                 DS4_METAL_PROFILE_MOE_STAGE("gate");
             }
             if (ok && !use_mm_id_pair_swiglu) {
@@ -42101,7 +42149,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                    ds4_gpu_tensor_offset(x),
                                                    upbuf,
                                                    ds4_gpu_tensor_offset(up),
-                                                   ds4_gpu_mm_id_moe_threadgroup_bytes());
+                                                   ds4_gpu_mm_id_moe_threadgroup_bytes(),
+                                                   mpp_tile_threads,
+                                                   64u);
                 DS4_METAL_PROFILE_MOE_STAGE("up");
             }
         } else if (use_tiny_pair_swiglu) {
@@ -42365,7 +42415,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        ds4_gpu_tensor_offset(mid),
                                                        down_dst,
                                                        down_dst_off,
-                                                       ds4_gpu_mm_id_moe_threadgroup_bytes());
+                                                       ds4_gpu_mm_id_moe_threadgroup_bytes(),
+                                                       mpp_tile_threads,
+                                                       64u);
             } else {
                 ok = ds4_gpu_encode_mul_mv_id(cb,
                                                      down_mv_pipeline,

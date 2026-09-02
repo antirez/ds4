@@ -8903,7 +8903,12 @@ kernel void kernel_attn_out_low_mpp_direct_rhs(
 // Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline. The
 // barrier after mm.run prevents the next K iteration from replacing staged
 // tiles while the cooperative matmul still reads them.
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+//
+// T_NSG is the cooperating simdgroup count (tile threads = 32*T_NSG). The
+// staging index math below requires T_NR0*T_NK/16 == T_NR1*T_NK/8 == 32*T_NSG
+// (i.e. T_NR0 == 2*T_NR1) so both operand tiles exactly cover the
+// threadgroup; 64/32/32 with 4 simdgroups is the shipped shape.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, int T_NSG, int T_NR0, int T_NR1, int T_NK>
 kernel void kernel_mul_mm_id_mpp(
         constant ds4_metal_args_mul_mm_id & args,
         device const char * src0,
@@ -8917,9 +8922,9 @@ kernel void kernel_mul_mm_id_mpp(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
-    constexpr int NK  = 32;
+    constexpr int NR0 = T_NR0;
+    constexpr int NR1 = T_NR1;
+    constexpr int NK  = T_NK;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
     constexpr int SA_BYTES = NK * NR0 * (int)sizeof(S0);
@@ -8995,7 +9000,7 @@ kernel void kernel_mul_mm_id_mpp(
     matmul2d<
         matmul2d_descriptor(NR1, NR0, NK, false, true, false,
             matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<4>> mm;
+        execution_simdgroups<T_NSG>> mm;
 
     auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
@@ -9054,8 +9059,12 @@ kernel void kernel_mul_mm_id_mpp(
                 (S1_2x4)(*((device T1_2x4 *) y));
         }
 
-        il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        /* Advance the dequant group by the tile's per-thread group stride
+         * NL0 so group == (loop_k/16 + il0) mod nl; wrap below NL0 marks the
+         * next weight block row.  NK=32 reduces this to the historical
+         * +2 / %2 / <2 form. */
+        il = (il + NL0 < nl) ? il + NL0 : il % NL0;
+        x  = (il < NL0) ? x + (2 + nl - 1)/nl : x;
 
         y += NK;
 
@@ -9543,23 +9552,27 @@ kernel void kernel_mul_mm_id_mpp_muladd(
 }
 
 
-typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_t;
-typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_f16_rhs_t;
+/* Tile geometry is <simdgroups, NR0, NR1, NK>.  4/64/32/32 is the shipped
+ * shape; _mpp_deepk doubles the staged K depth (64) under 8 simdgroups,
+ * halving the per-row barrier/matmul iterations at the same threadgroup
+ * count and tile coverage.  Selected via DS4_METAL_MPP_MOE_TILE=deepk. */
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, 4, 64, 32, 32>) mul_mm_id_mpp_t;
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>) mul_mm_id_mpp_f16_rhs_t;
 
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp")]] kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp")]]    kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp")]] kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp")]] kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp")]]    kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp")]] kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4, 4, 64, 32, 32>;
 
 /* F32-staged MPP variants: same TensorOps route, but the threadgroup operand
  * tiles are staged as fp32 instead of binary16, removing the half-rounding
  * of both operands (measured ~2.5x tighter vs the exact CPU f32 reference).
  * Selected via DS4_METAL_MPP_MOE_F32STAGE=1. */
-typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_f32stage_t;
-typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_f32stage_f16_rhs_t;
+typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, 4, 64, 32, 32>) mul_mm_id_mpp_f32stage_t;
+typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>) mul_mm_id_mpp_f32stage_f16_rhs_t;
 
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_f32stage")]] kernel mul_mm_id_mpp_f32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_f32stage")]]    kernel mul_mm_id_mpp_f32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_f32stage")]] kernel mul_mm_id_mpp_f32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_f32stage")]] kernel mul_mm_id_mpp_f32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_f32stage")]]    kernel mul_mm_id_mpp_f32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_f32stage")]] kernel mul_mm_id_mpp_f32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4, 4, 64, 32, 32>;
 
 /* Mixed-staging MPP variants: stage only one operand tile as fp32.
  * _w32stage stages the dequantized weight tile fp32 and the activation tile
@@ -9568,18 +9581,41 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_f32stage")]] kernel mul_m
  * it recovers most of the f32stage accuracy at a smaller threadgroup
  * footprint.  If matmul2d rejects mixed operand element types these fail
  * at pipeline creation and the route falls back to the staged default. */
-typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_w32stage_t;
-typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_w32stage_f16_rhs_t;
-typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_a32stage_t;
-typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_a32stage_f16_rhs_t;
+typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, 4, 64, 32, 32>) mul_mm_id_mpp_w32stage_t;
+typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>) mul_mm_id_mpp_w32stage_f16_rhs_t;
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, 4, 64, 32, 32>) mul_mm_id_mpp_a32stage_t;
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>) mul_mm_id_mpp_a32stage_f16_rhs_t;
 
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_w32stage")]] kernel mul_mm_id_mpp_w32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_w32stage")]]    kernel mul_mm_id_mpp_w32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_w32stage")]] kernel mul_mm_id_mpp_w32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_w32stage")]] kernel mul_mm_id_mpp_w32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_w32stage")]]    kernel mul_mm_id_mpp_w32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_w32stage")]] kernel mul_mm_id_mpp_w32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4, 4, 64, 32, 32>;
 
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_a32stage")]] kernel mul_mm_id_mpp_a32stage_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_a32stage")]]    kernel mul_mm_id_mpp_a32stage_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
-template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_a32stage")]] kernel mul_mm_id_mpp_a32stage_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_a32stage")]] kernel mul_mm_id_mpp_a32stage_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_a32stage")]]    kernel mul_mm_id_mpp_a32stage_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 4, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_a32stage")]] kernel mul_mm_id_mpp_a32stage_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4, 4, 64, 32, 32>;
+
+/* Deep-K half-staged tile: same 64x32 output tile as the shipped shape but
+ * NK=64 under 8 simdgroups (256 threads).  KNOWN-BROKEN on M5 Max: the
+ * cooperative matmul2d mis-executes at K=64 (GT vs exact CPU f32 shows
+ * rms ~0.8 with sign flips, while the shipped K=32 shape passes at both 4
+ * and 8 simdgroups).  Kept as a canary -- if a driver update fixes K=64
+ * matmul2d, this arm starts passing --metal-moe-ground-truth and the
+ * deeper-K tile becomes tunable.  DS4_METAL_MPP_MOE_TILE=deepk. */
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, 8, 64, 32, 64>) mul_mm_id_mpp_deepk_t;
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 8, 64, 32, 64>) mul_mm_id_mpp_deepk_f16_rhs_t;
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_deepk")]] kernel mul_mm_id_mpp_deepk_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, 8, 64, 32, 64>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_deepk")]]    kernel mul_mm_id_mpp_deepk_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 8, 64, 32, 64>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_deepk")]] kernel mul_mm_id_mpp_deepk_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4, 8, 64, 32, 64>;
+
+/* Probe: shipped 64x32x32 tile but cooperatively executed across 8
+ * simdgroups (256 threads).  Isolates whether the 8-simdgroup cooperative
+ * matmul2d path is correct at all; every other kernel in the tree uses 4. */
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, 8, 64, 32, 32>) mul_mm_id_mpp_8sg_t;
+typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 8, 64, 32, 32>) mul_mm_id_mpp_8sg_f16_rhs_t;
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_8sg")]] kernel mul_mm_id_mpp_8sg_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, 8, 64, 32, 32>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_8sg")]]    kernel mul_mm_id_mpp_8sg_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4, 8, 64, 32, 32>;
 
 typedef decltype(kernel_mul_mm_id_mpp_muladd<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_muladd_t;
 typedef decltype(kernel_mul_mm_id_mpp_muladd<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_muladd_f16_rhs_t;
