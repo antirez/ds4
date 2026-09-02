@@ -9105,6 +9105,7 @@ kernel void kernel_mul_mm_id_mpp(
  * count on the same data.  If the M5 drift scales with the number of tensor
  * op runs (per-run result truncation), this variant drifts about twice as
  * much as kernel_mul_mm_id_mpp_muladd. */
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id_mpp_muladd_k16(
         constant ds4_metal_args_mul_mm_id & args,
         device const char * src0,
@@ -9283,7 +9284,9 @@ kernel void kernel_mul_mm_id_mpp_muladd_k16(
                 cTk[i] = 0.0f;
             }
         }
-        mm.run(sB.slice(0, NK/2), sA.slice(NK/2, 0), cTk);
+        auto sB_hi = sB.slice(0, NK/2);
+        auto sA_hi = sA.slice(NK/2, 0);
+        mm.run(sB_hi, sA_hi, cTk);
         #pragma unroll
         for (uint16_t i = 0; i < cTk.get_capacity(); ++i) {
             if (cTk.is_valid_element(i)) {
@@ -9558,6 +9561,7 @@ typedef decltype(kernel_mul_mm_id_mpp_muladd_k16<half, half4x4, simdgroup_half8x
 
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_muladd_k16")]] kernel mul_mm_id_mpp_muladd_k16_t kernel_mul_mm_id_mpp_muladd_k16<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_muladd_k16")]]    kernel mul_mm_id_mpp_muladd_k16_f16_rhs_t kernel_mul_mm_id_mpp_muladd_k16<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_muladd_k16")]] kernel mul_mm_id_mpp_muladd_k16_f16_rhs_t kernel_mul_mm_id_mpp_muladd_k16<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 
 typedef decltype(kernel_attn_out_low_mpp_direct_rhs<
         block_q8_0, 2, dequantize_q8_0_pairs, 64>)
