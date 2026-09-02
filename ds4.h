@@ -322,6 +322,7 @@ bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
+bool ds4_engine_is_distributed(const ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
@@ -544,6 +545,20 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* Worker-side batched layer-slice decode (L1): N sessions' rows run through
+ * one combined encode of layer_start..layer_end starting from injected
+ * hidden-state rows; row i's logits land in logits_rows + i*vocab when the
+ * slice reaches the output head. Falls back to serial per-session
+ * ds4_session_eval_layer_slice when the batch encoder is unsupported. */
+int ds4_sessions_eval_layer_slice_batch(
+        ds4_decode_item *items,
+        int count,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        const float *input_hc_rows,
+        float *logits_rows,
+        char *err,
+        size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

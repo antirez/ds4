@@ -223,6 +223,19 @@ typedef struct ds4_dist_worker_entry {
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
+/* Shared across the batched-server session slots: the worker registry and
+ * the mutex protecting it must be a single object, not a per-session copy.
+ * The server serializes inference across slots (inference_mu + the prefill
+ * slot gate), so one registry is safe without wire-level demux. */
+typedef struct {
+    pthread_mutex_t mu;
+    ds4_dist_worker_entry *workers;
+    uint64_t next_link_generation;
+    /* Worker set membership epoch: bumped on every connect/remove so every
+     * session sharing this registry revalidates its route plan. */
+    uint64_t generation;
+} ds4_dist_registry;
+
 typedef struct {
     ds4_engine *engine;
     uint32_t model_id;
@@ -240,10 +253,7 @@ typedef struct {
     uint32_t activation_bits;
     ds4_distributed_transport transport_policy;
     const char *nhi_device;
-    uint64_t generation;
-    uint64_t next_link_generation;
-    pthread_mutex_t mu;
-    ds4_dist_worker_entry *workers;
+    ds4_dist_registry *registry;
     bool shutting_down;
 } ds4_dist_coordinator_state;
 
@@ -335,6 +345,7 @@ typedef struct {
     ds4_dist_work_fixed work;
     ds4_transport_bulk_desc bulk_desc;
     int *tokens;
+    uint64_t *row_session_ids;
     void *input_hc_wire;
     ds4_transport_lease *input_lease;
     void *route_blob;
@@ -557,6 +568,7 @@ static int dist_send_work_frame_prepared(
         ds4_transport *transport,
         const ds4_dist_work_fixed *work,
         const int *tokens,
+        const uint64_t *row_session_ids,
         const float *input_hc,
         const void *route_blob,
         const ds4_transport_bulk_desc *prepared_desc,
@@ -586,6 +598,13 @@ static int dist_worker_upstream_init(
         int fd,
         ds4_transport *transport,
         uint32_t selected_caps);
+/* Row-batched decode spans: one WORK carries rows owned by different
+ * coordinator sessions; each row's KV lives in the session plane keyed by
+ * its wire session id, and the whole batch evaluates in one layer pass. */
+static int dist_worker_process_multi_session_work(
+        ds4_dist_worker_state *state,
+        ds4_dist_worker_upstream *upstream,
+        ds4_dist_work_message *message);
 static void dist_worker_upstream_destroy(ds4_dist_worker_upstream *upstream);
 static int dist_worker_upstream_send_work_error(
         ds4_dist_worker_upstream *upstream,
@@ -2102,7 +2121,8 @@ static ds4_dist_v3_hello_ext dist_v3_local_offer(
     offer.protocol_max = DS4_DIST_V3_PROTOCOL_VERSION;
     offer.capabilities = DS4_DIST_V3_CAP_BULK_DESC_V1 |
                          DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
-                         DS4_DIST_V3_CAP_SPEC_EXACT_V1;
+                         DS4_DIST_V3_CAP_SPEC_EXACT_V1 |
+                         DS4_DIST_V3_CAP_MULTI_SESSION_V1;
     offer.transport_policy = policy == DS4_DIST_TRANSPORT_NHI
         ? DS4_DIST_V3_POLICY_REQUIRE_NHI : DS4_DIST_V3_POLICY_AUTO;
     if (nhi) {
@@ -2218,8 +2238,8 @@ static int dist_recv_hello_ready(
 
 static uint64_t dist_coordinator_next_link_generation(
         ds4_dist_coordinator_state *state) {
-    pthread_mutex_lock(&state->mu);
-    if (state->next_link_generation == 0) {
+    pthread_mutex_lock(&state->registry->mu);
+    if (state->registry->next_link_generation == 0) {
         struct timespec realtime;
         struct timespec monotonic;
         clock_gettime(CLOCK_REALTIME, &realtime);
@@ -2231,13 +2251,13 @@ static uint64_t dist_coordinator_next_link_generation(
             ((uint64_t)(uint32_t)getpid() << 7) ^
             (uint64_t)(uintptr_t)state;
         if (seed == 0 || seed == UINT64_MAX) seed = 1;
-        state->next_link_generation = seed;
+        state->registry->next_link_generation = seed;
     }
-    state->next_link_generation++;
-    if (state->next_link_generation == 0)
-        state->next_link_generation = 1;
-    const uint64_t generation = state->next_link_generation;
-    pthread_mutex_unlock(&state->mu);
+    state->registry->next_link_generation++;
+    if (state->registry->next_link_generation == 0)
+        state->registry->next_link_generation = 1;
+    const uint64_t generation = state->registry->next_link_generation;
+    pthread_mutex_unlock(&state->registry->mu);
     return generation;
 }
 
@@ -2487,14 +2507,14 @@ static bool dist_coordinator_add_worker(
         ? ds4_transport_generation(prepared_transport) : 0;
 
     ds4_dist_worker_entry *stale = NULL;
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->registry->mu);
     if (state->shutting_down) {
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->registry->mu);
         ds4_transport_release(entry->transport);
         free(entry);
         return false;
     }
-    ds4_dist_worker_entry **link = &state->workers;
+    ds4_dist_worker_entry **link = &state->registry->workers;
     while (*link) {
         ds4_dist_worker_entry *old = *link;
         if (strcmp(old->peer_host, peer_host) == 0 &&
@@ -2518,10 +2538,10 @@ static bool dist_coordinator_add_worker(
         }
         link = &old->next;
     }
-    entry->next = state->workers;
-    state->workers = entry;
-    state->generation++;
-    pthread_mutex_unlock(&state->mu);
+    entry->next = state->registry->workers;
+    state->registry->workers = entry;
+    state->registry->generation++;
+    pthread_mutex_unlock(&state->registry->mu);
 
     while (stale) {
         ds4_dist_worker_entry *next = stale->next;
@@ -2611,20 +2631,20 @@ static bool dist_route_search_workers(
 
 static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
     if (!dist_coordinator_debug_enabled(state)) return;
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->registry->mu);
     uint32_t n = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) n++;
+    for (ds4_dist_worker_entry *it = state->registry->workers; it; it = it->next) n++;
     ds4_dist_worker_entry **workers = n ? calloc(n, sizeof(workers[0])) : NULL;
     ds4_dist_worker_entry **path = n ? calloc(n, sizeof(path[0])) : NULL;
     if ((n && !workers) || (n && !path)) {
         free(workers);
         free(path);
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->registry->mu);
         fprintf(stderr, "ds4: distributed coordinator: out of memory building route plan\n");
         return;
     }
     uint32_t i = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) workers[i++] = it;
+    for (ds4_dist_worker_entry *it = state->registry->workers; it; it = it->next) workers[i++] = it;
     qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
 
     const uint32_t last = state->n_layers - 1u;
@@ -2688,7 +2708,7 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
                                  " -> local output");
     }
     complete = complete && has_output && next == state->n_layers;
-    pthread_mutex_unlock(&state->mu);
+    pthread_mutex_unlock(&state->registry->mu);
 
     if (complete) {
         fprintf(stderr, "ds4: distributed coordinator: complete route ready: %s\n", plan);
@@ -2724,9 +2744,9 @@ static void dist_coordinator_forget_route_workers(
         ds4_dist_coordinator_state *state,
         const ds4_dist_route_plan *plan) {
     bool removed_any = false;
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->registry->mu);
     for (uint32_t i = 0; i < plan->count; i++) {
-        ds4_dist_worker_entry **link = &state->workers;
+        ds4_dist_worker_entry **link = &state->registry->workers;
         while (*link) {
             ds4_dist_worker_entry *entry = *link;
             if (!dist_route_entry_matches_worker(&plan->entry[i], entry)) {
@@ -2747,8 +2767,8 @@ static void dist_coordinator_forget_route_workers(
             break;
         }
     }
-    if (removed_any) state->generation++;
-    pthread_mutex_unlock(&state->mu);
+    if (removed_any) state->registry->generation++;
+    pthread_mutex_unlock(&state->registry->mu);
 
     if (removed_any && dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
 }
@@ -2828,25 +2848,25 @@ static bool dist_coordinator_build_route_plan(
     memset(plan, 0, sizeof(*plan));
     if (generation) *generation = 0;
 
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->registry->mu);
     uint32_t n = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) n++;
+    for (ds4_dist_worker_entry *it = state->registry->workers; it; it = it->next) n++;
     ds4_dist_worker_entry **workers = n ? calloc(n, sizeof(workers[0])) : NULL;
     ds4_dist_worker_entry **path = n ? calloc(n, sizeof(path[0])) : NULL;
     if ((n && !workers) || (n && !path)) {
         free(workers);
         free(path);
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->registry->mu);
         if (errlen) snprintf(err, errlen, "out of memory building route");
         return false;
     }
     uint32_t i = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) workers[i++] = it;
+    for (ds4_dist_worker_entry *it = state->registry->workers; it; it = it->next) workers[i++] = it;
     qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
 
     const uint32_t last = state->n_layers - 1u;
     if (state->local_start != 0) {
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->registry->mu);
         free(workers);
         free(path);
         if (errlen) snprintf(err, errlen, "coordinator route does not start at layer 0");
@@ -2854,8 +2874,8 @@ static bool dist_coordinator_build_route_plan(
     }
     if (state->local_end == last &&
         (state->local_has_output || state->local_can_output_head)) {
-        if (generation) *generation = state->generation;
-        pthread_mutex_unlock(&state->mu);
+        if (generation) *generation = state->registry->generation;
+        pthread_mutex_unlock(&state->registry->mu);
         free(workers);
         free(path);
         return true;
@@ -2872,7 +2892,7 @@ static bool dist_coordinator_build_route_plan(
                                    path,
                                    &path_len,
                                    &missing)) {
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->registry->mu);
         free(workers);
         free(path);
         if (errlen) snprintf(err, errlen, "distributed route incomplete: missing layer %u", missing);
@@ -2897,7 +2917,7 @@ static bool dist_coordinator_build_route_plan(
 
         ds4_dist_route_entry *new_entries = realloc(plan->entry, (size_t)(plan->count + 1u) * sizeof(plan->entry[0]));
         if (!new_entries) {
-            pthread_mutex_unlock(&state->mu);
+            pthread_mutex_unlock(&state->registry->mu);
             free(workers);
             free(path);
             if (entry.fd >= 0) close(entry.fd);
@@ -2908,15 +2928,15 @@ static bool dist_coordinator_build_route_plan(
         plan->entry = new_entries;
         plan->entry[plan->count++] = entry;
         if (!dist_route_plan_append_blob(plan, &entry, err, errlen)) {
-            pthread_mutex_unlock(&state->mu);
+            pthread_mutex_unlock(&state->registry->mu);
             free(workers);
             free(path);
             dist_route_plan_free(plan);
             return false;
         }
     }
-    if (generation) *generation = state->generation;
-    pthread_mutex_unlock(&state->mu);
+    if (generation) *generation = state->registry->generation;
+    pthread_mutex_unlock(&state->registry->mu);
     free(workers);
     free(path);
     if (plan->count != 0 && !dist_route_plan_append_return_upstream(plan, err, errlen)) {
@@ -2945,9 +2965,9 @@ static bool dist_coordinator_ensure_route(
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
     if (!state) return 0;
-    pthread_mutex_lock(&state->mu);
-    uint64_t generation = state->generation;
-    pthread_mutex_unlock(&state->mu);
+    pthread_mutex_lock(&state->registry->mu);
+    uint64_t generation = state->registry->generation;
+    pthread_mutex_unlock(&state->registry->mu);
     return generation;
 }
 
@@ -3338,7 +3358,7 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.route_bytes = plan->blob_bytes;
 
     if (dist_send_work_frame_prepared(
-            fd, transport, &work, tokens, hidden_hc, plan->blob,
+            fd, transport, &work, tokens, NULL, hidden_hc, plan->blob,
             dist_tx_bulk_plan_desc(tx_plan), tx_plan ? tx_plan->lease : NULL) != 0) {
         if (errlen) snprintf(err, errlen, "failed to send distributed work");
         return 1;
@@ -3368,9 +3388,13 @@ static int dist_result_limits_for_work(
         (work_flags & DS4_DIST_WORK_F_OUTPUT_DRAFTS) != 0;
     const bool output_all_logits =
         (work_flags & DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS) != 0;
+    const bool multi_session =
+        (work_flags & DS4_DIST_WORK_F_MULTI_SESSION) != 0;
     if ((work_flags & (DS4_DIST_WORK_F_ACK_ONLY |
                        DS4_DIST_WORK_F_SPEC_COMMIT)) != 0) {
         expected_kind = DS4_DIST_RESULT_ACK;
+    } else if (multi_session) {
+        expected_kind = DS4_DIST_RESULT_LOGITS_NROWS;
     } else if (output_drafts && output_all_logits) {
         expected_kind = DS4_DIST_RESULT_LOGITS_NROWS;
     } else if (output_drafts) {
@@ -5201,13 +5225,13 @@ static int dist_run_coordinator_generation(
  * ========================================================================= */
 
 static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, int fd) {
-    pthread_mutex_lock(&state->mu);
-    ds4_dist_worker_entry **link = &state->workers;
+    pthread_mutex_lock(&state->registry->mu);
+    ds4_dist_worker_entry **link = &state->registry->workers;
     while (*link) {
         ds4_dist_worker_entry *entry = *link;
         if (entry->fd == fd) {
             *link = entry->next;
-            state->generation++;
+            state->registry->generation++;
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: removed worker %s:%s layers=%u:%u%s\n",
                              entry->peer_host,
@@ -5215,7 +5239,7 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
                              entry->layer_start,
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
-            pthread_mutex_unlock(&state->mu);
+            pthread_mutex_unlock(&state->registry->mu);
             ds4_transport_release(entry->transport);
             free(entry);
             if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
@@ -5223,7 +5247,7 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
         }
         link = &entry->next;
     }
-    pthread_mutex_unlock(&state->mu);
+    pthread_mutex_unlock(&state->registry->mu);
 }
 
 static void dist_coordinator_monitor_worker_fd(
@@ -6557,7 +6581,8 @@ int ds4_dist_session_create(
         ds4_session *owner,
         int ctx_size,
         char *err,
-        size_t errlen) {
+        size_t errlen,
+        ds4_dist_session *parent) {
     (void)owner;
     if (!out || !engine || !opt) {
         if (errlen) snprintf(err, errlen, "missing distributed session parameters");
@@ -6570,12 +6595,19 @@ int ds4_dist_session_create(
     }
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
 
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
-    if (listen_fd < 0) return 1;
+    /* The first (parentless) session owns the listening socket and accept
+     * thread; batched-server session slots attach to it and share its worker
+     * registry. Inference is serialized across slots by the server, so no
+     * wire-level demux is needed. */
+    int listen_fd = -1;
+    if (!parent) {
+        listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
+        if (listen_fd < 0) return 1;
+    }
 
     ds4_dist_session *d = calloc(1, sizeof(*d));
     if (!d) {
-        close(listen_fd);
+        if (listen_fd >= 0) close(listen_fd);
         if (errlen) snprintf(err, errlen, "out of memory creating distributed session");
         return 1;
     }
@@ -6597,7 +6629,23 @@ int ds4_dist_session_create(
     d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     d->state.transport_policy = opt->transport;
     d->state.nhi_device = opt->nhi_device;
-    pthread_mutex_init(&d->state.mu, NULL);
+    if (parent) {
+        if (!parent->state.registry) {
+            free(d);
+            if (errlen) snprintf(err, errlen, "parent distributed session has no worker registry");
+            return 1;
+        }
+        d->state.registry = parent->state.registry;
+    } else {
+        d->state.registry = calloc(1, sizeof(*d->state.registry));
+        if (!d->state.registry) {
+            close(listen_fd);
+            free(d);
+            if (errlen) snprintf(err, errlen, "out of memory creating distributed worker registry");
+            return 1;
+        }
+        pthread_mutex_init(&d->state.registry->mu, NULL);
+    }
     d->session_id = dist_make_session_id(d);
     d->request_id = 1;
     /* KV snapshots use separate data connections and can run while pipelined
@@ -6605,54 +6653,63 @@ int ds4_dist_session_create(
      * so progress callbacks cannot perturb the reader's contiguous expectations. */
     d->snapshot_request_id = UINT64_C(1) << 63;
 
-    char local_end[32];
-    if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
-    else snprintf(local_end, sizeof(local_end), "%u", opt->layers.end);
-    DIST_COORD_DEBUG(&d->state,
-                     "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
-                     opt->listen_host,
-                     opt->listen_port,
-                     d->state.model_id,
-                     d->state.n_layers,
-                     opt->layers.start,
-                     local_end,
-                     d->state.activation_bits);
+    if (!parent) {
+        char local_end[32];
+        if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
+        else snprintf(local_end, sizeof(local_end), "%u", opt->layers.end);
+        DIST_COORD_DEBUG(&d->state,
+                         "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
+                         opt->listen_host,
+                         opt->listen_port,
+                         d->state.model_id,
+                         d->state.n_layers,
+                         opt->layers.start,
+                         local_end,
+                         d->state.activation_bits);
 
-    if (ds4_dist_spec_trust_all_enabled() &&
-        ds4_engine_mtp_draft_tokens(engine) > 1) {
-        fprintf(stderr,
-                "ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-vs-draft acceptance DISABLED (research mode); batched target-state advancement remains and emitted completion is not guaranteed to match greedy decode\n");
-    }
+        if (ds4_dist_spec_trust_all_enabled() &&
+            ds4_engine_mtp_draft_tokens(engine) > 1) {
+            fprintf(stderr,
+                    "ds4: WARNING: DS4_DIST_SPEC_TRUST_ALL=1 — target-vs-draft acceptance DISABLED (research mode); batched target-state advancement remains and emitted completion is not guaranteed to match greedy decode\n");
+        }
 
-    d->accept_ctx.state = &d->state;
-    d->accept_ctx.listen_fd = listen_fd;
-    if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main, &d->accept_ctx) != 0) {
-        close(listen_fd);
-        pthread_mutex_destroy(&d->state.mu);
-        free(d);
-        if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
-        return 1;
+        d->accept_ctx.state = &d->state;
+        d->accept_ctx.listen_fd = listen_fd;
+        if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main, &d->accept_ctx) != 0) {
+            close(listen_fd);
+            pthread_mutex_destroy(&d->state.registry->mu);
+            free(d->state.registry);
+            free(d);
+            if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
+            return 1;
+        }
+        pthread_detach(d->accept_tid);
+        d->accept_started = true;
     }
-    pthread_detach(d->accept_tid);
-    d->accept_started = true;
     *out = d;
     return 0;
 }
 
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
+    dist_route_plan_free(&d->plan);
+    /* Only the listener-owning (primary) session tears down the shared
+     * worker connections; batched-server slots attached to the same
+     * registry must not touch it here. */
     if (d->listen_fd >= 0) {
         shutdown(d->listen_fd, SHUT_RDWR);
         close(d->listen_fd);
         d->listen_fd = -1;
+        ds4_dist_registry *reg = d->state.registry;
+        if (reg) {
+            pthread_mutex_lock(&reg->mu);
+            d->state.shutting_down = true;
+            for (ds4_dist_worker_entry *it = reg->workers; it; it = it->next) {
+                if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
+            }
+            pthread_mutex_unlock(&reg->mu);
+        }
     }
-    dist_route_plan_free(&d->plan);
-    pthread_mutex_lock(&d->state.mu);
-    d->state.shutting_down = true;
-    for (ds4_dist_worker_entry *it = d->state.workers; it; it = it->next) {
-        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
-    }
-    pthread_mutex_unlock(&d->state.mu);
     /* Client threads are detached and remove their registry entries after the
      * socket closes. Keep this small coordinator object process-lifetime to
      * avoid racing those threads during application shutdown. */
@@ -6867,6 +6924,154 @@ int ds4_dist_session_eval(
         rc = 0;
     }
     return rc;
+}
+
+/* =====================================================================
+ * Batched multi-session decode spans (coordinator)
+ * =====================================================================
+ */
+
+int ds4_dist_session_local_layers(const ds4_dist_session *d,
+                                  uint32_t *start,
+                                  uint32_t *end) {
+    if (!d || !start || !end) return 1;
+    *start = d->state.local_start;
+    *end = d->state.local_end;
+    return 0;
+}
+
+uint64_t ds4_dist_session_id(const ds4_dist_session *d) {
+    return d ? d->session_id : 0;
+}
+
+bool ds4_dist_session_batch_cap(ds4_dist_session *d) {
+    if (!d) return false;
+    if (dist_session_ensure_route(d, NULL, 0) != 0) return false;
+    if (d->plan.count == 0) return false;
+    const ds4_dist_route_entry *first = &d->plan.entry[0];
+    return first->fd >= 0 &&
+           (first->caps & DS4_DIST_V3_CAP_MULTI_SESSION_V1) != 0;
+}
+
+int ds4_dist_eval_batch_span(
+        ds4_dist_session *owner,
+        ds4_session *owner_session,
+        const int *tokens,
+        const uint64_t *row_session_ids,
+        const float *hidden_rows,
+        uint32_t count,
+        float *logits_rows,
+        char *err,
+        size_t errlen) {
+    if (!owner || !owner_session || !tokens || !row_session_ids ||
+        !hidden_rows || !logits_rows || count < 2u ||
+        count > DS4_DIST_MAX_MULTI_ROWS) {
+        if (err && errlen) snprintf(err, errlen, "invalid batched span request");
+        return 1;
+    }
+    ds4_dist_session *d = owner;
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (d->plan.count == 0) {
+        if (err && errlen) snprintf(err, errlen, "batched span has no remote worker");
+        return 1;
+    }
+    const ds4_dist_route_entry *first = &d->plan.entry[0];
+    if (first->fd < 0) {
+        if (err && errlen) snprintf(err, errlen, "batched span route is not live");
+        return 1;
+    }
+    if ((first->caps & DS4_DIST_V3_CAP_MULTI_SESSION_V1) == 0) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "batched span route lacks multi-session capability");
+        return 1;
+    }
+    const ds4_tokens *owner_timeline = ds4_session_tokens(owner_session);
+    if (!owner_timeline || owner_timeline->len < 0) {
+        if (err && errlen) snprintf(err, errlen, "batched span owner has no timeline");
+        return 1;
+    }
+    const uint32_t pos0 = (uint32_t)owner_timeline->len;
+    uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
+    if (dist_session_token_hash_prefix(owner_session, pos0,
+                                       &prefix_hash, err, errlen) != 0)
+        return 1;
+    const uint64_t result_hash =
+        dist_token_hash_update_span(prefix_hash, tokens, count);
+    const uint64_t request_id = d->request_id++;
+    const uint64_t session_id = d->session_id;
+
+    ds4_dist_work_fixed work;
+    memset(&work, 0, sizeof(work));
+    work.model_id = d->state.model_id;
+    dist_u64_to_halves(session_id, &work.session_hi, &work.session_lo);
+    dist_u64_to_halves(request_id, &work.request_hi, &work.request_lo);
+    dist_u64_to_halves(prefix_hash, &work.prefix_hash_hi, &work.prefix_hash_lo);
+    dist_u64_to_halves(result_hash, &work.result_hash_hi, &work.result_hash_lo);
+    work.pos0 = pos0;
+    work.n_tokens = count;
+    work.layer_start = first->layer_start;
+    work.layer_end = first->layer_end;
+    work.flags = DS4_DIST_WORK_F_INPUT_HC |
+                 DS4_DIST_WORK_F_OUTPUT_LOGITS |
+                 DS4_DIST_WORK_F_MULTI_SESSION;
+    const uint64_t hidden_bytes64 =
+        (uint64_t)count * ds4_engine_hidden_f32_values(d->state.engine) *
+        sizeof(float);
+    uint32_t wire_hidden_bytes = 0;
+    if (!dist_activation_wire_bytes_from_f32_bytes(d->state.activation_bits,
+                                                   (uint32_t)hidden_bytes64,
+                                                   &wire_hidden_bytes)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "invalid batched span hidden-state size");
+        return 1;
+    }
+    work.token_bytes = count * (uint32_t)(sizeof(uint32_t) + 2u * sizeof(uint32_t));
+    work.input_hc_bytes = wire_hidden_bytes;
+    work.input_hc_bits = d->state.activation_bits;
+    work.route_count = d->plan.count;
+    work.route_index = 0;
+    work.route_bytes = d->plan.blob_bytes;
+
+    if (dist_send_work_frame_prepared(
+            first->fd, first->transport, &work, tokens, row_session_ids,
+            hidden_rows, d->plan.blob, NULL, NULL) != 0) {
+        if (err && errlen) snprintf(err, errlen, "failed to send batched span");
+        return 1;
+    }
+
+    ds4_dist_v3_result_limits limits;
+    if (dist_result_limits_for_work(
+            d->state.engine, d->state.activation_bits,
+            (uint32_t)hidden_bytes64, count,
+            DS4_DIST_WORK_F_MULTI_SESSION, true,
+            &limits, err, errlen) != 0)
+        return 1;
+    uint32_t kind = 0, payload_bytes = 0;
+    uint64_t got_hash = 0;
+    void *payload = NULL;
+    ds4_transport_lease *payload_lease = NULL;
+    int rc = dist_recv_result_alloc_leased(first->fd, first->transport,
+                                           &d->state, request_id, &limits,
+                                           &kind, &got_hash, &payload,
+                                           &payload_bytes, &payload_lease,
+                                           err, errlen);
+    if (rc != 0) return rc;
+    if (got_hash != result_hash) {
+        (void)dist_result_payload_release(payload, payload_lease, NULL, 0);
+        if (err && errlen) snprintf(err, errlen,
+                                    "batched span result prefix hash mismatch");
+        return 1;
+    }
+    const uint32_t expected_bytes =
+        count * (uint32_t)ds4_engine_vocab_size(d->state.engine) * 4u;
+    if (kind != DS4_DIST_RESULT_LOGITS_NROWS || payload_bytes != expected_bytes) {
+        (void)dist_result_payload_release(payload, payload_lease, NULL, 0);
+        if (err && errlen) snprintf(err, errlen,
+                                    "batched span returned an invalid logits payload");
+        return 1;
+    }
+    memcpy(logits_rows, payload, expected_bytes);
+    return dist_result_payload_release(payload, payload_lease, err, errlen);
 }
 
 /* =========================================================================
@@ -7740,7 +7945,12 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     state.transport_policy = opt->transport;
     state.nhi_device = opt->nhi_device;
-    pthread_mutex_init(&state.mu, NULL);
+    state.registry = calloc(1, sizeof(*state.registry));
+    if (!state.registry) {
+        close(listen_fd);
+        return 1;
+    }
+    pthread_mutex_init(&state.registry->mu, NULL);
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
@@ -8424,7 +8634,7 @@ static int dist_send_work_frame(
         const int *tokens,
         const float *input_hc,
         const void *route_blob) {
-    return dist_send_work_frame_prepared(fd, transport, work, tokens,
+    return dist_send_work_frame_prepared(fd, transport, work, tokens, NULL,
                                          input_hc, route_blob, NULL, NULL);
 }
 
@@ -8433,12 +8643,14 @@ static int dist_send_work_frame_prepared(
         ds4_transport *transport,
         const ds4_dist_work_fixed *work,
         const int *tokens,
+        const uint64_t *row_session_ids,
         const float *input_hc,
         const void *route_blob,
         const ds4_transport_bulk_desc *prepared_desc,
         ds4_transport_lease *tx_lease) {
     if (!work || !tokens || work->n_tokens == 0) return -1;
-    const uint64_t token_bytes = (uint64_t)work->n_tokens * sizeof(uint32_t);
+    const uint64_t token_bytes = (uint64_t)work->n_tokens * sizeof(uint32_t) +
+        (row_session_ids ? (uint64_t)work->n_tokens * 2u * sizeof(uint32_t) : 0);
     if (token_bytes > UINT32_MAX || work->token_bytes != (uint32_t)token_bytes) return -1;
     if (work->input_hc_bytes != 0 && !input_hc) return -1;
     if (work->route_bytes != 0 && !route_blob) return -1;
@@ -8547,6 +8759,17 @@ static int dist_send_work_frame_prepared(
             uint32_t token = htonl((uint32_t)tokens[i]);
             if (dist_write_full(fd, &token, sizeof(token)) != 0)
                 goto v3_done;
+        }
+        if (row_session_ids) {
+            for (uint32_t i = 0; i < work->n_tokens; i++) {
+                uint32_t sid_hi = 0, sid_lo = 0;
+                dist_u64_to_halves(row_session_ids[i], &sid_hi, &sid_lo);
+                sid_hi = htonl(sid_hi);
+                sid_lo = htonl(sid_lo);
+                if (dist_write_full(fd, &sid_hi, sizeof(sid_hi)) != 0 ||
+                    dist_write_full(fd, &sid_lo, sizeof(sid_lo)) != 0)
+                    goto v3_done;
+            }
         }
         if (work->route_bytes &&
             dist_write_full(fd, route_blob, work->route_bytes) != 0)
@@ -9595,6 +9818,7 @@ static int dist_worker_handle_snapshot_load(
 static void dist_work_message_free(ds4_dist_work_message *message) {
     if (!message) return;
     free(message->tokens);
+    free(message->row_session_ids);
     if (message->input_lease)
         ds4_transport_lease_release(message->input_lease);
     else
@@ -9719,12 +9943,19 @@ static int dist_worker_recv_work_message(
 
     const uint64_t token_bytes_expected =
         (uint64_t)work->n_tokens * sizeof(uint32_t);
-    uint64_t body_bytes_expected = token_bytes_expected + work->route_bytes;
+    const uint64_t token_meta_bytes_expected =
+        (uint64_t)work->n_tokens *
+        (sizeof(uint32_t) + 2u * sizeof(uint32_t));
+    const bool multi_session =
+        (work->flags & DS4_DIST_WORK_F_MULTI_SESSION) != 0;
+    const uint64_t token_section_expected =
+        multi_session ? token_meta_bytes_expected : token_bytes_expected;
+    uint64_t body_bytes_expected = token_section_expected + work->route_bytes;
     if (!message->v3 ||
         message->bulk_desc.mode == DS4_TRANSPORT_BULK_TCP_INLINE)
         body_bytes_expected += work->input_hc_bytes;
-    if (token_bytes_expected > UINT32_MAX ||
-        work->token_bytes != (uint32_t)token_bytes_expected ||
+    if (token_section_expected > UINT32_MAX ||
+        work->token_bytes != (uint32_t)token_section_expected ||
         body_bytes_expected != unread) {
         return dist_worker_reject_typed_work(
             upstream, unread, message, request_id,
@@ -9822,6 +10053,35 @@ static int dist_worker_recv_work_message(
         }
     }
     unread -= work->token_bytes;
+
+    /* Row-batched decode spans (multi-session): per-row session ids ride
+     * inside the token section (tokens then n × u64 sid halves). Only
+     * reachable after the caps gate accepted the flag. */
+    if (message->v3 && (work->flags & DS4_DIST_WORK_F_MULTI_SESSION) != 0) {
+        const uint32_t n = work->n_tokens;
+        if (work->token_bytes !=
+            n * (uint32_t)(sizeof(uint32_t) + 2u * sizeof(uint32_t))) {
+            dist_work_message_free(message);
+            shutdown(upstream->fd, SHUT_RDWR);
+            return -1;
+        }
+        message->row_session_ids = malloc((size_t)n * sizeof(uint64_t));
+        if (!message->row_session_ids) {
+            dist_work_message_free(message);
+            shutdown(upstream->fd, SHUT_RDWR);
+            return -1;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t sid_hi = 0, sid_lo = 0;
+            if (dist_read_full(upstream->fd, &sid_hi, sizeof(sid_hi)) <= 0 ||
+                dist_read_full(upstream->fd, &sid_lo, sizeof(sid_lo)) <= 0) {
+                dist_work_message_free(message);
+                return -1;
+            }
+            message->row_session_ids[i] =
+                dist_u64_from_halves(ntohl(sid_hi), ntohl(sid_lo));
+        }
+    }
 
     if (!message->v3 && work->input_hc_bytes != 0) {
         message->input_hc_wire = malloc(work->input_hc_bytes);
@@ -9949,12 +10209,17 @@ static int dist_worker_process_work_message(
     }
     const uint32_t remaining = bytes - metadata_bytes - descriptor_bytes;
     const uint64_t token_bytes_expected = (uint64_t)work.n_tokens * sizeof(uint32_t);
+    const uint64_t token_meta_bytes_expected = (uint64_t)work.n_tokens *
+        (sizeof(uint32_t) + 2u * sizeof(uint32_t));
+    const bool multi_session =
+        (work.flags & DS4_DIST_WORK_F_MULTI_SESSION) != 0;
     uint64_t payload_bytes_expected =
         (uint64_t)work.token_bytes + work.route_bytes;
     if (!message->v3 ||
         message->bulk_desc.mode == DS4_TRANSPORT_BULK_TCP_INLINE)
         payload_bytes_expected += work.input_hc_bytes;
-    if ((uint64_t)work.token_bytes != token_bytes_expected ||
+    if ((uint64_t)work.token_bytes !=
+            (multi_session ? token_meta_bytes_expected : token_bytes_expected) ||
         payload_bytes_expected != remaining) {
         return dist_worker_reject_received_work(
             upstream, message, request_id,
@@ -9981,7 +10246,8 @@ static int dist_worker_process_work_message(
         return dist_worker_reject_received_work(upstream, message,
                                                 request_id, err);
     }
-    if ((work.flags & ~DS4_DIST_WORK_F_VALID_MASK) != 0) {
+    if ((work.flags & ~(DS4_DIST_WORK_F_VALID_MASK |
+                        DS4_DIST_WORK_F_MULTI_SESSION)) != 0) {
         return dist_worker_reject_received_work(
             upstream, message, request_id, "invalid distributed WORK flags");
     }
@@ -9991,6 +10257,18 @@ static int dist_worker_process_work_message(
                                        sizeof(err)) != 0) {
         return dist_worker_reject_received_work(upstream, message,
                                                 request_id, err);
+    }
+    if ((work.flags & DS4_DIST_WORK_F_MULTI_SESSION) != 0) {
+        /* The caps gate accepted the flag. Dispatch to the multi-session
+         * handler: per-row session planes, one batched layer-slice eval,
+         * NROWS logits result. */
+        if (getenv("DS4_DIST_BATCH_DEBUG") != NULL) {
+            fprintf(stderr,
+                    "ds4: dist worker: multi-session span dispatch request=%llu n=%u\n",
+                    (unsigned long long)request_id, work.n_tokens);
+        }
+        return dist_worker_process_multi_session_work(
+                state, upstream, message);
     }
     if (work.n_tokens == 0) {
         return dist_worker_reject_received_work(
@@ -10702,6 +10980,158 @@ static int dist_worker_process_work_message(
     free(route_blob);
     free(tokens);
     return send_rc;
+}
+
+static int dist_worker_process_multi_session_work(
+        ds4_dist_worker_state *state,
+        ds4_dist_worker_upstream *upstream,
+        ds4_dist_work_message *message) {
+    char err[256];
+    err[0] = '\0';
+    const ds4_dist_work_fixed *work = &message->work;
+    const uint64_t request_id =
+        dist_u64_from_halves(work->request_hi, work->request_lo);
+    const uint64_t work_result_hash =
+        dist_u64_from_halves(work->result_hash_hi, work->result_hash_lo);
+    const uint32_t n = work->n_tokens;
+    const int *tokens = message->tokens;
+    const uint64_t *sids = message->row_session_ids;
+
+    /* Phase 2 admission: final-layer logits-only decode spans over the
+     * shared route, no speculative/prefix-reset flags, one plane per row. */
+    const bool bad_shape =
+        !message->v3 || !sids || n < 2u || n > DS4_DIST_MAX_MULTI_ROWS ||
+        (work->flags & (DS4_DIST_WORK_F_SPEC_MASK |
+                        DS4_DIST_WORK_F_ACK_ONLY |
+                        DS4_DIST_WORK_F_RESET_SESSION)) != 0 ||
+        (work->flags & DS4_DIST_WORK_F_OUTPUT_LOGITS) == 0 ||
+        work->route_count != 1u || work->route_index != 0u ||
+        work->layer_end + 1u != (uint32_t)ds4_engine_layer_count(state->engine);
+    if (bad_shape) {
+        fprintf(stderr,
+                "ds4: dist worker: multi-session span rejected: "
+                "v3=%d sids=%d n=%u flags=0x%x routes=%u/%u layers=%u:%u\n",
+                message->v3 ? 1 : 0, sids ? 1 : 0, n, work->flags,
+                work->route_index, work->route_count,
+                work->layer_start, work->layer_end);
+        return dist_worker_reject_received_work(
+                upstream, message, request_id,
+                "multi-session spans require a final logits-only decode route");
+    }
+
+    const uint32_t input_hc_bits =
+        dist_activation_bits_or_default(work->input_hc_bits);
+    float *input_hc = NULL;
+    bool input_hc_uses_wire = false;
+    uint32_t input_hc_decoded_bytes = 0;
+    if (dist_decode_activation_payload(message->input_hc_wire,
+                                       input_hc_bits,
+                                       work->input_hc_bytes,
+                                       &input_hc,
+                                       &input_hc_decoded_bytes,
+                                       &input_hc_uses_wire,
+                                       err,
+                                       sizeof(err)) != 0) {
+        return dist_worker_reject_received_work(upstream, message,
+                                                request_id, err);
+    }
+    const uint64_t expected_hc_bytes =
+        (uint64_t)n * state->hidden_f32_values * sizeof(float);
+    if (input_hc_decoded_bytes != expected_hc_bytes) {
+        if (!input_hc_uses_wire) free(input_hc);
+        return dist_worker_reject_received_work(
+                upstream, message, request_id,
+                "multi-session span hidden-state size mismatch");
+    }
+
+    const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(state->engine);
+    float *result = malloc((size_t)n * vocab * sizeof(float));
+    if (!result) {
+        if (!input_hc_uses_wire) free(input_hc);
+        return dist_worker_reject_received_work(
+                upstream, message, request_id,
+                "out of memory allocating multi-session result");
+    }
+
+    ds4_decode_item items[DS4_DIST_MAX_MULTI_ROWS];
+    ds4_dist_worker_session *planes[DS4_DIST_MAX_MULTI_ROWS];
+    int eval_rc = 0;
+    pthread_mutex_lock(&state->mu);
+    for (uint32_t i = 0; i < n; i++) {
+        planes[i] = dist_worker_find_session_locked(state, sids[i]);
+        if (!planes[i] || !planes[i]->session) {
+            snprintf(err, sizeof(err),
+                     "multi-session span references an unknown session plane");
+            fprintf(stderr,
+                    "ds4: dist worker: multi-session span: no plane for session %llu (row %u)\n",
+                    (unsigned long long)sids[i], i);
+            eval_rc = 1;
+            break;
+        }
+        items[i].session = planes[i]->session;
+        items[i].token = tokens[i];
+    }
+    if (eval_rc == 0) {
+        eval_rc = ds4_sessions_eval_layer_slice_batch(
+                items, (int)n, work->layer_start, work->layer_end,
+                input_hc, result, err, sizeof(err));
+    }
+    if (eval_rc == 0) {
+        for (uint32_t i = 0; i < n; i++) {
+            if (planes[i]->token_hash_valid) {
+                planes[i]->token_hash =
+                    dist_token_hash_update_span(planes[i]->token_hash,
+                                                &tokens[i], 1u);
+            } else {
+                const ds4_tokens *timeline =
+                    ds4_session_tokens(planes[i]->session);
+                uint64_t h = 0;
+                if (timeline &&
+                    dist_session_token_hash_prefix(planes[i]->session,
+                                                   (uint32_t)timeline->len,
+                                                   &h, NULL, 0) == 0) {
+                    planes[i]->token_hash = h;
+                    planes[i]->token_hash_valid = true;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&state->mu);
+
+    if (!input_hc_uses_wire) free(input_hc);
+    if (eval_rc != 0) {
+        free(result);
+        fprintf(stderr,
+                "ds4: dist worker: multi-session span eval failed request=%llu: %s\n",
+                (unsigned long long)request_id,
+                err[0] ? err : "unknown");
+        return dist_worker_reject_received_work(
+                upstream, message, request_id,
+                err[0] ? err : "multi-session layer-slice evaluation failed");
+    }
+
+    ds4_dist_telemetry_fixed telemetry;
+    memset(&telemetry, 0, sizeof(telemetry));
+    telemetry.layer_start = work->layer_start;
+    telemetry.layer_end = work->layer_end;
+    telemetry.pos0 = work->pos0;
+    telemetry.n_tokens = n;
+    const uint32_t payload_bytes = n * vocab * 4u;
+    const int send_rc = dist_worker_upstream_send_work_result_prepared(
+            upstream, request_id, work_result_hash, 0,
+            DS4_DIST_RESULT_LOGITS_NROWS, 32u, &telemetry, 1u,
+            result, payload_bytes, false, NULL);
+    free(result);
+    if (send_rc <= 0) {
+        fprintf(stderr,
+                "ds4: dist worker: multi-session span result send failed request=%llu rc=%d errno=%d\n",
+                (unsigned long long)request_id, send_rc, errno);
+        shutdown(upstream->fd, SHUT_RDWR);
+        return -1;
+    }
+    /* Convention: worker message handlers return >0 on success so the
+     * queue pump keeps the link alive. */
+    return 1;
 }
 
 static int dist_worker_handle_work(

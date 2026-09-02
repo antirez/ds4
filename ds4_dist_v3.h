@@ -32,6 +32,12 @@
 #define DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS   0x00000080u
 #define DS4_DIST_WORK_F_SPEC_COMMIT         0x00000100u
 #define DS4_DIST_WORK_F_SPEC_EXACT_REQUIRED 0x00000200u
+/* Row-batched decode span: WORK carries a per-row session-ownership section
+ * (session id + position per row) when this flag is set. Deliberately NOT in
+ * F_VALID_MASK: legacy peers reject the flag outright, and current workers
+ * accept it only when DS4_DIST_V3_CAP_MULTI_SESSION_V1 was negotiated, so
+ * mixed-version links fail closed in both directions. */
+#define DS4_DIST_WORK_F_MULTI_SESSION        0x00000400u
 #define DS4_DIST_WORK_F_SPEC_MASK \
     (DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_SPEC_ROLLBACK | \
      DS4_DIST_WORK_F_OUTPUT_DRAFTS | DS4_DIST_WORK_F_OUTPUT_ALL_LOGITS | \
@@ -55,6 +61,11 @@
  * speculative capability so mixed pre-flag peers fall back to replay rather
  * than receiving an unknown WORK bit. */
 #define DS4_DIST_V3_CAP_SPEC_EXACT_V1   0x00000010u
+/* Row-batched decode spans over the shared worker connection (F_MULTI_SESSION
+ * WORK plus a per-row ownership section). Opt-in per link like the
+ * speculative extensions: a coordinator must not set the flag unless this
+ * bit was selected for the route. */
+#define DS4_DIST_V3_CAP_MULTI_SESSION_V1 0x00000040u
 #define DS4_DIST_V3_CAP_NHI_V1 \
     (DS4_DIST_V3_CAP_BULK_DESC_V1 | \
      DS4_DIST_V3_CAP_NHI_CPU_COPY_V1 | \

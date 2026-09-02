@@ -247,6 +247,23 @@ static void test_negotiation(void) {
           DS4_DIST_V3_CAP_SPEC_EXACT_V1);
     CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
                                          err, sizeof(err)) == 0);
+
+    /* Row-batched decode spans: the WORK flag is outside the legacy valid
+     * mask (old peers reject it before negotiation) and the capability is
+     * opt-in per link like the speculative extensions. */
+    CHECK((DS4_DIST_WORK_F_MULTI_SESSION &
+           DS4_DIST_WORK_F_VALID_MASK) == 0);
+    worker.capabilities |= DS4_DIST_V3_CAP_MULTI_SESSION_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_MULTI_SESSION_V1) == 0);
+    coordinator.capabilities |= DS4_DIST_V3_CAP_MULTI_SESSION_V1;
+    CHECK(ds4_dist_v3_negotiate(&worker, &coordinator, generation,
+                                &ack, err, sizeof(err)) == 0);
+    CHECK((ack.selected_caps & DS4_DIST_V3_CAP_MULTI_SESSION_V1) ==
+          DS4_DIST_V3_CAP_MULTI_SESSION_V1);
+    CHECK(ds4_dist_v3_hello_ack_validate(&ack, &worker,
+                                         err, sizeof(err)) == 0);
     worker.capabilities &= ~(DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
                              DS4_DIST_V3_CAP_SPEC_EXACT_V1);
     coordinator.capabilities &= ~(DS4_DIST_V3_CAP_SPEC_DECODE_V1 |

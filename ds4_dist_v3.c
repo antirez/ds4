@@ -34,6 +34,10 @@ int ds4_dist_v3_work_caps_validate(
         (selected_caps & DS4_DIST_V3_CAP_SPEC_EXACT_V1) == 0)
         return v3_fail(EPROTO, err, errlen,
                        "exact speculative WORK requires negotiated exact capability");
+    if ((work_flags & DS4_DIST_WORK_F_MULTI_SESSION) != 0 &&
+        (selected_caps & DS4_DIST_V3_CAP_MULTI_SESSION_V1) == 0)
+        return v3_fail(EPROTO, err, errlen,
+                       "multi-session WORK requires negotiated multi-session capability");
     return 0;
 }
 
@@ -421,7 +425,8 @@ int ds4_dist_v3_negotiate(
     ack->coordinator_caps = coordinator->capabilities;
     ack->selected_caps = common_caps & (DS4_DIST_V3_CAP_BULK_DESC_V1 |
                                         DS4_DIST_V3_CAP_SPEC_DECODE_V1 |
-                                        DS4_DIST_V3_CAP_SPEC_EXACT_V1);
+                                        DS4_DIST_V3_CAP_SPEC_EXACT_V1 |
+                                        DS4_DIST_V3_CAP_MULTI_SESSION_V1);
     ds4_dist_v3_u64_to_halves(generation,
                               &ack->generation_hi, &ack->generation_lo);
     if (both_nhi) {
