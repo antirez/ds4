@@ -6097,6 +6097,48 @@ static void test_run_mpp_candidate(const char *label,
     test_mpp_summary_print(&summary);
 }
 
+static void test_metal_moe_ground_truth(void) {
+    test_close_engines();
+
+    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
+    char *saved_f32stage = test_save_env("DS4_METAL_MOE_F32STAGE");
+    char *saved_muladd = test_save_env("DS4_METAL_MPP_MOE_MULADD");
+
+    static const char *const arm_names[4] = {"legacy", "auto", "f32stage", "muladd"};
+    for (int a = 0; a < 4; a++) {
+        if (a == 0) {            /* legacy simdgroup reference route */
+            setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+            unsetenv("DS4_METAL_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_MULADD");
+        } else if (a == 1) {     /* shipped MPP tensor route */
+            unsetenv("DS4_METAL_DISABLE_METAL4");
+            unsetenv("DS4_METAL_MOE_F32STAGE");
+            unsetenv("DS4_METAL_MPP_MOE_MULADD");
+        } else if (a == 2) {     /* legacy engine, fp32-staged operands */
+            setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+            setenv("DS4_METAL_MOE_F32STAGE", "1", 1);
+            unsetenv("DS4_METAL_MPP_MOE_MULADD");
+        } else {                 /* MPP with mode::multiply + explicit adds */
+            unsetenv("DS4_METAL_DISABLE_METAL4");
+            unsetenv("DS4_METAL_MOE_F32STAGE");
+            setenv("DS4_METAL_MPP_MOE_MULADD", "1", 1);
+        }
+        fprintf(stderr, "ds4-test: MoE ground-truth arm=%s\n", arm_names[a]);
+        ds4_engine *engine = test_open_engine(false);
+        if (!engine) {
+            TEST_ASSERT(false);
+            break;
+        }
+        const int rc = ds4_engine_metal_moe_gt_test(engine);
+        ds4_engine_close(engine);
+        TEST_ASSERT(rc == 0);
+    }
+
+    test_restore_env("DS4_METAL_MPP_MOE_MULADD", saved_muladd);
+    test_restore_env("DS4_METAL_MOE_F32STAGE", saved_f32stage);
+    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+}
+
 static void test_metal_mpp_equivalence(void) {
     test_close_engines();
 
@@ -6800,6 +6842,7 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
+    {"--metal-moe-ground-truth", "metal-moe-ground-truth", "routed-MoE GPU routes vs exact CPU f32 reference on synthetic input", test_metal_moe_ground_truth},
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
@@ -6815,6 +6858,7 @@ static const ds4_test_entry test_entries[] = {
 
 static void test_print_help(const char *prog) {
     printf("Usage: %s [--all | TEST...]\n\n", prog);
+
     puts("Tests:");
     puts("  --all");
     puts("      Run every test. This is the default, ordered from slower to faster.");
@@ -6846,6 +6890,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
+    puts("  DS4_TEST_MOE_GT_LAYER=N     MoE ground-truth sparse layer (default 8).");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
     puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");
     puts("  DS4_TEST_CONTINUED_PREFILL_ALLOW_COARSE=1  Permit coarse short-suffix progress for baseline timing.");
