@@ -60028,10 +60028,11 @@ int ds4_engine_metal_moe_gt_test(ds4_engine *e) {
     if (ok) {
         char label[96];
         printf("moe_ground_truth layer=%u tokens=%u "
-               "route=[disable_metal4=%d f32stage=%d muladd=%d k16=%d]\n",
+               "route=[disable_metal4=%d f32stage=%d mpp_f32stage=%d muladd=%d k16=%d]\n",
                il, n_tokens,
                getenv("DS4_METAL_DISABLE_METAL4") != NULL,
                getenv("DS4_METAL_MOE_F32STAGE") != NULL,
+               getenv("DS4_METAL_MPP_MOE_F32STAGE") != NULL,
                getenv("DS4_METAL_MPP_MOE_MULADD") != NULL,
                getenv("DS4_METAL_MPP_MOE_K16") != NULL);
         snprintf(label, sizeof(label), "layer%u_cpu_q8K_vs_f32", il);

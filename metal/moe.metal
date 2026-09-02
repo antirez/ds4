@@ -8917,15 +8917,16 @@ kernel void kernel_mul_mm_id_mpp(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
-    threadgroup float *sc = (threadgroup float *)shmem;
-
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
+    constexpr int SA_BYTES = NK * NR0 * (int)sizeof(S0);
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
+    threadgroup float *sc = (threadgroup float *)shmem;
 
     device const uint32_t *work_count = (device const uint32_t *)work;
     const uint32_t work_index = tgpig.x;
@@ -9548,6 +9549,17 @@ typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, ha
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp")]] kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp")]]    kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp")]] kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
+
+/* F32-staged MPP variants: same TensorOps route, but the threadgroup operand
+ * tiles are staged as fp32 instead of binary16, removing the half-rounding
+ * of both operands (measured ~2.5x tighter vs the exact CPU f32 reference).
+ * Selected via DS4_METAL_MPP_MOE_F32STAGE=1. */
+typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_f32stage_t;
+typedef decltype(kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_f32stage_f16_rhs_t;
+
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp_f32stage")]] kernel mul_mm_id_mpp_f32stage_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp_f32stage")]]    kernel mul_mm_id_mpp_f32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp_f32stage")]] kernel mul_mm_id_mpp_f32stage_f16_rhs_t kernel_mul_mm_id_mpp<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
 
 typedef decltype(kernel_mul_mm_id_mpp_muladd<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_muladd_t;
 typedef decltype(kernel_mul_mm_id_mpp_muladd<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_muladd_f16_rhs_t;
