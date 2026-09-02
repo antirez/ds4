@@ -72,7 +72,8 @@ int ds4_dist_session_create(
         ds4_session *owner,
         int ctx_size,
         char *err,
-        size_t errlen);
+        size_t errlen,
+        ds4_dist_session *parent);
 void ds4_dist_session_free(ds4_dist_session *d);
 
 /* Returns 1 when the coordinator has full layer coverage, 0 when workers are
@@ -97,6 +98,36 @@ int ds4_dist_session_eval(
         const ds4_tokens *checkpoint,
         int token,
         float *logits,
+        char *err,
+        size_t errlen);
+
+/* Maximum rows in one multi-session decode span. */
+#define DS4_DIST_MAX_MULTI_ROWS 16u
+
+/* True when the route's worker negotiated row-batched decode spans. */
+bool ds4_dist_session_batch_cap(ds4_dist_session *d);
+
+/* Coordinator local layer range for this dist session. */
+int ds4_dist_session_local_layers(const ds4_dist_session *d,
+                                  uint32_t *start,
+                                  uint32_t *end);
+
+/* The session's wire id (per-row ownership in batched spans). */
+uint64_t ds4_dist_session_id(const ds4_dist_session *d);
+
+/* One decode span carrying rows owned by different coordinator sessions:
+ * tokens[i] is evaluated for the session plane row_session_ids[i] with the
+ * precomputed leader-side hidden row hidden_rows + i*hidden_f32_values;
+ * logits_rows receives count × vocab f32 in row order. The owner session
+ * drives request-id sequencing and the span's timeline prefix hash. */
+int ds4_dist_eval_batch_span(
+        ds4_dist_session *owner,
+        ds4_session *owner_session,
+        const int *tokens,
+        const uint64_t *row_session_ids,
+        const float *hidden_rows,
+        uint32_t count,
+        float *logits_rows,
         char *err,
         size_t errlen);
 

@@ -39505,6 +39505,10 @@ struct ds4_engine {
     int            placement_session_count_hint;
     uint32_t       glm_session_count;
     uint64_t       glm_session_graph_bytes;
+
+    /* Batched-server support: the first distributed coordinator session
+     * becomes the canonical worker registry; later slots attach to it. */
+    struct ds4_dist_session *coord_dist_share;
 };
 
 static DS4_MAYBE_UNUSED uint64_t ds4_engine_glm_graph_budget(
@@ -65234,6 +65238,10 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
+bool ds4_engine_is_distributed(const ds4_engine *e) {
+    return e != NULL && e->distributed.role != DS4_DISTRIBUTED_NONE;
+}
+
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
@@ -66303,7 +66311,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                         s,
                                         ctx_size,
                                         err,
-                                        sizeof(err)) != 0) {
+                                        sizeof(err),
+                                        e->coord_dist_share) != 0) {
                 fprintf(stderr,
                         "ds4: failed to create distributed coordinator session: %s\n",
                         err[0] ? err : "unknown error");
@@ -66320,6 +66329,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         e->glm_session_graph_bytes = glm_graph_saturating_add_u64(
             e->glm_session_graph_bytes, s->glm_reserved_graph_bytes);
         e->glm_session_count++;
+        if (!e->coord_dist_share) e->coord_dist_share = s->distributed;
         if (!ds4_session_tp_register(s)) {
             ds4_session_free(s);
             return 1;
@@ -66473,7 +66483,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                     s,
                                     ctx_size,
                                     err,
-                                    sizeof(err)) != 0) {
+                                    sizeof(err),
+                                    e->coord_dist_share) != 0) {
             fprintf(stderr,
                     "ds4: failed to create distributed coordinator session: %s\n",
                     err[0] ? err : "unknown error");
@@ -66488,6 +66499,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
     }
+    if (!e->coord_dist_share) e->coord_dist_share = s->distributed;
     if (!ds4_session_tp_register(s)) {
         ds4_session_free(s);
         return 1;
@@ -72502,6 +72514,493 @@ static bool metal_graph_encode_native_session_batch_shared(
     return ok;
 }
 
+/* --------------------------------------------------------------------
+ * Batched layer-slice decode (worker-side L1): N sessions' decode rows
+ * run through one combined encode of a mid-model layer range, starting
+ * from injected hidden-state rows instead of token embeddings. Mirrors
+ * metal_graph_encode_native_session_batch_shared with three deltas:
+ * layer bounds, an inject stage replacing embed, and optional
+ * output-logits rows read back per session.
+ * ------------------------------------------------------------------ */
+
+static bool metal_graph_native_session_batch_layer_slice_supported(
+        ds4_decode_item *items,
+        int count,
+        const ds4_engine *e,
+        uint32_t layer_start,
+        uint32_t layer_end) {
+    const char *enabled = getenv("DS4_METAL_SESSION_BATCH_SHARED");
+    if ((enabled && enabled[0] && strcmp(enabled, "0") == 0) ||
+        !items || count < 2 || !e || e->tp.active ||
+        e->support_kind != DS4_SUPPORT_NONE ||
+        layer_start > layer_end ||
+        layer_end >= (uint32_t)DS4_N_LAYER ||
+        metal_graph_use_reference_shared_down_hc() ||
+        metal_graph_use_q4_selected_shared_overlap(NULL) ||
+        metal_graph_use_pro_q4_cpu_router()) {
+        return false;
+    }
+
+    ds4_gpu_graph *first = &items[0].session->graph;
+    if (first->placement || first->ssd_streaming || first->quality ||
+        !first->shared_gate_up_swiglu_fuse ||
+        (uint32_t)count > first->prefill_cap ||
+        !metal_graph_batch_ffn_norm(first) ||
+        !metal_graph_batch_shared_gate(first) ||
+        !metal_graph_batch_shared_up(first) ||
+        !metal_graph_batch_shared_mid(first)) {
+        return false;
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        if (!layer->ffn_gate_shexp || !layer->ffn_up_shexp ||
+            !layer->ffn_down_shexp ||
+            layer->ffn_gate_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_up_shexp->type != DS4_TENSOR_Q8_0 ||
+            layer->ffn_down_shexp->type != DS4_TENSOR_Q8_0) {
+            return false;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s || ds4_session_is_glm(s) || s->graph.placement ||
+            s->graph.ssd_streaming || s->graph.quality ||
+            s->graph.tp_world >= 2 ||
+            !s->graph.shared_gate_up_swiglu_fuse ||
+            s->graph.materialize_ffn_out ||
+            metal_graph_directional_steering_attn_enabled(&s->graph) ||
+            metal_graph_directional_steering_ffn_enabled(&s->graph)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool metal_graph_native_session_batch_layer_slice_qkv_supported(
+        ds4_decode_item *items,
+        int count,
+        const ds4_engine *e,
+        uint32_t layer_start,
+        uint32_t layer_end) {
+    const char *enabled = getenv("DS4_METAL_SESSION_BATCH_QKV");
+    if ((enabled && enabled[0] && strcmp(enabled, "0") == 0) ||
+        !items || count < 2 || !e || e->tp.active ||
+        layer_start > layer_end ||
+        layer_end >= (uint32_t)DS4_N_LAYER ||
+        metal_graph_use_reference_qkv_norm()) {
+        return false;
+    }
+    ds4_gpu_graph *first = &items[0].session->graph;
+    if (!metal_graph_batch_attn_norm(first) ||
+        !metal_graph_batch_qr(first) ||
+        !metal_graph_batch_kv_raw(first)) {
+        return false;
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        if (!layer->attn_q_a || !layer->attn_kv ||
+            layer->attn_q_a->type != DS4_TENSOR_Q8_0 ||
+            layer->attn_kv->type != DS4_TENSOR_Q8_0 ||
+            layer->attn_q_a->dim[0] != DS4_N_EMBD ||
+            layer->attn_kv->dim[0] != DS4_N_EMBD ||
+            layer->attn_kv->dim[1] != DS4_N_HEAD_DIM) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool metal_graph_encode_native_session_batch_layer_slice(
+        ds4_decode_item *items,
+        int count,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        bool batch_qkv,
+        const float *input_hc_rows,
+        float *output_hc_rows,
+        bool output_logits,
+        float *logits_rows) {
+    if (!items || count < 2 || !model || !weights) return false;
+    if (layer_start != 0 && !input_hc_rows) return false;
+    ds4_gpu_graph *batch = &items[0].session->graph;
+    const uint64_t norm_row_bytes =
+        (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_row_values =
+        (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const char *stage = input_hc_rows ? "inject" : "embed";
+    uint32_t failed_layer = layer_start;
+    bool ok = true;
+
+    for (int i = 0; ok && i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        metal_graph_dspark_capture_begin(g);
+        if (input_hc_rows) {
+            ok = ds4_gpu_tensor_write(
+                    metal_graph_cur_hc(g),
+                    0,
+                    input_hc_rows + (uint64_t)i * hc_row_values,
+                    hc_row_values * sizeof(float)) != 0;
+        } else {
+            ok = ds4_gpu_embed_token_hc_tensor(
+                    metal_graph_cur_hc(g),
+                    model->map,
+                    model->size,
+                    weights->token_embd->abs_offset,
+                    (uint32_t)weights->token_embd->dim[1],
+                    (uint32_t)items[i].token,
+                    DS4_N_EMBD,
+                    DS4_N_HC) != 0;
+        }
+    }
+
+    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
+        const uint64_t shared_row_bytes = shared_dim * sizeof(float);
+        failed_layer = il;
+
+        const bool layer_batch_qkv =
+            layer->attn_q_a && layer->attn_kv;
+        if (batch_qkv && layer_batch_qkv) {
+            stage = "decode-to-qkv";
+            for (int i = 0; ok && i < count; i++) {
+                ds4_session *s = items[i].session;
+                ds4_gpu_graph *g = &s->graph;
+                const uint32_t pos = (uint32_t)s->checkpoint.len;
+                const uint32_t raw_row = pos % g->raw_cap;
+                const uint32_t n_raw =
+                    metal_graph_raw_span_for_batch(g, pos, 1);
+                ok = metal_graph_encode_decode_layer_phase(
+                        g, model, layer, il, pos,
+                        g->layer_raw_cache[il], g->raw_cap, raw_row, n_raw,
+                        items[i].token, METAL_DECODE_LAYER_TO_QKV);
+            }
+            stage = "gather-qkv";
+            for (int i = 0; ok && i < count; i++) {
+                ok = ds4_gpu_tensor_copy(
+                        metal_graph_batch_attn_norm(batch),
+                        (uint64_t)i * norm_row_bytes,
+                        metal_graph_attn_norm(&items[i].session->graph),
+                        0,
+                        norm_row_bytes) != 0;
+            }
+
+            const uint64_t q_rank = layer->attn_q_a->dim[1];
+            const uint64_t qr_row_bytes = q_rank * sizeof(float);
+            const uint64_t kv_row_bytes =
+                (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            ds4_gpu_tensor *qr = NULL;
+            ds4_gpu_tensor *kv_raw = NULL;
+            if (ok) {
+                qr = ds4_gpu_tensor_view(
+                        metal_graph_batch_qr(batch), 0,
+                        (uint64_t)count * qr_row_bytes);
+                kv_raw = ds4_gpu_tensor_view(
+                        metal_graph_batch_kv_raw(batch), 0,
+                        (uint64_t)count * kv_row_bytes);
+                ok = qr && kv_raw;
+            }
+            stage = "qkv";
+            if (ok) {
+                ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        qr,
+                        model->map,
+                        model->size,
+                        layer->attn_q_a->abs_offset,
+                        DS4_N_EMBD,
+                        q_rank,
+                        metal_graph_batch_attn_norm(batch),
+                        (uint32_t)count) != 0 &&
+                     ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        kv_raw,
+                        model->map,
+                        model->size,
+                        layer->attn_kv->abs_offset,
+                        DS4_N_EMBD,
+                        DS4_N_HEAD_DIM,
+                        metal_graph_batch_attn_norm(batch),
+                        (uint32_t)count) != 0;
+            }
+            stage = "decode-from-qkv";
+            for (int i = 0; ok && i < count; i++) {
+                ds4_session *s = items[i].session;
+                ds4_gpu_graph *g = &s->graph;
+                const int tier = g->active_tier;
+                ds4_gpu_tensor *qr_row = ds4_gpu_tensor_view(
+                        qr, (uint64_t)i * qr_row_bytes, qr_row_bytes);
+                ds4_gpu_tensor *kv_row = ds4_gpu_tensor_view(
+                        kv_raw, (uint64_t)i * kv_row_bytes, kv_row_bytes);
+                ds4_gpu_tensor *saved_qr = g->qr_by_tier[tier];
+                ds4_gpu_tensor *saved_kv_raw = g->kv_raw_by_tier[tier];
+                ok = qr_row && kv_row;
+                if (ok) {
+                    g->qr_by_tier[tier] = qr_row;
+                    g->kv_raw_by_tier[tier] = kv_row;
+                    const uint32_t pos = (uint32_t)s->checkpoint.len;
+                    const uint32_t raw_row = pos % g->raw_cap;
+                    const uint32_t n_raw =
+                        metal_graph_raw_span_for_batch(g, pos, 1);
+                    ok = metal_graph_encode_decode_layer_phase(
+                            g, model, layer, il, pos,
+                            g->layer_raw_cache[il], g->raw_cap,
+                            raw_row, n_raw, items[i].token,
+                            METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID);
+                    g->qr_by_tier[tier] = saved_qr;
+                    g->kv_raw_by_tier[tier] = saved_kv_raw;
+                }
+                ds4_gpu_tensor_free(kv_row);
+                ds4_gpu_tensor_free(qr_row);
+            }
+            ds4_gpu_tensor_free(kv_raw);
+            ds4_gpu_tensor_free(qr);
+        } else {
+            stage = "decode-to-shared";
+            for (int i = 0; ok && i < count; i++) {
+                ds4_session *s = items[i].session;
+                ds4_gpu_graph *g = &s->graph;
+                const uint32_t pos = (uint32_t)s->checkpoint.len;
+                const uint32_t raw_row = pos % g->raw_cap;
+                const uint32_t n_raw =
+                    metal_graph_raw_span_for_batch(g, pos, 1);
+                ok = metal_graph_encode_decode_layer_phase(
+                        g, model, layer, il, pos,
+                        g->layer_raw_cache[il], g->raw_cap, raw_row, n_raw,
+                        items[i].token, METAL_DECODE_LAYER_TO_SHARED_MID);
+            }
+        }
+
+        stage = "gather-norm";
+        for (int i = 0; ok && i < count; i++) {
+            ok = ds4_gpu_tensor_copy(
+                    metal_graph_batch_ffn_norm(batch),
+                    (uint64_t)i * norm_row_bytes,
+                    metal_graph_ffn_norm(&items[i].session->graph),
+                    0,
+                    norm_row_bytes) != 0;
+        }
+
+        ds4_gpu_tensor *gate = NULL;
+        ds4_gpu_tensor *up = NULL;
+        ds4_gpu_tensor *mid = NULL;
+        if (ok) {
+            gate = ds4_gpu_tensor_view(
+                    metal_graph_batch_shared_gate(batch), 0,
+                    (uint64_t)count * shared_row_bytes);
+            up = ds4_gpu_tensor_view(
+                    metal_graph_batch_shared_up(batch), 0,
+                    (uint64_t)count * shared_row_bytes);
+            mid = ds4_gpu_tensor_view(
+                    metal_graph_batch_shared_mid(batch), 0,
+                    (uint64_t)count * shared_row_bytes);
+            ok = gate && up && mid;
+        }
+        stage = "shared-gate-up";
+        if (ok) {
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                    gate, up, mid,
+                    model->map,
+                    model->size,
+                    layer->ffn_gate_shexp->abs_offset,
+                    layer->ffn_up_shexp->abs_offset,
+                    DS4_N_EMBD,
+                    shared_dim,
+                    metal_graph_batch_ffn_norm(batch),
+                    (uint32_t)count,
+                    DS4_SWIGLU_CLAMP_EXP) != 0;
+        }
+
+        stage = "shared-down";
+        for (int i = 0; ok && i < count; i++) {
+            ds4_gpu_graph *g = &items[i].session->graph;
+            ds4_gpu_tensor *mid_row = ds4_gpu_tensor_view(
+                    mid, (uint64_t)i * shared_row_bytes,
+                    shared_row_bytes);
+            ok = mid_row &&
+                 ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+                         metal_graph_after_ffn_hc(g),
+                         metal_graph_shared_out(g),
+                         model->map,
+                         model->size,
+                         layer->ffn_down_shexp->abs_offset,
+                         shared_dim,
+                         DS4_N_EMBD,
+                         mid_row,
+                         metal_graph_routed_out(g),
+                         metal_graph_after_attn_hc(g),
+                         metal_graph_hc_split(g),
+                         DS4_N_EMBD,
+                         DS4_N_HC) != 0;
+            ds4_gpu_tensor_free(mid_row);
+        }
+        for (int i = 0; ok && i < count; i++) {
+            ds4_gpu_graph *g = &items[i].session->graph;
+            ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
+            g->cur_hc_by_tier[g->active_tier] =
+                metal_graph_after_ffn_hc(g);
+            g->after_ffn_hc_by_tier[g->active_tier] = tmp;
+            ok = metal_graph_dspark_capture_decode_layer(g, il);
+        }
+        ds4_gpu_tensor_free(mid);
+        ds4_gpu_tensor_free(up);
+        ds4_gpu_tensor_free(gate);
+    }
+
+    stage = "output";
+    for (int i = 0; ok && i < count; i++) {
+        ds4_gpu_graph *g = &items[i].session->graph;
+        if (output_hc_rows) {
+            ok = ds4_gpu_tensor_read(
+                    metal_graph_cur_hc(g),
+                    0,
+                    output_hc_rows + (uint64_t)i * hc_row_values,
+                    hc_row_values * sizeof(float)) != 0;
+        }
+        if (ok && output_logits) {
+            ok = metal_graph_encode_output_head(g, model, weights,
+                                                weights->output->dim[1]);
+            if (ok && logits_rows) {
+                ds4_gpu_tensor *logits = metal_graph_logits(g);
+                ok = logits &&
+                     ds4_gpu_tensor_read(logits, 0,
+                                         logits_rows + (uint64_t)i * DS4_N_VOCAB,
+                                         (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            }
+        }
+    }
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: native shared session batch layer-slice failed "
+                "stage=%s layer=%u rows=%d\n",
+                stage, failed_layer, count);
+    }
+    return ok;
+}
+
+    /* Batched layer-slice decode over N sessions' rows (worker-side L1).
+     * count<2 or unsupported shapes fall back to serial per-session
+     * ds4_session_eval_layer_slice, mirroring the native batch's fallback
+     * all-or-nothing semantics. */
+int ds4_sessions_eval_layer_slice_batch(
+        ds4_decode_item *items,
+        int count,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        const float *input_hc_rows,
+        float *logits_rows,
+        char *err,
+        size_t errlen) {
+    if (!items || count <= 0 || !input_hc_rows ||
+        (layer_end >= (uint32_t)DS4_N_LAYER) ||
+        (layer_start > layer_end)) {
+        if (err && errlen) snprintf(err, errlen, "invalid batched layer-slice request");
+        return 1;
+    }
+    ds4_engine *e = items[0].session->engine;
+    const bool wants_logits = layer_end + 1u == (uint32_t)DS4_N_LAYER;
+    if (wants_logits && !logits_rows) {
+        if (err && errlen) snprintf(err, errlen, "batched layer-slice logits output is missing");
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s || !e || s->engine != e ||
+            items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB ||
+            ds4_session_is_glm(s) ||
+            s->checkpoint.len >= s->ctx_size) {
+            if (err && errlen) {
+                snprintf(err, errlen, "invalid batched layer-slice item %d", i);
+            }
+            return 1;
+        }
+        for (int j = 0; j < i; j++) {
+            if (items[j].session == s) {
+                if (err && errlen) {
+                    snprintf(err, errlen, "batched layer-slice repeats session %d", j);
+                }
+                return 1;
+            }
+        }
+        const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+        if (ds4_session_slice_check_timeline(s, &items[i].token, 1, pos0,
+                                             err, errlen) != 0) {
+            return 1;
+        }
+    }
+
+    const uint64_t hc_row_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = false;
+    bool used_batch = false;
+    const bool supported =
+        metal_graph_native_session_batch_layer_slice_supported(
+                items, count, e, layer_start, layer_end);
+    if (!supported && getenv("DS4_DIST_BATCH_DEBUG") != NULL) {
+        const ds4_gpu_graph *first = &items[0].session->graph;
+        fprintf(stderr,
+                "ds4: batch layer-slice unsupported: glm=%d placement=%d "
+                "ssd=%d quality=%d tp_world=%d fuse=%d prefill_cap=%u "
+                "ffn_norm=%p qkv_support...\n",
+                ds4_session_is_glm(items[0].session) ? 1 : 0,
+                first->placement ? 1 : 0, first->ssd_streaming ? 1 : 0,
+                first->quality ? 1 : 0, (int)first->tp_world,
+                first->shared_gate_up_swiglu_fuse ? 1 : 0,
+                first->prefill_cap,
+                (void *)metal_graph_batch_ffn_norm(
+                        (ds4_gpu_graph *)first));
+    }
+    if (count >= 2 && supported) {
+        const bool batch_qkv =
+            metal_graph_native_session_batch_layer_slice_qkv_supported(
+                    items, count, e, layer_start, layer_end);
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = metal_graph_encode_native_session_batch_layer_slice(
+                    items, count, &e->model, &e->weights,
+                    layer_start, layer_end, batch_qkv,
+                    input_hc_rows, NULL, wants_logits, logits_rows);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        used_batch = true;
+    } else {
+        /* Serial fallback: one layer-slice eval per session row. The slice
+         * function commits each session's timeline internally. */
+        ok = true;
+        for (int i = 0; ok && i < count; i++) {
+            ds4_session *s = items[i].session;
+            const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+            ok = ds4_session_eval_layer_slice(
+                    s, &items[i].token, 1, pos0,
+                    layer_start, layer_end,
+                    input_hc_rows + (uint64_t)i * hc_row_values,
+                    NULL, wants_logits,
+                    wants_logits
+                        ? logits_rows + (uint64_t)i * DS4_N_VOCAB
+                        : NULL,
+                    err, errlen) == 0;
+        }
+    }
+    if (!ok) {
+        for (int i = 0; i < count; i++) {
+            ds4_session_invalidate(items[i].session);
+        }
+        if (err && errlen && !err[0]) {
+            snprintf(err, errlen, "batched layer-slice evaluation failed");
+        }
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (used_batch) {
+            ds4_session_slice_commit_timeline(s, &items[i].token, 1);
+        }
+        s->mtp_draft_valid = false;
+    }
+    return 0;
+}
+
 static ds4_tp_batch_item *ds4_sessions_tp_batch_items(
         const ds4_decode_item *items, int count) {
     if (!items || count <= 0) return NULL;
@@ -72921,6 +73420,129 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         char *err,
         size_t errlen);
 
+/* Coordinator-side batched local encode: embed each session's token, run
+ * the leader's layer range batched across sessions, and read each row's
+ * final hidden state for the wire. Returns 0 on success; sessions keep
+ * their checkpoints (the caller advances them after the remote span). */
+static int ds4_sessions_eval_batch_local_layers(
+        ds4_decode_item *items,
+        int count,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        float *hidden_rows,
+        char *err,
+        size_t errlen) {
+    if (!items || count < 2 || !hidden_rows ||
+        layer_start != 0 || layer_end >= (uint32_t)DS4_N_LAYER) {
+        if (err && errlen) snprintf(err, errlen, "invalid batched local-layer request");
+        return 1;
+    }
+    ds4_engine *e = items[0].session->engine;
+    if (!e || !e->weights.token_embd) {
+        if (err && errlen) snprintf(err, errlen, "batched local layers need the embedding table");
+        return 1;
+    }
+    bool ok = metal_graph_native_session_batch_layer_slice_supported(
+            items, count, e, layer_start, layer_end);
+    const bool batch_qkv = ok &&
+        metal_graph_native_session_batch_layer_slice_qkv_supported(
+                items, count, e, layer_start, layer_end);
+    if (ok) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = metal_graph_encode_native_session_batch_layer_slice(
+                    items, count, &e->model, &e->weights,
+                    layer_start, layer_end, batch_qkv,
+                    NULL, hidden_rows, false, NULL);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+    }
+    if (!ok) {
+        if (err && errlen) snprintf(err, errlen, "batched local-layer evaluation failed");
+        return 1;
+    }
+    return 0;
+}
+
+/* Batched decode over the shared worker connection: one span carries one
+ * token per session; the leader-side layers run as a single batched encode
+ * and the worker runs its slice batched per row. Returns 0 on success,
+ * nonzero when the caller must fall back to per-session spans. */
+static int ds4_sessions_eval_batch_dist(
+        ds4_decode_item *items,
+        int count,
+        char *err,
+        size_t errlen) {
+    const bool dbg = getenv("DS4_DIST_BATCH_DEBUG") != NULL;
+    ds4_session *owner_s = items[0].session;
+    ds4_engine *e = owner_s->engine;
+    if (count < 2 || count > (int)DS4_DIST_MAX_MULTI_ROWS) return 1;
+    for (int i = 0; i < count; i++) {
+        ds4_session *s = items[i].session;
+        if (!s || s->engine != e || !s->distributed ||
+            !s->checkpoint_valid || s->checkpoint.len >= s->ctx_size) {
+            if (dbg) fprintf(stderr, "ds4: dist batch: item %d fails admission\n", i);
+            return 1;
+        }
+    }
+    ds4_dist_session *d0 = owner_s->distributed;
+    if (!d0 || !ds4_dist_session_batch_cap(d0)) {
+        if (dbg) fprintf(stderr, "ds4: dist batch: no multi-session capability on route\n");
+        return 1;
+    }
+    uint32_t local_start = 0, local_end = 0;
+    if (ds4_dist_session_local_layers(d0, &local_start, &local_end) != 0)
+        return 1;
+    if (local_start != 0) return 1;
+
+    const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(e);
+    const uint64_t hc_values = ds4_engine_hidden_f32_values(e);
+    float *hidden = malloc((size_t)count * hc_values * sizeof(float));
+    float *logits_rows = malloc((size_t)count * vocab * sizeof(float));
+    if (!hidden || !logits_rows) {
+        free(hidden);
+        free(logits_rows);
+        if (err && errlen) snprintf(err, errlen, "out of memory for batched span");
+        return 1;
+    }
+
+    int tokens[DS4_DIST_MAX_MULTI_ROWS];
+    uint64_t sids[DS4_DIST_MAX_MULTI_ROWS];
+    for (int i = 0; i < count; i++) {
+        tokens[i] = items[i].token;
+        sids[i] = ds4_dist_session_id(items[i].session->distributed);
+    }
+
+    int rc = ds4_sessions_eval_batch_local_layers(
+            items, count, local_start, local_end, hidden, err, errlen);
+    if (rc != 0 && dbg) {
+        fprintf(stderr, "ds4: dist batch: local-layer encode failed: %s\n",
+                err[0] ? err : "unsupported");
+    }
+    if (rc == 0) {
+        rc = ds4_dist_eval_batch_span(d0, owner_s, tokens, sids, hidden,
+                                      (uint32_t)count, logits_rows,
+                                      err, errlen);
+    }
+    if (dbg) {
+        fprintf(stderr, "ds4: dist batch: count=%d span_rc=%d\n", count, rc);
+    }
+    free(hidden);
+    if (rc != 0) {
+        free(logits_rows);
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        memcpy(items[i].session->logits,
+               logits_rows + (uint64_t)i * vocab,
+               (uint64_t)vocab * sizeof(float));
+        ds4_session_slice_commit_timeline(items[i].session, &items[i].token, 1);
+    }
+    free(logits_rows);
+    return 0;
+}
+
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
@@ -72971,11 +73593,24 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
         }
     }
 
+    /* Distributed coordinator sessions share one worker connection; when the
+     * worker negotiated multi-session spans, one span carries all sessions'
+     * tokens. Otherwise decode serially through the shared-wire-safe
+     * fallback below. */
+    bool any_dist = false;
+    for (int i = 0; i < count; i++) {
+        if (ds4_session_is_distributed(items[i].session)) any_dist = true;
+    }
+    if (any_dist && count >= 2 &&
+        ds4_sessions_eval_batch_dist(items, count, err, errlen) == 0) {
+        return 0;
+    }
+
 #ifndef DS4_NO_GPU
-    if (e->backend == DS4_BACKEND_CUDA) {
+    if (!any_dist && e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
-    if (ds4_sessions_eval_batch_metal_supported(items, count, e)) {
+    if (!any_dist && ds4_sessions_eval_batch_metal_supported(items, count, e)) {
         return ds4_sessions_eval_batch_metal(items, count, e, err, errlen);
     }
 #endif
@@ -73040,12 +73675,18 @@ int ds4_sessions_eval_batch_with_prefill(
         }
     }
 
+    bool any_dist = false;
+    for (int i = 0; i < count; i++) {
+        if (ds4_session_is_distributed(items[i].session)) any_dist = true;
+    }
+    if (prefill_session && ds4_session_is_distributed(prefill_session)) any_dist = true;
+
 #ifndef DS4_NO_GPU
-    if (prefill_session->engine->backend == DS4_BACKEND_CUDA) {
+    if (!any_dist && prefill_session->engine->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_with_prefill_cuda(
                 items, count, prefill_session, prefill_prompt, err, errlen);
     }
-    if (ds4_sessions_eval_batch_with_prefill_metal_supported(
+    if (!any_dist && ds4_sessions_eval_batch_with_prefill_metal_supported(
                 items, count, prefill_session, prefill_prompt)) {
         return ds4_sessions_eval_batch_with_prefill_metal(
                 items, count, prefill_session, prefill_prompt, err, errlen);

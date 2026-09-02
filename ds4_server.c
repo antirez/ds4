@@ -11284,6 +11284,10 @@ static void server_prefill_leave(server *s) {
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
     int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    /* Distributed sessions share one worker connection and the mixed
+     * prefill/decode interleave is not dist-aware yet (L0): keep prefills
+     * exclusive so a prefill never runs beside another slot's decode. */
+    if (s->engine && ds4_engine_is_distributed(s->engine)) quantum = 2048;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -12008,7 +12012,8 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     return rc;
 }
 
-static long server_decode_coalesce_us(void) {
+static long server_decode_coalesce_us(const server *s) {
+    (void)s;
     long us = 2000;
     const char *env = getenv("DS4_SERVER_DECODE_COALESCE_US");
     if (env && env[0]) {
@@ -12030,7 +12035,7 @@ static void *decode_worker_main(void *arg) {
     server *s = arg;
     ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    const long coalesce_us = server_decode_coalesce_us();
+    const long coalesce_us = server_decode_coalesce_us(s);
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
     pthread_mutex_lock(&s->model_mu);
@@ -14643,7 +14648,7 @@ int main(int argc, char **argv) {
                    s.slot_count,
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
-                   server_decode_coalesce_us());
+                   server_decode_coalesce_us(&s));
         if (ds4_engine_has_mtp(engine)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
