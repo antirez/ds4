@@ -375,6 +375,46 @@ static constant ulong ds4_metal_iq2xxs_grid[256] = {
 #define ksigns_iq2xs ds4_metal_ksigns_iq2xs
 #define iq2xxs_grid ds4_metal_iq2xxs_grid
 
+/*
+ * Stage the IQ2_XXS dequant grid (256 uint64) and sign table (128 uint8) into
+ * threadgroup memory.
+ *
+ * The open-coded form this replaces derived a position from
+ * (32*sgitg + tiisg) with no upper bound, so it covered the two tables exactly
+ * only at FC_mul_mv_nsg == 2; at nsg 4 or 8 it wrote 512 or 1024 uint64 into a
+ * 256-entry region, over ssigns and past the end of the threadgroup
+ * allocation.  The host pins these pipelines to nsg = 2 today, which is the
+ * only reason that is not reachable.
+ *
+ * The grid-stride form below is correct for any simdgroup count, including
+ * nsg == 1 where a fixed 64-thread staging window would leave the upper half
+ * of both tables unwritten.  It is taken from the equivalent fix in #621,
+ * which arrived at the same shape independently for two of these kernels.
+ *
+ * At nsg == 2 each thread writes the same entries it wrote before, so the
+ * staged tables are identical to the open-coded form; only the loop shape and
+ * the barrier count (unchanged, one) differ.
+ *
+ * The barrier is outside any guard on purpose -- it has to be reached by every
+ * thread in the threadgroup.
+ */
+static inline void ds4_metal_stage_iq2xxs_tables(
+        threadgroup uint64_t *svalues,
+        threadgroup uint8_t  *ssigns,
+        ushort sgitg,
+        ushort tiisg,
+        short  nsg) {
+    const uint tid = 32u*(uint)sgitg + (uint)tiisg;
+    const uint nth = 32u*(uint)nsg;
+    for (uint i = tid; i < 256u; i += nth) {
+        svalues[i] = ds4_metal_iq2xxs_grid[i];
+    }
+    for (uint i = tid; i < 128u; i += nth) {
+        ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 struct block_q2_K {
     uchar scales[QK_K/16];
     uchar qs[QK_K/4];
@@ -3074,15 +3114,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    ds4_metal_stage_iq2xxs_tables(svalues, ssigns, sgitg, tiisg, NSG);
 
     const int ix = tiisg;
 
@@ -3173,15 +3205,7 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
 
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    ds4_metal_stage_iq2xxs_tables(svalues, ssigns, sgitg, tiisg, NSG);
 
     const int ix = tiisg;
     device const float * y4 = y + 32 * ix;
@@ -3624,15 +3648,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
 
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    ds4_metal_stage_iq2xxs_tables(svalues, ssigns, sgitg, tiisg, NSG);
 
     const int ix = tiisg;
     device const float *y4 = y + 32 * ix;
@@ -3776,15 +3792,9 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
 
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
-    if (sgitg < 2) {
-        int nval = 4;
-        int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    /* Already bounded (sgitg < 2 is the same 64 staging threads); routed
+     * through the shared helper so no open-coded copy of this block is left. */
+    ds4_metal_stage_iq2xxs_tables(svalues, ssigns, sgitg, tiisg, NSG);
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
         if (!yl_preloaded) {
@@ -5784,15 +5794,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
 
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    ds4_metal_stage_iq2xxs_tables(svalues, ssigns, sgitg, tiisg, NSG);
 
     const int ix = tiisg;
 

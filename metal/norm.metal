@@ -345,21 +345,21 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
     threadgroup float *scratch = shmem_f32 + 32;
 
     for (int off = 0; off < n_nope; off += 64) {
+        /*
+         * The amax is reduced from a register via simd_max rather than staged
+         * through threadgroup memory.  That is what removes the partial-block
+         * hazard this loop used to carry: there is no shared array left whose
+         * tail lanes could go uninitialised on the final block, so the guard
+         * that used to be needed here is now structural.
+         */
         float v = 0.0f;
+        float a = 0.0f;
         if (tid < 64u && off + (int)tid < n_nope) {
             v = kv[off + tid];
-            scratch[tid] = abs(v);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            a = abs(v);
         }
 
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(ds4_metal_fp8_amax64(a, tid, scratch), 1.0e-4f);
         const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
         if (tid < 64u && off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;

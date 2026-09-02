@@ -542,22 +542,12 @@ kernel void kernel_dsv4_kv_rope_fp8_store_f32(
 
     for (int off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
+        float a = 0.0f;
         if (off + (int)tid < n_nope) {
             v = kv[off + tid];
-            scratch[tid] = abs(v);
-        } else {
-            scratch[tid] = 0.0f;
+            a = abs(v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(ds4_metal_fp8_amax64(a, tid, scratch), 1.0e-4f);
         const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
@@ -702,18 +692,12 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
         threadgroup_barrier(mem_flags::mem_device);
         for (int off = 0; off < 512 - rope_args.n_dims; off += 64) {
             float v = 0.0f;
+            float a = 0.0f;
             if (tiitg < 64) {
                 v = attn_row[off + tiitg];
-                shmem[tiitg] = abs(v);
+                a = abs(v);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint stride = 32; stride > 0; stride >>= 1) {
-                if (tiitg < stride) {
-                    shmem[tiitg] = max(shmem[tiitg], shmem[tiitg + stride]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const float amax = max(shmem[0], 1.0e-4f);
+            const float amax = max(ds4_metal_fp8_amax64(a, tiitg, shmem), 1.0e-4f);
             const float scale = exp2(ceil(log2(amax / 448.0f)));
             if (tiitg < 64) {
                 const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;

@@ -170,11 +170,29 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
+/*
+ * Device capability, reporting only -- no dispatch decision reads these yet.
+ * architecture() is the stable "applegpu_gNN<tier>" string (macOS 14+) rather
+ * than the marketing name; generation() is NN parsed from it; core_count() is
+ * the IORegistry gpu-core-count, which is the only way to tell an 80-core M3
+ * Ultra from a 40-core M3 Max.  core_count() returns 0 when unavailable, and
+ * callers must treat it as a hint, not a contract.  DS4_METAL_GPU_ARCH and
+ * DS4_METAL_GPU_CORES override them for testing on other hardware.
+ */
+const char *ds4_gpu_device_architecture(void);
+int         ds4_gpu_device_generation(void);
+uint32_t    ds4_gpu_device_core_count(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void);
+/*
+ * Strict test oracle for the Metal E4M3FN conversion.  Evaluates
+ * dsv4_e4m3fn_dequant over `count` inputs so the host can compare it against
+ * the CPU reference element by element.  Returns 0 if the dispatch failed.
+ */
+int ds4_gpu_test_e4m3fn_dequant(const float *in, float *out, uint32_t count);
 /* Strict test oracle for the generated resident-prefill MXFP4 half LUT. */
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits);
@@ -192,6 +210,9 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
+static inline const char *ds4_gpu_device_architecture(void) { return ""; }
+static inline int ds4_gpu_device_generation(void) { return 0; }
+static inline uint32_t ds4_gpu_device_core_count(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);

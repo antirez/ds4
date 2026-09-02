@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <IOKit/IOKitLib.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -493,6 +494,17 @@ static int g_metal4_m5_neural_accelerators_hint;
 static int g_metal4_tensor_api_enabled;
 static int g_metal4_tensor_api_compile_supported;
 static char g_metal_device_name[128];
+/*
+ * Device capability, as opposed to marketing name.  g_metal_device_name alone
+ * cannot separate an 80-core M3 Ultra from a 10-core M3, so every threshold
+ * expressed against the name is off by up to 8x on the wide part.  These are
+ * populated once at init and are reporting-only for now: nothing dispatches
+ * differently on them yet.
+ */
+static char     g_metal_device_arch[64];
+static int      g_metal_gpu_generation;
+static char     g_metal_gpu_tier;
+static uint32_t g_metal_gpu_core_count;
 static int ds4_gpu_model_map_log_enabled(void);
 static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t gate_expert_bytes,
@@ -2390,6 +2402,146 @@ int ds4_gpu_device_is_m5_apple_silicon(void) {
             g_metal_device_name[8] == ' ');
 }
 
+/*
+ * GPU core count, read from the IORegistry.
+ *
+ * Metal exposes no core-count API, and MLX does not have this number either --
+ * it uses generation+tier as a proxy, which cannot separate an M3 Max from an
+ * M3 Ultra.  "gpu-core-count" on the AGXAccelerator node is the real figure.
+ *
+ * This is explicitly a hint, not a contract: it is not documented API, the key
+ * can be absent under virtualisation or on future parts, and every caller must
+ * behave sanely when it returns 0.
+ */
+static uint32_t ds4_gpu_query_gpu_core_count(void) {
+    CFMutableDictionaryRef match = IOServiceMatching("AGXAccelerator");
+    if (!match) return 0;
+
+    io_iterator_t it = MACH_PORT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &it) != KERN_SUCCESS) {
+        /* IOServiceGetMatchingServices consumes `match` even on failure. */
+        return 0;
+    }
+
+    uint32_t cores = 0;
+    io_object_t service = MACH_PORT_NULL;
+    while (cores == 0 && (service = IOIteratorNext(it)) != MACH_PORT_NULL) {
+        CFTypeRef prop = IORegistryEntryCreateCFProperty(
+                service, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+        if (prop) {
+            int value = 0;
+            if (CFGetTypeID(prop) == CFNumberGetTypeID() &&
+                CFNumberGetValue((CFNumberRef)prop, kCFNumberIntType, &value) &&
+                value > 0) {
+                cores = (uint32_t)value;
+            }
+            CFRelease(prop);
+        }
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(it);
+    return cores;
+}
+
+/*
+ * Parse "applegpu_g15d" into generation 15 and tier 'd'.  This is what MLX
+ * reads (mlx/backend/metal/device.cpp) and it is a stable API from macOS 14,
+ * unlike the marketing string.  Unrecognised shapes leave both outputs zeroed.
+ */
+static void ds4_gpu_parse_architecture(const char *arch,
+                                       int        *out_generation,
+                                       char       *out_tier) {
+    *out_generation = 0;
+    *out_tier = '\0';
+    if (!arch || !arch[0]) return;
+
+    size_t end = strlen(arch);
+    char tier = '\0';
+    if (end > 0 && isalpha((unsigned char)arch[end - 1])) {
+        tier = arch[end - 1];
+        end--;
+    }
+
+    size_t start = end;
+    while (start > 0 && isdigit((unsigned char)arch[start - 1])) start--;
+    if (start == end) return;   /* no digits: not an applegpu_gNN<tier> string */
+
+    int generation = 0;
+    for (size_t i = start; i < end; i++) {
+        generation = generation * 10 + (arch[i] - '0');
+    }
+    *out_generation = generation;
+    *out_tier = tier;
+}
+
+/*
+ * Populate the capability globals once, at device init.
+ *
+ * Reporting only: nothing dispatches on these yet.  They are the missing input
+ * for the thresholds that are currently absolute constants or keyed off a
+ * marketing-name substring, and landing them separately keeps the measurement
+ * change apart from any tuning change.
+ *
+ * Both inputs can be overridden so that width- and generation-dependent paths
+ * are testable on hardware that does not have those values, which is the one
+ * facility MLX has (env::metal_gpu_arch) that DS4 lacked entirely.
+ */
+static void ds4_gpu_detect_device_capability(void) {
+    g_metal_device_arch[0] = '\0';
+    g_metal_gpu_generation = 0;
+    g_metal_gpu_tier = '\0';
+    g_metal_gpu_core_count = 0;
+
+    if (!g_device) return;
+
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+    if (@available(macOS 14.0, *)) {
+        const char *arch = [[[g_device architecture] name] UTF8String];
+        if (arch) {
+            snprintf(g_metal_device_arch, sizeof(g_metal_device_arch), "%s", arch);
+        }
+    }
+#endif
+
+    const char *arch_override = getenv("DS4_METAL_GPU_ARCH");
+    if (arch_override && arch_override[0]) {
+        snprintf(g_metal_device_arch, sizeof(g_metal_device_arch), "%s", arch_override);
+    }
+
+    ds4_gpu_parse_architecture(g_metal_device_arch,
+                               &g_metal_gpu_generation,
+                               &g_metal_gpu_tier);
+
+    g_metal_gpu_core_count = ds4_gpu_query_gpu_core_count();
+
+    const char *cores_override = getenv("DS4_METAL_GPU_CORES");
+    if (cores_override && cores_override[0]) {
+        char *endp = NULL;
+        const long v = strtol(cores_override, &endp, 10);
+        if (endp != cores_override && v > 0 && v <= 4096) {
+            g_metal_gpu_core_count = (uint32_t)v;
+        }
+    }
+
+    fprintf(stderr, "ds4: Metal GPU capability: arch %s",
+            g_metal_device_arch[0] ? g_metal_device_arch : "unknown");
+    if (g_metal_gpu_generation > 0) {
+        fprintf(stderr, " (gen %d", g_metal_gpu_generation);
+        if (g_metal_gpu_tier) fprintf(stderr, ", tier %c", g_metal_gpu_tier);
+        fprintf(stderr, ")");
+    }
+    if (g_metal_gpu_core_count > 0) {
+        fprintf(stderr, ", %u GPU cores", g_metal_gpu_core_count);
+    } else {
+        fprintf(stderr, ", GPU core count unavailable");
+    }
+    fprintf(stderr, "\n");
+}
+
+const char *ds4_gpu_device_architecture(void) { return g_metal_device_arch; }
+int         ds4_gpu_device_generation(void)   { return g_metal_gpu_generation; }
+uint32_t    ds4_gpu_device_core_count(void)   { return g_metal_gpu_core_count; }
+
 static bool ds4_gpu_ported_m5_decode_feature_enabled(
         const char *pre_m5_disable_env,
         const char *m5_disable_env) {
@@ -2471,6 +2623,8 @@ static void ds4_gpu_detect_metal4_features(void) {
         snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
     }
 
+    ds4_gpu_detect_device_capability();
+
     const int metal4_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_METAL4") > 0;
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
@@ -2490,7 +2644,17 @@ static void ds4_gpu_detect_metal4_features(void) {
         }
 
         if (g_metal4_family_supported) {
+            /*
+             * DS4_METAL_FORCE_METAL4 enables the tensor path on hardware the
+             * automatic gate declines.  Only DS4_METAL_DISABLE_METAL4 existed,
+             * so on a pre-M5 device the entire kernel_mul_mm_mpp_direct_rhs
+             * family could not be measured at all -- not even to establish
+             * that it does not pay.  This exists for that measurement; it
+             * stays off by default.
+             */
+            const int forced = ds4_gpu_env_bool("DS4_METAL_FORCE_METAL4") > 0;
             const int default_enable =
+                forced ||
                 ds4_gpu_device_name_contains("M5") ||
                 ds4_gpu_device_name_contains("M6") ||
                 ds4_gpu_device_name_contains("A19") ||
@@ -2511,7 +2675,9 @@ static void ds4_gpu_detect_metal4_features(void) {
                     fprintf(stderr, "ds4: Metal 4 tensor API probe failed; using legacy Metal kernels\n");
                 }
             } else {
-                fprintf(stderr, "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices\n");
+                fprintf(stderr,
+                        "ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices "
+                        "(set DS4_METAL_FORCE_METAL4=1 to measure it anyway)\n");
             }
         }
     }
@@ -8727,6 +8893,43 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
         }
         memcpy(legacy_bits, [legacy contents], bytes);
         memcpy(lut_bits, [lut contents], bytes);
+    }
+    return 1;
+}
+
+int ds4_gpu_test_e4m3fn_dequant(const float *in, float *out, uint32_t count) {
+    if (!in || !out || count == 0) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    @autoreleasepool {
+        const NSUInteger bytes = (NSUInteger)count * sizeof(float);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_test_dsv4_e4m3fn_dequant");
+        id<MTLBuffer> src = [g_device newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = [g_device newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        if (!pipeline || !src || !dst || !cb) {
+            fprintf(stderr, "ds4: Metal E4M3 dequant test setup failed\n");
+            return 0;
+        }
+        memcpy([src contents], in, bytes);
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBytes:&count length:sizeof(count) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        if (!ds4_gpu_wait_command_buffer(cb, "E4M3 dequant equivalence test")) {
+            return 0;
+        }
+        memcpy(out, [dst contents], bytes);
     }
     return 1;
 }

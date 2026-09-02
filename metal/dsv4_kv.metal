@@ -1,10 +1,3 @@
-constant float dsv4_e4m3fn_exp_scale[16] = {
-    0.0f, 0.015625f, 0.03125f, 0.0625f,
-    0.125f, 0.25f, 0.5f, 1.0f,
-    2.0f, 4.0f, 8.0f, 16.0f,
-    32.0f, 64.0f, 128.0f, 256.0f,
-};
-
 constant float dsv4_e2m1fn_values[8] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
 };
@@ -55,39 +48,68 @@ struct ds4_metal_args_dsv4_compressor_store_one {
     uint32_t ape_type;
 };
 
-static inline float dsv4_e4m3fn_value(int i) {
-    const int exp  = (i >> 3) & 0x0f;
-    const int mant = i & 0x07;
-    return exp == 0
-        ? float(mant) * 0.001953125f
-        : (1.0f + float(mant) * 0.125f) * dsv4_e4m3fn_exp_scale[exp];
-}
-
 static inline float dsv4_e4m3fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = min(abs(x), 448.0f);
 
-    int lo = 0;
-    int hi = 126;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
+    /*
+     * The per-code value table this used to search lives on as the independent
+     * oracle in test_metal_e4m3fn_dequant_exact (tests/ds4_test.c).
+     *
+     * E4M3FN magnitudes are exactly (8 + mant) * 2^(e - 10), where e is the
+     * 4-bit exponent field and the subnormal case (e == 0) continues the same
+     * 2^-9 spacing as the first normal binade.  So picking the nearest
+     * representable value is: find the binade, express ax in units of that
+     * binade's spacing, round to nearest-even, and scale back.  The rounded
+     * integer q is 8 + mant, and q * scale is already the value -- there is
+     * no code index or table lookup anywhere in this.
+     *
+     * q rounds half to even, and code = (e - 1) * 8 + q, so code and q always
+     * have the same parity.  That makes rint() exactly reproduce the
+     * ties-to-even-code rule of the binary search this replaces.  A tie at the
+     * top of a binade rounds q to 16, which scales to the same value as the
+     * next binade's q == 8, so no carry handling is needed.
+     *
+     * The scale factors are built directly from the exponent field rather than
+     * with exp2() so they are exact regardless of the shader's fast-math
+     * setting.  For e in [1, 15] the biased exponents stay in [118, 136], well
+     * inside the normal range.
+     */
+    const uint32_t bits = as_type<uint32_t>(ax);
+    const int fe = (int)((bits >> 23) & 0xffu) - 127;
+    const int e = clamp(fe + 7, 1, 15);
 
-    int best = lo;
-    if (best < 126) {
-        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
-        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
-        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
-            best = best + 1;
-        }
-    }
+    const float scale     = as_type<float>((uint32_t)(127 + (e - 10)) << 23);
+    const float inv_scale = as_type<float>((uint32_t)(127 - (e - 10)) << 23);
 
-    return sign * dsv4_e4m3fn_value(best);
+    return sign * (rint(ax * inv_scale) * scale);
+}
+
+/*
+ * amax across the 64 lanes covering one FP8 block: two simd_max plus a single
+ * exchange, replacing a six-step threadgroup reduction tree.
+ *
+ * `a` is the lane's |value|, or 0 for lanes past the end of a partial block.
+ * Passing it in a register removes the staging array the tree needed, and with
+ * it the whole class of bug where a partial block left some slots
+ * uninitialised and folded them into the result.
+ *
+ * max over non-negative finite floats is associative and exact, so the result
+ * is bit-identical to the tree regardless of reduction order.
+ *
+ * scratch needs only two floats.  The barrier is unconditional so every thread
+ * reaches it, including in callers whose threadgroup is wider than 64 lanes.
+ */
+static inline float ds4_metal_fp8_amax64(
+        float a,
+        uint tid,
+        threadgroup float * scratch) {
+    const float sg = simd_max(a);
+    if (tid < 64u && (tid & 31u) == 0u) {
+        scratch[tid >> 5] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return max(scratch[0], scratch[1]);
 }
 
 static inline float dsv4_e2m1fn_dequant(float x) {
@@ -103,6 +125,26 @@ static inline float dsv4_e2m1fn_dequant(float x) {
         }
     }
     return sign * dsv4_e2m1fn_values[best];
+}
+
+/*
+ * Test hook: evaluate dsv4_e4m3fn_dequant over a caller-supplied input array.
+ *
+ * The FP8 KV path is required to be bit-identical between the CPU reference
+ * (dsv4_e4m3fn_dequant_cpu) and this file. Nothing in the tree tested that,
+ * which made any rewrite of the conversion an argument rather than a proof.
+ * Exposing the scalar conversion lets the host compare both implementations
+ * element by element over an exhaustive input set.
+ */
+kernel void kernel_test_dsv4_e4m3fn_dequant(
+        device const float *in [[buffer(0)]],
+        device       float *out [[buffer(1)]],
+        constant     uint  &count [[buffer(2)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= count) {
+        return;
+    }
+    out[tid] = dsv4_e4m3fn_dequant(in[tid]);
 }
 
 // Quantizes the non-RoPE part of a KV row through E4M3FN and writes the
@@ -131,20 +173,12 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
 
     for (int64_t off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
+        float a = 0.0f;
         if (tid < 64) {
             v = *((device const float *) (src_base + (off + tid)*args.nb00));
-            scratch[tid] = abs(v);
+            a = abs(v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(ds4_metal_fp8_amax64(a, tid, scratch), 1.0e-4f);
         const float scale = exp2(ceil(log2(amax / 448.0f)));
         if (tid < 64) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
@@ -229,22 +263,12 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
 
     for (int off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
+        float a = 0.0f;
         if (off + (int)tid < n_nope) {
             v = kv[off + tid];
-            scratch[tid] = abs(v);
-        } else {
-            scratch[tid] = 0.0f;
+            a = abs(v);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        const float amax = max(scratch[0], 1.0e-4f);
+        const float amax = max(ds4_metal_fp8_amax64(a, tid, scratch), 1.0e-4f);
         const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;

@@ -6153,7 +6153,36 @@ static void config_validate_glm53_model(const ds4_model *m) {
     config_validate_glm53_layer_types(m);
 }
 
+/*
+ * Every FP8 KV quantise path walks the non-RoPE prefix in fixed 64-element
+ * blocks: dsv4_fp8_kv_quantize_row_inplace_cpu, kernel_dsv4_fp8_kv_quantize_f32,
+ * kernel_dsv4_kv_fp8_store_f32, kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32,
+ * and the CUDA/ROCm equivalents.  On a partial final block those implementations
+ * do not agree with one another, so a variant whose prefix is not 64-aligned
+ * would diverge between backends rather than fail.
+ *
+ * All four shipped variants give 448 or 512 and are unaffected.  This exists so
+ * that a fifth variant with an unaligned prefix fails loudly at load instead of
+ * producing quietly different numbers per backend.  It cannot be a
+ * _Static_assert: the shape tables are selected at runtime.
+ *
+ * This lives at the shared entry point rather than in
+ * config_validate_fixed_shape because the GLM-DSA branch below returns before
+ * ever reaching that function, and the invariant binds on both architectures.
+ */
+static void config_validate_fp8_kv_prefix_alignment(void) {
+    const uint32_t head_dim = (uint32_t)DS4_N_HEAD_DIM;
+    const uint32_t n_rot = (uint32_t)DS4_N_ROT;
+    if (n_rot > head_dim || ((head_dim - n_rot) % 64u) != 0u) {
+        ds4_die("model variant has (key_length - rope.dimension_count) not a "
+                "multiple of 64; FP8 KV quantisation requires a 64-aligned "
+                "non-RoPE prefix");
+    }
+}
+
 static void config_validate_model(const ds4_model *m) {
+    config_validate_fp8_kv_prefix_alignment();
+
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
@@ -12958,6 +12987,18 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 
 #define DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK 2048u
 
+/*
+ * Largest prefill chunk the GPU graph can stage.
+ *
+ * The raw KV cache is sized align_up(raw_window + prefill_cap, 256) and then
+ * clamped to 8192 rows (metal_graph_raw_cap_for_context / engine_planner_raw_cap).
+ * A chunk larger than that cannot be staged: the raw cache clamps silently and
+ * the prefill then dies inside the attention batch encode with
+ * "gpu layer N attention batch encode failed" and nothing pointing at the
+ * cause.  Verified empirically -- 8192 runs, 8448 does not.
+ */
+#define DS4_PREFILL_MAX_CHUNK 8192u
+
 static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
                                             uint32_t requested_chunk) {
     if (requested_chunk != 0) return requested_chunk;
@@ -12986,6 +13027,22 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     }
 
     if (cap == 0) cap = 1;
+    /*
+     * Clamp rather than abort: an out-of-range --prefill-chunk or
+     * DS4_METAL_PREFILL_CHUNK should degrade to the largest workable value and
+     * say so, not fail deep in the graph encode with an unrelated message.
+     */
+    if (cap > DS4_PREFILL_MAX_CHUNK) {
+        static int warned_prefill_chunk_clamped;
+        if (!warned_prefill_chunk_clamped) {
+            fprintf(stderr,
+                    "ds4: prefill chunk %u exceeds the %u-row raw KV cache "
+                    "limit; using %u\n",
+                    cap, DS4_PREFILL_MAX_CHUNK, DS4_PREFILL_MAX_CHUNK);
+            warned_prefill_chunk_clamped = 1;
+        }
+        cap = DS4_PREFILL_MAX_CHUNK;
+    }
     if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
     return cap;
 }
