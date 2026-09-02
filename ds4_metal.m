@@ -20552,9 +20552,20 @@ int ds4_gpu_matmul_f32_mm_tensor(
      * float through threadgroup staging and simdgroup accumulation, so the
      * logits only change summation order relative to the per-token matvec.
      * DS4_METAL_DISABLE_ROUTER_MM=1 restores the matvec for A/B benches. */
+    const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+    id<MTLComputePipelineState> mm_pipeline = nil;
     if (getenv("DS4_METAL_DISABLE_ROUTER_MM") == NULL &&
         n_tok >= 32u &&
         (in_dim % 32u) == 0) {
+        mm_pipeline = ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32", false, bc_out);
+        if (!mm_pipeline) {
+            fprintf(stderr,
+                    "ds4: f32-staged router matmul unavailable on this device, "
+                    "using the per-token matvec\n");
+        }
+    }
+
+    if (mm_pipeline) {
         @autoreleasepool {
             id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
             id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
@@ -20583,11 +20594,6 @@ int ds4_gpu_matmul_f32_mm_tensor(
                                          &inner_offset);
             if (!wbuf) return 0;
 
-            const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32", false, bc_out);
-            if (!pipeline) return 0;
-
             static bool route_debugged = false;
             if (!route_debugged && getenv("DS4_METAL_MOE_ROUTE_DEBUG") != NULL) {
                 route_debugged = true;
@@ -20609,7 +20615,7 @@ int ds4_gpu_matmul_f32_mm_tensor(
             ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:pipeline];
+            [enc setComputePipelineState:mm_pipeline];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
