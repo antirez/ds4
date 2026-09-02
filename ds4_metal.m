@@ -20537,6 +20537,107 @@ int ds4_gpu_matmul_f32_tensor(
     return 1;
 }
 
+int ds4_gpu_matmul_f32_mm_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    /* Fully fp32-staged batched GEMM for prompt batches: both operands stay
+     * float through threadgroup staging and simdgroup accumulation, so the
+     * logits only change summation order relative to the per-token matvec.
+     * DS4_METAL_DISABLE_ROUTER_MM=1 restores the matvec for A/B benches. */
+    if (getenv("DS4_METAL_DISABLE_ROUTER_MM") == NULL &&
+        n_tok >= 32u &&
+        (in_dim % 32u) == 0) {
+        @autoreleasepool {
+            id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+            id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+            const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+            const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+            if (!xbuf || !outbuf ||
+                ds4_gpu_tensor_bytes(x) < x_bytes ||
+                ds4_gpu_tensor_bytes(out) < out_bytes) {
+                fprintf(stderr, "ds4: Metal F32 MM tensor matmul received undersized activation buffers\n");
+                return 0;
+            }
+
+            const uint64_t row_bytes = in_dim * sizeof(float);
+            const uint64_t weight_bytes = row_bytes * out_dim;
+            if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+                fprintf(stderr, "ds4: Metal F32 MM tensor matmul range is outside the mapped model\n");
+                return 0;
+            }
+
+            uint64_t inner_offset = 0;
+            id<MTLBuffer> wbuf =
+                ds4_gpu_wrap_model_range(model_map,
+                                         model_size,
+                                         weight_offset,
+                                         weight_bytes,
+                                         &inner_offset);
+            if (!wbuf) return 0;
+
+            const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32", false, bc_out);
+            if (!pipeline) return 0;
+
+            static bool route_debugged = false;
+            if (!route_debugged && getenv("DS4_METAL_MOE_ROUTE_DEBUG") != NULL) {
+                route_debugged = true;
+                fprintf(stderr,
+                        "ds4: [router-mm] n_tok=%llu in_dim=%llu out_dim=%llu "
+                        "kernel=kernel_mul_mm_f32_f32 bc_out=%d grid=%llux%llu\n",
+                        (unsigned long long)n_tok,
+                        (unsigned long long)in_dim,
+                        (unsigned long long)out_dim,
+                        bc_out ? 1 : 0,
+                        (unsigned long long)((n_tok + 31u) / 32u),
+                        (unsigned long long)((out_dim + 63u) / 64u));
+            }
+
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+
+            ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:(64u * 32u * sizeof(float) +
+                                          32u * 32u * sizeof(float)) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                                  ((NSUInteger)out_dim + 63u) / 64u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "F32 MM tensor matmul")) return 0;
+        }
+
+        return 1;
+    }
+
+    return ds4_gpu_matmul_f32_tensor(out,
+                                     model_map,
+                                     model_size,
+                                     weight_offset,
+                                     in_dim,
+                                     out_dim,
+                                     x,
+                                     n_tok);
+}
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

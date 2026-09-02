@@ -974,6 +974,19 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Batched (matrix-matrix) fp32 variant for prompt batches; falls back to
+ * ds4_gpu_matmul_f32_tensor for small n_tok or when
+ * DS4_METAL_DISABLE_ROUTER_MM is set. */
+int ds4_gpu_matmul_f32_mm_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,
