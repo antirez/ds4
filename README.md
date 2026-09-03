@@ -1509,6 +1509,32 @@ re-processing if it was written to the disk KV cache. In other words, memory
 cache handles the active session; disk cache is the resume mechanism for
 different sessions.
 
+### Keeping the live session warm from a stateless chat client
+
+After a generation finishes, the live slot holds `prompt + sampled output`. A
+typical chat client next sends `prompt + new user turns` and never includes that
+exact assistant text, so the token-prefix check fails (`token-mismatch`) and
+every request falls through to disk. On disk, cold checkpoints are trimmed to
+the last user turn before the first assistant turn (`kv_cache_chat_anchor_pos`);
+for a client that cannot replay, that anchor is usually the only prefix it can
+hit.
+
+To extend the live session instead:
+
+1. Replay the previous assistant turn byte-for-byte in the next request
+   (plain `content`, or `tool_calls` plus the matching `tool` result). Exact
+   DSML tool-id replay makes tool histories match the sampled text too.
+2. To create or re-warm a session after a slot steal/eviction, send the
+   conversation with `max_tokens: 0` (prefill only, no sampled token). Do not
+   use `max_tokens: 1`: the one sampled token is appended to the live session
+   and the next prompt misses it.
+3. Witness: `usage.prompt_tokens_details.cached_tokens` should be about prior
+   prompt + completion on a warm follow-up (or the full prompt after a
+   `max_tokens: 0` prewarm).
+
+Prefer plain-text structured output over a short tool call when no tool result
+is needed: DSML scaffolding adds tokens to every warm extension.
+
 Enable it with:
 
 ```sh
@@ -1646,6 +1672,9 @@ builds for this model layout.
 The cache stores checkpoints at four moments:
 
 - `cold`: after a long first prompt reaches a stable prefix, before generation.
+  For chat prompts this is trimmed to the last user turn before the first
+  assistant turn (`kv_cache_chat_anchor_pos`), so a client that cannot replay
+  assistant text can still resume from that shared prefix on disk.
 - `continued`: when prefill or generation reaches the next absolute aligned frontier.
 - `evict`: before an unrelated request replaces the live in-memory session.
 - `shutdown`: when the server exits cleanly.
