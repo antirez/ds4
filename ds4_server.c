@@ -11624,10 +11624,20 @@ static char *build_responses_visible_assistant_suffix(const request *r,
 static void remember_multimodal_chat_checkpoint(
         server *s, server_slot *slot, const job *j, const char *ctx,
         uint64_t trace_id, const char *content, const char *reasoning,
-        const tool_calls *calls, const char *finish) {
+        const tool_calls *calls, const char *finish,
+        const thinking_state *thinking) {
     if (!s || !slot || !j || j->req.kind != REQ_CHAT ||
         j->req.api == API_RESPONSES || j->req.image_count == 0 ||
         !finish || !strcmp(finish, "error") || !strcmp(finish, "length")) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+    /* A custom stop sequence can fire while still inside reasoning, before
+     * </think>.  The live KV then remains in an unclosed think block, so
+     * recording a closed visible assistant turn would let the next same-image
+     * request append the user message inside the unfinished reasoning.  Drop
+     * the checkpoint instead. */
+    if (thinking && thinking->inside) {
         thinking_live_clear(s, slot);
         return;
     }
@@ -11646,6 +11656,7 @@ static void remember_multimodal_chat_checkpoint(
         return;
     }
     size_t base_len = strlen(base);
+    size_t raw_base_len = strlen(j->req.prompt_text);
     /* A pending DeepSeek turn ends in <think>.  When Pi replays a normal
      * no-tool assistant answer, render_deepseek_chat_prompt_text() replaces
      * that pending tag with </think>; it does not render <think></think>.
@@ -11664,12 +11675,18 @@ static void remember_multimodal_chat_checkpoint(
             free(suffix);
             return;
         }
+        /* Keep the raw checkpoint boundary aligned with the visible key: the
+         * visible text dropped this pending tag, so the replay offset must too,
+         * or the next same-image request starts tokenizing seven bytes into
+         * the new user suffix (potentially mid-UTF-8) and corrupts the
+         * continuation. */
         base_len -= open_think_len;
+        raw_base_len -= open_think_len;
     }
     buf visible = {0};
     buf_append(&visible, base, base_len);
     buf_puts(&visible, suffix);
-    const size_t raw_len = strlen(j->req.prompt_text) + strlen(suffix);
+    const size_t raw_len = raw_base_len + strlen(suffix);
     thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", raw_len);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: multimodal chat live checkpoint remembered ctx=%s live=%d visible=%zu raw=%zu",
@@ -13196,7 +13213,7 @@ decode_again:
         remember_multimodal_chat_checkpoint(
             s, slot, j, ctx_span, trace_id,
             parsed_content ? parsed_content : "", parsed_reasoning,
-            &parsed_calls, final_finish);
+            &parsed_calls, final_finish, &thinking);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
     } else if (!parsed_calls.len &&
