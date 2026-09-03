@@ -103,10 +103,13 @@ static ds4_backend test_model_backend(void) {
 static ds4_engine *test_open_engine(bool quality) {
     ds4_engine *engine = NULL;
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
-     * verify regression can reuse it; draft=4 hits the multi-row verify path. */
+     * verify regression can reuse it; draft=4 hits the multi-row verify path.
+     * DS4_TEST_PLE binds the Qwen pack's PLE sidecar the same way. */
     const char *mtp = getenv("DS4_TEST_MTP");
+    const char *ple = getenv("DS4_TEST_PLE");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
+        .ple_path = (ple && ple[0]) ? ple : NULL,
         .backend = test_model_backend(),
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
@@ -6966,6 +6969,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
+    puts("  DS4_TEST_PLE=FILE         Qwen PLE sidecar for packs that require one.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
     puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");

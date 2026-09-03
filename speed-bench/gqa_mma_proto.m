@@ -234,6 +234,14 @@ int main(int argc, char **argv) {
             {"gqa_rs_b64_d8", 2, 64, 8, 0, 0.0},
             {"gqa_rs_b64_d8_qsplit", 3, 64, 8, 0, 0.0},
             {"gqa_rs_b128_d8_qsplit", 3, 128, 8, 0, 0.0},
+            {"gqa_t2d_split", 4, 32, 32, 0, 0.0},
+            {"gqa_t2d_exact", 5, 32, 32, 0, 0.0},
+            {"gqa_t2d_split_tk256", 6, 32, 32, 0, 0.0},
+            {"gqa_t2d_exact_tk256", 7, 32, 32, 0, 0.0},
+            {"gqa_t2d_split_noqk", 8, 32, 32, 0, 0.0},
+            {"gqa_t2d_split_nopv", 9, 32, 32, 0, 0.0},
+            {"gqa_t2d_split_nogather", 10, 32, 32, 0, 0.0},
+            {"gqa_t2d_split_tk256_nogather", 11, 32, 32, 0, 0.0},
         };
         const int n_variants =
             (int)(sizeof(variants) / sizeof(variants[0]));
@@ -279,18 +287,28 @@ int main(int argc, char **argv) {
             }
         }
         float *ref = malloc((size_t)VROWS * Q_HEADS * DIM * 4);
+        float *ref_exact = malloc((size_t)VROWS * Q_HEADS * DIM * 4);
         cpu_reference(VROWS, q, gate, key, value, sel, v_counts, v_visible,
                       ref, 1);
+        cpu_reference(VROWS, q, gate, key, value, sel, v_counts, v_visible,
+                      ref_exact, 0);
         float *first = malloc((size_t)VROWS * Q_HEADS * DIM * 4);
         /* rolesplit (org 2): 16 Q rows + BK*DC staging + 16xBK S/P +
          * selections/stats; O rescale overlays staging. */
         const uint v_hpad2 = 16u;
         int validated = 0;
+        for (int pass = 0; pass < 2; pass++) {
         for (int v = 0; v < n_variants; v++) {
-            /* Validate the role-split (production) variants only; the
-             * legacy lockstep/per-simdgroup comparison kernels are
-             * timing-only. */
-            if (variants[v].skip != 0 || variants[v].org != 2) continue;
+            /* pass 0: only t2d; pass 1: the rest */
+            const int is_t2d = variants[v].org >= 4;
+            if ((pass == 0) != (is_t2d != 0)) continue;
+            /* Validate the role-split (production) variants and the
+             * TensorOps t2d variants; the legacy lockstep/per-simdgroup
+             * comparison kernels are timing-only. */
+            if (variants[v].skip != 0 ||
+                (variants[v].org != 2 && variants[v].org < 4) ||
+                variants[v].org >= 7) /* timing-only t2d variants */ continue;
+            const float *vref = variants[v].org == 5 ? ref_exact : ref;
             id<MTLFunction> fn = [lib newFunctionWithName:
                 [NSString stringWithUTF8String:variants[v].name]];
             if (!fn) {
@@ -301,15 +319,35 @@ int main(int argc, char **argv) {
             id<MTLComputePipelineState> pso =
                 [device newComputePipelineStateWithFunction:fn error:nil];
             const uint hpad = variants[v].org >= 1 ? 16u : 8u;
-            size_t tg_bytes =
-                (size_t)hpad * DIM * 2u + (size_t)variants[v].bk *
-                    variants[v].dc * 2u +
-                (size_t)hpad * variants[v].bk * 4u +
-                (size_t)hpad * variants[v].bk * 2u +
-                (size_t)variants[v].bk * 4u + hpad * 2u * 4u + hpad * 4u +
-                2u * 4u + 64u;
-            if (variants[v].org == 2)
-                tg_bytes += (size_t)8u * 128u * 4u + 64u; /* O block */
+            size_t tg_bytes;
+            if (variants[v].org >= 4) {
+                /* t2d: SPLIT qt 16*256*2 + kt 32*256*2 (V overlays K) +
+                 * pt 16*32*4 + sel/stats/rfac/vote; EXACT adds the qc/kc
+                 * double buffers and a standalone V region. */
+                const int tk = (variants[v].org == 6 ||
+                                variants[v].org == 7) ? 256 : 32;
+                tg_bytes = (variants[v].org & 1) == 0
+                    ? (size_t)16u * DIM * 2u + (size_t)32u * DIM * 2u +
+                      (size_t)16u * 32u * 4u +
+                      (size_t)32u * 4u + (size_t)16u * 2u * 4u +
+                      (size_t)16u * 4u + (size_t)16u * 4u
+                    : (size_t)2u * 16u * (size_t)tk * 4u +
+                      (size_t)2u * 32u * (size_t)tk * 4u +
+                      (size_t)128u * 32u * 4u +
+                      (size_t)16u * 32u * 4u +
+                      (size_t)32u * 4u + (size_t)16u * 2u * 4u +
+                      (size_t)16u * 4u + (size_t)16u * 4u;
+            } else {
+                tg_bytes =
+                    (size_t)hpad * DIM * 2u + (size_t)variants[v].bk *
+                        variants[v].dc * 2u +
+                    (size_t)hpad * variants[v].bk * 4u +
+                    (size_t)hpad * variants[v].bk * 2u +
+                    (size_t)variants[v].bk * 4u + hpad * 2u * 4u +
+                    hpad * 4u + 2u * 4u + 64u;
+                if (variants[v].org == 2)
+                    tg_bytes += (size_t)8u * 128u * 4u + 64u; /* O block */
+            }
             proto_args args = {VROWS, CACHE_CAP, Q_HEADS, KV_HEADS, DIM,
                                TOP_K, RATIO, TOP_K * RATIO + RATIO - 1u,
                                0u};
@@ -332,7 +370,8 @@ int main(int argc, char **argv) {
                 variants[v].org == 0 ? KV_HEADS * 2u : KV_HEADS, 1);
             const MTLSize threads = MTLSizeMake(
                 variants[v].org == 0 ? 32u
-                    : (variants[v].org == 1 ? 64u : 192u),
+                    : (variants[v].org == 1 ? 64u
+                        : (variants[v].org >= 4 ? 128u : 192u)),
                 1, 1);
             [enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
             [enc endEncoding];
@@ -348,12 +387,15 @@ int main(int argc, char **argv) {
             double worst = 0.0;
             size_t at = 0;
             for (size_t i = 0; i < (size_t)VROWS * Q_HEADS * DIM; i++) {
-                const double err = fabs(got[i] - ref[i]);
-                const double tol = 5e-3 + 3e-2 * fabs(ref[i]);
+                const double err = fabs(got[i] - vref[i]);
+                const double tol = variants[v].org == 5
+                    ? 1e-3 + 1e-3 * fabs(vref[i])
+                    : 5e-3 + 3e-2 * fabs(vref[i]);
                 if (!isfinite(got[i]) || err > tol) {
                     fprintf(stderr, "gqa-mma-proto: %s VALIDATION FAIL at "
                                     "%zu: got %.6g ref %.6g\n",
-                            variants[v].name, i, got[i], ref[i]);
+                            variants[v].name, i, got[i], vref[i]);
+                    if (variants[v].org >= 4) break; /* debug below */
                     const uint q0 = (uint)(i / (Q_HEADS * DIM));
                     const uint h0 =
                         (uint)((i % (Q_HEADS * DIM)) / DIM);
@@ -361,9 +403,17 @@ int main(int argc, char **argv) {
                         const size_t j = ((size_t)q0 * Q_HEADS + h0) * DIM + d;
                         fprintf(stderr, "  d%u: got %.6g ref %.6g "
                                         "pw-sum-check\n",
-                                d, got[j], ref[j]);
+                                d, got[j], vref[j]);
                     }
-                    return 1;
+                    if (variants[v].org < 4) return 1;
+                    static int shown = 0;
+                    if (shown++ < 12)
+                        fprintf(stderr, "  viol q%zu h%zu d%zu got %.6g "
+                                        "ref %.6g\n",
+                                i / ((size_t)Q_HEADS * DIM),
+                                (i / DIM) % Q_HEADS, i % DIM,
+                                got[i], vref[i]);
+                    continue;
                 }
                 if (err > worst) { worst = err; at = i; }
             }
@@ -379,9 +429,7 @@ int main(int argc, char **argv) {
                        "%.2e)\n", variants[v].name, worst, xworst);
             }
         }
-        free(ref);
-        free(first);
-
+        }
         /* ---- magnitude sweep: the F16-Q rounding error is proportional
          * to |q||k|, so production-scale inputs must show the plain
          * variant drifting from EXACT (scalar-kernel semantics) while
@@ -752,18 +800,35 @@ int main(int argc, char **argv) {
                 [device newComputePipelineStateWithFunction:fn error:nil];
             if (!pso) continue;
             const uint hpad = variants[v].org >= 1 ? 16u : 8u;
-            size_t tg_bytes =
-                (size_t)hpad * DIM * 2u + (size_t)variants[v].bk *
-                    variants[v].dc * 2u +
-                (size_t)hpad * variants[v].bk * 4u +
-                (size_t)hpad * variants[v].bk * 2u +
-                (size_t)variants[v].bk * 4u + hpad * 2u * 4u + hpad * 4u +
-                2u * 4u + 64u;
-            if (variants[v].org == 2)
-                tg_bytes += (size_t)8u * 128u * 4u + 64u; /* O block */
-            if (variants[v].org == 3) {
-                tg_bytes += (size_t)8u * 128u * 4u + 64u; /* O block */
-                tg_bytes += (size_t)hpad * DIM * 2u;      /* qs_lo tile */
+            size_t tg_bytes;
+            if (variants[v].org >= 4) {
+                const int tk = (variants[v].org == 6 ||
+                                variants[v].org == 7) ? 256 : 32;
+                tg_bytes = (variants[v].org & 1) == 0
+                    ? (size_t)16u * DIM * 2u + (size_t)32u * DIM * 2u +
+                      (size_t)16u * 32u * 4u +
+                      (size_t)32u * 4u + (size_t)16u * 2u * 4u +
+                      (size_t)16u * 4u + (size_t)16u * 4u
+                    : (size_t)2u * 16u * (size_t)tk * 4u +
+                      (size_t)2u * 32u * (size_t)tk * 4u +
+                      (size_t)128u * 32u * 4u +
+                      (size_t)16u * 32u * 4u +
+                      (size_t)32u * 4u + (size_t)16u * 2u * 4u +
+                      (size_t)16u * 4u + (size_t)16u * 4u;
+            } else {
+                tg_bytes =
+                    (size_t)hpad * DIM * 2u + (size_t)variants[v].bk *
+                        variants[v].dc * 2u +
+                    (size_t)hpad * variants[v].bk * 4u +
+                    (size_t)hpad * variants[v].bk * 2u +
+                    (size_t)variants[v].bk * 4u + hpad * 2u * 4u +
+                    hpad * 4u + 2u * 4u + 64u;
+                if (variants[v].org == 2)
+                    tg_bytes += (size_t)8u * 128u * 4u + 64u; /* O block */
+                if (variants[v].org == 3) {
+                    tg_bytes += (size_t)8u * 128u * 4u + 64u; /* O block */
+                    tg_bytes += (size_t)hpad * DIM * 2u;      /* qs_lo tile */
+                }
             }
             if (tg_bytes > device.maxThreadgroupMemoryLength) {
                 printf("  %-24s SKIP (tg %zu > limit %llu)\n",
@@ -779,7 +844,8 @@ int main(int argc, char **argv) {
                 rows, variants[v].org == 0 ? KV_HEADS * 2u : KV_HEADS, 1);
             const MTLSize threads = MTLSizeMake(
                 variants[v].org == 0 ? 32u
-                    : (variants[v].org == 1 ? 64u : 192u),
+                    : (variants[v].org == 1 ? 64u
+                        : (variants[v].org >= 4 ? 128u : 192u)),
                 1, 1);
             double samples[5];
             for (int iter = 0; iter < 7; iter++) {

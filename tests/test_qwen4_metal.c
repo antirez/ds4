@@ -1413,12 +1413,24 @@ static void test_model_q8_0_mpp_rows(void) {
 
 static void test_model_q8_0_mpp_f32stage_rows(void) {
     /* The F32-staged NAX quality route (DS4_QWEN4_Q8_0_MPP_F32STAGE=1)
-     * stages the Q8_0 weight tile as fp32, so the only remaining deviation
-     * from the exact CPU dequant reference is the TensorOps accumulate
-     * order.  On the portable fallback that measures bit-exact; the bound
-     * below keeps headroom for the M5 hardware accumulate (the
-     * exp/m5-tensor-precision GT sweep measured ~1.7e-4 rms there) while
-     * staying far tighter than the binary16-staged fixture. */
+     * stages the Q8_0 weight tile as fp32, removing the binary16 weight
+     * rounding while TensorOps reads the dense F32 activation tile straight
+     * from device memory.  On the portable fallback (pre-M5 GPUs with
+     * DS4_METAL_ENABLE_TENSOR=1) that measures bit-exact, and the grouped
+     * MoE f32stage twins hold the same near-exact class on real M5 tensor
+     * units (their cooperative tensors are threadgroup-staged; fixtures
+     * below measure 5.96e-8 / 1.91e-6 max).  The DENSE direct-RHS twin is
+     * different on real M5 hardware: the tensor units compute the
+     * device-memory F32 operand at ~binary16-class precision no matter how
+     * the weight tile is staged, so F32 staging does not tighten the dense
+     * route there — measured on M5 Max at this fixture's geometry
+     * (K=512, seed 211/17): rel_rms 4.0e-4 binary16 vs 6.9e-4 f32stage,
+     * max_abs 0.0236 vs 0.0351, max_rel 6.7e-3 (DS4_METAL_MATH_SAFE is
+     * bit-identical, so compiler fast-math is not the source).  The bound
+     * below therefore pins the measured M5 envelope (with ~1.4-2.2x
+     * margin) rather than the fallback's near-exact class: on real M5 the
+     * dense f32stage twin is ~1.7x LOOSER than the default binary16 route
+     * and the dense quality-route claim does not hold. */
     if (!ds4_gpu_metal4_tensor_route_enabled()) {
         puts("Qwen Q8_0 TensorOps route not compiled; MPP f32stage fixture skipped");
         return;
@@ -1469,7 +1481,7 @@ static void test_model_q8_0_mpp_f32stage_rows(void) {
         snprintf(label, sizeof(label),
                  "Qwen Q8_0 MPP f32stage rows=%u", rows);
         require_array_close(label, actual, expected,
-                            (size_t)rows * OUT, 4e-3f, 4e-3f);
+                            (size_t)rows * OUT, 5e-2f, 1.5e-2f);
         ds4_gpu_tensor_free(out);
         ds4_gpu_tensor_free(x);
         free(actual);
@@ -1478,6 +1490,93 @@ static void test_model_q8_0_mpp_f32stage_rows(void) {
     }
     unsetenv("DS4_QWEN4_Q8_0_MPP_F32STAGE");
     free(allocation);
+}
+
+static void test_model_q8_0_bf16_mul_mm_rows(void) {
+    /* The OPT-IN tiled route for prefill-sized BF16-input batches (the PLE
+     * key/value tiles): DS4_QWEN4_Q8_0_BF16_MUL_MM=1 widens to F32 and
+     * runs the tiled tensor-core kernel_mul_mm_q8_0_f32 instead of the
+     * per-row scalar kernel.  out_dim 67 and the 33-row case exercise the
+     * bounds-checked variant; 8 rows stays below the route threshold and
+     * pins the scalar path's exact BF16 arithmetic (which is also the
+     * default for every row count with the opt-in flag unset — checked by
+     * the plain-path case in test_model_q8_0_paths).  The tiled kernel
+     * rounds dequantized weights and the widened activations to F16
+     * threadgroup tiles and accumulates F32, so the rows>=32 reference
+     * tolerance covers that rounding (the same class as the F32-input
+     * tiled fixture). */
+    enum { IN = 512 };
+    const size_t weight_offset = 4096u;
+    const uint32_t out_cases[] = {128u, 67u};
+    const uint32_t row_cases[] = {64u, 33u, 8u};
+    for (uint32_t oc = 0u; oc < 2u; oc++) {
+        const uint32_t out_dim = out_cases[oc];
+        const size_t weight_bytes =
+            (size_t)out_dim * (IN / 32u) * sizeof(test_block_q8_0);
+        const size_t model_size = weight_offset + weight_bytes + 256u;
+        void *allocation = NULL;
+        require_ok(posix_memalign(&allocation, 4096u,
+                                  align_size(model_size, 4096u)) == 0,
+                   "Q8_0 BF16 mul_mm model allocation");
+        memset(allocation, 0, align_size(model_size, 4096u));
+        uint8_t *model = allocation;
+        test_block_q8_0 *weights =
+            (test_block_q8_0 *)(model + weight_offset);
+        fill_q8_0_matrix(weights, out_dim, IN, 71u);
+        require_ok(ds4_gpu_set_model_map(model, model_size),
+                   "Q8_0 BF16 mul_mm model registration");
+        for (uint32_t rc = 0u; rc < 3u; rc++) {
+            const uint32_t rows = row_cases[rc];
+            require_ok(
+                setenv("DS4_QWEN4_Q8_0_BF16_MUL_MM",
+                       rows >= 32u ? "1" : "0", 1) == 0,
+                "Q8_0 BF16 mul_mm env");
+            float *input = malloc((size_t)rows * IN * sizeof(float));
+            uint16_t *input_bf16 =
+                malloc((size_t)rows * IN * sizeof(uint16_t));
+            float *rounded = malloc((size_t)rows * IN * sizeof(float));
+            float *expected = malloc((size_t)rows * out_dim * sizeof(float));
+            float *actual = malloc((size_t)rows * out_dim * sizeof(float));
+            require_ok(input && input_bf16 && rounded && expected && actual,
+                       "Q8_0 BF16 mul_mm host allocations");
+            for (uint32_t i = 0; i < rows * IN; i++) {
+                input[i] = cosf((float)(i + 11u) * 0.013f) * 0.4f;
+                input_bf16[i] = f32_to_bf16(input[i]);
+                rounded[i] = bf16_to_f32(input_bf16[i]);
+            }
+            q8_0_matmul_reference(expected, weights, rounded, IN, out_dim,
+                                  rows);
+            ds4_gpu_tensor *xb = tensor_from(
+                input_bf16, (size_t)rows * IN * sizeof(uint16_t));
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+                (size_t)rows * out_dim * sizeof(float));
+            require_ok(xb && out, "Q8_0 BF16 mul_mm tensor allocation");
+            require_ok(ds4_gpu_qwen4_q8_0_matmul_model_bf16(
+                           out, model, model_size, weight_offset,
+                           xb, IN, out_dim, rows),
+                       "Q8_0 BF16 mul_mm dispatch");
+            require_ok(ds4_gpu_tensor_read(
+                           out, 0, actual,
+                           (size_t)rows * out_dim * sizeof(float)),
+                       "Q8_0 BF16 mul_mm readback");
+            char label[80];
+            snprintf(label, sizeof(label),
+                     "Qwen Q8_0 BF16 mul_mm out=%u rows=%u", out_dim, rows);
+            require_array_close(label, actual, expected,
+                                (size_t)rows * out_dim,
+                                rows >= 32u ? 2e-1f : 4e-4f, 4e-3f);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(xb);
+            free(actual);
+            free(expected);
+            free(rounded);
+            free(input_bf16);
+            free(input);
+        }
+        free(allocation);
+    }
+    require_ok(unsetenv("DS4_QWEN4_Q8_0_BF16_MUL_MM") == 0,
+               "Q8_0 BF16 mul_mm env clear");
 }
 
 static void test_model_bf16_matmul_rows(void) {
@@ -4088,6 +4187,85 @@ static void test_gdn_length(uint32_t tokens) {
         free(ref_state);
         free(ref_out);
     }
+
+    /* BF16-state cross-R byte identity at the same length: every state
+     * element's op sequence is independent of how rows map onto threads,
+     * so the swept R1/R2 BF16-state kernels must match R4 byte for byte
+     * (the prefill-width sweep cannot change numerics). */
+    {
+        uint16_t *initial_bf16 =
+            malloc(state_count * sizeof(uint16_t));
+        require_ok(initial_bf16 != NULL,
+                   "GDN BF16-state sweep allocation");
+        for (size_t i = 0; i < state_count; i++)
+            initial_bf16[i] = f32_to_bf16(initial[i]);
+        uint16_t *state_b16 = malloc(state_count * sizeof(uint16_t));
+        float *out_b16 = malloc(value_count * sizeof(float));
+        uint16_t *r_state = malloc(state_count * sizeof(uint16_t));
+        float *r_out = malloc(value_count * sizeof(float));
+        require_ok(state_b16 && out_b16 && r_state && r_out,
+                   "GDN BF16-state sweep buffers");
+        ds4_gpu_tensor *qt = tensor_from(q, qk_count * sizeof(float));
+        ds4_gpu_tensor *kt = tensor_from(k, qk_count * sizeof(float));
+        ds4_gpu_tensor *vt = tensor_from(v, value_count * sizeof(float));
+        ds4_gpu_tensor *dt = tensor_from(decay, gate_count * sizeof(float));
+        ds4_gpu_tensor *bt = tensor_from(beta, gate_count * sizeof(float));
+        ds4_gpu_tensor *mt = tensor_from(mask, tokens);
+        require_ok(qt && kt && vt && dt && bt && mt,
+                   "GDN BF16-state sweep device buffers");
+        for (uint32_t k = 0u; k < 3u; k++) {
+            const uint32_t r = k == 0u ? 4u : k;   /* R4 first: snapshot */
+            ds4_gpu_tensor *st = tensor_from(
+                initial_bf16, state_count * sizeof(uint16_t));
+            ds4_gpu_tensor *ot = ds4_gpu_tensor_alloc(
+                value_count * sizeof(float));
+            require_ok(st && ot, "GDN BF16-state sweep dispatch buffers");
+            require_ok(ds4_gpu_qwen4_gdn_prefill_bf16_state(
+                           ot, st, qt, kt, vt, dt, bt, mt,
+                           tokens, KH, VH, DIM, r),
+                       "GDN BF16-state sweep dispatch");
+            require_ok(ds4_gpu_tensor_read(
+                           ot, 0, r_out, value_count * sizeof(float)) &&
+                           ds4_gpu_tensor_read(
+                               st, 0, r_state,
+                               state_count * sizeof(uint16_t)),
+                       "GDN BF16-state sweep readback");
+            if (r == 4u) {
+                memcpy(out_b16, r_out, value_count * sizeof(float));
+                memcpy(state_b16, r_state, state_count * sizeof(uint16_t));
+            } else {
+                /* R instantiations contract the recurrence differently
+                 * under fast math (the fp32 R-sweep fixtures pin the same
+                 * class), so the FP32 output carries rounding-scale
+                 * differences while the BF16 state quantization absorbs
+                 * them: outputs are tolerance-pinned, states byte-pinned. */
+                snprintf(label, sizeof(label),
+                         "Qwen GDN BF16-state R%u output length=%u",
+                         r, tokens);
+                require_array_close(label, out_b16, r_out, value_count,
+                                    1e-6f, 1e-5f);
+                snprintf(label, sizeof(label),
+                         "Qwen GDN BF16-state R%u state length=%u",
+                         r, tokens);
+                require_ok(memcmp(state_b16, r_state,
+                                  state_count * sizeof(uint16_t)) == 0,
+                           label);
+            }
+            ds4_gpu_tensor_free(ot);
+            ds4_gpu_tensor_free(st);
+        }
+        ds4_gpu_tensor_free(mt);
+        ds4_gpu_tensor_free(bt);
+        ds4_gpu_tensor_free(dt);
+        ds4_gpu_tensor_free(vt);
+        ds4_gpu_tensor_free(kt);
+        ds4_gpu_tensor_free(qt);
+        free(r_out);
+        free(r_state);
+        free(out_b16);
+        free(state_b16);
+        free(initial_bf16);
+    }
     free(state_r4); free(state_r2); free(state_r1);
     free(out_r4); free(out_r2); free(out_r1);
     free(initial); free(mask); free(beta); free(decay); free(v); free(k); free(q);
@@ -5698,6 +5876,745 @@ static void test_qsa_attention_gqa_mma(void) {
     free(q);
 }
 
+/* CPU reference for the gathered QSA attention with exact scalar-kernel
+ * semantics (F32 Q, BF16 cache expanded, F32 softmax and PV), shared by
+ * the TensorOps t2d fixture passes. */
+static void qsa_attention_cpu_reference(
+        const float *q, const float *gate, const uint16_t *key,
+        const uint16_t *value, const uint32_t *selected,
+        const uint32_t *counts, const uint32_t *visible,
+        uint32_t queries, float *expected) {
+    enum { Q_HEADS = 24, KV_HEADS = 2, DIM = 256, TOP_K = 512, RATIO = 4 };
+    for (uint32_t query = 0; query < queries; query++) {
+        const uint32_t complete = visible[query] / RATIO;
+        const uint32_t blocks =
+            counts[query] < complete ? counts[query] : complete;
+        if (blocks > TOP_K) exit(1);
+        uint32_t tokens[TOP_K * RATIO + RATIO - 1u];
+        uint32_t token_count = 0;
+        for (uint32_t rank = 0; rank < blocks; rank++)
+            for (uint32_t item = 0; item < RATIO; item++) {
+                const uint32_t token =
+                    selected[(size_t)query * TOP_K + rank] * RATIO + item;
+                if (token < visible[query]) tokens[token_count++] = token;
+            }
+        for (uint32_t token = complete * RATIO; token < visible[query];
+             token++)
+            tokens[token_count++] = token;
+
+        for (uint32_t head = 0; head < Q_HEADS; head++) {
+            const uint32_t kv_head = head / (Q_HEADS / KV_HEADS);
+            float *scores = malloc(token_count * sizeof(*scores));
+            require_ok(scores != NULL, "QSA t2d reference scores");
+            float maximum = -INFINITY;
+            for (uint32_t rank = 0; rank < token_count; rank++) {
+                float dot = 0.0f;
+                const size_t qbase =
+                    ((size_t)query * Q_HEADS + head) * DIM;
+                const size_t kbase =
+                    ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    dot = fmaf(q[qbase + dim],
+                               bf16_to_f32(key[kbase + dim]), dot);
+                scores[rank] = dot / sqrtf((float)DIM);
+                if (scores[rank] > maximum) maximum = scores[rank];
+            }
+            float sum = 0.0f;
+            for (uint32_t rank = 0; rank < token_count; rank++)
+                sum += expf(scores[rank] - maximum);
+            const size_t out_base =
+                ((size_t)query * Q_HEADS + head) * DIM;
+            if (token_count == 0) {
+                for (uint32_t dim = 0; dim < DIM; dim++)
+                    expected[out_base + dim] = 0.0f;
+                free(scores);
+                continue;
+            }
+            for (uint32_t dim = 0; dim < DIM; dim++) {
+                float result = 0.0f;
+                for (uint32_t rank = 0; rank < token_count; rank++) {
+                    const size_t vbase =
+                        ((size_t)tokens[rank] * KV_HEADS + kv_head) * DIM;
+                    result = fmaf(expf(scores[rank] - maximum) / sum,
+                                  bf16_to_f32(value[vbase + dim]), result);
+                }
+                expected[out_base + dim] =
+                    result / (1.0f + expf(-gate[out_base + dim]));
+            }
+            free(scores);
+        }
+    }
+}
+
+/* GQA tile-sharing Metal-4 TensorOps (matmul2d) attention: the fp32-P
+ * cooperative-tensor kernel.  The only operand rounding versus the
+ * scalar kernel is Q -> F16 once per (query, KV head) group (measured
+ * non-binding by the Q-split probe) — K/V convert losslessly from BF16
+ * and the softmax probabilities stay fp32 with exact fp32 cooperative
+ * accumulation — so the fixture checks against the EXACT CPU reference
+ * at fixture magnitudes with rounding-scale tolerances, and at
+ * production magnitudes (score spread ~+-20) with the F16-Q envelope.
+ * It also cross-checks the scalar kernel and proves observable
+ * engagement (the route must perturb some outputs). */
+static void test_qsa_attention_gqa_t2d(void) {
+    enum {
+        QUERIES = 40,
+        CACHE_CAP = 2051,
+        Q_HEADS = 24,
+        KV_HEADS = 2,
+        DIM = 256,
+        TOP_K = 512,
+        RATIO = 4,
+    };
+    const size_t query_count = (size_t)QUERIES * Q_HEADS * DIM;
+    const size_t cache_count = (size_t)CACHE_CAP * KV_HEADS * DIM;
+    const size_t selected_count = (size_t)QUERIES * TOP_K;
+    float *q = malloc(query_count * sizeof(*q));
+    float *gate = malloc(query_count * sizeof(*gate));
+    uint16_t *key = malloc(cache_count * sizeof(*key));
+    uint16_t *value = malloc(cache_count * sizeof(*value));
+    uint32_t *selected = malloc(selected_count * sizeof(*selected));
+    uint32_t *counts = malloc((size_t)QUERIES * sizeof(*counts));
+    uint32_t *visible = malloc((size_t)QUERIES * sizeof(*visible));
+    float *expected = malloc(query_count * sizeof(*expected));
+    float *actual = malloc(query_count * sizeof(*actual));
+    float *scalar = malloc(query_count * sizeof(*scalar));
+    require_ok(q && gate && key && value && selected && counts && visible &&
+                   expected && actual && scalar,
+               "QSA GQA T2D host allocation");
+
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] = 0.0025f *
+            (float)((int)((i * 29u + i / DIM * 7u + 11u) % 97u) - 48);
+        gate[i] = 0.03125f *
+            (float)((int)((i * 13u + i / DIM * 5u + 3u) % 33u) - 16);
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        key[i] = f32_to_bf16(
+            0.00175f * (float)((int)((i * 31u + 5u) % 113u) - 56));
+        value[i] = f32_to_bf16(
+            0.00225f * (float)((int)((i * 19u + 9u) % 109u) - 54));
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        for (uint32_t rank = 0; rank < TOP_K; rank++)
+            selected[(size_t)query * TOP_K + rank] =
+                (query * 131u + rank * 37u + 19u) % 512u;
+    }
+    /* Boundary cases first, then deterministic mixed profiles. */
+    visible[0] = 7u;    counts[0] = 1u;
+    visible[1] = 2047u; counts[1] = 511u;
+    visible[2] = 2051u; counts[2] = 512u;
+    visible[3] = 3u;    counts[3] = 0u;   /* tail-only selection */
+    visible[4] = 2u;    counts[4] = 0u;
+    visible[5] = 0u;    counts[5] = 0u;   /* zero selection */
+    for (uint32_t query = 6; query < QUERIES; query++) {
+        visible[query] = 17u + (query * 173u) % 2051u;
+        counts[query] = (query * 61u + 7u) % (TOP_K + 1u);
+    }
+
+    qsa_attention_cpu_reference(q, gate, key, value, selected, counts,
+                                visible, QUERIES, expected);
+
+    ds4_gpu_tensor *q_t = tensor_from(q, query_count * sizeof(*q));
+    ds4_gpu_tensor *gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    ds4_gpu_tensor *key_t = tensor_from(key, cache_count * sizeof(*key));
+    ds4_gpu_tensor *value_t =
+        tensor_from(value, cache_count * sizeof(*value));
+    ds4_gpu_tensor *selected_t =
+        tensor_from(selected, selected_count * sizeof(*selected));
+    ds4_gpu_tensor *counts_t =
+        tensor_from(counts, (size_t)QUERIES * sizeof(*counts));
+    ds4_gpu_tensor *visible_t =
+        tensor_from(visible, (size_t)QUERIES * sizeof(*visible));
+    ds4_gpu_tensor *actual_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*actual));
+    ds4_gpu_tensor *scalar_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*scalar));
+    require_ok(actual_t && scalar_t, "QSA GQA T2D output allocation");
+
+    /* The route is default-on for prefill-sized batches; force it
+     * explicitly so the fixture proves the kernel regardless of the
+     * machine's Metal-4 capability default. */
+    const char *prior_raw = getenv("DS4_QWEN4_QSA_GQA_T2D");
+    char *prior = prior_raw ? strdup(prior_raw) : NULL;
+    require_ok(!prior_raw || prior, "QSA GQA T2D environment copy");
+    const char *rows_raw = getenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS");
+    char *rows_prior = rows_raw ? strdup(rows_raw) : NULL;
+    require_ok(!rows_raw || rows_prior, "QSA GQA T2D min-rows copy");
+    /* Isolate the scalar reference arm from the default-on GQA share
+     * route (bitwise-identical to the scalar kernel by contract, but the
+     * reference here must be the per-(query, head) kernel itself). */
+    const char *share_raw = getenv("DS4_QWEN4_QSA_GQA_SHARE");
+    char *share_prior = share_raw ? strdup(share_raw) : NULL;
+    require_ok(!share_raw || share_prior, "QSA GQA T2D share copy");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "0", 1) == 0,
+               "QSA GQA T2D share isolate");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "1", 1) == 0,
+               "QSA GQA T2D enable");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", "8", 1) == 0,
+               "QSA GQA T2D min-rows lower");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "0", 1) == 0,
+               "QSA GQA T2D scalar fallback");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D scalar dispatch");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D") == 0,
+               "QSA GQA T2D environment restore");
+    require_ok(rows_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", rows_prior, 1)
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS") == 0,
+               "QSA GQA T2D min-rows restore");
+    free(rows_prior);
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA T2D readback");
+    /* Observable engagement: the F16 Q staging must perturb some
+     * outputs; a silently-undispatched route is byte-identical. */
+    {
+        uint64_t changed = 0;
+        for (size_t i = 0; i < query_count; i++)
+            if (actual[i] != scalar[i]) changed++;
+        require_ok(changed > query_count / 16u,
+                   "QSA GQA T2D observable engagement");
+    }
+    require_array_close("Qwen QSA GQA T2D attention vs scalar kernel",
+                        actual, scalar, query_count, 2e-3f, 2e-2f);
+    require_array_close("Qwen QSA GQA T2D attention vs CPU reference",
+                        actual, expected, query_count, 2e-3f, 2e-2f);
+
+    /* Production-magnitude pass: q/k/v scaled so the gathered score
+     * spread reaches the +-20 class; the tolerance admits the F16-Q
+     * rounding envelope at that spread (P stays fp32, so this must sit
+     * far inside the failed F16-MMA variant's class). */
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] *= 12.0f;
+        gate[i] *= 12.0f;
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        const float kf = bf16_to_f32(key[i]);
+        key[i] = f32_to_bf16(kf * 12.0f);
+        const float vf = bf16_to_f32(value[i]);
+        value[i] = f32_to_bf16(vf * 12.0f);
+    }
+    qsa_attention_cpu_reference(q, gate, key, value, selected, counts,
+                                visible, QUERIES, expected);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(value_t);
+    q_t = tensor_from(q, query_count * sizeof(*q));
+    gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    key_t = tensor_from(key, cache_count * sizeof(*key));
+    value_t = tensor_from(value, cache_count * sizeof(*value));
+    require_ok(q_t && gate_t && key_t && value_t,
+               "QSA GQA T2D scaled upload");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "1", 1) == 0,
+               "QSA GQA T2D enable (scaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", "8", 1) == 0,
+               "QSA GQA T2D min-rows lower (scaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D dispatch (scaled)");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "0", 1) == 0,
+               "QSA GQA T2D scalar fallback (scaled)");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA T2D scalar dispatch (scaled)");
+    require_ok(prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D", prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D") == 0,
+               "QSA GQA T2D environment restore (scaled)");
+    require_ok(rows_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS", rows_prior, 1)
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D_MIN_ROWS") == 0,
+               "QSA GQA T2D min-rows restore (scaled)");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA T2D readback (scaled)");
+    require_array_close("Qwen QSA GQA T2D production magnitudes vs scalar",
+                        actual, scalar, query_count, 5e-2f, 2e-1f);
+    require_array_close(
+        "Qwen QSA GQA T2D production magnitudes vs CPU reference",
+        actual, expected, query_count, 5e-2f, 2e-1f);
+    {
+        double t2d_mean = 0.0;
+        for (size_t i = 0; i < query_count; i++)
+            t2d_mean += fabs((double)actual[i] - (double)scalar[i]);
+        t2d_mean /= (double)query_count;
+        printf("Qwen QSA GQA T2D drift vs scalar mean=%.3e\n", t2d_mean);
+        /* The F16-MMA closure measured 2.6e-4-class mean drift with the
+         * F16 P-tile rounding present; with P fp32 the mean must stay
+         * in the same rounding family (Q-F16 only). */
+        require_ok(t2d_mean < 3e-4,
+                   "QSA GQA T2D mean drift out of family");
+    }
+
+    ds4_gpu_tensor_free(scalar_t);
+    ds4_gpu_tensor_free(actual_t);
+    ds4_gpu_tensor_free(visible_t);
+    ds4_gpu_tensor_free(counts_t);
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(value_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(q_t);
+    require_ok(share_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_SHARE", share_prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_SHARE") == 0,
+               "QSA GQA T2D share restore");
+    free(share_prior);
+    free(prior);
+    free(scalar);
+    free(actual);
+    free(expected);
+    free(visible);
+    free(counts);
+    free(selected);
+    free(value);
+    free(key);
+    free(gate);
+    free(q);
+}
+
+/* GQA load-share scalar attention: one threadgroup per (query, KV head)
+ * stages the gathered K/V tiles once in threadgroup memory and all 12
+ * sibling query heads consume them with the incumbent kernel's exact
+ * arithmetic, so the fixture pins the contract directly as a BITWISE
+ * kill-switch A/B: identical bytes at fixture and production magnitudes,
+ * through both pipeline names, below the min-rows gate, and with the
+ * non-12-head geometry excluded.  The reference arm also forces the
+ * GQA-T2D and GQA-MMA routes off so the A/B measures the share kernel
+ * against the per-(query, head) scalar kernel on any machine, including
+ * M5-class defaults.  Engagement cannot be observed through outputs
+ * (identical bytes ARE the contract); it is evidenced by the
+ * qsa-prefill-bench gathered-attention stage attribution recorded in
+ * QWEN38_FLASH_NEXT.md. */
+static void test_qsa_attention_gqa_share(void) {
+    enum {
+        QUERIES = 40,
+        SMALL_QUERIES = 8,
+        CACHE_CAP = 2051,
+        Q_HEADS = 24,
+        KV_HEADS = 2,
+        DIM = 256,
+        TOP_K = 512,
+        RATIO = 4,
+    };
+    const size_t query_count = (size_t)QUERIES * Q_HEADS * DIM;
+    const size_t cache_count = (size_t)CACHE_CAP * KV_HEADS * DIM;
+    const size_t selected_count = (size_t)QUERIES * TOP_K;
+    float *q = malloc(query_count * sizeof(*q));
+    float *gate = malloc(query_count * sizeof(*gate));
+    uint16_t *key = malloc(cache_count * sizeof(*key));
+    uint16_t *value = malloc(cache_count * sizeof(*value));
+    uint32_t *selected = malloc(selected_count * sizeof(*selected));
+    uint32_t *counts = malloc((size_t)QUERIES * sizeof(*counts));
+    uint32_t *visible = malloc((size_t)QUERIES * sizeof(*visible));
+    float *expected = malloc(query_count * sizeof(*expected));
+    float *actual = malloc(query_count * sizeof(*actual));
+    float *scalar = malloc(query_count * sizeof(*scalar));
+    require_ok(q && gate && key && value && selected && counts && visible &&
+                   expected && actual && scalar,
+               "QSA GQA share host allocation");
+
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] = 0.0025f *
+            (float)((int)((i * 29u + i / DIM * 7u + 11u) % 97u) - 48);
+        gate[i] = 0.03125f *
+            (float)((int)((i * 13u + i / DIM * 5u + 3u) % 33u) - 16);
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        key[i] = f32_to_bf16(
+            0.00175f * (float)((int)((i * 31u + 5u) % 113u) - 56));
+        value[i] = f32_to_bf16(
+            0.00225f * (float)((int)((i * 19u + 9u) % 109u) - 54));
+    }
+    for (uint32_t query = 0; query < QUERIES; query++)
+        for (uint32_t rank = 0; rank < TOP_K; rank++)
+            selected[(size_t)query * TOP_K + rank] =
+                (query * 131u + rank * 37u + 19u) % 512u;
+    /* Boundary cases first, then deterministic mixed profiles (mirrors
+     * the GQA-T2D fixture so both organizations see the same edges). */
+    visible[0] = 7u;    counts[0] = 1u;
+    visible[1] = 2047u; counts[1] = 511u;
+    visible[2] = 2051u; counts[2] = 512u;
+    visible[3] = 3u;    counts[3] = 0u;   /* tail-only selection */
+    visible[4] = 2u;    counts[4] = 0u;
+    visible[5] = 0u;    counts[5] = 0u;   /* zero selection */
+    for (uint32_t query = 6; query < QUERIES; query++) {
+        visible[query] = 17u + (query * 173u) % 2051u;
+        counts[query] = (query * 61u + 7u) % (TOP_K + 1u);
+    }
+
+    qsa_attention_cpu_reference(q, gate, key, value, selected, counts,
+                                visible, QUERIES, expected);
+
+    ds4_gpu_tensor *q_t = tensor_from(q, query_count * sizeof(*q));
+    ds4_gpu_tensor *gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    ds4_gpu_tensor *key_t = tensor_from(key, cache_count * sizeof(*key));
+    ds4_gpu_tensor *value_t =
+        tensor_from(value, cache_count * sizeof(*value));
+    ds4_gpu_tensor *selected_t =
+        tensor_from(selected, selected_count * sizeof(*selected));
+    ds4_gpu_tensor *counts_t =
+        tensor_from(counts, (size_t)QUERIES * sizeof(*counts));
+    ds4_gpu_tensor *visible_t =
+        tensor_from(visible, (size_t)QUERIES * sizeof(*visible));
+    ds4_gpu_tensor *actual_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*actual));
+    ds4_gpu_tensor *scalar_t =
+        ds4_gpu_tensor_alloc(query_count * sizeof(*scalar));
+    require_ok(q_t && gate_t && key_t && value_t && selected_t && counts_t &&
+                   visible_t && actual_t && scalar_t,
+               "QSA GQA share device allocation");
+
+    const char *share_raw = getenv("DS4_QWEN4_QSA_GQA_SHARE");
+    char *share_prior = share_raw ? strdup(share_raw) : NULL;
+    require_ok(!share_raw || share_prior, "QSA GQA share env copy");
+    const char *rows_raw = getenv("DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS");
+    char *rows_prior = rows_raw ? strdup(rows_raw) : NULL;
+    require_ok(!rows_raw || rows_prior, "QSA GQA share min-rows copy");
+    const char *t2d_raw = getenv("DS4_QWEN4_QSA_GQA_T2D");
+    char *t2d_prior = t2d_raw ? strdup(t2d_raw) : NULL;
+    require_ok(!t2d_raw || t2d_prior, "QSA GQA share t2d copy");
+    const char *mma_raw = getenv("DS4_QWEN4_QSA_GQA_MMA");
+    char *mma_prior = mma_raw ? strdup(mma_raw) : NULL;
+    require_ok(!mma_raw || mma_prior, "QSA GQA share mma copy");
+    const char *cache_raw = getenv("DS4_QWEN4_QSA_PROB_CACHE");
+    char *cache_prior = cache_raw ? strdup(cache_raw) : NULL;
+    require_ok(!cache_raw || cache_prior, "QSA GQA share cache copy");
+
+    /* Both arms force the alternate routes off so the A/B is the share
+     * kernel versus the per-(query, head) scalar kernel everywhere. */
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_T2D", "0", 1) == 0 &&
+                   setenv("DS4_QWEN4_QSA_GQA_MMA", "0", 1) == 0,
+               "QSA GQA share isolate routes");
+
+    /* Below the default 32-row gate: decode/verify-shaped batches keep
+     * today's per-(query, head) kernel; still pinned byte-exact and
+     * against the CPU reference. */
+    {
+        const size_t small_count = (size_t)SMALL_QUERIES * Q_HEADS * DIM;
+        ds4_gpu_tensor *q_v = ds4_gpu_tensor_view(
+            q_t, 0, small_count * sizeof(float));
+        ds4_gpu_tensor *gate_v = ds4_gpu_tensor_view(
+            gate_t, 0, small_count * sizeof(float));
+        ds4_gpu_tensor *selected_v = ds4_gpu_tensor_view(
+            selected_t, 0,
+            (size_t)SMALL_QUERIES * TOP_K * sizeof(uint32_t));
+        ds4_gpu_tensor *counts_v = ds4_gpu_tensor_view(
+            counts_t, 0, (size_t)SMALL_QUERIES * sizeof(uint32_t));
+        ds4_gpu_tensor *visible_v = ds4_gpu_tensor_view(
+            visible_t, 0, (size_t)SMALL_QUERIES * sizeof(uint32_t));
+        ds4_gpu_tensor *out_v =
+            ds4_gpu_tensor_alloc(small_count * sizeof(float));
+        require_ok(q_v && gate_v && selected_v && counts_v && visible_v &&
+                       out_v,
+                   "QSA GQA share small-batch views");
+        require_ok(unsetenv("DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS") == 0 &&
+                       setenv("DS4_QWEN4_QSA_GQA_SHARE", "1", 1) == 0,
+                   "QSA GQA share small-batch enable");
+        require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                       out_v, q_v, gate_v, key_t, value_t, selected_v,
+                       counts_v, visible_v, SMALL_QUERIES, CACHE_CAP,
+                       Q_HEADS, KV_HEADS, DIM, TOP_K, RATIO),
+                   "QSA GQA share small-batch dispatch");
+        require_ok(ds4_gpu_tensor_read(out_v, 0, actual,
+                                       small_count * sizeof(*actual)),
+                   "QSA GQA share small-batch readback");
+        require_array_close("Qwen QSA small-batch vs CPU reference",
+                            actual, expected, small_count, 3e-6f, 3e-5f);
+        ds4_gpu_tensor_free(out_v);
+        ds4_gpu_tensor_free(visible_v);
+        ds4_gpu_tensor_free(counts_v);
+        ds4_gpu_tensor_free(selected_v);
+        ds4_gpu_tensor_free(gate_v);
+        ds4_gpu_tensor_free(q_v);
+    }
+
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "1", 1) == 0 &&
+                   setenv("DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS", "8", 1) == 0,
+               "QSA GQA share enable");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA share dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "0", 1) == 0,
+               "QSA GQA share scalar fallback");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA share scalar dispatch");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA share readback");
+    {
+        size_t mismatched = 0;
+        float max_drift = 0.0f;
+        double mean_drift = 0.0;
+        for (size_t i = 0; i < query_count; i++) {
+            if (actual[i] != scalar[i]) mismatched++;
+            const float d = fabsf(actual[i] - scalar[i]);
+            if (d > max_drift) max_drift = d;
+            mean_drift += d;
+        }
+        mean_drift /= (double)query_count;
+        printf("QSA GQA share A/B stats: mismatched=%zu/%zu max=%.3e "
+               "mean=%.3e\n",
+               mismatched, query_count, max_drift, mean_drift);
+        require_ok(mismatched == 0, "QSA GQA share bitwise identity");
+    }
+    require_array_close("Qwen QSA GQA share vs CPU reference",
+                        actual, expected, query_count, 3e-6f, 3e-5f);
+
+    /* Legacy pipeline name (probability-cache off): same bitwise body. */
+    require_ok(setenv("DS4_QWEN4_QSA_PROB_CACHE", "0", 1) == 0,
+               "QSA GQA share legacy mode");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "1", 1) == 0,
+               "QSA GQA share legacy enable");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA share legacy dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "0", 1) == 0,
+               "QSA GQA share legacy scalar fallback");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA share legacy scalar dispatch");
+    require_ok(cache_prior
+                   ? setenv("DS4_QWEN4_QSA_PROB_CACHE", cache_prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_PROB_CACHE") == 0,
+               "QSA GQA share cache restore");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA share legacy readback");
+    {
+        size_t mismatched = 0;
+        for (size_t i = 0; i < query_count; i++)
+            if (actual[i] != scalar[i]) mismatched++;
+        require_ok(mismatched == 0, "QSA GQA share legacy bitwise identity");
+    }
+
+    /* Production magnitudes (gathered score spread ~+-12x12): the
+     * identical-arithmetic contract must survive magnitude. */
+    for (size_t i = 0; i < query_count; i++) {
+        q[i] *= 12.0f;
+        gate[i] *= 12.0f;
+    }
+    for (size_t i = 0; i < cache_count; i++) {
+        const float kf = bf16_to_f32(key[i]);
+        key[i] = f32_to_bf16(kf * 12.0f);
+        const float vf = bf16_to_f32(value[i]);
+        value[i] = f32_to_bf16(vf * 12.0f);
+    }
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(value_t);
+    q_t = tensor_from(q, query_count * sizeof(*q));
+    gate_t = tensor_from(gate, query_count * sizeof(*gate));
+    key_t = tensor_from(key, cache_count * sizeof(*key));
+    value_t = tensor_from(value, cache_count * sizeof(*value));
+    require_ok(q_t && gate_t && key_t && value_t,
+               "QSA GQA share scaled upload");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "1", 1) == 0,
+               "QSA GQA share scaled enable");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   actual_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA share scaled dispatch");
+    require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "0", 1) == 0,
+               "QSA GQA share scaled scalar fallback");
+    require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                   scalar_t, q_t, gate_t, key_t, value_t, selected_t,
+                   counts_t, visible_t, QUERIES, CACHE_CAP, Q_HEADS,
+                   KV_HEADS, DIM, TOP_K, RATIO),
+               "QSA GQA share scaled scalar dispatch");
+    require_ok(ds4_gpu_tensor_read(actual_t, 0, actual,
+                                   query_count * sizeof(*actual)) &&
+                   ds4_gpu_tensor_read(scalar_t, 0, scalar,
+                                       query_count * sizeof(*scalar)),
+               "QSA GQA share scaled readback");
+    {
+        size_t mismatched = 0;
+        for (size_t i = 0; i < query_count; i++)
+            if (actual[i] != scalar[i]) mismatched++;
+        require_ok(mismatched == 0,
+                   "QSA GQA share scaled bitwise identity");
+    }
+
+    /* Non-12-head geometry must stay on the scalar kernel: a broken gate
+     * would dispatch the constexpr-12 share kernel and diverge (or fault)
+     * on the 8-head map. */
+    {
+        enum { NARROW_QUERIES = 4, NARROW_HEADS = 8 };
+        const size_t narrow_count =
+            (size_t)NARROW_QUERIES * NARROW_HEADS * DIM;
+        const size_t narrow_cache = (size_t)CACHE_CAP * 1u * DIM;
+        float *nq = malloc(narrow_count * sizeof(*nq));
+        float *ng = malloc(narrow_count * sizeof(*ng));
+        uint16_t *nk = malloc(narrow_cache * sizeof(*nk));
+        uint16_t *nv = malloc(narrow_cache * sizeof(*nv));
+        uint32_t *nsel =
+            malloc((size_t)NARROW_QUERIES * TOP_K * sizeof(*nsel));
+        uint32_t *ncounts =
+            malloc((size_t)NARROW_QUERIES * sizeof(*ncounts));
+        uint32_t *nvisible =
+            malloc((size_t)NARROW_QUERIES * sizeof(*nvisible));
+        float *na = malloc(narrow_count * sizeof(*na));
+        float *ns = malloc(narrow_count * sizeof(*ns));
+        require_ok(nq && ng && nk && nv && nsel && ncounts && nvisible &&
+                       na && ns,
+                   "QSA GQA share narrow host allocation");
+        for (size_t i = 0; i < narrow_count; i++) {
+            nq[i] = q[i % query_count];
+            ng[i] = gate[i % query_count];
+        }
+        for (size_t i = 0; i < narrow_cache; i++) {
+            nk[i] = key[i % cache_count];
+            nv[i] = value[i % cache_count];
+        }
+        for (uint32_t query = 0; query < NARROW_QUERIES; query++) {
+            for (uint32_t rank = 0; rank < TOP_K; rank++)
+                nsel[(size_t)query * TOP_K + rank] =
+                    selected[(size_t)(query % QUERIES) * TOP_K + rank];
+            ncounts[query] = counts[query % QUERIES];
+            nvisible[query] = visible[query % QUERIES];
+        }
+        ds4_gpu_tensor *nq_t = tensor_from(nq, narrow_count * sizeof(*nq));
+        ds4_gpu_tensor *ng_t = tensor_from(ng, narrow_count * sizeof(*ng));
+        ds4_gpu_tensor *nk_t = tensor_from(nk, narrow_cache * sizeof(*nk));
+        ds4_gpu_tensor *nv_t = tensor_from(nv, narrow_cache * sizeof(*nv));
+        ds4_gpu_tensor *nsel_t = tensor_from(
+            nsel, (size_t)NARROW_QUERIES * TOP_K * sizeof(*nsel));
+        ds4_gpu_tensor *ncounts_t = tensor_from(
+            ncounts, (size_t)NARROW_QUERIES * sizeof(*ncounts));
+        ds4_gpu_tensor *nvisible_t = tensor_from(
+            nvisible, (size_t)NARROW_QUERIES * sizeof(*nvisible));
+        ds4_gpu_tensor *na_t =
+            ds4_gpu_tensor_alloc(narrow_count * sizeof(*na));
+        ds4_gpu_tensor *ns_t =
+            ds4_gpu_tensor_alloc(narrow_count * sizeof(*ns));
+        require_ok(nq_t && ng_t && nk_t && nv_t && nsel_t && ncounts_t &&
+                       nvisible_t && na_t && ns_t,
+                   "QSA GQA share narrow device allocation");
+        require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "1", 1) == 0,
+                   "QSA GQA share narrow enable");
+        require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                       na_t, nq_t, ng_t, nk_t, nv_t, nsel_t, ncounts_t,
+                       nvisible_t, NARROW_QUERIES, CACHE_CAP, NARROW_HEADS,
+                       1u, DIM, TOP_K, RATIO),
+                   "QSA GQA share narrow dispatch");
+        require_ok(setenv("DS4_QWEN4_QSA_GQA_SHARE", "0", 1) == 0,
+                   "QSA GQA share narrow scalar fallback");
+        require_ok(ds4_gpu_qwen4_qsa_attention_bf16(
+                       ns_t, nq_t, ng_t, nk_t, nv_t, nsel_t, ncounts_t,
+                       nvisible_t, NARROW_QUERIES, CACHE_CAP, NARROW_HEADS,
+                       1u, DIM, TOP_K, RATIO),
+                   "QSA GQA share narrow scalar dispatch");
+        require_ok(ds4_gpu_tensor_read(na_t, 0, na,
+                                       narrow_count * sizeof(*na)) &&
+                       ds4_gpu_tensor_read(ns_t, 0, ns,
+                                           narrow_count * sizeof(*ns)),
+                   "QSA GQA share narrow readback");
+        {
+            size_t mismatched = 0;
+            for (size_t i = 0; i < narrow_count; i++)
+                if (na[i] != ns[i]) mismatched++;
+            require_ok(mismatched == 0,
+                       "QSA GQA share non-12-head gate exclusion");
+        }
+        ds4_gpu_tensor_free(ns_t);
+        ds4_gpu_tensor_free(na_t);
+        ds4_gpu_tensor_free(nvisible_t);
+        ds4_gpu_tensor_free(ncounts_t);
+        ds4_gpu_tensor_free(nsel_t);
+        ds4_gpu_tensor_free(nv_t);
+        ds4_gpu_tensor_free(nk_t);
+        ds4_gpu_tensor_free(ng_t);
+        ds4_gpu_tensor_free(nq_t);
+        free(ns);
+        free(na);
+        free(nvisible);
+        free(ncounts);
+        free(nsel);
+        free(nv);
+        free(nk);
+        free(ng);
+        free(nq);
+    }
+
+    require_ok(share_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_SHARE", share_prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_SHARE") == 0,
+               "QSA GQA share environment restore");
+    require_ok(rows_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS",
+                            rows_prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_SHARE_MIN_ROWS") == 0,
+               "QSA GQA share min-rows restore");
+    require_ok(t2d_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_T2D", t2d_prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_T2D") == 0,
+               "QSA GQA share t2d restore");
+    require_ok(mma_prior
+                   ? setenv("DS4_QWEN4_QSA_GQA_MMA", mma_prior, 1) == 0
+                   : unsetenv("DS4_QWEN4_QSA_GQA_MMA") == 0,
+               "QSA GQA share mma restore");
+
+    ds4_gpu_tensor_free(scalar_t);
+    ds4_gpu_tensor_free(actual_t);
+    ds4_gpu_tensor_free(visible_t);
+    ds4_gpu_tensor_free(counts_t);
+    ds4_gpu_tensor_free(selected_t);
+    ds4_gpu_tensor_free(value_t);
+    ds4_gpu_tensor_free(key_t);
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(q_t);
+    free(mma_prior);
+    free(t2d_prior);
+    free(cache_prior);
+    free(rows_prior);
+    free(share_prior);
+    free(scalar);
+    free(actual);
+    free(expected);
+    free(visible);
+    free(counts);
+    free(selected);
+    free(value);
+    free(key);
+    free(gate);
+    free(q);
+}
+
 static void test_qsa_streaming_topk(void) {
     enum {
         QUERIES = 5,
@@ -6587,6 +7504,7 @@ int main(void) {
     test_q8_0_matmul();
     test_model_q8_0_paths();
     test_model_q8_0_mul_mm_rows();
+    test_model_q8_0_bf16_mul_mm_rows();
     test_model_q8_0_mpp_rows();
     test_model_q8_0_mpp_f32stage_rows();
     test_model_bf16_matmul_rows();
@@ -6622,6 +7540,8 @@ int main(void) {
     test_qsa_sparse_attention();
     test_qsa_probability_cache_exact();
     test_qsa_attention_gqa_mma();
+    test_qsa_attention_gqa_t2d();
+    test_qsa_attention_gqa_share();
     test_qsa_streaming_topk();
     test_qsa_streaming_topk_merge_select();
     test_qsa_streaming_topk_score_mm();

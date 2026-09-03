@@ -14,7 +14,14 @@
  * production rank-to-token semantics (see QWEN38_PERF_HANDOFF item 20).
  */
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
+using namespace mpp::tensor_ops;
+
+static inline float qwen4_bf16_to_f32(ushort value) {
+    return as_type<float>((uint)value << 16);
+}
 
 struct proto_args {
     uint queries;
@@ -765,6 +772,428 @@ static inline void gqa_mma_rolesplit_body(
     }
 }
 
+/* ===== Metal-4 TensorOps (matmul2d) gathered-attention variants =====
+ *
+ * One 128-thread threadgroup (4 simdgroups) owns one (query, KV head)
+ * pair: all 12 query heads (padded to M=16) share every gathered K/V
+ * tile, and QK^T and PV run as threadgroup-staged cooperative-tensor
+ * matmuls.  The historical F16-MMA failure was the F16 P-tile rounding
+ * (the Q-split probe showed Q's own F16 rounding is NOT binding), so
+ * the SPLIT variant keeps the P/V operands fp32 (exact products, exact
+ * fp32 accumulate per the f32stage finding) and stages only the Q/K
+ * QK operands as half (K is value-exact BF16->F16; Q rounds once per
+ * group, measured non-binding).  The EXACT variant stages every
+ * operand fp32.  Layouts follow the t2d probe: LEFT [m][k] k-contig,
+ * RIGHT [n][k] k-contig, dest stored through a (N, M) extents tensor
+ * with strides {1, N} = plain [m][n] row-major; register epilogues
+ * use get_multidimensional_index with ids[0] = n, ids[1] = m.
+ *
+ * Geometry: BK=32 tokens per tile (top_k 512 x ratio 4 -> 64 tiles at
+ * the full 2048-token budget), PV split into two N=128 halves so the
+ * fp32 V chunk (16 KB) fits the 32 KB threadgroup limit; the S and P
+ * tiles share one buffer element-for-element (softmax reads S and
+ * overwrites P in place), and in SPLIT the V chunks overlay the dead
+ * K tile. */
+constant constexpr int T2D_D = 256;
+constant constexpr int T2D_NK = 32;
+constant constexpr int T2D_NH = 128;
+constant constexpr int T2D_T = 128;
+
+/* TILEK: the QK contraction chunk (32 = the probe-proven small step,
+ * 256 = one run over the resident tile letting the op tile internally).
+ * ABLATE: 0 full, 1 skip QK runs, 2 skip PV runs, 3 skip device gathers
+ * (staging writes constants, barriers kept). */
+template <bool EXACT, int TILEK, int ABLATE>
+static inline void gqa_t2d_body(
+        constant proto_args &args,
+        device const float *q,
+        device const float *raw_gate,
+        device const ushort *key_cache,
+        device const ushort *value_cache,
+        device const uint *selected_blocks,
+        device const uint *selected_counts,
+        device const uint *visible_tokens,
+        device float *out,
+        threadgroup uchar *tgm,
+        uint2 group,
+        uint tid) {
+    constexpr uint GQA = 12u;
+    constexpr uint M = 16u;
+    constexpr uint BK = 32u;
+    constexpr uint NK = (uint)T2D_NK;
+    constexpr uint NH = (uint)T2D_NH;
+    constexpr uint TPT = (uint)T2D_T;
+
+    /* Threadgroup layout. */
+    threadgroup uchar *cursor = tgm;
+    threadgroup half *qt = nullptr;    /* M*D half, SPLIT only        */
+    threadgroup half *kt = nullptr;    /* BK*D half, SPLIT only       */
+    threadgroup float *qc[2] = {nullptr, nullptr}; /* M*NK f32, EXACT */
+    threadgroup float *kc[2] = {nullptr, nullptr}; /* BK*NK f32, EXACT */
+    threadgroup float *vb = nullptr;   /* NH*NK f32 V chunk           */
+    threadgroup float *pt = nullptr;   /* M*BK f32, S then P in place */
+    threadgroup int *sel = nullptr;    /* BK                          */
+    threadgroup float *stats = nullptr;/* M*2                         */
+    threadgroup float *rfac = nullptr; /* M                           */
+    threadgroup int *vote = nullptr;   /* M                           */
+    if constexpr (EXACT) {
+        qc[0] = (threadgroup float *)cursor;
+        qc[1] = qc[0] + M * (uint)TILEK;
+        kc[0] = qc[1] + M * (uint)TILEK;
+        kc[1] = kc[0] + BK * (uint)TILEK;
+        vb = kc[1] + BK * (uint)TILEK;
+        cursor = (threadgroup uchar *)(vb + NH * NK);
+    } else {
+        qt = (threadgroup half *)cursor;
+        kt = qt + M * T2D_D;
+        /* The fp32 V chunks (16 KB) overlay the K tile's region: K is
+         * dead once QK finishes, and the sizes match exactly. */
+        vb = (threadgroup float *)kt;
+        cursor = (threadgroup uchar *)(kt + BK * T2D_D);
+    }
+    pt = (threadgroup float *)cursor;
+    sel = (threadgroup int *)(pt + M * BK);
+    stats = (threadgroup float *)(sel + BK);
+    rfac = stats + M * 2u;
+    vote = (threadgroup int *)(rfac + M);
+
+    const uint query = group.x;
+    if (query >= args.queries) return;
+    if (group.y >= args.kv_heads) return;
+    const uint kv_head = group.y;
+
+    const uint visible = min(visible_tokens[query], args.cache_cap);
+    const uint complete = visible / args.ratio;
+    const uint block_count =
+        min(min(selected_counts[query], args.top_k), complete);
+    const uint tail = visible - complete * args.ratio;
+    const uint selected = block_count * args.ratio + tail;
+
+    if (selected == 0u) {
+        for (uint i = tid; i < GQA * T2D_D; i += TPT)
+            out[((ulong)query * args.query_heads + kv_head * GQA + i / T2D_D)
+                * args.head_dim + (i % T2D_D)] = 0.0f;
+        return;
+    }
+
+    const ulong kv_base = (ulong)kv_head * args.head_dim;
+    const ulong kv_token_stride = (ulong)args.kv_heads * args.head_dim;
+    const float scale = rsqrt((float)args.head_dim);
+
+    /* Stage Q once per group (SPLIT: resident half tile; EXACT: chunks
+     * are restaged inside the d-chunk loop). */
+    if (!EXACT) {
+        for (uint i = tid; i < M * (uint)T2D_D; i += TPT) {
+            const uint m = i / (uint)T2D_D, d = i % (uint)T2D_D;
+            float v = 0.0f;
+            if (m < GQA) {
+                v = q[((ulong)query * args.query_heads + kv_head * GQA + m) *
+                          args.head_dim +
+                      d];
+            }
+            qt[i] = half(v);
+        }
+    }
+    for (uint r = tid; r < M; r += TPT) {
+        stats[r * 2u] = -INFINITY;
+        stats[r * 2u + 1u] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* QK matmul: S(M,BK) = Q(M,D) @ K(BK,D)^T, d-chunked by NK. */
+    matmul2d<
+        matmul2d_descriptor(
+            M, BK, TILEK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_qk;
+    /* PV matmuls: O_half(M,NH) = P(M,BK) @ V(BK,NH)^T, one chunk step. */
+    matmul2d<
+        matmul2d_descriptor(
+            M, NH, NK, false, true, false,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_pv;
+
+    threadgroup float *stage_qk_chunk = nullptr; /* EXACT chunk tensors */
+    auto tQ_sp = tensor(qt, dextents<int32_t, 2>(T2D_D, M));
+    auto tK_sp = tensor(kt, dextents<int32_t, 2>(T2D_D, BK));
+    auto tP = tensor(pt, dextents<int32_t, 2>(BK, M));
+    auto tV = tensor(vb, dextents<int32_t, 2>(NK, NH));
+    (void)stage_qk_chunk;
+
+    auto stage_chunk = [&](const uint d0, const uint buf) {
+        for (uint i = tid; i < M * (uint)TILEK; i += TPT) {
+            const uint m = i / (uint)TILEK, k = i % (uint)TILEK;
+            qc[buf][i] = m < GQA
+                ? q[((ulong)query * args.query_heads + kv_head * GQA + m) *
+                        args.head_dim +
+                    d0 + k]
+                : 0.0f;
+        }
+        for (uint i = tid; i < BK * (uint)TILEK; i += TPT) {
+            const uint t = i / (uint)TILEK, k = i % (uint)TILEK;
+            float v = 0.0f;
+            if (sel[t] >= 0 && ABLATE != 3)
+                v = qwen4_bf16_to_f32(
+                    key_cache[(ulong)sel[t] * kv_token_stride + kv_base +
+                              d0 + k]);
+            kc[buf][i] = v;
+        }
+    };
+
+    /* Two persistent register destinations for the O halves. */
+    auto cO0 = mm_pv.template get_destination_cooperative_tensor<
+        decltype(tV), decltype(tP), float>();
+    auto cO1 = mm_pv.template get_destination_cooperative_tensor<
+        decltype(tV), decltype(tP), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < cO0.get_capacity(); ++i) {
+        if (cO0.is_valid_element(i)) cO0[i] = 0.0f;
+        if (cO1.is_valid_element(i)) cO1[i] = 0.0f;
+    }
+
+    const uint n_tiles = (selected + BK - 1u) / BK;
+    for (uint ktile = 0u; ktile < n_tiles; ktile++) {
+        /* Resolve this tile's ranks to tokens (-1 invalid). */
+        for (uint k = tid; k < BK; k += TPT) {
+            const uint rank = ktile * BK + k;
+            uint token = UINT_MAX;
+            if (rank < block_count * args.ratio) {
+                const uint block = selected_blocks[
+                    (ulong)query * args.top_k + rank / args.ratio];
+                token = block * args.ratio + rank % args.ratio;
+            } else if (rank < selected) {
+                token = complete * args.ratio +
+                        rank - block_count * args.ratio;
+            }
+            sel[k] = (token == UINT_MAX || token >= visible)
+                ? -1 : (int)token;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* QK^T. */
+        constexpr uint QKC = (uint)T2D_D / (uint)TILEK;
+        if constexpr (EXACT) {
+            auto tQ0 = tensor(qc[0], dextents<int32_t, 2>(TILEK, M));
+            auto tQ1 = tensor(qc[1], dextents<int32_t, 2>(TILEK, M));
+            auto tK0 = tensor(kc[0], dextents<int32_t, 2>(TILEK, BK));
+            auto tK1 = tensor(kc[1], dextents<int32_t, 2>(TILEK, BK));
+            auto cS = mm_qk.template get_destination_cooperative_tensor<
+                decltype(tK0), decltype(tQ0), float>();
+            #pragma unroll
+            for (uint16_t i = 0; i < cS.get_capacity(); ++i)
+                if (cS.is_valid_element(i)) cS[i] = 0.0f;
+            stage_chunk(0u, 0u);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint c = 0u; c < QKC; ++c) {
+                if (c + 1u < QKC)
+                    stage_chunk((c + 1u) * (uint)TILEK, (c + 1u) & 1u);
+                if (c & 1u) {
+                    auto sQ = tQ1.slice(0, 0);
+                    auto sK = tK1.slice(0, 0);
+                    if (ABLATE != 1) mm_qk.run(sQ, sK, cS);
+                } else {
+                    auto sQ = tQ0.slice(0, 0);
+                    auto sK = tK0.slice(0, 0);
+                    if (ABLATE != 1) mm_qk.run(sQ, sK, cS);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            auto tS = tensor(pt, dextents<int32_t, 2>(BK, M),
+                             array<int, 2>({1, BK}));
+            cS.store(tS);
+        } else {
+            /* Gather the whole K tile once (half, dim-contiguous rows:
+             * the resident (D, BK) tensor reads [t*D + d]).  128-bit
+             * vector loads (8 ushorts) keep the gather
+             * instruction-count at an eighth of the scalar form. */
+            for (uint i = tid; i < BK * ((uint)T2D_D / 8u); i += TPT) {
+                const uint t = i / ((uint)T2D_D / 8u);
+                const uint d8 = i % ((uint)T2D_D / 8u);
+                uint4 raw = 0u;
+                if (sel[t] >= 0 && ABLATE != 3)
+                    raw = *((device const uint4 *)(
+                        key_cache + (ulong)sel[t] * kv_token_stride +
+                        kv_base + d8 * 8u));
+                thread const ushort *e =
+                    (thread const ushort *)&raw;
+                uint4 packed;
+                thread ushort *pk = (thread ushort *)&packed;
+                for (uint e8 = 0u; e8 < 8u; e8++) {
+                    const half h = half(qwen4_bf16_to_f32(e[e8]));
+                    pk[e8] = *((thread const ushort *)&h);
+                }
+                *((threadgroup uint4 *)(kt + t * (uint)T2D_D + d8 * 8u)) =
+                    packed;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto cS = mm_qk.template get_destination_cooperative_tensor<
+                decltype(tK_sp), decltype(tQ_sp), float>();
+            #pragma unroll
+            for (uint16_t i = 0; i < cS.get_capacity(); ++i)
+                if (cS.is_valid_element(i)) cS[i] = 0.0f;
+            for (uint c = 0u; c < QKC; ++c) {
+                auto sQ = tQ_sp.slice(c * (uint)TILEK, 0);
+                auto sK = tK_sp.slice(c * (uint)TILEK, 0);
+                if (ABLATE != 1) mm_qk.run(sQ, sK, cS);
+            }
+            auto tS = tensor(pt, dextents<int32_t, 2>(BK, M),
+                             array<int, 2>({1, BK}));
+            cS.store(tS);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Online softmax, 8 threads per row of 32 columns.  Rows live
+         * inside one simdgroup as 8-lane groups, so the row reductions
+         * are 7 simd_shuffles.  S is scaled (invalid -> -inf) and then
+         * overwritten by P in place. */
+        {
+            const uint row = tid >> 3;
+            const uint sub = tid & 7u;
+            const uint col0 = sub * 4u;
+            const uint lane_base = (row & 3u) * 8u;
+            float lmax = -INFINITY;
+            for (uint c = 0u; c < 4u; c++) {
+                const uint col = col0 + c;
+                float s = -INFINITY;
+                if (sel[col] >= 0) s = pt[row * BK + col] * scale;
+                pt[row * BK + col] = s;
+                lmax = max(lmax, s);
+            }
+            float rmax = lmax;
+            for (uint j = 1u; j < 8u; j++)
+                rmax = max(rmax, simd_shuffle(lmax, lane_base + j));
+            const float old_max = stats[row * 2u];
+            const float old_sum = stats[row * 2u + 1u];
+            const float new_max = max(old_max, rmax);
+            float lsum = 0.0f;
+            for (uint c = 0u; c < 4u; c++) {
+                const float s = pt[row * BK + col0 + c];
+                const float p = isfinite(s) ? exp(s - new_max) : 0.0f;
+                pt[row * BK + col0 + c] = p;
+                lsum += p;
+            }
+            float rsum = lsum;
+            for (uint j = 1u; j < 8u; j++)
+                rsum += simd_shuffle(lsum, lane_base + j);
+            if (sub == 0u) {
+                const float factor = isfinite(old_max)
+                    ? exp(old_max - new_max) : 1.0f;
+                rfac[row] = factor;
+                vote[row] =
+                    (isfinite(old_max) && new_max > old_max) ? 1 : 0;
+                stats[row * 2u] = new_max;
+                stats[row * 2u + 1u] = old_sum * factor + rsum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Lazy register rescale of the running O when a row max grew. */
+        bool any_vote = false;
+        for (uint r = 0u; r < M; r++) any_vote = any_vote || vote[r] != 0;
+        if (any_vote) {
+            #pragma unroll
+            for (uint16_t i = 0; i < cO0.get_capacity(); ++i) {
+                if (cO0.is_valid_element(i)) {
+                    const auto ids = cO0.get_multidimensional_index(i);
+                    cO0[i] *= rfac[ids[1]];
+                }
+                if (cO1.is_valid_element(i)) {
+                    const auto ids = cO1.get_multidimensional_index(i);
+                    cO1[i] *= rfac[ids[1]];
+                }
+            }
+        }
+
+        /* PV: P is resident; stage each half's V chunk (fp32, [d][t]
+         * for the NT operand) with 128-bit vector loads: consecutive
+         * threads read consecutive 8-dim blocks of one token. */
+        auto sP = tP.slice(0, 0);
+        for (uint hf = 0u; hf < 2u; hf++) {
+            for (uint i = tid; i < BK * (NH / 8u); i += TPT) {
+                const uint t = i / (NH / 8u);
+                const uint d8 = i % (NH / 8u);
+                const int tok = sel[t];
+                uint4 raw = 0u;
+                if (tok >= 0 && ABLATE != 3)
+                    raw = *((device const uint4 *)(
+                        value_cache + (ulong)tok * kv_token_stride +
+                        kv_base + hf * NH + d8 * 8u));
+                thread const ushort *e =
+                    (thread const ushort *)&raw;
+                for (uint e8 = 0u; e8 < 8u; e8++)
+                    vb[(d8 * 8u + e8) * NK + t] =
+                        qwen4_bf16_to_f32(e[e8]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto sV = tV.slice(0, 0);
+            if (ABLATE != 2) {
+                if (hf == 0u) mm_pv.run(sP, sV, cO0);
+                else mm_pv.run(sP, sV, cO1);
+            }
+        }
+    }
+
+    /* Emit from registers: normalize, gate, write the 12 head rows. */
+    #pragma unroll
+    for (uint16_t i = 0; i < cO0.get_capacity(); ++i) {
+        if (!cO0.is_valid_element(i)) continue;
+        const auto ids = cO0.get_multidimensional_index(i);
+        const uint m = (uint)ids[1], d = (uint)ids[0];
+        if (m >= GQA) continue;
+        const ulong base =
+            ((ulong)query * args.query_heads + kv_head * GQA + m) *
+                args.head_dim +
+            d;
+        const float mx = stats[m * 2u], sm = stats[m * 2u + 1u];
+        const float inv = isfinite(mx) && sm > 0.0f ? 1.0f / sm : 0.0f;
+        out[base] = cO0[i] * inv /
+            (1.0f + exp(-raw_gate[base]));
+    }
+    #pragma unroll
+    for (uint16_t i = 0; i < cO1.get_capacity(); ++i) {
+        if (!cO1.is_valid_element(i)) continue;
+        const auto ids = cO1.get_multidimensional_index(i);
+        const uint m = (uint)ids[1], d = (uint)ids[0];
+        if (m >= GQA) continue;
+        const ulong base =
+            ((ulong)query * args.query_heads + kv_head * GQA + m) *
+                args.head_dim +
+            NH + d;
+        const float mx = stats[m * 2u], sm = stats[m * 2u + 1u];
+        const float inv = isfinite(mx) && sm > 0.0f ? 1.0f / sm : 0.0f;
+        out[base] = cO1[i] * inv /
+            (1.0f + exp(-raw_gate[base]));
+    }
+}
+
+#define INSTANTIATE_T2D(name, exact, tilek, ablate) \
+    kernel void name( \
+            constant proto_args &args [[buffer(0)]], \
+            device const float *q [[buffer(1)]], \
+            device const float *raw_gate [[buffer(2)]], \
+            device const ushort *key_cache [[buffer(3)]], \
+            device const ushort *value_cache [[buffer(4)]], \
+            device const uint *selected_blocks [[buffer(5)]], \
+            device const uint *selected_counts [[buffer(6)]], \
+            device const uint *visible_tokens [[buffer(7)]], \
+            device float *out [[buffer(8)]], \
+            threadgroup uchar *tgm [[threadgroup(0)]], \
+            uint2 group [[threadgroup_position_in_grid]], \
+            uint tid [[thread_index_in_threadgroup]]) { \
+        gqa_t2d_body<exact, tilek, ablate>( \
+            args, q, raw_gate, key_cache, value_cache, selected_blocks, \
+            selected_counts, visible_tokens, out, tgm, group, tid); \
+    }
+
+INSTANTIATE_T2D(gqa_t2d_split, false, 32, 0)
+INSTANTIATE_T2D(gqa_t2d_exact, true, 32, 0)
+INSTANTIATE_T2D(gqa_t2d_split_tk256, false, 256, 0)
+INSTANTIATE_T2D(gqa_t2d_exact_tk256, true, 256, 0)
+INSTANTIATE_T2D(gqa_t2d_split_noqk, false, 32, 1)
+INSTANTIATE_T2D(gqa_t2d_split_nopv, false, 32, 2)
+INSTANTIATE_T2D(gqa_t2d_split_nogather, false, 32, 3)
+INSTANTIATE_T2D(gqa_t2d_split_tk256_nogather, false, 256, 3)
+
 #define INSTANTIATE_PROTO(name, org, bk, dc, skip) \
     kernel void name( \
             constant proto_args &args [[buffer(0)]], \
@@ -949,6 +1378,10 @@ static inline void gqa_mma_rolesplit_qsplit_body(
             sel[k] = (token == UINT_MAX || token >= visible)
                 ? -1 : (int)token;
         }
+        if (args.debug != 0u && query == 0u && kv_head == 0u &&
+            ktile == 0u && tid < 32u)
+            out[(ulong)997u * args.query_heads * args.head_dim + tid] =
+                (float)sel[tid];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         {

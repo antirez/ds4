@@ -51,6 +51,20 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
+/* GDN recurrence rows-per-thread for the prefill-width sweep:
+ * DS4_BENCH_GDN_ROWS overrides the production default of 4. */
+static uint32_t gdn_rows(void) {
+    const char *raw = getenv("DS4_BENCH_GDN_ROWS");
+    if (raw && raw[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(raw, &end, 10);
+        if (end != raw && *end == '\0' &&
+            (parsed == 1u || parsed == 2u || parsed == 4u))
+            return (uint32_t)parsed;
+    }
+    return GDN_ROWS_PER_THREAD;
+}
+
 static uint32_t lcg_state = 0x12345678u;
 static float lcg_float(float scale) {
     lcg_state = lcg_state * 1664525u + 1013904223u;
@@ -503,7 +517,7 @@ int main(int argc, char **argv) {
         if (ds4_gpu_qwen4_gdn_prefill_bf16_state(
                 gdn_out_t, gdn_state_t, gdn_q_t, gdn_k_t, gdn_v_t,
                 gdn_decay_t, gdn_beta_t, NULL, rows, GDN_KEY_HEADS,
-                GDN_VALUE_HEADS, GDN_HEAD_DIM, GDN_ROWS_PER_THREAD) == 0) {
+                GDN_VALUE_HEADS, GDN_HEAD_DIM, gdn_rows()) == 0) {
             fprintf(stderr, "qsa-prefill-bench: gdn dispatch failed\n");
             return 1;
         }
@@ -564,8 +578,8 @@ int main(int argc, char **argv) {
            attn_ms, attn_ms * 12.0);
     printf("  streaming top-k     %8.2f ms/layer   x12 = %8.1f ms/chunk\n",
            topk_ms, topk_ms * 12.0);
-    printf("  gdn recurrence R4   %8.2f ms/layer   x36 = %8.1f ms/chunk\n",
-           gdn_ms, gdn_ms * 36.0);
+    printf("  gdn recurrence R%u   %8.2f ms/layer   x36 = %8.1f ms/chunk\n",
+           gdn_rows(), gdn_ms, gdn_ms * 36.0);
     printf("  dense q8 %ux%u %8.2f ms        x48 ~ %8.1f ms/chunk (per-proj)\n",
            DENSE_OUT, DENSE_IN, dense_ms, dense_ms * 48.0);
     printf("  K/V gather traffic/layer ~%.1f GB (ideal shared %.2f GB)\n",
