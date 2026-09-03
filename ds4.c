@@ -39515,6 +39515,10 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+static int glm_chat_bos_fallback_id(int gmask_id, int sop_id) {
+    return gmask_id >= 0 ? gmask_id : sop_id;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
@@ -39552,7 +39556,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
-            vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
+            vocab->bos_id = glm_chat_bos_fallback_id(
+                    vocab_lookup_optional(vocab, "[gMASK]"),
+                    vocab_lookup_optional(vocab, "<sop>"));
         }
         if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
             vocab->eos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
@@ -39608,7 +39614,8 @@ static void vocab_free(ds4_vocab *vocab) {
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
     token_vec_push(out, vocab->bos_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        vocab->sop_id >= 0 && vocab->sop_id != vocab->bos_id)
         token_vec_push(out, vocab->sop_id);
 }
 
@@ -39753,6 +39760,50 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
+
+#ifdef DS4_TEST_HOOKS
+bool ds4_test_glm_chat_preamble(void) {
+    static const ds4_str gmask = {"[gMASK]", 7};
+    static const ds4_str sop = {"<sop>", 5};
+    const ds4_shape saved_shape = g_ds4_shape;
+    ds4_vocab vocab = {0};
+    ds4_vocab sop_only = {0};
+    token_vec direct = {0};
+    token_vec rendered = {0};
+    token_vec shared = {0};
+
+    table_init(&vocab.token_to_id, 2);
+    table_put(&vocab.token_to_id, gmask, 154822);
+    table_put(&vocab.token_to_id, sop, 154824);
+    vocab.bos_id = glm_chat_bos_fallback_id(
+            vocab_lookup_optional(&vocab, "[gMASK]"),
+            vocab_lookup_optional(&vocab, "<sop>"));
+    vocab.sop_id = vocab_lookup_optional(&vocab, "<sop>");
+
+    g_ds4_shape.family = DS4_MODEL_FAMILY_GLM_DSA;
+    chat_push_bos_sequence(&vocab, &direct);
+    tokenize_rendered_chat_vocab(&vocab, "[gMASK]<sop>", &rendered);
+    bool ok = direct.len == 2 && direct.v[0] == 154822 && direct.v[1] == 154824 &&
+              rendered.len == 2 && rendered.v[0] == 154822 && rendered.v[1] == 154824;
+
+    table_init(&sop_only.token_to_id, 1);
+    table_put(&sop_only.token_to_id, sop, 154824);
+    sop_only.bos_id = glm_chat_bos_fallback_id(
+            vocab_lookup_optional(&sop_only, "[gMASK]"),
+            vocab_lookup_optional(&sop_only, "<sop>"));
+    sop_only.sop_id = vocab_lookup_optional(&sop_only, "<sop>");
+    chat_push_bos_sequence(&sop_only, &shared);
+    ok = ok && shared.len == 1 && shared.v[0] == 154824;
+
+    token_vec_free(&shared);
+    token_vec_free(&rendered);
+    token_vec_free(&direct);
+    table_free(&sop_only.token_to_id);
+    table_free(&vocab.token_to_id);
+    g_ds4_shape = saved_shape;
+    return ok;
+}
+#endif
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     chat_push_bos_sequence(&e->vocab, tokens);
