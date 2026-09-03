@@ -145,6 +145,38 @@ static void test_close_engine(bool quality) {
     *slot = NULL;
 }
 
+/* A tool observation without images must render exactly like the plain chat
+ * path: the shortcut in ds4_chat_append_multimodal_message never inspects
+ * model family or vision_kind, so the guarantee holds regardless of build
+ * configuration, but this test only exercises it on the default (no vision
+ * loaded) engine. The agent sends every tool result through the multimodal
+ * entry point, so a text-only rejection breaks all tool calls on DeepSeek
+ * text models. */
+static void test_chat_append_multimodal_text_only(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    static const char *const roles[] = {"tool", "user"};
+    const char *text = ".:\nd        96 src/\n-      1204 package.json\n";
+    const char *const parts[] = {text};
+    for (size_t r = 0; r < sizeof(roles) / sizeof(roles[0]); r++) {
+        ds4_tokens plain = {0};
+        ds4_tokens multimodal = {0};
+        char err[160] = {0};
+
+        ds4_chat_append_message(engine, &plain, roles[r], text);
+        int ok = ds4_chat_append_multimodal_message(engine, &multimodal,
+                                                    roles[r], parts, NULL, 0,
+                                                    NULL, err, sizeof(err));
+        TEST_ASSERT(ok == 1);
+        TEST_ASSERT(plain.len > 0 && multimodal.len == plain.len &&
+                    memcmp(multimodal.v, plain.v,
+                           (size_t)plain.len * sizeof(plain.v[0])) == 0);
+        ds4_tokens_free(&plain);
+        ds4_tokens_free(&multimodal);
+    }
+}
+
 static void test_session_snapshot_roundtrip(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -6796,6 +6828,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
+    {"--chat-multimodal-text-only", "chat-multimodal-text-only", "text-only multimodal message renders like the plain chat path", test_chat_append_multimodal_text_only},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
