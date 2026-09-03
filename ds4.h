@@ -22,10 +22,22 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Reasoning-effort tiers.  The enumerators are APPENDED, never renumbered or
+ * renamed: the existing names are spelled out in ~120 literals across the
+ * server, CLI, agent and eval code, so a rename would silently re-point every
+ * one of them.  The names are historical and do NOT line up 1:1 with DeepSeek's
+ * own tier names; ds4_think_effort_prefix() below is the mapping of record.
+ *
+ *   DS4_THINK_NONE   no thinking at all (</think> opener, no prefix)
+ *   DS4_THINK_HIGH   thinking with no prompt prefix        == DeepSeek "low"
+ *   DS4_THINK_MAX    "Reasoning Effort: Absolute maximum"  == DeepSeek "high"
+ *   DS4_THINK_ULTRA  "Reasoning Effort: Beyond maximum"    == DeepSeek "max"
+ */
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
+    DS4_THINK_ULTRA,
 } ds4_think_mode;
 
 typedef enum {
@@ -306,9 +318,18 @@ bool ds4_engine_is_glm53(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
+/* Prompt prefix for a tier.  Returns "" (never NULL) for NONE and HIGH, so
+ * callers can append unconditionally. */
+const char *ds4_think_effort_prefix(ds4_think_mode mode);
+/* Compatibility shim: the pre-tier single-constant accessor, == the
+ * DS4_THINK_MAX prefix.  Prefer ds4_think_effort_prefix(). */
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
+/* Context floor below which ds4_think_mode_for_context() steps a tier down.
+ * Defaults to DeepSeek's recommended 393216.  Call during argument parsing,
+ * before any request is served: it is a process-wide setting. */
+void ds4_think_set_effort_min_context(uint32_t min_context);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
  * the GGUF so Flash/Pro dimensions are known. */
@@ -366,6 +387,8 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out);
+void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode);
+/* Compatibility shim for ds4_chat_append_effort_prefix(.., DS4_THINK_MAX). */
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);

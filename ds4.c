@@ -388,15 +388,38 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #define DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE (160000.0f)
 #define DS4_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
 
+/* Reasoning-effort prompt prefixes, copied byte-for-byte from DeepSeek's own
+ * REASONING_EFFORT_PROMPTS in encoding/encoding_dsv4.py (DeepSeek-V4-Flash-0731).
+ * DeepSeek's "low" tier is the empty string, so only two prefixes exist.
+ *
+ *   DeepSeek "high" -> DS4_THINK_MAX    (this file's ..._MAX_PREFIX)
+ *   DeepSeek "max"  -> DS4_THINK_ULTRA  (this file's ..._ULTRA_PREFIX, added
+ *                                        for 0731; it did not exist before)
+ *
+ * The ULTRA string contains an em dash (U+2014, bytes E2 80 94) after
+ * "Beyond maximum".  It is part of the tokenised prompt: do not "normalise" it
+ * to a hyphen and keep this file UTF-8. */
 static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
-/* DeepSeek recommends Think Max only with at least a 384K-token context window.
- * Below that size we keep ordinary thinking to avoid injecting a prompt that
- * asks for a reasoning budget the allocated context is not meant to hold. */
+static const char DS4_REASONING_EFFORT_ULTRA_PREFIX[] =
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
+/* DeepSeek recommends the prefixed tiers only with at least a 384K-token
+ * context window.  Below that size we step the tier down so we never inject a
+ * prompt that asks for a reasoning budget the allocated context is not meant
+ * to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
+
+/* Runtime-settable so an operator can lower or raise the floor without a
+ * rebuild.  The default is DeepSeek's recommendation and is what every tool
+ * uses unless --think-effort-min-ctx says otherwise.  Set once during argument
+ * parsing, before any request is served. */
+static uint32_t g_think_effort_min_context = DS4_THINK_MAX_MIN_CONTEXT;
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
@@ -39614,9 +39637,13 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
 
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
-    case DS4_THINK_HIGH: return "Reasoning Effort: High";
-    case DS4_THINK_MAX:  return "Reasoning Effort: Max";
-    case DS4_THINK_NONE: return NULL;
+    case DS4_THINK_HIGH:  return "Reasoning Effort: High";
+    case DS4_THINK_MAX:   return "Reasoning Effort: Max";
+    /* GLM exposes no tier above "Max", so ULTRA saturates there.  This switch
+     * has no default: an unlisted enumerator returns NULL and drops the effort
+     * text with no diagnostic. */
+    case DS4_THINK_ULTRA: return "Reasoning Effort: Max";
+    case DS4_THINK_NONE:  return NULL;
     }
     return NULL;
 }
@@ -39630,8 +39657,13 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
-    } else if (think_mode == DS4_THINK_MAX) {
-        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
+    } else {
+        /* Tier -> prefix comes from ds4_think_effort_prefix(), which returns ""
+         * (never NULL) for the unprefixed tiers, so this stays a single call
+         * site as tiers are added. */
+        const char *effort_prefix = ds4_think_effort_prefix(think_mode);
+        if (effort_prefix[0])
+            bpe_tokenize_text(vocab, effort_prefix, out);
     }
 }
 
@@ -39767,8 +39799,14 @@ void ds4_encode_chat_prompt(
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
 }
 
+void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
+    const char *prefix = ds4_think_effort_prefix(mode);
+    if (!prefix[0]) return;
+    bpe_tokenize_text(&e->vocab, prefix, tokens);
+}
+
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
+    ds4_chat_append_effort_prefix(e, tokens, DS4_THINK_MAX);
 }
 
 static void bpe_tokenize_wrapped_payload_text(ds4_vocab *vocab, const char *content,
@@ -54007,31 +54045,55 @@ static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 #endif
 }
 
+/* Every tier above NONE is a thinking tier.  ULTRA MUST be listed here: this
+ * predicate gates the <think> opener, the streaming reasoning channels and the
+ * tool-marker handling at ~25 call sites, and omitting a new tier disables
+ * thinking for it everywhere at once without a single compiler warning. */
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
+    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX ||
+           mode == DS4_THINK_ULTRA;
 }
 
 const char *ds4_think_mode_name(ds4_think_mode mode) {
     switch (mode) {
-    case DS4_THINK_NONE: return "none";
-    case DS4_THINK_HIGH: return "high";
-    case DS4_THINK_MAX:  return "max";
+    case DS4_THINK_NONE:  return "none";
+    case DS4_THINK_HIGH:  return "high";
+    case DS4_THINK_MAX:   return "max";
+    case DS4_THINK_ULTRA: return "ultra";
     }
     return "unknown";
 }
 
+const char *ds4_think_effort_prefix(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE:  return "";
+    case DS4_THINK_HIGH:  return "";
+    case DS4_THINK_MAX:   return DS4_REASONING_EFFORT_MAX_PREFIX;
+    case DS4_THINK_ULTRA: return DS4_REASONING_EFFORT_ULTRA_PREFIX;
+    }
+    return "";
+}
+
 const char *ds4_think_max_prefix(void) {
-    return DS4_REASONING_EFFORT_MAX_PREFIX;
+    return ds4_think_effort_prefix(DS4_THINK_MAX);
 }
 
 uint32_t ds4_think_max_min_context(void) {
-    return DS4_THINK_MAX_MIN_CONTEXT;
+    return g_think_effort_min_context;
 }
 
+void ds4_think_set_effort_min_context(uint32_t min_context) {
+    g_think_effort_min_context = min_context;
+}
+
+/* Step the tier down ONE level when the context is too small, so ULTRA in a
+ * small context still reasons at MAX rather than collapsing all the way to the
+ * unprefixed tier. */
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
-    if (mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
-        return DS4_THINK_HIGH;
-    }
+    const uint32_t ctx = (uint32_t)(ctx_size > 0 ? ctx_size : 0);
+    if (ctx >= g_think_effort_min_context) return mode;
+    if (mode == DS4_THINK_ULTRA) return DS4_THINK_MAX;
+    if (mode == DS4_THINK_MAX) return DS4_THINK_HIGH;
     return mode;
 }
 

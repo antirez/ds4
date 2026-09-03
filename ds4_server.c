@@ -994,32 +994,89 @@ static void request_free(request *r) {
     memset(r, 0, sizeof(*r));
 }
 
-static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
-    if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
-    return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+/* How wire reasoning_effort names map onto ds4 tiers.
+ *
+ *   DEEPSEEK (default) -- align with DeepSeek-V4-Flash-0731: the wire name
+ *     selects the prompt DeepSeek itself would use for that name.
+ *   LEGACY -- the pre-0731 ds4 mapping, kept so the old behaviour is one flag
+ *     away for anyone whose prompts were tuned against it.
+ *
+ * Runtime-global rather than per-request: it describes how this server reads
+ * the wire protocol, and every endpoint must read it the same way. */
+typedef enum {
+    EFFORT_MAP_DEEPSEEK = 0,
+    EFFORT_MAP_LEGACY,
+} reasoning_effort_map;
+
+static reasoning_effort_map g_reasoning_effort_map = EFFORT_MAP_DEEPSEEK;
+
+static bool parse_reasoning_effort_map_name(const char *s, reasoning_effort_map *out) {
+    if (!s) return false;
+    if (!strcmp(s, "deepseek")) { *out = EFFORT_MAP_DEEPSEEK; return true; }
+    if (!strcmp(s, "legacy"))   { *out = EFFORT_MAP_LEGACY;   return true; }
+    return false;
 }
 
-static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
+/* LANDMINE, no compiler warning: this used to collapse everything that was not
+ * DS4_THINK_MAX down to DS4_THINK_HIGH.  With a fourth tier that would destroy
+ * ULTRA before the renderer ever saw it, silently.  It is now a pass-through:
+ * the only decision left here is the thinking on/off control. */
+static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
+    if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
+    return effort;
+}
+
+static bool parse_reasoning_effort_name_mapped(const char *s,
+                                               reasoning_effort_map map,
+                                               ds4_think_mode *out)
+{
     if (!s) return false;
-    if (!strcmp(s, "max")) {
-        *out = DS4_THINK_MAX;
-        return true;
-    }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low") ||
-        !strcmp(s, "minimal"))
-    {
-        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
-         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
-         * must use "none" instead. */
-        *out = DS4_THINK_HIGH;
-        return true;
-    }
     if (!strcmp(s, "none")) {
         *out = DS4_THINK_NONE;
         return true;
     }
+    if (map == EFFORT_MAP_LEGACY) {
+        /* Pre-0731 behaviour, byte for byte: only "max" reached the prefixed
+         * tier and everything else non-zero collapsed to HIGH. */
+        if (!strcmp(s, "max")) {
+            *out = DS4_THINK_MAX;
+            return true;
+        }
+        if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
+            !strcmp(s, "medium") || !strcmp(s, "low") ||
+            !strcmp(s, "minimal"))
+        {
+            *out = DS4_THINK_HIGH;
+            return true;
+        }
+        return false;
+    }
+    /* DeepSeek 0731 mapping.  DeepSeek has three prompts; the wire has six
+     * names, so the four below the top collapse onto DeepSeek's "low".
+     *
+     *   minimal/low/medium -> HIGH  (DeepSeek "low",  no prefix)
+     *   high/xhigh         -> MAX   (DeepSeek "high", "Absolute maximum...")
+     *   max                -> ULTRA (DeepSeek "max",  "Beyond maximum...")
+     */
+    if (!strcmp(s, "max")) {
+        *out = DS4_THINK_ULTRA;
+        return true;
+    }
+    if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
+        *out = DS4_THINK_MAX;
+        return true;
+    }
+    if (!strcmp(s, "medium") || !strcmp(s, "low") || !strcmp(s, "minimal")) {
+        /* Callers that need *no* reasoning must use "none" instead. */
+        *out = DS4_THINK_HIGH;
+        return true;
+    }
     return false;
+}
+
+/* Unknown names still fail, so the HTTP layer keeps answering 400. */
+static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
+    return parse_reasoning_effort_name_mapped(s, g_reasoning_effort_map, out);
 }
 
 static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
@@ -2915,7 +2972,7 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
 
     buf out = {0};
     buf_puts(&out, "<｜begin▁of▁sentence｜>");
-    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
+    buf_puts(&out, ds4_think_effort_prefix(think_mode));
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;
@@ -10993,10 +11050,20 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     const char *bos = "<｜begin▁of▁sentence｜>";
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const char *max_prefix = ds4_think_max_prefix();
-    const size_t max_prefix_len = strlen(max_prefix);
-    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
-        p += max_prefix_len;
+    /* Strip whichever effort prefix this prompt was rendered with.  Every
+     * prefixed tier must be listed: a tier missing here leaves its prompt text
+     * inside the "system region" that gets echoed back into tool-error
+     * recovery messages. */
+    static const ds4_think_mode prefixed_tiers[] = {
+        DS4_THINK_MAX, DS4_THINK_ULTRA,
+    };
+    for (size_t i = 0; i < sizeof(prefixed_tiers) / sizeof(prefixed_tiers[0]); i++) {
+        const char *prefix = ds4_think_effort_prefix(prefixed_tiers[i]);
+        const size_t prefix_len = strlen(prefix);
+        if (prefix_len && !strncmp(p, prefix, prefix_len)) {
+            p += prefix_len;
+            break;
+        }
     }
     while (*p && isspace((unsigned char)*p)) p++;
 
@@ -14107,6 +14174,18 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--think-effort-min-ctx")) {
+            /* 0 disables the gate entirely, so this must accept zero:
+             * parse_int_arg() rejects v <= 0 and would exit(2) first. */
+            const int v = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            ds4_think_set_effort_min_context((uint32_t)v);
+        } else if (!strcmp(arg, "--reasoning-effort-map")) {
+            const char *name = need_arg(&i, argc, argv, arg);
+            if (!parse_reasoning_effort_map_name(name, &g_reasoning_effort_map)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --reasoning-effort-map must be deepseek or legacy");
+                exit(2);
+            }
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr, NULL);
@@ -15882,15 +15961,90 @@ static void test_chat_ignore_eos_contract(void) {
 
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
+
+    /* Default map: DeepSeek 0731.  Every wire name lands on the tier whose
+     * prompt DeepSeek itself would use for that name. */
+    TEST_ASSERT(g_reasoning_effort_map == EFFORT_MAP_DEEPSEEK);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
+    TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_MAX);
+    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_MAX);
+    TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_ULTRA);
+    TEST_ASSERT(parse_reasoning_effort_name("none", &mode) && mode == DS4_THINK_NONE);
+
+    /* Unknown strings must still be rejected so the HTTP layer answers 400. */
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("ultra", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name(NULL, &mode));
+
+    /* Legacy map: the pre-0731 table, unchanged. */
+    reasoning_effort_map legacy = EFFORT_MAP_LEGACY;
+    TEST_ASSERT(parse_reasoning_effort_map_name("legacy", &legacy) &&
+                legacy == EFFORT_MAP_LEGACY);
+    TEST_ASSERT(parse_reasoning_effort_name_mapped("minimal", legacy, &mode) &&
+                mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name_mapped("high", legacy, &mode) &&
+                mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name_mapped("xhigh", legacy, &mode) &&
+                mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name_mapped("max", legacy, &mode) &&
+                mode == DS4_THINK_MAX);
+    TEST_ASSERT(parse_reasoning_effort_name_mapped("none", legacy, &mode) &&
+                mode == DS4_THINK_NONE);
+    TEST_ASSERT(!parse_reasoning_effort_name_mapped("banana", legacy, &mode));
+
+    reasoning_effort_map deepseek = EFFORT_MAP_LEGACY;
+    TEST_ASSERT(parse_reasoning_effort_map_name("deepseek", &deepseek) &&
+                deepseek == EFFORT_MAP_DEEPSEEK);
+    TEST_ASSERT(!parse_reasoning_effort_map_name("banana", &deepseek));
+    TEST_ASSERT(!parse_reasoning_effort_map_name(NULL, &deepseek));
+
+    /* The new tier is a real tier, not a synonym for MAX. */
+    TEST_ASSERT(ds4_think_mode_enabled(DS4_THINK_ULTRA));
+    TEST_ASSERT(!strcmp(ds4_think_mode_name(DS4_THINK_ULTRA), "ultra"));
+    TEST_ASSERT(strcmp(ds4_think_effort_prefix(DS4_THINK_ULTRA),
+                       ds4_think_effort_prefix(DS4_THINK_MAX)) != 0);
+    TEST_ASSERT(!strncmp(ds4_think_effort_prefix(DS4_THINK_ULTRA),
+                         "Reasoning Effort: Beyond maximum \xe2\x80\x94 exhaustive,",
+                         strlen("Reasoning Effort: Beyond maximum \xe2\x80\x94 exhaustive,")));
+    TEST_ASSERT(ds4_think_effort_prefix(DS4_THINK_HIGH)[0] == '\0');
+    TEST_ASSERT(ds4_think_effort_prefix(DS4_THINK_NONE)[0] == '\0');
+    TEST_ASSERT(!strcmp(ds4_think_max_prefix(),
+                        ds4_think_effort_prefix(DS4_THINK_MAX)));
+
+    /* think_mode_from_enabled() must pass the tier through untouched: the old
+     * "collapse anything non-MAX to HIGH" destroyed ULTRA before rendering. */
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_ULTRA) == DS4_THINK_ULTRA);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_MAX) == DS4_THINK_MAX);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_HIGH) == DS4_THINK_HIGH);
+    TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_ULTRA) == DS4_THINK_NONE);
+    TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_NONE) == DS4_THINK_NONE);
+
+    /* The context gate steps down ONE tier, not straight to HIGH. */
+    const int floor_ctx = (int)ds4_think_max_min_context();
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 32768) == DS4_THINK_MAX);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
-                                           (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_HIGH, 32768) == DS4_THINK_HIGH);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_NONE, 32768) == DS4_THINK_NONE);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, floor_ctx) == DS4_THINK_ULTRA);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, floor_ctx) == DS4_THINK_MAX);
+
+    /* The floor itself is runtime-settable; restore it before returning. */
+    ds4_think_set_effort_min_context(4096);
+    TEST_ASSERT(ds4_think_max_min_context() == 4096);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 32768) == DS4_THINK_ULTRA);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 2048) == DS4_THINK_MAX);
+    /* 0 disables the gate: every tier must survive at any context. */
+    ds4_think_set_effort_min_context(0);
+    TEST_ASSERT(ds4_think_max_min_context() == 0);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 1) == DS4_THINK_ULTRA);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_ULTRA, 0) == DS4_THINK_ULTRA);
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 1) == DS4_THINK_MAX);
+
+    ds4_think_set_effort_min_context((uint32_t)floor_ctx);
+    TEST_ASSERT(ds4_think_max_min_context() == (uint32_t)floor_ctx);
 }
 
 static void test_model_alias_thinking_controls(void) {
@@ -15922,15 +16076,18 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
+    /* Both of these go through parse_reasoning_effort_name(), so they follow
+     * the active map.  Under the default deepseek map every tier moved up one
+     * notch: "max" is now ULTRA and "xhigh" is now MAX. */
     ds4_think_mode mode = DS4_THINK_HIGH;
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
     TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode));
-    TEST_ASSERT(mode == DS4_THINK_MAX);
+    TEST_ASSERT(mode == DS4_THINK_ULTRA);
 
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
-    TEST_ASSERT(mode == DS4_THINK_HIGH);
+    TEST_ASSERT(mode == DS4_THINK_MAX);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -15950,6 +16107,39 @@ static void test_render_think_max_prompt_prefix(void) {
     TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) != NULL);
     TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
     TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+/* The ULTRA tier must reach the renderer with its own text.  Both silent
+ * landmines would fail here rather than in production: if
+ * ds4_think_mode_enabled() had missed ULTRA the prompt would close </think>,
+ * and if think_mode_from_enabled() still collapsed non-MAX tiers the MAX text
+ * would appear instead of the ULTRA text. */
+static void test_render_think_ultra_prompt_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_ULTRA);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_effort_prefix(DS4_THINK_ULTRA)) != NULL);
+    TEST_ASSERT(strstr(prompt, ds4_think_effort_prefix(DS4_THINK_MAX)) == NULL);
+    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+
+    /* The system region must not swallow the ULTRA preamble. */
+    char *system = rendered_chat_system_region(prompt);
+    TEST_ASSERT(system != NULL);
+    TEST_ASSERT(!strcmp(system, "You are terse."));
+    free(system);
 
     free(prompt);
     chat_msgs_free(&msgs);
@@ -19413,6 +19603,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
+    test_render_think_ultra_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

@@ -214,7 +214,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
+    opt(fp, c, "--think-ultra", "Use Think Ultra, DeepSeek 0731 'max' effort, when context allows.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    opt(fp, c, "--think-effort-min-ctx N", "Context floor for the prefixed think tiers. Default: 393216");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -300,7 +302,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think, /think-max, /think-ultra, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
@@ -353,9 +355,11 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
-    para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
-    para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
+    para(fp, c, "Chat requests default to thinking with no effort prefix, matching DeepSeek's own 'low' default.");
+    opt(fp, c, "--reasoning-effort-map MAP", "How wire effort names map to tiers: deepseek (default) or legacy.");
+    para(fp, c, "deepseek: minimal/low/medium -> high, high/xhigh -> max, max -> ultra.");
+    para(fp, c, "legacy: the pre-0731 ds4 table, where only max reached a prefixed tier.");
+    para(fp, c, "The prefixed tiers require --ctx >= --think-effort-min-ctx (default 393216); below it each steps down one tier.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
     fputc('\n', fp);
