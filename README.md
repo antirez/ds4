@@ -1403,12 +1403,13 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
           "name": "DeepSeek V4 Flash (ds4.c local)",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
-            "minimal": "low",
-            "low": "low",
-            "medium": "medium",
+            "off": "off",
+            "minimal": null,
+            "low": null,
+            "medium": null,
             "high": "high",
-            "xhigh": "xhigh"
+            "xhigh": null,
+            "max": "max"
           },
           "input": ["text"],
           "contextWindow": 100000,
