@@ -1,0 +1,3 @@
+To understand why evaluating 50 prompts is more informative than evaluating one "favorite" prompt, we have to shift our mindset from **subjective preference** to **objective reliability**. 
+
+A single favorite prompt is a **data point**. Fifty prompts are a **dataset**. Here is why that distinction matters across four key dimensions

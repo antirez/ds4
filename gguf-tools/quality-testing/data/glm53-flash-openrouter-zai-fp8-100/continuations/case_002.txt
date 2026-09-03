@@ -1,0 +1,16 @@
+# mmap vs. Private Buffer Copy for Model Weights on macOS
+
+## How Each Approach Works
+
+**mmap (memory-mapped files)**
+```c
+void *weights = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+```
+The OS lazily pages weight data from disk into the page cache as your inference code touches it. Pages are shared with the file cache — no private copy exists unless pages get dirtied.
+
+**Explicit read/copy**
+```c
+void *weights = malloc(size);
+read(fd, weights, size);  // or fread / memcpy
+```
+You now

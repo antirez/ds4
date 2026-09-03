@@ -1,0 +1,9 @@
+# Checklist: Revisione Lifetime di Memoria in una PR
+
+## Ownership e Borrowing (Rust)
+- [ ] Nessun `unsafe` non giustificato o senza commento esplicativo
+- [ ] I borrow non violano le regole (un mutabile XOR più letture)
+- [ ] Uso di `Rc`/`Arc`/`RefCell` motivato (evitare reference counting superfluo)
+- [ ] Nessun `clone()` evitabile usato per "far passare" il borrow checker
+
+## Allocazione e Deallocazione

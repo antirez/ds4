@@ -1,0 +1,1 @@
+Per confrontare due quantizzazioni (ad esempio, due modelli LLM compressi con tecniche diverse, o due versioni di un algoritmo di compressione) **senza fidarsi di una singola metrica**, devi adottare un approccio **multidimensionale, statistico

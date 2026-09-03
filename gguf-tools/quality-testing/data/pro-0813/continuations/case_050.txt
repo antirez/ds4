@@ -1,0 +1,3 @@
+Ecco cinque misure iniziali per affrontare un decode lento a contesto lungo:
+
+1. **Ab

@@ -1,6 +1,8 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_ssd.h"
+#include "ds4_tp.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -25,8 +27,29 @@ static void usage(const char *prog) {
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
-            "[--ssd-streaming-preload-experts N]\n",
+            "[--ssd-streaming-preload-experts N] "
+            "[--dump-first-logits PATH] "
+            "[--max-cases N] "
+            "[--tensor-parallel --role coordinator --listen HOST PORT "
+            "[--transport auto|rdma|tcp]]\n",
             prog);
+}
+
+static ds4_tp *exit_tp;
+
+static void stop_tp_at_exit(void) {
+    if (!exit_tp) return;
+    ds4_tp_send_stop(exit_tp);
+    ds4_tp_free(exit_tp);
+    exit_tp = NULL;
+}
+
+static void close_engine(ds4_engine *engine) {
+    ds4_tp *tp = exit_tp;
+    if (tp) ds4_tp_send_stop(tp);
+    exit_tp = NULL;
+    ds4_engine_close(engine);
+    ds4_tp_free(tp);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -431,7 +454,8 @@ static bool local_logits(ds4_session *session, float *logits, int n_vocab,
     int best = -1;
     for (int i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (isfinite(v) && (best < 0 || v > max_logit)) {
+        if (!isfinite(v)) return false;
+        if (best < 0 || v > max_logit) {
             max_logit = v;
             best = i;
         }
@@ -439,12 +463,31 @@ static bool local_logits(ds4_session *session, float *logits, int n_vocab,
     if (best < 0) return false;
     double sum = 0.0;
     for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+        sum += exp((double)logits[i] - (double)max_logit);
     }
     *logsum = (double)max_logit + log(sum);
     *argmax = best;
     return true;
+}
+
+static bool dump_logits(const char *path, const char *case_id, int target,
+                        int greedy, const float *logits, int n_vocab) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    bool ok = fprintf(fp,
+                      "# ds4 first logits v1\n"
+                      "# case=%s target=%d greedy=%d vocab=%d\n"
+                      "token\tlogit\n",
+                      case_id, target, greedy, n_vocab) >= 0;
+    for (int i = 0; ok && i < n_vocab; i++) {
+        ok = fprintf(fp, "%d\t%a\n", i, (double)logits[i]) >= 0;
+    }
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) fprintf(stderr, "write %s failed\n", path);
+    return ok;
 }
 
 static double local_logprob(const float *logits, int n_vocab, int token, double logsum) {
@@ -530,9 +573,32 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_cache_experts = 0;
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
+    const char *first_logits_path = NULL;
+    int max_cases = 0;
+    ds4_dist_options dist = {0};
+    ds4_tp_options tp = {0};
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
+        char parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg, &i, argc, argv, &dist,
+                                   parse_err, sizeof(parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n", parse_err);
+            return 2;
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &tp,
+                                 parse_err, sizeof(parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n", parse_err);
+            return 2;
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "--quality")) {
             quality = true;
         } else if (!strcmp(arg, "--gpu-vram")) {
@@ -558,6 +624,10 @@ int main(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             ssd_streaming_preload_experts =
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dump-first-logits")) {
+            first_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--max-cases")) {
+            max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (arg[0] != '-' && !ctx_set) {
             ctx_size = parse_positive_int(arg, "ctx");
             ctx_set = true;
@@ -567,6 +637,16 @@ int main(int argc, char **argv) {
         }
     }
     if (ctx_size < 1024) ctx_size = 1024;
+
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&tp, &dist,
+                                          tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n", tp_err);
+        return 2;
+    }
+    if (tp.role == DS4_TP_WORKER || dist.role == DS4_DISTRIBUTED_WORKER) {
+        die("score_official: start workers with ./ds4");
+    }
 
     ds4_engine_options opt = {
         .model_path = model_path,
@@ -586,7 +666,19 @@ int main(int argc, char **argv) {
         .cuda_tensor_parallel = cuda_tensor_parallel,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
+        .distributed = dist,
+        .tp = tp,
     };
+    char dist_err[256] = {0};
+    if (ds4_dist_prepare_engine_options(&dist, &opt,
+                                        dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "score_official: %s\n", dist_err);
+        return 2;
+    }
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n", tp_err);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (gpu_vram_arg || gpu_devices_arg) {
@@ -614,6 +706,32 @@ int main(int argc, char **argv) {
             die("score_official: --cuda-tensor-parallel requires --gpu-vram or --gpu-devices");
         }
         if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
+    }
+
+    if (tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
+        if (!ds4_tp_create(&exit_tp, &tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, exit_tp,
+                                tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "score_official: %s\n", tp_err);
+            close_engine(engine);
+            return 1;
+        }
+        atexit(stop_tp_at_exit);
     }
 
     ds4_session *session = NULL;
@@ -655,6 +773,7 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), mf)) {
         strip_newline(line);
         if (!line[0] || line[0] == '#') continue;
+        if (max_cases != 0 && case_n >= max_cases) break;
 
         char *id = strtok(line, "\t");
         char *prompt_path = strtok(NULL, "\t");
@@ -706,7 +825,15 @@ int main(int argc, char **argv) {
             double logsum = 0.0;
             int greedy = -1;
             if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
-                fprintf(stderr, "%s logits failed at target token %d\n", id, i);
+                fprintf(stderr,
+                        "%s logits copy failed or returned a non-finite value "
+                        "at target token %d\n",
+                        id, i);
+                return 1;
+            }
+            if (first_logits_path && case_n == 0 && i == 0 &&
+                !dump_logits(first_logits_path, id, target.v[i], greedy,
+                             logits, n_vocab)) {
                 return 1;
             }
 
@@ -879,6 +1006,6 @@ int main(int argc, char **argv) {
     fclose(mf);
     free(logits);
     ds4_session_free(session);
-    ds4_engine_close(engine);
+    close_engine(engine);
     return 0;
 }

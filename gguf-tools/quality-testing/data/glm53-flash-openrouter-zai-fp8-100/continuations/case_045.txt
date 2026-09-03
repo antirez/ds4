@@ -1,0 +1,6 @@
+# One Large Metal Buffer vs. Multiple Overlapping Views
+
+In Metal, you can allocate one big `MTLBuffer` and create "views" into it using offsets (`newBufferWithOffset:length:` or passing an offset at bind time). While a single giant buffer seems simpler, it can actually hurt performance in several ways:
+
+## 1. Memory Page Granularity and Waste
+- `MTLBuffer` allocations are backed by page-granular memory (typically

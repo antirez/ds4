@@ -1,0 +1,4 @@
+Here is a brief, actionable plan for testing long-context prompt chunking. This plan focuses on **functional correctness** (does the model still get the right answer?) and **context integrity** (does the model lose critical information?).
+
+### Phase 1: Baseline & Data Preparation
+**Goal:** Establish a control

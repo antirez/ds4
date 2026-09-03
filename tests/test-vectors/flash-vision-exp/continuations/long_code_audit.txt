@@ -1,0 +1,1 @@
+The most important code quality issue is **the massive code duplication across 68 nearly identical functions, which should be refactored into a single parameterized function to

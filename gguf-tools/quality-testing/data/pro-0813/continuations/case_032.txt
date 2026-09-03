@@ -1,0 +1,1 @@
+La differenza principale tra **mutex** e **contatore atomico** riguarda il loro scopo e il

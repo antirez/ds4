@@ -81,6 +81,7 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    int imatrix_min_expert_samples;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -597,17 +598,15 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(session,
-                                                       token,
-                                                       max_tokens - generated,
-                                                       ds4_token_eos(engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = ds4_session_eval_speculative(
+                session, token, max_tokens - generated,
+                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1275,7 +1274,8 @@ static void print_repl_help(void) {
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
-    puts("  /read FILE     Read a prompt from FILE and run it.");
+    puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
+    puts("  /read FILE     Submit a text file, PNG, or JPEG.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1288,6 +1288,18 @@ static bool parse_power_percent(const char *arg, int *out) {
     return true;
 }
 
+static bool parse_steering_level(const char *arg, float *out) {
+    char *end = NULL;
+    errno = 0;
+    float v = strtof(arg, &end);
+    if (!arg[0] || *end != '\0' || errno == ERANGE || !isfinite(v) ||
+        v < -100.0f || v > 100.0f) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
 static void history_file_path(char *buf, size_t len) {
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
@@ -1297,10 +1309,34 @@ static void history_file_path(char *buf, size_t len) {
 typedef struct {
     ds4_session *session;
     ds4_tokens transcript;
+    ds4_vision_span *images;
+    size_t image_count;
+    size_t image_cap;
     int ctx_size;
     int think_prefix_pos;
     int think_prefix_tokens;
 } repl_chat;
+
+static void repl_chat_trim_images(repl_chat *chat, size_t count) {
+    while (chat->image_count > count) {
+        chat->image_count--;
+        ds4_vision_embedding_free(&chat->images[chat->image_count].embedding);
+    }
+}
+
+static ds4_vision_span *repl_chat_add_image(repl_chat *chat) {
+    if (chat->image_count == chat->image_cap) {
+        size_t cap = chat->image_cap ? chat->image_cap * 2u : 4u;
+        if (cap > SIZE_MAX / sizeof(chat->images[0])) return NULL;
+        void *next = realloc(chat->images, cap * sizeof(chat->images[0]));
+        if (!next) return NULL;
+        chat->images = next;
+        chat->image_cap = cap;
+    }
+    ds4_vision_span *span = &chat->images[chat->image_count++];
+    memset(span, 0, sizeof(*span));
+    return span;
+}
 
 static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
     if (!src || src->len <= 0) return;
@@ -1365,10 +1401,16 @@ static void repl_chat_apply_think_prefix(ds4_engine *engine,
                        (size_t)prefix.len * sizeof(prefix.v[0]));
     }
     if (!same) {
+        const int old_prefix_tokens = chat->think_prefix_tokens;
         tokens_remove(&chat->transcript, chat->think_prefix_pos,
                       chat->think_prefix_tokens);
         tokens_insert(&chat->transcript, chat->think_prefix_pos, &prefix);
         chat->think_prefix_tokens = prefix.len;
+        const int shift = prefix.len - old_prefix_tokens;
+        for (size_t i = 0; i < chat->image_count; i++) {
+            chat->images[i].token_start =
+                (uint32_t)((int64_t)chat->images[i].token_start + shift);
+        }
         if (chat->session) ds4_session_invalidate(chat->session);
     }
     ds4_tokens_free(&prefix);
@@ -1401,6 +1443,8 @@ static void repl_chat_free(repl_chat *chat) {
     if (!chat) return;
     ds4_session_free(chat->session);
     ds4_tokens_free(&chat->transcript);
+    repl_chat_trim_images(chat, 0);
+    free(chat->images);
     memset(chat, 0, sizeof(*chat));
 }
 
@@ -1419,7 +1463,9 @@ static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
  * and assistant markers, then ds4_session_sync() decides whether this is a KV
  * continuation.  If prompt processing fails, the transcript rolls back before
  * returning to the prompt. */
-static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
+static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
+                         const char *user_text,
+                         ds4_vision_embedding *image) {
     if (!chat->session) {
         fprintf(stderr, "ds4: no active interactive KV cache\n");
         return 1;
@@ -1429,7 +1475,28 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                            chat->ctx_size);
     repl_chat_apply_think_prefix(engine, chat, think_mode);
     const int rollback_len = chat->transcript.len;
-    ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
+    const size_t rollback_images = chat->image_count;
+    if (image) {
+        ds4_tokens_push(&chat->transcript, ds4_token_user(engine));
+        ds4_vision_span *span = repl_chat_add_image(chat);
+        char image_error[160] = {0};
+        if (!span || !ds4_prompt_append_vision(engine, &chat->transcript,
+                                               span, image,
+                                               image_error,
+                                               sizeof(image_error))) {
+            repl_chat_trim_images(chat, rollback_images);
+            chat->transcript.len = rollback_len;
+            fprintf(stderr, "ds4: failed to add image: %s\n",
+                    image_error[0] ? image_error : "out of memory");
+            return 1;
+        }
+        if (user_text && user_text[0]) {
+            ds4_tokenize_text(engine, "\n", &chat->transcript);
+            ds4_tokenize_text(engine, user_text, &chat->transcript);
+        }
+    } else {
+        ds4_chat_append_message(engine, &chat->transcript, "user", user_text);
+    }
     ds4_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
 
     const int old_pos = ds4_session_pos(chat->session);
@@ -1449,12 +1516,18 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err));
+    int sync_rc = ds4_session_sync_multimodal(chat->session,
+                                              &chat->transcript,
+                                              chat->images,
+                                              chat->image_count,
+                                              err,
+                                              sizeof(err));
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
         ds4_session_set_progress(chat->session, NULL, NULL);
         ds4_session_set_display_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
+        repl_chat_trim_images(chat, rollback_images);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
         return 1;
     }
@@ -1505,17 +1578,15 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(chat->session,
-                                                       token,
-                                                       max_tokens - generated,
-                                                       ds4_token_eos(engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = ds4_session_eval_speculative(
+                chat->session, token, max_tokens - generated,
+                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                err, sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1565,6 +1636,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     const bool interrupted = cli_interrupt_requested();
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
+        repl_chat_trim_images(chat, rollback_images);
         ds4_session_invalidate(chat->session);
     } else if (repl_chat_assistant_turn_uses_eos(engine)) {
         ds4_tokens_push(&chat->transcript, ds4_token_eos(engine));
@@ -1579,6 +1651,16 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
+}
+
+static bool cli_file_has_image_magic(const char *path) {
+    unsigned char magic[8] = {0};
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    size_t n = fread(magic, 1, sizeof(magic), fp);
+    fclose(fp);
+    return (n >= 8 && !memcmp(magic, "\x89PNG\r\n\x1a\n", 8)) ||
+           (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8);
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
@@ -1652,6 +1734,22 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     printf("Power: %d%%.\n", power);
                 }
             }
+        } else if (!strncmp(cmd, "/steer", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            char *arg = trim_inplace(cmd + 6);
+            if (!arg[0]) {
+                printf("Steering FFN: %g.\n",
+                       (double)ds4_session_directional_steering_ffn(chat.session));
+            } else {
+                float scale = 0.0f;
+                if (!parse_steering_level(arg, &scale)) {
+                    fprintf(stderr, "ds4: /steer must be between -100 and 100\n");
+                } else if (ds4_session_set_directional_steering_ffn(
+                                   chat.session, scale) == 0) {
+                    cfg->engine.directional_steering_ffn = scale;
+                    printf("Steering FFN: %g.\n", (double)scale);
+                }
+            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -1679,10 +1777,24 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             char *path = trim_inplace(cmd + 5);
             if (!path[0]) {
                 fprintf(stderr, "ds4: /read needs a file path\n");
+            } else if (cli_file_has_image_magic(path)) {
+                char image_error[256] = {0};
+                ds4_vision_embedding image = {0};
+                if (!ds4_engine_vision_encode_file(engine, path, &image,
+                                                   image_error,
+                                                   sizeof(image_error))) {
+                    fprintf(stderr, "ds4: /read image failed: %s\n", image_error);
+                } else {
+                    fprintf(stderr,
+                            "ds4: image %ux%u, %u image tokens\n",
+                            image.width, image.height, image.token_count);
+                    rc = run_chat_turn(engine, cfg, &chat, "", &image);
+                    ds4_vision_embedding_free(&image);
+                }
             } else {
                 char *prompt = read_prompt_file(path, false);
                 if (prompt) {
-                    rc = run_chat_turn(engine, cfg, &chat, prompt);
+                    rc = run_chat_turn(engine, cfg, &chat, prompt, NULL);
                     free(prompt);
                 }
             }
@@ -1690,7 +1802,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             fprintf(stderr, "ds4: unknown command: %s\n", cmd);
             fprintf(stderr, "ds4: type /help for commands\n");
         } else {
-            rc = run_chat_turn(engine, cfg, &chat, cmd);
+            rc = run_chat_turn(engine, cfg, &chat, cmd, NULL);
         }
         linenoiseFree(line);
     }
@@ -1837,15 +1949,17 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
+            c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
-        } else if (!strcmp(arg, "--glm-mtp")) {
-            c.engine.glm_mtp = true;
-        } else if (!strcmp(arg, "--glm-mtp-timing")) {
+        } else if (!strcmp(arg, "--mtp-timing")) {
             c.engine.glm_mtp = true;
             c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
@@ -1858,6 +1972,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--mtp-exact-sampling")) {
+            c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -1973,6 +2089,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-min-expert-samples")) {
+            c.gen.imatrix_min_expert_samples =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -2032,6 +2151,10 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
         exit(2);
     }
+    if (c.gen.imatrix_min_expert_samples < 0) {
+        fprintf(stderr, "ds4: --imatrix-min-expert-samples must not be negative\n");
+        exit(2);
+    }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
@@ -2063,9 +2186,18 @@ int main(int argc, char **argv) {
             free(cfg.prompt_owned);
             return 2;
         }
-        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
+        int rc;
+        if (cfg.gen.raw_prompt || is_rendered_chat_prompt(cfg.gen.prompt)) {
+            rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);
+        } else {
+            rc = ds4_dump_chat_tokenization(cfg.engine.model_path,
+                                            cfg.gen.system,
+                                            cfg.gen.prompt,
+                                            cli_effective_think_mode(&cfg.gen),
+                                            stdout);
+        }
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
@@ -2140,7 +2272,8 @@ int main(int argc, char **argv) {
         ds4_engine_tp_gate_schedule(engine,
                                     &tp_id.gate_slot_start,
                                     &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token);
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
         if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id, tp_err, sizeof(tp_err)) ||
             !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
             fprintf(stderr, "ds4: %s\n", tp_err);
@@ -2188,7 +2321,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_output_path,
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
-                                        cfg.gen.imatrix_max_tokens);
+                                        cfg.gen.imatrix_max_tokens,
+                                        cfg.gen.imatrix_min_expert_samples);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

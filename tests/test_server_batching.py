@@ -128,6 +128,36 @@ def post_chat(url, payload, timeout, start_event):
     return result
 
 
+def cancel_stream(url, payload, timeout, start_event):
+    """Close a streaming response after the first generated text fragment."""
+    start_event.wait()
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        while True:
+            line = response.readline()
+            if not line:
+                raise RuntimeError("stream ended before cancellation point")
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == b"[DONE]":
+                continue
+            event = json.loads(data)
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            if delta.get("content") or delta.get("reasoning_content"):
+                return time.monotonic() - started
+
+
 def comparable(result):
     return (
         result["content"],
@@ -157,11 +187,43 @@ def main():
         "--case", choices=[case[0] for case in CASES],
         help="repeat one case shape instead of cycling through mixed lengths",
     )
+    parser.add_argument(
+        "--cancel-first", type=int, default=0,
+        help="abort this many concurrent streams before running the pair oracle",
+    )
     args = parser.parse_args()
     if args.pairs <= 0:
         parser.error("--pairs must be positive")
+    if args.cancel_first < 0:
+        parser.error("--cancel-first must not be negative")
+    if args.max_tokens is not None and args.max_tokens < 0:
+        parser.error("--max-tokens must be non-negative")
 
     nonce = args.nonce or "cold-%d" % time.time_ns()
+    cancelled = []
+    if args.cancel_first:
+        cancel_start = threading.Event()
+        cancel_payloads = []
+        for i in range(args.cancel_first):
+            _, _, payload = make_payload(
+                CASES[3], i, nonce + "-cancel", True
+            )
+            payload["max_tokens"] = max(args.max_tokens or 0, 128)
+            cancel_payloads.append(payload)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.cancel_first
+        ) as executor:
+            futures = [
+                executor.submit(
+                    cancel_stream, args.url, payload, args.timeout, cancel_start
+                )
+                for payload in cancel_payloads
+            ]
+            cancel_start.set()
+            cancelled = [future.result() for future in futures]
+        # Give the server time to observe closed sockets and recycle every slot.
+        time.sleep(0.5)
+
     requests = []
     metadata = []
     for i in range(args.pairs):
@@ -173,8 +235,6 @@ def main():
             case, case_number, nonce, args.stream
         )
         if args.max_tokens is not None:
-            if args.max_tokens < 0:
-                parser.error("--max-tokens must be non-negative")
             payload["max_tokens"] = args.max_tokens
         for copy in range(2):
             requests.append(payload)
@@ -243,6 +303,10 @@ def main():
         "completion_tokens": sum(known_tokens) if known_tokens else None,
         "completion_tokens_per_second": (
             round(sum(known_tokens) / wall, 2) if known_tokens else None
+        ),
+        "cancelled_streams": len(cancelled),
+        "cancel_latency_max_seconds": (
+            round(max(cancelled), 3) if cancelled else None
         ),
         "nonce": nonce,
     }

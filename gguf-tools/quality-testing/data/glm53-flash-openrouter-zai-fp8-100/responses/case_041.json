@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762208-yV6qsUGgbEwze81FHBUI",
+  "object": "chat.completion",
+  "created": 1787762208,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Why Small Logit Differences Can Change Greedy Continuations\n\n## The Core Mechanism: Argmax Is a Discrete Operation\n\nGreedy decoding takes `argmax` over logits at each step. Argmax is **not continuous** — it only cares about *which* logit is largest, not by how much. So:\n\n- If logits are `[5.2, 5.1, ...]`, the top token wins by 0.1\n- If a tiny perturbation makes them `[5.15, 5.16, ...]`, the argmax flips entirely\n\nThe output token changes completely",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 128,
+    "total_tokens": 151,
+    "cost": 3.3725e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.3725e-05,
+      "upstream_inference_prompt_cost": 1.725e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

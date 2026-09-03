@@ -12,6 +12,16 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
 int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
 
+extern "C" int ds4_gpu_matmul_q4_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows);
+
 static int rocm_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;
 }
@@ -293,6 +303,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim, x,
                                          n_tok);
+    }
+    if (weight_type == 12u) {
+        return ds4_gpu_matmul_q4_K_tensor(out, model_map, model_size,
+                                          weight_offset, in_dim, out_dim, x,
+                                          n_tok);
     }
     return 0;
 }

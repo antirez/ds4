@@ -1,0 +1,11 @@
+# Inserimento in un B-tree
+
+## Proprietà di base
+
+Un B-tree di ordine minimo *t* ha queste proprietà:
+- Ogni nodo ha al massimo **2t − 1** chiavi
+- Ogni nodo (tranne la radice) ha almeno **t − 1** chiavi
+- La radice ha almeno 1 chiave (se l'albero non è vuoto)
+- Le chiavi in ogni nodo sono ordinate; i figli separano gli intervalli delle chiavi
+- Tutte le foglie sono allo **stesso livello**
+

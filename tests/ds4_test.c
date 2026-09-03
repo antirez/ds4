@@ -10,6 +10,8 @@ bool ds4_test_dspark_cache_window_crop(void);
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
 
+static char *test_read_file(const char *path);
+
 static const char *test_model_path(void) {
     const char *model_path = getenv("DS4_TEST_MODEL");
     return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
@@ -116,6 +118,7 @@ static ds4_engine *test_open_engine(bool quality) {
             test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
+        .glm_mtp = test_env_bool("DS4_TEST_GLM_MTP"),
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;
@@ -140,6 +143,182 @@ static void test_close_engine(bool quality) {
     ds4_engine **slot = quality ? &test_engine_quality : &test_engine_fast;
     ds4_engine_close(*slot);
     *slot = NULL;
+}
+
+static void test_session_snapshot_roundtrip(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    ds4_session *reference = NULL;
+    ds4_session *restored = NULL;
+    ds4_session_snapshot snapshot = {0};
+    ds4_tokens prompt = {0};
+    char err[192] = {0};
+    ds4_token_score before[8];
+    ds4_token_score reference_after[8];
+    ds4_token_score restored_before[8];
+    ds4_token_score restored_after[8];
+    enum { GLM_MTP_SNAPSHOT_CYCLES = 16 };
+    int reference_accepted[GLM_MTP_SNAPSHOT_CYCLES * 2] = {0};
+    int reference_counts[GLM_MTP_SNAPSHOT_CYCLES] = {0};
+    int reference_total = 0;
+    const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
+#ifdef DS4_ROCM_BUILD
+    const float continued_logit_tolerance =
+        ds4_engine_is_glm53(engine) ? 1e-5f : 1e-6f;
+#else
+    const float continued_logit_tolerance = 1e-6f;
+#endif
+
+    uint32_t ctx = test_env_u32("DS4_TEST_SNAPSHOT_CTX");
+    if (ctx == 0) ctx = 1024;
+    const char *prompt_path = getenv("DS4_TEST_SNAPSHOT_PROMPT");
+    char *prompt_text = prompt_path && prompt_path[0] ?
+        test_read_file(prompt_path) : NULL;
+    if (prompt_path && prompt_path[0]) {
+        TEST_ASSERT(prompt_text != NULL);
+        if (!prompt_text) goto cleanup;
+    }
+
+    TEST_ASSERT(ds4_session_create(&reference, engine, ctx) == 0);
+    if (!reference) goto cleanup;
+
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user",
+                            prompt_text ? prompt_text :
+                            "Give one concise reason to test session restore.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+    TEST_ASSERT(ds4_session_sync(reference, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(reference, before, 8) == 8);
+    TEST_ASSERT(ds4_session_save_snapshot(reference, &snapshot,
+                                          err, sizeof(err)) == 0);
+    TEST_ASSERT(snapshot.ptr != NULL && snapshot.len > 0);
+    if (!snapshot.ptr || snapshot.len == 0) goto cleanup;
+
+    if (test_glm_mtp) {
+        for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
+            const int first = ds4_session_argmax(reference);
+            const int n = ds4_session_eval_speculative_argmax(
+                    reference, first, 2, -1,
+                    reference_accepted + reference_total, 2,
+                    err, sizeof(err));
+            TEST_ASSERT(n > 0 && n <= 2);
+            if (n <= 0 || n > 2) goto cleanup;
+            reference_counts[cycle] = n;
+            reference_total += n;
+        }
+    } else {
+        TEST_ASSERT(ds4_session_eval(reference, before[0].id,
+                                     err, sizeof(err)) == 0);
+    }
+    TEST_ASSERT(ds4_session_top_logprobs(reference, reference_after, 8) == 8);
+    ds4_session_free(reference);
+    reference = NULL;
+
+    TEST_ASSERT(ds4_session_create(&restored, engine, ctx) == 0);
+    if (!restored) goto cleanup;
+    TEST_ASSERT(ds4_session_load_snapshot(restored, &snapshot,
+                                          err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(restored, restored_before, 8) == 8);
+    for (int i = 0; i < 8; i++) {
+        if (restored_before[i].id != before[i].id ||
+            fabsf(restored_before[i].logit - before[i].logit) > 1e-6f) {
+            fprintf(stderr,
+                    "ds4-test: snapshot before[%d] reference=(%d,%.9g) "
+                    "restored=(%d,%.9g) delta=%.9g\n",
+                    i, before[i].id, before[i].logit,
+                    restored_before[i].id, restored_before[i].logit,
+                    restored_before[i].logit - before[i].logit);
+        }
+        TEST_ASSERT(restored_before[i].id == before[i].id);
+        TEST_ASSERT(fabsf(restored_before[i].logit - before[i].logit) <= 1e-6f);
+    }
+
+    if (test_glm_mtp) {
+        int restored_total = 0;
+        int single_cycles = 0;
+        int double_cycles = 0;
+        for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
+            int restored_accepted[2] = {0};
+            const int first = ds4_session_argmax(restored);
+            TEST_ASSERT(first == reference_accepted[restored_total]);
+            const int n = ds4_session_eval_speculative_argmax(
+                    restored, first, 2, -1,
+                    restored_accepted, 2, err, sizeof(err));
+            TEST_ASSERT(n == reference_counts[cycle]);
+            if (n != reference_counts[cycle]) goto cleanup;
+            for (int i = 0; i < n; i++) {
+                TEST_ASSERT(restored_accepted[i] ==
+                            reference_accepted[restored_total + i]);
+            }
+            restored_total += n;
+            single_cycles += n == 1;
+            double_cycles += n == 2;
+        }
+        TEST_ASSERT(restored_total == reference_total);
+        fprintf(stderr,
+                "ds4-test: GLM MTP snapshot cycles=%d single=%d double=%d tokens=%d\n",
+                GLM_MTP_SNAPSHOT_CYCLES,
+                single_cycles,
+                double_cycles,
+                restored_total);
+    } else {
+        TEST_ASSERT(ds4_session_eval(restored, before[0].id,
+                                     err, sizeof(err)) == 0);
+    }
+    TEST_ASSERT(ds4_session_top_logprobs(restored, restored_after, 8) == 8);
+    for (int i = 0; i < 8; i++) {
+        if (restored_after[i].id != reference_after[i].id ||
+            fabsf(restored_after[i].logit - reference_after[i].logit) >
+                continued_logit_tolerance) {
+            fprintf(stderr,
+                    "ds4-test: snapshot after[%d] reference=(%d,%.9g) "
+                    "restored=(%d,%.9g) delta=%.9g\n",
+                    i, reference_after[i].id, reference_after[i].logit,
+                    restored_after[i].id, restored_after[i].logit,
+                    restored_after[i].logit - reference_after[i].logit);
+        }
+        TEST_ASSERT(restored_after[i].id == reference_after[i].id);
+        TEST_ASSERT(fabsf(restored_after[i].logit -
+                          reference_after[i].logit) <=
+                    continued_logit_tolerance);
+    }
+    if (test_glm_mtp) {
+        TEST_ASSERT(ds4_session_sync(restored, &prompt,
+                                     err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_top_logprobs(restored,
+                                             restored_before, 8) == 8);
+        for (int i = 0; i < 8; i++) {
+            TEST_ASSERT(restored_before[i].id == before[i].id);
+            TEST_ASSERT(fabsf(restored_before[i].logit - before[i].logit) <=
+                        1e-6f);
+        }
+        int reuse_single = 0;
+        int reuse_double = 0;
+        for (int cycle = 0; cycle < 4; cycle++) {
+            int cycle_accepted[2] = {0};
+            const int first = ds4_session_argmax(restored);
+            const int n = ds4_session_eval_speculative_argmax(
+                    restored, first, 2, -1,
+                    cycle_accepted, 2, err, sizeof(err));
+            TEST_ASSERT(n > 0 && n <= 2);
+            if (n <= 0 || n > 2) goto cleanup;
+            reuse_single += n == 1;
+            reuse_double += n == 2;
+        }
+        fprintf(stderr,
+                "ds4-test: GLM MTP context reuse single=%d double=%d\n",
+                reuse_single,
+                reuse_double);
+    }
+
+cleanup:
+    free(prompt_text);
+    ds4_tokens_free(&prompt);
+    ds4_session_snapshot_free(&snapshot);
+    ds4_session_free(restored);
+    ds4_session_free(reference);
 }
 
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
@@ -4611,6 +4790,201 @@ static void test_metal_short_prefill_ratio4(void) {
     }
 }
 
+typedef struct {
+    int expected_start;
+    int expected_total;
+    int last_current;
+    int chunk_events;
+    int display_events;
+    int intermediate_events;
+    bool invalid;
+} test_continued_prefill_progress;
+
+static void test_continued_prefill_progress_cb(
+        void       *ud,
+        const char *event,
+        int         current,
+        int         total) {
+    test_continued_prefill_progress *p = ud;
+    const bool chunk = !strcmp(event, "prefill_chunk");
+    const bool display = !strcmp(event, "prefill_display");
+    if (!chunk && !display) return;
+
+    if (total != p->expected_total || current < p->expected_start ||
+        current > total || current < p->last_current) {
+        p->invalid = true;
+    }
+    if (current > p->expected_start && current < total) {
+        p->intermediate_events++;
+    }
+    if (current > p->last_current) p->last_current = current;
+    if (chunk) p->chunk_events++;
+    if (display) p->display_events++;
+}
+
+static double test_monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static bool test_sync_continued_prefill_stage(
+        ds4_session *session,
+        ds4_tokens  *prompt,
+        int          previous_len,
+        int          next_len,
+        double      *elapsed_out) {
+    test_continued_prefill_progress progress = {
+        .expected_start = previous_len,
+        .expected_total = next_len,
+        .last_current = previous_len,
+    };
+    char err[160] = {0};
+    prompt->len = next_len;
+    ds4_session_set_progress(session, test_continued_prefill_progress_cb,
+                             &progress);
+    ds4_session_set_display_progress(session,
+                                     test_continued_prefill_progress_cb,
+                                     &progress);
+    const double started = test_monotonic_seconds();
+    const int rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    const double elapsed = test_monotonic_seconds() - started;
+    ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
+    if (elapsed_out) *elapsed_out = elapsed;
+
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4-test: continued prefill %d -> %d failed: %s\n",
+                previous_len, next_len, err);
+    }
+    const int added = next_len - previous_len;
+    fprintf(stderr,
+            "ds4-test: continued prefill +%d: %.2f ms, %.1f t/s, "
+            "chunk=%d display=%d intermediate=%d\n",
+            added, elapsed * 1000.0,
+            elapsed > 0.0 ? (double)added / elapsed : 0.0,
+            progress.chunk_events, progress.display_events,
+            progress.intermediate_events);
+
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(!progress.invalid);
+    TEST_ASSERT(progress.chunk_events > 0);
+    TEST_ASSERT(progress.last_current == next_len);
+    if (added > 1 &&
+        (added >= 32 ||
+         !test_env_bool("DS4_TEST_CONTINUED_PREFILL_ALLOW_COARSE"))) {
+        TEST_ASSERT(progress.intermediate_events > 0);
+    }
+    if (added >= 32) TEST_ASSERT(progress.display_events > 0);
+    return rc == 0 && !progress.invalid;
+}
+
+static bool test_top_tokens_overlap(
+        const ds4_token_score *a,
+        const ds4_token_score *b,
+        int                    count) {
+    bool a0_in_b = false;
+    bool b0_in_a = false;
+    for (int i = 0; i < count; i++) {
+        if (a[0].id == b[i].id) a0_in_b = true;
+        if (b[0].id == a[i].id) b0_in_a = true;
+    }
+    return a0_in_b && b0_in_a;
+}
+
+static void test_glm53_continued_prefill(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine)) {
+        fprintf(stderr,
+                "ds4-test: glm53-continued-prefill skipped (GLM 5.3 model required)\n");
+        return;
+    }
+
+    const int base_len = 64;
+    uint32_t large_add = test_env_u32("DS4_TEST_CONTINUED_PREFILL_TOKENS");
+    if (large_add == 0) large_add = 256;
+    uint32_t large_steps = test_env_u32("DS4_TEST_CONTINUED_PREFILL_STEPS");
+    if (large_steps == 0) large_steps = 1;
+    const uint64_t final_len64 = (uint64_t)base_len + 4u +
+                                 (uint64_t)large_add * large_steps;
+    TEST_ASSERT(final_len64 < INT_MAX - 128);
+    if (final_len64 >= INT_MAX - 128) return;
+    const int final_len = (int)final_len64;
+    int ctx_size = final_len + 128;
+    if (ctx_size < 4096) ctx_size = 4096;
+
+    ds4_tokens pattern = {0};
+    ds4_tokens prompt = {0};
+    ds4_session *resumed = NULL;
+    ds4_session *cold = NULL;
+    ds4_token_score resumed_top[8] = {0};
+    ds4_token_score cold_top[8] = {0};
+    char err[160] = {0};
+    ds4_tokenize_text(engine,
+                      " continued prefill checks latency throughput and progress",
+                      &pattern);
+    TEST_ASSERT(pattern.len > 0);
+    if (pattern.len == 0) goto cleanup;
+    ds4_chat_begin(engine, &prompt);
+    while (prompt.len < final_len) {
+        ds4_tokens_push(&prompt, pattern.v[prompt.len % pattern.len]);
+    }
+
+    TEST_ASSERT(ds4_session_create(&resumed, engine, ctx_size) == 0);
+    if (!resumed) goto cleanup;
+
+    prompt.len = base_len;
+    TEST_ASSERT(ds4_session_sync(resumed, &prompt, err, sizeof(err)) == 0);
+    if (!test_sync_continued_prefill_stage(resumed, &prompt,
+                                           base_len, base_len + 1, NULL)) {
+        goto cleanup;
+    }
+    if (!test_sync_continued_prefill_stage(resumed, &prompt,
+                                           base_len + 1, base_len + 4, NULL)) {
+        goto cleanup;
+    }
+    int previous_len = base_len + 4;
+    for (uint32_t step = 0; step < large_steps; step++) {
+        const int next_len = previous_len + (int)large_add;
+        if (!test_sync_continued_prefill_stage(resumed, &prompt,
+                                               previous_len, next_len, NULL)) {
+            goto cleanup;
+        }
+        previous_len = next_len;
+    }
+    TEST_ASSERT(ds4_session_top_logprobs(resumed, resumed_top, 8) == 8);
+    ds4_session_free(resumed);
+    resumed = NULL;
+
+    TEST_ASSERT(ds4_session_create(&cold, engine, ctx_size) == 0);
+    if (!cold) goto cleanup;
+    prompt.len = final_len;
+    TEST_ASSERT(ds4_session_sync(cold, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_top_logprobs(cold, cold_top, 8) == 8);
+    int same_rank = 0;
+    float max_same_rank_delta = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        if (resumed_top[i].id != cold_top[i].id) continue;
+        same_rank++;
+        const float delta = fabsf(resumed_top[i].logit - cold_top[i].logit);
+        if (delta > max_same_rank_delta) max_same_rank_delta = delta;
+    }
+    fprintf(stderr,
+            "ds4-test: continued/cold final top token %d/%d, "
+            "same-rank top8=%d, max same-rank logit delta=%.6g\n",
+            resumed_top[0].id, cold_top[0].id,
+            same_rank, max_same_rank_delta);
+    TEST_ASSERT(resumed_top[0].id == cold_top[0].id);
+    TEST_ASSERT(test_top_tokens_overlap(resumed_top, cold_top, 8));
+
+cleanup:
+    ds4_session_free(cold);
+    ds4_session_free(resumed);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&pattern);
+}
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -6421,6 +6795,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
+    {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},
@@ -6428,6 +6803,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+    {"--glm53-continued-prefill", "glm53-continued-prefill", "GLM 5.3 resumed prefill latency, throughput, progress, and cold-path agreement", test_glm53_continued_prefill},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
@@ -6461,12 +6837,18 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
     puts("  DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL=1  Force canonical streamed cold prefill.");
+    puts("  DS4_TEST_SNAPSHOT_PROMPT=FILE  Prompt for the session snapshot round trip.");
+    puts("  DS4_TEST_SNAPSHOT_CTX=N        Context for the session snapshot round trip.");
+    puts("  DS4_TEST_GLM_MTP=1             Include embedded GLM MTP in snapshot verification.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
+    puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
+    puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");
+    puts("  DS4_TEST_CONTINUED_PREFILL_ALLOW_COARSE=1  Permit coarse short-suffix progress for baseline timing.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {

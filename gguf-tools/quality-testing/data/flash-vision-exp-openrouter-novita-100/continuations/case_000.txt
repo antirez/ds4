@@ -1,0 +1,3 @@
+To understand B-tree insertion, it helps to first recall the core rule: **A B-tree node can hold at most `m-1` keys and at most `m` children** (where `m` is the order of the tree). 
+
+Insertion always starts at the **leaf level**. The algorithm is

@@ -1,0 +1,12 @@
+Here are a few ways to complete this comment, depending on what the lock protects:
+
+**Most common/general:**
+```c
+/* This lock protects shared data structures */
+```
+
+**More specific examples:**
+```c
+/* This lock protects the linked list */
+/* This lock protects the cache */
+/* This lock protects

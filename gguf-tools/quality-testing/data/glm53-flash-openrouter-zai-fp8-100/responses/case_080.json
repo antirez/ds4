@@ -1,0 +1,54 @@
+{
+  "id": "gen-1787762350-Fva9WELqOB2Fule9hmnt",
+  "object": "chat.completion",
+  "created": 1787762350,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "A good benchmark should measure **what it claims to measure — reliably, fairly, and in a way that reflects meaningful performance rather than artifacts of the test itself.**\n\nDepending on context, this can be unpacked as:\n\n- **Validity** — it captures the actual skill, quality, or capability of interest (not just a proxy that's easy to test)\n- **Reliability** — repeated measurements produce consistent results\n- **Discriminative power** — it distinguishes meaningfully between different levels of performance\n- **Fairness** — it doesn't systematically favor certain groups or approaches for irrelevant reasons\n- **",
+        "refusal": null,
+        "reasoning": "Simple question.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "Simple question.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 21,
+    "completion_tokens": 128,
+    "total_tokens": 149,
+    "cost": 3.3575e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.3575e-05,
+      "upstream_inference_prompt_cost": 1.575e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 3,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

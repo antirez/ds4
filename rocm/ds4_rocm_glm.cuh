@@ -173,6 +173,786 @@ static int glm_rocm_check_pos_span(
     return glm_rocm_check_token_span(pos0, n_tokens, &end) && end <= cache_cap;
 }
 
+static int glm53_rocm_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || (a != 0u && b > UINT64_MAX / a)) return 0;
+    *out = a * b;
+    return 1;
+}
+
+static int glm53_rocm_tensor_has(
+        const ds4_gpu_tensor *tensor,
+        uint64_t elements,
+        uint64_t elem_size) {
+    return tensor && tensor->ptr &&
+        (elements == 0u || elem_size <= UINT64_MAX / elements) &&
+        tensor->bytes >= elements * elem_size;
+}
+
+static const float *glm53_rocm_weight_f32(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t elements,
+        const char *label) {
+    uint64_t bytes = 0;
+    if (!model_map ||
+        !glm53_rocm_mul_u64(elements, sizeof(float), &bytes) ||
+        offset > model_size || bytes > model_size - offset) {
+        fprintf(stderr, "ds4: GLM-5.3 %s range is outside the mapped model\n",
+                label ? label : "weight");
+        return NULL;
+    }
+    return (const float *)cuda_model_range_ptr(
+        model_map, offset, bytes, label);
+}
+
+__global__ static void glm53_rocm_embedding_bf16_kernel(
+        float *out,
+        const uint16_t *weights,
+        const int32_t *tokens,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        uint32_t n_vocab) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (i >= n) return;
+    const uint32_t token_row = (uint32_t)(i / n_embd);
+    const uint32_t col = (uint32_t)(i - (uint64_t)token_row * n_embd);
+    const int32_t token = tokens[token_row];
+    if (token < 0 || (uint32_t)token >= n_vocab) {
+        out[i] = 0.0f;
+        return;
+    }
+    const uint16_t bits = weights[(uint64_t)(uint32_t)token * n_embd + col];
+    out[i] = __uint_as_float((uint32_t)bits << 16);
+}
+
+__global__ static void glm53_rocm_f32_to_bf16_kernel(
+        hip_bfloat16 *out,
+        const float *x,
+        uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = hip_bfloat16(x[i]);
+}
+
+__global__ static void glm53_rocm_matvec_bf16_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    const uint32_t row = blockIdx.y;
+    float sum = 0.0f;
+    if (col < out_dim) {
+        const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+        const float *xrow = x + (uint64_t)row * in_dim;
+        for (uint32_t i = lane; i < in_dim; i += 32u) {
+            const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+            sum = fmaf(w, xrow[i], sum);
+        }
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0u && col < out_dim) {
+        out[(uint64_t)row * out_dim + col] = sum;
+    }
+}
+
+__global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t col = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim) return;
+    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+    const float *xrow = x + (uint64_t)row * in_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+        sum = fmaf(w, xrow[i], sum);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        out[(uint64_t)row * out_dim + col] = partial[0];
+    }
+}
+
+extern "C" int ds4_gpu_glm53_embedding_bf16(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *token_ids,
+        uint32_t              n_tokens,
+        uint32_t              n_embd,
+        uint32_t              n_vocab) {
+    if (!out || !token_ids || !model_map || n_tokens == 0u ||
+        n_embd == 0u || n_vocab == 0u ||
+        weight_offset > model_size) {
+        return 0;
+    }
+    uint64_t weight_elements = 0, weight_bytes = 0;
+    uint64_t output_elements = 0, output_bytes = 0, token_bytes = 0;
+    if (!glm53_rocm_mul_u64(n_vocab, n_embd, &weight_elements) ||
+        !glm53_rocm_mul_u64(weight_elements, sizeof(uint16_t), &weight_bytes) ||
+        !glm53_rocm_mul_u64(n_tokens, n_embd, &output_elements) ||
+        !glm53_rocm_mul_u64(output_elements, sizeof(float), &output_bytes) ||
+        !glm53_rocm_mul_u64(n_tokens, sizeof(int32_t), &token_bytes)) {
+        return 0;
+    }
+    if (weight_bytes > model_size - weight_offset ||
+        token_ids->bytes < token_bytes || out->bytes < output_bytes) {
+        return 0;
+    }
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes,
+        "GLM-5.3 BF16 embedding");
+    if (!weights) return 0;
+    glm53_rocm_embedding_bf16_kernel<<<
+        (unsigned)((output_elements + 255u) / 256u), 256u>>>(
+            (float *)out->ptr, (const uint16_t *)weights,
+            (const int32_t *)token_ids->ptr, n_tokens, n_embd, n_vocab);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 BF16 embedding launch");
+}
+
+extern "C" int ds4_gpu_glm53_matmul_bf16(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || !g_cublas_ready || in_dim == 0u ||
+        out_dim == 0u || n_rows == 0u ||
+        weight_offset > model_size) {
+        return 0;
+    }
+    uint64_t weight_elements = 0, weight_bytes = 0;
+    uint64_t input_elements = 0, input_bytes = 0;
+    uint64_t output_elements = 0, output_bytes = 0;
+    if (!glm53_rocm_mul_u64(out_dim, in_dim, &weight_elements) ||
+        !glm53_rocm_mul_u64(weight_elements, sizeof(uint16_t), &weight_bytes) ||
+        !glm53_rocm_mul_u64(n_rows, in_dim, &input_elements) ||
+        !glm53_rocm_mul_u64(input_elements, sizeof(float), &input_bytes) ||
+        !glm53_rocm_mul_u64(n_rows, out_dim, &output_elements) ||
+        !glm53_rocm_mul_u64(output_elements, sizeof(float), &output_bytes)) {
+        return 0;
+    }
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < input_bytes || out->bytes < output_bytes) {
+        return 0;
+    }
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes,
+        "GLM-5.3 BF16 matrix");
+    if (!weights) return 0;
+    if (n_rows <= 8u) {
+        if (out_dim <= 128u && in_dim >= 4096u &&
+            getenv("DS4_ROCM_GLM_DISABLE_BF16_ROW_MATVEC") == NULL) {
+            const dim3 row_grid(out_dim, n_rows, 1u);
+            glm53_rocm_matvec_bf16_row_f32_kernel<<<row_grid, 256u>>>(
+                (float *)out->ptr, (const uint16_t *)weights,
+                (const float *)x->ptr, in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "GLM-5.3 BF16/F32 row matvec launch");
+        }
+        const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
+        glm53_rocm_matvec_bf16_f32_kernel<<<grid, 256u>>>(
+            (float *)out->ptr, (const uint16_t *)weights,
+            (const float *)x->ptr, in_dim, out_dim);
+        return cuda_ok(cudaGetLastError(),
+                       "GLM-5.3 BF16/F32 matvec launch");
+    }
+    hip_bfloat16 *xb = (hip_bfloat16 *)cuda_tmp_alloc(
+        input_elements * sizeof(hip_bfloat16),
+        "GLM-5.3 BF16 matmul activations");
+    if (!xb) return 0;
+    glm53_rocm_f32_to_bf16_kernel<<<
+        (unsigned)((input_elements + 255u) / 256u), 256u>>>(
+            xb, (const float *)x->ptr, input_elements);
+    if (!cuda_ok(cudaGetLastError(),
+                 "GLM-5.3 BF16 activation conversion launch")) {
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)out_dim, (int)n_rows, (int)in_dim,
+        &alpha,
+        weights, HIPBLAS_R_16B, (int)in_dim,
+        xb, HIPBLAS_R_16B, (int)in_dim,
+        &beta,
+        out->ptr, CUDA_R_32F, (int)out_dim,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(status, "GLM-5.3 BF16 matmul");
+}
+
+__global__ static void glm53_rocm_matmul_q4_K_q8_K_kernel(
+        float *out,
+        const cuda_block_q4_K *weights,
+        const cuda_block_q8_K *xq,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t col = blockIdx.x * 32u + row_lane;
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim || row >= n_rows) return;
+    const cuda_block_q4_K *wrow = weights + (uint64_t)col * n_blocks;
+    const cuda_block_q8_K *xrow = xq + (uint64_t)row * n_blocks;
+    float sum = 0.0f;
+    for (uint32_t b = lane; b < n_blocks; b += 8u) {
+        sum += dev_dot_q4_K_q8_K_block(wrow + b, xrow + b);
+    }
+    sum = quarter_warp_sum_f32(sum, lane);
+    if (lane == 0u) out[(uint64_t)row * out_dim + col] = sum;
+}
+
+extern "C" int ds4_gpu_matmul_q4_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_rows == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_rows > UINT32_MAX || (in_dim % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    const uint64_t n_blocks = in_dim / CUDA_QK_K;
+    uint64_t weight_blocks = 0, weight_bytes = 0;
+    uint64_t input_elems = 0, output_elems = 0, xq_blocks = 0, xq_bytes = 0;
+    if (!glm53_rocm_mul_u64(out_dim, n_blocks, &weight_blocks) ||
+        !glm53_rocm_mul_u64(weight_blocks,
+                            sizeof(cuda_block_q4_K), &weight_bytes) ||
+        !glm53_rocm_mul_u64(n_rows, in_dim, &input_elems) ||
+        !glm53_rocm_mul_u64(n_rows, out_dim, &output_elems) ||
+        !glm53_rocm_mul_u64(n_rows, n_blocks, &xq_blocks) ||
+        !glm53_rocm_mul_u64(xq_blocks, sizeof(cuda_block_q8_K), &xq_bytes) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        !glm53_rocm_tensor_has(x, input_elems, sizeof(float)) ||
+        !glm53_rocm_tensor_has(out, output_elems, sizeof(float))) {
+        return 0;
+    }
+    const char *weight = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "GLM-5.3 Q4_K matrix");
+    if (!weight) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)cuda_tmp_alloc(
+        xq_bytes,
+        "GLM-5.3 Q4_K activations");
+    if (!xq) return 0;
+    const dim3 quant_grid((uint32_t)n_blocks, (uint32_t)n_rows, 1u);
+    q8_K_quantize_kernel<<<quant_grid, 256u>>>(
+        xq, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_rows);
+    if (!cuda_ok(cudaGetLastError(),
+                 "GLM-5.3 Q4_K activation quantization launch")) {
+        return 0;
+    }
+    const dim3 grid(((uint32_t)out_dim + 31u) / 32u,
+                    (uint32_t)n_rows, 1u);
+    glm53_rocm_matmul_q4_K_q8_K_kernel<<<grid, 256u>>>(
+        (float *)out->ptr, (const cuda_block_q4_K *)weight, xq,
+        (uint32_t)n_blocks, (uint32_t)out_dim, (uint32_t)n_rows);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 Q4_K matmul launch");
+}
+
+enum {
+    GLM53_ROCM_KDA_DIM = 128,
+    GLM53_ROCM_KDA_HISTORY = 3,
+};
+
+__device__ __forceinline__ static float glm53_rocm_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ static float glm53_rocm_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ static float glm53_rocm_lane0(float x) {
+    return __shfl(x, 0, 32);
+}
+
+__global__ static void glm53_rocm_kda_decode_kernel(
+        float *out,
+        float *conv_state,
+        float *state,
+        const float *q_in,
+        const float *k_in,
+        const float *v_in,
+        const float *raw_gate,
+        const float *raw_beta,
+        const float *output_gate,
+        const float *q_conv,
+        const float *k_conv,
+        const float *v_conv,
+        const float *a_log,
+        const float *dt_bias,
+        const float *output_norm,
+        uint32_t n_heads,
+        uint32_t n_rows,
+        float lower_bound,
+        float norm_eps) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (row >= n_rows || head >= n_heads || tid >= GLM53_ROCM_KDA_DIM) {
+        return;
+    }
+
+    __shared__ float scratch[656];
+    float *sq = scratch;
+    float *sk = sq + GLM53_ROCM_KDA_DIM;
+    float *sd = sk + GLM53_ROCM_KDA_DIM;
+    float *sv = sd + GLM53_ROCM_KDA_DIM;
+    float *so = sv + GLM53_ROCM_KDA_DIM;
+    float *reduce_q = so + GLM53_ROCM_KDA_DIM;
+    float *reduce_k = reduce_q + 4;
+    float *reduce_o = reduce_k + 4;
+    float *beta_shared = reduce_o + 4;
+
+    const uint32_t projection = n_heads * GLM53_ROCM_KDA_DIM;
+    const uint32_t channel = head * GLM53_ROCM_KDA_DIM + tid;
+    const uint64_t input_base =
+        (uint64_t)row * projection + head * GLM53_ROCM_KDA_DIM;
+    const uint64_t conv_row_stride =
+        (uint64_t)3 * GLM53_ROCM_KDA_HISTORY * projection;
+    float *q_state = conv_state + (uint64_t)row * conv_row_stride;
+    float *k_state = q_state + GLM53_ROCM_KDA_HISTORY * projection;
+    float *v_state = k_state + GLM53_ROCM_KDA_HISTORY * projection;
+
+    float q_acc = 0.0f;
+    float k_acc = 0.0f;
+    float v_acc = 0.0f;
+    for (uint32_t w = 0; w < GLM53_ROCM_KDA_HISTORY; w++) {
+        q_acc = fmaf(q_state[(uint64_t)w * projection + channel],
+                     q_conv[(uint64_t)channel * 4u + w], q_acc);
+        k_acc = fmaf(k_state[(uint64_t)w * projection + channel],
+                     k_conv[(uint64_t)channel * 4u + w], k_acc);
+        v_acc = fmaf(v_state[(uint64_t)w * projection + channel],
+                     v_conv[(uint64_t)channel * 4u + w], v_acc);
+    }
+    const float q_new = q_in[input_base + tid];
+    const float k_new = k_in[input_base + tid];
+    const float v_new = v_in[input_base + tid];
+    q_acc = fmaf(q_new, q_conv[(uint64_t)channel * 4u + 3u], q_acc);
+    k_acc = fmaf(k_new, k_conv[(uint64_t)channel * 4u + 3u], k_acc);
+    v_acc = fmaf(v_new, v_conv[(uint64_t)channel * 4u + 3u], v_acc);
+
+    q_state[channel] = q_state[projection + channel];
+    q_state[projection + channel] = q_state[2ull * projection + channel];
+    q_state[2ull * projection + channel] = q_new;
+    k_state[channel] = k_state[projection + channel];
+    k_state[projection + channel] = k_state[2ull * projection + channel];
+    k_state[2ull * projection + channel] = k_new;
+    v_state[channel] = v_state[projection + channel];
+    v_state[projection + channel] = v_state[2ull * projection + channel];
+    v_state[2ull * projection + channel] = v_new;
+
+    sq[tid] = glm53_rocm_silu(q_acc);
+    sk[tid] = glm53_rocm_silu(k_acc);
+    sv[tid] = glm53_rocm_silu(v_acc);
+    const float gate = raw_gate[input_base + tid] + dt_bias[channel];
+    sd[tid] = expf(lower_bound *
+        glm53_rocm_sigmoid(expf(a_log[head]) * gate));
+    if (tid == 0u) {
+        beta_shared[0] = glm53_rocm_sigmoid(
+            raw_beta[(uint64_t)row * n_heads + head]);
+    }
+    __syncthreads();
+
+    float q_sumsq = warp_sum_f32(sq[tid] * sq[tid]);
+    float k_sumsq = warp_sum_f32(sk[tid] * sk[tid]);
+    if (lane == 0u) {
+        reduce_q[warp] = q_sumsq;
+        reduce_k[warp] = k_sumsq;
+    }
+    __syncthreads();
+    float q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+    float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+    q_total = glm53_rocm_lane0(warp_sum_f32(q_total));
+    k_total = glm53_rocm_lane0(warp_sum_f32(k_total));
+    sq[tid] *= rsqrtf(q_total + 1.0e-6f) * 0.08838834764831845f;
+    sk[tid] *= rsqrtf(k_total + 1.0e-6f);
+    __syncthreads();
+
+    const uint32_t k0 = lane * 4u;
+    const float4 q4 = *(const float4 *)(sq + k0);
+    const float4 k4 = *(const float4 *)(sk + k0);
+    const float4 decay4 = *(const float4 *)(sd + k0);
+    const uint64_t state_head =
+        ((uint64_t)row * n_heads + head) *
+        GLM53_ROCM_KDA_DIM * GLM53_ROCM_KDA_DIM;
+
+    for (uint32_t value = warp; value < GLM53_ROCM_KDA_DIM; value += 4u) {
+        float4 *hptr = (float4 *)(state + state_head +
+            (uint64_t)value * GLM53_ROCM_KDA_DIM + k0);
+        float4 h = *hptr;
+        h.x *= decay4.x;
+        h.y *= decay4.y;
+        h.z *= decay4.z;
+        h.w *= decay4.w;
+        const float hk = glm53_rocm_lane0(warp_sum_f32(dot4_f32(h, k4)));
+        const float delta_v = (sv[value] - hk) * beta_shared[0];
+        h.x = fmaf(k4.x, delta_v, h.x);
+        h.y = fmaf(k4.y, delta_v, h.y);
+        h.z = fmaf(k4.z, delta_v, h.z);
+        h.w = fmaf(k4.w, delta_v, h.w);
+        *hptr = h;
+        const float hq = glm53_rocm_lane0(warp_sum_f32(dot4_f32(h, q4)));
+        if (lane == 0u) so[value] = hq;
+    }
+    __syncthreads();
+
+    float o_sumsq = warp_sum_f32(so[tid] * so[tid]);
+    if (lane == 0u) reduce_o[warp] = o_sumsq;
+    __syncthreads();
+    float o_total = lane < 4u ? reduce_o[lane] : 0.0f;
+    o_total = glm53_rocm_lane0(warp_sum_f32(o_total));
+    const float o_scale =
+        rsqrtf(o_total / (float)GLM53_ROCM_KDA_DIM + norm_eps);
+    const float out_gate = glm53_rocm_sigmoid(output_gate[input_base + tid]);
+    out[input_base + tid] =
+        so[tid] * o_scale * output_norm[tid] * out_gate;
+}
+
+__global__ static void glm53_rocm_kda_prefill_prepare_kernel(
+        float *q,
+        float *k,
+        float *v,
+        float *raw_gate,
+        float *conv_state,
+        const float *q_conv,
+        const float *k_conv,
+        const float *v_conv,
+        const float *a_log,
+        const float *dt_bias,
+        uint32_t n_heads,
+        uint32_t n_tokens,
+        float lower_bound) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (head >= n_heads || tid >= GLM53_ROCM_KDA_DIM) return;
+
+    __shared__ float sq[GLM53_ROCM_KDA_DIM];
+    __shared__ float sk[GLM53_ROCM_KDA_DIM];
+    __shared__ float reduce_q[4];
+    __shared__ float reduce_k[4];
+    const uint32_t projection = n_heads * GLM53_ROCM_KDA_DIM;
+    const uint32_t channel = head * GLM53_ROCM_KDA_DIM + tid;
+    float *q_state = conv_state;
+    float *k_state = q_state + GLM53_ROCM_KDA_HISTORY * projection;
+    float *v_state = k_state + GLM53_ROCM_KDA_HISTORY * projection;
+
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t index = (uint64_t)token * projection + channel;
+        float q_acc = 0.0f;
+        float k_acc = 0.0f;
+        float v_acc = 0.0f;
+        for (uint32_t w = 0; w < GLM53_ROCM_KDA_HISTORY; w++) {
+            q_acc = fmaf(q_state[(uint64_t)w * projection + channel],
+                         q_conv[(uint64_t)channel * 4u + w], q_acc);
+            k_acc = fmaf(k_state[(uint64_t)w * projection + channel],
+                         k_conv[(uint64_t)channel * 4u + w], k_acc);
+            v_acc = fmaf(v_state[(uint64_t)w * projection + channel],
+                         v_conv[(uint64_t)channel * 4u + w], v_acc);
+        }
+        const float q_new = q[index];
+        const float k_new = k[index];
+        const float v_new = v[index];
+        q_acc = fmaf(q_new, q_conv[(uint64_t)channel * 4u + 3u], q_acc);
+        k_acc = fmaf(k_new, k_conv[(uint64_t)channel * 4u + 3u], k_acc);
+        v_acc = fmaf(v_new, v_conv[(uint64_t)channel * 4u + 3u], v_acc);
+        q_state[channel] = q_state[projection + channel];
+        q_state[projection + channel] = q_state[2ull * projection + channel];
+        q_state[2ull * projection + channel] = q_new;
+        k_state[channel] = k_state[projection + channel];
+        k_state[projection + channel] = k_state[2ull * projection + channel];
+        k_state[2ull * projection + channel] = k_new;
+        v_state[channel] = v_state[projection + channel];
+        v_state[projection + channel] = v_state[2ull * projection + channel];
+        v_state[2ull * projection + channel] = v_new;
+
+        sq[tid] = glm53_rocm_silu(q_acc);
+        sk[tid] = glm53_rocm_silu(k_acc);
+        v[index] = glm53_rocm_silu(v_acc);
+        raw_gate[index] = expf(lower_bound * glm53_rocm_sigmoid(
+            expf(a_log[head]) * (raw_gate[index] + dt_bias[channel])));
+        __syncthreads();
+
+        float q_total = warp_sum_f32(sq[tid] * sq[tid]);
+        float k_total = warp_sum_f32(sk[tid] * sk[tid]);
+        if (lane == 0u) {
+            reduce_q[warp] = q_total;
+            reduce_k[warp] = k_total;
+        }
+        __syncthreads();
+        q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+        k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+        q_total = glm53_rocm_lane0(warp_sum_f32(q_total));
+        k_total = glm53_rocm_lane0(warp_sum_f32(k_total));
+        q[index] = sq[tid] * rsqrtf(q_total + 1.0e-6f) *
+                   0.08838834764831845f;
+        k[index] = sk[tid] * rsqrtf(k_total + 1.0e-6f);
+        __syncthreads();
+    }
+}
+
+__global__ static void glm53_rocm_kda_prefill_recurrence_kernel(
+        float *out,
+        float *state,
+        const float *q,
+        const float *k,
+        const float *v,
+        const float *decay,
+        const float *raw_beta,
+        uint32_t n_heads,
+        uint32_t n_tokens) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (head >= n_heads || value >= GLM53_ROCM_KDA_DIM) return;
+    const uint32_t projection = n_heads * GLM53_ROCM_KDA_DIM;
+    const uint32_t k0 = lane * 4u;
+    float4 *state_ptr = (float4 *)(state +
+        ((uint64_t)head * GLM53_ROCM_KDA_DIM + value) *
+        GLM53_ROCM_KDA_DIM + k0);
+    float4 h = *state_ptr;
+
+    for (uint32_t token = 0; token < n_tokens; token++) {
+        const uint64_t base =
+            (uint64_t)token * projection + head * GLM53_ROCM_KDA_DIM;
+        const float4 q4 = *(const float4 *)(q + base + k0);
+        const float4 k4 = *(const float4 *)(k + base + k0);
+        const float4 d4 = *(const float4 *)(decay + base + k0);
+        h.x *= d4.x;
+        h.y *= d4.y;
+        h.z *= d4.z;
+        h.w *= d4.w;
+        const float hk = glm53_rocm_lane0(warp_sum_f32(dot4_f32(h, k4)));
+        const float beta = glm53_rocm_sigmoid(
+            raw_beta[(uint64_t)token * n_heads + head]);
+        const float delta_v = (v[base + value] - hk) * beta;
+        h.x = fmaf(k4.x, delta_v, h.x);
+        h.y = fmaf(k4.y, delta_v, h.y);
+        h.z = fmaf(k4.z, delta_v, h.z);
+        h.w = fmaf(k4.w, delta_v, h.w);
+        const float result =
+            glm53_rocm_lane0(warp_sum_f32(dot4_f32(h, q4)));
+        if (lane == 0u) out[base + value] = result;
+    }
+    *state_ptr = h;
+}
+
+__global__ static void glm53_rocm_kda_prefill_output_kernel(
+        float *out,
+        const float *output_gate,
+        const float *output_norm,
+        uint32_t n_heads,
+        uint32_t n_tokens,
+        float norm_eps) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (token >= n_tokens || head >= n_heads || tid >= GLM53_ROCM_KDA_DIM) {
+        return;
+    }
+    __shared__ float partial[4];
+    const uint32_t projection = n_heads * GLM53_ROCM_KDA_DIM;
+    const uint64_t index = (uint64_t)token * projection +
+        head * GLM53_ROCM_KDA_DIM + tid;
+    const float raw = out[index];
+    float total = warp_sum_f32(raw * raw);
+    if (lane == 0u) partial[warp] = total;
+    __syncthreads();
+    total = lane < 4u ? partial[lane] : 0.0f;
+    total = glm53_rocm_lane0(warp_sum_f32(total));
+    const float scale =
+        rsqrtf(total / (float)GLM53_ROCM_KDA_DIM + norm_eps);
+    out[index] = raw * scale * output_norm[tid] *
+        glm53_rocm_sigmoid(output_gate[index]);
+}
+
+extern "C" int ds4_gpu_glm53_kda_decode(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps) {
+    uint64_t projection = 0, activations = 0, conv_elements = 0;
+    uint64_t state_elements = 0;
+    if (n_heads == 0u || n_rows == 0u || gate_lower_bound >= 0.0f ||
+        !glm53_rocm_mul_u64(n_heads, GLM53_ROCM_KDA_DIM, &projection) ||
+        !glm53_rocm_mul_u64(projection, n_rows, &activations) ||
+        !glm53_rocm_mul_u64(activations,
+            3u * GLM53_ROCM_KDA_HISTORY, &conv_elements) ||
+        !glm53_rocm_mul_u64(activations,
+            GLM53_ROCM_KDA_DIM, &state_elements) ||
+        !glm53_rocm_tensor_has(q, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(k, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(v, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(raw_gate, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(raw_beta,
+            (uint64_t)n_rows * n_heads, sizeof(float)) ||
+        !glm53_rocm_tensor_has(output_gate, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(out, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(conv_state, conv_elements, sizeof(float)) ||
+        !glm53_rocm_tensor_has(recurrent_state, state_elements, sizeof(float))) {
+        fprintf(stderr, "ds4: GLM-5.3 KDA decode received invalid buffers\n");
+        return 0;
+    }
+    const float *qw = glm53_rocm_weight_f32(model_map, model_size,
+        q_conv_offset, projection * 4u, "KDA Q convolution");
+    const float *kw = glm53_rocm_weight_f32(model_map, model_size,
+        k_conv_offset, projection * 4u, "KDA K convolution");
+    const float *vw = glm53_rocm_weight_f32(model_map, model_size,
+        v_conv_offset, projection * 4u, "KDA V convolution");
+    const float *a_log = glm53_rocm_weight_f32(model_map, model_size,
+        a_log_offset, n_heads, "KDA A_log");
+    const float *dt_bias = glm53_rocm_weight_f32(model_map, model_size,
+        dt_bias_offset, projection, "KDA dt bias");
+    const float *output_norm = glm53_rocm_weight_f32(model_map, model_size,
+        output_norm_offset, GLM53_ROCM_KDA_DIM, "KDA output norm");
+    if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm) return 0;
+    const dim3 grid(n_rows, n_heads, 1u);
+    glm53_rocm_kda_decode_kernel<<<grid, GLM53_ROCM_KDA_DIM>>>(
+        (float *)out->ptr, (float *)conv_state->ptr,
+        (float *)recurrent_state->ptr, (const float *)q->ptr,
+        (const float *)k->ptr, (const float *)v->ptr,
+        (const float *)raw_gate->ptr, (const float *)raw_beta->ptr,
+        (const float *)output_gate->ptr, qw, kw, vw, a_log, dt_bias,
+        output_norm, n_heads, n_rows, gate_lower_bound, norm_eps);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA decode launch");
+}
+
+extern "C" int ds4_gpu_glm53_kda_prefill(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_tokens,
+        float                 gate_lower_bound,
+        float                 norm_eps) {
+    uint64_t projection = 0, activations = 0, conv_elements = 0;
+    uint64_t state_elements = 0;
+    if (n_heads == 0u || n_tokens == 0u || gate_lower_bound >= 0.0f ||
+        !glm53_rocm_mul_u64(n_heads, GLM53_ROCM_KDA_DIM, &projection) ||
+        !glm53_rocm_mul_u64(projection, n_tokens, &activations) ||
+        !glm53_rocm_mul_u64(projection,
+            3u * GLM53_ROCM_KDA_HISTORY, &conv_elements) ||
+        !glm53_rocm_mul_u64(projection,
+            GLM53_ROCM_KDA_DIM, &state_elements) ||
+        !glm53_rocm_tensor_has(q, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(k, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(v, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(raw_gate, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(raw_beta,
+            (uint64_t)n_tokens * n_heads, sizeof(float)) ||
+        !glm53_rocm_tensor_has(output_gate, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(out, activations, sizeof(float)) ||
+        !glm53_rocm_tensor_has(conv_state, conv_elements, sizeof(float)) ||
+        !glm53_rocm_tensor_has(recurrent_state, state_elements, sizeof(float))) {
+        fprintf(stderr, "ds4: GLM-5.3 KDA prefill received invalid buffers\n");
+        return 0;
+    }
+    const float *qw = glm53_rocm_weight_f32(model_map, model_size,
+        q_conv_offset, projection * 4u, "KDA Q convolution");
+    const float *kw = glm53_rocm_weight_f32(model_map, model_size,
+        k_conv_offset, projection * 4u, "KDA K convolution");
+    const float *vw = glm53_rocm_weight_f32(model_map, model_size,
+        v_conv_offset, projection * 4u, "KDA V convolution");
+    const float *a_log = glm53_rocm_weight_f32(model_map, model_size,
+        a_log_offset, n_heads, "KDA A_log");
+    const float *dt_bias = glm53_rocm_weight_f32(model_map, model_size,
+        dt_bias_offset, projection, "KDA dt bias");
+    const float *output_norm = glm53_rocm_weight_f32(model_map, model_size,
+        output_norm_offset, GLM53_ROCM_KDA_DIM, "KDA output norm");
+    if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm) return 0;
+
+    glm53_rocm_kda_prefill_prepare_kernel<<<
+        n_heads, GLM53_ROCM_KDA_DIM>>>(
+            (float *)q->ptr, (float *)k->ptr, (float *)v->ptr,
+            (float *)raw_gate->ptr, (float *)conv_state->ptr,
+            qw, kw, vw, a_log, dt_bias, n_heads, n_tokens,
+            gate_lower_bound);
+    if (!cuda_ok(cudaGetLastError(),
+                 "GLM-5.3 KDA prefill prepare launch")) {
+        return 0;
+    }
+    const dim3 recurrence_grid(n_heads, 32u, 1u);
+    glm53_rocm_kda_prefill_recurrence_kernel<<<recurrence_grid, 128u>>>(
+        (float *)out->ptr, (float *)recurrent_state->ptr,
+        (const float *)q->ptr, (const float *)k->ptr,
+        (const float *)v->ptr, (const float *)raw_gate->ptr,
+        (const float *)raw_beta->ptr, n_heads, n_tokens);
+    if (!cuda_ok(cudaGetLastError(),
+                 "GLM-5.3 KDA prefill recurrence launch")) {
+        return 0;
+    }
+    const dim3 output_grid(n_tokens, n_heads, 1u);
+    glm53_rocm_kda_prefill_output_kernel<<<
+        output_grid, GLM53_ROCM_KDA_DIM>>>(
+            (float *)out->ptr, (const float *)output_gate->ptr,
+            output_norm, n_heads, n_tokens, norm_eps);
+    return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA prefill output launch");
+}
+
 __global__ static void glm_kv_lora_rms_norm_kernel(
         float *out,
         const float *kv_raw,
@@ -737,6 +1517,7 @@ __global__ static void glm_indexer_scores_batch_kernel(
         uint32_t n_rows,
         uint32_t n_tokens,
         uint32_t pos0,
+        uint32_t row_group_size,
         uint32_t n_head,
         uint32_t head_dim,
         float scale,
@@ -745,7 +1526,7 @@ __global__ static void glm_indexer_scores_batch_kernel(
     const uint32_t token = blockIdx.y;
     if (row >= n_rows || token >= n_tokens) return;
     float *dst = scores + (uint64_t)token * n_rows + row;
-    if (row >= pos0 + token + 1u) {
+    if (row >= (pos0 + token + 1u) / row_group_size) {
         if (threadIdx.x == 0u) *dst = -INFINITY;
         return;
     }
@@ -850,6 +1631,7 @@ __global__ static void glm_attention_indexed_lora_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     if (!isfinite(max_score)) {
         float *out = lora_out + ((uint64_t)token * n_head + head) * kv_lora_dim;
         for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += blockDim.x) {
@@ -1400,18 +2182,31 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
         uint32_t qk_rope,
         bool cache_f16) {
     const uint64_t elem = cache_f16 ? sizeof(__half) : sizeof(float);
-    if (!kv_lora_cache || !k_rope_cache || !kv_norm || !kv_raw ||
+    if (!kv_lora_cache || (qk_rope != 0u && !k_rope_cache) ||
+        !kv_norm || !kv_raw ||
         !glm_rocm_check_pos_span(pos0, n_tokens, cache_cap) ||
-        kv_raw_dim == 0u || kv_lora_dim == 0u || qk_rope == 0u ||
+        kv_raw_dim == 0u || kv_lora_dim == 0u ||
+        kv_lora_dim > kv_raw_dim || qk_rope > kv_raw_dim - kv_lora_dim ||
         !cuda_tensor_has_elems2(kv_norm, n_tokens, kv_lora_dim, sizeof(float)) ||
         !cuda_tensor_has_elems2(kv_raw, n_tokens, kv_raw_dim, sizeof(float)) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
+        fprintf(stderr,
+                "ds4: GLM compact KV store received invalid buffers "
+                "(pos=%u tokens=%u cap=%u raw_dim=%u lora=%u rope=%u "
+                "kv_cache=%llu rope_cache=%llu norm=%llu raw=%llu)\n",
+                pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope,
+                (unsigned long long)(kv_lora_cache ? kv_lora_cache->bytes : 0u),
+                (unsigned long long)(k_rope_cache ? k_rope_cache->bytes : 0u),
+                (unsigned long long)(kv_norm ? kv_norm->bytes : 0u),
+                (unsigned long long)(kv_raw ? kv_raw->bytes : 0u));
         return 0;
     }
-    dim3 grid(n_tokens, 2, 1);
+    dim3 grid(n_tokens, qk_rope != 0u ? 2u : 1u, 1);
     glm_store_compact_kv_kernel<<<grid, 256>>>((char *)kv_lora_cache->ptr,
-                                               (char *)k_rope_cache->ptr,
+                                               k_rope_cache ?
+                                                   (char *)k_rope_cache->ptr : NULL,
                                                (const float *)kv_norm->ptr,
                                                (const float *)kv_raw->ptr,
                                                pos0,
@@ -1446,14 +2241,17 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
     const uint64_t elem = cache_f16 ? sizeof(__half) : sizeof(float);
     uint64_t q_weight_bytes = 0;
     uint64_t kv_weight_bytes = 0;
-    if (!q_out || !q || !model_map || !kv_lora_cache || !k_rope_cache || !kv_raw ||
+    if (!q_out || !q || !model_map || !kv_lora_cache ||
+        (qk_rope != 0u && !k_rope_cache) || !kv_raw ||
         !glm_rocm_check_pos_span(pos0, n_tokens, cache_cap) ||
-        q_n == 0u || kv_raw_dim == 0u || kv_lora_dim == 0u || qk_rope == 0u ||
+        q_n == 0u || kv_raw_dim == 0u || kv_lora_dim == 0u ||
+        kv_lora_dim > kv_raw_dim || qk_rope > kv_raw_dim - kv_lora_dim ||
         !cuda_tensor_has_elems2(q, n_tokens, q_n, sizeof(float)) ||
         !cuda_tensor_has_elems2(q_out, n_tokens, q_n, sizeof(float)) ||
         !cuda_tensor_has_elems2(kv_raw, n_tokens, kv_raw_dim, sizeof(float)) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem) ||
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) ||
         !glm_rocm_model_f32_range(model_size, q_weight_offset, q_n, &q_weight_bytes) ||
         !glm_rocm_model_f32_range(model_size, kv_weight_offset, kv_lora_dim, &kv_weight_bytes)) {
         return 0;
@@ -1465,13 +2263,14 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
                                                            kv_weight_bytes,
                                                            "glm_kv_norm");
     if (!qw || !kvw) return 0;
-    dim3 grid(n_tokens, 3, 1);
+    dim3 grid(n_tokens, qk_rope != 0u ? 3u : 2u, 1);
     glm_qkv_norm_store_compact_kv_kernel<<<grid, 256>>>((float *)q_out->ptr,
                                                         (const float *)q->ptr,
                                                         qw,
                                                         q_n,
                                                         (char *)kv_lora_cache->ptr,
-                                                        (char *)k_rope_cache->ptr,
+                                                        k_rope_cache ?
+                                                            (char *)k_rope_cache->ptr : NULL,
                                                         (const float *)kv_raw->ptr,
                                                         kvw,
                                                         pos0,
@@ -1794,6 +2593,297 @@ extern "C" int ds4_gpu_glm_indexer_rope_tail_tensor(
     return cuda_ok(cudaGetLastError(), "glm indexer rope tail launch");
 }
 
+__global__ static void glm53_rocm_indexer_pool_update_kernel(
+        char *pool_cache,
+        float *tail,
+        const float *raw_k,
+        const float *gate,
+        const float *norm_weight,
+        const float *norm_bias,
+        const uint16_t *ape,
+        uint32_t pos0,
+        uint32_t n_tokens,
+        uint32_t cache_cap,
+        uint32_t head_dim,
+        uint32_t pool_size,
+        float eps,
+        bool cache_f16) {
+    const uint32_t tid = threadIdx.x;
+    if (head_dim == 0u || pool_size == 0u || tid >= head_dim ||
+        n_tokens == 0u) {
+        return;
+    }
+    float *const tail_k = tail;
+    float *const tail_gate = tail + (uint64_t)pool_size * head_dim;
+    extern __shared__ float shared[];
+    float *rows = shared;
+    float *mean = rows + (uint64_t)pool_size * head_dim;
+    float *inv = mean + pool_size;
+    const uint32_t pool = pos0 / pool_size + blockIdx.x;
+    const uint32_t pool_start = pool * pool_size;
+    const uint32_t input_end = pos0 + n_tokens;
+    if (pool_start >= input_end || pool_start + pool_size <= pos0) return;
+    const bool complete = pool_start + pool_size <= input_end;
+
+    for (uint32_t r = 0; r < pool_size; r++) {
+        const uint32_t pos = pool_start + r;
+        float k_value = 0.0f;
+        float gate_value = 0.0f;
+        if (pos >= pos0 && pos < input_end) {
+            const uint32_t src_row = pos - pos0;
+            k_value = raw_k[(uint64_t)src_row * head_dim + tid];
+            gate_value = gate[(uint64_t)src_row * head_dim + tid];
+            if (!complete) {
+                tail_k[(uint64_t)r * head_dim + tid] = k_value;
+                tail_gate[(uint64_t)r * head_dim + tid] = gate_value;
+            }
+        } else {
+            k_value = tail_k[(uint64_t)r * head_dim + tid];
+            gate_value = tail_gate[(uint64_t)r * head_dim + tid];
+        }
+        rows[(uint64_t)r * head_dim + tid] = k_value;
+    }
+    __syncthreads();
+    if (!complete || pool >= (cache_cap + pool_size - 1u) / pool_size) {
+        return;
+    }
+
+    if (tid < pool_size) {
+        const uint32_t r = tid;
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            sum += rows[(uint64_t)r * head_dim + d];
+        }
+        const float m = sum / (float)head_dim;
+        float ss = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            const float delta = rows[(uint64_t)r * head_dim + d] - m;
+            ss = fmaf(delta, delta, ss);
+        }
+        mean[r] = m;
+        inv[r] = rsqrtf(ss / (float)head_dim + eps);
+    }
+    __syncthreads();
+
+    float max_logit = -INFINITY;
+    float logits[4];
+    for (uint32_t r = 0; r < pool_size; r++) {
+        const uint32_t pos = pool_start + r;
+        const float gate_value = pos >= pos0
+            ? gate[(uint64_t)(pos - pos0) * head_dim + tid]
+            : tail_gate[(uint64_t)r * head_dim + tid];
+        const float ape_value =
+            __uint_as_float((uint32_t)ape[(uint64_t)r * head_dim + tid] << 16);
+        logits[r] = gate_value + ape_value;
+        max_logit = fmaxf(max_logit, logits[r]);
+    }
+    float denom = 0.0f;
+    for (uint32_t r = 0; r < pool_size; r++) {
+        logits[r] = expf(logits[r] - max_logit);
+        denom += logits[r];
+    }
+    float pooled = 0.0f;
+    for (uint32_t r = 0; r < pool_size; r++) {
+        const float normalized =
+            (rows[(uint64_t)r * head_dim + tid] - mean[r]) * inv[r] *
+            norm_weight[tid] + norm_bias[tid];
+        pooled = fmaf(logits[r] / denom, normalized, pooled);
+    }
+    glm_rocm_cache_store(pool_cache,
+        (uint64_t)pool * head_dim + tid, cache_f16, pooled);
+}
+
+extern "C" int ds4_gpu_glm53_indexer_pool_update_tensor(
+        ds4_gpu_tensor       *pool_cache,
+        ds4_gpu_tensor       *tail_k,
+        ds4_gpu_tensor       *tail_gate,
+        const ds4_gpu_tensor *raw_k,
+        const ds4_gpu_tensor *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              norm_weight_offset,
+        uint64_t              norm_bias_offset,
+        uint64_t              ape_offset,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              head_dim,
+        uint32_t              pool_size,
+        float                 eps,
+        bool                  cache_f16) {
+    if (!pool_cache || !tail_k || !tail_gate || !raw_k || !gate ||
+        !model_map || n_tokens == 0u || cache_cap == 0u || head_dim == 0u ||
+        head_dim > 1024u || pool_size != 4u || !isfinite(eps) || eps <= 0.0f ||
+        pos0 > cache_cap || n_tokens > cache_cap - pos0) {
+        fprintf(stderr,
+                "ds4: GLM-5.3 indexer pool received invalid arguments "
+                "(pos=%u tokens=%u cap=%u dim=%u pool=%u)\n",
+                pos0, n_tokens, cache_cap, head_dim, pool_size);
+        return 0;
+    }
+    const uint64_t pool_cap =
+        ((uint64_t)cache_cap + pool_size - 1u) / pool_size;
+    const uint64_t cache_elem_size = cache_f16 ? sizeof(__half) : sizeof(float);
+    if (!glm53_rocm_tensor_has(pool_cache, pool_cap * head_dim,
+                               cache_elem_size) ||
+        !glm53_rocm_tensor_has(tail_k,
+            2u * (uint64_t)pool_size * head_dim, sizeof(float)) ||
+        !glm53_rocm_tensor_has(tail_gate,
+            (uint64_t)pool_size * head_dim, sizeof(float)) ||
+        (char *)tail_gate->ptr !=
+            (char *)tail_k->ptr +
+                (uint64_t)pool_size * head_dim * sizeof(float) ||
+        !glm53_rocm_tensor_has(raw_k,
+            (uint64_t)n_tokens * head_dim, sizeof(float)) ||
+        !glm53_rocm_tensor_has(gate,
+            (uint64_t)n_tokens * head_dim, sizeof(float))) {
+        fprintf(stderr,
+                "ds4: GLM-5.3 indexer pool received invalid buffers "
+                "(cache=%llu tail_k=%llu tail_gate=%llu raw=%llu gate=%llu)\n",
+                (unsigned long long)pool_cache->bytes,
+                (unsigned long long)tail_k->bytes,
+                (unsigned long long)tail_gate->bytes,
+                (unsigned long long)raw_k->bytes,
+                (unsigned long long)gate->bytes);
+        return 0;
+    }
+    const float *norm_weight = glm53_rocm_weight_f32(
+        model_map, model_size, norm_weight_offset, head_dim,
+        "indexer pool norm weight");
+    const float *norm_bias = glm53_rocm_weight_f32(
+        model_map, model_size, norm_bias_offset, head_dim,
+        "indexer pool norm bias");
+    const uint64_t ape_bytes =
+        (uint64_t)pool_size * head_dim * sizeof(uint16_t);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset) {
+        fprintf(stderr, "ds4: GLM-5.3 indexer pool APE range is invalid\n");
+        return 0;
+    }
+    const uint16_t *ape = (const uint16_t *)cuda_model_range_ptr(
+        model_map, ape_offset, ape_bytes, "indexer pool APE");
+    if (!norm_weight || !norm_bias || !ape) {
+        fprintf(stderr,
+                "ds4: GLM-5.3 indexer pool could not resolve model weights "
+                "(norm=%d bias=%d ape=%d)\n",
+                norm_weight != NULL, norm_bias != NULL, ape != NULL);
+        return 0;
+    }
+
+    const uint64_t shared_bytes =
+        ((uint64_t)pool_size * head_dim + 2u * pool_size) * sizeof(float);
+    uint32_t done = 0u;
+    const uint32_t leading = pos0 % pool_size;
+    if (leading != 0u) {
+        uint32_t chunk = pool_size - leading;
+        if (chunk > n_tokens) chunk = n_tokens;
+        glm53_rocm_indexer_pool_update_kernel<<<
+            1u, head_dim, shared_bytes>>>(
+                (char *)pool_cache->ptr, (float *)tail_k->ptr,
+                (const float *)raw_k->ptr, (const float *)gate->ptr,
+                norm_weight, norm_bias, ape, pos0, chunk, cache_cap,
+                head_dim, pool_size, eps, cache_f16);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM-5.3 leading indexer pool update launch")) {
+            return 0;
+        }
+        done = chunk;
+    }
+    const uint32_t remaining = n_tokens - done;
+    const uint32_t full_tokens = remaining - remaining % pool_size;
+    if (full_tokens != 0u) {
+        const uint32_t groups = full_tokens / pool_size;
+        glm53_rocm_indexer_pool_update_kernel<<<
+            groups, head_dim, shared_bytes>>>(
+                (char *)pool_cache->ptr, (float *)tail_k->ptr,
+                (const float *)raw_k->ptr + (uint64_t)done * head_dim,
+                (const float *)gate->ptr + (uint64_t)done * head_dim,
+                norm_weight, norm_bias, ape, pos0 + done, full_tokens,
+                cache_cap, head_dim, pool_size, eps, cache_f16);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM-5.3 full indexer pool update launch")) {
+            return 0;
+        }
+        done += full_tokens;
+    }
+    if (done < n_tokens) {
+        const uint32_t tail_tokens = n_tokens - done;
+        glm53_rocm_indexer_pool_update_kernel<<<
+            1u, head_dim, shared_bytes>>>(
+                (char *)pool_cache->ptr, (float *)tail_k->ptr,
+                (const float *)raw_k->ptr + (uint64_t)done * head_dim,
+                (const float *)gate->ptr + (uint64_t)done * head_dim,
+                norm_weight, norm_bias, ape, pos0 + done, tail_tokens,
+                cache_cap, head_dim, pool_size, eps, cache_f16);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM-5.3 trailing indexer pool update launch")) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+__global__ static void glm53_rocm_expand_pool_selection_kernel(
+        uint32_t *raw_selected,
+        const uint32_t *pool_selected,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t selected_pools,
+        uint32_t index_topk,
+        uint32_t pool_size,
+        uint32_t output_width) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_tokens * output_width;
+    if (gid >= total || output_width == 0u || pool_size == 0u) return;
+    const uint32_t token = (uint32_t)(gid / output_width);
+    const uint32_t slot = (uint32_t)(gid - (uint64_t)token * output_width);
+    uint32_t value = UINT32_MAX;
+    if (slot < index_topk) {
+        const uint32_t pool_slot = slot / pool_size;
+        if (pool_slot < selected_pools) {
+            const uint32_t pool = pool_selected[
+                (uint64_t)token * selected_pools + pool_slot];
+            value = pool * pool_size + slot % pool_size;
+        }
+    } else {
+        const uint32_t tail_slot = slot - index_topk;
+        const uint32_t visible = pos0 + token + 1u;
+        const uint32_t tail_count = visible % pool_size;
+        if (tail_slot < tail_count) {
+            value = visible - tail_count + tail_slot;
+        }
+    }
+    raw_selected[gid] = value;
+}
+
+extern "C" int ds4_gpu_glm53_expand_pool_selection_tensor(
+        ds4_gpu_tensor       *raw_selected,
+        const ds4_gpu_tensor *pool_selected,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              selected_pools,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              output_width) {
+    if (!raw_selected || !pool_selected || n_tokens == 0u ||
+        selected_pools == 0u || index_topk == 0u || pool_size == 0u ||
+        selected_pools > index_topk / pool_size ||
+        output_width < index_topk + pool_size - 1u ||
+        !glm53_rocm_tensor_has(raw_selected,
+            (uint64_t)n_tokens * output_width, sizeof(uint32_t)) ||
+        !glm53_rocm_tensor_has(pool_selected,
+            (uint64_t)n_tokens * selected_pools, sizeof(uint32_t))) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_tokens * output_width;
+    glm53_rocm_expand_pool_selection_kernel<<<
+        (unsigned)((total + 255u) / 256u), 256u>>>(
+            (uint32_t *)raw_selected->ptr,
+            (const uint32_t *)pool_selected->ptr, n_tokens, pos0,
+            selected_pools, index_topk, pool_size, output_width);
+    return cuda_ok(cudaGetLastError(),
+                   "GLM-5.3 pool selection expansion launch");
+}
+
 extern "C" int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor *scores,
         const ds4_gpu_tensor *q,
@@ -1857,11 +2947,49 @@ extern "C" int ds4_gpu_glm_indexer_scores_batch_tensor(
                                                    n_rows,
                                                    n_tokens,
                                                    pos0,
+                                                   1u,
                                                    n_head,
                                                    head_dim,
                                                    scale,
                                                    cache_f16);
     return cuda_ok(cudaGetLastError(), "glm indexer scores batch launch");
+}
+
+extern "C" int ds4_gpu_glm53_indexer_scores_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              pool_size,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    const uint64_t elem = cache_f16 ? sizeof(__half) : sizeof(float);
+    uint32_t end_pos = 0;
+    if (!scores || !q || !weights || !indexer_key_cache || n_tokens == 0u ||
+        n_rows == 0u || pool_size != 4u || n_head == 0u ||
+        head_dim != 128u || !isfinite(scale) || scale <= 0.0f ||
+        !glm_rocm_check_token_span(pos0, n_tokens, &end_pos) ||
+        end_pos / pool_size > n_rows ||
+        !cuda_tensor_has_elems2(scores, n_tokens, n_rows, sizeof(float)) ||
+        !cuda_tensor_has_elems3(q, n_tokens, n_head, head_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(weights, n_tokens, n_head, sizeof(float)) ||
+        !glm_rocm_tensor_has_cache2(indexer_key_cache, n_rows, head_dim, elem)) {
+        return 0;
+    }
+    const dim3 grid(n_rows, n_tokens, 1u);
+    glm_indexer_scores_batch_kernel<<<grid, 256u>>>(
+        (float *)scores->ptr, (const float *)q->ptr,
+        (const float *)weights->ptr,
+        (const char *)indexer_key_cache->ptr,
+        n_rows, n_tokens, pos0, pool_size, n_head, head_dim,
+        scale, cache_f16);
+    return cuda_ok(cudaGetLastError(),
+                   "GLM-5.3 grouped indexer scores launch");
 }
 
 extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
@@ -1889,6 +3017,28 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
                                 (uint64_t)n_head * kv_lora_dim, qk_nope,
                                 "glm_qk_lowrank", &w, &row_bytes)) {
         return 0;
+    }
+    const char *wave_decode_env =
+        getenv("DS4_ROCM_GLM_QK_LOW_WAVE_DECODE");
+    if (wave_decode_env == NULL || cuda_env_present(wave_decode_env)) {
+        const uint32_t threads = 256u;
+        const uint32_t waves_per_block = threads / 32u;
+        const dim3 grid((kv_lora_dim + waves_per_block - 1u) /
+                            waves_per_block,
+                        n_head,
+                        1u);
+        glm_q8_project_head_wave_kernel<<<grid, threads>>>(
+                (float *)qk_low->ptr,
+                w,
+                (const float *)q->ptr,
+                n_head,
+                qk_nope,
+                kv_lora_dim,
+                (uint32_t)x_stride64,
+                qk_dim,
+                row_bytes);
+        return cuda_ok(cudaGetLastError(),
+                       "glm wave-parallel qk lowrank launch");
     }
     glm_q8_project_head_kernel<<<dim3(n_head, 1, 1), 256, (size_t)qk_nope * sizeof(float)>>>(
             (float *)qk_low->ptr,
@@ -2631,10 +3781,10 @@ static int glm_attention_indexed_lora_causal_gemm(
         float beta_fast,
         float beta_slow) {
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
-        !kv_lora_cache || !k_rope_cache ||
+        !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) ||
         n_tokens < 256u || n_selected == 0u ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        (qk_rope & 1u) != 0u ||
         n_tokens > INT_MAX || n_selected > INT_MAX ||
         kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
         return 0;
@@ -2699,23 +3849,27 @@ static int glm_attention_indexed_lora_causal_gemm(
     if (!cuda_ok(cudaGetLastError(), "glm causal attention kv f16 launch")) {
         return 0;
     }
-    const uint64_t rope_pairs = (uint64_t)n_selected * (qk_rope >> 1u);
-    glm_causal_gemm_rope_to_f16_kernel<<<
-        (rope_pairs + 255u) / 256u, 256>>>(
-            rope_h,
-            (const char *)k_rope_cache->ptr,
-            n_selected,
-            qk_rope,
-            cache_f16,
-            n_ctx_orig,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow);
-    if (!cuda_ok(cudaGetLastError(), "glm causal attention rope f16 launch")) {
-        return 0;
+    if (qk_rope != 0u) {
+        const uint64_t rope_pairs =
+            (uint64_t)n_selected * (qk_rope >> 1u);
+        glm_causal_gemm_rope_to_f16_kernel<<<
+            (rope_pairs + 255u) / 256u, 256>>>(
+                rope_h,
+                (const char *)k_rope_cache->ptr,
+                n_selected,
+                qk_rope,
+                cache_f16,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm causal attention rope f16 launch")) {
+            return 0;
+        }
     }
 
     const float one = 1.0f;
@@ -2762,27 +3916,29 @@ static int glm_attention_indexed_lora_causal_gemm(
         if (!cublas_ok(st, "glm causal attention lora score gemm")) {
             return 0;
         }
-        st = cublasGemmEx(g_cublas,
-                          CUBLAS_OP_T,
-                          CUBLAS_OP_N,
-                          (int)n_selected,
-                          (int)n_tokens,
-                          (int)qk_rope,
-                          &one,
-                          rope_h,
-                          CUDA_R_16F,
-                          (int)qk_rope,
-                          qrope_h,
-                          CUDA_R_16F,
-                          (int)qk_rope,
-                          &one,
-                          scores,
-                          CUDA_R_32F,
-                          (int)n_selected,
-                          CUBLAS_COMPUTE_32F,
-                          CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm causal attention rope score gemm")) {
-            return 0;
+        if (qk_rope != 0u) {
+            st = cublasGemmEx(g_cublas,
+                              CUBLAS_OP_T,
+                              CUBLAS_OP_N,
+                              (int)n_selected,
+                              (int)n_tokens,
+                              (int)qk_rope,
+                              &one,
+                              rope_h,
+                              CUDA_R_16F,
+                              (int)qk_rope,
+                              qrope_h,
+                              CUDA_R_16F,
+                              (int)qk_rope,
+                              &one,
+                              scores,
+                              CUDA_R_32F,
+                              (int)n_selected,
+                              CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, "glm causal attention rope score gemm")) {
+                return 0;
+            }
         }
         glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
             probs, scores, n_tokens, n_selected, pos0, scale);
@@ -3211,14 +4367,15 @@ static int glm_attention_indexed_lora_launch(
             return 0;
         }
     }
-    if (!lora_out || !q || !qk_low || !kv_lora_cache || !k_rope_cache ||
+    if (!lora_out || !q || !qk_low || !kv_lora_cache ||
+        (qk_rope != 0u && !k_rope_cache) ||
         n_tokens == 0u || n_selected == 0u ||
         cache_cap == 0u || n_selected > cache_cap ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_nope == 0u || qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        qk_nope == 0u || (qk_rope & 1u) != 0u ||
         !cuda_attention_score_buffer_fits(n_selected) ||
-        !isfinite(freq_base) || freq_base <= 0.0f ||
-        !isfinite(freq_scale) || freq_scale <= 0.0f ||
+        (qk_rope != 0u && (!isfinite(freq_base) || freq_base <= 0.0f)) ||
+        (qk_rope != 0u && (!isfinite(freq_scale) || freq_scale <= 0.0f)) ||
         !isfinite(ext_factor) || !isfinite(attn_factor) ||
         !isfinite(beta_fast) || !isfinite(beta_slow) ||
         !cuda_tensor_has_elems3(lora_out, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
@@ -3226,7 +4383,8 @@ static int glm_attention_indexed_lora_launch(
         !cuda_tensor_has_elems3(qk_low, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
         (has_selected && !cuda_tensor_has_elems2(selected, n_tokens, n_selected, sizeof(int32_t))) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
     }
     /* Once the visible context exceeds the indexer's top-k, each token carries
@@ -3324,7 +4482,8 @@ static int glm_attention_indexed_lora_launch(
                                                             (const float *)q->ptr,
                                                             (const float *)qk_low->ptr,
                                                             (const char *)kv_lora_cache->ptr,
-                                                            (const char *)k_rope_cache->ptr,
+                                                            k_rope_cache ?
+                                                                (const char *)k_rope_cache->ptr : NULL,
                                                             has_selected ? (const int32_t *)selected->ptr : NULL,
                                                             n_tokens,
                                                             pos0,
@@ -3487,15 +4646,16 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_tensor(
         !cuda_u64_mul_checked(heads_elems, sizeof(float), &heads_bytes)) {
         return 0;
     }
-    if (!heads || !q || !qk_low || !kv_lora_cache || !k_rope_cache ||
+    if (!heads || !q || !qk_low || !kv_lora_cache ||
+        (qk_rope != 0u && !k_rope_cache) ||
         !model_map || !selected ||
         n_tokens == 0u || n_selected == 0u ||
         cache_cap == 0u || n_selected > cache_cap ||
         n_head == 0u || kv_lora_dim == 0u || value_dim == 0u ||
-        qk_nope == 0u || qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        qk_nope == 0u || (qk_rope & 1u) != 0u ||
         !cuda_attention_score_buffer_fits(n_selected) ||
-        !isfinite(freq_base) || freq_base <= 0.0f ||
-        !isfinite(freq_scale) || freq_scale <= 0.0f ||
+        (qk_rope != 0u && (!isfinite(freq_base) || freq_base <= 0.0f)) ||
+        (qk_rope != 0u && (!isfinite(freq_scale) || freq_scale <= 0.0f)) ||
         !isfinite(ext_factor) || !isfinite(attn_factor) ||
         !isfinite(beta_fast) || !isfinite(beta_slow) ||
         !cuda_tensor_has_bytes(q, q_bytes) ||
@@ -3503,7 +4663,8 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_tensor(
         !cuda_tensor_has_elems2(selected, n_tokens, n_selected, sizeof(int32_t)) ||
         !cuda_tensor_has_bytes(heads, heads_bytes) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
     }
     lora_tmp.ptr = cuda_tmp_alloc(lora_tmp.bytes, "glm indexed batch lora");
@@ -3565,7 +4726,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         !q ||
         !qk_low ||
         !kv_lora_cache ||
-        !k_rope_cache ||
+        (qk_rope != 0u && !k_rope_cache) ||
         !selected ||
         !model_map ||
         n_selected == 0u ||
@@ -3575,11 +4736,10 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         kv_lora_dim == 0u ||
         value_dim == 0u ||
         qk_nope == 0u ||
-        qk_rope == 0u ||
         (qk_rope & 1u) != 0u ||
         !cuda_attention_score_buffer_fits(n_selected) ||
-        !isfinite(freq_base) || freq_base <= 0.0f ||
-        !isfinite(freq_scale) || freq_scale <= 0.0f ||
+        (qk_rope != 0u && (!isfinite(freq_base) || freq_base <= 0.0f)) ||
+        (qk_rope != 0u && (!isfinite(freq_scale) || freq_scale <= 0.0f)) ||
         !isfinite(ext_factor) || !isfinite(attn_factor) ||
         !isfinite(beta_fast) || !isfinite(beta_slow) ||
         !cuda_tensor_has_bytes(q, q_bytes) ||
@@ -3587,7 +4747,8 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         !cuda_tensor_has_i32(selected, n_selected) ||
         !cuda_tensor_has_bytes(heads, heads_bytes) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
     }
     ds4_gpu_tensor q_view = *q;
@@ -3878,7 +5039,9 @@ static int glm_router_select_launch(
     const uint32_t active_n_expert_used = n_expert_used != 0u ? n_expert_used : DS4_ROCM_N_EXPERT_USED;
     const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : DS4_ROCM_EXPERT_WEIGHT_SCALE;
     if (!selected || !weights || !probs || !logits || !model_map || n_tokens == 0 ||
-        (active_n_expert != DS4_ROCM_N_EXPERT && active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
+        (active_n_expert != DS4_ROCM_N_EXPERT &&
+         active_n_expert != DS4_ROCM_GLM53_N_EXPERT &&
+         active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
         active_n_expert_used == 0u ||
         active_n_expert_used > active_n_expert ||
         active_n_expert_used > DS4_ROCM_N_EXPERT_USED ||
@@ -3901,6 +5064,16 @@ static int glm_router_select_launch(
     dim3 block(32, 4, 1);
     if (active_n_expert == DS4_ROCM_MAX_N_EXPERT) {
         glm_router_select_warp_topk_kernel<DS4_ROCM_MAX_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (float *)probs->ptr,
+                bias,
+                (const float *)logits->ptr,
+                n_tokens,
+                active_n_expert_used,
+                active_scale);
+    } else if (active_n_expert == DS4_ROCM_GLM53_N_EXPERT) {
+        glm_router_select_warp_topk_kernel<DS4_ROCM_GLM53_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
                 (float *)probs->ptr,
@@ -3980,6 +5153,7 @@ static int glm_rocm_routed_moe_wrap(
         const ds4_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
+        float swiglu_clamp,
         uint32_t layer_index,
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
@@ -4022,7 +5196,7 @@ static int glm_rocm_routed_moe_wrap(
                                              down_row_bytes, expert_in_dim,
                                              expert_mid_dim, out_dim, selected,
                                              weights, n_total_expert, n_expert,
-                                             0.0f, x, NULL, layer_index,
+                                             swiglu_clamp, x, NULL, layer_index,
                                              force_resident);
     }
     return ds4_gpu_routed_moe_batch_tensor(out, &gate_tmp, &up_tmp, mid, &down_tmp,
@@ -4033,7 +5207,7 @@ static int glm_rocm_routed_moe_wrap(
                                            down_row_bytes, expert_in_dim,
                                            expert_mid_dim, out_dim, selected,
                                            weights, n_total_expert, n_expert,
-                                           0.0f, x, layer_index, n_tokens, NULL,
+                                           swiglu_clamp, x, layer_index, n_tokens, NULL,
                                            force_resident);
 }
 
@@ -4061,6 +5235,7 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
+        float swiglu_clamp,
         uint32_t layer_index,
         const ds4_gpu_tensor *x,
         bool force_resident) {
@@ -4070,7 +5245,8 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
                                     up_expert_bytes, up_row_bytes, down_expert_bytes,
                                     down_row_bytes, expert_in_dim, expert_mid_dim,
                                     out_dim, selected, weights, n_total_expert,
-                                    n_expert, layer_index, x, 1, n_expert * expert_mid_dim,
+                                    n_expert, swiglu_clamp, layer_index, x, 1,
+                                    n_expert * expert_mid_dim,
                                     force_resident);
 }
 
@@ -4098,6 +5274,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
+        float swiglu_clamp,
         uint32_t layer_index,
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
@@ -4109,7 +5286,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                                     up_expert_bytes, up_row_bytes, down_expert_bytes,
                                     down_row_bytes, expert_in_dim, expert_mid_dim,
                                     out_dim, selected, weights, n_total_expert,
-                                    n_expert, layer_index, x, n_tokens,
+                                    n_expert, swiglu_clamp, layer_index, x, n_tokens,
                                     mid_token_stride, force_resident);
 }
 
@@ -4137,6 +5314,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t n_total_expert,
         uint32_t n_expert,
+        float swiglu_clamp,
         uint32_t layer_index,
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
@@ -4147,6 +5325,6 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
                                     up_expert_bytes, up_row_bytes, down_expert_bytes,
                                     down_row_bytes, expert_in_dim, expert_mid_dim,
                                     out_dim, selected, weights, n_total_expert,
-                                    n_expert, layer_index, x, n_tokens,
+                                    n_expert, swiglu_clamp, layer_index, x, n_tokens,
                                     mid_token_stride, false);
 }

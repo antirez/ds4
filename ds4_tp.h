@@ -45,14 +45,17 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
-     * slot: slot(seq) = start + ((seq-1) % per_token) * step.
+     * slot. A nonempty mask lists the exact slots in firing order; otherwise
+     * slot(seq) = start + ((seq-1) % per_token) * step.
      * per_token 0 falls back to the identity mapping over all slots
      * (DS4: every layer fires ATTN then FFN). GLM fires one FFN gate per
-     * sparse layer only, so its schedule skips the dense prefix and the
-     * ATTN slots. Exchanged in the hello; both sides must agree. */
+     * sparse layer in streaming mode. Hybrid GLM-5.3 uses the mask because
+     * DSA layers also fire ATTN while KDA layers do not. Exchanged in the
+     * hello; both sides must agree. */
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_identity;
 
 bool ds4_tp_enabled(const ds4_tp_options *opt);
@@ -151,6 +154,10 @@ int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size);
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens);
+int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
+                                const int *tokens, uint32_t n_tokens,
+                                const ds4_vision_span *images,
+                                uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
@@ -188,6 +195,7 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -199,6 +207,8 @@ typedef struct {
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
     uint32_t n_items;
+    ds4_vision_span *images;
+    uint32_t n_images;
 } ds4_tp_command;
 
 int ds4_tp_recv_command(

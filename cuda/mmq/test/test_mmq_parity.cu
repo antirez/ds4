@@ -24,20 +24,28 @@
 
 // Pull in the block_* struct definitions.  We use the CUDA decl/impl mode
 // so the field paths match what the vendored mmq code uses (anonymous
-// outer union + named "data" inner struct).  cuda_fp16.h is available
-// because nvcc compiles this TU.  Half-precision conversions go via
+// outer union + named "data" inner struct).  Half-precision conversions go via
 // __half_raw <-> uint16_t bit patterns, which makes the CPU-side
 // fp16<->float helpers below independent of any host-side fp16 ABI.
 //
 // We DON'T use the host IQ2 lookup tables from this mode (they'd be
 // __device__).  iq2_host_tables.h instead provides plain host const
 // arrays generated directly from ggml-common.h's bit-for-bit contents.
+#if defined(GGML_USE_HIP)
+#define GGML_COMMON_DECL_HIP
+#define GGML_COMMON_IMPL_HIP
+#else
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
+#endif
 #include "../ggml-common.h"
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -719,7 +727,9 @@ bool run_moe_pair_generic(
                           const int32_t *, float *, float *,
                           int, int, int, int, int, cudaStream_t),
         int (*single_entry)(const void *, const float *, const int32_t *,
-                            float *, int, int, int, int, int, cudaStream_t)) {
+                            float *, int, int, int, int, int, cudaStream_t),
+        bool default_stream = false,
+        int repeats = 1) {
     fprintf(stderr, "=== %s/PAIR  M=%d K=%d ntok=%d nexp=%d nused=%d  seed=%u ===\n",
             tag, M, K, n_tokens, n_experts, n_expert_used, seed);
 
@@ -752,8 +762,10 @@ bool run_moe_pair_generic(
 
     const int64_t ne_get_rows = (int64_t)n_tokens * n_expert_used;
     const size_t  out_count   = (size_t)M * ne_get_rows;
+    const size_t  pair_count  = out_count * (size_t)repeats;
 
-    cudaStream_t stream; cudaStreamCreate(&stream);
+    cudaStream_t stream = nullptr;
+    if (!default_stream) cudaStreamCreate(&stream);
     void * dWa = nullptr; void * dWb = nullptr;
     float * dX = nullptr; int32_t * dIds = nullptr;
     float * dYa_single = nullptr; float * dYb_single = nullptr;
@@ -764,45 +776,69 @@ bool run_moe_pair_generic(
     cudaMalloc(&dIds, ids.size() * sizeof(int32_t));
     cudaMalloc(&dYa_single, out_count * sizeof(float));
     cudaMalloc(&dYb_single, out_count * sizeof(float));
-    cudaMalloc(&dYa_pair,   out_count * sizeof(float));
-    cudaMalloc(&dYb_pair,   out_count * sizeof(float));
+    cudaMalloc(&dYa_pair,   pair_count * sizeof(float));
+    cudaMalloc(&dYb_pair,   pair_count * sizeof(float));
     cudaMemcpyAsync(dWa, W_a.data(), W_a.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(dWb, W_b.data(), W_b.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(dX,  X.data(),   X.size()  * sizeof(float),   cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(dIds, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
     cudaMemsetAsync(dYa_single, 0, out_count * sizeof(float), stream);
     cudaMemsetAsync(dYb_single, 0, out_count * sizeof(float), stream);
-    cudaMemsetAsync(dYa_pair,   0, out_count * sizeof(float), stream);
-    cudaMemsetAsync(dYb_pair,   0, out_count * sizeof(float), stream);
+    cudaMemsetAsync(dYa_pair,   0, pair_count * sizeof(float), stream);
+    cudaMemsetAsync(dYb_pair,   0, pair_count * sizeof(float), stream);
 
     int rc_sa = single_entry(dWa, dX, dIds, dYa_single, M, K, n_tokens, n_experts, n_expert_used, stream);
     int rc_sb = single_entry(dWb, dX, dIds, dYb_single, M, K, n_tokens, n_experts, n_expert_used, stream);
-    int rc_p  = pair_entry  (dWa, dWb, dX, dIds, dYa_pair, dYb_pair,
-                             M, K, n_tokens, n_experts, n_expert_used, stream);
+    int rc_p = 0;
+    for (int repeat = 0; repeat < repeats && rc_p == 0; repeat++) {
+        rc_p = pair_entry(
+            dWa, dWb, dX, dIds,
+            dYa_pair + (size_t)repeat * out_count,
+            dYb_pair + (size_t)repeat * out_count,
+            M, K, n_tokens, n_experts, n_expert_used, stream);
+    }
     if (rc_sa != 0 || rc_sb != 0 || rc_p != 0) {
         fprintf(stderr, "%s pair entry: rc_sa=%d rc_sb=%d rc_p=%d\n", tag, rc_sa, rc_sb, rc_p);
         cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
         cudaFree(dYa_single); cudaFree(dYb_single); cudaFree(dYa_pair); cudaFree(dYb_pair);
-        cudaStreamDestroy(stream);
+        if (stream) cudaStreamDestroy(stream);
         return false;
     }
 
     std::vector<float> ya_single(out_count, 0.0f), yb_single(out_count, 0.0f);
-    std::vector<float> ya_pair  (out_count, 0.0f), yb_pair  (out_count, 0.0f);
+    std::vector<float> ya_pair(pair_count, 0.0f), yb_pair(pair_count, 0.0f);
     cudaMemcpyAsync(ya_single.data(), dYa_single, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(yb_single.data(), dYb_single, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(ya_pair.data(),   dYa_pair,   out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(yb_pair.data(),   dYb_pair,   out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(ya_pair.data(), dYa_pair, pair_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(yb_pair.data(), dYb_pair, pair_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
     cudaFree(dYa_single); cudaFree(dYb_single); cudaFree(dYa_pair); cudaFree(dYb_pair);
-    cudaStreamDestroy(stream);
+    if (stream) cudaStreamDestroy(stream);
 
-    // Both pair outputs should be bit-identical to their single counterparts -
-    // same kernel, same Q8_1 buffer.  Allow exactly zero abs/rel tolerance.
-    const bool ok_a = check_close(ya_pair, ya_single, 0.0f, 0.0f);
-    const bool ok_b = check_close(yb_pair, yb_single, 0.0f, 0.0f);
-    const bool ok   = ok_a && ok_b;
+    // The pair path can choose a tighter tile width than two separate calls,
+    // which changes accumulation order slightly. Repeated pair calls must
+    // still be bit-identical to the first pair result.
+#if defined(GGML_USE_HIP)
+    constexpr float pair_atol = 2.0e-4f;
+    constexpr float pair_rtol = 1.0e-5f;
+#else
+    constexpr float pair_atol = 0.0f;
+    constexpr float pair_rtol = 0.0f;
+#endif
+    const std::vector<float> ya_first(ya_pair.begin(), ya_pair.begin() + out_count);
+    const std::vector<float> yb_first(yb_pair.begin(), yb_pair.begin() + out_count);
+    bool ok_a = check_close(ya_first, ya_single, pair_atol, pair_rtol);
+    bool ok_b = check_close(yb_first, yb_single, pair_atol, pair_rtol);
+    for (int repeat = 1; repeat < repeats; repeat++) {
+        const auto a_first = ya_pair.begin() + (size_t)repeat * out_count;
+        const auto b_first = yb_pair.begin() + (size_t)repeat * out_count;
+        const std::vector<float> ya(a_first, a_first + out_count);
+        const std::vector<float> yb(b_first, b_first + out_count);
+        ok_a &= check_close(ya, ya_first, 0.0f, 0.0f);
+        ok_b &= check_close(yb, yb_first, 0.0f, 0.0f);
+    }
+    const bool ok = ok_a && ok_b;
     fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -1197,6 +1233,15 @@ int main(int argc, char ** argv) {
         "IQ2_XXS", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC0FE10, gen_iq2,
         ds4_mmq_iq2_xxs_moe_pair, ds4_mmq_iq2_xxs_moe);
+    // Production admission geometry. This uses the default stream so the
+    // persistent routing maps and tight expert-column bound are exercised
+    // together.
+    all_ok &= run_moe_pair_generic<block_iq2_xxs>(
+        "IQ2_XXS/PRODUCTION_ADMISSION", QK_K_LOCAL,
+        /*M=*/256, /*K=*/512, /*nt=*/371, /*ne=*/256, /*nu=*/6,
+        0xC0FE11, gen_iq2,
+        ds4_mmq_iq2_xxs_moe_pair, ds4_mmq_iq2_xxs_moe,
+        /*default_stream=*/true, /*repeats=*/32);
     all_ok &= run_moe_pair_generic<block_q4_K>(
         "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,

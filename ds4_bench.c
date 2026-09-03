@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -23,10 +24,19 @@
 #include <string.h>
 #include <time.h>
 
+/* CUDA builds resolve these weak symbols through libcudart; other builds
+ * remain independent of CUDA headers and libraries. */
+#if defined(__GNUC__) && !defined(__APPLE__)
+#define DS4_BENCH_HAVE_CUDA_PROFILER 1
+extern int cudaProfilerStart(void) __attribute__((weak));
+extern int cudaProfilerStop(void) __attribute__((weak));
+#endif
+
 #define DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES (UINT64_C(1) << 30)
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -51,6 +61,7 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -58,6 +69,10 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
     bool show_output;
+    bool teacher_forced_decode;
+    bool dspark;
+    bool dspark_confidence_threshold_set;
+    float dspark_confidence_threshold;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -234,8 +249,38 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-model")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark = true;
+        } else if (!strcmp(arg, "--dspark-confidence")) {
+            const double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1.0) {
+                fprintf(stderr, "ds4-bench: --dspark-confidence must be between 0 and 1\n");
+                exit(2);
+            }
+            c.dspark = true;
+            c.dspark_confidence_threshold = (float)v;
+            c.dspark_confidence_threshold_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -328,6 +373,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--show-output")) {
             c.show_output = true;
+        } else if (!strcmp(arg, "--teacher-forced-decode")) {
+            c.teacher_forced_decode = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -337,6 +384,16 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.dspark && !c.mtp_path) {
+        fprintf(stderr, "ds4-bench: --dspark requires --mtp-model FILE\n");
+        exit(2);
+    }
+    if (c.dspark && c.teacher_forced_decode) {
+        fprintf(stderr,
+                "ds4-bench: --dspark cannot be combined with "
+                "--teacher-forced-decode\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -360,12 +417,20 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
     }
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.tp,
+                                          &c.dist,
+                                          tp_err,
+                                          sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
         exit(2);
     }
-    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER || c.tp.role == DS4_TP_WORKER) {
         fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
@@ -551,6 +616,12 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
+static void close_engine(ds4_engine *engine, ds4_tp *tp) {
+    if (tp) ds4_tp_send_stop(tp);
+    ds4_engine_close(engine);
+    ds4_tp_free(tp);
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
@@ -576,6 +647,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -588,16 +660,25 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .dspark = cfg.dspark,
+        .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
+        .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
+    char tp_err[256];
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -616,6 +697,33 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    ds4_tp *tp_leader = NULL;
+    if (cfg.tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.ctx_alloc,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
+        if (!ds4_tp_create(&tp_leader,
+                           &cfg.tp,
+                           &tp_id,
+                           tp_err,
+                           sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-bench: %s\n", tp_err);
+            close_engine(engine, tp_leader);
+            return 1;
+        }
+    }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
@@ -630,13 +738,16 @@ int main(int argc, char **argv) {
     }
     free(text);
 
-    if (prompt.len < cfg.ctx_max) {
+    const int prompt_tokens_needed = cfg.ctx_max +
+        (cfg.teacher_forced_decode ? cfg.gen_tokens : 0);
+    if (prompt.len < prompt_tokens_needed) {
         fprintf(stderr,
-                "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
+                "ds4-bench: prompt has %d tokens, need at least %d%s\n",
                 prompt.len,
-                cfg.ctx_max);
+                prompt_tokens_needed,
+                cfg.teacher_forced_decode ? " for teacher-forced decode" : "");
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        close_engine(engine, tp_leader);
         return 1;
     }
 
@@ -644,7 +755,7 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        close_engine(engine, tp_leader);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -652,7 +763,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        close_engine(engine, tp_leader);
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
@@ -664,7 +775,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.csv_path, strerror(errno));
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
-            ds4_engine_close(engine);
+            close_engine(engine, tp_leader);
             return 1;
         }
     }
@@ -672,7 +783,23 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
-    const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool distributed =
+        cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
+        cfg.tp.role == DS4_TP_LEADER;
+    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
+    if (cfg.dspark && !speculative) {
+        fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
+        if (out != stdout) fclose(out);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        close_engine(engine, tp_leader);
+        return 1;
+    }
+    if (speculative) {
+        fprintf(stderr,
+                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
+                ds4_engine_mtp_draft_tokens(engine));
+    }
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;
@@ -688,7 +815,18 @@ int main(int argc, char **argv) {
         };
 
         const double prefill_t0 = bench_now_sec();
-        if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+#if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
+        const bool cuda_profile_prefill =
+            getenv("DS4_BENCH_CUDA_PROFILE_PREFILL") != NULL &&
+            cudaProfilerStart && cudaProfilerStop;
+        if (cuda_profile_prefill) (void)cudaProfilerStart();
+#endif
+        const int prefill_rc =
+            ds4_session_sync(session, &prefix, err, sizeof(err));
+#if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
+        if (cuda_profile_prefill) (void)cudaProfilerStop();
+#endif
+        if (prefill_rc != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
             rc = 1;
             break;
@@ -732,34 +870,98 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int cuda_profile_start = -1;
+        int cuda_profile_tokens = 0;
+        const char *cuda_profile_range =
+            getenv("DS4_BENCH_CUDA_PROFILE_RANGE");
+        if (cuda_profile_range &&
+            (sscanf(cuda_profile_range, "%d:%d",
+                    &cuda_profile_start, &cuda_profile_tokens) != 2 ||
+             cuda_profile_start < 0 || cuda_profile_tokens <= 0)) {
+            fprintf(stderr,
+                    "ds4-bench: invalid DS4_BENCH_CUDA_PROFILE_RANGE=%s "
+                    "(expected START_TOKEN:TOKEN_COUNT)\n",
+                    cuda_profile_range);
+            cuda_profile_start = -1;
+            cuda_profile_tokens = 0;
+        }
+        bool generation_stop = false;
+        while (gen_done < cfg.gen_tokens && !generation_stop) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
+            const int token = cfg.teacher_forced_decode
+                ? prompt.v[frontier + gen_done]
+                : ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+#if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
+            if (gen_done == cuda_profile_start && cudaProfilerStart) {
+                (void)cudaProfilerStart();
             }
+#endif
+            int toks[17];
+            int ntok = 1;
+            if (speculative) {
+                ntok = ds4_session_eval_speculative_argmax(
+                    session, token, cfg.gen_tokens - gen_done, eos,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (ntok == 0) {
+                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d accepted no tokens\n", frontier);
+                    rc = 1;
+                    break;
+                }
+            } else {
+                toks[0] = token;
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+            }
+#if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
+            if (cuda_profile_start >= 0 &&
+                gen_done + ntok >=
+                    cuda_profile_start + cuda_profile_tokens &&
+                cudaProfilerStop) {
+                (void)cudaProfilerStop();
+            }
+#endif
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            int cycle_tokens = 0;
+            for (int j = 0; j < ntok && gen_done < cfg.gen_tokens; j++) {
+                if (toks[j] == eos) {
+                    generation_stop = true;
+                    break;
+                }
+                if (gen_token_buf) gen_token_buf[gen_token_count++] = toks[j];
+                gen_done++;
+                cycle_tokens++;
+            }
+            if (gen_first_tokens == 0) {
+                gen_first_sec = token_t1 - token_t0;
+                gen_first_tokens = cycle_tokens;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+            }
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,7 +997,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens = gen_done > gen_first_tokens ?
+            gen_done - gen_first_tokens : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,
@@ -817,6 +1020,6 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
-    ds4_engine_close(engine);
+    close_engine(engine, tp_leader);
     return rc;
 }

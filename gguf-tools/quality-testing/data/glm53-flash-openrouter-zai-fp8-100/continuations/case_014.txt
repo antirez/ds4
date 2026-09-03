@@ -1,0 +1,8 @@
+# Cache KV su disco nelle sessioni agentiche
+
+## Il problema
+
+Nei sistemi transformer, ogni token generato produce una **cache KV** (Key-Value cache): le rappresentazioni interne di tutti i token precedenti, necessarie per generare i successivi. Nelle sessioni agentiche questo diventa critico perché:
+
+1. **Contesti molto lunghi**: un agente accumula cronologia di conversazione, risultati di tool, output di codice, documenti letti — spesso decine o centinaia di migliaia di token.
+2. **Chiamate iterative**:

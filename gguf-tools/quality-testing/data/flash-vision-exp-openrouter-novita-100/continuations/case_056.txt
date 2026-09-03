@@ -1,0 +1,1 @@
+Per rispondere con precisione, è importante chiarire che in un **Layer Mixture-of-Experts (MoE)** il termine "router" non si riferisce a un dispositivo di rete, ma a una **rete neurale leggera** (solitamente un piccolo MLP o una funzione line

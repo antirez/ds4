@@ -1,0 +1,9 @@
+# GPU Prefill vs. Single-Token Decode: Why Prefill Is Faster
+
+## The Core Difference: Compute vs. Memory Bound
+
+**Prefill** (processing the prompt) processes many tokens **in parallel**, while **decode** (generating each new token) processes **one token at a time**. This leads to fundamentally different performance characteristics.
+
+## 1. Arithmetic Intensity
+
+- **Prefill**: All prompt tokens flow through the model simultaneously. Matrix multiplications have large dimensions (e.g., `[batch, seq_len, d_model] × [d_model, d_model]`), so each weight loaded from

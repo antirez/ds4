@@ -15,10 +15,15 @@ calling hosted APIs:
 
 - `data/glm52-openrouter-100`: 100 GLM 5.2 continuations collected through
   OpenRouter `z-ai/glm-5.2` with `top_logprobs=20`.
+- `data/glm53-flash-openrouter-zai-fp8-100`: 100 GLM 5.3 Flash continuations
+  from OpenRouter's pinned Z.AI FP8 endpoint. The endpoint does not expose
+  logprobs, so these are deterministic continuation fixtures.
 - `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
-- `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
+- `data/pro`: 100 DeepSeek V4 PRO preview continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
+- `data/pro-0813`: 100 DeepSeek V4 PRO 0813 continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -65,14 +70,33 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort none
 ```
 
-Use one output directory per official model. For PRO through the official
+For GLM 5.3 Flash through the pinned Z.AI FP8 endpoint:
+
+```sh
+export OPENROUTER_API_KEY=...
+python3 gguf-tools/quality-testing/collect_official.py \
+  --model z-ai/glm-5.3-flash \
+  --endpoint https://openrouter.ai/api/v1/chat/completions \
+  --api-key-env OPENROUTER_API_KEY \
+  --prompts gguf-tools/quality-testing/prompts.jsonl \
+  --out gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100 \
+  --count 100 \
+  --max-tokens 128 \
+  --top-logprobs 0 \
+  --token-limit-field max_tokens \
+  --provider-order z-ai/fp8 \
+  --thinking omit \
+  --reasoning-effort low
+```
+
+Use one output directory per checkpoint. For PRO 0813 through the official
 DeepSeek API:
 
 ```sh
 python3 gguf-tools/quality-testing/collect_official.py \
   --model deepseek-v4-pro \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/pro \
+  --out gguf-tools/quality-testing/data/pro-0813 \
   --count 100 \
   --max-tokens 24 \
   --top-logprobs 20
@@ -119,11 +143,13 @@ gguf-tools/quality-testing/score_official \
   4096
 ```
 
-Use `data/flash/manifest.tsv` for Flash GGUFs,
-`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs, and
-`data/pro/manifest.tsv` for PRO GGUFs.  The scorer and comparator do not care
-which model produced the manifest; the manifest path selects the continuation
-set.
+Use `data/flash/manifest.tsv` for Flash GGUFs and
+`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs. Use
+`data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv` for GLM 5.3 Flash. Use
+`data/pro/manifest.tsv` for the PRO preview checkpoint and
+`data/pro-0813/manifest.tsv` for PRO 0813. The scorer and comparator do not
+care which model produced the manifest; the manifest path selects the
+continuation set.
 
 Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
 independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest

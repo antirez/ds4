@@ -1,0 +1,13 @@
+# Top-p (Nucleus) Sampling vs. Temperature Zero (Greedy) Decoding
+
+## Temperature Zero (Greedy Decoding)
+
+**How it works:** Always selects the highest-probability token at each step.
+
+**Pros:**
+- **Deterministic and reproducible** — same input always yields the same output, which is valuable for debugging, testing, and production consistency
+- **Maximizes per-token likelihood** — each step picks the locally most probable continuation
+- **Fast to reason about** — no hyperparameter tuning needed
+
+**Cons:**
+- **Repetition loops** — greedy decoding notoriously gets

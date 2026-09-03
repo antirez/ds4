@@ -1,0 +1,15 @@
+# Ring Buffers: Wrapping and Overflow Prevention
+
+## What Is a Ring Buffer?
+
+A ring buffer (circular buffer) is a fixed-size array treated as if it were connected end-to-end. Two pointers track its state:
+
+- **Head (write pointer)**: where new data is written
+- **Tail (read pointer)**: where data is read
+
+## How Wrapping Works
+
+When the write pointer reaches the end of the array, it wraps around to index 0 instead of allocating more memory:
+
+```
+Size = 8, buffer contains [A B C D E], head=5, tail=0

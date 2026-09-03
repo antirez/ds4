@@ -1,0 +1,3 @@
+Per rispondere a questa domanda, dobbiamo prima chiarire cosa intendiamo per **"esperti rari"** in un contesto di quantizzazione. 
+
+In ambito tecnico-scientifico (come l'elaborazione dei segnali, l'IA o la fisica),

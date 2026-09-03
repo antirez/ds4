@@ -1,0 +1,9 @@
+# Confrontare due quantizzazioni senza fidarsi di una sola risposta
+
+Quando si confrontano due metodi o esecuzioni di quantizzazione (es. due modelli compressi, due run dello stesso algoritmo), l'obiettivo è valutare le differenze in modo indipendente e verificabile. Ecco un approccio strutturato:
+
+## 1. Definire metriche oggettive multiple
+
+Non affidarsi a una singola misura, ma combinarne diverse:
+
+- **Accuratezza del modello**: valutare entrambe le quantizzazioni su uno stesso set di test

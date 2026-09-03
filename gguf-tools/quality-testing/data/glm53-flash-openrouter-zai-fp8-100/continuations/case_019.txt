@@ -1,0 +1,10 @@
+# Tre invarianti per una tabella di token speciali
+
+Una tabella di token speciali (es. `<PAD>`, `<UNK>`, `<BOS>`, `<EOS>`, `<SEP>`, `<MASK>`) deve rispettare tipicamente questi invarianti:
+
+## 1. Unicità degli ID
+Ogni token speciale ha un ID distinto e non sovrapposto:
+```
+∀ i, j : 0 ≤ i < j < n → id(token[i]) ≠ id(token[j])
+```
+N

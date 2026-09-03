@@ -1,0 +1,10 @@
+# Backpressure in un server di rete
+
+Il **backpressure** (contropressione) è un meccanismo con cui un sistema segnala a chi lo sta "sopraffacendo" di rallentare, perché non riesce a gestire il carico corrente.
+
+## Il problema che risolve
+
+Immagina un server che riceve richieste più velocemente di quanto riesca a processarle. Senza backpressure:
+
+- Le richieste si accumulano in coda (buffer sempre più grandi)
+- La memoria cresce fino all'esaurimento (OOM)

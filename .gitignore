@@ -30,10 +30,14 @@
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
 /tests/test_sampling
+/tests/test_glm53_kda
+/tests/test_deepseek4_vision_image
 *.o
 *.dSYM/
 __pycache__/
 *.pyc
+/gguf-tools/libds4quants.dylib
+/gguf-tools/libds4quants.so
 /misc/
 .*.swp
 .DS_Store
