@@ -356,6 +356,10 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "When generation is still inside <think>, soft/hard reply budgets can force </think> so HTTP callers leave room for an answer (same controller as ds4-eval).");
+    opt(fp, c, "--soft-limit-reply-budget N", "Soft close thinking near the end of reply budget. Default: 1024");
+    opt(fp, c, "--hard-limit-reply-budget N", "Force </think> with N tokens left. Default: 512");
+    opt(fp, c, "--soft-limit-think-close-rank N", "Soft-close when </think> is in top N tokens. Default: 3");
     fputc('\n', fp);
 }
 

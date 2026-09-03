@@ -9104,6 +9104,9 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    int soft_limit_reply_budget;
+    int hard_limit_reply_budget;
+    int soft_limit_think_close_rank;
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
@@ -10967,6 +10970,53 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static int server_token_rank_in_top(ds4_session *session, int token, int max_rank) {
+    if (token < 0 || max_rank <= 0 || !session) return 0;
+    ds4_token_score *top = malloc((size_t)max_rank * sizeof(*top));
+    if (!top) return 0;
+    int n = ds4_session_top_logprobs(session, top, max_rank);
+    int rank = 0;
+    for (int i = 0; i < n; i++) {
+        if (top[i].id == token) {
+            rank = i + 1;
+            break;
+        }
+    }
+    free(top);
+    return rank;
+}
+
+/* Mirror ds4-eval: soft-close when </think> is already near the top, hard-close
+ * to reserve answer tokens. Returns >=0 to force that token, or -1 to sample. */
+static int server_think_close_forced_token(ds4_session *session,
+                                          bool inside_think,
+                                          const ds4_tokens *close_tokens,
+                                          int *forced_close_pos,
+                                          int remaining_budget,
+                                          int soft_budget,
+                                          int hard_budget,
+                                          int soft_rank_limit) {
+    if (!inside_think || !close_tokens || close_tokens->len <= 0 || !forced_close_pos) {
+        return -1;
+    }
+    if (*forced_close_pos >= 0) {
+        int token = close_tokens->v[*forced_close_pos];
+        (*forced_close_pos)++;
+        if (*forced_close_pos >= close_tokens->len) *forced_close_pos = -1;
+        return token;
+    }
+    if (remaining_budget <= hard_budget) {
+        *forced_close_pos = close_tokens->len > 1 ? 1 : -1;
+        return close_tokens->v[0];
+    }
+    if (remaining_budget <= soft_budget && close_tokens->len == 1) {
+        if (server_token_rank_in_top(session, close_tokens->v[0], soft_rank_limit) > 0) {
+            return close_tokens->v[0];
+        }
+    }
+    return -1;
+}
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
@@ -12433,6 +12483,15 @@ decode_again:
     size_t think_recovery_scan_from = 0;
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
+    ds4_tokens think_close_tokens = {0};
+    int forced_close_pos = -1;
+    const bool think_close_enabled =
+        thinking_gates_tool_markers &&
+        max_tokens > s->hard_limit_reply_budget &&
+        s->soft_limit_reply_budget >= s->hard_limit_reply_budget;
+    if (think_close_enabled) {
+        ds4_tokenize_text(s->engine, "</think>", &think_close_tokens);
+    }
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -12461,11 +12520,26 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
-            ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k,
-                               top_p, min_p, &rng);
+        const int remaining_budget = max_tokens - completion;
+        int token = -1;
+        if (think_close_enabled) {
+            token = server_think_close_forced_token(slot->session,
+                                                   thinking.inside,
+                                                   &think_close_tokens,
+                                                   &forced_close_pos,
+                                                   remaining_budget,
+                                                   s->soft_limit_reply_budget,
+                                                   s->hard_limit_reply_budget,
+                                                   s->soft_limit_think_close_rank);
+        }
+        const bool forced_think_close = token >= 0;
+        if (token < 0) {
+            token = j->req.ignore_eos ?
+                ds4_session_argmax_ignoring_eos(slot->session,
+                                                j->req.think_mode) :
+                ds4_session_sample(slot->session, temperature, top_k,
+                                   top_p, min_p, &rng);
+        }
         if (token < 0) {
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -12480,7 +12554,8 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode &&
+        if (!forced_think_close &&
+            !s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -12701,6 +12776,7 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+    ds4_tokens_free(&think_close_tokens);
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -13761,6 +13837,9 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    int soft_limit_reply_budget;
+    int hard_limit_reply_budget;
+    int soft_limit_think_close_rank;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -13911,6 +13990,9 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .soft_limit_reply_budget = 1024,
+        .hard_limit_reply_budget = 512,
+        .soft_limit_think_close_rank = 3,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
     };
@@ -13991,6 +14073,12 @@ static server_config parse_options(int argc, char **argv) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
+            c.soft_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
+            c.hard_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--soft-limit-think-close-rank")) {
+            c.soft_limit_think_close_rank = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -14118,6 +14206,18 @@ static server_config parse_options(int argc, char **argv) {
     {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
+        exit(2);
+    }
+    if (c.hard_limit_reply_budget >= c.default_tokens) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --hard-limit-reply-budget (%d) must be smaller than --tokens (%d)",
+                   c.hard_limit_reply_budget, c.default_tokens);
+        exit(2);
+    }
+    if (c.soft_limit_reply_budget < c.hard_limit_reply_budget) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --soft-limit-reply-budget (%d) must be >= --hard-limit-reply-budget (%d)",
+                   c.soft_limit_reply_budget, c.hard_limit_reply_budget);
         exit(2);
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
@@ -14275,6 +14375,9 @@ int main(int argc, char **argv) {
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    s.soft_limit_reply_budget = cfg.soft_limit_reply_budget;
+    s.hard_limit_reply_budget = cfg.hard_limit_reply_budget;
+    s.soft_limit_think_close_rank = cfg.soft_limit_think_close_rank;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -14517,6 +14620,44 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_think_close_reply_budget_options(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.soft_limit_reply_budget == 1024);
+    TEST_ASSERT(defaults.hard_limit_reply_budget == 512);
+    TEST_ASSERT(defaults.soft_limit_think_close_rank == 3);
+
+    char *custom_argv[] = {
+        "ds4-server",
+        "--soft-limit-reply-budget", "2048",
+        "--hard-limit-reply-budget", "256",
+        "--soft-limit-think-close-rank", "5",
+    };
+    server_config custom = parse_options(7, custom_argv);
+    TEST_ASSERT(custom.soft_limit_reply_budget == 2048);
+    TEST_ASSERT(custom.hard_limit_reply_budget == 256);
+    TEST_ASSERT(custom.soft_limit_think_close_rank == 5);
+
+    ds4_tokens close = {0};
+    int ids[2] = {42, 43};
+    close.v = ids;
+    close.len = 1;
+    int forced_pos = -1;
+    TEST_ASSERT(server_think_close_forced_token(NULL, false, &close, &forced_pos,
+                                                100, 1024, 512, 3) == -1);
+    TEST_ASSERT(server_think_close_forced_token(NULL, true, &close, &forced_pos,
+                                                512, 1024, 512, 3) == 42);
+    TEST_ASSERT(forced_pos == -1);
+    forced_pos = -1;
+    close.len = 2;
+    TEST_ASSERT(server_think_close_forced_token(NULL, true, &close, &forced_pos,
+                                                10, 1024, 512, 3) == 42);
+    TEST_ASSERT(forced_pos == 1);
+    TEST_ASSERT(server_think_close_forced_token(NULL, true, &close, &forced_pos,
+                                                10, 1024, 512, 3) == 43);
+    TEST_ASSERT(forced_pos == -1);
 }
 
 static void test_multimodal_prefill_resume_frontier(void) {
@@ -19405,6 +19546,7 @@ static void test_responses_inline_image_content(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_think_close_reply_budget_options();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
