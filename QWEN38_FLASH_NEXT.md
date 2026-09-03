@@ -1648,6 +1648,33 @@ The verify pass prices every row at ~7.7 ms and the M5's acceptance on
 counting is near-perfect at every depth, which is exactly why deeper
 drafts keep paying here longer than on the M3.
 
+ds4-bench can now drive the same comparison end to end (`--mtp-draft N`,
+joining `--mtp-model`; the speculative loop and per-frontier session
+snapshots were already in place for DSpark).  Measured on the M5 Max with
+the standard sweep shape (8 windows, 32K..262078, 64 greedy tokens each):
+on a 300K-number deterministic counting corpus, depth 7 delivers
+60.9/59.1/58.4/55.3/56.8/51.6/53.2/51.8 tok/s against plain
+39.5/39.0/38.6/37.6/37.4/36.9/35.2/35.6 — a +46..+56 percent end-to-end
+win that holds across the whole context band, with the MTP arm's
+context falloff proportional to plain's.  On prose (tripled
+promessi_sposi) depth 4 measures 30.4..26.9 against plain 34.5..32.3 —
+a 7-16 percent LOSS at this window size: 64 greedy tokens is ~16
+speculative cycles, exactly the scheduler's window, so the unprofitable
+speculative phase is paid in full every window and the bypass decision
+never arrives.  Short greedy windows over entropic text are the worst
+case for speculative decode here; longer runs bypass after the window
+and land within ~1 ms/token of plain.
+
+One harness boundary measured while closing the session: `ds4-eval`
+generates by sampling each token (default temperature 1.0) through the
+one-token-at-a-time eval loop, so the greedy speculative executor never
+runs there — passing `--mtp-model/--mtp-draft` to `ds4-eval` fires zero
+speculative cycles and only adds the per-token drafter-history pass
+(measured 39.3 -> 44.1 s wall on two questions, +12 percent, identical
+outputs; zero `Qwen MTP timing` lines in the log).  ds4-eval now prints a
+note when it sees those flags; speculative decoding is a `ds4-server
+--mtp-draft` feature.
+
 ## Integration status
 
 Pack conversion, trusted-local loading, single-base Metal mapping, adaptive

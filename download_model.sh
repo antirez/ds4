@@ -5,6 +5,8 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
+# Qwen3.8 DS4 release; will move to the antirez org — flip this one line then.
+QWEN38_REPO="ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -30,6 +32,9 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
+QWEN38_Q4K_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out.gguf"
+QWEN38_Q4K_MTP_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf"
+QWEN38_PLE_FILE="Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -67,6 +72,7 @@ Usage:
   ./download_model.sh glm53-q4 [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
   ./download_model.sh glm53-vision [--token TOKEN]
+  ./download_model.sh qwen38-q4k [--token TOKEN]
 
 Targets:
 
@@ -166,6 +172,15 @@ Targets:
   glm53-vision
        GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
        with --vision; this target does not update ./ds4flash.gguf.
+
+  qwen38-q4k
+       Qwen3.8-Flash-Next DS4 Q4_K imatrix build: the base
+       GGUF, the MTP speculative-decoding variant, and the external PLE
+       n-gram sidecar — about 180 GB on disk together. Routed gate/up
+       experts are imatrix Q4_K, routed down MXFP4, dense Q8_0. Both GGUFs
+       need --ple at runtime; the MTP file additionally takes --mtp
+       (--mtp-exact-sampling for exact sampling under speculation).
+       Fits 128 GB Macs (~68 GiB resident).
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -292,6 +307,12 @@ case "$MODEL" in
         MODEL_FILE=$GLM53_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
+        ;;
+    qwen38-q4k)
+        REPO=$QWEN38_REPO
+        MODEL_FILE=$QWEN38_Q4K_FILE
+        MODEL_FILES="$QWEN38_Q4K_FILE $QWEN38_Q4K_MTP_FILE $QWEN38_PLE_FILE"
+        FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)
         usage
