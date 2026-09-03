@@ -70,7 +70,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut test-kv-frontier-state
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -113,6 +113,18 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
+
+ds4_metal_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -c -o $@ ds4.c
+
+tests/test_kv_frontier_state.o: tests/test_kv_frontier_state.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ tests/test_kv_frontier_state.c
+
+tests/test_kv_frontier_state: tests/test_kv_frontier_state.o ds4_metal_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-kv-frontier-state: tests/test_kv_frontier_state
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_kv_frontier_state
 
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<

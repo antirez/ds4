@@ -54696,6 +54696,40 @@ static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
     return (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
+/* Compressor frontier-state occupancy.
+ *
+ * Single-lane layers (compress_ratio != 0 && != 4, i.e. coff == 1) use the
+ * attn_state_* buffers as a ring of `ratio` rows, one written per token at
+ * index pos % ratio.  At a checkpoint of live length L only the `partial =
+ * L % ratio` rows accumulated in the current block are live; rows [partial,
+ * ratio) are stale leftovers from the previous committed block and are
+ * overwritten before they are ever read (they are still inside the raw SWA
+ * window, so no attention path reads the in-progress compressor state
+ * mid-block).  We therefore serialize only the occupied rows plus a u32 count.
+ *
+ * Ratio-4 layers are two-lane (coff == 2): the pooler reads the one-block-old
+ * lane A by design, so the stale-rows-never-read invariant is false there and
+ * they keep the full-capacity layout byte-for-byte.
+ *
+ * No new struct fields: partial is derived from the checkpoint length and
+ * cross-checked against the already-serialized n_comp on load
+ * (n_comp * ratio + partial == checkpoint_len). */
+static uint32_t layer_state_partial_rows(uint32_t ratio, uint32_t checkpoint_len) {
+    return checkpoint_len % ratio;
+}
+
+/* Bytes occupied by both compressor-state tensors (kv + score) for one layer
+ * in the on-disk payload.  Single-lane: one u32 partial count + partial rows
+ * of kv + partial rows of score.  Ratio-4: full capacity, unchanged. */
+static uint64_t layer_attn_state_payload_bytes(uint32_t ratio, uint32_t checkpoint_len) {
+    if (ratio != 4) {
+        const uint32_t partial = layer_state_partial_rows(ratio, checkpoint_len);
+        const uint64_t span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+        return 2u * span + sizeof(uint32_t);
+    }
+    return 2u * layer_attn_state_bytes(ratio);
+}
+
 #ifndef DS4_NO_GPU
 /* Only the last logical sliding-window rows are needed from the raw cache.
  * The physical Metal tensor is a ring sized for ubatches, but after restore
@@ -54721,8 +54755,7 @@ static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
-        bytes += layer_attn_state_bytes(ratio);
-        bytes += layer_attn_state_bytes(ratio);
+        bytes += layer_attn_state_payload_bytes(ratio, checkpoint_len);
         if (ratio == 4) {
             bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
             bytes += layer_index_state_bytes(ratio);
@@ -55161,6 +55194,7 @@ static uint32_t session_cpu_comp_cap(const ds4_session *s) {
 }
 
 static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
+    const uint32_t checkpoint_len = (uint32_t)s->checkpoint.len;
     uint64_t bytes = 0;
     const uint32_t raw_live = session_cpu_raw_live_rows(s);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -55169,8 +55203,7 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
         const uint32_t ratio = layer->compress_ratio;
         if (ratio == 0) continue;
         bytes += (uint64_t)layer->n_comp * DS4_N_HEAD_DIM * sizeof(float);
-        bytes += layer_attn_state_bytes(ratio);
-        bytes += layer_attn_state_bytes(ratio);
+        bytes += layer_attn_state_payload_bytes(ratio, checkpoint_len);
         if (ratio == 4) {
             bytes += (uint64_t)layer->n_index_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
             bytes += layer_index_state_bytes(ratio);
@@ -55184,6 +55217,66 @@ static void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
+
+#ifdef DS4_TEST_HOOKS
+/* Test helper: byte offset of the compressor-state partial count for layer
+ * il_target within a payload ds4_session_save_payload would write at the
+ * session's current checkpoint.  Returns false for ratio-0/4 layers (no partial
+ * field) or unsupported backends.  Reuses the same per-layer accounting as the
+ * real save so it cannot drift from the on-disk layout; used only to let tests
+ * flip the count and assert the load rejects the inconsistency. */
+bool ds4_test_payload_partial_offset(ds4_session *s, uint32_t il_target,
+                                     uint64_t *offset_out) {
+    if (!s || !s->checkpoint_valid || !offset_out) return false;
+    if (ds4_session_is_glm(s) || ds4_session_is_distributed(s)) return false;
+    const uint32_t checkpoint_len = (uint32_t)s->checkpoint.len;
+
+    uint32_t raw_live;
+    uint32_t n_comp_l[DS4_MAX_LAYER];
+    uint32_t n_index_l[DS4_MAX_LAYER];
+    if (ds4_session_is_cpu(s)) {
+        raw_live = session_cpu_raw_live_rows(s);
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+            n_comp_l[i] = s->cpu_cache.layer[i].n_comp;
+            n_index_l[i] = s->cpu_cache.layer[i].n_index_comp;
+        }
+    } else {
+#ifdef DS4_NO_GPU
+        return false;
+#else
+        const ds4_gpu_graph *g = &s->graph;
+        raw_live = session_raw_live_rows(g, checkpoint_len);
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+            n_comp_l[i] = g->layer_n_comp[i];
+            n_index_l[i] = g->layer_n_index_comp[i];
+        }
+#endif
+    }
+
+    uint64_t off = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    off += (uint64_t)checkpoint_len * sizeof(uint32_t);   /* token array */
+    off += (uint64_t)DS4_N_VOCAB * sizeof(float);         /* logits       */
+    off += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);      /* n_comp array */
+    off += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);      /* n_index array */
+    for (uint32_t il = 0; il <= il_target && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        off += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);  /* raw rows */
+        if (ratio == 0) continue;
+        off += (uint64_t)n_comp_l[il] * DS4_N_HEAD_DIM * sizeof(float);  /* comp rows */
+        if (il == il_target) {
+            if (ratio == 4) return false;   /* ratio-4 has no partial field */
+            *offset_out = off;              /* partial u32 sits here */
+            return true;
+        }
+        off += layer_attn_state_payload_bytes(ratio, checkpoint_len);
+        if (ratio == 4) {
+            off += (uint64_t)n_index_l[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            off += 2u * layer_index_state_bytes(ratio);
+        }
+    }
+    return false;
+}
+#endif /* DS4_TEST_HOOKS */
 
 static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_end) {
     const uint32_t n_layers = ds4_model_normal_layer_count();
@@ -55237,7 +55330,8 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
     return 0;
 #else
     const ds4_gpu_graph *g = &s->graph;
-    const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
+    const uint32_t checkpoint_len = (uint32_t)s->checkpoint.len;
+    const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
     uint64_t bytes = (uint64_t)DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     const uint32_t n_layers = layer_end - layer_start + 1u;
     bytes += (uint64_t)n_layers * sizeof(uint32_t);
@@ -55247,8 +55341,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
-        bytes += layer_attn_state_bytes(ratio);
-        bytes += layer_attn_state_bytes(ratio);
+        bytes += layer_attn_state_payload_bytes(ratio, checkpoint_len);
         if (ratio == 4) {
             bytes += (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
             bytes += layer_index_state_bytes(ratio);
@@ -55477,10 +55570,18 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                            err,
                                            errlen);
         }
+        uint64_t attn_state_span = layer_attn_state_bytes(ratio);
+        if (ratio != 4) {
+            /* Single-lane layer: prefix the occupied rows with a u32 partial
+             * count (partial = L % ratio) and serialize only [0, partial). */
+            const uint32_t partial = layer_state_partial_rows(ratio, (uint32_t)s->checkpoint.len);
+            if (rc == 0 && payload_write_u32(fp, partial, err, errlen) != 0) rc = 1;
+            attn_state_span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+        }
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                     0,
-                                                    layer_attn_state_bytes(ratio),
+                                                    attn_state_span,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -55488,7 +55589,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_score[il],
                                                     0,
-                                                    layer_attn_state_bytes(ratio),
+                                                    attn_state_span,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -55919,10 +56020,30 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                           err,
                                           errlen);
         }
+        uint64_t attn_state_span = layer_attn_state_bytes(ratio);
+        if (ratio != 4) {
+            /* Single-lane: refresh-init the whole block buffer (kv=0,
+             * score=DS4_NEG_INF) so the unserialized tail is correct, then
+             * overwrite the occupied head with the saved partial rows. */
+            uint32_t partial = 0;
+            if (rc == 0 && payload_read_u32(fp, &partial, &remaining, err, errlen) != 0) rc = 1;
+            if (rc == 0 && (partial != saved_tokens % ratio ||
+                            (uint64_t)n_comp[i] * ratio + partial != saved_tokens)) {
+                payload_set_err(err, errlen, "KV shard compressor partial count is inconsistent");
+                rc = 1;
+            }
+            if (rc == 0) {
+                const uint64_t total_state_floats = layer_attn_state_bytes(ratio) / sizeof(float);
+                if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, total_state_floats) ||
+                    !metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, total_state_floats))
+                    rc = 1;
+            }
+            attn_state_span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+        }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
                                                    0,
-                                                   layer_attn_state_bytes(ratio),
+                                                   attn_state_span,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
@@ -55931,7 +56052,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_score[il],
                                                    0,
-                                                   layer_attn_state_bytes(ratio),
+                                                   attn_state_span,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
@@ -56497,8 +56618,16 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                     (uint64_t)layer->n_comp * DS4_N_HEAD_DIM * sizeof(float),
                                     err,
                                     errlen) != 0) return 1;
-            if (payload_write_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), err, errlen) != 0) return 1;
-            if (payload_write_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), err, errlen) != 0) return 1;
+            uint64_t attn_state_span = layer_attn_state_bytes(ratio);
+            if (ratio != 4) {
+                /* Single-lane layer: prefix the occupied rows with a u32 partial
+                 * count (partial = L % ratio) and serialize only [0, partial). */
+                const uint32_t partial = layer_state_partial_rows(ratio, (uint32_t)s->checkpoint.len);
+                if (payload_write_u32(fp, partial, err, errlen) != 0) return 1;
+                attn_state_span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+            }
+            if (payload_write_bytes(fp, layer->attn_state_kv, attn_state_span, err, errlen) != 0) return 1;
+            if (payload_write_bytes(fp, layer->attn_state_score, attn_state_span, err, errlen) != 0) return 1;
             if (ratio == 4) {
                 if (payload_write_bytes(fp,
                                         layer->index_comp_kv,
@@ -56599,10 +56728,18 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                            err,
                                            errlen);
         }
+        uint64_t attn_state_span = layer_attn_state_bytes(ratio);
+        if (ratio != 4) {
+            /* Single-lane layer: prefix the occupied rows with a u32 partial
+             * count (partial = L % ratio) and serialize only [0, partial). */
+            const uint32_t partial = layer_state_partial_rows(ratio, (uint32_t)s->checkpoint.len);
+            if (rc == 0 && payload_write_u32(fp, partial, err, errlen) != 0) rc = 1;
+            attn_state_span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+        }
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                     0,
-                                                    layer_attn_state_bytes(ratio),
+                                                    attn_state_span,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -56610,7 +56747,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_score[il],
                                                     0,
-                                                    layer_attn_state_bytes(ratio),
+                                                    attn_state_span,
                                                     buf,
                                                     DS4_SESSION_IO_CHUNK,
                                                     err,
@@ -56987,14 +57124,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                    (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
                                    &remaining,
                                    err,
-                                   errlen) != 0 ||
-                payload_read_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0 ||
-                payload_read_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0)
+                                   errlen) != 0)
             {
                 token_vec_free(&new_checkpoint);
                 return 1;
             }
             if (ratio == 4) {
+                if (payload_read_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0 ||
+                    payload_read_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0)
+                {
+                    token_vec_free(&new_checkpoint);
+                    return 1;
+                }
                 if (payload_read_bytes(fp,
                                        layer->index_comp_kv,
                                        (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -57003,6 +57144,30 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                        errlen) != 0 ||
                     payload_read_bytes(fp, layer->index_state_kv, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0 ||
                     payload_read_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0)
+                {
+                    token_vec_free(&new_checkpoint);
+                    return 1;
+                }
+            } else {
+                /* Single-lane layer: read the u32 partial count, validate it
+                 * against the checkpoint length and n_comp, then read only the
+                 * occupied rows.  The tail [partial, ratio) is already cleared
+                 * to fresh-init values (kv=0, score=DS4_NEG_INF) by the
+                 * session_cpu_reset_cache call above. */
+                uint32_t partial = 0;
+                if (payload_read_u32(fp, &partial, &remaining, err, errlen) != 0) {
+                    token_vec_free(&new_checkpoint);
+                    return 1;
+                }
+                if (partial != saved_tokens % ratio ||
+                    (uint64_t)n_comp[il] * ratio + partial != saved_tokens) {
+                    token_vec_free(&new_checkpoint);
+                    payload_set_err(err, errlen, "KV checkpoint compressor partial count is inconsistent");
+                    return 1;
+                }
+                const uint64_t state_span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+                if (payload_read_bytes(fp, layer->attn_state_kv, state_span, &remaining, err, errlen) != 0 ||
+                    payload_read_bytes(fp, layer->attn_state_score, state_span, &remaining, err, errlen) != 0)
                 {
                     token_vec_free(&new_checkpoint);
                     return 1;
@@ -57159,10 +57324,30 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                           err,
                                           errlen);
         }
+        uint64_t attn_state_span = layer_attn_state_bytes(ratio);
+        if (ratio != 4) {
+            /* Single-lane: refresh-init the whole block buffer (kv=0,
+             * score=DS4_NEG_INF) so the unserialized tail is correct, then
+             * overwrite the occupied head with the saved partial rows. */
+            uint32_t partial = 0;
+            if (rc == 0 && payload_read_u32(fp, &partial, &remaining, err, errlen) != 0) rc = 1;
+            if (rc == 0 && (partial != saved_tokens % ratio ||
+                            (uint64_t)n_comp[il] * ratio + partial != saved_tokens)) {
+                payload_set_err(err, errlen, "KV checkpoint compressor partial count is inconsistent");
+                rc = 1;
+            }
+            if (rc == 0) {
+                const uint64_t total_state_floats = layer_attn_state_bytes(ratio) / sizeof(float);
+                if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, total_state_floats) ||
+                    !metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, total_state_floats))
+                    rc = 1;
+            }
+            attn_state_span = (uint64_t)partial * DS4_N_HEAD_DIM * sizeof(float);
+        }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
                                                    0,
-                                                   layer_attn_state_bytes(ratio),
+                                                   attn_state_span,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
@@ -57171,7 +57356,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_score[il],
                                                    0,
-                                                   layer_attn_state_bytes(ratio),
+                                                   attn_state_span,
                                                    buf,
                                                    DS4_SESSION_IO_CHUNK,
                                                    &remaining,
