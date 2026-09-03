@@ -43460,6 +43460,10 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                             false,
                                                             q4_batch_table_queue_residency);
         } else if (use_mm_id) {
+            /* kernel_mul_mm_id_mpp double-buffers tiles (12 KiB). */
+            const NSUInteger gate_up_tg =
+                (ds4_gpu_routed_mm_mpp_mask() != 0 &&
+                 gate_type == DS4_METAL_TENSOR_IQ2_XXS) ? 12288u : 8192u;
             /*
              * The routed pair ids are the same for gate, up, and down. Build
              * the expert-major work map once, then reuse it for all three
@@ -43509,7 +43513,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                            ds4_gpu_tensor_offset(x),
                                                            gatebuf,
                                                            ds4_gpu_tensor_offset(gate),
-                                                           8192u);
+                                                           gate_up_tg);
                 DS4_METAL_PROFILE_MOE_STAGE("gate");
             }
             if (ok && !use_mm_id_pair_swiglu) {
@@ -43522,7 +43526,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                    ds4_gpu_tensor_offset(x),
                                                    upbuf,
                                                    ds4_gpu_tensor_offset(up),
-                                                   8192u);
+                                                   gate_up_tg);
                 DS4_METAL_PROFILE_MOE_STAGE("up");
             }
         } else if (use_tiny_pair_swiglu) {
@@ -43777,6 +43781,11 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      down_smem,
                                                      2);
             } else if (use_mm_id) {
+                const NSUInteger down_tg =
+                    ((ds4_gpu_routed_mm_mpp_mask() & 4) != 0 &&
+                     request_mid_f16 &&
+                     (down_type == DS4_METAL_TENSOR_Q2_K ||
+                      down_type == DS4_METAL_TENSOR_IQ2_XXS)) ? 12288u : 8192u;
                 ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
                                                        down_mm_pipeline,
                                                        &down_mm_args,
@@ -43786,7 +43795,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        ds4_gpu_tensor_offset(mid),
                                                        down_dst,
                                                        down_dst_off,
-                                                       8192u);
+                                                       down_tg);
             } else {
                 ok = ds4_gpu_encode_mul_mv_id(cb,
                                                      down_mv_pipeline,
