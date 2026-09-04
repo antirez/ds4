@@ -326,6 +326,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
 static void print_agent_sessions(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Runtime Commands");
     opt(fp, c, "/save", "Save the current session in ~/.ds4/kvcache.");
+    opt(fp, c, "/fork [NAME]", "Save this frontier and continue as a new session.");
     opt(fp, c, "/compact", "Compact the current session context now.");
     opt(fp, c, "/list", "List saved sessions, sorted by recent update time.");
     opt(fp, c, "/switch ID", "Load a saved session and show recent history.");
