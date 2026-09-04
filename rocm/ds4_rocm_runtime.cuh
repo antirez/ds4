@@ -4901,15 +4901,20 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     if (g_ssd_streaming_mode) {
         return cuda_stream_resident_free_reserve_bytes();
     }
-    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
-        return 512ull * 1048576ull;
-    }
 
     /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
-     * device memory free for cuBLAS workspaces, transient graph buffers, and
-     * driver bookkeeping instead of letting optional cached weights consume the
-     * last few GiB on 96 GiB cards. */
-    const uint64_t min_reserve = 4096ull * 1048576ull;
+     * device memory free for the session/context tensors, cuBLAS workspaces,
+     * and transient graph buffers allocated after model load, instead of
+     * letting optional cached weights consume the last few GiB.
+     *
+     * 100K ctx session needs ~7 GiB.
+     *
+     * Do not shrink this to a sub-GiB reserve on large unified-memory machines -
+     * a tiny reserve lets the eager preload fill device memory down to a few
+     * hundred MiB and OOM at session creation.
+     * Loading an MTP model disables this cache and hides the issue. */
+
+    const uint64_t min_reserve = 8192ull * 1048576ull; /* 8 GiB */
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
 }
