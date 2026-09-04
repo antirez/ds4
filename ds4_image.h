@@ -74,6 +74,11 @@ int ds4_image_decode_file(
 
 void ds4_image_free(ds4_image *image);
 
+/* SHA-256 of an exact byte sequence. Used to bind cached multimodal state to
+ * the conditioning vectors that were actually supplied to the language model. */
+void ds4_image_fingerprint_data(const void *data, size_t len,
+                                uint8_t fingerprint[32]);
+
 int ds4_image_preprocess_glm53(
         ds4_image_patches *out,
         const ds4_image   *image,

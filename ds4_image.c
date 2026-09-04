@@ -126,6 +126,15 @@ static void ds4_sha256_final(ds4_sha256 *sha, uint8_t out[32]) {
     }
 }
 
+void ds4_image_fingerprint_data(const void *data, size_t len,
+                                uint8_t fingerprint[32]) {
+    if (!fingerprint) return;
+    ds4_sha256 sha;
+    ds4_sha256_init(&sha);
+    if (data && len != 0) ds4_sha256_update(&sha, data, len);
+    ds4_sha256_final(&sha, fingerprint);
+}
+
 static void ds4_image_error(char *error, size_t cap, const char *message) {
     if (!error || cap == 0) return;
     snprintf(error, cap, "%s", message);

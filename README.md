@@ -1592,12 +1592,24 @@ Enable it with:
 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-The cache key is the SHA1 of the rendered byte prefix, and files are named
-`<sha1>.kv`. The DS4 payload still stores the exact token IDs and graph state
-for that prefix. This matters for continued chats: the model may have generated
-one token whose decoded text is later sent back by a client as two canonical
-prompt tokens. A rendered byte-prefix hit can still reuse the checkpoint and
-tokenize only the new suffix.
+Cache files are named `<sha1>.kv`, where the digest identifies the lookup-key
+prefix. Text keys are the rendered prompt bytes. Conditioned keys prepend image
+span identities to those bytes. The DS4 payload still stores the exact token IDs
+and graph state for that prefix. This matters for continued chats: the model may
+have generated one token whose decoded text is later sent back by a client as
+two canonical prompt tokens. A rendered byte-prefix hit can still reuse the
+checkpoint and tokenize only the new suffix.
+
+Text and multimodal checkpoints participate in the same longest-compatible-
+prefix search. Image-conditioned entries additionally record each image's token
+span and a SHA-256 fingerprint of the actual floating-point conditioning rows.
+If a request appends an image, a text checkpoint can therefore be reused up to
+the image's start. Likewise, a checkpoint for image A can be reused when image B
+is appended later. When an image changes, moves, or disappears, only a compatible
+checkpoint ending no later than that image's start may be reused; a checkpoint
+is never resumed from the middle of an image block. Existing text-only cache
+files remain compatible.
+
 The file is intentionally written with ordinary `read`/`write` I/O, not
 `mmap`, so restoring cache entries does not add more VM mappings to a process
 that already maps the model.
