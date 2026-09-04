@@ -3099,6 +3099,13 @@ static uint64_t ds4_vembed_bytes_now(server *s);
 static void ds4_vembed_log_reuse(uint64_t hits, size_t count,
                                  uint64_t cache_bytes);
 
+/* Only call on a marker already matched against a server-generated nonce.
+ * Keep its width/offset but give the rendered replay key stable bytes. Literal
+ * marker-shaped user text must stay byte-exact, not become a wildcard. */
+static void canonicalize_image_marker(char *marker) {
+    memset(marker + sizeof("\x1e" "DS4_IMAGE_") - 1, '0', 24);
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3148,7 +3155,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     memset(r->images, 0, count * sizeof(r->images[0]));
     const char *cursor = r->prompt_text;
     for (size_t i = 0; i < count; i++) {
-        const char *marker = strstr(cursor, inputs[i]->marker);
+        char *marker = strstr(cursor, inputs[i]->marker);
         if (!marker) {
             snprintf(err, errlen, "image marker was lost while rendering the request");
             ok = false;
@@ -3164,6 +3171,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         }
         r->image_count++;
         cursor = marker + strlen(inputs[i]->marker);
+        canonicalize_image_marker(marker);
     }
     if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
 
@@ -10276,43 +10284,6 @@ static bool byte_prefix_match(const char *text, size_t text_len,
     return ds4_kvstore_byte_prefix_match(text, text_len, prefix, prefix_len);
 }
 
-/* Image markers are request-scoped sentinels: "\x1e DS4_IMAGE_<24 hex> \x1f",
- * fixed length by construction, regenerated with a fresh nonce on every
- * request even when the replayed image is byte-identical.  A remembered
- * visible transcript can therefore only prefix-match a future replay when
- * marker nonces are treated as wildcards at equal offsets; the fixed length
- * keeps byte alignment intact so the matched length indexes both strings
- * identically. */
-static size_t ds4_image_marker_span(const char *s, size_t len, size_t i) {
-    static const char head[] = "\x1e" "DS4_IMAGE_";
-    const size_t head_len = sizeof(head) - 1;
-    if (len - i < head_len + 24 + 1) return 0;
-    if (memcmp(s + i, head, head_len) != 0) return 0;
-    for (size_t k = 0; k < 24; k++) {
-        const char c = s[i + head_len + k];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-              (c >= 'A' && c <= 'F'))) return 0;
-    }
-    if (s[i + head_len + 24] != '\x1f') return 0;
-    return i + head_len + 25;
-}
-
-static bool byte_prefix_match_visible(const char *text, size_t text_len,
-                                      const char *prefix, size_t prefix_len) {
-    if (text_len < prefix_len) return false;
-    size_t i = 0;
-    while (i < prefix_len) {
-        const size_t e = ds4_image_marker_span(prefix, prefix_len, i);
-        if (e) {
-            if (ds4_image_marker_span(text, text_len, i) != e) return false;
-            i = e;
-            continue;
-        }
-        if (text[i] != prefix[i]) return false;
-        i++;
-    }
-    return true;
-}
 
 
 static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
@@ -10756,9 +10727,9 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
               slot->thinking_live.live_tokens == live_pos &&
               slot->thinking_live.visible_text &&
               slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match_visible(req->prompt_text, prompt_len,
-                                        slot->thinking_live.visible_text,
-                                        slot->thinking_live.visible_len) &&
+              byte_prefix_match(req->prompt_text, prompt_len,
+                                slot->thinking_live.visible_text,
+                                slot->thinking_live.visible_len) &&
               /* The remembered prefix can carry image sentinels (the live
                * graph already holds their rows).  Anything AFTER the prefix
                * is tokenized as plain text here, so a new image appearing
@@ -18597,32 +18568,35 @@ static void test_vembed_cache_store_hit_evict(void) {
     s.vembed_bytes = 0;
 }
 
-static void test_byte_prefix_match_visible_markers(void) {
-    char prefix[128], text[128], skewed[160];
-    snprintf(prefix, sizeof(prefix),
-             "A\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f" "B tail");
-    snprintf(text, sizeof(text),
-             "A\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f" "B tail");
-    snprintf(skewed, sizeof(skewed),
-             "X\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f" "B tail");
-    const size_t plen = strlen(prefix);
-    TEST_ASSERT(byte_prefix_match_visible(text, strlen(text), prefix, plen));
-    /* Same nonce trivially matches. */
-    TEST_ASSERT(byte_prefix_match_visible(prefix, plen, prefix, plen));
-    /* A marker shifted by one byte is not an equal-offset marker. */
-    TEST_ASSERT(!byte_prefix_match_visible(skewed, strlen(skewed), prefix, plen));
-    /* Malformed nonce (too short) on the text side must not wildcard-match. */
-    char broken[128];
-    snprintf(broken, sizeof(broken),
-             "A\x1e" "DS4_IMAGE_short" "\x1f" "B tail more");
-    TEST_ASSERT(!byte_prefix_match_visible(broken, strlen(broken),
-                                           prefix, plen));
-    /* Divergence in the non-marker region still fails. */
-    char differ[128];
-    snprintf(differ, sizeof(differ),
-             "A\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f" "B talX more");
-    TEST_ASSERT(!byte_prefix_match_visible(differ, strlen(differ),
-                                           prefix, plen));
+static void test_canonical_image_markers_keep_literal_text_exact(void) {
+    const char *literal_a = "\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f";
+    const char *literal_b = "\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f";
+    /* No images: two different literal strings must not select one frontier. */
+    TEST_ASSERT(!byte_prefix_match(literal_b, strlen(literal_b),
+                                   literal_a, strlen(literal_a)));
+
+    server_image_inputs images = {0};
+    char first[SERVER_IMAGE_MARKER_BYTES], second[SERVER_IMAGE_MARKER_BYTES];
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "eA==", first));
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "eA==", second));
+    char prefix[256], replay[256], changed[256];
+    snprintf(prefix, sizeof(prefix), "%s literal %s end", first, literal_a);
+    snprintf(replay, sizeof(replay), "%s literal %s end next", second, literal_a);
+    snprintf(changed, sizeof(changed), "%s literal %s end next", second, literal_b);
+    size_t original_len = strlen(prefix);
+    /* These offsets represent only the known parser-inserted markers. */
+    canonicalize_image_marker(prefix);
+    canonicalize_image_marker(replay);
+    canonicalize_image_marker(changed);
+    TEST_ASSERT(strlen(prefix) == original_len);
+    TEST_ASSERT(strstr(prefix, literal_a) != NULL);
+    TEST_ASSERT(byte_prefix_match(replay, strlen(replay), prefix, original_len));
+    TEST_ASSERT(!byte_prefix_match(changed, strlen(changed), prefix, original_len));
+    TEST_ASSERT(!byte_prefix_match(replay + 1, strlen(replay + 1), prefix, original_len));
+    TEST_ASSERT(!byte_prefix_match(replay, original_len - 1, prefix, original_len));
+    canonicalize_image_marker(prefix); /* Idempotent. */
+    TEST_ASSERT(byte_prefix_match(replay, strlen(replay), prefix, original_len));
+    server_image_inputs_free(&images);
 }
 
 static void test_thinking_checkpoint_remember_gate(void) {
@@ -19932,7 +19906,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_preserved_thinking_canonical_matches_future_prompt();
     test_vembed_cache_store_hit_evict();
-    test_byte_prefix_match_visible_markers();
+    test_canonical_image_markers_keep_literal_text_exact();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
