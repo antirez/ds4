@@ -11,6 +11,15 @@ typedef struct {
     int total;
 } progress_counter;
 
+typedef struct {
+    int calls;
+} cancel_counter;
+
+static bool cancel_after_first_check(void *ud) {
+    cancel_counter *counter = ud;
+    return ++counter->calls > 1;
+}
+
 static void count_progress(void *ud, const char *event, int current, int total) {
     (void)event;
     progress_counter *counter = ud;
@@ -83,6 +92,21 @@ int main(int argc, char **argv) {
         ds4_session_vision_state_matches(session, NULL, 0)) {
         snprintf(error, sizeof(error),
                  "live session did not retain exact image identity");
+        goto done;
+    }
+
+    /* Cancellation has one authoritative no-work preflight.  A callback that
+     * changes immediately afterward must not turn an exact no-op sync into an
+     * interruption that discards the completed image checkpoint. */
+    cancel_counter cancel = {0};
+    ds4_session_set_cancel(session, cancel_after_first_check, &cancel);
+    int cancel_race_rc = ds4_session_sync_multimodal(
+        session, &prompt, &span, 1, error, sizeof(error));
+    ds4_session_set_cancel(session, NULL, NULL);
+    if (cancel_race_rc != 0 || cancel.calls != 1 ||
+        !ds4_session_vision_state_matches(session, &span, 1)) {
+        snprintf(error, sizeof(error),
+                 "no-work cancellation check discarded image checkpoint");
         goto done;
     }
 
