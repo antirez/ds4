@@ -86,6 +86,12 @@ typedef struct {
     ds4_glp_hook hook;
     char     hook_name[DS4_GLP_STR_MAX];  /* verbatim, "" if absent */
 
+    /* Where the direction was CAPTURED, which is not necessarily where it is
+     * applied.  A transferred vector has derived_at != hook_name.  This is a
+     * warning, never a refusal: the reader applies at hook_point regardless,
+     * and alpha_default belongs to the apply site, not the derivation site. */
+    char     derived_at[DS4_GLP_STR_MAX]; /* verbatim glp.derived_at, "" if absent */
+
     /* Shape, as resolved from the direction.<N> tensors. */
     uint32_t n_embd;
     uint32_t n_dirs;

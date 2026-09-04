@@ -560,6 +560,12 @@ static int glp_read_metadata(const glp_file *f,
     glp_get_str(f, "glp.hook_point", info->hook_name, sizeof(info->hook_name));
     info->hook = glp_hook_from_name(info->hook_name);
 
+    /* Where the direction was captured, when the producer says.  Absent means
+     * "same as hook_point" (a natively derived vector); a value that differs
+     * marks a transferred vector -- surfaced as a warning at load and in
+     * --dir-steering-info, never a refusal. */
+    glp_get_str(f, "glp.derived_at", info->derived_at, sizeof(info->derived_at));
+
     glp_get_str(f, "general.base_model.0.name",         info->base_model,     sizeof(info->base_model));
     glp_get_str(f, "general.base_model.0.organization", info->base_org,       sizeof(info->base_org));
     glp_get_str(f, "general.base_model.0.version",      info->base_version,   sizeof(info->base_version));
@@ -786,6 +792,18 @@ int ds4_glp_load(const char   *path,
         rc = glp_check_hook(path, info, target_hook, allow_hook_mismatch, err, errlen);
     }
 
+    /* A transferred vector (captured at one site, calibrated for another) is
+     * legal and loadable, but invisible without this line: nothing else in the
+     * log would say the direction was estimated on a different distribution
+     * than the one it is about to edit. */
+    if (rc == 0 && info->derived_at[0] && info->hook_name[0] &&
+        strcmp(info->derived_at, info->hook_name) != 0) {
+        fprintf(stderr,
+                "ds4: %s: transferred vector -- derived at \"%s\", applied at "
+                "\"%s\". glp.alpha_default belongs to the apply site.\n",
+                path, info->derived_at, info->hook_name);
+    }
+
     /* Shape must match the model exactly.  n_embd and the layer count are the
      * two things quantisation preserves, which is why the same vector pairs
      * with any quantisation of the same base checkpoint -- and also why a
@@ -916,6 +934,13 @@ void ds4_glp_print_info(FILE *out, const char *path, const ds4_glp_info *info) {
             info->hook_name[0] ? info->hook_name : "(absent)",
             (info->hook_name[0] && info->hook == DS4_GLP_HOOK_UNKNOWN)
                 ? "  [not a hook this build knows]" : "");
+    if (info->derived_at[0]) {
+        const int transferred = info->hook_name[0] &&
+            strcmp(info->derived_at, info->hook_name) != 0;
+        fprintf(out, "  %-14s %s%s\n", "derived_at", info->derived_at,
+                transferred ? "  [TRANSFERRED: captured at a different site; "
+                              "alpha_default belongs to the apply site]" : "");
+    }
     if (info->has_alpha_default) {
         fprintf(out, "  %-14s %g\n", "alpha_default", (double)info->alpha_default);
     } else {

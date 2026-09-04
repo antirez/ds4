@@ -649,6 +649,65 @@ static void test_malformed_input(void) {
     unlink(path);
 }
 
+static void test_derived_at(void) {
+    /* Native: derived_at == hook_point. Loads, no transfer marker. */
+    gguf_spec g;
+    spec_valid(&g, N_EMBD);
+    kv_str(&g, "glp.derived_at", "ffn_out_pre_residual");
+    const char *path = tmp_path("derived-native");
+    CHECK(write_gguf(path, &g), "fixture written");
+
+    float dirs[N_LAYERS * N_EMBD];
+    ds4_glp_info info;
+    char err[512];
+    int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                          dirs, N_LAYERS, N_EMBD, &info, err, sizeof(err));
+    CHECK(rc == 0, "native derived_at loads");
+    CHECK(strcmp(info.derived_at, "ffn_out_pre_residual") == 0, "derived_at read");
+
+    FILE *dump = tmpfile();
+    CHECK(dump != NULL, "tmpfile");
+    if (dump) {
+        ds4_glp_print_info(dump, path, &info);
+        rewind(dump);
+        char buf[4096];
+        const size_t n = fread(buf, 1, sizeof(buf) - 1, dump);
+        buf[n] = '\0';
+        fclose(dump);
+        CHECK(strstr(buf, "derived_at") != NULL, "derived_at shown in info");
+        CHECK(strstr(buf, "TRANSFERRED") == NULL, "no transfer marker when native");
+    }
+    unlink(path);
+
+    /* Transferred: captured on the residual, calibrated for the FFN write.
+     * A warning, not a refusal -- the file still loads at the FFN hook. */
+    spec_valid(&g, N_EMBD);
+    kv_str(&g, "glp.derived_at", "residual_stream_post_layer");
+    path = tmp_path("derived-transferred");
+    CHECK(write_gguf(path, &g), "fixture written");
+
+    rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                      dirs, N_LAYERS, N_EMBD, &info, err, sizeof(err));
+    CHECK(rc == 0, "transferred vector loads (warning, not refusal)");
+    if (rc != 0) fprintf(stderr, "    err: %s\n", err);
+    CHECK(strcmp(info.derived_at, "residual_stream_post_layer") == 0,
+          "transferred derived_at read");
+
+    dump = tmpfile();
+    CHECK(dump != NULL, "tmpfile");
+    if (dump) {
+        ds4_glp_print_info(dump, path, &info);
+        rewind(dump);
+        char buf[4096];
+        const size_t n = fread(buf, 1, sizeof(buf) - 1, dump);
+        buf[n] = '\0';
+        fclose(dump);
+        CHECK(strstr(buf, "TRANSFERRED") != NULL,
+              "transfer marker shown in info");
+    }
+    unlink(path);
+}
+
 static void test_hook_names_round_trip(void) {
     CHECK(strcmp(ds4_glp_hook_name(DS4_GLP_HOOK_RESID_POST_LAYER),
                  "residual_stream_post_layer") == 0, "resid hook name");
@@ -674,6 +733,7 @@ int main(void) {
     RUN(test_refuse_no_directions);
     RUN(test_read_info_needs_no_model);
     RUN(test_malformed_input);
+    RUN(test_derived_at);
     RUN(test_hook_names_round_trip);
 
     fprintf(stderr, "\n%d checks, %d failed\n", g_total, g_failed);
