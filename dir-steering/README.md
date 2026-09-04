@@ -71,13 +71,16 @@ moe + shared`, or the attention output — before the residual / hyper-connectio
 fold, and the post-layer residual itself (`--dir-steering-resid`), where each
 of the four hyper-connection streams is projected independently. The residual
 site is where llama.cpp's `build_cvec()` and the weightless vLLM overlay apply.
-Writers and residual are different tensors, not two names for one. A writer
-holds only what that block computed *this layer*; the folded residual holds the
-accumulated sum, so projecting it also removes whatever every upstream layer
-contributed. Steering a writer prevents refusal being *added*; steering the
-residual *deletes* refusal already there. Neither site's calibrated strength
-transfers to the other, and a vector applied at the wrong one degrades rather
-than errors.
+Writers and residual are different tensors, not two names for one, and which
+site carries the usable window is architecture- and dose-dependent, not a
+ranking: measured on DeepSeek-V4-Flash-0731 (NVFP4, vLLM overlay, greedy,
+refusal32, 2026-09-04), the FFN writer at α=6 reached 26/32 (α=4: 19/32,
+benign clean), the post-layer residual 11/32 at α=2 (α=4 garbled), the
+attention writer 5/32 at α=4 — with a direction derived at the residual and
+transferred to the FFN site. The residual hook exists because vectors for our
+other models are calibrated there. What does not change: a site's calibrated α
+does not transfer to another site, and a vector applied at the wrong one
+degrades rather than errors.
 
 **The layer map.** `direction.N` applies at layer `N`, with no offset. A
 one-layer shift does not fail, it degrades — adjacent layers' refusal

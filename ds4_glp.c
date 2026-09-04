@@ -812,13 +812,10 @@ static int glp_check_hook(const char        *path,
                         "%s: glp.hook_point=\"%s\" but this projection applies at "
                         "\"%s\". Steer the declared site instead (%s), or pass "
                         "--dir-steering-allow-hook-mismatch and re-tune the scale. "
-                        "These are different tensors: a writer hook steers one of "
-                        "the layer's contributors, while a vector calibrated on "
-                        "the post-layer residual steers the accumulated stream, "
-                        "which also removes what upstream layers contributed. "
-                        "Applying it here degrades rather than errors -- the "
-                        "failure this field exists to prevent -- and the file's "
-                        "alpha belongs to its own site.",
+                        "These are different tensors, and the alpha was "
+                        "calibrated at one site and does not transfer silently: "
+                        "applying it here degrades rather than errors -- the "
+                        "failure this field exists to prevent.",
                         path, info->hook_name, ds4_glp_hook_name(target),
                         site_flag);
     }

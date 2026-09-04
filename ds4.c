@@ -1874,14 +1874,15 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
  * is the residual_stream_post_layer site llama.cpp's build_cvec() and our vLLM
  * overlay use. The writer sites and the residual site are different tensors,
  * not two names for one: a writer carries only what that block computed this
- * layer, while the folded residual carries the accumulated sum, so projecting
- * it also removes what every upstream layer contributed. Steering a writer
- * prevents refusal being added; steering the residual deletes refusal already
- * there. The one measured comparison at matched direction and alpha put a
- * per-contributor edit far behind a projection on the accumulated stream, and
- * neither dose transfers to the other site. So a file calibrated for one is
- * refused at the other unless the caller says otherwise, in which case the
- * scale has to be re-tuned.
+ * layer, while the folded residual carries the accumulated sum. Which site
+ * carries the usable window is architecture- and dose-dependent, not a
+ * ranking -- measured on DeepSeek-V4-Flash-0731 (2026-09-04, refusal32,
+ * greedy), the FFN writer at alpha 4-6 outperformed the residual site with a
+ * residual-derived direction transferred to it. What holds everywhere is the
+ * mismatch argument: a dose is calibrated at one site and does not transfer
+ * silently to another. So a file calibrated for one is refused at the other
+ * unless the caller says otherwise, in which case the scale has to be
+ * re-tuned.
  */
 /* Load-time policy, not per-session state: set once from the engine options
  * and read only by steering_load_directions(). A file-scope flag keeps the
