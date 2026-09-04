@@ -137,6 +137,9 @@ Targets:
   glm-antirez-iq2xxs
        GLM 5.2 antirez routed IQ2_XXS GGUF from antirez/GLM-5.2-GGUF.
        Includes Q2_K block 78 and is intended for reduced-memory testing.
+       About 211 GB on disk. Does not fully fit in 128 GB RAM — use
+       --ssd-streaming (and --ssd-streaming-cache-experts) on single-node
+       96/128 GB machines; two-node tensor parallelism also works.
 
   glm-antirez-q2
        GLM 5.2 antirez routed Q2_K GGUF from antirez/GLM-5.2-GGUF.
