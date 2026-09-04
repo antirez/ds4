@@ -687,6 +687,15 @@ static int glp_scan_tensors(const glp_file *f,
  * unrecognised name is as much a refusal as a recognised mismatch, because
  * either way we would be applying the direction somewhere it was not
  * calibrated. */
+static const char *glp_hook_flag(ds4_glp_hook hook) {
+    switch (hook) {
+    case DS4_GLP_HOOK_RESID_POST_LAYER: return "--dir-steering-resid";
+    case DS4_GLP_HOOK_FFN_OUT:          return "--dir-steering-ffn";
+    case DS4_GLP_HOOK_ATTN_OUT:         return "--dir-steering-attn";
+    default:                            return NULL;
+    }
+}
+
 static int glp_check_hook(const char        *path,
                           const ds4_glp_info *info,
                           ds4_glp_hook       target,
@@ -702,20 +711,36 @@ static int glp_check_hook(const char        *path,
     if (info->hook == target) return 0;
     if (allow_mismatch) return 0;
 
+    /* When the file's hook is one ds4 implements, the fix is to steer that
+     * site, not to override: the file is fine, the site choice is not.  An
+     * unrecognised hook has no such remedy. */
+    const char *site_flag = glp_hook_flag(info->hook);
+    if (site_flag) {
+        return glp_fail(err, errlen,
+                        /* Remedy first, rationale second: this message is written
+                         * into a caller-sized buffer, and a truncation should cost
+                         * the explanation, not the fix. */
+                        "%s: glp.hook_point=\"%s\" but this projection applies at "
+                        "\"%s\". Steer the declared site instead (%s), or pass "
+                        "--dir-steering-allow-hook-mismatch and re-tune the scale. "
+                        "These are different tensors: a writer hook steers one of "
+                        "the layer's contributors, while a vector calibrated on "
+                        "the post-layer residual steers the accumulated stream, "
+                        "which also removes what upstream layers contributed. "
+                        "Applying it here degrades rather than errors -- the "
+                        "failure this field exists to prevent -- and the file's "
+                        "alpha belongs to its own site.",
+                        path, info->hook_name, ds4_glp_hook_name(target),
+                        site_flag);
+    }
     return glp_fail(err, errlen,
-                    /* Remedy first, rationale second: this message is written into
-                     * a caller-sized buffer, and a truncation should cost the
-                     * explanation, not the fix. */
-                    "%s: glp.hook_point=\"%s\" but ds4 applies this projection at "
-                    "\"%s\". Use a vector exported for this hook, or pass "
-                    "--dir-steering-allow-hook-mismatch and re-tune the scale. "
-                    "These are different tensors: ds4 steers one of the layer's "
-                    "contributors, while a vector calibrated on the post-layer "
-                    "residual steers the accumulated stream, which also removes "
-                    "what upstream layers contributed. Applying it here degrades "
-                    "rather than errors -- the failure this field exists to "
-                    "prevent -- and the file's alpha belongs to its own site.",
-                    path, info->hook_name, ds4_glp_hook_name(target));
+                    "%s: glp.hook_point=\"%s\" is not a hook this build "
+                    "implements (ds4 implements residual_stream_post_layer, "
+                    "ffn_out_pre_residual, attn_out_pre_residual). Refusing to "
+                    "apply the direction somewhere it was not calibrated; "
+                    "--dir-steering-allow-hook-mismatch overrides this, and the "
+                    "scale then has to be re-tuned.",
+                    path, info->hook_name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -894,19 +919,30 @@ static void glp_print_field(FILE *out, const char *label, const char *value) {
     if (value && value[0]) fprintf(out, "  %-14s %s\n", label, value);
 }
 
-float ds4_glp_default_ffn_scale(const char *path, float fallback) {
+static float glp_default_scale(const char *path, ds4_glp_hook hook,
+                               const char *flag, float fallback) {
     if (ds4_glp_is_gguf(path) != 1) return fallback;
 
     ds4_glp_info info;
     char err[64];
     if (ds4_glp_read_info(path, &info, err, sizeof(err)) != 0) return fallback;
     if (!info.has_alpha_default) return fallback;
-    if (info.hook != DS4_GLP_HOOK_FFN_OUT) return fallback;
+    if (info.hook != hook) return fallback;
 
     fprintf(stderr,
-            "ds4: --dir-steering-ffn defaulted to %g from glp.alpha_default\n",
-            (double)info.alpha_default);
+            "ds4: %s defaulted to %g from glp.alpha_default\n",
+            flag, (double)info.alpha_default);
     return info.alpha_default;
+}
+
+float ds4_glp_default_ffn_scale(const char *path, float fallback) {
+    return glp_default_scale(path, DS4_GLP_HOOK_FFN_OUT,
+                             "--dir-steering-ffn", fallback);
+}
+
+float ds4_glp_default_resid_scale(const char *path, float fallback) {
+    return glp_default_scale(path, DS4_GLP_HOOK_RESID_POST_LAYER,
+                             "--dir-steering-resid", fallback);
 }
 
 int ds4_glp_inspect_main(const char *path) {

@@ -29,6 +29,10 @@ GGUF container that states what they are. See [GLP files](#glp-files) below.
                            or the raw f32 blob described above
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
+--dir-steering-resid F     apply steering to each hyper-connection stream after
+                           the layer's FFN fold (the post-layer residual);
+                           a residual-calibrated GLP file defaults to its
+                           glp.alpha_default at this site
 --dir-steering-info FILE   print a GLP vector's metadata and exit; loads no model
 --dir-steering-allow-hook-mismatch
                            apply a GLP vector at a hook it was not calibrated for
@@ -62,15 +66,18 @@ the right shapes, raises no error, and produces wrong output in one of them: an
 additive apply of a projective direction pushes every token *along* the
 direction instead of removing it.
 
-**The hook point.** ds4 steers the block writers — `ffn_out = moe + shared`, or
-the attention output — before the residual / hyper-connection fold. llama.cpp's
-`build_cvec()` and the weightless vLLM overlay steer the post-layer residual.
-Those are different tensors, not two names for one. A writer holds only what
-that block computed *this layer*; the folded residual holds the accumulated sum,
-so projecting it also removes whatever every upstream layer contributed.
-Steering a writer prevents refusal being *added*; steering the residual
-*deletes* refusal already there. Neither site's calibrated strength transfers to
-the other, and a vector applied at the wrong one degrades rather than errors.
+**The hook point.** ds4 steers three sites: the block writers — `ffn_out =
+moe + shared`, or the attention output — before the residual / hyper-connection
+fold, and the post-layer residual itself (`--dir-steering-resid`), where each
+of the four hyper-connection streams is projected independently. The residual
+site is where llama.cpp's `build_cvec()` and the weightless vLLM overlay apply.
+Writers and residual are different tensors, not two names for one. A writer
+holds only what that block computed *this layer*; the folded residual holds the
+accumulated sum, so projecting it also removes whatever every upstream layer
+contributed. Steering a writer prevents refusal being *added*; steering the
+residual *deletes* refusal already there. Neither site's calibrated strength
+transfers to the other, and a vector applied at the wrong one degrades rather
+than errors.
 
 **The layer map.** `direction.N` applies at layer `N`, with no offset. A
 one-layer shift does not fail, it degrades — adjacent layers' refusal
@@ -108,9 +115,10 @@ GLP vector: dir-steering/out/verbosity-GLP.gguf
   content sha256 2fc93b0a...
 ```
 
-When the file's hook matches the site ds4 is about to steer, `glp.alpha_default`
-becomes the default `--dir-steering-ffn`, so a published vector runs at the
-strength it was calibrated at with no flags:
+When the file's hook matches a site ds4 steers, `glp.alpha_default` becomes the
+default scale for that site's flag — `--dir-steering-ffn` for an FFN-hooked
+file, `--dir-steering-resid` for a residual-hooked one — so a published vector
+runs at the strength it was calibrated at with no flags:
 
 ```sh
 ./ds4 -m ds4flash.gguf --nothink --temp 0 -n 160 \

@@ -377,6 +377,8 @@ static void test_refuse_hook_mismatch(void) {
     CHECK(strstr(err, "hook_point") != NULL, "error names hook_point");
     CHECK(strstr(err, "--dir-steering-allow-hook-mismatch") != NULL,
           "error names the override flag");
+    CHECK(strstr(err, "--dir-steering-resid") != NULL,
+          "error names the flag for the file's declared site");
 
     /* ...and loads with the explicit override, which is the whole point of
      * having one: the operation is right, only the calibration moves. */
@@ -599,8 +601,8 @@ static void test_read_info_needs_no_model(void) {
     CHECK(info.norm_min > 0.99f && info.norm_max < 1.01f, "read_info reports norms");
 
     /* read_info deliberately does not check the hook: it must be able to
-     * describe a file this build would refuse to apply. That is what makes it
-     * the first tool to reach for. */
+     * describe a file regardless of where this build would apply it. That is
+     * what makes it the first tool to reach for. */
     for (int i = 0; i < g.n_kv; i++) {
         if (strcmp(g.kv[i].key, "glp.hook_point") == 0) {
             snprintf(g.kv[i].s, sizeof(g.kv[i].s), "residual_stream_post_layer");
@@ -608,7 +610,7 @@ static void test_read_info_needs_no_model(void) {
     }
     CHECK(write_gguf(path, &g), "fixture rewritten");
     CHECK(ds4_glp_read_info(path, &info, err, sizeof(err)) == 0,
-          "read_info describes a file this build cannot apply");
+          "read_info describes a residual-hooked file");
     CHECK(info.hook == DS4_GLP_HOOK_RESID_POST_LAYER, "and reports its hook");
     unlink(path);
 }
@@ -708,6 +710,56 @@ static void test_derived_at(void) {
     unlink(path);
 }
 
+static void test_load_resid_hook(void) {
+    /* residual_stream_post_layer is the site every published GLP vector
+     * declares. It must load at the resid target with no override, and its
+     * calibrated alpha must be adopted by the resid default only. */
+    gguf_spec g;
+    spec_valid(&g, N_EMBD);
+    for (int i = 0; i < g.n_kv; i++) {
+        if (strcmp(g.kv[i].key, "glp.hook_point") == 0) {
+            snprintf(g.kv[i].s, sizeof(g.kv[i].s), "residual_stream_post_layer");
+        }
+    }
+    const char *path = tmp_path("resid");
+    CHECK(write_gguf(path, &g), "fixture written");
+
+    float dirs[N_LAYERS * N_EMBD];
+    ds4_glp_info info;
+    char err[768];
+    int rc = ds4_glp_load(path, DS4_GLP_HOOK_RESID_POST_LAYER, 0,
+                          dirs, N_LAYERS, N_EMBD, &info, err, sizeof(err));
+    CHECK(rc == 0, "residual-hooked vector loads at the residual hook");
+    if (rc != 0) fprintf(stderr, "    err: %s\n", err);
+    CHECK(info.hook == DS4_GLP_HOOK_RESID_POST_LAYER, "hook resolved");
+    CHECK(info.n_dirs == 4 && info.layer_min == 2 && info.layer_max == 5,
+          "coverage resolved");
+    double sumsq = 0.0;
+    for (uint32_t i = 0; i < N_EMBD; i++) {
+        const float v = dirs[(size_t)3 * N_EMBD + i];
+        sumsq += (double)v * (double)v;
+    }
+    CHECK(fabs(sumsq - 1.0) < 1e-5, "covered layer holds a unit direction");
+
+    /* alpha_default is adopted at the site it was calibrated for, and only
+     * there: the FFN default must return the caller's fallback. */
+    CHECK(fabsf(ds4_glp_default_resid_scale(path, 0.0f) - 3.0f) < 1e-6f,
+          "resid default adopts glp.alpha_default");
+    CHECK(fabsf(ds4_glp_default_ffn_scale(path, 7.0f) - 7.0f) < 1e-6f,
+          "ffn default does not adopt a residual site's alpha");
+    unlink(path);
+
+    /* And the mirror image on an FFN-hooked file. */
+    spec_valid(&g, N_EMBD);
+    path = tmp_path("resid-ffn");
+    CHECK(write_gguf(path, &g), "fixture written");
+    CHECK(fabsf(ds4_glp_default_ffn_scale(path, 0.0f) - 3.0f) < 1e-6f,
+          "ffn default adopts glp.alpha_default");
+    CHECK(ds4_glp_default_resid_scale(path, 0.0f) == 0.0f,
+          "resid default does not adopt an FFN site's alpha");
+    unlink(path);
+}
+
 static void test_hook_names_round_trip(void) {
     CHECK(strcmp(ds4_glp_hook_name(DS4_GLP_HOOK_RESID_POST_LAYER),
                  "residual_stream_post_layer") == 0, "resid hook name");
@@ -734,6 +786,7 @@ int main(void) {
     RUN(test_read_info_needs_no_model);
     RUN(test_malformed_input);
     RUN(test_derived_at);
+    RUN(test_load_resid_hook);
     RUN(test_hook_names_round_trip);
 
     fprintf(stderr, "\n%d checks, %d failed\n", g_total, g_failed);

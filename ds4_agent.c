@@ -883,6 +883,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-resid")) {
+            c.engine.directional_steering_resid = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            steering_scale_set = true;
         } else if (!strcmp(arg, "--dir-steering-allow-hook-mismatch")) {
             c.engine.directional_steering_allow_hook_mismatch = true;
         } else if (!strcmp(arg, "--dir-steering-info")) {
@@ -894,9 +897,15 @@ static agent_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (c.engine.directional_steering_file && !steering_scale_set)
-        c.engine.directional_steering_ffn =
-            ds4_glp_default_ffn_scale(c.engine.directional_steering_file, 1.0f);
+    if (c.engine.directional_steering_file && !steering_scale_set) {
+        /* A residual-calibrated GLP defaults to the post-layer hook at its
+         * own alpha; anything else keeps the historical FFN default. */
+        c.engine.directional_steering_resid =
+            ds4_glp_default_resid_scale(c.engine.directional_steering_file, 0.0f);
+        if (c.engine.directional_steering_resid == 0.0f)
+            c.engine.directional_steering_ffn =
+                ds4_glp_default_ffn_scale(c.engine.directional_steering_file, 1.0f);
+    }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp,
                                           &c.engine.distributed,

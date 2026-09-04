@@ -229,6 +229,7 @@ static void print_steering(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dir-steering-file FILE", "Direction per layer: a GLP .gguf, or a raw f32 blob.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    opt(fp, c, "--dir-steering-resid F", "Apply steering to each hyper-connection stream after the layer's FFN fold (residual_stream_post_layer). Default for a residual-calibrated GLP: its glp.alpha_default");
     opt(fp, c, "--dir-steering-info FILE", "Print a GLP vector's metadata and exit; loads no model.");
     opt(fp, c, "--dir-steering-allow-hook-mismatch", "Apply a GLP vector at a hook it was not calibrated for.");
     fputc('\n', fp);

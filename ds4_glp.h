@@ -65,13 +65,16 @@
  * rather than apply it somewhere else.
  *
  * ds4 hooks the block writers, before the residual/hyper-connection fold --
- * ffn_out = moe + shared, and the attention output -- which is NOT
- * residual_stream_post_layer.  Both names are therefore part of the enum and
- * the two are not interchangeable. */
+ * ffn_out = moe + shared, and the attention output -- and the post-layer
+ * residual itself, where each of the n_hc hyper-connection streams is
+ * projected independently.  The two kinds of site are not interchangeable: a
+ * writer carries only what that block computed this layer, while the folded
+ * residual carries the accumulated sum. */
 typedef enum {
     DS4_GLP_HOOK_UNKNOWN = 0,
     /* "residual_stream_post_layer": llama.cpp's build_cvec() site and the
-     * vLLM overlay's site.  ds4 does not implement it (yet). */
+     * vLLM overlay's site.  ds4 --dir-steering-resid, applied per
+     * hyper-connection stream after the FFN fold (out_hc). */
     DS4_GLP_HOOK_RESID_POST_LAYER,
     /* "ffn_out_pre_residual": ds4 --dir-steering-ffn. */
     DS4_GLP_HOOK_FFN_OUT,
@@ -197,6 +200,11 @@ void ds4_glp_print_info(FILE *out, const char *path, const ds4_glp_info *info);
  * scale the user did not type should be visible in the log. Shared by ds4,
  * ds4-server and ds4-agent so the three cannot drift. */
 float ds4_glp_default_ffn_scale(const char *path, float fallback);
+
+/* The --dir-steering-resid sibling: adopts glp.alpha_default only for a file
+ * whose hook is residual_stream_post_layer.  Same rules and same stderr line
+ * as ds4_glp_default_ffn_scale. */
+float ds4_glp_default_resid_scale(const char *path, float fallback);
 
 /* --dir-steering-info: describe the vector at path on stdout and return the
  * process exit code (0 ok, 1 unreadable/refused, 2 not a GLP file).
