@@ -12595,15 +12595,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    if (cached == 0 && old_pos > 0) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
-                   responses_protocol ? " RESPPROTO" : "",
-                   old_pos, j->req.prompt.len, common,
-                   live_vision_exact_match ? "exact-match" :
-                   live_vision_prefix_match ? "prefix-match" : "mismatch",
-                   trace_cache_miss_reason(&cache_diag));
-    }
+    /* A live-slot miss is only an intermediate result while disk fallback is
+     * enabled.  Delay reporting it until after lookup so a successful restore
+     * is not presented as a cache failure. */
+    const bool live_cache_missed = cached == 0 && old_pos > 0;
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=%s",
@@ -12626,6 +12621,25 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = disk_cache_source;
             prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (live_cache_missed) {
+        if (cached > 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: live kv fallback recovered%s live=%d prompt=%d common=%d vision=%s source=%s cached=%d",
+                       responses_protocol ? " RESPPROTO" : "",
+                       old_pos, j->req.prompt.len, common,
+                       live_vision_exact_match ? "exact-match" :
+                       live_vision_prefix_match ? "prefix-match" : "mismatch",
+                       cache_source, cached);
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: kv cache miss (cold prefill)%s live=%d prompt=%d common=%d vision=%s reason=%s",
+                       responses_protocol ? " RESPPROTO" : "",
+                       old_pos, j->req.prompt.len, common,
+                       live_vision_exact_match ? "exact-match" :
+                       live_vision_prefix_match ? "prefix-match" : "mismatch",
+                       trace_cache_miss_reason(&cache_diag));
         }
     }
     const bool responses_reasoning_state_preserved =
