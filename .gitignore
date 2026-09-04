@@ -28,6 +28,7 @@
 /tests/test_mxfp4_cuda
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
+/tests/test_argsort_metal
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_glm53_kda

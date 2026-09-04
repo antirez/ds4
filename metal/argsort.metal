@@ -29,6 +29,8 @@ struct ds4_metal_args_argsort_merge {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    int32_t  total;
+    int32_t  keep_k;
 };
 
 typedef void (argsort_t)(
@@ -142,21 +144,25 @@ kernel void kernel_argsort_merge_f32_i32(
     const int i02 = tgpig[1];
     const int i03 = tgpig[2];
 
-    const int start = im * (2 * args.len);
+    // Runs are read at stride 2*len within the args.total valid elements of the
+    // row; output is packed at stride new_len so a round keeps at most keep_k.
+    const int start_read  = im * (2 * args.len);
+    const int new_len     = MIN(2 * args.len, args.keep_k);
+    const int start_write = im * new_len;
 
-    const int len0 = MIN(args.len, MAX(0, args.ne0 - (int)(start)));
-    const int len1 = MIN(args.len, MAX(0, args.ne0 - (int)(start + args.len)));
+    const int len0 = MIN(args.len, MAX(0, args.total - (int)(start_read)));
+    const int len1 = MIN(args.len, MAX(0, args.total - (int)(start_read + args.len)));
 
     const int total = len0 + len1;
 
-    device const int32_t * tmp0 = tmp + start
+    device const int32_t * tmp0 = tmp + start_read
         + i01*args.ne0
         + i02*args.ne0*args.ne01
         + i03*args.ne0*args.ne01*args.ne02;
 
     device const int32_t * tmp1 = tmp0 + args.len;
 
-    dst += start
+    dst += start_write
         + i01*args.top_k
         + i02*args.top_k*args.ne01
         + i03*args.top_k*args.ne01*args.ne02;
@@ -170,16 +176,13 @@ kernel void kernel_argsort_merge_f32_i32(
         return;
     }
 
-    const int chunk = (total + ntg.x - 1) / ntg.x;
+    const int out   = MIN(total, new_len);
+    const int chunk = (out + ntg.x - 1) / ntg.x;
 
     const int k0 = tpitg.x * chunk;
-    const int k1 = MIN(MIN(k0 + chunk, total), args.top_k);
+    const int k1 = MIN(k0 + chunk, out);
 
-    if (k0 >= args.top_k) {
-        return;
-    }
-
-    if (k0 >= total) {
+    if (k0 >= out) {
         return;
     }
 

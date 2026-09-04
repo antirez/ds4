@@ -6333,6 +6333,8 @@ typedef struct {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    int32_t  total;
+    int32_t  keep_k;
 } ds4_gpu_kargs_argsort_merge;
 
 typedef struct {
@@ -19087,14 +19089,28 @@ int ds4_gpu_indexer_topk_tensor(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* Runs are packed at stride len, all full but the last; total tracks the
+         * valid elements per row.  A round merges pairs into runs of new_len,
+         * so total shrinks toward top_k instead of staying at work_width. */
         int32_t len = block_top_k;
-        while (len < work_width) {
-            const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
+        int32_t total = work_width;
+        int32_t nruns = npr;
+        while (nruns > 1) {
+            const int32_t nm = (nruns + 1) / 2;   /* odd leftover passes through */
             const bool final_merge = nm == 1;
+            /* Final round: nruns == 2 so total <= 2*len, and total >= top_k, hence new_len == top_k. */
+            const int32_t new_len = (2 * len < (int32_t)top_k) ? 2 * len : (int32_t)top_k;
             NSUInteger merge_threads = g_argsort_merge_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
             if (merge_threads == 0 || merge_threads > 512u) merge_threads = 512u;
-            if (merge_threads > (NSUInteger)len) merge_threads = (NSUInteger)len;
+            if (merge_threads > (NSUInteger)new_len) merge_threads = (NSUInteger)new_len;
             if (merge_threads == 0) merge_threads = 1;
+
+            /* Full pairs write new_len each, the last partial pair writes
+             * min(r, new_len); q is clamped to the pairs actually dispatched. */
+            const int32_t q = total / (2 * len);
+            const int32_t r = total % (2 * len);
+            const int32_t total_next =
+                MIN(q, nm) * new_len + (q < nm ? MIN(r, new_len) : 0);
 
             ds4_gpu_kargs_argsort_merge merge_args = {
                 .ne00 = (int64_t)n_comp,
@@ -19109,8 +19125,10 @@ int ds4_gpu_indexer_topk_tensor(
                 .ne1 = (int32_t)n_tokens,
                 .ne2 = 1,
                 .ne3 = 1,
-                .top_k = nm == 1 ? (int32_t)top_k : work_width,
+                .top_k = final_merge ? (int32_t)top_k : work_width,
                 .len = len,
+                .total = total,
+                .keep_k = (int32_t)top_k,
             };
 
             enc = ds4_gpu_compute_encoder(cb);
@@ -19128,7 +19146,9 @@ int ds4_gpu_indexer_topk_tensor(
             const NSUInteger tmp = cur_off;
             cur_off = next_off;
             next_off = tmp;
-            len <<= 1;
+            len = new_len;
+            total = total_next;
+            nruns = nm;
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer top-k")) return 0;
