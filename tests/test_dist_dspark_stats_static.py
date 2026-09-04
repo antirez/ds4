@@ -124,7 +124,7 @@ class DistributedSafetyContractsStaticTest(unittest.TestCase):
 
     def test_worker_enforces_negotiated_speculative_capabilities(self) -> None:
         worker = c_function_from(DIST_SOURCE, "dist_worker_process_work_message")
-        flags = worker.index("work.flags & ~DS4_DIST_WORK_F_VALID_MASK")
+        flags = worker.index("work.flags & ~(DS4_DIST_WORK_F_VALID_MASK")
         caps = worker.index("ds4_dist_v3_work_caps_validate", flags)
         semantics = worker.index("const bool spec_verify", caps)
         self.assertLess(flags, caps)
