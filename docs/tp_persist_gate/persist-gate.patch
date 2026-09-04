@@ -1,0 +1,2106 @@
+diff --git a/Makefile b/Makefile
+index ab6037d..154bf9d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -83,7 +83,7 @@ TEST_HOOK_LINK = $(DS4_LINK)
+ TEST_HOOK_LDLIBS = $(DS4_LINK_LIBS)
+ endif
+ 
+-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-rocm-qkv-fusion test-q8-krow-rocm test-tp-combine-rocm test-graph-deferred-dump-rocm
++.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-incremental rocm test-rocm-qkv-fusion test-q8-krow-rocm test-tp-combine-rocm test-tp-persist-gate-rocm test-graph-deferred-dump-rocm
+ 
+ ifeq ($(UNAME_S),Darwin)
+ .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+@@ -209,6 +209,16 @@ strix-halo:
+ 
+ rocm: strix-halo
+ 
++# Same binaries/flags as strix-halo without the forced rebuild: only
++# objects whose sources changed (e.g. ds4_rocm.o after a .cuh edit) are
++# recompiled.  Use after a clean strix-halo build of the same tree.
++strix-halo-incremental:
++	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent \
++		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
++		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
++		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
++		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
++
+ # Core regression suite for ROCm-only hosts: the CUDA-specific binaries
+ # (tests/test_sampling, the CUDA session/mixed-batch oracles) are not part
+ # of this target; run them through `make test` / `make cuda-regression` on
+@@ -217,7 +227,7 @@ rocm: strix-halo
+ test-rocm:
+ 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
+ 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+-		tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm \
++		tests/test_tp_combine_rocm tests/test_tp_persist_gate_rocm tests/test_graph_deferred_dump_rocm \
+ 		ds4 ds4-server ds4-bench ds4-agent \
+ 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+ 		TEST_HOOK_GPU_OBJS="ds4_rocm.o" \
+@@ -232,6 +242,7 @@ test-rocm:
+ 	./tests/test_gpu_args
+ 	./tests/test_tp_combine_rocm
+ 	DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
++	./tests/test_tp_persist_gate_rocm
+ 	./tests/test_graph_deferred_dump_rocm
+ 	DS4_TEST_ROCM=1 ./tests/test_gpu_args_cli.sh
+ 
+@@ -664,7 +675,7 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
+ 	./tests/test_mxfp4_dot
+ 
+ clean:
+-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm tests/test_transport tests/test_dist_v3 tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm
++	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm tests/test_transport tests/test_dist_v3 tests/test_tp_combine_rocm tests/test_tp_persist_gate_rocm tests/test_graph_deferred_dump_rocm
+ 
+ tests/test_transport.o: tests/test_transport.c ds4_transport.h ds4_transport_internal.h
+ 	$(CC) $(CFLAGS) -I. -c -o $@ $<
+@@ -694,6 +705,15 @@ test-tp-combine-rocm: tests/test_tp_combine_rocm
+ 	./tests/test_tp_combine_rocm
+ 	DS4_TEST_TP_PREQUANT=1 ./tests/test_tp_combine_rocm
+ 
++tests/test_tp_persist_gate_rocm.o: tests/test_tp_persist_gate_rocm.cpp rocm/ds4_rocm_tp.cuh
++	$(HIPCC) $(ROCM_CFLAGS) -std=c++17 -I. -c -o $@ $<
++
++tests/test_tp_persist_gate_rocm: tests/test_tp_persist_gate_rocm.o
++	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
++
++test-tp-persist-gate-rocm: tests/test_tp_persist_gate_rocm
++	./tests/test_tp_persist_gate_rocm
++
+ ds4_rocm_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+ 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) \
+ 		-DDS4_ROCM_BUILD -DDS4_TEST_HOOKS -Wno-unused-function -I. -c -o $@ ds4.c
+diff --git a/ds4_rocm.cu b/ds4_rocm.cu
+index 3022ff0..0e66bc6 100644
+--- a/ds4_rocm.cu
++++ b/ds4_rocm.cu
+@@ -35,6 +35,9 @@
+ #include <sys/stat.h>
+ #include <time.h>
+ #include <unistd.h>
++#if defined(__linux__)
++#include <sched.h>
++#endif
+ #include <algorithm>
+ #include <unordered_map>
+ #include <vector>
+@@ -514,6 +517,9 @@ typedef struct {
+     hipEvent_t rx_consumed;
+     int in_use;
+     int rx_queued; /* producer queued the matching RX spin-copy */
++    int persist;   /* ring-path record: flag polls replace the events */
++    uint64_t h_detect_ns; /* trace: host saw TX released (CLOCK_MONOTONIC) */
++    uint64_t h_submit_ns; /* trace: NHI submit returned */
+ } ds4_rocm_tp_request;
+ 
+ static ds4_gpu_tensor *g_tp_engine_slab;
+@@ -561,6 +567,336 @@ static uint32_t g_tp_engine_building;
+  * floor below the 4096-frame production ring (4096 / 64 frames = 64). */
+ static uint32_t g_tp_engine_ring_msgs = 32;
+ 
++/* Persistent gate control plane (DS4_TP_PERSIST_GATE=1).  One resident
++ * kernel on its own non-blocking stream eats commands off a mapped
++ * host-written ring; the service thread polls mapped u64 flags instead of
++ * HIP events.  Layout in rocm/ds4_rocm_tp.cuh. */
++static unsigned char *g_tp_persist_ctrl_host; /* pinned, mapped */
++static unsigned char *g_tp_persist_ctrl_dev;
++static hipStream_t g_tp_persist_stream;
++static int g_tp_persist_active;
++static pthread_mutex_t g_tp_persist_pub_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* DS4_TP_GATE_STATS=1: per-gate GPU-timeline cost, stamp-released ->
++ * RX-copy-done, identical in meaning on both paths (legacy: elapsed time
++ * between the tx_ready and rx_consumed events; persistent: wall_clock64
++ * stamps the resident kernel writes next to the two flags).  Summarized
++ * once at shutdown; only the service thread touches the accumulators. */
++static int g_tp_gate_stats;
++static double g_tp_gate_stats_clock_khz;
++static uint64_t g_tp_gate_stats_n;
++static double g_tp_gate_stats_sum_us;
++static double g_tp_gate_stats_max_us;
++static uint64_t g_tp_gate_stats_hist[6]; /* <50 <100 <200 <500 <1000 >= */
++
++/* DS4_TP_GATE_TRACE=<path>: per-gate CSV written at shutdown.  GPU
++ * wall_clock64 stamps (persistent path only: tx released, RX warp started
++ * spinning, peer stamp first seen, RX copy done) plus the two host clocks
++ * the service thread takes around the NHI submit.  Joining both ranks'
++ * files on seq splits the arrival window into one-way latency and rank
++ * skew: rank0 waits L+s, rank1 waits L-s (scripts/tp_gate_trace.py). */
++typedef struct {
++    uint64_t seq;
++    uint32_t layer, gate;
++    uint64_t ts_tx, ts_rxq, ts_seen, ts_rx;
++    uint64_t h_detect_ns, h_submit_ns;
++    double ev_us; /* legacy rows: hipEventElapsedTime(tx_ready, rx_consumed) */
++} ds4_rocm_tp_trace_row;
++enum { DS4_ROCM_TP_TRACE_MAX = 262144 };
++static ds4_rocm_tp_trace_row *g_tp_gate_trace;
++static uint32_t g_tp_gate_trace_n;
++static const char *g_tp_gate_trace_path;
++
++static uint64_t ds4_rocm_tp_host_ns(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++static void ds4_rocm_tp_trace_add(const ds4_rocm_tp_request *req) {
++    if (!g_tp_gate_trace || g_tp_gate_trace_n >= DS4_ROCM_TP_TRACE_MAX)
++        return;
++    ds4_rocm_tp_trace_row *row = &g_tp_gate_trace[g_tp_gate_trace_n++];
++    memset(row, 0, sizeof(*row));
++    row->seq = req->seq;
++    row->layer = req->layer;
++    row->gate = req->gate;
++    row->h_detect_ns = req->h_detect_ns;
++    row->h_submit_ns = req->h_submit_ns;
++    if (req->persist && g_tp_persist_ctrl_host) {
++        const uint64_t slot = req->seq % DS4_ROCM_TP_PERSIST_CAP;
++        const unsigned char *c = g_tp_persist_ctrl_host;
++#define DS4_TP_TRACE_LOAD(off) \
++        __atomic_load_n((const uint64_t *)(const void *)((c) + (off)) + slot, \
++                        __ATOMIC_ACQUIRE)
++        row->ts_tx = DS4_TP_TRACE_LOAD(DS4_ROCM_TP_PERSIST_OFF_TS_TX);
++        row->ts_rxq = DS4_TP_TRACE_LOAD(DS4_ROCM_TP_PERSIST_OFF_TS_RXQ);
++        row->ts_seen = DS4_TP_TRACE_LOAD(DS4_ROCM_TP_PERSIST_OFF_TS_SEEN);
++        row->ts_rx = DS4_TP_TRACE_LOAD(DS4_ROCM_TP_PERSIST_OFF_TS_RX);
++#undef DS4_TP_TRACE_LOAD
++    } else {
++        float ms = 0.0f;
++        if (hipEventElapsedTime(&ms, req->tx_ready, req->rx_consumed) ==
++            hipSuccess)
++            row->ev_us = (double)ms * 1000.0;
++    }
++}
++
++static void ds4_rocm_tp_gate_stats_add(double us) {
++    g_tp_gate_stats_n++;
++    g_tp_gate_stats_sum_us += us;
++    if (us > g_tp_gate_stats_max_us) g_tp_gate_stats_max_us = us;
++    const int b = us < 50.0 ? 0 : us < 100.0 ? 1 : us < 200.0 ? 2 :
++                  us < 500.0 ? 3 : us < 1000.0 ? 4 : 5;
++    g_tp_gate_stats_hist[b]++;
++}
++
++/* ---- Resident-kernel launch / pause / resume -------------------------
++ *
++ * CLR's hipDeviceSynchronize, hipFree and hipHostFree wait for every
++ * stream on the device; the resident gate kernel never finishes on its
++ * own, so those calls would deadlock while it is up (observed: worker
++ * wedged in ds4_session_gpu_warmup -> ds4_gpu_end_commands ->
++ * hipDeviceSynchronize; the loopback runtime probe shows the same for
++ * hipFree/hipHostFree).  The guarded wrappers below (routed from every
++ * alias in ds4_rocm.h) pause the kernel: set the shutdown word, let the
++ * dispatcher drain (all published commands complete, consumed == publish)
++ * and exit, make the real call, then relaunch; the kernel resumes
++ * dispatch from the ring's consumed word.  Cost is one kernel exit +
++ * launch per device-wide call (~tens of us), flag off they are the plain
++ * runtime calls. */
++static uint32_t g_tp_persist_rank;
++static pthread_mutex_t g_tp_persist_pause_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static uint32_t *ds4_rocm_tp_persist_shutdown_word(void) {
++    return (uint32_t *)(void *)(g_tp_persist_ctrl_host +
++                                DS4_ROCM_TP_PERSIST_OFF_SHUTDOWN);
++}
++
++static int ds4_rocm_tp_persist_launch(void) {
++    hipLaunchKernelGGL(dsv4_tp_persistent_gate_kernel, dim3(1),
++                       dim3(DS4_ROCM_TP_PERSIST_THREADS), 0,
++                       g_tp_persist_stream, g_tp_persist_ctrl_dev,
++                       g_tp_persist_rank, g_tp_engine_max_spins,
++                       g_tp_engine_state_dev);
++    return hipGetLastError() == hipSuccess;
++}
++
++#undef hipDeviceSynchronize
++#undef hipFree
++#undef hipHostFree
++#undef hipFreeHost
++
++/* Caller holds g_tp_persist_pause_lock and has checked g_tp_persist_active. */
++static void ds4_rocm_tp_persist_pause_locked(void) {
++    __atomic_store_n(ds4_rocm_tp_persist_shutdown_word(), 1u, __ATOMIC_RELEASE);
++    (void)hipStreamSynchronize(g_tp_persist_stream);
++    __atomic_store_n(ds4_rocm_tp_persist_shutdown_word(), 0u, __ATOMIC_RELEASE);
++}
++
++static void ds4_rocm_tp_persist_resume_locked(void) {
++    if (ds4_rocm_tp_persist_launch()) return;
++    fprintf(stderr, DS4_GPU_LOG_PREFIX
++            "persistent TP gate kernel relaunch failed; latching TP failure\n");
++    if (g_tp_engine_state_host) {
++        uint32_t expected = 0;
++        (void)__atomic_compare_exchange_n(g_tp_engine_state_host, &expected,
++                                          1u, 0, __ATOMIC_ACQ_REL,
++                                          __ATOMIC_ACQUIRE);
++    }
++}
++
++hipError_t ds4_rocm_guarded_device_synchronize(void) {
++    if (!g_tp_persist_active) return hipDeviceSynchronize();
++    pthread_mutex_lock(&g_tp_persist_pause_lock);
++    if (!g_tp_persist_active || !g_tp_persist_ctrl_host) {
++        pthread_mutex_unlock(&g_tp_persist_pause_lock);
++        return hipDeviceSynchronize();
++    }
++    ds4_rocm_tp_persist_pause_locked();
++    const hipError_t err = hipDeviceSynchronize();
++    ds4_rocm_tp_persist_resume_locked();
++    pthread_mutex_unlock(&g_tp_persist_pause_lock);
++    return err;
++}
++
++hipError_t ds4_rocm_guarded_free(void *ptr) {
++    if (!g_tp_persist_active) return hipFree(ptr);
++    pthread_mutex_lock(&g_tp_persist_pause_lock);
++    if (!g_tp_persist_active || !g_tp_persist_ctrl_host) {
++        pthread_mutex_unlock(&g_tp_persist_pause_lock);
++        return hipFree(ptr);
++    }
++    ds4_rocm_tp_persist_pause_locked();
++    const hipError_t err = hipFree(ptr);
++    ds4_rocm_tp_persist_resume_locked();
++    pthread_mutex_unlock(&g_tp_persist_pause_lock);
++    return err;
++}
++
++hipError_t ds4_rocm_guarded_host_free(void *ptr) {
++    if (!g_tp_persist_active) return hipHostFree(ptr);
++    pthread_mutex_lock(&g_tp_persist_pause_lock);
++    if (!g_tp_persist_active || !g_tp_persist_ctrl_host) {
++        pthread_mutex_unlock(&g_tp_persist_pause_lock);
++        return hipHostFree(ptr);
++    }
++    ds4_rocm_tp_persist_pause_locked();
++    const hipError_t err = hipHostFree(ptr);
++    ds4_rocm_tp_persist_resume_locked();
++    pthread_mutex_unlock(&g_tp_persist_pause_lock);
++    return err;
++}
++
++#define hipDeviceSynchronize ds4_rocm_guarded_device_synchronize
++#define hipFree ds4_rocm_guarded_free
++#define hipHostFree ds4_rocm_guarded_host_free
++#define hipFreeHost ds4_rocm_guarded_host_free
++
++static void ds4_rocm_tp_gate_stats_report(void) {
++    if (!g_tp_gate_stats) return;
++    const double n = g_tp_gate_stats_n ? (double)g_tp_gate_stats_n : 1.0;
++    fprintf(stderr, DS4_GPU_LOG_PREFIX
++            "TP gate stats (%s): gates=%llu mean=%.1fus max=%.1fus "
++            "hist[<50,<100,<200,<500,<1000,>=1000us]="
++            "%llu,%llu,%llu,%llu,%llu,%llu  (~%.2f ms/token at 86 gates)\n",
++            g_tp_persist_active ? "persistent" : "legacy",
++            (unsigned long long)g_tp_gate_stats_n,
++            g_tp_gate_stats_sum_us / n, g_tp_gate_stats_max_us,
++            (unsigned long long)g_tp_gate_stats_hist[0],
++            (unsigned long long)g_tp_gate_stats_hist[1],
++            (unsigned long long)g_tp_gate_stats_hist[2],
++            (unsigned long long)g_tp_gate_stats_hist[3],
++            (unsigned long long)g_tp_gate_stats_hist[4],
++            (unsigned long long)g_tp_gate_stats_hist[5],
++            g_tp_gate_stats_sum_us / n * 86.0 / 1000.0);
++}
++
++/* Write the per-gate trace CSV and a compact summary (persistent path:
++ * arrival = tx released -> peer stamp seen, copy = seen -> rx_done;
++ * both paths: submit = host detect -> NHI submit returned). */
++static void ds4_rocm_tp_gate_trace_report(void) {
++    if (!g_tp_gate_trace) return;
++    const double khz = g_tp_gate_stats_clock_khz > 0.0 ?
++        g_tp_gate_stats_clock_khz : 100000.0;
++    FILE *f = g_tp_gate_trace_path ? fopen(g_tp_gate_trace_path, "w") : NULL;
++    if (f) {
++        fprintf(f, "seq,layer,gate,ts_tx,ts_rxq,ts_seen,ts_rx,"
++                   "h_detect_ns,h_submit_ns,ev_us\n");
++    }
++    double sum_arrive = 0, sum_copy = 0, sum_submit = 0, sum_spin = 0;
++    uint64_t n_gpu = 0, n_host = 0;
++    for (uint32_t i = 0; i < g_tp_gate_trace_n; i++) {
++        const ds4_rocm_tp_trace_row *r = &g_tp_gate_trace[i];
++        if (f) {
++            fprintf(f, "%llu,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%.1f\n",
++                    (unsigned long long)r->seq, r->layer, r->gate,
++                    (unsigned long long)r->ts_tx,
++                    (unsigned long long)r->ts_rxq,
++                    (unsigned long long)r->ts_seen,
++                    (unsigned long long)r->ts_rx,
++                    (unsigned long long)r->h_detect_ns,
++                    (unsigned long long)r->h_submit_ns, r->ev_us);
++        }
++        if (r->ts_tx && r->ts_seen && r->ts_rx && r->ts_rxq &&
++            r->ts_tx != ~0ull && r->ts_seen != ~0ull &&
++            r->ts_rx != ~0ull && r->ts_rxq != ~0ull &&
++            r->ts_seen >= r->ts_tx && r->ts_rx >= r->ts_seen) {
++            sum_arrive += (double)(r->ts_seen - r->ts_tx) * 1000.0 / khz;
++            sum_copy += (double)(r->ts_rx - r->ts_seen) * 1000.0 / khz;
++            /* RX warp spin start relative to our TX release (negative =
++             * the RX command was already waiting when we released). */
++            sum_spin += ((double)r->ts_rxq - (double)r->ts_tx) * 1000.0 / khz;
++            n_gpu++;
++        }
++        if (r->h_submit_ns >= r->h_detect_ns && r->h_detect_ns) {
++            sum_submit += (double)(r->h_submit_ns - r->h_detect_ns) / 1000.0;
++            n_host++;
++        }
++    }
++    if (f) fclose(f);
++    fprintf(stderr, DS4_GPU_LOG_PREFIX
++            "TP gate trace: rows=%u%s%s",
++            g_tp_gate_trace_n,
++            g_tp_gate_trace_path ? " -> " : "",
++            g_tp_gate_trace_path ? g_tp_gate_trace_path : "");
++    if (n_host)
++        fprintf(stderr, "  submit(host detect->ioctl done) mean=%.1fus",
++                sum_submit / (double)n_host);
++    if (n_gpu)
++        fprintf(stderr, "  arrival(tx released->peer stamp seen) mean=%.1fus"
++                "  copy(seen->rx_done) mean=%.1fus"
++                "  rx spin start rel. tx release mean=%.1fus",
++                sum_arrive / (double)n_gpu, sum_copy / (double)n_gpu,
++                sum_spin / (double)n_gpu);
++    fprintf(stderr, "\n");
++    free(g_tp_gate_trace);
++    g_tp_gate_trace = NULL;
++    g_tp_gate_trace_n = 0;
++}
++
++static int ds4_rocm_tp_persist_wanted(void) {
++    const char *v = getenv("DS4_TP_PERSIST_GATE");
++    return v && strcmp(v, "1") == 0;
++}
++
++static void ds4_rocm_tp_poll_spin(int *tick) {
++    if ((++(*tick) & 0x3ff) == 0) {
++#if defined(__linux__)
++        sched_yield();
++#endif
++    }
++}
++
++/* Poll a mapped per-seq flag until it carries `seq` (returns 1), or the
++ * engine state word latches (returns 0; the latch, not this poll, is what
++ * aborts the corresponding GPU spin, mirroring the event-sync path). */
++static int ds4_rocm_tp_wait_flag(const uint64_t *flags, uint64_t seq) {
++    int tick = 0;
++    for (;;) {
++        if (__atomic_load_n(&flags[seq % DS4_ROCM_TP_PERSIST_CAP],
++                            __ATOMIC_ACQUIRE) == seq)
++            return 1;
++        if (!g_tp_engine_state_host ||
++            __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)
++            return 0;
++        ds4_rocm_tp_poll_spin(&tick);
++    }
++}
++
++/* Write one command: ring entry (plain stores) then publish (release). */
++static int ds4_rocm_tp_persist_publish(const ds4_rocm_tp_ring_cmd *cmd) {
++    if (!g_tp_persist_active || !g_tp_persist_ctrl_host || !cmd)
++        return 0;
++    uint64_t *publish = (uint64_t *)(void *)g_tp_persist_ctrl_host;
++    uint64_t *consumed = (uint64_t *)(void *)
++        (g_tp_persist_ctrl_host + DS4_ROCM_TP_PERSIST_OFF_CONSUMED);
++    ds4_rocm_tp_ring_cmd *ring = (ds4_rocm_tp_ring_cmd *)(void *)
++        (g_tp_persist_ctrl_host + DS4_ROCM_TP_PERSIST_OFF_RING);
++    pthread_mutex_lock(&g_tp_persist_pub_lock);
++    const uint64_t next = __atomic_load_n(publish, __ATOMIC_ACQUIRE);
++    for (;;) {
++        if (__atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
++            (g_tp_engine_state_host &&
++             __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) != 0)) {
++            pthread_mutex_unlock(&g_tp_persist_pub_lock);
++            return 0;
++        }
++        /* Never let more than the ring capacity stand published; the
++         * kernel advances `consumed` in command order, so this subsumes
++         * the transport-ring outstanding bound. */
++        if (next - __atomic_load_n(consumed, __ATOMIC_ACQUIRE) <
++            DS4_ROCM_TP_PERSIST_CAP)
++            break;
++        static thread_local int tick;
++        ds4_rocm_tp_poll_spin(&tick);
++    }
++    ring[next % DS4_ROCM_TP_PERSIST_CAP] = *cmd;
++    __atomic_store_n(publish, next + 1u, __ATOMIC_RELEASE);
++    pthread_mutex_unlock(&g_tp_persist_pub_lock);
++    return 1;
++}
++
+ static void ds4_rocm_tp_expert_range(uint32_t n_total_expert,
+                                      uint32_t *first_expert,
+                                      uint32_t *n_expert) {
+@@ -661,8 +997,15 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
+          * while the peer is still draining earlier messages. */
+         if (have_pending) {
+             ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
+-            if (hipEventSynchronize(req->tx_ready) != hipSuccess)
++            if (req->persist) {
++                const uint64_t *tx_flags = (const uint64_t *)(const void *)
++                    (g_tp_persist_ctrl_host +
++                     DS4_ROCM_TP_PERSIST_OFF_TX_RELEASED);
++                (void)ds4_rocm_tp_wait_flag(tx_flags, req->seq);
++            } else if (hipEventSynchronize(req->tx_ready) != hipSuccess) {
+                 ds4_rocm_tp_fail("TX-ready event synchronize", req);
++            }
++            if (g_tp_gate_trace) req->h_detect_ns = ds4_rocm_tp_host_ns();
+             const uint32_t state = g_tp_engine_state_host
+                 ? __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE)
+                 : 1u;
+@@ -670,6 +1013,7 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
+                 !(g_tp_nhi_submit_fn &&
+                   g_tp_nhi_submit_fn(g_tp_nhi_ud, req->seq)))
+                 ds4_rocm_tp_fail("NHI submit", req);
++            if (g_tp_gate_trace) req->h_submit_ns = ds4_rocm_tp_host_ns();
+ 
+             pthread_mutex_lock(&g_tp_engine_mutex);
+             const uint32_t tail =
+@@ -702,25 +1046,69 @@ static void *ds4_rocm_tp_service_thread(void *arg) {
+                 pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
+             pthread_mutex_unlock(&g_tp_engine_mutex);
+ 
+-            const hipError_t query = hipEventQuery(req->rx_consumed);
+-            if (query == hipErrorNotReady) {
+-                pthread_mutex_lock(&g_tp_engine_mutex);
+-                const int more_pending = g_tp_engine_pending_count != 0;
+-                pthread_mutex_unlock(&g_tp_engine_mutex);
+-                if (more_pending) break; /* keep submitting; retire later */
+-                /* Nothing else to submit: block on the oldest reader.  On
+-                 * transport failure or shutdown the mapped state word
+-                 * aborts the spin, so teardown cannot wedge here. */
+-                if (hipEventSynchronize(req->rx_consumed) != hipSuccess)
+-                    ds4_rocm_tp_fail("RX-consumed event synchronize", req);
+-            } else if (query != hipSuccess) {
+-                ds4_rocm_tp_fail("RX-consumed event query", req);
++            int rx_ready = 0;
++            if (req->persist) {
++                const uint64_t *rx_flags = (const uint64_t *)(const void *)
++                    (g_tp_persist_ctrl_host +
++                     DS4_ROCM_TP_PERSIST_OFF_RX_DONE);
++                rx_ready = __atomic_load_n(
++                    &rx_flags[req->seq % DS4_ROCM_TP_PERSIST_CAP],
++                    __ATOMIC_ACQUIRE) == req->seq;
++                if (!rx_ready) {
++                    pthread_mutex_lock(&g_tp_engine_mutex);
++                    const int more_pending = g_tp_engine_pending_count != 0;
++                    pthread_mutex_unlock(&g_tp_engine_mutex);
++                    if (more_pending) break; /* keep submitting */
++                    /* Nothing else to submit: block on the oldest reader's
++                     * mapped flag; a failure latch aborts the spin. */
++                    rx_ready = ds4_rocm_tp_wait_flag(rx_flags, req->seq);
++                }
++            } else {
++                const hipError_t query = hipEventQuery(req->rx_consumed);
++                if (query == hipErrorNotReady) {
++                    pthread_mutex_lock(&g_tp_engine_mutex);
++                    const int more_pending = g_tp_engine_pending_count != 0;
++                    pthread_mutex_unlock(&g_tp_engine_mutex);
++                    if (more_pending) break; /* keep submitting; retire later */
++                    /* Nothing else to submit: block on the oldest reader.  On
++                     * transport failure or shutdown the mapped state word
++                     * aborts the spin, so teardown cannot wedge here. */
++                    if (hipEventSynchronize(req->rx_consumed) != hipSuccess)
++                        ds4_rocm_tp_fail("RX-consumed event synchronize", req);
++                    rx_ready = 1;
++                } else if (query != hipSuccess) {
++                    ds4_rocm_tp_fail("RX-consumed event query", req);
++                } else {
++                    rx_ready = 1;
++                }
+             }
+             if (g_tp_engine_state_host &&
+                 __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 1u)
+                 ds4_rocm_tp_fail("RX stamp timeout", req);
+ 
+-            if (g_tp_engine_state_host &&
++            if (rx_ready && g_tp_gate_trace) ds4_rocm_tp_trace_add(req);
++            if (rx_ready && g_tp_gate_stats) {
++                if (req->persist) {
++                    const uint64_t *ts_tx = (const uint64_t *)(const void *)
++                        (g_tp_persist_ctrl_host + DS4_ROCM_TP_PERSIST_OFF_TS_TX);
++                    const uint64_t *ts_rx = (const uint64_t *)(const void *)
++                        (g_tp_persist_ctrl_host + DS4_ROCM_TP_PERSIST_OFF_TS_RX);
++                    const uint64_t slot = req->seq % DS4_ROCM_TP_PERSIST_CAP;
++                    const uint64_t t0 = __atomic_load_n(&ts_tx[slot], __ATOMIC_ACQUIRE);
++                    const uint64_t t1 = __atomic_load_n(&ts_rx[slot], __ATOMIC_ACQUIRE);
++                    if (t1 >= t0 && g_tp_gate_stats_clock_khz > 0.0)
++                        ds4_rocm_tp_gate_stats_add(
++                            (double)(t1 - t0) * 1000.0 / g_tp_gate_stats_clock_khz);
++                } else {
++                    float ms = 0.0f;
++                    if (hipEventElapsedTime(&ms, req->tx_ready,
++                                            req->rx_consumed) == hipSuccess)
++                        ds4_rocm_tp_gate_stats_add((double)ms * 1000.0);
++                }
++            }
++
++            if (rx_ready &&
++                g_tp_engine_state_host &&
+                 __atomic_load_n(g_tp_engine_state_host, __ATOMIC_ACQUIRE) == 0 &&
+                 g_tp_nhi_consumed_fn &&
+                 !g_tp_nhi_consumed_fn(g_tp_nhi_ud, req->seq))
+@@ -809,6 +1197,11 @@ extern "C" int ds4_gpu_tp_nhi_init(
+     if (spins && strtoull(spins, NULL, 10) != 0)
+         g_tp_engine_max_spins = strtoull(spins, NULL, 10);
+ 
++    static_assert(sizeof(ds4_rocm_tp_ring_cmd) == 40,
++                  "persistent ring command must stay 40 bytes");
++    static_assert(DS4_ROCM_TP_PERSIST_CAP == DS4_ROCM_TP_QUEUE,
++                  "persistent ring capacity must match the engine queue");
++
+     if (hipGetDevice(&g_tp_engine_device) != hipSuccess ||
+         hipHostMalloc((void **)&g_tp_engine_state_host, sizeof(uint32_t),
+                       hipHostMallocMapped) != hipSuccess ||
+@@ -818,6 +1211,104 @@ extern "C" int ds4_gpu_tp_nhi_init(
+         return 0;
+     }
+     __atomic_store_n(g_tp_engine_state_host, 0u, __ATOMIC_RELEASE);
++
++    g_tp_gate_stats = getenv("DS4_TP_GATE_STATS") != NULL;
++    g_tp_gate_stats_n = 0;
++    g_tp_gate_stats_sum_us = 0.0;
++    g_tp_gate_stats_max_us = 0.0;
++    memset(g_tp_gate_stats_hist, 0, sizeof(g_tp_gate_stats_hist));
++    g_tp_gate_stats_clock_khz = 0.0;
++    g_tp_gate_trace_path = getenv("DS4_TP_GATE_TRACE");
++    g_tp_gate_trace_n = 0;
++    free(g_tp_gate_trace);
++    g_tp_gate_trace = NULL;
++    if (g_tp_gate_trace_path && *g_tp_gate_trace_path) {
++        g_tp_gate_trace = (ds4_rocm_tp_trace_row *)
++            calloc(DS4_ROCM_TP_TRACE_MAX, sizeof(*g_tp_gate_trace));
++        if (!g_tp_gate_trace)
++            fprintf(stderr, DS4_GPU_LOG_PREFIX
++                    "TP gate trace disabled: allocation failed\n");
++        g_tp_gate_stats = 1; /* the trace needs the wall-clock rate */
++    }
++    if (g_tp_gate_stats) {
++        int khz = 0;
++        if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
++                                  g_tp_engine_device) == hipSuccess && khz > 0)
++            g_tp_gate_stats_clock_khz = (double)khz;
++    }
++
++    /* Opt-in resident gate kernel (DS4_TP_PERSIST_GATE=1).  Must come
++     * AFTER the mapped state word exists: the kernel takes
++     * g_tp_engine_state_dev as its failure latch and exits on the spot if
++     * that pointer is NULL.  Every setup failure logs and falls back to
++     * the legacy launch path (R6). */
++    g_tp_persist_active = 0;
++    if (ds4_rocm_tp_persist_wanted()) {
++        int persist_ok = 0;
++        const char *why = "unknown";
++        do {
++            int wave = 0;
++            if (hipDeviceGetAttribute(&wave, hipDeviceAttributeWarpSize,
++                                      g_tp_engine_device) != hipSuccess ||
++                wave != (int)DS4_ROCM_TP_PERSIST_WAVE) {
++                why = "device wave size is not 32";
++                break;
++            }
++            const size_t bytes = (size_t)DS4_ROCM_TP_PERSIST_BYTES;
++            if (hipHostMalloc((void **)&g_tp_persist_ctrl_host, bytes,
++                              hipHostMallocMapped) != hipSuccess) {
++                why = "control-plane hipHostMalloc";
++                break;
++            }
++            if (hipHostGetDevicePointer((void **)&g_tp_persist_ctrl_dev,
++                                        g_tp_persist_ctrl_host, 0) !=
++                hipSuccess) {
++                why = "control-plane device pointer";
++                break;
++            }
++            /* Header words to 0; the per-seq u64 arrays (flags + stamps)
++             * to the all-ones sentinel (real seq values are < 2^32); ring
++             * entries to 0. */
++            memset(g_tp_persist_ctrl_host, 0,
++                   (size_t)DS4_ROCM_TP_PERSIST_OFF_SRC_READY);
++            memset(g_tp_persist_ctrl_host +
++                       DS4_ROCM_TP_PERSIST_OFF_SRC_READY,
++                   0xFF,
++                   (size_t)DS4_ROCM_TP_PERSIST_CAP * 8u *
++                       DS4_ROCM_TP_PERSIST_FLAG_ARRAYS);
++            memset(g_tp_persist_ctrl_host + DS4_ROCM_TP_PERSIST_OFF_RING, 0,
++                   (size_t)DS4_ROCM_TP_PERSIST_CAP *
++                       sizeof(ds4_rocm_tp_ring_cmd));
++            if (hipStreamCreateWithFlags(&g_tp_persist_stream,
++                                         hipStreamNonBlocking) !=
++                hipSuccess) {
++                why = "persistent stream create";
++                break;
++            }
++            g_tp_persist_rank = rank;
++            if (!ds4_rocm_tp_persist_launch()) {
++                why = "persistent kernel launch";
++                break;
++            }
++            persist_ok = 1;
++        } while (0);
++        if (persist_ok) {
++            g_tp_persist_active = 1;
++            fprintf(stderr, DS4_GPU_LOG_PREFIX
++                    "persistent TP gate kernel enabled (rank %u)\n", rank);
++        } else {
++            if (g_tp_persist_stream)
++                (void)hipStreamDestroy(g_tp_persist_stream);
++            g_tp_persist_stream = 0;
++            if (g_tp_persist_ctrl_host)
++                (void)hipHostFree(g_tp_persist_ctrl_host);
++            g_tp_persist_ctrl_host = NULL;
++            g_tp_persist_ctrl_dev = NULL;
++            fprintf(stderr, DS4_GPU_LOG_PREFIX
++                    "persistent TP gate kernel setup failed (%s); falling "
++                    "back to the legacy launch path\n", why);
++        }
++    }
+     for (uint32_t i = 0; i < DS4_ROCM_TP_QUEUE; i++) {
+         if (hipEventCreateWithFlags(&g_tp_engine_requests[i].tx_ready,
+                                     hipEventReleaseToSystem) != hipSuccess ||
+@@ -843,12 +1334,49 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
+          * submit/final-reader/repost.  A previously latched failure already
+          * set state=1, which is the only path that aborts RX spins. */
+         __atomic_store_n(&g_tp_engine_shutdown, 1, __ATOMIC_RELEASE);
++        /* Every builder must finish (publish its record) before the
++         * resident kernel is allowed to leave, or a late publish would
++         * strand its service-thread wait on a dead kernel.  `building` is
++         * the engine's existing builder drain: it reaches 0 only after
++         * all records are in the pending queue. */
++        while (g_tp_engine_building != 0)
++            pthread_cond_wait(&g_tp_engine_cond, &g_tp_engine_mutex);
++        if (g_tp_persist_active && g_tp_persist_ctrl_host) {
++            /* Ask the resident kernel to drain its ring and exit; the
++             * service thread keeps submitting/consuming those records
++             * until its own join (R7 teardown order). */
++            __atomic_store_n((uint32_t *)(void *)(g_tp_persist_ctrl_host +
++                                                  DS4_ROCM_TP_PERSIST_OFF_SHUTDOWN),
++                             1u, __ATOMIC_RELEASE);
++        }
+         pthread_cond_broadcast(&g_tp_engine_cond);
+         pthread_mutex_unlock(&g_tp_engine_mutex);
+         pthread_join(g_tp_engine_thread, NULL);
+         g_tp_engine_thread_running = 0;
++        ds4_rocm_tp_gate_stats_report();
++        ds4_rocm_tp_gate_trace_report();
+         (void)hipDeviceSynchronize();
+     }
++    if (g_tp_persist_active) {
++        /* The shutdown word may not have been written above (init-failure
++         * teardown runs before the service thread exists); the resident
++         * kernel only exits once it sees it, so store it unconditionally
++         * before waiting on the stream.  Clear the active flag under the
++         * pause lock BEFORE destroying/freeing, so the guarded free below
++         * (and any concurrent guarded call) takes the plain path. */
++        pthread_mutex_lock(&g_tp_persist_pause_lock);
++        if (g_tp_persist_ctrl_host)
++            __atomic_store_n(ds4_rocm_tp_persist_shutdown_word(), 1u,
++                             __ATOMIC_RELEASE);
++        (void)hipStreamSynchronize(g_tp_persist_stream);
++        g_tp_persist_active = 0;
++        pthread_mutex_unlock(&g_tp_persist_pause_lock);
++        (void)hipStreamDestroy(g_tp_persist_stream);
++        g_tp_persist_stream = 0;
++        if (g_tp_persist_ctrl_host) (void)hipHostFree(g_tp_persist_ctrl_host);
++        g_tp_persist_ctrl_host = NULL;
++        g_tp_persist_ctrl_dev = NULL;
++    }
+     if (g_tp_engine_state_host) {
+         uint32_t expected = 0;
+         (void)__atomic_compare_exchange_n(g_tp_engine_state_host, &expected,
+@@ -892,7 +1420,8 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
+ static int ds4_rocm_tp_enqueue_gate_tx(uint32_t layer,
+                                        uint32_t gate,
+                                        const void *src,
+-                                       uint32_t n_floats) {
++                                       uint32_t n_floats,
++                                       int persist) {
+     if (!g_tp_engine_thread_running ||
+         __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE) ||
+         !src || n_floats == 0 ||
+@@ -938,6 +1467,7 @@ static int ds4_rocm_tp_enqueue_gate_tx(uint32_t layer,
+     req->gate = gate;
+     req->seq = g_tp_engine_seq++;
+     req->rx_queued = 0;
++    req->persist = 0;
+     g_tp_engine_building++;
+     pthread_mutex_unlock(&g_tp_engine_mutex);
+ 
+@@ -953,21 +1483,55 @@ static int ds4_rocm_tp_enqueue_gate_tx(uint32_t layer,
+         return -1;
+     }
+ 
+-    const uint32_t block = 256u;
+-    const uint32_t grid = (n_floats + block - 1u) / block;
+-    hipLaunchKernelGGL(dsv4_tp_slot_copy_f32_kernel,
+-                       dim3(grid), dim3(block), 0, 0,
+-                       (unsigned char *)tx_slot, (const float *)src,
+-                       n_floats);
+-    hipLaunchKernelGGL(dsv4_tp_stamp_release_kernel,
+-                       dim3(1), dim3(1), 0, 0,
+-                       (unsigned char *)tx_slot,
+-                       ds4_rocm_tp_stamp((uint32_t)g_tp_split_rank, req->seq));
+-    if (hipGetLastError() != hipSuccess ||
+-        hipEventRecord(req->tx_ready, 0) != hipSuccess) {
+-        ds4_rocm_tp_cancel_build(req);
+-        ds4_rocm_tp_fail("gate TX kernel/event enqueue", req);
+-        return -1;
++    if (persist && g_tp_persist_active) {
++        /* Ring path: the one-thread mark kernel orders the producer's
++         * payload stores on the compute stream; the resident TX warp
++         * spins src_ready[seq], so the ring publish may legally precede
++         * or follow the mark's execution. */
++        hipLaunchKernelGGL(dsv4_tp_mark_src_ready_kernel, dim3(1), dim3(1),
++                           0, 0, g_tp_persist_ctrl_dev, req->seq);
++        ds4_rocm_tp_ring_cmd cmd;
++        memset(&cmd, 0, sizeof(cmd));
++        cmd.kind = DS4_ROCM_TP_PERSIST_KIND_TX;
++        cmd.seq = req->seq;
++        cmd.addr_a = (uint64_t)(uintptr_t)src;
++        cmd.addr_b = (uint64_t)(uintptr_t)tx_slot;
++        cmd.n_floats = n_floats;
++        cmd.expect_stamp = ds4_rocm_tp_stamp((uint32_t)g_tp_split_rank,
++                                             req->seq);
++        if (hipGetLastError() != hipSuccess ||
++            !ds4_rocm_tp_persist_publish(&cmd)) {
++            ds4_rocm_tp_cancel_build(req);
++            const int shutting =
++                __atomic_load_n(&g_tp_engine_shutdown, __ATOMIC_ACQUIRE);
++            const int latched = g_tp_engine_state_host &&
++                __atomic_load_n(g_tp_engine_state_host,
++                                __ATOMIC_ACQUIRE) != 0;
++            /* Dropping a not-yet-pending record during clean shutdown is
++             * not a transport failure; the caller bails the same way. */
++            if (latched || !shutting)
++                ds4_rocm_tp_fail("persistent gate TX publish", req);
++            return -1;
++        }
++        req->persist = 1;
++    } else {
++        const uint32_t block = 256u;
++        const uint32_t grid = (n_floats + block - 1u) / block;
++        hipLaunchKernelGGL(dsv4_tp_slot_copy_f32_kernel,
++                           dim3(grid), dim3(block), 0, 0,
++                           (unsigned char *)tx_slot, (const float *)src,
++                           n_floats);
++        hipLaunchKernelGGL(dsv4_tp_stamp_release_kernel,
++                           dim3(1), dim3(1), 0, 0,
++                           (unsigned char *)tx_slot,
++                           ds4_rocm_tp_stamp((uint32_t)g_tp_split_rank,
++                                             req->seq));
++        if (hipGetLastError() != hipSuccess ||
++            hipEventRecord(req->tx_ready, 0) != hipSuccess) {
++            ds4_rocm_tp_cancel_build(req);
++            ds4_rocm_tp_fail("gate TX kernel/event enqueue", req);
++            return -1;
++        }
+     }
+ 
+     pthread_mutex_lock(&g_tp_engine_mutex);
+@@ -1003,7 +1567,25 @@ static int ds4_rocm_tp_enqueue_gate_rx(uint32_t index,
+     ds4_rocm_tp_request *req = &g_tp_engine_requests[index];
+     const void *rx_slot = g_tp_nhi_rx_slot_fn(g_tp_nhi_ud, req->seq);
+     int ok = rx_slot != NULL;
+-    if (ok) {
++    if (ok && req->persist) {
++        /* Ring path: wait_rx_done replaces the spin-copy on the compute
++         * stream; it spins the mapped rx_done flag (latch-aware) so later
++         * graph work cannot consume dst before the copy lands. */
++        hipLaunchKernelGGL(dsv4_tp_wait_rx_done_kernel, dim3(1), dim3(1),
++                           0, 0, g_tp_persist_ctrl_dev, req->seq,
++                           g_tp_engine_state_dev);
++        ds4_rocm_tp_ring_cmd cmd;
++        memset(&cmd, 0, sizeof(cmd));
++        cmd.kind = DS4_ROCM_TP_PERSIST_KIND_RX;
++        cmd.seq = req->seq;
++        cmd.addr_a = (uint64_t)(uintptr_t)rx_slot;
++        cmd.addr_b = (uint64_t)(uintptr_t)dst;
++        cmd.n_floats = n_floats;
++        cmd.expect_stamp = ds4_rocm_tp_stamp(
++            (uint32_t)(g_tp_split_rank ^ 1), req->seq);
++        ok = hipGetLastError() == hipSuccess &&
++             ds4_rocm_tp_persist_publish(&cmd);
++    } else if (ok) {
+         hipLaunchKernelGGL(dsv4_tp_spin_copy_f32_kernel,
+                            dim3(1), dim3(256), 0, 0,
+                            (float *)dst, (const unsigned char *)rx_slot,
+@@ -1023,7 +1605,8 @@ static int ds4_rocm_tp_enqueue_gate_rx(uint32_t index,
+     pthread_cond_broadcast(&g_tp_engine_cond);
+     pthread_mutex_unlock(&g_tp_engine_mutex);
+     if (!ok) {
+-        ds4_rocm_tp_fail("gate RX kernel/event enqueue", req);
++        ds4_rocm_tp_fail(req->persist ? "persistent gate RX publish" :
++                         "gate RX kernel/event enqueue", req);
+         return 0;
+     }
+     return 1;
+@@ -1039,7 +1622,8 @@ static int ds4_rocm_tp_enqueue_gate(uint32_t layer,
+                                     uint32_t n_floats) {
+     if (!dst) return 0;
+     const int index =
+-        ds4_rocm_tp_enqueue_gate_tx(layer, gate, src, n_floats);
++        ds4_rocm_tp_enqueue_gate_tx(layer, gate, src, n_floats,
++                                    g_tp_persist_active);
+     if (index < 0) return 0;
+     return ds4_rocm_tp_enqueue_gate_rx((uint32_t)index, dst, n_floats);
+ }
+@@ -1128,7 +1712,8 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+                 layer,
+                 DS4_ROCM_TP_BIG_GATE_TAG,
+                 (const float *)out_t->ptr + tx_done,
+-                chunk);
++                chunk,
++                0 /* big gates stay on the legacy launch path (R8) */);
+             if (index < 0)
+                 return 0;
+             tx_records[n_window++] = index;
+diff --git a/ds4_rocm.h b/ds4_rocm.h
+index 50481b8..c9b0828 100644
+--- a/ds4_rocm.h
++++ b/ds4_rocm.h
+@@ -19,6 +19,21 @@
+ #define cudaGetLastError hipGetLastError
+ #define cudaGetErrorString hipGetErrorString
+ 
++/* Device-wide runtime calls (device sync, free of device/host memory) wait
++ * for every stream on the device in CLR, including the resident TP gate
++ * kernel's stream (DS4_TP_PERSIST_GATE), which never finishes by design.
++ * These wrappers pause that kernel (drain + exit), make the real call, and
++ * relaunch it resuming from the ring's consumed index.  Flag off they are
++ * the plain runtime calls.  Every alias and direct spelling below routes
++ * through them; the implementations #undef locally. */
++hipError_t ds4_rocm_guarded_device_synchronize(void);
++hipError_t ds4_rocm_guarded_free(void *ptr);
++hipError_t ds4_rocm_guarded_host_free(void *ptr);
++#define hipDeviceSynchronize ds4_rocm_guarded_device_synchronize
++#define hipFree ds4_rocm_guarded_free
++#define hipHostFree ds4_rocm_guarded_host_free
++#define hipFreeHost ds4_rocm_guarded_host_free
++
+ #define cudaGetDevice hipGetDevice
+ #define cudaSetDevice hipSetDevice
+ #define cudaDeviceSynchronize hipDeviceSynchronize
+diff --git a/rocm/ds4_rocm_tp.cuh b/rocm/ds4_rocm_tp.cuh
+index 0364d6c..094cd9c 100644
+--- a/rocm/ds4_rocm_tp.cuh
++++ b/rocm/ds4_rocm_tp.cuh
+@@ -164,3 +164,635 @@ __global__ void dsv4_tp_spin_combine_f32_kernel(float *__restrict__ acc,
+         acc[i] += payload[i];
+     }
+ }
++
++/* ------------------------------------------------------------------------
++ * Persistent gate kernel (DS4_TP_PERSIST_GATE=1, POC).
++ *
++ * One resident kernel replaces the per-gate launch/event choreography on
++ * the NHI TP decode path.  The host writes commands into a ring living in
++ * pinned, mapped memory and bumps `publish`; a dispatcher warp hands each
++ * command to a worker warp pair, which run inlined copies of
++ * dsv4_tp_slot_copy_f32_kernel + dsv4_tp_stamp_release_kernel (TX) and
++ * dsv4_tp_spin_copy_f32_kernel (RX).  The per-seq u64 flag arrays take the
++ * place of the tx_ready/rx_consumed HIP events:
++ *
++ *   compute stream:  [producer] -> mark_src_ready(seq) ... wait_rx_done(seq)
++ *   persistent warp: src_ready spin -> fill -> barrier -> lane0 stamp
++ *                    -> tx_released[slot] = seq        (TX)
++ *                    lane0 stamp spin -> barrier -> copy -> rx_done[slot] = seq
++ *   host thread:     submit_fn after tx_released, consumed_fn after rx_done
++ *
++ * Memory model: payload stores are separated from the slot's stamp and
++ * from every per-seq flag by a workgroup-wide (__syncwarp) barrier plus
++ * RELEASE/SYSTEM stores, exactly like the dispatch-per-gate kernels
++ * (contract rules 6-7).  Flags store the full 64-bit seq, so slot reuse
++ * across the ring wrap needs no reset and cannot false-match (rule 9).
++ */
++
++/* The worker layout below is written for 32-lane waves (warp = threadIdx>>5,
++ * lane-0 spins with the rest of the wave masked off, __syncwarp team
++ * barriers).  gfx11 compiles wave32 by default; refuse anything else at
++ * compile time rather than deadlock a wave64 build at runtime. */
++#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE__) && \
++    (__AMDGCN_WAVEFRONT_SIZE__ != 32)
++#error "dsv4_tp_persistent_gate_kernel requires a wave32 build"
++#endif
++#define DS4_ROCM_TP_PERSIST_WAVE 32u
++
++#define DS4_ROCM_TP_PERSIST_CAP 512u            /* ring entries + flag slots */
++#define DS4_ROCM_TP_PERSIST_TX_WARPS 4u
++#define DS4_ROCM_TP_PERSIST_RX_WARPS 4u
++#define DS4_ROCM_TP_PERSIST_THREADS 320u        /* dispatch + 4 TX + 4 RX + spare */
++#define DS4_ROCM_TP_PERSIST_KIND_TX 0u
++#define DS4_ROCM_TP_PERSIST_KIND_RX 1u
++
++/* Control-plane layout (offsets into the mapped block, see ds4_rocm.cu):
++ *
++ *   [0]  publish  u64  host -> kernel: next ring index to execute
++ *   [8]  consumed u64  kernel -> host: executions completed (in seq order)
++ *   [16] shutdown u32  host -> kernel: 1 = exit after draining
++ *   [24] src_ready   u64[CAP]  compute stream -> TX warp (stores seq)
++ *   [24 + CAP*8]     tx_released u64[CAP]  TX warp -> host (stores seq)
++ *   [24 + 2*CAP*8]   rx_done u64[CAP]      RX warp -> compute stream/host
++ *   [24 + 3*CAP*8]   ts_tx u64[CAP]        wall_clock64 at tx_released (stats)
++ *   [24 + 4*CAP*8]   ts_rx u64[CAP]        wall_clock64 at rx_done (stats)
++ *   [24 + 5*CAP*8]   ts_rxq u64[CAP]       wall_clock64 when the RX warp
++ *                                          starts spinning (trace)
++ *   [24 + 6*CAP*8]   ts_seen u64[CAP]      wall_clock64 when the peer stamp
++ *                                          is first observed (trace)
++ *   [24 + 7*CAP*8]   ring ds4_rocm_tp_ring_cmd[CAP] */
++#define DS4_ROCM_TP_PERSIST_OFF_PUBLISH 0u
++#define DS4_ROCM_TP_PERSIST_OFF_CONSUMED 8u
++#define DS4_ROCM_TP_PERSIST_OFF_SHUTDOWN 16u
++#define DS4_ROCM_TP_PERSIST_OFF_SRC_READY 24u
++#define DS4_ROCM_TP_PERSIST_OFF_TX_RELEASED \
++    (DS4_ROCM_TP_PERSIST_OFF_SRC_READY + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++#define DS4_ROCM_TP_PERSIST_OFF_RX_DONE \
++    (DS4_ROCM_TP_PERSIST_OFF_TX_RELEASED + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++#define DS4_ROCM_TP_PERSIST_OFF_TS_TX \
++    (DS4_ROCM_TP_PERSIST_OFF_RX_DONE + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++#define DS4_ROCM_TP_PERSIST_OFF_TS_RX \
++    (DS4_ROCM_TP_PERSIST_OFF_TS_TX + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++#define DS4_ROCM_TP_PERSIST_OFF_TS_RXQ \
++    (DS4_ROCM_TP_PERSIST_OFF_TS_RX + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++#define DS4_ROCM_TP_PERSIST_OFF_TS_SEEN \
++    (DS4_ROCM_TP_PERSIST_OFF_TS_RXQ + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++#define DS4_ROCM_TP_PERSIST_OFF_RING \
++    (DS4_ROCM_TP_PERSIST_OFF_TS_SEEN + (uint64_t)DS4_ROCM_TP_PERSIST_CAP * 8u)
++/* Number of u64 per-seq arrays between the header and the ring (for the
++ * host-side memset that initializes them). */
++#define DS4_ROCM_TP_PERSIST_FLAG_ARRAYS 7u
++
++typedef struct {
++    uint32_t kind;         /* DS4_ROCM_TP_PERSIST_KIND_* */
++    uint32_t reserved;
++    uint64_t seq;
++    uint64_t addr_a;       /* TX: payload source, RX: pool slot */
++    uint64_t addr_b;       /* TX: pool slot, RX: payload destination */
++    uint32_t n_floats;
++    uint32_t expect_stamp; /* ds4_rocm_tp_stamp of the producing rank */
++} ds4_rocm_tp_ring_cmd;    /* must stay 40 bytes */
++
++/* Debug/introspection words after the ring (host-readable, written only
++ * by lane 0 of each warp at phase transitions):
++ *   [0..3]  TX worker w: (phase << 56) | task
++ *   [4..7]  RX worker w: (phase << 56) | task
++ *   [8..11] dispatcher tx_assigned[w], [12..15] rx_assigned[w]
++ *   [16] next_cmd  [17] consumed  [18] dispatcher iterations */
++#define DS4_ROCM_TP_PERSIST_OFF_DEBUG \
++    (DS4_ROCM_TP_PERSIST_OFF_RING + \
++     (uint64_t)DS4_ROCM_TP_PERSIST_CAP * sizeof(ds4_rocm_tp_ring_cmd))
++#define DS4_ROCM_TP_PERSIST_DEBUG_WORDS 24u
++#define DS4_ROCM_TP_PERSIST_PHASE_IDLE 1ull
++#define DS4_ROCM_TP_PERSIST_PHASE_TASK 2ull
++#define DS4_ROCM_TP_PERSIST_PHASE_SPIN 3ull
++#define DS4_ROCM_TP_PERSIST_PHASE_DONE 4ull
++#define DS4_ROCM_TP_PERSIST_PHASE_ACK 5ull
++
++#define DS4_ROCM_TP_PERSIST_BYTES \
++    (DS4_ROCM_TP_PERSIST_OFF_DEBUG + \
++     (uint64_t)DS4_ROCM_TP_PERSIST_DEBUG_WORDS * 8u)
++
++typedef char ds4_rocm_tp_ring_cmd_must_be_40[
++    sizeof(ds4_rocm_tp_ring_cmd) == 40 ? 1 : -1];
++
++__device__ static uint32_t dsv4_tp_persist_stamp(uint32_t rank, uint64_t seq) {
++    const uint32_t role_magic = rank == 0 ? 0x5ca16e39u : 0xc35a91e7u;
++    return role_magic ^ (uint32_t)seq;
++}
++
++/* Wave-uniform reads of shared words that another wave writes
++ * concurrently.  A 32-lane LDS read of one address is serviced over several
++ * cycles, so a store landing mid-instruction can hand different lanes
++ * different values; a control decision on that value then diverges the
++ * wave (some lanes idle, the rest enter the task body without lane 0 and
++ * park forever in the ack wait).  readfirstlane makes the value, and every
++ * branch taken on it, uniform. */
++__device__ static inline uint32_t dsv4_tp_wave_u32(uint32_t v) {
++    return __builtin_amdgcn_readfirstlane(v);
++}
++__device__ static inline uint64_t dsv4_tp_wave_u64(uint64_t v) {
++    const uint32_t lo = __builtin_amdgcn_readfirstlane((uint32_t)v);
++    const uint32_t hi = __builtin_amdgcn_readfirstlane((uint32_t)(v >> 32));
++    return ((uint64_t)hi << 32) | (uint64_t)lo;
++}
++
++/* Volatile shared-memory frames cannot use the implicit copy assignment in
++ * C++, so load/store go through explicit member copies. */
++__device__ static ds4_rocm_tp_ring_cmd dsv4_tp_persist_frame_load(
++        const volatile ds4_rocm_tp_ring_cmd *src) {
++    ds4_rocm_tp_ring_cmd c;
++    c.kind = src->kind;
++    c.reserved = src->reserved;
++    c.seq = src->seq;
++    c.addr_a = src->addr_a;
++    c.addr_b = src->addr_b;
++    c.n_floats = src->n_floats;
++    c.expect_stamp = src->expect_stamp;
++    return c;
++}
++
++__device__ static void dsv4_tp_persist_frame_store(
++        volatile ds4_rocm_tp_ring_cmd *dst,
++        const ds4_rocm_tp_ring_cmd *src) {
++    dst->kind = src->kind;
++    dst->reserved = src->reserved;
++    dst->seq = src->seq;
++    dst->addr_a = src->addr_a;
++    dst->addr_b = src->addr_b;
++    dst->n_floats = src->n_floats;
++    dst->expect_stamp = src->expect_stamp;
++}
++
++/* One-thread compute-stream kernels at the two ends of the gate window. */
++
++/* One-wave copy with memory-level parallelism.  A naive per-lane scalar
++ * loop over possibly-aliasing pointers serializes one 128-byte round trip
++ * per iteration; against the host-coherent NHI pool that is ~1 us each,
++ * i.e. >100 us for a 16 KiB payload (measured: the persistent path's
++ * per-gate cost came out ABOVE legacy's before this).  Here each lane keeps
++ * eight 16-byte loads in flight (4 KiB per wave per round trip), with a
++ * scalar tail and an unaligned fallback.  The legacy grid kernels get the
++ * same effect from 8 waves + __restrict__. */
++static __device__ __forceinline__ void
++dsv4_tp_wave_copy_f32(float *__restrict__ dst, const float *__restrict__ src,
++                      uint32_t n, uint32_t lane) {
++    uint32_t i = lane;
++    if (((((uintptr_t)dst) | ((uintptr_t)src)) & 15u) == 0u) {
++        const uint32_t n4 = n >> 2;
++        const float4 *__restrict__ s4 = (const float4 *)(const void *)src;
++        float4 *__restrict__ d4 = (float4 *)(void *)dst;
++        for (; i + 7u * 32u < n4; i += 8u * 32u) {
++            const float4 v0 = s4[i + 0u * 32u];
++            const float4 v1 = s4[i + 1u * 32u];
++            const float4 v2 = s4[i + 2u * 32u];
++            const float4 v3 = s4[i + 3u * 32u];
++            const float4 v4 = s4[i + 4u * 32u];
++            const float4 v5 = s4[i + 5u * 32u];
++            const float4 v6 = s4[i + 6u * 32u];
++            const float4 v7 = s4[i + 7u * 32u];
++            d4[i + 0u * 32u] = v0;
++            d4[i + 1u * 32u] = v1;
++            d4[i + 2u * 32u] = v2;
++            d4[i + 3u * 32u] = v3;
++            d4[i + 4u * 32u] = v4;
++            d4[i + 5u * 32u] = v5;
++            d4[i + 6u * 32u] = v6;
++            d4[i + 7u * 32u] = v7;
++        }
++        for (; i < n4; i += 32u) d4[i] = s4[i];
++        i = (n4 << 2) + lane;
++    }
++    for (; i + 7u * 32u < n; i += 8u * 32u) {
++        const float v0 = src[i + 0u * 32u];
++        const float v1 = src[i + 1u * 32u];
++        const float v2 = src[i + 2u * 32u];
++        const float v3 = src[i + 3u * 32u];
++        const float v4 = src[i + 4u * 32u];
++        const float v5 = src[i + 5u * 32u];
++        const float v6 = src[i + 6u * 32u];
++        const float v7 = src[i + 7u * 32u];
++        dst[i + 0u * 32u] = v0;
++        dst[i + 1u * 32u] = v1;
++        dst[i + 2u * 32u] = v2;
++        dst[i + 3u * 32u] = v3;
++        dst[i + 4u * 32u] = v4;
++        dst[i + 5u * 32u] = v5;
++        dst[i + 6u * 32u] = v6;
++        dst[i + 7u * 32u] = v7;
++    }
++    for (; i < n; i += 32u) dst[i] = src[i];
++}
++
++__global__ void dsv4_tp_mark_src_ready_kernel(
++        unsigned char *__restrict__ ctrl, uint64_t seq) {
++    if (blockIdx.x != 0 || threadIdx.x != 0) return;
++    uint64_t *flags = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_SRC_READY);
++    __hip_atomic_store(flags + (seq % DS4_ROCM_TP_PERSIST_CAP), seq,
++                       __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
++}
++
++__global__ void dsv4_tp_wait_rx_done_kernel(
++        unsigned char *__restrict__ ctrl, uint64_t seq,
++        uint32_t *__restrict__ failed) {
++    if (blockIdx.x != 0 || threadIdx.x != 0) return;
++    uint64_t *flags = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_RX_DONE);
++    for (;;) {
++        if (failed &&
++            __hip_atomic_load(failed, __ATOMIC_ACQUIRE,
++                              __HIP_MEMORY_SCOPE_SYSTEM) != 0)
++            break;
++        if (__hip_atomic_load(flags + (seq % DS4_ROCM_TP_PERSIST_CAP),
++                              __ATOMIC_ACQUIRE,
++                              __HIP_MEMORY_SCOPE_SYSTEM) == seq)
++            break;
++    }
++}
++
++/* The resident gate kernel.  One block, 320 threads:
++ *   warp 0: dispatcher (lane 0 drives)
++ *   warps 1..4: TX workers (fill + stamp)
++ *   warps 5..8: RX workers (spin + copy)
++ *   warp 9: exits immediately. */
++__global__ void dsv4_tp_persistent_gate_kernel(
++        unsigned char *__restrict__ ctrl,
++        uint32_t rank,
++        unsigned long long max_spins,
++        uint32_t *__restrict__ failed) {
++    const uint32_t lane = threadIdx.x & 31u;
++    const uint32_t warp = threadIdx.x >> 5;
++
++    __shared__ volatile ds4_rocm_tp_ring_cmd s_tx_frame[DS4_ROCM_TP_PERSIST_TX_WARPS];
++    __shared__ volatile ds4_rocm_tp_ring_cmd s_rx_frame[DS4_ROCM_TP_PERSIST_RX_WARPS];
++    __shared__ volatile uint64_t s_tx_task[DS4_ROCM_TP_PERSIST_TX_WARPS];
++    __shared__ volatile uint64_t s_tx_done[DS4_ROCM_TP_PERSIST_TX_WARPS];
++    __shared__ volatile uint64_t s_rx_task[DS4_ROCM_TP_PERSIST_RX_WARPS];
++    __shared__ volatile uint64_t s_rx_done[DS4_ROCM_TP_PERSIST_RX_WARPS];
++    __shared__ volatile uint32_t s_arrived[DS4_ROCM_TP_PERSIST_TX_WARPS +
++                                          DS4_ROCM_TP_PERSIST_RX_WARPS];
++    __shared__ volatile uint32_t s_exit;
++
++    /* Initialize every shared word explicitly before any worker runs:
++     * a garbage task frame would send an RX worker after an arbitrary
++     * address (aperture violation) instead of an idle spin.  Every thread
++     * (including warp 9) takes part, so the barrier below is safe. */
++    if (threadIdx.x <
++        (DS4_ROCM_TP_PERSIST_TX_WARPS + DS4_ROCM_TP_PERSIST_RX_WARPS) * 32u) {
++        const uint32_t w = threadIdx.x >> 5;
++        if (w < DS4_ROCM_TP_PERSIST_TX_WARPS) {
++            volatile ds4_rocm_tp_ring_cmd *f = &s_tx_frame[w];
++            f->kind = 0; f->reserved = 0; f->seq = 0;
++            f->addr_a = 0; f->addr_b = 0;
++            f->n_floats = 0; f->expect_stamp = 0;
++            if ((threadIdx.x & 31u) == 0) {
++                s_tx_task[w] = 0;
++                /* ~0: ring index 0 is a valid command; a zero here would
++                 * let the dispatcher ack index 0 before the worker ran. */
++                s_tx_done[w] = ~0ull;
++            }
++        } else {
++            const uint32_t rw = w - DS4_ROCM_TP_PERSIST_TX_WARPS;
++            volatile ds4_rocm_tp_ring_cmd *f = &s_rx_frame[rw];
++            f->kind = 0; f->reserved = 0; f->seq = 0;
++            f->addr_a = 0; f->addr_b = 0;
++            f->n_floats = 0; f->expect_stamp = 0;
++            if ((threadIdx.x & 31u) == 0) {
++                s_rx_task[rw] = 0;
++                s_rx_done[rw] = ~0ull;
++            }
++        }
++    }
++    if (threadIdx.x <
++        DS4_ROCM_TP_PERSIST_TX_WARPS + DS4_ROCM_TP_PERSIST_RX_WARPS)
++        s_arrived[threadIdx.x] = 0;
++    if (threadIdx.x == 0) s_exit = 0;
++    __syncthreads();
++
++    if (warp > DS4_ROCM_TP_PERSIST_TX_WARPS +
++               DS4_ROCM_TP_PERSIST_RX_WARPS)
++        return;
++
++    const uint64_t *publish_ptr = (const uint64_t *)(const void *)ctrl;
++    uint64_t *consumed_ptr = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_CONSUMED);
++    const uint32_t *shutdown_ptr = (const uint32_t *)(const void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_SHUTDOWN);
++    uint64_t *src_ready = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_SRC_READY);
++    uint64_t *tx_released = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_TX_RELEASED);
++    uint64_t *rx_done = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_RX_DONE);
++    uint64_t *ts_tx = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_TS_TX);
++    uint64_t *ts_rx = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_TS_RX);
++    uint64_t *ts_rxq = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_TS_RXQ);
++    uint64_t *ts_seen = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_TS_SEEN);
++    const ds4_rocm_tp_ring_cmd *ring = (const ds4_rocm_tp_ring_cmd *)(const void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_RING);
++    uint64_t *dbg = (uint64_t *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_DEBUG);
++#define DSV4_TP_DBG(i, phase, v) \
++    do { if (lane == 0) dbg[(i)] = ((uint64_t)(phase) << 56) | ((uint64_t)(v) & 0xFFFFFFFFFFFFull); } while (0)
++
++    if (warp >= 1u && warp <= DS4_ROCM_TP_PERSIST_TX_WARPS) {
++        /* TX worker: spin src_ready, fill the slot, release the stamp. */
++        const uint32_t w = warp - 1u;
++        DSV4_TP_DBG(w, DS4_ROCM_TP_PERSIST_PHASE_IDLE, 0);
++        for (;;) {
++            const uint64_t task = dsv4_tp_wave_u64((uint64_t)s_tx_task[w]);
++            if (task == 0) {
++                if (dsv4_tp_wave_u32(s_exit)) return;
++                continue;
++            }
++            const ds4_rocm_tp_ring_cmd cmd = dsv4_tp_persist_frame_load(
++                &s_tx_frame[w]);
++            const uint64_t slot = cmd.seq % DS4_ROCM_TP_PERSIST_CAP;
++            DSV4_TP_DBG(w, DS4_ROCM_TP_PERSIST_PHASE_SPIN, cmd.seq);
++            if (lane == 0) {
++                uint32_t arrived = 0;
++                for (;;) {
++                    if (failed &&
++                        __hip_atomic_load(failed, __ATOMIC_ACQUIRE,
++                                          __HIP_MEMORY_SCOPE_SYSTEM) != 0)
++                        break;
++                    if (__hip_atomic_load(src_ready + slot, __ATOMIC_ACQUIRE,
++                                          __HIP_MEMORY_SCOPE_SYSTEM) ==
++                        cmd.seq) {
++                        arrived = 1;
++                        break;
++                    }
++                }
++                s_arrived[w] = arrived;
++            }
++            __syncwarp();
++            const uint32_t arrived = dsv4_tp_wave_u32(s_arrived[w]);
++            if (arrived && cmd.kind == DS4_ROCM_TP_PERSIST_KIND_TX &&
++                cmd.n_floats != 0 &&
++                cmd.n_floats <= DS4_ROCM_TP_PAYLOAD_FLOATS_MAX &&
++                (cmd.expect_stamp == 0 ||
++                 cmd.expect_stamp == dsv4_tp_persist_stamp(rank, cmd.seq))) {
++                unsigned char *slot_bytes = (unsigned char *)(uintptr_t)cmd.addr_b;
++                const float *src = (const float *)(uintptr_t)cmd.addr_a;
++                float *payload = (float *)(void *)slot_bytes;
++                dsv4_tp_wave_copy_f32(payload, src, cmd.n_floats, lane);
++                __syncwarp();
++                if (lane == 0) {
++                    uint32_t *stamp_ptr = (uint32_t *)(void *)
++                        (slot_bytes + DS4_ROCM_TP_STAMP_OFF);
++                    __hip_atomic_store(stamp_ptr,
++                                       dsv4_tp_persist_stamp(rank, cmd.seq),
++                                       __ATOMIC_RELEASE,
++                                       __HIP_MEMORY_SCOPE_SYSTEM);
++                    ts_tx[slot] = wall_clock64();
++                    __hip_atomic_store(tx_released + slot, cmd.seq,
++                                       __ATOMIC_RELEASE,
++                                       __HIP_MEMORY_SCOPE_SYSTEM);
++                }
++            }
++            DSV4_TP_DBG(w, DS4_ROCM_TP_PERSIST_PHASE_ACK, task);
++            if (lane == 0) s_tx_done[w] = task - 1u;
++            /* Wait for the dispatcher's ack (task slot cleared) before
++             * touching anything shared again.  Every lane joins the wait:
++             * other lanes must not race ahead and re-read the stale task
++             * slot at the loop top while lane 0 is still ack-blocked. */
++            for (;;) {
++                if (dsv4_tp_wave_u64((uint64_t)s_tx_task[w]) != task) break;
++                if (dsv4_tp_wave_u32(s_exit)) {
++                    if (lane == 0) s_tx_task[w] = 0;
++                    break;
++                }
++            }
++            __syncwarp();
++            DSV4_TP_DBG(w, DS4_ROCM_TP_PERSIST_PHASE_IDLE, task);
++        }
++    }
++
++    if (warp >= DS4_ROCM_TP_PERSIST_TX_WARPS + 1u &&
++        warp <= DS4_ROCM_TP_PERSIST_TX_WARPS + DS4_ROCM_TP_PERSIST_RX_WARPS) {
++        /* RX worker: spin the peer stamp, copy into the graph tensor. */
++        const uint32_t w = warp - DS4_ROCM_TP_PERSIST_TX_WARPS - 1u;
++        DSV4_TP_DBG(4u + w, DS4_ROCM_TP_PERSIST_PHASE_IDLE, 0);
++        for (;;) {
++            const uint64_t task = dsv4_tp_wave_u64((uint64_t)s_rx_task[w]);
++            if (task == 0) {
++                if (dsv4_tp_wave_u32(s_exit)) return;
++                continue;
++            }
++            const ds4_rocm_tp_ring_cmd cmd = dsv4_tp_persist_frame_load(
++                &s_rx_frame[w]);
++            const uint64_t slot = cmd.seq % DS4_ROCM_TP_PERSIST_CAP;
++            DSV4_TP_DBG(4u + w, DS4_ROCM_TP_PERSIST_PHASE_SPIN, cmd.seq);
++            if (lane == 0) {
++                uint32_t arrived = 0;
++                unsigned long long spins = 0;
++                const uint32_t *stamp_ptr = (const uint32_t *)(const void *)
++                    ((const unsigned char *)(uintptr_t)cmd.addr_a +
++                     DS4_ROCM_TP_STAMP_OFF);
++                const uint32_t expect = dsv4_tp_persist_stamp(rank ^ 1u,
++                                                              cmd.seq);
++                ts_rxq[slot] = wall_clock64();
++                for (;;) {
++                    if (failed &&
++                        __hip_atomic_load(failed, __ATOMIC_ACQUIRE,
++                                          __HIP_MEMORY_SCOPE_SYSTEM) != 0)
++                        break;
++                    const uint32_t seen =
++                        __hip_atomic_load(stamp_ptr, __ATOMIC_ACQUIRE,
++                                          __HIP_MEMORY_SCOPE_SYSTEM);
++                    if (seen == expect) {
++                        arrived = 1;
++                        ts_seen[slot] = wall_clock64();
++                        break;
++                    }
++                    if (++spins >= max_spins) {
++                        if (failed) {
++                            __hip_atomic_store(failed, 1u, __ATOMIC_RELEASE,
++                                               __HIP_MEMORY_SCOPE_SYSTEM);
++                        }
++                        break;
++                    }
++                }
++                s_arrived[DS4_ROCM_TP_PERSIST_TX_WARPS + w] = arrived;
++            }
++            __syncwarp();
++            const uint32_t arrived =
++                dsv4_tp_wave_u32(s_arrived[DS4_ROCM_TP_PERSIST_TX_WARPS + w]);
++            /* On timeout (arrived == 0) skip the copy entirely, exactly
++             * like dsv4_tp_spin_copy_f32_kernel: no rx_done flag, the
++             * latched failed word wakes the host-side waits. */
++            if (arrived && cmd.kind == DS4_ROCM_TP_PERSIST_KIND_RX &&
++                cmd.n_floats != 0 &&
++                cmd.n_floats <= DS4_ROCM_TP_PAYLOAD_FLOATS_MAX &&
++                (cmd.expect_stamp == 0 ||
++                 cmd.expect_stamp ==
++                     dsv4_tp_persist_stamp(rank ^ 1u, cmd.seq))) {
++                const float *payload =
++                    (const float *)(const void *)(uintptr_t)cmd.addr_a;
++                float *dst = (float *)(uintptr_t)cmd.addr_b;
++                dsv4_tp_wave_copy_f32(dst, payload, cmd.n_floats, lane);
++                __syncwarp();
++                if (lane == 0) {
++                    ts_rx[slot] = wall_clock64();
++                    __hip_atomic_store(rx_done + slot, cmd.seq,
++                                       __ATOMIC_RELEASE,
++                                       __HIP_MEMORY_SCOPE_SYSTEM);
++                }
++            }
++            DSV4_TP_DBG(4u + w, DS4_ROCM_TP_PERSIST_PHASE_ACK, task);
++            if (lane == 0) s_rx_done[w] = task - 1u;
++            for (;;) {
++                if (dsv4_tp_wave_u64((uint64_t)s_rx_task[w]) != task) break;
++                if (dsv4_tp_wave_u32(s_exit)) {
++                    if (lane == 0) s_rx_task[w] = 0;
++                    break;
++                }
++            }
++            __syncwarp();
++            DSV4_TP_DBG(4u + w, DS4_ROCM_TP_PERSIST_PHASE_IDLE, task);
++        }
++    }
++
++    /* Dispatcher. */
++    if (warp != 0) return;
++    if (threadIdx.x != 0) return;
++
++    uint64_t tx_assigned[DS4_ROCM_TP_PERSIST_TX_WARPS] = {~0ull, ~0ull, ~0ull, ~0ull};
++    uint64_t rx_assigned[DS4_ROCM_TP_PERSIST_RX_WARPS] = {~0ull, ~0ull, ~0ull, ~0ull};
++    uint64_t done_tx[DS4_ROCM_TP_PERSIST_TX_WARPS] = {~0ull, ~0ull, ~0ull, ~0ull};
++    uint64_t done_rx[DS4_ROCM_TP_PERSIST_RX_WARPS] = {~0ull, ~0ull, ~0ull, ~0ull};
++    /* Resume point.  The host pauses this kernel (shutdown word, drain,
++     * exit) around device-wide runtime calls and relaunches it; at a drained
++     * exit consumed == next_cmd == publish, so the ring's consumed word is
++     * exactly where dispatch continues.  Fresh launch: 0. */
++    uint64_t consumed = __hip_atomic_load(consumed_ptr, __ATOMIC_ACQUIRE,
++                                          __HIP_MEMORY_SCOPE_SYSTEM);
++    uint64_t next_cmd = consumed;
++    uint32_t next_worker = 0;
++    bool started = false;
++    uint64_t iters = 0;
++    if (failed) {
++        started = __hip_atomic_load(failed, __ATOMIC_ACQUIRE,
++                                    __HIP_MEMORY_SCOPE_SYSTEM) == 0;
++    }
++    for (;;) {
++        if ((++iters & 1023ull) == 0) {
++            for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_TX_WARPS; w++) dbg[8u + w] = tx_assigned[w];
++            for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_RX_WARPS; w++) dbg[12u + w] = rx_assigned[w];
++            dbg[16] = next_cmd;
++            dbg[17] = consumed;
++            dbg[18] = iters;
++            for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_TX_WARPS; w++) dbg[19u + w] = (uint64_t)s_tx_done[w] | ((uint64_t)s_tx_task[w] << 32);
++        }
++        /* Acknowledge completed workers (strict order not required for
++         * acks). */
++        for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_TX_WARPS; w++) {
++            if (tx_assigned[w] == ~0ull) continue;
++            if ((uint64_t)s_tx_done[w] == tx_assigned[w]) {
++                s_tx_task[w] = 0;
++                done_tx[w] = tx_assigned[w];
++                tx_assigned[w] = ~0ull;
++            }
++        }
++        for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_RX_WARPS; w++) {
++            if (rx_assigned[w] == ~0ull) continue;
++            if ((uint64_t)s_rx_done[w] == rx_assigned[w]) {
++                s_rx_task[w] = 0;
++                done_rx[w] = rx_assigned[w];
++                rx_assigned[w] = ~0ull;
++            }
++        }
++
++        /* Advance `consumed` in seq order: the ring is single-numbered, so
++         * walk done_tx/done_rx for the next index. */
++        while (true) {
++            bool advanced = false;
++            for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_TX_WARPS; w++) {
++                if (done_tx[w] == consumed) { consumed++; done_tx[w] = ~0ull; advanced = true; }
++            }
++            for (uint32_t w = 0; w < DS4_ROCM_TP_PERSIST_RX_WARPS; w++) {
++                if (done_rx[w] == consumed) { consumed++; done_rx[w] = ~0ull; advanced = true; }
++            }
++            if (!advanced) break;
++        }
++        if (consumed) {
++            __hip_atomic_store(consumed_ptr, consumed, __ATOMIC_RELEASE,
++                               __HIP_MEMORY_SCOPE_SYSTEM);
++        }
++
++        const uint32_t shutting = __hip_atomic_load(
++            (uint32_t *)(void *)shutdown_ptr, __ATOMIC_ACQUIRE,
++            __HIP_MEMORY_SCOPE_SYSTEM);
++        const uint32_t state = failed ?
++            __hip_atomic_load(failed, __ATOMIC_ACQUIRE,
++                              __HIP_MEMORY_SCOPE_SYSTEM) : 1u;
++        if (shutting || state != 0 || !started) {
++            const bool drained =
++                __hip_atomic_load(publish_ptr, __ATOMIC_ACQUIRE,
++                                  __HIP_MEMORY_SCOPE_SYSTEM) == next_cmd &&
++                tx_assigned[0] == ~0ull && tx_assigned[1] == ~0ull &&
++                tx_assigned[2] == ~0ull && tx_assigned[3] == ~0ull &&
++                rx_assigned[0] == ~0ull && rx_assigned[1] == ~0ull &&
++                rx_assigned[2] == ~0ull && rx_assigned[3] == ~0ull;
++            if (drained) { __threadfence_block(); s_exit = 1; return; }
++        }
++
++        const uint64_t publish = __hip_atomic_load(publish_ptr,
++                                                   __ATOMIC_ACQUIRE,
++                                                   __HIP_MEMORY_SCOPE_SYSTEM);
++        if (next_cmd >= publish) continue;
++
++        const ds4_rocm_tp_ring_cmd cmd = ring[next_cmd % DS4_ROCM_TP_PERSIST_CAP];
++        if (cmd.reserved != 0 ||
++            (cmd.kind != DS4_ROCM_TP_PERSIST_KIND_TX &&
++             cmd.kind != DS4_ROCM_TP_PERSIST_KIND_RX) ||
++            cmd.n_floats == 0 ||
++            cmd.n_floats > DS4_ROCM_TP_PAYLOAD_FLOATS_MAX) {
++            if (failed) {
++                __hip_atomic_store(failed, 1u, __ATOMIC_RELEASE,
++                                   __HIP_MEMORY_SCOPE_SYSTEM);
++            }
++            /* Skip the malformed command so the failure drain can still
++             * reach next_cmd == publish and the kernel can exit. */
++            next_cmd++;
++            continue;
++        }
++
++        if (cmd.kind == DS4_ROCM_TP_PERSIST_KIND_TX) {
++            for (uint32_t attempt = 0; attempt < DS4_ROCM_TP_PERSIST_TX_WARPS; attempt++) {
++                const uint32_t w = (next_worker + attempt) % DS4_ROCM_TP_PERSIST_TX_WARPS;
++                if (tx_assigned[w] == ~0ull) {
++                    /* Snapshot the ring entry into shared memory so the
++                     * worker never re-reads a ring slot the host may have
++                     * reused; the fence orders the frame stores before the
++                     * task store the worker spins on. */
++                    dsv4_tp_persist_frame_store(&s_tx_frame[w], &cmd);
++                    __threadfence_block();
++                    tx_assigned[w] = next_cmd;
++                    s_tx_task[w] = next_cmd + 1u;
++                    next_worker = (w + 1u) % DS4_ROCM_TP_PERSIST_TX_WARPS;
++                    next_cmd++;
++                    break;
++                }
++            }
++        } else {
++            for (uint32_t attempt = 0; attempt < DS4_ROCM_TP_PERSIST_RX_WARPS; attempt++) {
++                const uint32_t w = (next_worker + attempt) % DS4_ROCM_TP_PERSIST_RX_WARPS;
++                if (rx_assigned[w] == ~0ull) {
++                    dsv4_tp_persist_frame_store(&s_rx_frame[w], &cmd);
++                    __threadfence_block();
++                    rx_assigned[w] = next_cmd;
++                    s_rx_task[w] = next_cmd + 1u;
++                    next_worker = (w + 1u) % DS4_ROCM_TP_PERSIST_RX_WARPS;
++                    next_cmd++;
++                    break;
++                }
++            }
++        }
++    }
++}
+diff --git a/tests/test_tp_persist_gate_rocm.cpp b/tests/test_tp_persist_gate_rocm.cpp
+new file mode 100644
+index 0000000..b3cae6a
+--- /dev/null
++++ b/tests/test_tp_persist_gate_rocm.cpp
+@@ -0,0 +1,578 @@
++/* Loopback tests for the persistent TP gate kernel (POC,
++ * DS4_TP_PERSIST_GATE).  Runs on a single ROCm device: a host-written ring
++ * drives the resident kernel through one full TX+RX round trip with the
++ * exact stamps of the transport contract, then the spin-timeout latch path,
++ * then ordered shutdown.  No NHI device is needed.
++ *
++ * Mirrors the engine's memory-model discipline: host writes ring entries
++ * with plain stores and bumps `publish` with a release store; the kernel
++ * polls via ACQUIRE/SYSTEM; per-seq u64 flags replace hip events.
++ */
++
++#include <hip/hip_runtime.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <pthread.h>
++
++#include "../rocm/ds4_rocm_tp.cuh"
++
++static int g_checks, g_failures;
++
++static void check(int ok, const char *what) {
++    g_checks++;
++    if (!ok) {
++        g_failures++;
++        fprintf(stderr, "FAIL %s\n", what);
++    } else {
++        printf("ROCm TP-persist %-40s PASS\n", what);
++    }
++    fflush(stdout);
++    fflush(stderr);
++}
++
++enum {
++    N_FLOATS = 4096,          /* production decode payload (n_embd) */
++    MAX_SPINS = 4096,         /* small: timeout test must finish fast */
++    BURST_GATES = 600,        /* > DS4_ROCM_TP_PERSIST_CAP: wraps the ring */
++    BURST_FIRST_SEQ = 3,
++    TMO_SEQ = 1000,           /* timeout case, after the burst's seqs */
++};
++
++static int cmp_double(const void *a, const void *b) {
++    const double x = *(const double *)a, y = *(const double *)b;
++    return x < y ? -1 : x > y ? 1 : 0;
++}
++
++static void dump_debug(const unsigned char *ctrl_host) {
++    const uint64_t *d = (const uint64_t *)(const void *)
++        (ctrl_host + DS4_ROCM_TP_PERSIST_OFF_DEBUG);
++    for (int w = 0; w < 4; w++)
++        fprintf(stderr, "  TX%d phase=%llu v=%llu | RX%d phase=%llu v=%llu | "
++                "tx_assigned=%lld rx_assigned=%lld | tx done/task=%llu/%llu\n",
++                w, (unsigned long long)(d[w] >> 56),
++                (unsigned long long)(d[w] & 0xFFFFFFFFFFFFull),
++                w, (unsigned long long)(d[4 + w] >> 56),
++                (unsigned long long)(d[4 + w] & 0xFFFFFFFFFFFFull),
++                (long long)d[8 + w], (long long)d[12 + w],
++                (unsigned long long)(d[19 + w] & 0xFFFFFFFFull),
++                (unsigned long long)(d[19 + w] >> 32));
++    fprintf(stderr, "  dispatcher next_cmd=%llu consumed=%llu iters=%llu\n",
++            (unsigned long long)d[16], (unsigned long long)d[17],
++            (unsigned long long)d[18]);
++}
++
++static double now_sec(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
++}
++
++/* Host mirror of ds4_rocm_tp_stamp() in ds4_rocm.cu / dsv4_tp_persist_stamp
++ * in the kernel: the test cross-checks both the producer's stamp and the
++ * formula the engine uses. */
++static uint32_t host_stamp(uint32_t rank, uint64_t seq) {
++    const uint32_t role_magic = rank == 0 ? 0x5ca16e39u : 0xc35a91e7u;
++    return role_magic ^ (uint32_t)seq;
++}
++
++static uint64_t *host_u64(unsigned char *ctrl, uint64_t off) {
++    return (uint64_t *)(void *)(ctrl + off);
++}
++
++/* Publish one command exactly like the engine's ring writer. */
++static int publish_cmd(unsigned char *ctrl, const ds4_rocm_tp_ring_cmd *cmd) {
++    uint64_t *publish = host_u64(ctrl, DS4_ROCM_TP_PERSIST_OFF_PUBLISH);
++    uint64_t *consumed = host_u64(ctrl, DS4_ROCM_TP_PERSIST_OFF_CONSUMED);
++    ds4_rocm_tp_ring_cmd *ring = (ds4_rocm_tp_ring_cmd *)(void *)
++        (ctrl + DS4_ROCM_TP_PERSIST_OFF_RING);
++    const uint64_t next = __atomic_load_n(publish, __ATOMIC_ACQUIRE);
++    if (next - __atomic_load_n(consumed, __ATOMIC_ACQUIRE) >=
++        DS4_ROCM_TP_PERSIST_CAP)
++        return 0;
++    ring[next % DS4_ROCM_TP_PERSIST_CAP] = *cmd;
++    __atomic_store_n(publish, next + 1u, __ATOMIC_RELEASE);
++    return 1;
++}
++
++/* Poll a mapped per-seq flag until it equals `seq` or the deadline passes. */
++static int wait_flag_deadline(uint64_t *flags, uint64_t seq, double secs) {
++    const double deadline = now_sec() + secs;
++    for (;;) {
++        if (__atomic_load_n(&flags[seq % DS4_ROCM_TP_PERSIST_CAP],
++                            __ATOMIC_ACQUIRE) == seq)
++            return 1;
++        if (now_sec() > deadline) return 0;
++    }
++}
++
++static int test_writer_reads_peer_payload(void) {
++    /* One big buffer: two simulated NHI slots, one per direction. */
++    const size_t slot_bytes = DS4_ROCM_TP_SLOT_BYTES;
++    unsigned char *ctrl_host = NULL, *ctrl_dev = NULL;
++    unsigned char *slots = NULL;   /* device */
++    float *src = NULL;             /* device: engine's tp_out vector */
++    float *dst = NULL;             /* device: engine's tp_in vector */
++    uint32_t *state_dev = NULL;    /* device: engine failed word */
++    hipStream_t stream = 0;
++    int ok = 1;
++
++    float *src_host = (float *)malloc(N_FLOATS * sizeof(float));
++    float *rx_payload = (float *)malloc(N_FLOATS * sizeof(float));
++    float *out_host = (float *)malloc(N_FLOATS * sizeof(float));
++    ok = src_host && rx_payload && out_host;
++    for (uint32_t i = 0; ok && i < N_FLOATS; i++) {
++        src_host[i] = (float)((int)(i % 13u) - 6) * 0.25f +
++                      (float)((int)((i * 37u) % 7u) - 3) * 0.03125f;
++        rx_payload[i] = (float)((int)((i * 11u) % 17u) - 8) * 0.125f;
++    }
++
++    if (ok) ok = hipHostMalloc((void **)&ctrl_host,
++                               (size_t)DS4_ROCM_TP_PERSIST_BYTES,
++                               hipHostMallocMapped) == hipSuccess;
++    if (ok) ok = hipHostGetDevicePointer((void **)&ctrl_dev,
++                                         ctrl_host, 0) == hipSuccess;
++    if (ok) ok = hipMalloc((void **)&slots, 2u * slot_bytes) == hipSuccess;
++    if (ok) ok = hipMalloc((void **)&src, N_FLOATS * sizeof(float)) ==
++                 hipSuccess;
++    if (ok) ok = hipMalloc((void **)&dst, N_FLOATS * sizeof(float)) ==
++                 hipSuccess;
++    if (ok) ok = hipMalloc((void **)&state_dev, sizeof(uint32_t)) ==
++                 hipSuccess;
++    if (ok) {
++        /* Header 0; flags sentinel all-ones; ring zeroed. */
++        memset(ctrl_host, 0, (size_t)DS4_ROCM_TP_PERSIST_OFF_SRC_READY);
++        memset(ctrl_host + DS4_ROCM_TP_PERSIST_OFF_SRC_READY, 0xFF,
++               (size_t)DS4_ROCM_TP_PERSIST_CAP * 8u *
++                   DS4_ROCM_TP_PERSIST_FLAG_ARRAYS);
++        memset(ctrl_host + DS4_ROCM_TP_PERSIST_OFF_RING, 0,
++               (size_t)DS4_ROCM_TP_PERSIST_BYTES -
++                   (size_t)DS4_ROCM_TP_PERSIST_OFF_RING);
++        ok = hipMemset(slots, 0, 2u * slot_bytes) == hipSuccess &&
++             hipMemset(state_dev, 0, sizeof(uint32_t)) == hipSuccess &&
++             /* Non-blocking, like the engine: the resident kernel must run
++              * concurrently with the null stream's mark/wait kernels. */
++             hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) ==
++                 hipSuccess;
++    }
++
++    /* Round trip, seq 1: the "peer" has already filled the RX slot and
++     * released its stamp, like a wire arrival before our RX command. */
++    uint32_t rx_stamp_value = host_stamp(1u, 1ull);
++    if (ok) {
++        unsigned char *rx_slot_base = slots + slot_bytes;
++        ok = hipMemcpy(rx_slot_base, rx_payload,
++                       N_FLOATS * sizeof(float),
++                       hipMemcpyHostToDevice) == hipSuccess &&
++             hipMemcpy(rx_slot_base + DS4_ROCM_TP_STAMP_OFF,
++                       &rx_stamp_value, 4u,
++                       hipMemcpyHostToDevice) == hipSuccess &&
++             hipMemcpy(src, src_host, N_FLOATS * sizeof(float),
++                       hipMemcpyHostToDevice) == hipSuccess &&
++             hipMemset(dst, 0, N_FLOATS * sizeof(float)) == hipSuccess;
++    }
++    if (ok) {
++        hipLaunchKernelGGL(dsv4_tp_persistent_gate_kernel, dim3(1),
++                           dim3(DS4_ROCM_TP_PERSIST_THREADS), 0, stream,
++                           ctrl_dev, 0u, (unsigned long long)MAX_SPINS,
++                           state_dev);
++        ok = hipGetLastError() == hipSuccess;
++    }
++    if (ok) {
++        ds4_rocm_tp_ring_cmd tx = {0}, rx = {0};
++        tx.kind = DS4_ROCM_TP_PERSIST_KIND_TX;
++        tx.seq = 1;
++        tx.addr_a = (uint64_t)(uintptr_t)src;
++        tx.addr_b = (uint64_t)(uintptr_t)slots; /* TX slot */
++        tx.n_floats = N_FLOATS;
++        tx.expect_stamp = host_stamp(0u, 1ull);
++        rx.kind = DS4_ROCM_TP_PERSIST_KIND_RX;
++        rx.seq = 1;
++        rx.addr_a = (uint64_t)(uintptr_t)(slots + slot_bytes); /* RX slot */
++        rx.addr_b = (uint64_t)(uintptr_t)dst;
++        rx.n_floats = N_FLOATS;
++        rx.expect_stamp = rx_stamp_value;
++        ok = publish_cmd(ctrl_host, &tx) && publish_cmd(ctrl_host, &rx);
++    }
++    /* The engine launches the mark on the compute stream at enqueue time;
++     * publishing first proves the warp really spins src_ready. */
++    if (ok) {
++        hipLaunchKernelGGL(dsv4_tp_mark_src_ready_kernel, dim3(1), dim3(1),
++                           0, 0, ctrl_dev, (uint64_t)1);
++        ok = hipGetLastError() == hipSuccess;
++    }
++
++    uint64_t *tx_flags = host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_TX_RELEASED);
++    uint64_t *rx_flags = host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_RX_DONE);
++    if (ok) ok = wait_flag_deadline(tx_flags, 1ull, 5.0);
++    check(ok, "TX fill + tx_released[1]");
++    if (ok) ok = wait_flag_deadline(rx_flags, 1ull, 5.0);
++    check(ok, "RX copy + rx_done[1]");
++
++    /* The compute-stream wait kernel must pass now that rx_done landed. */
++    if (ok) {
++        hipLaunchKernelGGL(dsv4_tp_wait_rx_done_kernel, dim3(1), dim3(1),
++                           0, 0, ctrl_dev, (uint64_t)1, state_dev);
++        ok = hipGetLastError() == hipSuccess &&
++             hipStreamSynchronize(0) == hipSuccess;
++        check(ok, "wait_rx_done(1) returns on the compute stream");
++    }
++
++    /* Payload + stamp equality (R2): TX slot got src bytes and the exact
++     * stamp; the RX copy landed the peer payload into dst. */
++    if (ok) {
++        uint32_t tx_stamp_got = 0, state_got = 0;
++        uint64_t consumed_got = 0;
++        float *slot_host = (float *)malloc(N_FLOATS * sizeof(float));
++        ok = slot_host != NULL &&
++             hipMemcpy(slot_host, slots, N_FLOATS * sizeof(float),
++                       hipMemcpyDeviceToHost) == hipSuccess &&
++             hipMemcpy(&tx_stamp_got,
++                       slots + DS4_ROCM_TP_STAMP_OFF, 4u,
++                       hipMemcpyDeviceToHost) == hipSuccess &&
++             hipMemcpy(out_host, dst, N_FLOATS * sizeof(float),
++                       hipMemcpyDeviceToHost) == hipSuccess &&
++             hipMemcpy(&state_got, state_dev, 4u,
++                       hipMemcpyDeviceToHost) == hipSuccess;
++        if (ok) consumed_got = __atomic_load_n(
++            host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_CONSUMED),
++            __ATOMIC_ACQUIRE);
++        if (ok) {
++            ok = memcmp(slot_host, src_host,
++                        N_FLOATS * sizeof(float)) == 0;
++            check(ok, "TX slot payload equals source bytes");
++        }
++        if (ok) {
++            ok = tx_stamp_got == host_stamp(0u, 1ull);
++            check(ok, "TX slot stamp equals role-tagged stamp");
++        }
++        if (ok) {
++            ok = memcmp(out_host, rx_payload,
++                        N_FLOATS * sizeof(float)) == 0;
++            check(ok, "RX copy equals peer payload bytes");
++        }
++        check(state_got == 0, "engine state still healthy after round trip");
++        check(consumed_got >= 2, "kernel advanced consumed in order");
++        free(slot_host);
++    }
++
++    /* Burst + ring wrap + choreography floor.  BURST_GATES sequential
++     * gates (TX+RX each) through the ring, more than the ring's capacity
++     * so publish/consumed wrap and the per-seq flag slots are reused.  The
++     * slots are fine-grained host-coherent memory, like the production
++     * uncached NHI pool, so the "peer" stamp is a plain host store and no
++     * copy engine is involved.  The per-gate host time publish -> rx_done
++     * is the persistent path's own floor with no wire; it is the P0/P5
++     * kill-switch number (>~200us would already eat the R12 budget). */
++    unsigned char *uc_host = NULL, *uc_dev = NULL;
++    double *lat = (double *)malloc(sizeof(double) * BURST_GATES);
++    void *probe_dev = NULL;
++    unsigned char *probe_host = NULL;
++    if (ok) ok = lat != NULL &&
++                 hipHostMalloc((void **)&uc_host, 2u * slot_bytes,
++                               hipHostMallocMapped | hipHostMallocCoherent) ==
++                     hipSuccess &&
++                 hipHostGetDevicePointer((void **)&uc_dev, uc_host, 0) ==
++                     hipSuccess;
++    if (ok) {
++        memset(uc_host, 0, 2u * slot_bytes);
++        float *rx_slot_payload = (float *)(void *)(uc_host + slot_bytes);
++        uint32_t *rx_slot_stamp = (uint32_t *)(void *)
++            (uc_host + slot_bytes + DS4_ROCM_TP_STAMP_OFF);
++        memcpy(rx_slot_payload, rx_payload, N_FLOATS * sizeof(float));
++        uint64_t *consumed = host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_CONSUMED);
++        const uint64_t consumed_before = __atomic_load_n(consumed, __ATOMIC_ACQUIRE);
++        int n_done = 0;
++        const double t_burst0 = now_sec();
++        int n_pauses = 0;
++        for (int g = 0; ok && g < BURST_GATES; g++) {
++            const uint64_t seq = (uint64_t)BURST_FIRST_SEQ + (uint64_t)g;
++            /* Pause/resume mid-burst, twice, the way the engine's guarded
++             * hipFree/hipDeviceSynchronize wrappers do: shutdown word ->
++             * drain+exit -> device-wide call -> relaunch, which must resume
++             * from the ring's consumed word with no gate lost or repeated.
++             * Second pause lands after the ring has wrapped. */
++            if (g == BURST_GATES / 4 || g == BURST_GATES - 40) {
++                uint32_t *shut = (uint32_t *)(void *)
++                    (ctrl_host + DS4_ROCM_TP_PERSIST_OFF_SHUTDOWN);
++                __atomic_store_n(shut, 1u, __ATOMIC_RELEASE);
++                const double tp0 = now_sec();
++                ok = hipStreamSynchronize(stream) == hipSuccess;
++                __atomic_store_n(shut, 0u, __ATOMIC_RELEASE);
++                void *tmp = NULL;
++                if (ok) ok = hipMalloc(&tmp, 4096u) == hipSuccess &&
++                             hipFree(tmp) == hipSuccess &&
++                             hipDeviceSynchronize() == hipSuccess;
++                if (ok) {
++                    hipLaunchKernelGGL(dsv4_tp_persistent_gate_kernel, dim3(1),
++                                       dim3(DS4_ROCM_TP_PERSIST_THREADS), 0,
++                                       stream, ctrl_dev, 0u,
++                                       (unsigned long long)MAX_SPINS, state_dev);
++                    ok = hipGetLastError() == hipSuccess;
++                }
++                const uint64_t c = __atomic_load_n(consumed, __ATOMIC_ACQUIRE);
++                printf("ROCm TP-persist pause/resume at gate %d: %.1f us, "
++                       "consumed=%llu\n", g, (now_sec() - tp0) * 1e6,
++                       (unsigned long long)c);
++                check(ok, "burst: pause (drain+exit), hipFree+device sync, relaunch");
++                check(c == consumed_before + 2ull * (uint64_t)g,
++                      "burst: drained exit leaves consumed == publish");
++                n_pauses++;
++            }
++            rx_slot_payload[0] = (float)seq;
++            /* Peer stamp "arrives" before our RX command, release order. */
++            __atomic_store_n(rx_slot_stamp, host_stamp(1u, seq), __ATOMIC_RELEASE);
++            ds4_rocm_tp_ring_cmd tx = {0}, rx = {0};
++            tx.kind = DS4_ROCM_TP_PERSIST_KIND_TX;
++            tx.seq = seq;
++            tx.addr_a = (uint64_t)(uintptr_t)src;
++            tx.addr_b = (uint64_t)(uintptr_t)uc_dev;
++            /* Last gate uses an odd length so the wave copy's scalar tail
++             * runs after the 16-byte vector body. */
++            const uint32_t n_g = (g == BURST_GATES - 1) ? (N_FLOATS - 7u) : N_FLOATS;
++            tx.n_floats = n_g;
++            tx.expect_stamp = host_stamp(0u, seq);
++            rx.kind = DS4_ROCM_TP_PERSIST_KIND_RX;
++            rx.seq = seq;
++            rx.addr_a = (uint64_t)(uintptr_t)(uc_dev + slot_bytes);
++            rx.addr_b = (uint64_t)(uintptr_t)dst;
++            rx.n_floats = n_g;
++            rx.expect_stamp = host_stamp(1u, seq);
++            const double t0 = now_sec();
++            /* Same order as the engine: mark on the compute stream, then
++             * publish TX and RX. */
++            hipLaunchKernelGGL(dsv4_tp_mark_src_ready_kernel, dim3(1),
++                               dim3(1), 0, 0, ctrl_dev, seq);
++            ok = hipGetLastError() == hipSuccess;
++            /* Ring flow control: wait for space like the engine does. */
++            int tries = 0;
++            while (ok && !publish_cmd(ctrl_host, &tx)) {
++                if (++tries > 20000000) { ok = 0; break; }
++            }
++            tries = 0;
++            while (ok && !publish_cmd(ctrl_host, &rx)) {
++                if (++tries > 20000000) { ok = 0; break; }
++            }
++            int tx_ok = 0, rx_ok = 0;
++            if (ok) tx_ok = wait_flag_deadline(tx_flags, seq, 5.0);
++            if (ok && tx_ok) rx_ok = wait_flag_deadline(rx_flags, seq, 5.0);
++            lat[g] = (now_sec() - t0) * 1e6;
++            if (ok && tx_ok && rx_ok) {
++                n_done++;
++            } else {
++                uint64_t *sr = host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_SRC_READY);
++                uint32_t st = 0;
++                (void)hipMemcpy(&st, state_dev, 4u, hipMemcpyDeviceToHost);
++                fprintf(stderr,
++                        "burst gate %d seq %llu: ok=%d tx_ok=%d rx_ok=%d "
++                        "src_ready=%llu tx_released=%llu rx_done=%llu "
++                        "publish=%llu consumed=%llu state=%u slot_stamp=%08x\n",
++                        g, (unsigned long long)seq, ok, tx_ok, rx_ok,
++                        (unsigned long long)sr[seq % DS4_ROCM_TP_PERSIST_CAP],
++                        (unsigned long long)tx_flags[seq % DS4_ROCM_TP_PERSIST_CAP],
++                        (unsigned long long)rx_flags[seq % DS4_ROCM_TP_PERSIST_CAP],
++                        (unsigned long long)__atomic_load_n(
++                            host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_PUBLISH),
++                            __ATOMIC_ACQUIRE),
++                        (unsigned long long)__atomic_load_n(consumed, __ATOMIC_ACQUIRE),
++                        st, *rx_slot_stamp);
++                dump_debug(ctrl_host);
++                ok = 0;
++            }
++        }
++        const double t_burst = now_sec() - t_burst0;
++        check(n_pauses == 2, "burst: both pause/resume points exercised");
++        check(ok && n_done == BURST_GATES, "burst: all gates released+done");
++        if (ok) {
++            /* The dispatcher retires (advances consumed) asynchronously
++             * after the flags; give it a moment. */
++            const double cdl = now_sec() + 2.0;
++            uint64_t consumed_after = 0;
++            do {
++                consumed_after = __atomic_load_n(consumed, __ATOMIC_ACQUIRE);
++            } while (consumed_after - consumed_before != 2ull * BURST_GATES &&
++                     now_sec() < cdl);
++            check(consumed_after - consumed_before == 2ull * BURST_GATES,
++                  "burst: consumed advanced across the ring wrap");
++            uint32_t st = 0;
++            memcpy(&st, uc_host + DS4_ROCM_TP_STAMP_OFF, 4u);
++            check(st == host_stamp(0u, (uint64_t)BURST_FIRST_SEQ + BURST_GATES - 1),
++                  "burst: last TX stamp exact after wrap");
++            float dst0 = 0.0f;
++            ok = hipMemcpy(&dst0, dst, sizeof(float), hipMemcpyDeviceToHost) ==
++                 hipSuccess;
++            check(ok && dst0 == (float)((uint64_t)BURST_FIRST_SEQ + BURST_GATES - 1),
++                  "burst: last RX copy landed the last payload");
++            /* Full-payload byte checks for the odd-length last gate: TX slot
++             * == src for n floats; dst == peer payload for n floats. */
++            check(memcmp(uc_host, src_host, (N_FLOATS - 7u) * sizeof(float)) == 0,
++                  "burst: odd-length TX fill exact (vector body + scalar tail)");
++            if (ok) ok = hipMemcpy(out_host, dst, N_FLOATS * sizeof(float),
++                                   hipMemcpyDeviceToHost) == hipSuccess;
++            check(ok && memcmp(out_host, rx_slot_payload,
++                               (N_FLOATS - 7u) * sizeof(float)) == 0,
++                  "burst: odd-length RX copy exact (vector body + scalar tail)");
++            qsort(lat, BURST_GATES, sizeof(double), cmp_double);
++            double sum = 0.0;
++            for (int g = 0; g < BURST_GATES; g++) sum += lat[g];
++            printf("ROCm TP-persist burst: %d gates in %.1f ms; host publish->rx_done "
++                   "us: mean %.1f p50 %.1f p90 %.1f p99 %.1f max %.1f\n",
++                   BURST_GATES, t_burst * 1e3, sum / BURST_GATES,
++                   lat[BURST_GATES / 2], lat[BURST_GATES * 9 / 10],
++                   lat[BURST_GATES * 99 / 100], lat[BURST_GATES - 1]);
++            /* Loose gate: the persistent path's no-wire floor must sit well
++             * inside the R12 per-gate budget. */
++            check(lat[BURST_GATES / 2] < 500.0, "burst: p50 gate floor < 500us");
++        }
++    }
++
++    /* Runtime calls the engine makes while the kernel is resident.  Measured
++     * on CLR/TheRock 7.13 (2026-09-03): hipDeviceSynchronize, hipFree and
++     * hipHostFree wait for every stream on the device and therefore
++     * deadlock against the resident kernel -- the engine routes them through
++     * pause/resume wrappers (exercised mid-burst above).  Everything below
++     * must NOT block; the watchdog turns a regression into a named failure
++     * instead of a hang. */
++    if (ok) {
++        static volatile int probe_stage = 0;
++        static const char *const probe_names[] = {
++            "hipMalloc", "hipMemset", "hipMemcpy D2H", "hipHostMalloc",
++            "hipStreamSynchronize(0)", "hipEventSynchronize",
++            "hipEventDestroy", "done" };
++        pthread_t wd;
++        struct wd_arg { volatile int *stage; } wa = { &probe_stage };
++        auto wd_fn = [](void *p) -> void * {
++            struct wd_arg *a = (struct wd_arg *)p;
++            for (int i = 0; i < 100; i++) {
++                usleep(100000);
++                if (*a->stage >= 7) return NULL;
++            }
++            fprintf(stderr, "FAIL runtime probe hung in %s (resident kernel "
++                    "blocks it; add it to the guarded set in ds4_rocm.h)\n",
++                    probe_names[*a->stage]);
++            fflush(stderr);
++            _exit(3);
++        };
++        pthread_create(&wd, NULL, wd_fn, &wa);
++        hipEvent_t ev = 0;
++        uint32_t scratch = 0;
++        probe_stage = 0; ok = hipMalloc(&probe_dev, 1u << 20) == hipSuccess;
++        probe_stage = 1; if (ok) ok = hipMemset(probe_dev, 0, 1u << 20) == hipSuccess;
++        probe_stage = 2; if (ok) ok = hipMemcpy(&scratch, probe_dev, 4u, hipMemcpyDeviceToHost) == hipSuccess;
++        probe_stage = 3; if (ok) ok = hipHostMalloc((void **)&probe_host, 4096u, hipHostMallocMapped) == hipSuccess;
++        probe_stage = 4; if (ok) ok = hipStreamSynchronize(0) == hipSuccess;
++        probe_stage = 5; if (ok) ok = hipEventCreate(&ev) == hipSuccess &&
++                                      hipEventRecord(ev, 0) == hipSuccess &&
++                                      hipEventSynchronize(ev) == hipSuccess;
++        probe_stage = 6; if (ev) ok = ok && hipEventDestroy(ev) == hipSuccess;
++        probe_stage = 7;
++        pthread_join(wd, NULL);
++        check(ok, "runtime probe: malloc/memset/memcpy/host alloc/stream+event "
++                  "sync do not block on the resident kernel");
++        /* probe_dev / probe_host are freed after the kernel has exited. */
++    }
++
++    /* Timeout path (R6): TMO_SEQ's RX slot never receives its stamp.  The RX
++     * worker must spin out, latch the state word, and skip the copy. */
++    if (ok) {
++        ds4_rocm_tp_ring_cmd tx = {0}, rx = {0};
++        tx.kind = DS4_ROCM_TP_PERSIST_KIND_TX;
++        tx.seq = TMO_SEQ;
++        tx.addr_a = (uint64_t)(uintptr_t)src;
++        tx.addr_b = (uint64_t)(uintptr_t)slots;
++        tx.n_floats = N_FLOATS;
++        tx.expect_stamp = host_stamp(0u, TMO_SEQ);
++        rx.kind = DS4_ROCM_TP_PERSIST_KIND_RX;
++        rx.seq = TMO_SEQ;
++        rx.addr_a = (uint64_t)(uintptr_t)(slots + slot_bytes);
++        rx.addr_b = (uint64_t)(uintptr_t)dst;
++        rx.n_floats = N_FLOATS;
++        rx.expect_stamp = host_stamp(1u, TMO_SEQ);
++        ok = publish_cmd(ctrl_host, &tx) && publish_cmd(ctrl_host, &rx);
++        if (ok) {
++            hipLaunchKernelGGL(dsv4_tp_mark_src_ready_kernel, dim3(1),
++                               dim3(1), 0, 0, ctrl_dev, (uint64_t)TMO_SEQ);
++            ok = hipGetLastError() == hipSuccess;
++        }
++    }
++    if (ok) {
++        const double deadline = now_sec() + 10.0;
++        uint32_t state_got = 0;
++        for (;;) {
++            if (hipMemcpy(&state_got, state_dev, 4u,
++                          hipMemcpyDeviceToHost) != hipSuccess) {
++                ok = 0;
++                break;
++            }
++            if (state_got != 0) break;
++            if (now_sec() > deadline) { ok = 0; break; }
++        }
++        check(ok, "RX stamp timeout latches the state word");
++        /* The latched failure must also unblock wait_rx_done on the
++         * compute stream. */
++        if (ok) {
++            hipLaunchKernelGGL(dsv4_tp_wait_rx_done_kernel, dim3(1),
++                               dim3(1), 0, 0, ctrl_dev, (uint64_t)TMO_SEQ,
++                               state_dev);
++            ok = hipGetLastError() == hipSuccess &&
++                 hipStreamSynchronize(0) == hipSuccess;
++            check(ok, "wait_rx_done(tmo) unblocks on the failure latch");
++        }
++        uint64_t got = __atomic_load_n(&rx_flags[TMO_SEQ % DS4_ROCM_TP_PERSIST_CAP],
++                                       __ATOMIC_ACQUIRE);
++        check(got != TMO_SEQ, "timed-out RX never sets rx_done");
++    }
++
++    /* Ordered shutdown (R7): shutdown word, drain, stream sync returns. */
++    {
++        uint32_t *shutdown_ptr = (uint32_t *)(void *)
++            (ctrl_host + DS4_ROCM_TP_PERSIST_OFF_SHUTDOWN);
++        *shutdown_ptr = 1u;
++    }
++    {
++        /* Bounded: a wedged worker must fail the test, not hang it. */
++        const double deadline = now_sec() + 10.0;
++        hipError_t q = hipErrorNotReady;
++        while ((q = hipStreamQuery(stream)) == hipErrorNotReady &&
++               now_sec() < deadline) { }
++        check(q == hipSuccess, "resident kernel exits after shutdown word");
++        if (q != hipSuccess) {
++            fprintf(stderr, "kernel did not exit: publish=%llu consumed=%llu\n",
++                    (unsigned long long)*host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_PUBLISH),
++                    (unsigned long long)*host_u64(ctrl_host, DS4_ROCM_TP_PERSIST_OFF_CONSUMED));
++            fflush(stderr);
++            _exit(1);
++        }
++    }
++    check(hipStreamSynchronize(0) == hipSuccess, "compute stream drains");
++
++    if (ctrl_host) (void)hipHostFree(ctrl_host);
++    if (uc_host) (void)hipHostFree(uc_host);
++    if (probe_host) (void)hipHostFree(probe_host);
++    if (probe_dev) (void)hipFree(probe_dev);
++    free(lat);
++    if (slots) (void)hipFree(slots);
++    if (src) (void)hipFree(src);
++    if (dst) (void)hipFree(dst);
++    if (state_dev) (void)hipFree(state_dev);
++    if (stream) (void)hipStreamDestroy(stream);
++    free(out_host);
++    free(rx_payload);
++    free(src_host);
++    return 1;
++}
++
++int main(void) {
++    int count = 0;
++    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {
++        fprintf(stderr, "test_tp_persist_gate_rocm: no ROCm device available\n");
++        return 0;
++    }
++    (void)test_writer_reads_peer_payload();
++    printf("test_tp_persist_gate_rocm: %d/%d checks passed (%d failed)\n",
++           g_checks - g_failures, g_checks, g_failures);
++    return g_failures != 0;
++}
+\ No newline at end of file
