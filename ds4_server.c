@@ -501,6 +501,16 @@ static bool server_image_media_type(const char *media_type) {
             !strcasecmp(media_type, "image/jpg"));
 }
 
+/* User-turn images are the native chat shape.  OpenAI-compatible agents also
+ * attach read_file / view images on role=tool (or the legacy role=function).
+ * Assistant/system images stay rejected. */
+static bool server_image_role_ok(const char *role) {
+    return role &&
+           (!strcmp(role, "user") ||
+            !strcmp(role, "tool") ||
+            !strcmp(role, "function"));
+}
+
 static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             const char *media_type,
                                             const char *base64,
@@ -2028,7 +2038,11 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        /* OpenAI-compatible agents attach tool-result images on role=tool.
+         * Rejecting that used to 400 a well-formed request as
+         * "invalid JSON request".  DeepSeek already wraps tool results in
+         * <｜User｜>; GLM still prefers user-turn image tokens. */
+        if (msg.images.len && !server_image_role_ok(msg.role)) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2320,7 +2334,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        if (msg.images.len && !server_image_role_ok(msg.role)) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -19351,6 +19365,53 @@ static void test_openai_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_openai_tool_role_inline_image(void) {
+    /* OpenAI-compatible agents send tool-result images on role=tool. */
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":\"look\"},"
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":"
+        "[{\"id\":\"call_1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"Read image file\"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+    TEST_ASSERT(!strcmp(msgs.v[2].role, "tool"));
+    TEST_ASSERT(msgs.v[2].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[2].content, "Read image file") != NULL);
+    TEST_ASSERT(msgs.v[2].images.v[0].encoded_len >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[2].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    char *prompt = render_chat_prompt_text(&msgs, "{\"name\":\"read_file\"}",
+                                           NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt);
+    TEST_ASSERT(strstr(prompt, msgs.v[2].images.v[0].marker) != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* Assistant-role images stay rejected. */
+    const char *assistant =
+        "[{\"role\":\"user\",\"content\":\"look\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,";
+    buf bad = {0};
+    buf_puts(&bad, assistant);
+    buf_puts(&bad, test_inline_png_base64);
+    buf_puts(&bad, "\"}}]}]");
+    p = bad.ptr;
+    chat_msgs none = {0};
+    TEST_ASSERT(!parse_messages(&p, &none));
+    chat_msgs_free(&none);
+    buf_free(&bad);
+}
+
 static void test_http_image_paths_and_urls_are_rejected(void) {
     const char *cases[] = {
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
@@ -19488,6 +19549,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_openai_tool_role_inline_image();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
