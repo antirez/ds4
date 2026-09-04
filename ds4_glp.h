@@ -21,10 +21,20 @@
  *     output -- instead of removing the refusal component it pushes every token
  *     along the refusal axis.  Right tensor names, right dtype, right shapes.
  *
- *   - Hook point.  The same direction applied to the attention writer instead
- *     of the post-layer residual measured 9x weaker (34.0% vs 3.8% refusal at
- *     identical direction, layers and alpha).  A file cannot say where it was
- *     calibrated, so nothing can check.
+ *   - Hook point.  Steering one of a layer's contributors is not the same
+ *     intervention as steering the accumulated residual: the latter also
+ *     removes whatever upstream layers contributed, so a layer left unsteered
+ *     only re-adds its own share.  Measured at equal coverage and equal alpha,
+ *     cleaning the accumulated stream reached 3.8% refusal on a cyber suite
+ *     against 34.0% for cleaning the attention write alone -- roughly 9x.
+ *     Two caveats travel with that pair.  It predates the current scorer and
+ *     did not store completions, so it cannot be re-scored.  And it measured
+ *     the ATTENTION contributor, whereas ds4's default hook is the FFN/MoE
+ *     write -- a third site never measured, and plausibly much stronger there,
+ *     since the write-vs-explain contrast these directions come from is a
+ *     content decision and content is largely MoE-mediated on this
+ *     architecture.  So the mechanism is the argument here, not the factor.
+ *     A file cannot say where it was calibrated, so nothing can check.
  *
  *   - Layer map.  A one-layer shift does not fail, it degrades: adjacent
  *     layers' refusal directions have cosine similarity 0.555-0.979 (mean
@@ -152,10 +162,10 @@ int ds4_glp_read_info(const char *path,
  * correct and branch-free.
  *
  * target_hook is where the caller will apply the projection.  If the file
- * names a different hook the load fails unless allow_hook_mismatch is set,
- * because the same direction at the wrong site measured 9x weaker -- it
- * degrades rather than errors, which is the failure this field exists to
- * prevent.
+ * names a different hook the load fails unless allow_hook_mismatch is set:
+ * steering one contributor is a different intervention from steering the
+ * accumulated stream, and it degrades rather than errors, which is the failure
+ * this field exists to prevent.
  *
  * Returns 0 on success, nonzero on failure with a message in err.  On failure
  * dirs is left zeroed. */
@@ -177,9 +187,10 @@ void ds4_glp_print_info(FILE *out, const char *path, const ds4_glp_info *info);
  *
  * A GLP file carries the strength it was calibrated at, so honour it -- but
  * only when it was calibrated for the hook this scale drives. alpha is not a
- * property of the direction: projection is quadratic in the norm, and the same
- * direction at a different site measured 9x weaker, so an alpha from elsewhere
- * is not a better default than the fallback, only a more confident wrong one.
+ * property of the direction: projection is quadratic in the norm, and a site
+ * that steers one contributor rather than the accumulated stream needs a
+ * different dose, so an alpha from elsewhere is not a better default than the
+ * fallback, only a more confident wrong one.
  *
  * Returns fallback for a raw f32 blob, for a GLP file with no
  * glp.alpha_default, and for one whose hook is not ffn_out_pre_residual.

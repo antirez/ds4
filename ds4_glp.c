@@ -703,14 +703,18 @@ static int glp_check_hook(const char        *path,
     if (allow_mismatch) return 0;
 
     return glp_fail(err, errlen,
+                    /* Remedy first, rationale second: this message is written into
+                     * a caller-sized buffer, and a truncation should cost the
+                     * explanation, not the fix. */
                     "%s: glp.hook_point=\"%s\" but ds4 applies this projection at "
-                    "\"%s\". The same direction at the wrong site measured 9x weaker "
-                    "(34.0%% vs 3.8%% refusal at identical direction, layers and "
-                    "alpha), and it degrades rather than errors -- which is the "
-                    "failure this field exists to prevent. Either use a vector "
-                    "exported for this hook, or pass "
-                    "--dir-steering-allow-hook-mismatch and re-tune the scale: the "
-                    "file's alpha was calibrated elsewhere and does not transfer.",
+                    "\"%s\". Use a vector exported for this hook, or pass "
+                    "--dir-steering-allow-hook-mismatch and re-tune the scale. "
+                    "These are different tensors: ds4 steers one of the layer's "
+                    "contributors, while a vector calibrated on the post-layer "
+                    "residual steers the accumulated stream, which also removes "
+                    "what upstream layers contributed. Applying it here degrades "
+                    "rather than errors -- the failure this field exists to "
+                    "prevent -- and the file's alpha belongs to its own site.",
                     path, info->hook_name, ds4_glp_hook_name(target));
 }
 

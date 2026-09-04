@@ -1833,7 +1833,9 @@ the layer map and the base checkpoint, so a vector can be shared without the
 recipient having to be told how to apply it. ds4 refuses a file rather than
 misapplying it — notably a llama.cpp control vector, which shares the tensor
 convention exactly but is *added* where ds4 projects, an operation difference
-that raises no error and produces wrong output. `--dir-steering-info FILE`
+that raises no error and produces wrong output. The same goes for a vector
+calibrated on the post-layer residual rather than the block writers ds4 steers:
+a different tensor, and a dose that does not transfer. `--dir-steering-info FILE`
 prints what a vector is without loading a model. The raw `.f32` blob still
 works; the format is chosen by sniffing the file. See
 [dir-steering/README.md](dir-steering/README.md#glp-files).

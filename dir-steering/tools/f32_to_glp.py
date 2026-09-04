@@ -17,9 +17,12 @@ wrong:
   hook point  ds4 steers the block writers (ffn_out = moe + shared, or the
               attention output) before the residual fold. llama.cpp's
               build_cvec() and the weightless vLLM overlay steer the post-layer
-              residual. The same direction at the wrong site measured 9x
-              weaker: 34.0% vs 3.8% refusal at identical direction, layers and
-              alpha.
+              residual. A writer holds only what that block computed this
+              layer; the folded residual holds the accumulated sum, so
+              projecting it also removes what upstream layers contributed.
+              Steering a writer prevents refusal being added, steering the
+              residual deletes refusal already there -- different
+              interventions, and the dose does not transfer.
 
   layer map   direction.N applies at layer N. A one-layer shift does not fail,
               it degrades -- adjacent layers' refusal directions have cosine
@@ -289,8 +292,8 @@ def main():
     if not hook:
         die("no hook point: pass --hook (%s), or --meta with a component field. "
             "A vector that does not say where it was calibrated cannot be "
-            "applied safely anywhere else -- the same direction at the wrong "
-            "site measured 9x weaker."
+            "applied safely anywhere else -- the dose does not transfer between "
+            "sites, and applying it at the wrong one degrades silently."
             % ", ".join(sorted(VALID_HOOKS)))
     if hook not in VALID_HOOKS:
         die("--hook %r is not a site ds4 applies at (%s). "

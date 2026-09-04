@@ -65,8 +65,12 @@ direction instead of removing it.
 **The hook point.** ds4 steers the block writers — `ffn_out = moe + shared`, or
 the attention output — before the residual / hyper-connection fold. llama.cpp's
 `build_cvec()` and the weightless vLLM overlay steer the post-layer residual.
-Measured on the same direction, the same layers and the same alpha, the writer
-site left 34.0% refusal against 3.8% post-layer: 9x weaker, and not an error.
+Those are different tensors, not two names for one. A writer holds only what
+that block computed *this layer*; the folded residual holds the accumulated sum,
+so projecting it also removes whatever every upstream layer contributed.
+Steering a writer prevents refusal being *added*; steering the residual
+*deletes* refusal already there. Neither site's calibrated strength transfers to
+the other, and a vector applied at the wrong one degrades rather than errors.
 
 **The layer map.** `direction.N` applies at layer `N`, with no offset. A
 one-layer shift does not fail, it degrades — adjacent layers' refusal
@@ -115,10 +119,10 @@ strength it was calibrated at with no flags:
 ```
 
 An explicit `--dir-steering-ffn` always wins, and alpha is never adopted from a
-file whose hook does not match: projection is quadratic in the direction's
-norm and the same direction at a different site measured 9x weaker, so an alpha
-from elsewhere is not a better default than 1.0, only a more confident wrong
-one.
+file whose hook does not match: projection is quadratic in the direction's norm,
+and a site that cleans one contributor rather than the accumulated stream needs
+a different dose — so an alpha from elsewhere is not a better default than 1.0,
+only a more confident wrong one.
 
 ### Publishing a vector
 

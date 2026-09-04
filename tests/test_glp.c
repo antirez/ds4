@@ -10,7 +10,7 @@
  * a failure that cannot be caught downstream:
  *
  *   wrong operation   an additive vector applied projectively (or the reverse)
- *   wrong hook        the same direction 9x weaker
+ *   wrong hook        one contributor cleaned, not the accumulated stream
  *   wrong layer map   adjacent-layer cosine 0.55-0.98, so a shift still works
  *   wrong base model  undefined, and shapes can still match
  */
@@ -271,7 +271,7 @@ static void test_load_valid(void) {
 
     float dirs[N_LAYERS * N_EMBD];
     ds4_glp_info info;
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, &info, err, sizeof(err));
     CHECK(rc == 0, "conforming vector loads");
@@ -326,7 +326,7 @@ static void test_refuse_missing_mode(void) {
     CHECK(write_gguf(path, &h), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "no glp.mode is refused");
@@ -346,7 +346,7 @@ static void test_refuse_add_mode(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "glp.mode=add is refused, never coerced to project");
@@ -357,8 +357,8 @@ static void test_refuse_hook_mismatch(void) {
     /* Every GLP vector we have published so far declares
      * residual_stream_post_layer, because that is where llama.cpp's
      * build_cvec() and the vLLM overlay apply. ds4 applies at the block
-     * writers. Loading one into the other measured 9x weaker on the
-     * attention writer, so the default is a refusal. */
+     * writers -- a different tensor, cleaning one contributor rather than the
+     * accumulated stream -- so the default is a refusal. */
     gguf_spec g;
     spec_valid(&g, N_EMBD);
     for (int i = 0; i < g.n_kv; i++) {
@@ -370,7 +370,7 @@ static void test_refuse_hook_mismatch(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                           dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "hook mismatch is refused by default");
@@ -400,7 +400,7 @@ static void test_refuse_unknown_hook(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "a hook name this build does not implement is refused");
@@ -421,7 +421,7 @@ static void test_refuse_layer_id_mismatch(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "declared layer ids disagreeing with tensor names is refused");
@@ -441,7 +441,7 @@ static void test_refuse_direction_zero(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "direction.0 is refused");
@@ -457,7 +457,7 @@ static void test_refuse_wrong_dtype_and_rank(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                           dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "a non-F32 direction is refused");
@@ -483,7 +483,7 @@ static void test_refuse_shape_mismatch(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                           dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "n_embd mismatch is refused");
@@ -515,7 +515,7 @@ static void test_renormalise(void) {
 
     float dirs[N_LAYERS * N_EMBD];
     ds4_glp_info info;
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, &info, err, sizeof(err));
     CHECK(rc == 0, "off-unit directions load");
@@ -555,7 +555,7 @@ static void test_refuse_legacy_namespace(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "a dspark.*-only file is refused");
@@ -573,7 +573,7 @@ static void test_refuse_no_directions(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                                 dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
     CHECK(rc != 0, "a GGUF with no direction.<N> tensors is refused");
@@ -590,7 +590,7 @@ static void test_read_info_needs_no_model(void) {
     CHECK(write_gguf(path, &g), "fixture written");
 
     ds4_glp_info info;
-    char err[512];
+    char err[768];
     const int rc = ds4_glp_read_info(path, &info, err, sizeof(err));
     CHECK(rc == 0, "read_info succeeds with no model shape");
     if (rc != 0) fprintf(stderr, "    err: %s\n", err);
@@ -617,7 +617,7 @@ static void test_malformed_input(void) {
     /* Not a crash test for its own sake: --dir-steering-file is a path a user
      * types, so truncation and "you passed the model" are ordinary inputs. */
     float dirs[N_LAYERS * N_EMBD];
-    char err[512];
+    char err[768];
 
     CHECK(ds4_glp_load("/nonexistent/ds4-glp.gguf", DS4_GLP_HOOK_FFN_OUT, 0,
                        dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err)) != 0,
@@ -659,7 +659,7 @@ static void test_derived_at(void) {
 
     float dirs[N_LAYERS * N_EMBD];
     ds4_glp_info info;
-    char err[512];
+    char err[768];
     int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
                           dirs, N_LAYERS, N_EMBD, &info, err, sizeof(err));
     CHECK(rc == 0, "native derived_at loads");

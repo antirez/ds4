@@ -1869,9 +1869,14 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
  * The same argument applies to the hook point. ds4 steers the block writers
  * (ffn_out = moe + shared, and the attention output) before the residual /
  * hyper-connection fold. llama.cpp's build_cvec() and our vLLM overlay steer
- * the post-layer residual. Measured on the same direction, layers and alpha,
- * the writer site left 34.0% refusal against 3.8% post-layer -- 9x weaker,
- * not an error. So a file calibrated for one is refused at the other unless
+ * the post-layer residual. Those are different tensors, not two names for one:
+ * a writer carries only what that block computed this layer, while the folded
+ * residual carries the accumulated sum, so projecting it also removes what
+ * every upstream layer contributed. Steering a writer prevents refusal being
+ * added; steering the residual deletes refusal already there. The one measured
+ * comparison at matched direction and alpha put a per-contributor edit far
+ * behind a projection on the accumulated stream, and neither dose transfers to
+ * the other site. So a file calibrated for one is refused at the other unless
  * the caller says otherwise, in which case the scale has to be re-tuned.
  */
 /* Load-time policy, not per-session state: set once from the engine options
@@ -1949,8 +1954,8 @@ static bool steering_load_directions(
 
     /* glp.hook_point is not in the required set, so a file that predates it is
      * a warning rather than a refusal: we cannot tell a vector derived here
-     * from one derived at the post-layer residual, and the difference measured
-     * 9x. */
+     * from one derived at the post-layer residual, and those are different
+     * interventions with different doses. */
     if (!info.hook_name[0]) {
         fprintf(stderr,
                 "ds4: warning: %s declares no glp.hook_point. Applying at %s; if "
