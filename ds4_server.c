@@ -3090,6 +3090,75 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static void server_log(ds4_log_type type, const char *fmt, ...);
+
+/* Vision image budget.  Dropping older images is an intentionally lossy
+ * policy, so it is opt-in: by default requests with more than
+ * DS4_VISION_REJECT_LIMIT images are rejected.  Setting the environment
+ * variable DS4_VISION_KEEP_IMAGES=N (0 < N <= DS4_VISION_HARD_LIMIT) enables
+ * auto-reduction instead: the OLDEST images are dropped (the freshest views
+ * matter most to agent loops) and each dropped image sentinel in the rendered
+ * transcript is replaced by a fixed text note, so the model still sees an
+ * honest history and the prompt remains a deterministic cache key.  The
+ * retained set is always the last N in document order; a hard limit still
+ * fails absurd requests fast, before any work. */
+#define DS4_VISION_REJECT_LIMIT 16
+#define DS4_VISION_HARD_LIMIT 1024
+#define DS4_VISION_OMIT_NOTE "[oldest image omitted to fit the vision budget]"
+
+static size_t ds4_vision_keep_cached;   /* 0 = auto-reduce disabled */
+static pthread_once_t ds4_vision_keep_once = PTHREAD_ONCE_INIT;
+
+static void ds4_vision_keep_images_init(void) {
+    const char *env = getenv("DS4_VISION_KEEP_IMAGES");
+    if (!env || !env[0]) return;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (*end == '\0' && v >= 1 && v <= DS4_VISION_HARD_LIMIT) {
+        ds4_vision_keep_cached = (size_t)v;
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: ignoring invalid DS4_VISION_KEEP_IMAGES='%s' "
+                   "(valid range 1..%d); auto-reduce stays disabled",
+                   env, DS4_VISION_HARD_LIMIT);
+    }
+}
+
+/* Effective auto-reduce target, 0 when disabled. */
+static size_t ds4_vision_keep_images(void) {
+    pthread_once(&ds4_vision_keep_once, ds4_vision_keep_images_init);
+    return ds4_vision_keep_cached;
+}
+
+/* Rewrite r->prompt_text dropping the first `dropped` image sentinels.
+ * Returns false if a sentinel went missing during rendering. */
+static bool ds4_prompt_text_drop_oldest_images(request *r,
+                                                server_image_input **inputs,
+                                                size_t count, size_t dropped) {
+    const char *note = DS4_VISION_OMIT_NOTE;
+    const size_t note_len = strlen(note);
+    buf out = {0};
+    const char *cursor = r->prompt_text;
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        const char *marker = strstr(cursor, inputs[i]->marker);
+        if (!marker) { ok = false; break; }
+        buf_append(&out, cursor, (size_t)(marker - cursor));
+        if (i < dropped) buf_append(&out, note, note_len);
+        else buf_append(&out, marker, strlen(inputs[i]->marker));
+        cursor = marker + strlen(inputs[i]->marker);
+    }
+    if (ok) {
+        buf_append(&out, cursor, strlen(cursor));
+        char *text = buf_take(&out);
+        free(r->prompt_text);
+        r->prompt_text = text;
+    } else {
+        buf_free(&out);
+    }
+    return ok;
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3100,8 +3169,19 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    const size_t keep = ds4_vision_keep_images();   /* 0 = reject, not reduce */
+    if (keep == 0) {
+        if (count > DS4_VISION_REJECT_LIMIT) {
+            snprintf(err, errlen,
+                     "too many images; at most %d are allowed "
+                     "(set DS4_VISION_KEEP_IMAGES=N to serve the request "
+                     "with the oldest images dropped instead)",
+                     DS4_VISION_REJECT_LIMIT);
+            return false;
+        }
+    } else if (count > DS4_VISION_HARD_LIMIT) {
+        snprintf(err, errlen, "too many images; at most %d are allowed",
+                 DS4_VISION_HARD_LIMIT);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -3116,6 +3196,25 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     for (int i = 0; i < msgs->len; i++) {
         for (size_t j = 0; j < msgs->v[i].images.len; j++)
             inputs[next++] = &msgs->v[i].images.v[j];
+    }
+
+    server_image_input **inputs_base = inputs;
+    ds4_vision_embedding *embeddings_base = embeddings;
+    size_t total_images = count;
+    if (keep != 0 && count > keep) {
+        size_t dropped = count - keep;
+        if (!ds4_prompt_text_drop_oldest_images(r, inputs, count, dropped)) {
+            free(inputs_base);
+            free(embeddings_base);
+            snprintf(err, errlen, "image marker was lost while rendering the request");
+            return false;
+        }
+        inputs += dropped;
+        embeddings += dropped;
+        count -= dropped;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: multimodal image budget: %zu images, kept last %zu, omitted %zu oldest",
+                   total_images, count, dropped);
     }
 
     bool ok = true;
@@ -3157,8 +3256,8 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
 done:
     for (size_t i = 0; i < count; i++)
         ds4_vision_embedding_free(&embeddings[i]);
-    free(embeddings);
-    free(inputs);
+    free(inputs_base);
+    free(embeddings_base);
     if (!ok) {
         ds4_tokens_free(&r->prompt);
         for (size_t i = 0; i < r->image_count; i++)
@@ -19148,6 +19247,63 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
+static void test_prompt_text_drop_oldest_images(void) {
+    server_image_input imgs[3];
+    memset(imgs, 0, sizeof(imgs));
+    snprintf(imgs[0].marker, sizeof(imgs[0].marker),
+             "\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f");
+    snprintf(imgs[1].marker, sizeof(imgs[1].marker),
+             "\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f");
+    snprintf(imgs[2].marker, sizeof(imgs[2].marker),
+             "\x1e" "DS4_IMAGE_cccccccccccccccccccccccc" "\x1f");
+    server_image_input *list[3] = { &imgs[0], &imgs[1], &imgs[2] };
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    buf t = {0};
+    buf_puts(&t, "pre");
+    buf_puts(&t, imgs[0].marker);
+    buf_puts(&t, "mid");
+    buf_puts(&t, imgs[1].marker);
+    buf_puts(&t, "end");
+    buf_puts(&t, imgs[2].marker);
+    buf_puts(&t, "!");
+    r.prompt_text = buf_take(&t);
+
+    TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, list, 3, 1));
+    char want[256];
+    snprintf(want, sizeof(want), "pre%s", DS4_VISION_OMIT_NOTE);
+    size_t wl = strlen(want);
+    TEST_ASSERT(strlen(r.prompt_text) > wl);
+    TEST_ASSERT(!memcmp(r.prompt_text, want, wl));
+    /* Markers 2 and 3 survive verbatim. */
+    TEST_ASSERT(strstr(r.prompt_text, imgs[1].marker) != NULL);
+    TEST_ASSERT(strstr(r.prompt_text, imgs[2].marker) != NULL);
+    /* Marker 1 is gone. */
+    TEST_ASSERT(strstr(r.prompt_text, imgs[0].marker) == NULL);
+
+    /* Dropping all: every sentinel replaced, surrounding text intact. */
+    free(r.prompt_text);
+    buf t2 = {0};
+    buf_puts(&t2, "A");
+    buf_puts(&t2, imgs[0].marker);
+    buf_puts(&t2, "B");
+    r.prompt_text = buf_take(&t2);
+    server_image_input *one[1] = { &imgs[0] };
+    TEST_ASSERT(ds4_prompt_text_drop_oldest_images(&r, one, 1, 1));
+    TEST_ASSERT(strstr(r.prompt_text, "A") && strstr(r.prompt_text, "B"));
+    TEST_ASSERT(!strstr(r.prompt_text, imgs[0].marker));
+
+    /* Lost marker is reported, not silently misrendered. */
+    free(r.prompt_text);
+    r.prompt_text = xstrdup("nothing here");
+    TEST_ASSERT(!ds4_prompt_text_drop_oldest_images(&r, one, 1, 1));
+
+    free(r.prompt_text);
+    r.prompt_text = NULL;
+    request_free(&r);
+}
+
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -19483,6 +19639,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_prompt_text_drop_oldest_images();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
