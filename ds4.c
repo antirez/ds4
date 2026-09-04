@@ -47,8 +47,10 @@
 #include "ds4_image.h"
 #include "ds4_tp.h"
 
-/* TP context for the verify-block RDMA window (set with the gate callbacks). */
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+/* TP context for the verify-block RDMA window (set with the gate callbacks).
+ * Every GPU build compiles the use sites, so the guard is !DS4_NO_GPU,
+ * not Apple-only. */
+#if !defined(DS4_NO_GPU)
 static ds4_tp *g_tp_block_ctx;
 #endif
 
