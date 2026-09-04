@@ -332,7 +332,11 @@ library is required.
 Anthropic requests. HTTP images must be inline: use a PNG/JPEG data URI for
 OpenAI or base64 image source for Anthropic. File paths and remote URLs are
 rejected. A request may contain up to 16 images and the HTTP body is limited to
-64 MiB.
+64 MiB. Requests over that limit fail by default; agent loops that accumulate a
+screenshot per tool round can instead set the environment variable
+`DS4_VISION_KEEP_IMAGES=N` (1 <= N <= 1024) to opt into auto-reduction: the
+server keeps the last N images of the history and serves the request, replacing
+each dropped image sentinel in the transcript with a fixed text note.
 
 Vision runs on Metal, single-GPU CUDA, and ROCm. On a DGX Spark, use the CUDA
 command above and add `--vision FILE`. On the 128 GB Strix Halo reference host,
