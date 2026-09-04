@@ -2221,12 +2221,17 @@ static cli_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         /* A residual-calibrated GLP defaults to the post-layer hook at its
-         * own alpha; anything else keeps the historical FFN default. */
+         * own alpha; anything else keeps the historical FFN default.  The
+         * adopted flag, not the value, decides: alpha_default=0 means "no
+         * steering by default" and must not fall through to the FFN 1. */
+        int resid_adopted = 0;
         c.engine.directional_steering_resid =
-            ds4_glp_default_resid_scale(c.engine.directional_steering_file, 0.0f);
-        if (c.engine.directional_steering_resid == 0.0f) {
+            ds4_glp_default_resid_scale(c.engine.directional_steering_file, 0.0f,
+                                        &resid_adopted);
+        if (!resid_adopted) {
             c.engine.directional_steering_ffn =
-                ds4_glp_default_ffn_scale(c.engine.directional_steering_file, 1.0f);
+                ds4_glp_default_ffn_scale(c.engine.directional_steering_file, 1.0f,
+                                          NULL);
         }
     }
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {

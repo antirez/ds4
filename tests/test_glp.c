@@ -70,6 +70,7 @@ typedef struct {
     uint32_t ndim;       /* 1 unless a test wants otherwise */
     float    scale;      /* norm to write; 1.0 for a unit direction */
     float    fill;       /* value pattern seed; 0 writes a zero direction */
+    int      nonfinite;  /* 0 = all finite, 1 = NaN at [0], 2 = Inf at [0] */
 } dir_entry;
 
 typedef struct {
@@ -130,6 +131,16 @@ static void w_pad(FILE *fp) {
     while (pad-- > 0) fputc(0, fp);
 }
 
+/* Bit-pattern NaN/Inf: this file is built with -ffast-math, under which the
+ * NAN/INFINITY macros are UB, so construct the values by their bits. */
+static float f32_from_bits(uint32_t bits) {
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+#define TEST_NAN f32_from_bits(0x7fc00000u)
+#define TEST_INF f32_from_bits(0x7f800000u)
+
 /* Build the direction values: a deterministic pattern normalised to
  * d->scale, so a test can ask for a unit direction or a deliberately
  * off-unit one. fill == 0 writes an all-zero direction. */
@@ -146,6 +157,8 @@ static void fill_direction(const dir_entry *d, float *buf) {
     const float norm = (float)sqrt(sumsq);
     const float k = d->scale / norm;
     for (uint32_t i = 0; i < d->n; i++) buf[i] *= k;
+    if (d->nonfinite == 1) buf[0] = TEST_NAN;
+    if (d->nonfinite == 2) buf[0] = TEST_INF;
 }
 
 /* Write the spec to path. Tensor data offsets are relative to the aligned data
@@ -710,6 +723,142 @@ static void test_derived_at(void) {
     unlink(path);
 }
 
+static void test_refuse_nonfinite(void) {
+    /* A NaN or Inf direction poisons every activation it touches, and a NaN
+     * alpha scales the projection by NaN. Both refuse at load. */
+    gguf_spec g;
+    spec_valid(&g, N_EMBD);
+    g.dirs[0].nonfinite = 1;
+    const char *path = tmp_path("nan");
+    CHECK(write_gguf(path, &g), "fixture written");
+
+    float dirs[N_LAYERS * N_EMBD];
+    char err[768];
+    int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                          dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "a direction containing NaN is refused");
+    CHECK(strstr(err, "NaN") != NULL, "error names the non-finite direction");
+    if (rc == 0 || !strstr(err, "NaN")) fprintf(stderr, "    rc=%d err: %s\n", rc, err);
+    unlink(path);
+
+    spec_valid(&g, N_EMBD);
+    g.dirs[1].nonfinite = 2;
+    path = tmp_path("inf");
+    CHECK(write_gguf(path, &g), "fixture written");
+    rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                      dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "a direction containing Inf is refused");
+    unlink(path);
+
+    spec_valid(&g, N_EMBD);
+    for (int i = 0; i < g.n_kv; i++) {
+        if (strcmp(g.kv[i].key, "glp.alpha_default") == 0) g.kv[i].f32 = TEST_NAN;
+    }
+    path = tmp_path("nanalpha");
+    CHECK(write_gguf(path, &g), "fixture written");
+    rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                      dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "a NaN alpha_default is refused");
+    CHECK(strstr(err, "alpha_default") != NULL, "error names alpha_default");
+    unlink(path);
+}
+
+static void test_refuse_layer_set_mismatch(void) {
+    /* Count/min/max agree and the interior differs: the summary check could
+     * not see this. The exact-set comparison must. */
+    gguf_spec g;
+    spec_valid(&g, N_EMBD);
+    for (int i = 0; i < g.n_kv; i++) {
+        if (strcmp(g.kv[i].key, "glp.layer_ids_zero_based") == 0) {
+            snprintf(g.kv[i].s, sizeof(g.kv[i].s), "2,3,5,5");
+        }
+    }
+    const char *path = tmp_path("layermis");
+    CHECK(write_gguf(path, &g), "fixture written");
+
+    float dirs[N_LAYERS * N_EMBD];
+    char err[768];
+    int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                          dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "declared list differing in the interior is refused");
+    CHECK(strstr(err, "layer_ids_zero_based") != NULL, "error names the field");
+    unlink(path);
+
+    /* A duplicate direction.<N> would load twice, the second silently
+     * overwriting the first row. */
+    spec_valid(&g, N_EMBD);
+    add_dir(&g, 3, N_EMBD);
+    for (int i = 0; i < g.n_kv; i++) {
+        if (strcmp(g.kv[i].key, "glp.layer_ids_zero_based") == 0) {
+            g.kv[i].s[0] = '\0';
+        }
+    }
+    path = tmp_path("duplayer");
+    CHECK(write_gguf(path, &g), "fixture written");
+    rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                      dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "a duplicate direction.<N> is refused");
+    CHECK(strstr(err, "twice") != NULL, "error names the duplicate");
+    unlink(path);
+}
+
+static void test_refuse_misaligned_offset(void) {
+    /* Direction bytes are read as float * straight out of the mapping, so a
+     * tensor offset that is not float-aligned would be an unaligned load.
+     * Hand-roll the file: the fixture writer always aligns. */
+    const char *path = tmp_path("align");
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL, "fixture opened");
+    if (!fp) return;
+    w_u32(fp, 0x46554747u);
+    w_u32(fp, 3);
+    w_u64(fp, 1); /* one tensor */
+    w_u64(fp, 1); /* one KV */
+    w_str(fp, "glp.mode");
+    w_u32(fp, GGUF_TYPE_STRING);
+    w_str(fp, "project");
+    w_str(fp, "direction.2");
+    w_u32(fp, 1);          /* ndim */
+    w_u64(fp, N_EMBD);
+    w_u32(fp, GGML_TYPE_F32);
+    w_u64(fp, 2);          /* offset 2: not a multiple of 4 */
+    w_pad(fp);
+    for (int i = 0; i < N_EMBD + 1; i++) w_f32(fp, 0.5f);
+    fclose(fp);
+
+    float dirs[N_LAYERS * N_EMBD];
+    char err[768];
+    const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                                dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "a non-float-aligned direction offset is refused");
+    CHECK(strstr(err, "aligned") != NULL, "error names the alignment");
+    unlink(path);
+}
+
+static void test_refuse_amplified_header_counts(void) {
+    /* 100 KVs cannot fit in 500 bytes (13 minimum each), so the count is a
+     * lie and the calloc must not happen. The 1-byte floor used to let this
+     * through to a 100-entry allocation and a truncated-metadata refusal. */
+    const char *path = tmp_path("counts");
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL, "fixture opened");
+    if (!fp) return;
+    w_u32(fp, 0x46554747u);
+    w_u32(fp, 3);
+    w_u64(fp, 4);   /* tensors */
+    w_u64(fp, 100); /* KV entries */
+    for (int i = 0; i < 500; i++) fputc(0, fp);
+    fclose(fp);
+
+    float dirs[N_LAYERS * N_EMBD];
+    char err[768];
+    const int rc = ds4_glp_load(path, DS4_GLP_HOOK_FFN_OUT, 0,
+                                dirs, N_LAYERS, N_EMBD, NULL, err, sizeof(err));
+    CHECK(rc != 0, "counts the file cannot minimally contain are refused");
+    CHECK(strstr(err, "header counts") != NULL, "error names the header counts");
+    unlink(path);
+}
+
 static void test_load_resid_hook(void) {
     /* residual_stream_post_layer is the site every published GLP vector
      * declares. It must load at the resid target with no override, and its
@@ -743,9 +892,13 @@ static void test_load_resid_hook(void) {
 
     /* alpha_default is adopted at the site it was calibrated for, and only
      * there: the FFN default must return the caller's fallback. */
-    CHECK(fabsf(ds4_glp_default_resid_scale(path, 0.0f) - 3.0f) < 1e-6f,
+    int adopted = 0;
+    CHECK(fabsf(ds4_glp_default_resid_scale(path, 0.0f, &adopted) - 3.0f) < 1e-6f &&
+          adopted == 1,
           "resid default adopts glp.alpha_default");
-    CHECK(fabsf(ds4_glp_default_ffn_scale(path, 7.0f) - 7.0f) < 1e-6f,
+    adopted = 1;
+    CHECK(fabsf(ds4_glp_default_ffn_scale(path, 7.0f, &adopted) - 7.0f) < 1e-6f &&
+          adopted == 0,
           "ffn default does not adopt a residual site's alpha");
     unlink(path);
 
@@ -753,10 +906,53 @@ static void test_load_resid_hook(void) {
     spec_valid(&g, N_EMBD);
     path = tmp_path("resid-ffn");
     CHECK(write_gguf(path, &g), "fixture written");
-    CHECK(fabsf(ds4_glp_default_ffn_scale(path, 0.0f) - 3.0f) < 1e-6f,
+    adopted = 0;
+    CHECK(fabsf(ds4_glp_default_ffn_scale(path, 0.0f, &adopted) - 3.0f) < 1e-6f &&
+          adopted == 1,
           "ffn default adopts glp.alpha_default");
-    CHECK(ds4_glp_default_resid_scale(path, 0.0f) == 0.0f,
+    CHECK(ds4_glp_default_resid_scale(path, 0.0f, &adopted) == 0.0f &&
+          adopted == 0,
           "resid default does not adopt an FFN site's alpha");
+    unlink(path);
+
+    /* alpha_default=0 is a value -- "no steering by default" -- not an
+     * absence: adopted must be set so the caller does not fall through to
+     * another site's default scale. */
+    spec_valid(&g, N_EMBD);
+    for (int i = 0; i < g.n_kv; i++) {
+        if (strcmp(g.kv[i].key, "glp.hook_point") == 0) {
+            snprintf(g.kv[i].s, sizeof(g.kv[i].s), "residual_stream_post_layer");
+        }
+        if (strcmp(g.kv[i].key, "glp.alpha_default") == 0) {
+            g.kv[i].f32 = 0.0f;
+        }
+    }
+    path = tmp_path("alpha-zero");
+    CHECK(write_gguf(path, &g), "fixture written");
+    adopted = 0;
+    CHECK(ds4_glp_default_resid_scale(path, 9.0f, &adopted) == 0.0f &&
+          adopted == 1,
+          "alpha_default=0 is adopted as a value");
+    unlink(path);
+
+    /* And a file with no alpha_default at all adopts nothing. */
+    spec_valid(&g, N_EMBD);
+    {
+        gguf_spec h;
+        memset(&h, 0, sizeof(h));
+        for (int i = 0; i < g.n_kv; i++) {
+            if (strcmp(g.kv[i].key, "glp.alpha_default") == 0) continue;
+            h.kv[h.n_kv++] = g.kv[i];
+        }
+        memcpy(h.dirs, g.dirs, sizeof(g.dirs));
+        h.n_dirs = g.n_dirs;
+        path = tmp_path("alpha-absent");
+        CHECK(write_gguf(path, &h), "fixture written");
+    }
+    adopted = 1;
+    CHECK(ds4_glp_default_ffn_scale(path, 5.0f, &adopted) == 5.0f &&
+          adopted == 0,
+          "absent alpha_default adopts nothing");
     unlink(path);
 }
 
@@ -787,6 +983,10 @@ int main(void) {
     RUN(test_malformed_input);
     RUN(test_derived_at);
     RUN(test_load_resid_hook);
+    RUN(test_refuse_nonfinite);
+    RUN(test_refuse_layer_set_mismatch);
+    RUN(test_refuse_misaligned_offset);
+    RUN(test_refuse_amplified_header_counts);
     RUN(test_hook_names_round_trip);
 
     fprintf(stderr, "\n%d checks, %d failed\n", g_total, g_failed);

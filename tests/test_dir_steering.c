@@ -74,6 +74,23 @@ int main(void) {
     ds4_test_directional_steering_project_rows(x, dirs, 3, N_HC, 0.0f);
     CHECK(memcmp(x, ref, sizeof(x)) == 0, "zero scale is an exact no-op");
 
+    /* The zero-scale no-op must not even read the direction: with a NaN row
+     * and scale 0 the stack is bit-identical.  This is what makes
+     * alpha_default=0 -- "no steering by default" -- safe to honor. */
+    {
+        static float nan_dirs[N_LAYERS * N_EMBD];
+        const uint32_t nan_bits = 0x7fc00000u;   /* quiet NaN, by bits: this
+                                                    file builds with
+                                                    -ffast-math, where the
+                                                    NAN macro is UB */
+        float nan_f;
+        memcpy(&nan_f, &nan_bits, sizeof(nan_f));
+        for (int i = 0; i < N_EMBD; i++) nan_dirs[3 * N_EMBD + i] = nan_f;
+        ds4_test_directional_steering_project_rows(x, nan_dirs, 3, N_HC, 0.0f);
+        CHECK(memcmp(x, ref, sizeof(x)) == 0,
+              "zero scale does not read the direction (NaN row, no-op)");
+    }
+
     /* Nonzero direction, scale 2: x -= 2 * dot(dir, row) * dir per stream. */
     ds4_test_directional_steering_project_rows(x, dirs, 3, N_HC, 2.0f);
     double max_abs = 0.0;

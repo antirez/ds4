@@ -196,15 +196,19 @@ void ds4_glp_print_info(FILE *out, const char *path, const ds4_glp_info *info);
  *
  * Returns fallback for a raw f32 blob, for a GLP file with no
  * glp.alpha_default, and for one whose hook is not ffn_out_pre_residual.
+ * adopted, when given, is set to 1 exactly when the file's value is used --
+ * the caller needs it because an adopted 0 ("no steering by default") is a
+ * value, not an absence, and must not fall through to another site's
+ * default.
  * Prints a line to stderr when it does adopt the file's value, because a
  * scale the user did not type should be visible in the log. Shared by ds4,
  * ds4-server and ds4-agent so the three cannot drift. */
-float ds4_glp_default_ffn_scale(const char *path, float fallback);
+float ds4_glp_default_ffn_scale(const char *path, float fallback, int *adopted);
 
 /* The --dir-steering-resid sibling: adopts glp.alpha_default only for a file
  * whose hook is residual_stream_post_layer.  Same rules and same stderr line
  * as ds4_glp_default_ffn_scale. */
-float ds4_glp_default_resid_scale(const char *path, float fallback);
+float ds4_glp_default_resid_scale(const char *path, float fallback, int *adopted);
 
 /* --dir-steering-info: describe the vector at path on stdout and return the
  * process exit code (0 ok, 1 unreadable/refused, 2 not a GLP file).

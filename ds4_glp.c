@@ -275,11 +275,14 @@ static int glp_open(glp_file *f, const char *path, char *err, size_t errlen) {
                         "%s: GGUF v%u; GLP is specified on GGUF v3",
                         path, version);
     }
-    /* Each entry needs at least one byte on disk, so a count above the bytes
-     * remaining cannot be real. Reject before calloc so a 24-byte file cannot
-     * ask for an enormous allocation. */
+    /* Every KV entry serializes at least a key length, a type tag and a
+     * one-byte value (13 bytes); every tensor directory entry at least a name
+     * length, an ndim, one dim, a type and an offset (32). A count the
+     * remaining bytes cannot minimally contain is a hostile header. Reject
+     * before calloc so a small file cannot amplify itself into a multi-GB
+     * allocation. */
     const uint64_t remaining = f->size - c.pos;
-    if (f->n_kv > remaining || f->n_tensors > remaining) {
+    if (f->n_kv > remaining / 13 || f->n_tensors > remaining / 32) {
         glp_close(f);
         return glp_fail(err, errlen, "%s: GGUF header counts exceed file size", path);
     }
@@ -476,6 +479,23 @@ static ds4_glp_hook glp_hook_from_name(const char *name) {
 /* Spec checks shared by read_info and load                           */
 /* ------------------------------------------------------------------ */
 
+static int glp_cmp_u32(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a;
+    const uint32_t y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Finiteness of a serialized float, tested on its bytes. This file is built
+ * with -ffast-math, under which the compiler assumes every float-typed value
+ * is finite and folds even memcpy/bit-test NaN checks away -- so the value
+ * must stay integer-typed all the way through the test. NaN and Inf both
+ * have all exponent bits set. */
+static int glp_bytes_f32_finite(const void *p) {
+    uint32_t bits;
+    memcpy(&bits, p, sizeof(bits));
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
 /* Parse "direction.<N>" and return N, or -1 if the name is not one. */
 static long glp_direction_index(const glp_str *name) {
     static const char pfx[] = "direction.";
@@ -556,6 +576,26 @@ static int glp_read_metadata(const glp_file *f,
     }
 
     info->has_alpha_default = glp_get_f32(f, "glp.alpha_default", &info->alpha_default);
+    if (info->has_alpha_default) {
+        /* Test the serialized bytes, never the float value: see
+         * glp_bytes_f32_finite. */
+        const glp_kv *akv = glp_find(f, "glp.alpha_default");
+        int finite = 1;
+        if (akv && akv->type == GLP_KV_FLOAT32) {
+            finite = glp_bytes_f32_finite(f->map + akv->value_pos);
+        } else if (akv && akv->type == GLP_KV_FLOAT64) {
+            uint64_t bits;
+            memcpy(&bits, f->map + akv->value_pos, sizeof(bits));
+            finite = (bits & 0x7ff0000000000000ull) != 0x7ff0000000000000ull;
+        }
+        if (!finite) {
+            return glp_fail(err, errlen,
+                            "%s: glp.alpha_default is not finite. It is the "
+                            "scale the projection multiplies by; refusing rather "
+                            "than steering by NaN.",
+                            path);
+        }
+    }
 
     glp_get_str(f, "glp.hook_point", info->hook_name, sizeof(info->hook_name));
     info->hook = glp_hook_from_name(info->hook_name);
@@ -631,6 +671,14 @@ static int glp_scan_tensors(const glp_file *f,
             return glp_fail(err, errlen, "%s: direction.%ld data past end of file",
                             path, idx);
         }
+        /* The bytes are read as float * straight out of the mapping, so the
+         * absolute offset must be float-aligned; anything else is an
+         * unaligned scalar load. */
+        if (t->abs_offset % 4 != 0) {
+            return glp_fail(err, errlen,
+                            "%s: direction.%ld offset %llu is not float-aligned",
+                            path, idx, (unsigned long long)t->abs_offset);
+        }
         if ((uint32_t)idx < lo) lo = (uint32_t)idx;
         if ((uint32_t)idx > hi) hi = (uint32_t)idx;
         n_dirs++;
@@ -654,32 +702,73 @@ static int glp_scan_tensors(const glp_file *f,
      * field still read 10..38.  The names are what execute, so the mismatch
      * shifted the whole stack one layer, and a one-layer shift degrades
      * rather than fails.  The file carried the evidence and nothing looked at
-     * it. */
+     * it.
+     *
+     * Compare the exact sets, not a summary: count/min/max alone cannot see a
+     * duplicate direction.<N> (which would load twice, the second silently
+     * overwriting the first row of the dense buffer) or a declared list that
+     * differs only in the interior. */
+    uint32_t *ids = malloc((size_t)n_dirs * sizeof(ids[0]));
+    if (!ids) return glp_fail(err, errlen, "%s: out of memory", path);
+    uint32_t n_ids = 0;
+    for (uint64_t i = 0; i < f->n_tensors; i++) {
+        const long idx = glp_direction_index(&f->tensors[i].name);
+        if (idx >= 1) ids[n_ids++] = (uint32_t)idx;
+    }
+    qsort(ids, n_ids, sizeof(ids[0]), glp_cmp_u32);
+    for (uint32_t i = 1; i < n_ids; i++) {
+        if (ids[i] == ids[i - 1]) {
+            free(ids);
+            return glp_fail(err, errlen,
+                            "%s: direction.%u appears twice. The second would "
+                            "overwrite the first in the layer-indexed buffer.",
+                            path, ids[i]);
+        }
+    }
+
     char declared[1024];
     if (glp_get_str(f, "glp.layer_ids_zero_based", declared, sizeof(declared)) &&
         declared[0]) {
-        uint32_t d_lo = UINT32_MAX, d_hi = 0, d_n = 0;
+        uint32_t d_n = 0;
         const char *p = declared;
         while (*p) {
             while (*p == ' ' || *p == ',') p++;
             if (!*p) break;
             if (*p < '0' || *p > '9') { d_n = 0; break; }
-            uint32_t v = 0;
-            while (*p >= '0' && *p <= '9') v = v * 10 + (uint32_t)(*p++ - '0');
-            if (v < d_lo) d_lo = v;
-            if (v > d_hi) d_hi = v;
+            while (*p >= '0' && *p <= '9') p++;
             d_n++;
         }
-        if (d_n && (d_n != n_dirs || d_lo != lo || d_hi != hi)) {
-            return glp_fail(err, errlen,
-                            "%s: glp.layer_ids_zero_based declares layers %u..%u "
-                            "(%u entries) but the direction tensors resolve to "
-                            "%u..%u (%u entries). The tensor names are what get "
-                            "applied, so this file would steer the wrong layers. "
-                            "Re-export it.",
-                            path, d_lo, d_hi, d_n, lo, hi, n_dirs);
+        uint32_t *d_ids = d_n ? malloc((size_t)d_n * sizeof(d_ids[0])) : NULL;
+        if (d_n && !d_ids) {
+            free(ids);
+            return glp_fail(err, errlen, "%s: out of memory", path);
         }
+        if (d_ids) {
+            d_n = 0;
+            p = declared;
+            while (*p) {
+                while (*p == ' ' || *p == ',') p++;
+                if (!*p) break;
+                uint32_t v = 0;
+                while (*p >= '0' && *p <= '9') v = v * 10 + (uint32_t)(*p++ - '0');
+                d_ids[d_n++] = v;
+            }
+            qsort(d_ids, d_n, sizeof(d_ids[0]), glp_cmp_u32);
+        }
+        if (d_ids && (d_n != n_ids || memcmp(d_ids, ids,
+                                             (size_t)n_ids * sizeof(ids[0])) != 0)) {
+            free(d_ids);
+            free(ids);
+            return glp_fail(err, errlen,
+                            "%s: glp.layer_ids_zero_based does not match the "
+                            "direction tensors' layer set. The tensor names are "
+                            "what get applied, so this file would steer the "
+                            "wrong layers. Re-export it.",
+                            path);
+        }
+        free(d_ids);
     }
+    free(ids);
     return 0;
 }
 
@@ -877,6 +966,26 @@ int ds4_glp_load(const char   *path,
         const float *src = (const float *)(const void *)(f.map + t->abs_offset);
         memcpy(dst, src, (size_t)n_embd * sizeof(dst[0]));
 
+        /* A NaN or Inf in the direction makes every activation it touches
+         * NaN: the dot is NaN, the subtraction is NaN, and the model's output
+         * is NaN with no error raised. Refuse at load instead. The test reads
+         * the mapping as integers: float-typed NaN checks fold away under
+         * -ffast-math (see glp_bytes_f32_finite). */
+        const uint32_t *src_bits = (const uint32_t *)(const void *)(f.map + t->abs_offset);
+        int finite = 1;
+        for (uint32_t k = 0; k < n_embd; k++) {
+            if ((src_bits[k] & 0x7f800000u) == 0x7f800000u) { finite = 0; break; }
+        }
+        if (!finite) {
+            glp_close(&f);
+            memset(dirs, 0, (size_t)n_layers * n_embd * sizeof(dirs[0]));
+            return glp_fail(err, errlen,
+                            "%s: direction.%ld contains a NaN or Inf. The "
+                            "projection multiplies the activation by dot(v, y); "
+                            "a non-finite direction poisons every token.",
+                            path, idx);
+        }
+
         /* ds4's op removes the component exactly at scale 1 only for a unit
          * direction, and the projector v^ v^T is invariant to ||v||, so
          * rescaling here cannot change the intended operation -- whereas
@@ -920,7 +1029,9 @@ static void glp_print_field(FILE *out, const char *label, const char *value) {
 }
 
 static float glp_default_scale(const char *path, ds4_glp_hook hook,
-                               const char *flag, float fallback) {
+                               const char *flag, float fallback,
+                               int *adopted) {
+    if (adopted) *adopted = 0;
     if (ds4_glp_is_gguf(path) != 1) return fallback;
 
     ds4_glp_info info;
@@ -929,20 +1040,23 @@ static float glp_default_scale(const char *path, ds4_glp_hook hook,
     if (!info.has_alpha_default) return fallback;
     if (info.hook != hook) return fallback;
 
+    /* Adopted even when the value is 0: a file that declares alpha_default=0
+     * means "no steering by default", which is a value, not an absence. */
     fprintf(stderr,
             "ds4: %s defaulted to %g from glp.alpha_default\n",
             flag, (double)info.alpha_default);
+    if (adopted) *adopted = 1;
     return info.alpha_default;
 }
 
-float ds4_glp_default_ffn_scale(const char *path, float fallback) {
+float ds4_glp_default_ffn_scale(const char *path, float fallback, int *adopted) {
     return glp_default_scale(path, DS4_GLP_HOOK_FFN_OUT,
-                             "--dir-steering-ffn", fallback);
+                             "--dir-steering-ffn", fallback, adopted);
 }
 
-float ds4_glp_default_resid_scale(const char *path, float fallback) {
+float ds4_glp_default_resid_scale(const char *path, float fallback, int *adopted) {
     return glp_default_scale(path, DS4_GLP_HOOK_RESID_POST_LAYER,
-                             "--dir-steering-resid", fallback);
+                             "--dir-steering-resid", fallback, adopted);
 }
 
 int ds4_glp_inspect_main(const char *path) {

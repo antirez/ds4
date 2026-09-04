@@ -37,6 +37,7 @@
 #include <sys/sysctl.h>
 #endif
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1885,9 +1886,12 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
 /* Load-time policy, not per-session state: set once from the engine options
  * and read only by steering_load_directions(). A file-scope flag keeps the
  * four generate_* entry points that carry the steering path around from
- * growing another argument each. */
+ * growing another argument each. The provenance flag is atomic because
+ * ds4-server creates sessions from worker threads, and two sessions loading
+ * the same vector concurrently would otherwise both print -- or race on --
+ * the full provenance dump. */
 static bool g_steering_allow_hook_mismatch;
-static bool g_steering_provenance_logged;
+static atomic_bool g_steering_provenance_logged;
 
 static bool steering_load_directions(
         const char *path,
@@ -1950,8 +1954,8 @@ static bool steering_load_directions(
     /* Full provenance once, a single line after that: ds4-server calls this
      * per session, and thirteen repeated lines of the same metadata buries the
      * warnings below it. */
-    if (!g_steering_provenance_logged) {
-        g_steering_provenance_logged = true;
+    if (!atomic_exchange_explicit(&g_steering_provenance_logged, true,
+                                  memory_order_acq_rel)) {
         ds4_glp_print_info(stderr, path, &info);
         fprintf(stderr, "  %-14s %s\n", "applied at", ds4_glp_hook_name(target));
     } else {
@@ -63095,7 +63099,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_resid_scale = opt->directional_steering_resid;
     }
     g_steering_allow_hook_mismatch = opt->directional_steering_allow_hook_mismatch;
-    g_steering_provenance_logged = false;
+    atomic_store_explicit(&g_steering_provenance_logged, false, memory_order_release);
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
