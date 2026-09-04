@@ -1304,6 +1304,7 @@ Supported endpoints:
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 
 The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
@@ -1325,6 +1326,11 @@ the same DSML rendering and KV prefix reuse used by chat completions.
 clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
 controls. Tool uses are returned as Anthropic `tool_use` blocks.
+
+`/v1/messages/count_tokens` accepts the same Anthropic message fields and
+returns `{"input_tokens":N}` without queueing a generation request. The count
+uses the same rendered prompt and tokenizer path as `/v1/messages`, including
+system text and tool definitions.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than
