@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_glp.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
@@ -2117,6 +2118,14 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-resid")) {
+            c.engine.directional_steering_resid = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-allow-hook-mismatch")) {
+            c.engine.directional_steering_allow_hook_mismatch = true;
+        } else if (!strcmp(arg, "--dir-steering-info")) {
+            /* Inspect and exit before any model is loaded. */
+            exit(ds4_glp_inspect_main(need_arg(&i, argc, argv, arg)));
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -2211,7 +2220,19 @@ static cli_config parse_options(int argc, char **argv) {
     }
 
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
-        c.engine.directional_steering_ffn = 1.0f;
+        /* A residual-calibrated GLP defaults to the post-layer hook at its
+         * own alpha; anything else keeps the historical FFN default.  The
+         * adopted flag, not the value, decides: alpha_default=0 means "no
+         * steering by default" and must not fall through to the FFN 1. */
+        int resid_adopted = 0;
+        c.engine.directional_steering_resid =
+            ds4_glp_default_resid_scale(c.engine.directional_steering_file, 0.0f,
+                                        &resid_adopted);
+        if (!resid_adopted) {
+            c.engine.directional_steering_ffn =
+                ds4_glp_default_ffn_scale(c.engine.directional_steering_file, 1.0f,
+                                          NULL);
+        }
     }
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
         fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");

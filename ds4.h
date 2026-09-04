@@ -139,6 +139,15 @@ typedef struct {
     const char *expert_profile_path;
     float directional_steering_attn;
     float directional_steering_ffn;
+    /* Post-layer residual hook: project each of the n_hc hyper-connection
+     * streams independently after the FFN fold.  This is the
+     * residual_stream_post_layer site GLP vectors declare. */
+    float directional_steering_resid;
+    /* Apply a GLP vector at a hook it does not declare. Off by default:
+     * steering one of a layer's contributors is a different intervention from
+     * steering the accumulated residual, and it degrades rather than errors.
+     * See ds4_glp.h. */
+    bool directional_steering_allow_hook_mismatch;
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
@@ -478,6 +487,14 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+/* The CPU projection the steering hooks share, exposed so a model-free test
+ * can check it numerically: x holds rows independent n_embd rows; each is
+ * projected as x -= scale * dir * dot(dir, x) with dir = dirs[il]. */
+void ds4_test_directional_steering_project_rows(float       *x,
+                                                const float *dirs,
+                                                uint32_t     il,
+                                                uint32_t     rows,
+                                                float        scale);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

@@ -19141,6 +19141,15 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
     add_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "add launch");
 }
+/* ds4_gpu.h documents the tp_flag variant as falling back to
+ * ds4_gpu_add_tensor when the fold does not apply; the flag-publishing
+ * kernel is Metal-only for now, so the CUDA build provides the fallback
+ * directly. */
+extern "C" int ds4_gpu_add_tensor_tp_flag(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n, uint32_t layer, uint32_t gate) {
+    (void)layer;
+    (void)gate;
+    return ds4_gpu_add_tensor(out, a, b, n);
+}
 
 extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
                                         const ds4_gpu_tensor *local,
