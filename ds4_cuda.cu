@@ -32884,6 +32884,37 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     return 0;
 }
 
+/* CUDA has no equivalent of the Metal gate-flag-fold optimization (it never
+ * publishes the checked TP flag from the add kernel itself), so this always
+ * takes the plain-add fallback the Metal implementation itself falls back to
+ * when the fold does not apply. */
+extern "C" int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate) {
+    (void)layer; (void)gate;
+    return ds4_gpu_add_tensor(out, a, b, n);
+}
+
+extern "C" void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;   /* no fold path on CUDA: request is ignored */
+}
+
+extern "C" void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void) {
+    /* no-op on CUDA: the kv task always runs standalone, which is the
+     * documented fallback when nothing consumes the deferred task */
+}
+
+extern "C" int ds4_gpu_kv_norm_task_begin_concurrent(void) {
+    return 0;   /* nothing deferred on CUDA, so never concurrent */
+}
+
+extern "C" void ds4_gpu_kv_norm_task_end_concurrent(void) {
+}
+
 extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
     (void)enabled;   /* Mac network-TP head split: no-op on CUDA */
 }

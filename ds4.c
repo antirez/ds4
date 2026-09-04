@@ -46,7 +46,7 @@
 #include "ds4_tp.h"
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#if !defined(DS4_NO_GPU)
 static ds4_tp *g_tp_block_ctx;
 #endif
 
