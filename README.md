@@ -1563,10 +1563,14 @@ the saved prefix instead of processing the whole prompt again.
 ## Thinking Modes
 
 DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+The server defaults to thinking mode. `reasoning_effort` selects among three
+prompt-level tiers: `low` keeps thinking enabled but adds no effort prefix, so
+the model reasons at its own pace; `medium`, `high`, and `xhigh` are synonyms
+that all request the model card's "high" reasoning-effort prefix; `max`
+requests Think Max, the model card's most exhaustive tier. `max` is honored at
+any context size — the model card's 384K figure is a recommended output-length
+cap for the high/max tiers, not a context precondition, so it is no longer used
+to downgrade `max` to `high` on smaller contexts.
 
 For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
 non-thinking model alias such as `deepseek-chat`.

@@ -24,6 +24,7 @@ typedef enum {
 
 typedef enum {
     DS4_THINK_NONE,
+    DS4_THINK_LOW,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
 } ds4_think_mode;
@@ -306,6 +307,7 @@ bool ds4_engine_is_glm53(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
+const char *ds4_think_high_prefix(void);
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
