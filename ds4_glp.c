@@ -718,11 +718,12 @@ static int glp_scan_tensors(const glp_file *f,
     qsort(ids, n_ids, sizeof(ids[0]), glp_cmp_u32);
     for (uint32_t i = 1; i < n_ids; i++) {
         if (ids[i] == ids[i - 1]) {
+            const uint32_t dup = ids[i];
             free(ids);
             return glp_fail(err, errlen,
                             "%s: direction.%u appears twice. The second would "
                             "overwrite the first in the layer-indexed buffer.",
-                            path, ids[i]);
+                            path, dup);
         }
     }
 
