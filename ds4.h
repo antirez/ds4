@@ -139,6 +139,10 @@ typedef struct {
     const char *expert_profile_path;
     float directional_steering_attn;
     float directional_steering_ffn;
+    /* Apply a GLP vector at a hook it does not declare. Off by default: the
+     * same direction at the wrong site measured 9x weaker, and it degrades
+     * rather than errors. See ds4_glp.h. */
+    bool directional_steering_allow_hook_mismatch;
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;

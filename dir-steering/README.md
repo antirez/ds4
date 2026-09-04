@@ -19,17 +19,139 @@ The file shape depends on the model:
 
 GLM 5.2 steering is not implemented.
 
+`--dir-steering-file` also accepts a **GLP file** — the same directions in a
+GGUF container that states what they are. See [GLP files](#glp-files) below.
+
 ## Runtime Options
 
 ```text
---dir-steering-file FILE   load one f32 direction per normal model layer
+--dir-steering-file FILE   one direction per normal model layer: a GLP .gguf,
+                           or the raw f32 blob described above
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
+--dir-steering-info FILE   print a GLP vector's metadata and exit; loads no model
+--dir-steering-allow-hook-mismatch
+                           apply a GLP vector at a hook it was not calibrated for
 ```
+
+The format is chosen by sniffing the file, not by a flag, so every existing raw
+vector keeps working unchanged.
 
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+## GLP files
+
+The raw format is a headerless blob. That is fine on the machine that produced
+it and unsafe to hand to anyone else, because it cannot say four things that
+are each silently wrong when they are wrong:
+
+**The operation.** llama.cpp has shipped control vectors since 2024 with the
+tensor convention this format reuses exactly — tensors named `direction.<N>`,
+fp32, 1-D — but llama.cpp *adds* them:
+
+```text
+h <- h + v                      ADD:      steer towards a direction
+y -= scale * v * dot(v, y)      PROJECT:  delete the component along v  (ds4)
+```
+
+These are different operations, and the difference is not a scale factor. A
+file loads into either runtime with the right tensor names, the right dtype and
+the right shapes, raises no error, and produces wrong output in one of them: an
+additive apply of a projective direction pushes every token *along* the
+direction instead of removing it.
+
+**The hook point.** ds4 steers the block writers — `ffn_out = moe + shared`, or
+the attention output — before the residual / hyper-connection fold. llama.cpp's
+`build_cvec()` and the weightless vLLM overlay steer the post-layer residual.
+Measured on the same direction, the same layers and the same alpha, the writer
+site left 34.0% refusal against 3.8% post-layer: 9x weaker, and not an error.
+
+**The layer map.** `direction.N` applies at layer `N`, with no offset. A
+one-layer shift does not fail, it degrades — adjacent layers' refusal
+directions have cosine similarity 0.555–0.979 — so it survives a smoke test.
+
+**The base checkpoint.** A direction is tied to the exact revision it was
+derived from. Applying one elsewhere is undefined, and the shapes still match.
+
+GLP (GGUF Layer Projection) is standard GGUF v3 with llama.cpp's tensor
+convention unchanged, plus a `glp.*` block that states all four. ds4 refuses a
+file rather than misapplying it: wrong operation, a hook it was not calibrated
+for, tensor names disagreeing with the declared layer list, `rank > 1`, a
+non-F32 direction, or a width that is not this model's `n_embd`. Full spec:
+[weightless/spec/GLP.md](https://github.com/msuiche/weightless/blob/main/spec/GLP.md).
+
+Inspect a vector without loading the model it belongs to — the first thing to
+reach for when one behaves oddly:
+
+```sh
+./ds4 --dir-steering-info dir-steering/out/verbosity-GLP.gguf
+```
+
+```text
+GLP vector: dir-steering/out/verbosity-GLP.gguf
+  mode           project
+  spec_version   1
+  hook_point     ffn_out_pre_residual
+  alpha_default  2
+  rank           1
+  coverage       42 directions, n_embd=4096, layers 1..42
+  direction norm 1.000000 .. 1.000000
+  base model     DeepSeek-V4-Flash-0731
+  method         paired_difference_of_means
+  contrast       succinct.txt_vs_verbose.txt
+  content sha256 2fc93b0a...
+```
+
+When the file's hook matches the site ds4 is about to steer, `glp.alpha_default`
+becomes the default `--dir-steering-ffn`, so a published vector runs at the
+strength it was calibrated at with no flags:
+
+```sh
+./ds4 -m ds4flash.gguf --nothink --temp 0 -n 160 \
+  --dir-steering-file verbosity-GLP.gguf \
+  -p "Explain why databases use indexes."
+```
+
+An explicit `--dir-steering-ffn` always wins, and alpha is never adopted from a
+file whose hook does not match: projection is quadratic in the direction's
+norm and the same direction at a different site measured 9x weaker, so an alpha
+from elsewhere is not a better default than 1.0, only a more confident wrong
+one.
+
+### Publishing a vector
+
+`f32_to_glp.py` packages a raw vector built by `build_direction.py`, reading the
+sidecar JSON so the shape and the hook point cannot disagree with what was
+measured:
+
+```sh
+python3 dir-steering/tools/f32_to_glp.py \
+  dir-steering/out/verbosity.f32 dir-steering/out/verbosity-GLP.gguf \
+  --meta dir-steering/out/verbosity.json \
+  --layers 1-42 \
+  --base-model DeepSeek-V4-Flash-0731 \
+  --base-org deepseek-ai \
+  --base-revision <hf commit> \
+  --alpha 2.0
+```
+
+It normalises each direction to unit length, writes `glp.content_sha256` over
+the tensor bytes only — `glp.created` makes the file non-reproducible, so the
+hash is what lets two people confirm they hold the same direction — and reads
+the result back to assert the layer ids landed verbatim and the values survived
+exactly. No third-party Python packages.
+
+**Layer 0 cannot be expressed.** `direction.N` applies at layer `N` and
+`direction.0` is invalid, so the container has no slot for layer 0 — a
+difference from the raw format, which has a row for it. `build_direction.py`
+fills every layer, so a full-coverage vector needs `--layers 1-<last>` and
+loses layer 0. Vectors derived over a mid-stack range (ours cover L10–38) are
+unaffected. Coverage is the lever that matters most here — 6 layers 18%, 16
+layers 3.8%, 29 layers 0.0% on our refusal suites, while alpha saturates above
+about 4 — so losing the first layer of a 43-layer stack is not what decides a
+vector's strength.
 
 ## GLM 5.3 Example
 

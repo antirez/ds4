@@ -226,9 +226,13 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
 
 static void print_steering(FILE *fp, const help_colors *c) {
     title(fp, c, "Directional Steering");
-    opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
+    opt(fp, c, "--dir-steering-file FILE", "Direction per layer: a GLP .gguf, or a raw f32 blob.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    opt(fp, c, "--dir-steering-info FILE", "Print a GLP vector's metadata and exit; loads no model.");
+    opt(fp, c, "--dir-steering-allow-hook-mismatch", "Apply a GLP vector at a hook it was not calibrated for.");
+    fputc('\n', fp);
+    para(fp, c, "A GLP file (GGUF Layer Projection) is standard GGUF v3 carrying direction.<N> F32 tensors plus a glp.* metadata block that states the operation, the hook point, the layer map and the base checkpoint. It is refused rather than misapplied when any of those does not match: llama.cpp's control vectors share the tensor convention exactly but ADD the direction, where ds4 projects it out, and the wrong one of those two produces no error and wrong output. A raw f32 blob of n_layers * n_embd floats still loads, chosen by sniffing the file.");
     fputc('\n', fp);
 }
 
@@ -497,6 +501,8 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
         }
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
+        opt(fp, c, "GLP vector", "./ds4 -p \"...\" --dir-steering-file vec-GLP-29.gguf");
+        opt(fp, c, "inspect", "./ds4 --dir-steering-info vec-GLP-29.gguf");
     } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
         opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192");
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");

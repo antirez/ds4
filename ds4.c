@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_glp.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
 
@@ -1836,6 +1837,148 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
         fprintf(stderr, "ds4: failed to read %s\n", path);
         return false;
     }
+    return true;
+}
+
+/* =========================================================================
+ * Steering file loading: GLP container or raw f32.
+ * =========================================================================
+ *
+ * --dir-steering-file accepts two things:
+ *
+ *   - a GLP file (GGUF Layer Projection), which is standard GGUF v3 carrying
+ *     "direction.<N>" F32 tensors plus a "glp.*" metadata block that states
+ *     the operation, the hook point, the layer map and the base checkpoint.
+ *     See ds4_glp.h.
+ *
+ *   - the legacy raw blob: exactly n_layers * n_embd floats, no header. Every
+ *     vector built by dir-steering/tools/build_direction.py is one of these,
+ *     so the path stays bit-for-bit unchanged and is chosen by sniffing the
+ *     GGUF magic rather than by a flag.
+ *
+ * The GLP path exists because the operation ds4 performs -- remove the
+ * component of the activation along a direction -- is not the operation
+ * llama.cpp's control vectors perform, which is to add one. The two share the
+ * tensor convention exactly: same names, same dtype, same shapes. So a file
+ * from either world loads into either runtime without an error and produces
+ * wrong output in one of them: applying a projective direction additively
+ * pushes every token along the direction instead of removing it. Nothing
+ * downstream detects that, which is why the operation has to travel with the
+ * data and why an unrecognised one is fatal here.
+ *
+ * The same argument applies to the hook point. ds4 steers the block writers
+ * (ffn_out = moe + shared, and the attention output) before the residual /
+ * hyper-connection fold. llama.cpp's build_cvec() and our vLLM overlay steer
+ * the post-layer residual. Measured on the same direction, layers and alpha,
+ * the writer site left 34.0% refusal against 3.8% post-layer -- 9x weaker,
+ * not an error. So a file calibrated for one is refused at the other unless
+ * the caller says otherwise, in which case the scale has to be re-tuned.
+ */
+/* Load-time policy, not per-session state: set once from the engine options
+ * and read only by steering_load_directions(). A file-scope flag keeps the
+ * four generate_* entry points that carry the steering path around from
+ * growing another argument each. */
+static bool g_steering_allow_hook_mismatch;
+static bool g_steering_provenance_logged;
+
+static bool steering_load_directions(
+        const char *path,
+        float      *dirs,
+        uint32_t    n_layers,
+        float       attn_scale,
+        float       ffn_scale) {
+    const bool allow_hook_mismatch = g_steering_allow_hook_mismatch;
+    const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
+
+    if (ds4_glp_is_gguf(path) != 1) {
+        return read_f32_binary_file(path, dirs, n);
+    }
+
+    char err[768];
+    ds4_glp_info probe;
+    if (ds4_glp_read_info(path, &probe, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: %s\n", err);
+        return false;
+    }
+
+    /* FFN first: it is the default when a file is given, and the late-in-block
+     * site that carries behaviour, style and topic signal. The both-enabled
+     * case is rejected just below, so this picks the only live site. */
+    const ds4_glp_hook target =
+        (ffn_scale != 0.0f) ? DS4_GLP_HOOK_FFN_OUT : DS4_GLP_HOOK_ATTN_OUT;
+
+    /* When both hooks are enabled the file is applied at two sites, and it can
+     * have been calibrated for at most one of them. That is the same silent
+     * degradation as a plain hook mismatch, so it needs the same explicit
+     * opt-in. Two projections along the same direction at different tensors
+     * are also not one projection: the strengths do not add. */
+    if (attn_scale != 0.0f && ffn_scale != 0.0f && probe.hook_name[0] &&
+        !allow_hook_mismatch) {
+        fprintf(stderr,
+                "ds4: %s declares glp.hook_point=\"%s\", but both "
+                "--dir-steering-attn and --dir-steering-ffn are non-zero, so it "
+                "would be applied at two sites and was calibrated for at most "
+                "one. Steer one site, or pass "
+                "--dir-steering-allow-hook-mismatch and re-tune both scales.\n",
+                path, probe.hook_name);
+        return false;
+    }
+
+    ds4_glp_info info;
+    if (ds4_glp_load(path, target, allow_hook_mismatch ? 1 : 0,
+                     dirs, n_layers, DS4_N_EMBD, &info, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: %s\n", err);
+        return false;
+    }
+
+    /* Full provenance once, a single line after that: ds4-server calls this
+     * per session, and thirteen repeated lines of the same metadata buries the
+     * warnings below it. */
+    if (!g_steering_provenance_logged) {
+        g_steering_provenance_logged = true;
+        ds4_glp_print_info(stderr, path, &info);
+        fprintf(stderr, "  %-14s %s\n", "applied at", ds4_glp_hook_name(target));
+    } else {
+        fprintf(stderr,
+                "ds4: GLP vector %s: %u directions, layers %u..%u, applied at "
+                "%s\n",
+                path, info.n_dirs, info.layer_min, info.layer_max,
+                ds4_glp_hook_name(target));
+        return true;
+    }
+
+    /* glp.hook_point is not in the required set, so a file that predates it is
+     * a warning rather than a refusal: we cannot tell a vector derived here
+     * from one derived at the post-layer residual, and the difference measured
+     * 9x. */
+    if (!info.hook_name[0]) {
+        fprintf(stderr,
+                "ds4: warning: %s declares no glp.hook_point. Applying at %s; if "
+                "it was derived elsewhere the calibrated scale does not "
+                "transfer.\n",
+                path, ds4_glp_hook_name(target));
+    }
+    if (info.hook != target) {
+        fprintf(stderr,
+                "ds4: warning: applying a vector calibrated at %s to %s "
+                "(--dir-steering-allow-hook-mismatch). The operation is the same; "
+                "the strength is not. Re-tune the scale.\n",
+                info.hook_name, ds4_glp_hook_name(target));
+    }
+    if (info.n_renormalized) {
+        fprintf(stderr,
+                "ds4: warning: %u of %u directions in %s were not unit length and "
+                "were rescaled. The projector is invariant to the norm, but an "
+                "exporter that writes off-unit directions is folding strength "
+                "into the data, which the scale then multiplies again.\n",
+                info.n_renormalized, info.n_dirs, path);
+    }
+
+    /* Nothing here can check that the vector matches the loaded checkpoint.
+     * n_embd and the layer count are all a reader has, and quantisation
+     * preserves both -- which is exactly why one vector pairs with any quant
+     * of the right base model, and why general.base_model.0.version is printed
+     * above rather than compared. */
     return true;
 }
 
@@ -16779,7 +16922,7 @@ static bool metal_graph_load_directional_steering(
     if (n_layers == 0) return false;
     const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
     float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
-    bool ok = read_f32_binary_file(path, dirs, n);
+    bool ok = steering_load_directions(path, dirs, n_layers, attn_scale, ffn_scale);
     if (ok) {
         /* Replicate the directions buffer onto every Class P tier slot that
          * has any other Class P scratch allocated (used_tier marker is the
@@ -38914,7 +39057,11 @@ static bool cpu_load_directional_steering(ds4_engine *e) {
     if (n_layers == 0) return false;
     const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
     e->directional_steering_dirs = xmalloc((size_t)n * sizeof(e->directional_steering_dirs[0]));
-    if (!read_f32_binary_file(path, e->directional_steering_dirs, n)) {
+    if (!steering_load_directions(path,
+                                  e->directional_steering_dirs,
+                                  n_layers,
+                                  e->directional_steering_attn_scale,
+                                  e->directional_steering_ffn_scale)) {
         free(e->directional_steering_dirs);
         e->directional_steering_dirs = NULL;
         fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
@@ -41243,7 +41390,7 @@ static bool glm_graph_load_directional_steering(
     if (n_layers == 0 || n_layers != g->normal_layers) return false;
     const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
     float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
-    bool ok = read_f32_binary_file(path, dirs, n);
+    bool ok = steering_load_directions(path, dirs, n_layers, attn_scale, ffn_scale);
     bool used_tier[DS4_MAX_GPUS] = {false};
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         const int tier = glm_graph_directional_steering_tier(g, il);
@@ -62801,6 +62948,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
+    g_steering_allow_hook_mismatch = opt->directional_steering_allow_hook_mismatch;
+    g_steering_provenance_logged = false;
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
