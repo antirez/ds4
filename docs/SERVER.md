@@ -60,6 +60,17 @@ preallocates independent KV states and queues requests when all slots are busy.
 Choose context and slot count together: a context that fits once may not fit
 four times. Idle slots can be cached before reuse; active requests are not evicted.
 
+`--max-active-requests N` separates resident KV capacity from compute
+concurrency. It requires `--batched-session`, may not exceed the resident
+session count, and defaults to that count so existing behavior is unchanged.
+For example, `--batched-session 10 --max-active-requests 1` allocates ten
+resident session slots while processing complete requests one at a time;
+additional requests wait in the server queue instead of occupying another
+active slot. This avoids mixed prefill/decode contention without reducing
+resident KV capacity. Request-to-slot selection is unchanged: this option
+controls admission concurrency, not which checkpoint the existing router
+chooses for a request.
+
 | Backend/model | Decode execution |
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
