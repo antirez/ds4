@@ -64,6 +64,9 @@ ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o
+# Everything a standalone ROCm test/bench needs to link against ds4_rocm.o
+# (the MMQ kernels, the vision helpers and the two stub sets it references).
+ROCM_TEST_LINK_OBJS := ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -77,12 +80,17 @@ endif
 TEST_HOOK_SUPPORT_OBJS = ds4_image.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o \
 	ds4_transport_nhi.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o \
 	$(TEST_HOOK_GPU_OBJS)
+# CPU-only tests link with the plain C toolchain unless a GPU test flow
+# (test-rocm) asks for GPU objects, in which case the GPU linker is needed.
 ifeq ($(UNAME_S),Darwin)
 TEST_HOOK_LINK = $(CC) $(CFLAGS)
 TEST_HOOK_LDLIBS = $(METAL_LDLIBS)
-else
+else ifneq ($(strip $(TEST_HOOK_GPU_OBJS)),)
 TEST_HOOK_LINK = $(DS4_LINK)
 TEST_HOOK_LDLIBS = $(DS4_LINK_LIBS)
+else
+TEST_HOOK_LINK = $(CC) $(CFLAGS)
+TEST_HOOK_LDLIBS = $(LDLIBS)
 endif
 
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm test-rocm-qkv-fusion test-q8-krow-rocm test-tp-combine-rocm test-graph-deferred-dump-rocm
@@ -339,7 +347,7 @@ test-rocm:
 		tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm \
 		ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
-		TEST_HOOK_GPU_OBJS="ds4_rocm.o" \
+		TEST_HOOK_GPU_OBJS="ds4_rocm.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -814,7 +822,7 @@ test-mxfp4-rocm: tests/test_mxfp4_rocm
 tests/test_rocm_qkv_fusion.o: tests/test_rocm_qkv_fusion.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_rocm_qkv_fusion: tests/test_rocm_qkv_fusion.o ds4_rocm.o
+tests/test_rocm_qkv_fusion: tests/test_rocm_qkv_fusion.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-qkv-fusion: tests/test_rocm_qkv_fusion
@@ -823,7 +831,7 @@ test-rocm-qkv-fusion: tests/test_rocm_qkv_fusion
 tests/test_q8_krow_rocm.o: tests/test_q8_krow_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_q8_krow_rocm: tests/test_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
+tests/test_q8_krow_rocm: tests/test_q8_krow_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-q8-krow-rocm: tests/test_q8_krow_rocm
@@ -832,13 +840,13 @@ test-q8-krow-rocm: tests/test_q8_krow_rocm
 tests/bench_q8_krow_rocm.o: tests/bench_q8_krow_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/bench_q8_krow_rocm: tests/bench_q8_krow_rocm.o ds4_rocm.o ds4_rocm_compat.o
+tests/bench_q8_krow_rocm: tests/bench_q8_krow_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/bench_matvec_poc_rocm.o: tests/bench_matvec_poc_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/bench_matvec_poc_rocm: tests/bench_matvec_poc_rocm.o ds4_rocm.o ds4_rocm_compat.o $(ROCM_MMQ_OBJS)
+tests/bench_matvec_poc_rocm: tests/bench_matvec_poc_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_tp.h ds4_gpu_mgpu.h ds4_gpu_args.h ds4_rocm_memory.h ds4_linux_memory.h
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
@@ -879,8 +887,8 @@ tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o $(TEST_HOOK_SUPP
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
-tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_session_state: tests/test_session_state.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS)) $(TEST_HOOK_GPU_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 tests/test_session_state_gpu.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
@@ -895,14 +903,14 @@ endif
 tests/test_tp_commands.o: tests/test_tp_commands.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_tp_commands: tests/test_tp_commands.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_tp_commands: tests/test_tp_commands.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS)) $(TEST_HOOK_GPU_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 tests/test_tp_rdma.o: tests/test_tp_rdma.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_tp_rdma: tests/test_tp_rdma.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_tp_rdma: tests/test_tp_rdma.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS)) $(TEST_HOOK_GPU_OBJS)
+	$(TEST_HOOK_LINK) -o $@ $^ $(TEST_HOOK_LDLIBS)
 
 tests/test_tp_link.o: tests/test_tp_link.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -1111,6 +1119,7 @@ clean:
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
+	rm -f tests/bench_matvec_poc_rocm
 	rm -f tests/test_tp_combine_rocm tests/test_graph_deferred_dump_rocm tests/test_tp_nhi_live
 	rm -f tests/test_transport tests/test_dist_v3
 	rm -f tests/test_rocm_qkv_fusion tests/test_q8_krow_rocm tests/bench_q8_krow_rocm tests/bench_mxfp4_rocm
@@ -1141,7 +1150,7 @@ test-dist-v3: tests/test_dist_v3
 tests/test_tp_combine_rocm.o: tests/test_tp_combine_rocm.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o ds4_rocm.o ds4_rocm_unavailable.o
+tests/test_tp_combine_rocm: tests/test_tp_combine_rocm.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-tp-combine-rocm: tests/test_tp_combine_rocm
@@ -1159,8 +1168,7 @@ tests/test_graph_deferred_dump_rocm.o: tests/test_graph_deferred_dump_rocm.c ds4
 tests/test_graph_deferred_dump_rocm: tests/test_graph_deferred_dump_rocm.o \
 		ds4_rocm_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o \
 		ds4_distributed.o ds4_dist_v3.o ds4_transport.o ds4_transport_nhi.o \
-		ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o \
-		ds4_rocm_unavailable.o ds4_layer_pack.o
+		ds4_tp.o ds4_tp_nhi.o ds4_ssd.o ds4_layer_pack.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-graph-deferred-dump-rocm: tests/test_graph_deferred_dump_rocm
@@ -1172,5 +1180,5 @@ ds4_tp_nhi.o: ds4_tp_nhi.c ds4_tp_nhi.h ds4_tbstream_uapi.h ds4_gpu.h
 tests/test_tp_nhi_live.o: tests/test_tp_nhi_live.c ds4_tp_nhi.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_tp_nhi_live: tests/test_tp_nhi_live.o ds4_tp_nhi.o ds4_rocm.o
+tests/test_tp_nhi_live: tests/test_tp_nhi_live.o ds4_tp_nhi.o $(ROCM_TEST_LINK_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)

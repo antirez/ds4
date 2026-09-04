@@ -336,7 +336,19 @@ static int test_attention_slice(void) {
              out_t, low_t, model, model_bytes, 0, b_off,
              GD, RANK, GROUPS, 1, 1, OUT, heads_t) &&
          ds4_gpu_tensor_read(out_t, 0, actual, sizeof(actual));
-    if (ok) ok = memcmp(actual, expected, sizeof(actual)) == 0;
+    /* The ROCm decode tiers quantize the activation vector to Q8_1 blocks
+     * (reference llama.cpp numerics) before the int8 dot, at both the
+     * per-group low stage and the K-slice matvec, so the result tracks the
+     * fp32 reference to ~1e-2 relative rather than bit-exactly.  Layout
+     * errors (wrong group, wrong K offset, heads[GD..] read) show up as
+     * O(1) relative errors, which is what this check guards. */
+    if (ok) {
+        float max_abs = 0.0f;
+        for (uint32_t r = 0; r < OUT; r++)
+            if (fabsf(expected[r]) > max_abs) max_abs = fabsf(expected[r]);
+        for (uint32_t r = 0; r < OUT && ok; r++)
+            ok = fabsf(actual[r] - expected[r]) <= 0.01f * max_abs + 0.5f;
+    }
 
     ds4_gpu_tensor_free(out_t);
     ds4_gpu_tensor_free(low_t);
@@ -396,7 +408,7 @@ int main(void) {
           "Flash shared-expert halves recombine");
 
     check(test_attention_slice(),
-          "rank1 compact-head Q8 attention/K-slice");
+          "rank1 compact-head Q8 attention/K-slice (Q8_1-activation tolerance)");
 
     printf("test_tp_combine_rocm: %d/%d checks passed (%d failed)\n",
            g_checks - g_failures, g_checks, g_failures);
