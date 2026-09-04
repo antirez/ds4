@@ -382,8 +382,10 @@ GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
 `ds4f-q4` models listed above. It is checkpoint-specific
 and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
-is not supported. On Metal, the main model may be resident or use
-`--ssd-streaming`; the support model still adds its own weights and runtime
+is not supported. In a single-process run the main model must be resident:
+`--ssd-streaming` together with `--mtp` is rejected, and `--dspark` requires
+`--mtp`. In a distributed run `--mtp` is ignored instead, so DSpark is
+unavailable there too. The support model adds its own weights and runtime
 state to the memory requirement. DSpark replaces the legacy one-stage MTP
 support model for that run rather than stacking with it.
 
