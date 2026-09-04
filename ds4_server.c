@@ -498,7 +498,8 @@ static bool server_image_media_type(const char *media_type) {
     return media_type &&
            (!strcasecmp(media_type, "image/png") ||
             !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+            !strcasecmp(media_type, "image/jpg") ||
+            !strcasecmp(media_type, "image/webp"));
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
@@ -542,6 +543,7 @@ static bool server_image_inputs_push_data_uri(
     static const char png[] = "data:image/png;base64,";
     static const char jpeg[] = "data:image/jpeg;base64,";
     static const char jpg[] = "data:image/jpg;base64,";
+    static const char webp[] = "data:image/webp;base64,";
     if (!uri) return false;
     if (!strncmp(uri, png, sizeof(png) - 1))
         return server_image_inputs_push_base64(
@@ -552,6 +554,9 @@ static bool server_image_inputs_push_data_uri(
     if (!strncmp(uri, jpg, sizeof(jpg) - 1))
         return server_image_inputs_push_base64(
             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    if (!strncmp(uri, webp, sizeof(webp) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/webp", uri + sizeof(webp) - 1, marker);
     return false;
 }
 
@@ -19351,6 +19356,49 @@ static void test_openai_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* 16x12 lossless WebP, made with cwebp. */
+static const char test_inline_webp_base64[] =
+    "UklGRiwAAABXRUJQVlA4TB8AAAAvD8ACALmM6H/sIirQ/4CQgDDC/7uaPBCDEBMAXHUXAA==";
+
+static void test_webp_inline_image_content(void) {
+    /* Screenshot tooling for mobile and browser targets emits WebP by
+     * default, so it has to be accepted like PNG and JPEG rather than being
+     * refused by media type. */
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"describe \"},{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/webp;base64,");
+    buf_puts(&json, test_inline_webp_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 12);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "RIFF", 4));
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded + 8, "WEBP", 4));
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* Anthropic carries the media type beside the data instead of in a URI. */
+    buf anthropic = {0};
+    buf_puts(&anthropic,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\","
+        "\"source\":{\"type\":\"base64\",\"media_type\":\"image/webp\","
+        "\"data\":\"");
+    buf_puts(&anthropic, test_inline_webp_base64);
+    buf_puts(&anthropic, "\"}}]}]");
+    const char *q = anthropic.ptr;
+    chat_msgs amsgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&q, &amsgs));
+    TEST_ASSERT(amsgs.len == 1);
+    TEST_ASSERT(amsgs.v[0].images.len == 1);
+    chat_msgs_free(&amsgs);
+    buf_free(&anthropic);
+}
+
 static void test_http_image_paths_and_urls_are_rejected(void) {
     const char *cases[] = {
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
@@ -19488,6 +19536,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_webp_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();

@@ -325,12 +325,13 @@ The published encoder SHA-256 is
 
 In the interactive CLI, `/read photo.jpg` or `/read image.png` submits the
 image as a user turn. `ds4-agent` exposes the same support as its `view_image`
-tool when started with `--vision`. JPEG and PNG decoding is built in; no image
-library is required.
+tool when started with `--vision`. JPEG, PNG and WebP decoding is built in; no
+image library is required. Both WebP compression modes are supported; animated
+WebP is rejected.
 
 `ds4-server` accepts ordered image blocks in OpenAI Chat, Responses, and
-Anthropic requests. HTTP images must be inline: use a PNG/JPEG data URI for
-OpenAI or base64 image source for Anthropic. File paths and remote URLs are
+Anthropic requests. HTTP images must be inline: use a PNG/JPEG/WebP data URI
+for OpenAI or base64 image source for Anthropic. File paths and remote URLs are
 rejected. A request may contain up to 16 images and the HTTP body is limited to
 64 MiB.
 

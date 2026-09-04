@@ -303,7 +303,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
-    opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
+    opt(fp, c, "/read FILE", "Submit a text file, PNG, JPEG, or WebP as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
     opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
     fputc('\n', fp);

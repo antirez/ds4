@@ -1297,7 +1297,7 @@ static void print_repl_help(void) {
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
-    puts("  /read FILE     Submit a text file, PNG, or JPEG.");
+    puts("  /read FILE     Submit a text file, PNG, JPEG, or WebP.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
