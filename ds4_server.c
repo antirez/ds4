@@ -10260,6 +10260,12 @@ static void kv_cache_slot_note_store(server_slot *slot, int tokens) {
     }
 }
 
+static void kv_cache_slot_note_load(server_slot *slot, int tokens) {
+    /* A restore or rebuild may move a slot forward, backward, or to zero.
+     * Continued scheduling must restart from that exact frontier. */
+    if (slot && tokens >= 0) slot->continued_last_store_tokens = tokens;
+}
+
 static int kv_cache_slot_suppress_continued(server *s, server_slot *slot,
                                              int tokens) {
     if (kv_cache_slot_continued_target(s, slot, tokens) != tokens) return -1;
@@ -10342,6 +10348,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        kv_cache_slot_note_load(slot, loaded);
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -11646,6 +11653,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
+            kv_cache_slot_note_load(slot, 0);
         }
 
         char sync_err[160] = {0};
@@ -18373,7 +18381,7 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
-static void test_kv_cache_continued_uses_aligned_frontiers(void) {
+static void test_kv_cache_continued_crosses_interval_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
@@ -18395,6 +18403,53 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 20480;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+
+    /* Regression for a real Pi miss: loading a 9703-token cold anchor and
+     * advancing in 2048-token GLM prefill chunks never lands on an exact
+     * 16384-token multiple.  The first live point past each absolute frontier
+     * must still become a continued checkpoint. */
+    kc.opt.continued_interval_tokens = 16384;
+    kc.opt.boundary_align_tokens = 2048;
+    kc.continued_last_store_tokens = 9703;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 15847) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 17895) == 17895);
+    kc.continued_last_store_tokens = 17895;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 32231) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 34279) == 34279);
+    kc.continued_last_store_tokens = 34279;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 34279) == 0);
+
+    /* A large prefill step may cross several frontiers.  Persist the exact
+     * live state once; the following interval is then based on that state. */
+    kc.continued_last_store_tokens = 9703;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 65536) == 65536);
+    kc.continued_last_store_tokens = 65536;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 81919) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 81920) == 81920);
+
+    /* CLI values are int-sized.  Rounding near INT_MAX must not overflow. */
+    kc.opt.continued_interval_tokens = INT_MAX;
+    kc.opt.boundary_align_tokens = 2;
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, INT_MAX) == 0);
+    kc.opt.boundary_align_tokens = 1;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, INT_MAX) == INT_MAX);
+}
+
+static void test_kv_cache_disk_load_resets_slot_frontier(void) {
+    server_slot slot = {0};
+    slot.continued_last_store_tokens = 0;
+    kv_cache_slot_note_load(&slot, 65536);
+    TEST_ASSERT(slot.continued_last_store_tokens == 65536);
+
+    /* Restoring an older checkpoint must move the schedule backward too. */
+    slot.continued_last_store_tokens = 100000;
+    kv_cache_slot_note_load(&slot, 65536);
+    TEST_ASSERT(slot.continued_last_store_tokens == 65536);
+
+    /* A full rebuild starts scheduling again from token zero. */
+    kv_cache_slot_note_load(&slot, 0);
+    TEST_ASSERT(slot.continued_last_store_tokens == 0);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -19029,7 +19084,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
+static void test_kv_cache_eviction_keeps_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -19518,7 +19573,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
-    test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_crosses_interval_frontiers();
+    test_kv_cache_disk_load_resets_slot_frontier();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
@@ -19533,7 +19589,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
-    test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_keeps_continued_frontiers();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

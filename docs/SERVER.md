@@ -111,6 +111,11 @@ workloads, the controls are `--kv-cache-min-tokens`,
 `--kv-cache-boundary-trim-tokens`, and `--kv-cache-boundary-align-tokens`.
 Check `./ds4-server --help` for their defaults.
 
+Continued-save intervals are rounded up to the cold-boundary alignment. The
+cache writes the first valid live checkpoint at or beyond each absolute
+frontier. Restored unaligned checkpoints can therefore leave restart points
+even when fixed-size prefill chunks step over every exact interval boundary.
+
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.
 Cache files contain prompt text and model state: treat the directory as
