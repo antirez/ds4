@@ -1198,28 +1198,75 @@ int ds4_kvstore_find_text_prefix_filtered(ds4_kvstore *kc,
                                           int ctx_size,
                                           uint8_t required_ext_flags,
                                           uint8_t forbidden_ext_flags) {
-    if (!prompt_text) return -1;
-    const size_t prompt_bytes = strlen(prompt_text);
+    ds4_kvstore_prefix_query query = {
+        .text = prompt_text,
+        .max_tokens = UINT32_MAX,
+        .max_key_bytes = UINT32_MAX,
+        .required_ext_flags = required_ext_flags,
+        .forbidden_ext_flags = forbidden_ext_flags,
+    };
+    return ds4_kvstore_find_best_prefix(
+        kc, &query, 1, model_id, quant_bits, ctx_size, NULL);
+}
+
+int ds4_kvstore_find_best_prefix(
+        ds4_kvstore *kc,
+        const ds4_kvstore_prefix_query *queries,
+        size_t query_count,
+        int model_id, int quant_bits, int ctx_size,
+        size_t *matched_query_out) {
+    if (matched_query_out) *matched_query_out = SIZE_MAX;
+    if (!kc || !queries || query_count == 0) return -1;
+
     kv_cache_refresh(kc);
     int best = -1;
-    for (int i = 0; i < kc->len; i++) {
-        ds4_kvstore_entry *e = &kc->entry[i];
-        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
-        if ((int)e->tokens < kc->opt.min_tokens) continue;
-        if (e->model_id != (uint8_t)model_id) continue;
-        if ((e->ext_flags & required_ext_flags) != required_ext_flags) continue;
-        if ((e->ext_flags & forbidden_ext_flags) != 0) continue;
-        if ((uint32_t)ctx_size < e->ctx_size) continue;
-        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
-        if (best >= 0) {
-            ds4_kvstore_entry *b = &kc->entry[best];
-            if (e->text_bytes < b->text_bytes) continue;
-            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
+    size_t best_query = SIZE_MAX;
+    for (size_t q = 0; q < query_count; q++) {
+        const ds4_kvstore_prefix_query *query = &queries[q];
+        if (!query->text) continue;
+        const size_t prompt_bytes = strlen(query->text);
+        int query_best = -1;
+        for (int i = 0; i < kc->len; i++) {
+            ds4_kvstore_entry *e = &kc->entry[i];
+            if ((int)e->tokens < kc->opt.min_tokens) continue;
+            if (e->model_id != (uint8_t)model_id) continue;
+            if ((uint32_t)ctx_size < e->ctx_size) continue;
+            if (kc->reject_different_quant &&
+                e->quant_bits != (uint8_t)quant_bits) continue;
+            if (e->tokens > query->max_tokens) continue;
+            if (e->text_bytes > query->max_key_bytes) continue;
+            if ((e->ext_flags & query->required_ext_flags) !=
+                    query->required_ext_flags ||
+                (e->ext_flags & query->forbidden_ext_flags) != 0) continue;
+            if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX)
+                continue;
+
+            /* Preserve the established text-cache ordering within one key
+             * spelling: consume the longest rendered byte prefix, then the
+             * largest exact token history for an equal byte prefix. */
+            if (query_best >= 0) {
+                const ds4_kvstore_entry *b = &kc->entry[query_best];
+                if (e->text_bytes < b->text_bytes) continue;
+                if (e->text_bytes == b->text_bytes &&
+                    e->tokens <= b->tokens) continue;
+            }
+            char sha[41];
+            ds4_kvstore_sha1_bytes_hex(query->text,
+                                       (size_t)e->text_bytes, sha);
+            if (strcmp(sha, e->sha)) continue;
+            query_best = i;
         }
-        char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (!strcmp(sha, e->sha)) best = i;
+
+        if (query_best < 0) continue;
+        /* Metadata makes byte lengths incomparable across conditioning
+         * spellings. The caller orders them by semantic frontier (for example,
+         * all matching images before fewer matching images), so the first
+         * spelling with a candidate wins. */
+        best = query_best;
+        best_query = q;
+        break;
     }
+    if (best >= 0 && matched_query_out) *matched_query_out = best_query;
     return best;
 }
 
@@ -1230,28 +1277,33 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         DS4_KVSTORE_EXT_VISION_IDENTITY);
 }
 
-int ds4_kvstore_try_load_text_filtered(
+int ds4_kvstore_try_load_best_prefix(
         ds4_kvstore *kc,
         ds4_engine *engine,
         ds4_session *session,
-        const char *prompt_text,
+        const ds4_kvstore_prefix_query *queries,
+        size_t query_count,
         ds4_tokens *effective_prompt,
         ds4_kvstore_load_result *result,
         const ds4_kvstore_trailer_hooks *hooks,
         bool responses_protocol,
-        uint8_t required_ext_flags,
-        uint8_t forbidden_ext_flags) {
+        size_t *matched_query_out) {
     if (result) memset(result, 0, sizeof(*result));
+    if (matched_query_out) *matched_query_out = SIZE_MAX;
     if (effective_prompt) effective_prompt->len = 0;
-    if (!kc->enabled || !prompt_text) return 0;
+    if (!kc->enabled || !queries || query_count == 0) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const int model_id = ds4_engine_model_id(engine);
+    size_t matched_query = SIZE_MAX;
+    int idx = ds4_kvstore_find_best_prefix(
+        kc, queries, query_count, model_id, quant_bits,
+        ds4_session_ctx(session), &matched_query);
+    if (idx < 0 || matched_query >= query_count) return 0;
+
+    const ds4_kvstore_prefix_query *query = &queries[matched_query];
+    const char *prompt_text = query->text;
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix_filtered(
-        kc, prompt_text, model_id, quant_bits, ds4_session_ctx(session),
-        required_ext_flags, forbidden_ext_flags);
-    if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
     char *path = kv_xstrdup(e.path);
@@ -1270,10 +1322,17 @@ int ds4_kvstore_try_load_text_filtered(
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
-        } else if ((hdr.ext_flags & required_ext_flags) != required_ext_flags ||
-                   (hdr.ext_flags & forbidden_ext_flags) != 0) {
+        } else if ((hdr.ext_flags & query->required_ext_flags) !=
+                       query->required_ext_flags ||
+                   (hdr.ext_flags & query->forbidden_ext_flags) != 0) {
             header_ok = false;
             fail_reason = "cached checkpoint has the wrong key kind";
+        } else if (hdr.tokens > query->max_tokens) {
+            header_ok = false;
+            fail_reason = "cached checkpoint crosses the conditioning frontier";
+        } else if (text_bytes > query->max_key_bytes) {
+            header_ok = false;
+            fail_reason = "cached key crosses the conditioning frontier";
         } else if ((uint64_t)text_bytes > prompt_bytes) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";
@@ -1359,10 +1418,34 @@ int ds4_kvstore_try_load_text_filtered(
             result->load_ms = load_ms;
             result->path = kv_xstrdup(path);
         }
+        if (matched_query_out) *matched_query_out = matched_query;
     }
     free(cached_text);
     free(path);
     return loaded;
+}
+
+int ds4_kvstore_try_load_text_filtered(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        ds4_session *session,
+        const char *prompt_text,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol,
+        uint8_t required_ext_flags,
+        uint8_t forbidden_ext_flags) {
+    ds4_kvstore_prefix_query query = {
+        .text = prompt_text,
+        .max_tokens = UINT32_MAX,
+        .max_key_bytes = UINT32_MAX,
+        .required_ext_flags = required_ext_flags,
+        .forbidden_ext_flags = forbidden_ext_flags,
+    };
+    return ds4_kvstore_try_load_best_prefix(
+        kc, engine, session, &query, 1, effective_prompt, result, hooks,
+        responses_protocol, NULL);
 }
 
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,

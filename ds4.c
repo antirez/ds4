@@ -66260,24 +66260,32 @@ static int ds4_session_sync_preflight(ds4_session *s,
     return 0;
 }
 
-static bool ds4_session_vision_prefix_matches(
+bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
         size_t                 image_count) {
     if (!s || (image_count != 0 && !images)) return false;
     if (!s->checkpoint_valid) return true;
     if (s->checkpoint_image_count > image_count) return false;
-    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
-        const ds4_vision_identity *old = &s->checkpoint_images[i];
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
         const ds4_vision_span *current = &images[i];
-        if (old->token_start != current->token_start ||
-            old->token_count != current->embedding.token_count ||
-            memcmp(old->fingerprint, current->embedding.fingerprint,
-                   sizeof(old->fingerprint)) != 0) return false;
-    }
-    if (s->checkpoint_image_count < image_count) {
-        const ds4_vision_span *next = &images[s->checkpoint_image_count];
-        if (next->token_start < (uint32_t)s->checkpoint.len) return false;
+        const uint64_t end = (uint64_t)current->token_start +
+                             current->embedding.token_count;
+        if (current->embedding.token_count == 0 ||
+            current->token_start < previous_end) return false;
+        previous_end = end;
+
+        if (i < s->checkpoint_image_count) {
+            const ds4_vision_identity *old = &s->checkpoint_images[i];
+            if (old->token_start != current->token_start ||
+                old->token_count != current->embedding.token_count ||
+                end > (uint64_t)s->checkpoint.len ||
+                memcmp(old->fingerprint, current->embedding.fingerprint,
+                       sizeof(old->fingerprint)) != 0) return false;
+        } else if (current->token_start < (uint32_t)s->checkpoint.len) {
+            return false;
+        }
     }
     return true;
 }
@@ -66736,6 +66744,69 @@ bool ds4_test_vision_identity_keeps_retained_hash(void) {
         if (!ok) return false;
     }
     return true;
+}
+
+bool ds4_test_vision_prefix_compatibility(void) {
+    ds4_session session = {0};
+    session.checkpoint_valid = true;
+    for (int i = 0; i < 10; i++) token_vec_push(&session.checkpoint, i + 1);
+    session.checkpoint_images = calloc(1, sizeof(session.checkpoint_images[0]));
+    if (!session.checkpoint_images) {
+        token_vec_free(&session.checkpoint);
+        return false;
+    }
+    session.checkpoint_image_count = 1;
+    session.checkpoint_images[0].token_start = 2;
+    session.checkpoint_images[0].token_count = 3;
+    memset(session.checkpoint_images[0].fingerprint, 0xa5, 32);
+
+    ds4_vision_span images[3] = {0};
+    images[0].token_start = 2;
+    images[0].embedding.token_count = 3;
+    memset(images[0].embedding.fingerprint, 0xa5, 32);
+    images[1].token_start = 10;
+    images[1].embedding.token_count = 2;
+    memset(images[1].embedding.fingerprint, 0x5a, 32);
+
+    bool ok = ds4_session_vision_prefix_matches(&session, images, 1) &&
+              ds4_session_vision_state_matches(&session, images, 1) &&
+              ds4_session_vision_prefix_matches(&session, images, 2) &&
+              !ds4_session_vision_state_matches(&session, images, 2);
+
+    /* New conditioning may begin exactly at, but never before, live KV. */
+    images[1].token_start = 9;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, images, 2);
+    images[1].token_start = 10;
+
+    /* Retained conditioning is positional and content-addressed. */
+    images[0].token_start++;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, images, 2);
+    images[0].token_start = 2;
+    images[0].embedding.fingerprint[0] ^= 0xff;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, images, 2);
+    images[0].embedding.fingerprint[0] ^= 0xff;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, images, 0);
+
+    /* All incoming spans are validated, including newly appended spans. */
+    images[2] = images[1];
+    images[2].token_start = 11;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, images, 3);
+    images[2].token_start = 12;
+    ok = ok && ds4_session_vision_prefix_matches(&session, images, 3);
+    images[2].embedding.token_count = 0;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, images, 3);
+
+    /* A text-only live checkpoint follows the same rule for its first image. */
+    free(session.checkpoint_images);
+    session.checkpoint_images = NULL;
+    session.checkpoint_image_count = 0;
+    ds4_vision_span appended = images[1];
+    ok = ok && ds4_session_vision_prefix_matches(&session, &appended, 1);
+    appended.token_start = 9;
+    ok = ok && !ds4_session_vision_prefix_matches(&session, &appended, 1);
+
+    token_vec_free(&session.checkpoint);
+    return ok;
 }
 #endif
 

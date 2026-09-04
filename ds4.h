@@ -433,6 +433,13 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
+/* Return true when every image already represented by the live checkpoint
+ * matches the supplied prompt and every additional image starts at or beyond
+ * the live token frontier. The caller must independently verify the token
+ * prefix. */
+bool ds4_session_vision_prefix_matches(const ds4_session *s,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
 /* Return true only when every image that conditioned the live checkpoint has
  * the same token span and embedding fingerprint in the supplied prompt. */
 bool ds4_session_vision_state_matches(const ds4_session *s,

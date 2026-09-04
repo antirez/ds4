@@ -107,6 +107,22 @@ typedef struct {
     char *path;
 } ds4_kvstore_load_result;
 
+/* One compatible-prefix spelling for a cache lookup.  Callers order queries
+ * from most to least preferred.  Multimodal callers may provide several
+ * spellings for the same prompt: zero conditioning spans selects a legacy text
+ * checkpoint, while progressively longer conditioning prefixes select
+ * checkpoints containing those exact image identities.
+ *
+ * The bounds prevent a candidate frontier from crossing the next unmatched
+ * conditioning span in either exact-token or rendered-key space. */
+typedef struct {
+    const char *text;
+    uint32_t max_tokens;
+    uint32_t max_key_bytes;
+    uint8_t required_ext_flags;
+    uint8_t forbidden_ext_flags;
+} ds4_kvstore_prefix_query;
+
 ds4_kvstore_options ds4_kvstore_default_options(void);
 uint8_t ds4_kvstore_reason_code(const char *reason);
 const char *ds4_kvstore_key_kind(uint8_t ext_flags);
@@ -165,6 +181,12 @@ int ds4_kvstore_find_text_prefix_filtered(ds4_kvstore *kc,
                                           int ctx_size,
                                           uint8_t required_ext_flags,
                                           uint8_t forbidden_ext_flags);
+int ds4_kvstore_find_best_prefix(
+        ds4_kvstore *kc,
+        const ds4_kvstore_prefix_query *queries,
+        size_t query_count,
+        int model_id, int quant_bits, int ctx_size,
+        size_t *matched_query_out);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -212,6 +234,17 @@ int ds4_kvstore_try_load_text_filtered(
         bool responses_protocol,
         uint8_t required_ext_flags,
         uint8_t forbidden_ext_flags);
+int ds4_kvstore_try_load_best_prefix(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        ds4_session *session,
+        const ds4_kvstore_prefix_query *queries,
+        size_t query_count,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol,
+        size_t *matched_query_out);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

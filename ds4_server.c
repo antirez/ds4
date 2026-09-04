@@ -9684,9 +9684,9 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  * The server has one live Metal session.  We persist reusable DS4 session
  * snapshots when a cold prompt reaches a useful prefix, when a long continued
  * conversation has grown far enough, and when a request evicts the live session.
- * The cache key is the SHA1 of the rendered byte prefix.  The payload still
- * stores exact token IDs and graph state; the filename only selects a checkpoint
- * whose decoded transcript bytes are a prefix of the next rendered request.
+ * The cache filename is the SHA1 of a lookup-key prefix.  Text keys use the
+ * rendered bytes directly; conditioned keys prepend span identities.  The
+ * payload still stores exact token IDs and graph state.
  *
  * Files are loaded with plain read/write I/O into the existing graph tensors;
  * mmap is deliberately avoided here so cache restore cannot add more VM
@@ -9712,7 +9712,9 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  * can instead be the client-visible transcript. Image-conditioned checkpoints
  * prepend exact image spans and hashes of the actual conditioning vectors to
  * the rendered tokens, so identical placeholder tokens produced by different
- * images or encoder weights cannot collide. The payload always contains the
+ * images or encoder weights cannot collide. The lookup considers all retained
+ * image-prefix spellings together with ordinary text, then selects the longest
+ * safe token frontier. The payload always contains the
  * exact token and graph state being restored.
  *
  * The optional tool-id map is not part of model state, but it is needed to
@@ -9725,6 +9727,7 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
+#define KV_EXT_SESSION_TITLE DS4_KVSTORE_EXT_SESSION_TITLE
 #define KV_EXT_VISION_IDENTITY DS4_KVSTORE_EXT_VISION_IDENTITY
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
@@ -10128,26 +10131,6 @@ static char *vision_cache_key_from_text(const char *text, size_t text_len,
     return buf_take(&key);
 }
 
-/* Image placeholder tokens are identical for different images. Prefix the
- * rendered-token cache text with exact image spans and hashes of the vectors
- * that conditioned KV so only equivalent model input can select the payload. */
-static char *vision_cache_key_for_request(ds4_engine *engine,
-                                          const ds4_tokens *tokens,
-                                          ds4_vision_span *images,
-                                          size_t image_count) {
-    if (!engine || !tokens || !images || image_count == 0) return NULL;
-    for (size_t i = 0; i < image_count; i++) {
-        if (!images[i].embedding.state_fingerprint_valid &&
-            !vision_embedding_fingerprint_state(engine, &images[i].embedding))
-            return NULL;
-    }
-    size_t text_len = 0;
-    char *text = render_tokens_text(engine, tokens, &text_len);
-    char *key = vision_cache_key_from_text(text, text_len, images, image_count);
-    free(text);
-    return key;
-}
-
 static char *vision_cache_key_for_session(server *s, server_slot *slot,
                                           const ds4_tokens *tokens) {
     if (!s || !slot || !tokens) return NULL;
@@ -10458,18 +10441,21 @@ static int kv_cache_find_text_prefix_filtered(
 }
 #endif
 
-static int kv_cache_try_load_text_filtered(
+static int kv_cache_try_load_best_prefix(
                                   server *s, server_slot *slot,
-                                  const char *prompt_text,
+                                  const ds4_kvstore_prefix_query *queries,
+                                  size_t query_count,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  uint32_t *loaded_key_bytes_out,
                                   bool responses_protocol,
-                                  uint8_t required_ext_flags,
-                                  uint8_t forbidden_ext_flags) {
+                                  size_t *matched_query_out) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (loaded_key_bytes_out) *loaded_key_bytes_out = 0;
+    if (matched_query_out) *matched_query_out = SIZE_MAX;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -10480,17 +10466,41 @@ static int kv_cache_try_load_text_filtered(
         ds4_session_invalidate(slot->session);
     }
     pthread_mutex_lock(&s->kv_mu);
-    int loaded = ds4_kvstore_try_load_text_filtered(
-        &s->kv, s->engine, slot->session, prompt_text, effective_prompt, &lr,
-        &hooks, responses_protocol, required_ext_flags, forbidden_ext_flags);
+    size_t matched_query = SIZE_MAX;
+    int loaded = ds4_kvstore_try_load_best_prefix(
+        &s->kv, s->engine, slot->session, queries, query_count,
+        effective_prompt, &lr, &hooks, responses_protocol, &matched_query);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_key_bytes_out) *loaded_key_bytes_out = lr.text_bytes;
+        if (matched_query_out) *matched_query_out = matched_query;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
+}
+
+static int kv_cache_try_load_text_filtered(
+                                  server *s, server_slot *slot,
+                                  const char *prompt_text,
+                                  ds4_tokens *effective_prompt,
+                                  char **loaded_path_out,
+                                  uint8_t *loaded_ext_flags_out,
+                                  bool responses_protocol,
+                                  uint8_t required_ext_flags,
+                                  uint8_t forbidden_ext_flags) {
+    ds4_kvstore_prefix_query query = {
+        .text = prompt_text,
+        .max_tokens = UINT32_MAX,
+        .max_key_bytes = UINT32_MAX,
+        .required_ext_flags = required_ext_flags,
+        .forbidden_ext_flags = forbidden_ext_flags,
+    };
+    return kv_cache_try_load_best_prefix(
+        s, slot, &query, 1, effective_prompt, loaded_path_out,
+        loaded_ext_flags_out, NULL, responses_protocol, NULL);
 }
 
 static int kv_cache_try_load_text(server *s, server_slot *slot,
@@ -10516,46 +10526,327 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
-static int kv_cache_try_load_vision(server *s, server_slot *slot,
-                                    request *req,
-                                    ds4_tokens *effective_prompt,
-                                    char **loaded_path_out,
-                                    uint8_t *loaded_ext_flags_out) {
-    if (!s || !slot || !req || !s->kv.enabled ||
-        req->image_count == 0 || !req->images) return 0;
-    char *cache_key = vision_cache_key_for_request(
-        s->engine, &req->prompt, req->images, req->image_count);
-    if (!cache_key) return 0;
-
-    uint8_t ext_flags = 0;
-    int loaded = kv_cache_try_load_text_filtered(
-        s, slot, cache_key, effective_prompt, loaded_path_out, &ext_flags,
-        req->api == API_RESPONSES, KV_EXT_VISION_IDENTITY, 0);
-    free(cache_key);
-    if (loaded <= 0) return 0;
-
-    bool restored = false;
-    if (ext_flags & KV_EXT_VISION_IDENTITY) {
-        pthread_mutex_lock(&s->inference_mu);
-        restored = ds4_session_restore_vision_identities(
-            slot->session, req->images, req->image_count);
-        pthread_mutex_unlock(&s->inference_mu);
+static void kv_cache_conditioning_queries_free(
+        ds4_kvstore_prefix_query *queries, size_t query_count) {
+    if (!queries) return;
+    for (size_t i = 0; i < query_count; i++) {
+        free((char *)queries[i].text);
     }
-    if (!restored) {
+    free(queries);
+}
+
+/* Build one lookup spelling for every compatible conditioning prefix.  Query
+ * zero images is the ordinary token-text key.  Query N images uses the V2
+ * image key from #961, but caps its rendered bytes at image N+1.  A byte bound
+ * is required here because replaying sampled text can change BPE token counts;
+ * the exact token history is reconciled after restore. */
+static ds4_kvstore_prefix_query *kv_cache_conditioning_queries(
+        server *s, request *req, size_t *query_count_out) {
+    if (query_count_out) *query_count_out = 0;
+    if (!s || !req || req->image_count == 0 || !req->images ||
+        req->prompt.len <= 0) return NULL;
+
+    size_t text_len = 0;
+    char *text = render_tokens_text(s->engine, &req->prompt, &text_len);
+    if (!text) return NULL;
+
+    size_t fingerprinted = 0;
+    while (fingerprinted < req->image_count) {
+        ds4_vision_embedding *embedding =
+            &req->images[fingerprinted].embedding;
+        if (!embedding->state_fingerprint_valid &&
+            !vision_embedding_fingerprint_state(s->engine, embedding)) break;
+        fingerprinted++;
+    }
+
+    if (req->image_count == SIZE_MAX ||
+        req->image_count + 1 > SIZE_MAX / sizeof(ds4_kvstore_prefix_query)) {
+        free(text);
+        return NULL;
+    }
+    const size_t query_count = req->image_count + 1;
+    ds4_kvstore_prefix_query *queries =
+        xmalloc(query_count * sizeof(queries[0]));
+    memset(queries, 0, query_count * sizeof(queries[0]));
+    for (size_t retained = 0; retained <= req->image_count; retained++) {
+        /* Queries are ordered from most to least conditioning. */
+        const size_t q = req->image_count - retained;
+        if (retained > fingerprinted) continue;
+        queries[q].text = retained == 0 ? xstrdup(text) :
+            vision_cache_key_from_text(text, text_len, req->images, retained);
+        if (!queries[q].text) continue;
+
+        const size_t key_len = strlen(queries[q].text);
+        const size_t identity_bytes = key_len >= text_len ?
+                                      key_len - text_len : SIZE_MAX;
+        size_t frontier_text_bytes = text_len;
+        if (retained < req->image_count) {
+            const uint32_t token_start = req->images[retained].token_start;
+            if (token_start > (uint32_t)req->prompt.len) {
+                free((char *)queries[q].text);
+                queries[q].text = NULL;
+                continue;
+            }
+            ds4_tokens prefix = req->prompt;
+            prefix.len = (int)token_start;
+            char *prefix_text = render_tokens_text(
+                s->engine, &prefix, &frontier_text_bytes);
+            if (!prefix_text) {
+                free((char *)queries[q].text);
+                queries[q].text = NULL;
+                continue;
+            }
+            free(prefix_text);
+        }
+        if (identity_bytes > UINT32_MAX ||
+            frontier_text_bytes > UINT32_MAX - identity_bytes) {
+            free((char *)queries[q].text);
+            queries[q].text = NULL;
+            continue;
+        }
+        queries[q].max_tokens = UINT32_MAX;
+        queries[q].max_key_bytes =
+            (uint32_t)(identity_bytes + frontier_text_bytes);
+        queries[q].required_ext_flags = retained == 0 ? 0 :
+            KV_EXT_VISION_IDENTITY;
+        queries[q].forbidden_ext_flags = retained == 0 ?
+            (KV_EXT_VISION_IDENTITY | KV_EXT_RESPONSES_VISIBLE |
+             KV_EXT_THINKING_VISIBLE | KV_EXT_SESSION_TITLE) : 0;
+    }
+    free(text);
+    if (query_count_out) *query_count_out = query_count;
+    return queries;
+}
+
+static bool kv_cache_loaded_conditioning_matches(
+        const ds4_tokens *cached, const ds4_tokens *prompt,
+        const ds4_vision_span *images, size_t image_count,
+        size_t retained_images, const char **reason_out) {
+    const char *reason = "invalid-frontier";
+    if (!cached || !prompt || !images || retained_images > image_count ||
+        cached->len <= 0) goto fail;
+
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const uint64_t start = images[i].token_start;
+        const uint64_t count = images[i].embedding.token_count;
+        const uint64_t end = start + count;
+        if (count == 0 || start < previous_end || end > (uint64_t)prompt->len) {
+            reason = "invalid-conditioning-span";
+            goto fail;
+        }
+        if (i < retained_images) {
+            if (!images[i].embedding.state_fingerprint_valid ||
+                end > (uint64_t)cached->len) {
+                reason = "retained-conditioning-crosses-frontier";
+                goto fail;
+            }
+        }
+        previous_end = end;
+    }
+    if (reason_out) *reason_out = "compatible";
+    return true;
+
+fail:
+    if (reason_out) *reason_out = reason;
+    return false;
+}
+
+static size_t kv_cache_conditioning_key_prefix_bytes(
+        const ds4_kvstore_prefix_query *query, size_t retained_images) {
+    if (!query || !query->text) return SIZE_MAX;
+    if (retained_images == 0) return 0;
+    const char *separator = strchr(query->text, '\037');
+    return separator ? (size_t)(separator - query->text) + 1 : SIZE_MAX;
+}
+
+static bool kv_cache_shift_conditioning_spans(
+        ds4_vision_span *images, size_t image_count, size_t retained_images,
+        int64_t delta, int prompt_len) {
+    if (!images || retained_images > image_count || prompt_len < 0) return false;
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        int64_t shifted = images[i].token_start;
+        if (i >= retained_images) shifted += delta;
+        if (shifted < 0 || shifted > UINT32_MAX) return false;
+        const uint64_t end =
+            (uint64_t)shifted + images[i].embedding.token_count;
+        if (images[i].embedding.token_count == 0 ||
+            (uint64_t)shifted < previous_end ||
+            end > (uint64_t)prompt_len) return false;
+        previous_end = end;
+    }
+    for (size_t i = retained_images; i < image_count; i++) {
+        images[i].token_start =
+            (uint32_t)((int64_t)images[i].token_start + delta);
+    }
+    return true;
+}
+
+/* Reconcile the restored checkpoint's exact sampled tokenization with the
+ * canonical multimodal request.  Text up to the next image is retokenized from
+ * the cached rendered-byte boundary; the image block and everything after it
+ * are then copied from the canonical request and shifted onto that exact
+ * history. */
+static bool kv_cache_rebuild_partial_conditioning_prompt(
+        server *s, server_slot *slot, request *req,
+        const ds4_kvstore_prefix_query *query,
+        size_t retained_images, uint32_t loaded_key_bytes,
+        ds4_tokens *effective_prompt, const char **reason_out) {
+    const char *reason = "invalid-conditioning-replay";
+    if (!s || !slot || !req || !query || !effective_prompt ||
+        retained_images >= req->image_count) goto fail;
+
+    const size_t identity_bytes =
+        kv_cache_conditioning_key_prefix_bytes(query, retained_images);
+    if (identity_bytes == SIZE_MAX || loaded_key_bytes < identity_bytes) {
+        reason = "invalid-conditioning-key";
+        goto fail;
+    }
+    const size_t cached_text_bytes = loaded_key_bytes - identity_bytes;
+    const uint32_t canonical_image_start =
+        req->images[retained_images].token_start;
+    if (canonical_image_start > (uint32_t)req->prompt.len) {
+        reason = "invalid-conditioning-span";
+        goto fail;
+    }
+
+    ds4_tokens before_image = req->prompt;
+    before_image.len = (int)canonical_image_start;
+    size_t before_image_bytes = 0;
+    char *before_image_text = render_tokens_text(
+        s->engine, &before_image, &before_image_bytes);
+    if (!before_image_text || cached_text_bytes > before_image_bytes ||
+        memcmp(query->text + identity_bytes, before_image_text,
+               cached_text_bytes) != 0) {
+        free(before_image_text);
+        reason = "conditioning-byte-frontier-mismatch";
+        goto fail;
+    }
+
+    const ds4_tokens *loaded_tokens = ds4_session_tokens(slot->session);
+    if (!loaded_tokens || loaded_tokens->len <= 0) {
+        free(before_image_text);
+        reason = "missing-loaded-token-prefix";
+        goto fail;
+    }
+    ds4_tokens_free(effective_prompt);
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, loaded_tokens,
+        before_image_text + cached_text_bytes, effective_prompt);
+    free(before_image_text);
+
+    const int effective_image_start = effective_prompt->len;
+    for (int i = (int)canonical_image_start; i < req->prompt.len; i++) {
+        ds4_tokens_push(effective_prompt, req->prompt.v[i]);
+    }
+    const int64_t delta =
+        (int64_t)effective_image_start - (int64_t)canonical_image_start;
+    if (!kv_cache_shift_conditioning_spans(
+            req->images, req->image_count, retained_images,
+            delta, effective_prompt->len)) {
+        reason = "invalid-shifted-conditioning-span";
+        goto fail;
+    }
+    if (reason_out) *reason_out = "compatible";
+    return true;
+
+fail:
+    if (reason_out) *reason_out = reason;
+    return false;
+}
+
+/* Unified disk restore.  Text requests retain the existing visible-replay/BPE
+ * reconstruction path.  Multimodal requests search exact vision, retained
+ * vision-prefix, and zero-image text checkpoints in one ranked query. */
+static int kv_cache_try_load_compatible(server *s, server_slot *slot,
+                                        request *req,
+                                        ds4_tokens *effective_prompt,
+                                        char **loaded_path_out,
+                                        uint8_t *loaded_ext_flags_out,
+                                        const char **cache_source_out) {
+    if (cache_source_out) *cache_source_out = "none";
+    if (!s || !slot || !req || !s->kv.enabled) return 0;
+
+    if (req->image_count == 0) {
+        int loaded = kv_cache_try_load(s, slot, req, effective_prompt,
+                                       loaded_path_out,
+                                       loaded_ext_flags_out);
+        if (loaded > 0 && cache_source_out) *cache_source_out = "disk-text";
+        return loaded;
+    }
+
+    size_t query_count = 0;
+    ds4_kvstore_prefix_query *queries =
+        kv_cache_conditioning_queries(s, req, &query_count);
+    if (!queries) return 0;
+
+    size_t matched_query = SIZE_MAX;
+    uint8_t ext_flags = 0;
+    uint32_t loaded_key_bytes = 0;
+    int loaded = kv_cache_try_load_best_prefix(
+        s, slot, queries, query_count, effective_prompt, loaded_path_out,
+        &ext_flags, &loaded_key_bytes, req->api == API_RESPONSES,
+        &matched_query);
+    if (loaded <= 0 || matched_query >= query_count) {
+        kv_cache_conditioning_queries_free(queries, query_count);
+        return 0;
+    }
+
+    const size_t retained_images = req->image_count - matched_query;
+    const bool complete_conditioning = retained_images == req->image_count;
+    const ds4_tokens *cached_tokens = NULL;
+    pthread_mutex_lock(&s->inference_mu);
+    cached_tokens = ds4_session_tokens(slot->session);
+    const char *reject_reason = NULL;
+    bool compatible = kv_cache_loaded_conditioning_matches(
+        cached_tokens, &req->prompt, req->images, req->image_count,
+        retained_images, &reject_reason);
+    if (compatible && retained_images != 0) {
+        compatible = (ext_flags & KV_EXT_VISION_IDENTITY) &&
+            ds4_session_restore_vision_identities(
+                slot->session, req->images, retained_images);
+        if (!compatible) reject_reason = "invalid-conditioning-identity";
+    }
+    if (!compatible) ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+
+    if (compatible && !complete_conditioning) {
+        compatible = kv_cache_rebuild_partial_conditioning_prompt(
+            s, slot, req, &queries[matched_query], retained_images,
+            loaded_key_bytes, effective_prompt, &reject_reason);
+        if (!compatible) {
+            pthread_mutex_lock(&s->inference_mu);
+            ds4_session_invalidate(slot->session);
+            pthread_mutex_unlock(&s->inference_mu);
+        }
+    }
+
+    if (!compatible) {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: rejected vision disk checkpoint tokens=%d reason=invalid-image-identity-frontier",
-                   loaded);
-        pthread_mutex_lock(&s->inference_mu);
-        ds4_session_invalidate(slot->session);
-        pthread_mutex_unlock(&s->inference_mu);
+                   "ds4-server: rejected conditioned disk checkpoint tokens=%d images=%zu/%zu reason=%s",
+                   loaded, retained_images, req->image_count,
+                   reject_reason ? reject_reason : "invalid-frontier");
         ds4_tokens_free(effective_prompt);
         if (loaded_path_out) {
             free(*loaded_path_out);
             *loaded_path_out = NULL;
         }
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+        kv_cache_conditioning_queries_free(queries, query_count);
         return 0;
     }
+
+    const char *source = retained_images == 0 ? "disk-text-prefix" :
+                         complete_conditioning ? "disk-vision" :
+                                                 "disk-vision-prefix";
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: conditioned disk kv hit source=%s images=%zu/%zu cached=%d canonical=%d effective=%d",
+               source, retained_images, req->image_count,
+               loaded, req->prompt.len, effective_prompt->len);
     if (loaded_ext_flags_out) *loaded_ext_flags_out = ext_flags;
+    if (cache_source_out) *cache_source_out = source;
+    kv_cache_conditioning_queries_free(queries, query_count);
     return loaded;
 }
 
@@ -11411,7 +11702,7 @@ static int server_multimodal_resume_pos(ds4_session *session,
     const int common = ds4_session_common_prefix(session, prompt);
     return server_multimodal_resume_frontier(
         live, common, prompt->len,
-        ds4_session_vision_state_matches(session, images, image_count));
+        ds4_session_vision_prefix_matches(session, images, image_count));
 }
 
 static int server_session_sync_multimodal(server *s, server_slot *slot,
@@ -12147,10 +12438,10 @@ static void *decode_worker_main(void *arg) {
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
  * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
- * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
- * hits we build a fresh effective prompt from the checkpoint's exact token
- * history plus a newly tokenized string suffix; the canonical full-prompt
- * tokens are not sliced because BPE may merge across the byte boundary.  Cold
+ * then compatible disk restart snapshots, then a cold prefill.  On rendered-
+ * prefix hits we build a fresh effective prompt from the checkpoint's exact
+ * token history plus a newly tokenized string suffix; the canonical full-prompt
+ * tokens are not sliced because BPE may merge across the byte boundary. Cold
  * prompt caching is handled before generation: if the stable checkpoint is
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
@@ -12162,9 +12453,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    const bool live_vision_match =
+    const bool live_vision_exact_match =
         ds4_session_vision_state_matches(slot->session,
                                          j->req.images, j->req.image_count);
+    const bool live_vision_prefix_match =
+        ds4_session_vision_prefix_matches(slot->session,
+                                          j->req.images, j->req.image_count);
+    const int multimodal_prefix_cached = server_multimodal_resume_frontier(
+        old_pos, common, j->req.prompt.len, live_vision_prefix_match);
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
@@ -12184,7 +12480,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
+    int cached = live_vision_exact_match ?
         responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                               &effective_prompt) : 0;
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
@@ -12197,7 +12493,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && live_vision_exact_match) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
@@ -12207,7 +12503,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else if (live_vision_exact_match) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -12235,7 +12531,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0 && live_vision_match) {
+    } else if (cached == 0 && live_vision_exact_match) {
         const int rewind_to = live_prefix_rewind_target(
             ds4_engine_is_glm_dsa(s->engine), old_pos,
             j->req.prompt.len, common);
@@ -12267,7 +12563,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0 && live_vision_match) {
+    /* A request may append its first image to text KV, or append another image
+     * after an already-conditioned checkpoint.  Exact token continuation is
+     * sufficient when every retained conditioning span matches and the next
+     * span begins at or after the live frontier. */
+    if (cached == 0 && multimodal_prefix_cached > 0) {
+        cached = multimodal_prefix_cached;
+        cache_source = "memory-token";
+    }
+    if (cached == 0 && live_vision_exact_match) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                 &effective_prompt);
@@ -12281,7 +12585,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0 && live_vision_match) {
+    const char *disk_cache_source = "none";
+    if (cached == 0 && live_vision_exact_match) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
         if (text_cached > 0) {
@@ -12295,13 +12600,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   live_vision_match ? "match" : "mismatch",
+                   live_vision_exact_match ? "exact-match" :
+                   live_vision_prefix_match ? "prefix-match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
-                   j->req.image_count, cached, prompt_for_sync->len);
+                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=%s",
+                   j->req.image_count, cached, prompt_for_sync->len,
+                   live_vision_exact_match ? "fingerprint-exact-match" :
+                                             "fingerprint-prefix-match");
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -12311,16 +12619,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         kv_cache_store_current(s, slot, "evict");
     }
     if (cached == 0) {
-        disk_cached = multimodal ?
-            kv_cache_try_load_vision(s, slot, &j->req, &effective_prompt,
-                                     &disk_cache_path,
-                                     &disk_cache_ext_flags) :
-            kv_cache_try_load(s, slot, &j->req, &effective_prompt,
-                              &disk_cache_path,
-                              &disk_cache_ext_flags);
+        disk_cached = kv_cache_try_load_compatible(
+            s, slot, &j->req, &effective_prompt, &disk_cache_path,
+            &disk_cache_ext_flags, &disk_cache_source);
         if (disk_cached > 0) {
             cached = disk_cached;
-            cache_source = multimodal ? "disk-vision" : "disk-text";
+            cache_source = disk_cache_source;
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -13423,12 +13727,18 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
-    if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_state_matches(slot->session,
-                                          j->req.images, j->req.image_count)) {
-        return -1;
-    }
+    const int live = ds4_session_pos(slot->session);
+    const bool vision_exact = ds4_session_vision_state_matches(
+        slot->session, j->req.images, j->req.image_count);
+    const bool vision_prefix = ds4_session_vision_prefix_matches(
+        slot->session, j->req.images, j->req.image_count);
+    if (live > 0 && !vision_prefix) return -1;
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+    /* A newly appended conditioning span belongs on this slot only when the
+     * request extends its complete live token frontier.  Earlier text edits
+     * cannot reuse that state even if they share a shorter prefix. */
+    if (live > 0 && !vision_exact &&
+        (common != live || j->req.prompt.len < live)) return -1;
     return common;
 }
 
@@ -18781,6 +19091,15 @@ static void test_vision_kv_key_requires_exact_image_identity(void) {
     TEST_ASSERT(appended_key && saved_key &&
                 !byte_prefix_match(appended_key, strlen(appended_key),
                                    saved_key, strlen(saved_key)));
+    /* The legacy V2 spelling includes the image count, so a full two-image
+     * lookup cannot see a one-image checkpoint.  The unified lookup asks for
+     * every retained conditioning prefix; its one-image spelling remains
+     * byte-prefix compatible with the saved entry. */
+    char *retained_key = vision_cache_key_from_text(
+        future_text, strlen(future_text), two_images, 1);
+    TEST_ASSERT(retained_key && saved_key &&
+                byte_prefix_match(retained_key, strlen(retained_key),
+                                  saved_key, strlen(saved_key)));
     TEST_ASSERT(saved_key &&
                 !byte_prefix_match(future_text, strlen(future_text),
                                    saved_key, strlen(saved_key)));
@@ -18850,6 +19169,163 @@ static void test_vision_kv_key_requires_exact_image_identity(void) {
     free(changed_key);
     free(moved_key);
     free(appended_key);
+    free(retained_key);
+}
+
+static void test_loaded_conditioning_compatibility(void) {
+    int prompt_ids[16];
+    int cached_ids[16];
+    for (int i = 0; i < 16; i++) {
+        prompt_ids[i] = 1000 + i;
+        cached_ids[i] = prompt_ids[i];
+    }
+    ds4_tokens prompt = {.v = prompt_ids, .len = 16, .cap = 16};
+    ds4_tokens cached = {.v = cached_ids, .len = 2, .cap = 16};
+    ds4_vision_span images[2] = {0};
+    images[0].token_start = 2;
+    images[0].embedding.token_count = 3;
+    images[0].embedding.state_fingerprint_valid = true;
+    images[1].token_start = 10;
+    images[1].embedding.token_count = 2;
+    images[1].embedding.state_fingerprint_valid = true;
+    const char *reason = NULL;
+
+    /* With no retained image, safety comes from the lookup's rendered-byte
+     * cap; a different BPE spelling may legitimately use more token IDs. */
+    TEST_ASSERT(kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 0, &reason));
+    TEST_ASSERT(reason && !strcmp(reason, "compatible"));
+    cached.len = 18;
+    TEST_ASSERT(kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 0, &reason));
+
+    /* A retained image must be completely represented by the checkpoint. */
+    cached.len = 4;
+    TEST_ASSERT(!kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 1, &reason));
+    TEST_ASSERT(reason &&
+                !strcmp(reason, "retained-conditioning-crosses-frontier"));
+    cached.len = 5;
+    TEST_ASSERT(kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 1, &reason));
+    cached.len = 11;
+    TEST_ASSERT(!kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 2, &reason));
+
+    cached.len = 12;
+    TEST_ASSERT(kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 2, &reason));
+
+    images[0].embedding.state_fingerprint_valid = false;
+    TEST_ASSERT(!kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, images, 2, 1, &reason));
+    images[0].embedding.state_fingerprint_valid = true;
+
+    ds4_vision_span overlapping[2] = {images[0], images[1]};
+    overlapping[1].token_start = 4;
+    TEST_ASSERT(!kv_cache_loaded_conditioning_matches(
+        &cached, &prompt, overlapping, 2, 2, &reason));
+    TEST_ASSERT(reason && !strcmp(reason, "invalid-conditioning-span"));
+}
+
+static void test_conditioning_span_relocation(void) {
+    ds4_vision_span images[2] = {0};
+    images[0].token_start = 2;
+    images[0].embedding.token_count = 3;
+    images[1].token_start = 10;
+    images[1].embedding.token_count = 2;
+
+    TEST_ASSERT(kv_cache_shift_conditioning_spans(
+        images, 2, 1, 2, 18));
+    TEST_ASSERT(images[0].token_start == 2);
+    TEST_ASSERT(images[1].token_start == 12);
+
+    images[1].token_start = 10;
+    TEST_ASSERT(!kv_cache_shift_conditioning_spans(
+        images, 2, 1, -6, 16));
+    TEST_ASSERT(images[1].token_start == 10);
+    TEST_ASSERT(!kv_cache_shift_conditioning_spans(
+        images, 2, 1, 10, 16));
+    TEST_ASSERT(images[1].token_start == 10);
+
+    images[1].token_start = UINT32_MAX;
+    TEST_ASSERT(!kv_cache_shift_conditioning_spans(
+        images, 2, 1, 1, INT_MAX));
+    TEST_ASSERT(images[1].token_start == UINT32_MAX);
+}
+
+static void test_kv_cache_lookup_unifies_conditioning_prefixes(void) {
+    char tmpl[] = "/tmp/ds4-kv-conditioning-prefix-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text_prefix = "system and conversation prefix";
+    const char *text_past_image =
+        "system and conversation prefix text after image";
+    const char *vision_prefix =
+        "\036DS4_VISION_KV_V2\n1\nidentity\n\037system and conversation prefix";
+    test_kv_text_stub_file_model_ext(
+        dir, text_prefix, 0, KV_REASON_EVICT, 0, 1200, 0);
+    /* This entry matches the full rendered request, but includes bytes after
+     * the first unmatched image and must be excluded by max_key_bytes. */
+    test_kv_text_stub_file_model_ext(
+        dir, text_past_image, 0, KV_REASON_EVICT, 0, 1400, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, vision_prefix, 0, KV_REASON_EVICT,
+        KV_EXT_VISION_IDENTITY, 800, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    ds4_kvstore_prefix_query queries[2] = {
+        {
+            .text =
+                "\036DS4_VISION_KV_V2\n1\nidentity\n\037system and conversation prefix and suffix",
+            .max_tokens = 1000,
+            .max_key_bytes = UINT32_MAX,
+            .required_ext_flags = KV_EXT_VISION_IDENTITY,
+        },
+        {
+            .text =
+                "system and conversation prefix text after image and suffix",
+            .max_tokens = UINT32_MAX,
+            .max_key_bytes = sizeof("system and conversation prefix") - 1,
+            .forbidden_ext_flags = KV_EXT_VISION_IDENTITY,
+        },
+    };
+    size_t matched_query = SIZE_MAX;
+    int idx = ds4_kvstore_find_best_prefix(
+        &kc, queries, 2, 0, 2, 32768, &matched_query);
+    /* Matching more conditioning is a later semantic frontier even when its
+     * exact BPE history happens to contain fewer tokens. */
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 800);
+    TEST_ASSERT(matched_query == 0);
+
+    /* Once the vision candidate is capped below its frontier, the same search
+     * falls back to the safe text checkpoint and still excludes the longer
+     * text entry that crosses the image boundary. */
+    queries[0].max_tokens = 700;
+    matched_query = SIZE_MAX;
+    idx = ds4_kvstore_find_best_prefix(
+        &kc, queries, 2, 0, 2, 32768, &matched_query);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 1200);
+    TEST_ASSERT(matched_query == 1);
+
+    kv_cache_close(&kc);
+    const char *keys[] = {text_prefix, text_past_image, vision_prefix};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        char sha[41], name[44];
+        sha1_bytes_hex(keys[i], strlen(keys[i]), sha);
+        snprintf(name, sizeof(name), "%.40s.kv", sha);
+        char *path = path_join(dir, name);
+        unlink(path);
+        free(path);
+    }
+    rmdir(dir);
 }
 
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
@@ -19881,6 +20357,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_vision_kv_key_requires_exact_image_identity();
+    test_loaded_conditioning_compatibility();
+    test_conditioning_span_relocation();
+    test_kv_cache_lookup_unifies_conditioning_prefixes();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
