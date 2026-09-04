@@ -564,6 +564,7 @@ static bool agent_slash_command_with_args(const char *cmd, const char *name) {
 static bool agent_slash_command_known(const char *cmd) {
     return !strcmp(cmd, "/help") ||
            !strcmp(cmd, "/save") ||
+           agent_slash_command_with_args(cmd, "/fork") ||
            !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
            !strcmp(cmd, "/quit") ||
@@ -5124,6 +5125,69 @@ static char *agent_session_title_from_prompt(const char *prompt,
                                          "(empty user prompt)");
 }
 
+static char *agent_session_fork_title(const char *current_title,
+                                      const char *requested_title) {
+    if (requested_title && requested_title[0])
+        return agent_session_title_from_prompt(requested_title, 0);
+
+    agent_buf b = {0};
+    agent_buf_puts(&b, current_title ? current_title : "(no user prompt)");
+    agent_buf_puts(&b, " (fork)");
+    return agent_buf_take(&b);
+}
+
+/* Session identity is title plus second-resolution creation time.  An explicit
+ * fork title may equal the parent title, so advance the timestamp only when
+ * needed to guarantee that the child gets a distinct stable identity. */
+static uint64_t agent_session_fork_created_at(const char *child_title,
+                                              uint64_t candidate,
+                                              const char parent_sha[41],
+                                              char child_sha[41]) {
+    for (;;) {
+        agent_session_identity_sha(child_title, candidate, child_sha);
+        if (strcmp(child_sha, parent_sha) != 0) return candidate;
+        candidate++;
+    }
+}
+
+/* Save the current frontier as the parent, then keep the exact live transcript
+ * and KV state under a fresh identity.  The child is deliberately left dirty:
+ * it is live immediately and becomes a second on-disk session on the next save. */
+static bool agent_worker_fork_session(agent_worker *w,
+                                      const char *requested_title,
+                                      char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
+
+    char parent_sha[41];
+    int tokens = 0;
+    if (!agent_worker_save_session_now(w, parent_sha, &tokens, err, err_len))
+        return false;
+
+    char *child_title = agent_session_fork_title(w->session_title,
+                                                 requested_title);
+    char child_sha[41];
+    uint64_t created_at = agent_session_fork_created_at(
+        child_title, (uint64_t)time(NULL), parent_sha, child_sha);
+
+    free(w->session_title);
+    w->session_title = child_title;
+    w->session_created_at = created_at;
+    memcpy(w->session_sha, child_sha, sizeof(w->session_sha));
+    pthread_mutex_lock(&w->mu);
+    w->session_dirty = true;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
+    agent_trace(w, "session fork parent=%.40s child=%.40s tokens=%d",
+                parent_sha, child_sha, tokens);
+    printf("forked session %.8s -> %.8s (%d tokens)\n",
+           parent_sha, child_sha, tokens);
+    return true;
+}
+
 /* Extract a human-readable title from the first user turn stored in the
  * rendered transcript.  max_bytes==0 means "full normalized title"; callers
  * that render to the terminal pass an explicit display budget. */
@@ -7291,6 +7355,57 @@ static void test_agent_steering_command(void) {
     AGENT_TEST_ASSERT(!agent_slash_command_known("/steering"));
 }
 
+static void test_agent_session_fork_helpers(void) {
+    char *title = agent_session_fork_title("Investigate cache", NULL);
+    AGENT_TEST_ASSERT(!strcmp(title, "Investigate cache (fork)"));
+    free(title);
+
+    title = agent_session_fork_title("Ignored", "  Compare   schedulers  ");
+    AGENT_TEST_ASSERT(!strcmp(title, "Compare schedulers"));
+    free(title);
+
+    char parent_sha[41], child_sha[41];
+    agent_session_identity_sha("Same title", 100, parent_sha);
+    uint64_t created_at = agent_session_fork_created_at(
+        "Same title", 100, parent_sha, child_sha);
+    AGENT_TEST_ASSERT(created_at == 101);
+    AGENT_TEST_ASSERT(strcmp(parent_sha, child_sha) != 0);
+
+    created_at = agent_session_fork_created_at(
+        "Different title", 100, parent_sha, child_sha);
+    AGENT_TEST_ASSERT(created_at == 100);
+    AGENT_TEST_ASSERT(strcmp(parent_sha, child_sha) != 0);
+
+    AGENT_TEST_ASSERT(agent_slash_command_known("/fork"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/fork alternate path"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/forked"));
+
+    /* A parent-save failure must leave the current identity untouched. */
+    agent_worker w = {0};
+    AGENT_TEST_ASSERT(pthread_mutex_init(&w.mu, NULL) == 0);
+    w.initialized = true;
+    w.status.state = AGENT_WORKER_IDLE;
+    w.user_activity = true;
+    w.session_dirty = true;
+    w.image_count = 1;
+    w.session_title = xstrdup("Image session");
+    w.session_created_at = 200;
+    agent_session_identity_sha(w.session_title, w.session_created_at,
+                               w.session_sha);
+    char original_sha[41];
+    memcpy(original_sha, w.session_sha, sizeof(original_sha));
+    char err[160] = {0};
+    AGENT_TEST_ASSERT(!agent_worker_fork_session(&w, "Child", err,
+                                                  sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "images cannot be saved") != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.session_title, "Image session"));
+    AGENT_TEST_ASSERT(w.session_created_at == 200);
+    AGENT_TEST_ASSERT(!strcmp(w.session_sha, original_sha));
+    AGENT_TEST_ASSERT(w.session_dirty);
+    free(w.session_title);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void test_agent_terminal_wrap_output_is_deferred(void);
 
 static void ds4_agent_unit_tests_run(void) {
@@ -7299,6 +7414,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_cache_rejects_impossible_lengths();
     test_agent_tp_cache_payload_rebuild_policy();
     test_agent_steering_command();
+    test_agent_session_fork_helpers();
     test_agent_read_default_lines_follow_context();
     test_agent_glm_template_policy();
     test_agent_edit_upto_prompt_is_opt_in();
@@ -11095,6 +11211,7 @@ static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
     puts("  /save        Save the current session.");
+    puts("  /fork [NAME] Save this frontier and continue as a new session.");
     puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
@@ -11835,6 +11952,15 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             show_welcome_after_restart = true;
                         }
                     }
+                } else if (!strncmp(cmd, "/fork", 5) &&
+                           (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
+                    char *title = cmd + 5;
+                    while (*title == ' ' || *title == '\t') title++;
+                    char err[160] = {0};
+                    if (!agent_worker_fork_session(&worker,
+                                                   title[0] ? title : NULL,
+                                                   err, sizeof(err)))
+                        printf("fork failed: %s\n", err);
                 } else if (!strncmp(cmd, "/switch", 7) &&
                            (cmd[7] == '\0' || cmd[7] == ' ' || cmd[7] == '\t')) {
                     char *arg = cmd + 7;

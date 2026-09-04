@@ -1083,6 +1083,9 @@ Agent sessions are stored in `~/.ds4/kvcache`. Use `/save` to persist the
 current session, `/list` to show saved sessions sorted by recent update time,
 and `/switch <sha>` to resume one of them. The session ID is stable across
 future saves and is derived from the first user prompt and creation time.
+Use `/fork [title]` at an idle prompt to save the current frontier as the
+parent and continue immediately with the same live KV state under a new session
+identity. Without a title, the child uses the current title plus ` (fork)`.
 `/del <sha>` removes a saved session. `/strip <sha>` keeps the rendered
 conversation text and title but removes the heavy KV payload; switching to a
 stripped session rebuilds the KV cache by prefilling the saved text.
