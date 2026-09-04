@@ -30,11 +30,10 @@
  *     Two caveats travel with that pair.  It predates the current scorer and
  *     did not store completions, so it cannot be re-scored.  And it measured
  *     the ATTENTION contributor, whereas ds4's default hook is the FFN/MoE
- *     write -- a third site never measured, and plausibly much stronger there,
- *     since the write-vs-explain contrast these directions come from is a
- *     content decision and content is largely MoE-mediated on this
- *     architecture.  So the mechanism is the argument here, not the factor.
- *     A file cannot say where it was calibrated, so nothing can check.
+ *     write -- a third site that has never been measured, so the factor above
+ *     is not a bound on it in either direction.  So the mechanism is the
+ *     argument here, not the number.  A file cannot say where it was
+ *     calibrated, so nothing can check.
  *
  *   - Layer map.  A one-layer shift does not fail, it degrades: adjacent
  *     layers' refusal directions have cosine similarity 0.555-0.979 (mean
