@@ -6042,11 +6042,10 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
  * kernels across shapes, including blocks < T and ragged out_dim/n_tok.
  * Rollback: DS4_CUDA_NO_Q8_MMA=1. */
 __device__ __forceinline__ static uint32_t ldu32_unaligned(const uint8_t *p) {
-    const uintptr_t addr = (uintptr_t)p;
-    const uint32_t *base = (const uint32_t *)(addr & ~(uintptr_t)3);
-    const uint32_t lo = base[0];
-    const uint32_t hi = base[1];
-    return __funnelshift_r(lo, hi, (uint32_t)(addr & 3u) * 8u);
+    /* Q8_0 codes are halfword-aligned. Read only the four requested bytes,
+     * including at the end of an exactly-sized raw tensor allocation. */
+    const uint16_t *q = (const uint16_t *)p;
+    return (uint32_t)q[0] | ((uint32_t)q[1] << 16);
 }
 
 __device__ __forceinline__ static void mma_m16n8k32_s8(
