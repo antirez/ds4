@@ -533,6 +533,13 @@ void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+/* Behavioral tokenizer fingerprint: a fixed probe string set run through the
+ * real tokenizer, hashed.  Covers data (vocab/merges) AND code (pre-tokenizer
+ * rules) changes, so persisted KV checkpoints can detect engine builds whose
+ * tokenization the file's token history can no longer be reproduced by.
+ * Stable for a given build; 0 only before the vocab is loaded. */
+uint64_t ds4_engine_tokenizer_fingerprint(ds4_engine *e);
+
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);

@@ -1271,6 +1271,47 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             }
         }
     }
+    /* Tokenizer fingerprint pre-check.  Stamped files carry a behavioral
+     * fingerprint of the engine that produced their token history as the
+     * first trailer section.  A mismatch means this engine can no longer
+     * reproduce those token ids from the stored text (tokenizer code or
+     * data changed since the checkpoint was written), so restoring it
+     * would re-import a tokenization that every future request mismatches
+     * at the drift point — a permanent reload loop through text-keyed
+     * tiers.  Reject before touching the payload; the ordinary prefill
+     * path rewrites a fresh stamped file under the same text key.
+     * Unstamped legacy files keep today's trusted behavior. */
+    if (header_ok && (hdr.ext_flags & DS4_KVSTORE_EXT_TOKFP)) {
+        long payload_start = ftell(fp);
+        uint64_t tokfp = 0;
+        bool have_fp = false;
+        if (payload_start >= 0 &&
+            fseek(fp, payload_start + (long)hdr.payload_bytes, SEEK_SET) == 0) {
+            uint8_t sh[8];
+            uint8_t fb[8];
+            if (fread(sh, 1, sizeof(sh), fp) == (long)sizeof(sh) &&
+                sh[0] == 'T' && sh[1] == 'K' && sh[2] == 'F' &&
+                sh[3] == 1 && ds4_kvstore_le_get32(sh + 4) == 8 &&
+                fread(fb, 1, sizeof(fb), fp) == (long)sizeof(fb)) {
+                for (int i = 0; i < 8; i++) tokfp |= (uint64_t)fb[i] << (8 * i);
+                have_fp = true;
+            }
+            fseek(fp, payload_start, SEEK_SET);
+        }
+        if (have_fp && tokfp != ds4_engine_tokenizer_fingerprint(engine)) {
+            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
+                    "%s: kv cache tokenizer fingerprint mismatch, refusing stale tokenization%s%s %s",
+                    kv_log_name(kc),
+                    responses_protocol ? " " : "",
+                    responses_protocol ? "RESPPROTO" : "",
+                    path);
+            fclose(fp);
+            free(cached_text);
+            free(path);
+            return 0;
+        }
+    }
+
     char err[160] = {0};
     int loaded = 0;
     if (header_ok &&
