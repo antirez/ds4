@@ -926,6 +926,7 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
             int run = rs >> 4;
             int size = rs & 0x0F;
 
+            int new_val = 0;
             if (size == 0) {
                 if (run != 15) {
                     /* EOBn */
@@ -940,16 +941,13 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                     }
                     break;
                 }
-                /* ZRL: skip 16 zeros while refining non-zeros */
-                run = 16;
+                /* ZRL: skip 15 zeros, then write a zero (16 zeros total).
+                 * Do not keep refining trailing non-zeros before the next
+                 * Huffman symbol; those correction bits come after it. */
             } else if (size != 1) {
                 if (dec->bs.eof) break;
                 return -1;  /* Invalid: size must be 1 for refinement */
-            }
-
-            /* Skip 'run' zero coefficients, refining any non-zero ones along the way */
-            int new_val = 0;
-            if (size == 1) {
+            } else {
                 int bit = jpeg_get_bits(&dec->bs, 1);
                 if (bit < 0) {
                     if (dec->bs.eof) break;
@@ -958,6 +956,8 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                 new_val = bit ? p1 : m1;
             }
 
+            /* Skip 'run' zeros, refining non-zeros along the way, then
+             * place new_val (0 for ZRL) at the next zero and stop. */
             while (k <= dec->se) {
                 int zk = jpeg_zigzag[k];
                 if (coef[zk] != 0) {
@@ -979,16 +979,15 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                     run--;
                     k++;
                 } else {
+                    coef[zk] = (int16_t)new_val;
+                    k++;
                     break;
                 }
             }
 
             /* Huffman lookahead may have reached the next marker while valid
-             * bits remain buffered. Commit this decoded coefficient. */
-            if (size == 1 && k <= dec->se) {
-                coef[jpeg_zigzag[k]] = (int16_t)new_val;
-                k++;
-            }
+             * bits remain buffered. The new coefficient was already written
+             * in the skip loop; keep decoding this block. */
         }
     }
 

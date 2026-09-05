@@ -59,6 +59,7 @@
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
+/tests/test_image_decode
 /tests/test_deepseek41_metal
 /tests/test_deepseek41_cuda
 /tests/test_cuda_q8_rows
