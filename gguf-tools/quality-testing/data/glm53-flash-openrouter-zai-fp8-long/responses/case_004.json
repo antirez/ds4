@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788630696-Ut32vNcljjT9Jg0Bsbh1",
+  "object": "chat.completion",
+  "created": 1788630696,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Session State (agent_worker)\n\nThe worker struct is the single-process home for everything persistent:\n\n- **Engine/session wiring**: `engine`, `session`, plus `cfg` pointing back to the config (note `agent_worker_effective_ctx_size` falls back from session ctx to `cfg->gen.ctx_size` — session may not exist yet).\n- **Transcript**: a `ds4_tokens transcript`, plus an `images` array (`ds4_vision_span` with `image_count`/`image_cap`) for vision embeddings attached to the conversation. A turn's end token is appended only when the engine's tool syntax",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 2973,
+    "completion_tokens": 128,
+    "total_tokens": 3101,
+    "cost": 0.000254975,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.000254975,
+      "upstream_inference_prompt_cost": 0.000222975,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

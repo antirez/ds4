@@ -18,6 +18,9 @@ calling hosted APIs:
 - `data/glm53-flash-openrouter-zai-fp8-100`: 100 GLM 5.3 Flash continuations
   from OpenRouter's pinned Z.AI FP8 endpoint. The endpoint does not expose
   logprobs, so these are deterministic continuation fixtures.
+- `data/glm53-flash-openrouter-zai-fp8-long`: eight code-context continuations
+  from the same FP8 endpoint, with 3K-7K prompts that exercise sparse attention.
+  Use the rendered prompts below to preserve the API's reasoning prefix.
 - `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
 - `data/pro`: 100 DeepSeek V4 PRO preview continuations collected from the
@@ -163,6 +166,25 @@ gguf-tools/quality-testing/score_llama \
   4096 \
   deepseek-ds4
 ```
+
+GLM's hosted endpoint requires reasoning. A no-thinking local prompt does not
+match a reply generated after reasoning, even at temperature zero. For the long
+GLM fixtures, render the official `Reasoning Effort: Low` template and include
+the returned reasoning before scoring the answer:
+
+```sh
+python3 gguf-tools/quality-testing/render_glm_references.py \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long
+gguf-tools/quality-testing/score_official /path/to/GLM-5.3-Flash-Q2.gguf \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long/manifest-rendered.tsv \
+  /tmp/glm-long.tsv 8192 --rendered-prompt
+```
+
+`--rendered-prompt` reads the prompt file with its existing chat markers; it
+does not add another chat template. The renderer can also be applied to the
+older 100-case GLM 5.3 Flash fixture. Keep rendered and legacy no-thinking
+scores separate: their prefixes differ. Z.AI supplies no token logprobs, so
+judge these runs by continuation NLL and greedy agreement, not logprob parity.
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
