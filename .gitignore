@@ -23,6 +23,7 @@
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
 /tests/cuda_long_context_smoke
+/tests/test_cuda_q8_prefill
 /tests/test_layer_pack
 /tests/test_metal_session_batch
 /tests/test_metal_tp_spec
