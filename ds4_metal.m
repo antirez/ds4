@@ -47281,9 +47281,15 @@ enum {
     QWEN4_K_HC_NORM_F16 = 0,
     QWEN4_K_HC_NORM_F32,
     QWEN4_K_HC_NORM_Q8,
+    QWEN4_K_HC_NORM_REUSE_F16,
+    QWEN4_K_HC_NORM_REUSE_F32,
+    QWEN4_K_HC_NORM_REUSE_Q8,
     QWEN4_K_HC_GATE_MIX_F16,
     QWEN4_K_HC_GATE_MIX_F32,
     QWEN4_K_HC_GATE_MIX_Q8,
+    QWEN4_K_HC_GATE_MIX_PAIR_F16,
+    QWEN4_K_HC_GATE_MIX_PAIR_F32,
+    QWEN4_K_HC_GATE_MIX_PAIR_Q8,
     QWEN4_K_MULTI_GEMV,
     QWEN4_K_HC_COMBINE,
     QWEN4_K_CONV_STREAM,
@@ -47308,6 +47314,8 @@ enum {
     QWEN4_K_ATTN_MERGE_NPT1,
     QWEN4_K_ATTN_MM,
     QWEN4_K_MOE_MID,
+    QWEN4_K_MOE_MID_Q4K,
+    QWEN4_K_MOE_MID_Q4K_NR1,
     QWEN4_K_MOE_DOWN,
     QWEN4_K_MOE_REDUCE,
     QWEN4_K_MTP_STAGE,
@@ -47332,9 +47340,15 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_norm_f16",
     "kernel_qwen4_hc_norm_f32",
     "kernel_qwen4_hc_norm_q8",
+    "kernel_qwen4_hc_norm_reuse_f16",
+    "kernel_qwen4_hc_norm_reuse_f32",
+    "kernel_qwen4_hc_norm_reuse_q8",
     "kernel_qwen4_hc_gate_mix_f16",
     "kernel_qwen4_hc_gate_mix_f32",
     "kernel_qwen4_hc_gate_mix_q8",
+    "kernel_qwen4_hc_gate_mix_pair_f16",
+    "kernel_qwen4_hc_gate_mix_pair_f32",
+    "kernel_qwen4_hc_gate_mix_pair_q8",
     "kernel_qwen4_multi_gemv",
     "kernel_qwen4_hc_combine",
     "kernel_qwen4_conv_stream",
@@ -47359,6 +47373,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_merge_npt1",
     "kernel_qwen4_attn_mm",
     "kernel_qwen4_moe_mid",
+    "kernel_qwen4_moe_mid_q4k",
+    "kernel_qwen4_moe_mid_q4k_nr1",
     "kernel_qwen4_moe_down",
     "kernel_qwen4_moe_reduce",
     "kernel_qwen4_mtp_stage",
@@ -47458,9 +47474,23 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         b[2] = b[1];
         b[4] = b[3];
     }
-    const int kernel = qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
+    /* Reuse wins at the measured large prefill shape. Decode and MTP keep
+     * the original chunk parallelism, including with an explicit override. */
+    bool reuse = false;
+    if (n_tokens > 2u) {
+        const char *reuse_env = getenv("DS4_QWEN4_HC_NORM_REUSE");
+        if (reuse_env != NULL && strcmp(reuse_env, "1") == 0) {
+            reuse = true;
+        } else if (reuse_env == NULL || strcmp(reuse_env, "0") != 0) {
+            reuse = n_tokens >= 8192u && n_embd == 2560u && n_hc == 4u && n_inject == 4u &&
+                    ds4_gpu_device_name_contains("M3 Ultra");
+        }
+    }
+    const int kernel = reuse
+        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
+        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
@@ -47478,10 +47508,14 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         !qwen4_bind_tensor(&b[3], mixed, (uint64_t)n_tokens * n_embd * sizeof(float), "hc mixed")) {
         return 0;
     }
-    const int kernel = qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
+    const bool pair = n_tokens == 2u && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
+    const int kernel = pair ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
+                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8)
+                            : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
                                        QWEN4_K_HC_GATE_MIX_Q8);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 4,
-                          MTLSizeMake((n_embd + 3) / 4, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake((n_embd + 3) / 4, pair ? 1u : n_tokens, 1), MTLSizeMake(128, 1, 1),
+                          pair ? (NSUInteger)n_rank * 2u * sizeof(float) : 0u);
 }
 
 int ds4_gpu_qwen4_hc_combine_tensor(
@@ -47561,9 +47595,16 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
     } else {
         bd[5] = bd[3];
     }
-    if (head_dim == 128u && n_tokens > 8u) {
+    const bool decode_r4 = n_tokens <= 2u && getenv("DS4_QWEN4_NO_GDN_R4") == NULL;
+    if (head_dim == 128u && (n_tokens > 8u || decode_r4)) {
+        /* Four value rows share Q/K loads per SIMD group. M3 Ultra prefers
+         * eight groups for two-token verification; retain the prefill layout. */
+        const uint32_t default_nsg = n_tokens == 2u && ds4_gpu_device_name_contains("M3 Ultra") ? 8u : 1u;
+        const uint32_t nsg = n_tokens <= 2u ?
+            (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GDN_NSG", default_nsg, 1u, 8u) : 1u;
         return qwen4_dispatch(QWEN4_K_GDN_SCAN_R4, &args, sizeof(args), bd, 6,
-                              MTLSizeMake(head_dim / 4, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
+                              MTLSizeMake((head_dim + 4u * nsg - 1u) / (4u * nsg), n_v_head, 1),
+                              MTLSizeMake(32u * nsg, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_GDN_SCAN, &args, sizeof(args), bd, 6,
                           MTLSizeMake(head_dim, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
@@ -47899,7 +47940,7 @@ int ds4_gpu_qwen4_attn_decode_tensor(
 typedef struct {
     uint32_t n_tokens, n_slots, in_dim, out_rows, weight_type, row_bytes;
     uint64_t expert_bytes;
-    uint32_t has_shared, shared_type, shared_row_bytes, pad0;
+    uint32_t has_shared, shared_type, shared_row_bytes, n_total_expert;
 } qwen4_moe_args;
 
 int ds4_gpu_qwen4_moe_mid_tensor(
@@ -47916,7 +47957,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * ff_dim;
     qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0 };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && sh_row_bytes == 0) ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, experts_bytes, "moe gate experts") ||
@@ -47935,10 +47976,22 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         b[5] = b[0];
         b[6] = b[1];
     }
-    const uint32_t rows_per_tg = 4u * 2u;
-    return qwen4_dispatch(QWEN4_K_MOE_MID, &args, sizeof(args), b, 7,
+    const bool q4k = weight_type == 12u && getenv("DS4_QWEN4_NO_Q4K_MID") == NULL;
+    const bool m3_ultra = q4k && ds4_gpu_device_name_contains("M3 Ultra");
+    /* The NR1 gain was measured for one-token decode; retain NR2 for T2
+     * MTP verification and other batches unless explicitly overridden. */
+    const uint32_t default_nr = m3_ultra && n_tokens == 1u ? 1u : 2u;
+    const uint64_t nr_env = q4k ? ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) : 2u;
+    const uint32_t nr = nr_env == 1u || nr_env == 2u ? (uint32_t)nr_env : default_nr;
+    /* NR2 without an NSG override restores the former ordered dispatch. */
+    const uint32_t default_nsg = m3_ultra && nr == 1u ? 8u : 2u;
+    const uint32_t nsg = q4k ?
+        (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) : 4u;
+    const uint32_t rows_per_tg = nr * nsg;
+    const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
-                          MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_moe_down_tensor(
@@ -48037,9 +48090,14 @@ int ds4_gpu_qwen4_moe_build_lists_tensor(
                           MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1), 0);
 }
 
-static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens) {
+static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, const char *env_name) {
     uint32_t tiles = (n_tokens + 31u) / 32u;
-    return tiles > 8u ? 8u : tiles;
+    /* Spread large routed batches over more independent tiles on M3 Ultra.
+     * Each tile keeps the same K loop and accumulation order. */
+    const uint32_t default_cap = ds4_gpu_device_name_contains("M3 Ultra") ?
+        (n_tokens >= 8192u ? 32u : n_tokens >= 4096u ? 16u : 8u) : 8u;
+    const uint32_t cap = (uint32_t)ds4_gpu_env_u64(env_name, default_cap, 1u, 32u);
+    return tiles > cap ? cap : tiles;
 }
 
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
@@ -48049,7 +48107,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
-    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens);
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, "DS4_QWEN4_MOE_MID_TILES");
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, 0 };
     qwen4_bind b[6];
@@ -48075,7 +48133,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, ff_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
-    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens);
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, "DS4_QWEN4_MOE_DOWN_TILES");
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, 0 };
     qwen4_bind b[5];

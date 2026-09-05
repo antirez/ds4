@@ -1,0 +1,850 @@
+{
+  "repeated8k": {
+    "prefill_tps": {
+      "baseline": {
+        "values": [
+          1149.37,
+          1149.07,
+          1149.83
+        ],
+        "median": 1149.37
+      },
+      "candidate": {
+        "values": [
+          1201.69,
+          1200.53,
+          1201.06
+        ],
+        "median": 1201.06
+      },
+      "gain_pct": 4.497246317547887
+    },
+    "gen_tps": {
+      "baseline": {
+        "values": [
+          45.7,
+          45.59,
+          45.39
+        ],
+        "median": 45.59
+      },
+      "candidate": {
+        "values": [
+          47.28,
+          47.24,
+          47.21
+        ],
+        "median": 47.24
+      },
+      "gain_pct": 3.6192147400745833
+    }
+  },
+  "controlled_decode": {
+    "rows": 896,
+    "exact": 896,
+    "top1_matches": 896,
+    "max_abs": 0.0
+  },
+  "sweep_orders": [
+    "baseline then candidate",
+    "candidate then baseline"
+  ],
+  "all_28_prefill_dumps_match_original": true,
+  "all_14_candidate_greedy_continuations_match_original": true,
+  "sweeps": [
+    {
+      "context": 4096,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1101.66",
+            "gen_tokens": "128",
+            "gen_tps": "45.63",
+            "gen_first_ms": "23.078",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.75",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1104.77",
+            "gen_tokens": "128",
+            "gen_tps": "47.31",
+            "gen_first_ms": "30.942",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.58",
+            "kvcache_bytes": "248088668"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1102.87",
+            "gen_tokens": "128",
+            "gen_tps": "45.37",
+            "gen_first_ms": "23.217",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.48",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1159.20",
+            "gen_tokens": "128",
+            "gen_tps": "47.47",
+            "gen_first_ms": "33.633",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.81",
+            "kvcache_bytes": "248088668"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1101.66,
+              1102.87
+            ],
+            "median": 1102.2649999999999,
+            "range": [
+              1101.66,
+              1102.87
+            ]
+          },
+          "candidate": {
+            "values": [
+              1104.77,
+              1159.2
+            ],
+            "median": 1131.9850000000001,
+            "range": [
+              1104.77,
+              1159.2
+            ]
+          },
+          "median_gain_pct": 2.6962663243412566
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              45.63,
+              45.37
+            ],
+            "median": 45.5,
+            "range": [
+              45.37,
+              45.63
+            ]
+          },
+          "candidate": {
+            "values": [
+              47.31,
+              47.47
+            ],
+            "median": 47.39,
+            "range": [
+              47.31,
+              47.47
+            ]
+          },
+          "median_gain_pct": 4.153846153846152
+        }
+      }
+    },
+    {
+      "context": 8192,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1146.35",
+            "gen_tokens": "128",
+            "gen_tps": "45.44",
+            "gen_first_ms": "22.627",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.55",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1158.33",
+            "gen_tokens": "128",
+            "gen_tps": "47.13",
+            "gen_first_ms": "32.363",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.42",
+            "kvcache_bytes": "377145436"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1147.81",
+            "gen_tokens": "128",
+            "gen_tps": "45.40",
+            "gen_first_ms": "22.813",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.51",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1161.12",
+            "gen_tokens": "128",
+            "gen_tps": "47.17",
+            "gen_first_ms": "32.987",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.48",
+            "kvcache_bytes": "377145436"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1146.35,
+              1147.81
+            ],
+            "median": 1147.08,
+            "range": [
+              1146.35,
+              1147.81
+            ]
+          },
+          "candidate": {
+            "values": [
+              1158.33,
+              1161.12
+            ],
+            "median": 1159.725,
+            "range": [
+              1158.33,
+              1161.12
+            ]
+          },
+          "median_gain_pct": 1.1023642640443532
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              45.44,
+              45.4
+            ],
+            "median": 45.42,
+            "range": [
+              45.4,
+              45.44
+            ]
+          },
+          "candidate": {
+            "values": [
+              47.13,
+              47.17
+            ],
+            "median": 47.150000000000006,
+            "range": [
+              47.13,
+              47.17
+            ]
+          },
+          "median_gain_pct": 3.8088947600176226
+        }
+      }
+    },
+    {
+      "context": 16384,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1167.53",
+            "gen_tokens": "128",
+            "gen_tps": "45.25",
+            "gen_first_ms": "22.660",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.35",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1192.81",
+            "gen_tokens": "128",
+            "gen_tps": "46.88",
+            "gen_first_ms": "38.170",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.28",
+            "kvcache_bytes": "635258972"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1167.27",
+            "gen_tokens": "128",
+            "gen_tps": "45.32",
+            "gen_first_ms": "22.498",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.42",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1194.74",
+            "gen_tokens": "128",
+            "gen_tps": "47.04",
+            "gen_first_ms": "37.444",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.43",
+            "kvcache_bytes": "635258972"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1167.53,
+              1167.27
+            ],
+            "median": 1167.4,
+            "range": [
+              1167.27,
+              1167.53
+            ]
+          },
+          "candidate": {
+            "values": [
+              1192.81,
+              1194.74
+            ],
+            "median": 1193.775,
+            "range": [
+              1192.81,
+              1194.74
+            ]
+          },
+          "median_gain_pct": 2.2592941579578474
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              45.25,
+              45.32
+            ],
+            "median": 45.285,
+            "range": [
+              45.25,
+              45.32
+            ]
+          },
+          "candidate": {
+            "values": [
+              46.88,
+              47.04
+            ],
+            "median": 46.96,
+            "range": [
+              46.88,
+              47.04
+            ]
+          },
+          "median_gain_pct": 3.698796510985991
+        }
+      }
+    },
+    {
+      "context": 32768,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1164.70",
+            "gen_tokens": "128",
+            "gen_tps": "45.25",
+            "gen_first_ms": "22.800",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.35",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1146.74",
+            "gen_tokens": "128",
+            "gen_tps": "46.79",
+            "gen_first_ms": "41.869",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.25",
+            "kvcache_bytes": "0"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1166.25",
+            "gen_tokens": "128",
+            "gen_tps": "45.18",
+            "gen_first_ms": "22.529",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.28",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1189.93",
+            "gen_tokens": "128",
+            "gen_tps": "46.84",
+            "gen_first_ms": "32.827",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.14",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1164.7,
+              1166.25
+            ],
+            "median": 1165.475,
+            "range": [
+              1164.7,
+              1166.25
+            ]
+          },
+          "candidate": {
+            "values": [
+              1146.74,
+              1189.93
+            ],
+            "median": 1168.335,
+            "range": [
+              1146.74,
+              1189.93
+            ]
+          },
+          "median_gain_pct": 0.2453935090842796
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              45.25,
+              45.18
+            ],
+            "median": 45.215,
+            "range": [
+              45.18,
+              45.25
+            ]
+          },
+          "candidate": {
+            "values": [
+              46.79,
+              46.84
+            ],
+            "median": 46.815,
+            "range": [
+              46.79,
+              46.84
+            ]
+          },
+          "median_gain_pct": 3.5386486785358606
+        }
+      }
+    },
+    {
+      "context": 65536,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1155.76",
+            "gen_tokens": "128",
+            "gen_tps": "44.86",
+            "gen_first_ms": "22.797",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "44.95",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1095.71",
+            "gen_tokens": "128",
+            "gen_tps": "46.45",
+            "gen_first_ms": "32.733",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "46.74",
+            "kvcache_bytes": "0"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1157.03",
+            "gen_tokens": "128",
+            "gen_tps": "44.86",
+            "gen_first_ms": "22.854",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "44.96",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1180.03",
+            "gen_tokens": "128",
+            "gen_tps": "46.71",
+            "gen_first_ms": "31.856",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "46.99",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1155.76,
+              1157.03
+            ],
+            "median": 1156.395,
+            "range": [
+              1155.76,
+              1157.03
+            ]
+          },
+          "candidate": {
+            "values": [
+              1095.71,
+              1180.03
+            ],
+            "median": 1137.87,
+            "range": [
+              1095.71,
+              1180.03
+            ]
+          },
+          "median_gain_pct": -1.6019612675599704
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              44.86,
+              44.86
+            ],
+            "median": 44.86,
+            "range": [
+              44.86,
+              44.86
+            ]
+          },
+          "candidate": {
+            "values": [
+              46.45,
+              46.71
+            ],
+            "median": 46.58,
+            "range": [
+              46.45,
+              46.71
+            ]
+          },
+          "median_gain_pct": 3.8341506910387846
+        }
+      }
+    },
+    {
+      "context": 131072,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1139.44",
+            "gen_tokens": "128",
+            "gen_tps": "44.11",
+            "gen_first_ms": "23.191",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "44.20",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1068.50",
+            "gen_tokens": "128",
+            "gen_tps": "45.63",
+            "gen_first_ms": "36.089",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.95",
+            "kvcache_bytes": "0"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1140.97",
+            "gen_tokens": "128",
+            "gen_tps": "44.12",
+            "gen_first_ms": "23.082",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "44.22",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1161.91",
+            "gen_tokens": "128",
+            "gen_tps": "45.75",
+            "gen_first_ms": "31.830",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "46.01",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1139.44,
+              1140.97
+            ],
+            "median": 1140.205,
+            "range": [
+              1139.44,
+              1140.97
+            ]
+          },
+          "candidate": {
+            "values": [
+              1068.5,
+              1161.91
+            ],
+            "median": 1115.205,
+            "range": [
+              1068.5,
+              1161.91
+            ]
+          },
+          "median_gain_pct": -2.192588174933452
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              44.11,
+              44.12
+            ],
+            "median": 44.114999999999995,
+            "range": [
+              44.11,
+              44.12
+            ]
+          },
+          "candidate": {
+            "values": [
+              45.63,
+              45.75
+            ],
+            "median": 45.69,
+            "range": [
+              45.63,
+              45.75
+            ]
+          },
+          "median_gain_pct": 3.5702142128527736
+        }
+      }
+    },
+    {
+      "context": 262144,
+      "observations": {
+        "first": [
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1044.30",
+            "gen_tokens": "128",
+            "gen_tps": "42.40",
+            "gen_first_ms": "24.352",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "42.50",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1036.92",
+            "gen_tokens": "128",
+            "gen_tps": "43.64",
+            "gen_first_ms": "36.628",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "43.93",
+            "kvcache_bytes": "0"
+          }
+        ],
+        "reverse": [
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1108.38",
+            "gen_tokens": "128",
+            "gen_tps": "42.45",
+            "gen_first_ms": "24.419",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "42.54",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1128.65",
+            "gen_tokens": "128",
+            "gen_tps": "43.83",
+            "gen_first_ms": "32.958",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "44.07",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      "summary": {
+        "prefill_tps": {
+          "baseline": {
+            "values": [
+              1044.3,
+              1108.38
+            ],
+            "median": 1076.3400000000001,
+            "range": [
+              1044.3,
+              1108.38
+            ]
+          },
+          "candidate": {
+            "values": [
+              1036.92,
+              1128.65
+            ],
+            "median": 1082.785,
+            "range": [
+              1036.92,
+              1128.65
+            ]
+          },
+          "median_gain_pct": 0.5987884869093296
+        },
+        "gen_tps": {
+          "baseline": {
+            "values": [
+              42.4,
+              42.45
+            ],
+            "median": 42.425,
+            "range": [
+              42.4,
+              42.45
+            ]
+          },
+          "candidate": {
+            "values": [
+              43.64,
+              43.83
+            ],
+            "median": 43.735,
+            "range": [
+              43.64,
+              43.83
+            ]
+          },
+          "median_gain_pct": 3.087802003535667
+        }
+      }
+    }
+  ],
+  "mtp": {
+    "hamlet": {
+      "median_tps": {
+        "baseline": 60.5,
+        "candidate": 61.53
+      },
+      "range_tps": {
+        "baseline": [
+          60.5,
+          60.5
+        ],
+        "candidate": [
+          61.53,
+          61.53
+        ]
+      },
+      "speedup": 1.0170247933884298,
+      "all_outputs_identical": true,
+      "acceptance_identical": true
+    },
+    "fibonacci": {
+      "median_tps": {
+        "baseline": 73.09,
+        "candidate": 74.37
+      },
+      "range_tps": {
+        "baseline": [
+          73.09,
+          73.09
+        ],
+        "candidate": [
+          74.37,
+          74.37
+        ]
+      },
+      "speedup": 1.0175126556300451,
+      "all_outputs_identical": true,
+      "acceptance_identical": true
+    },
+    "explanation": {
+      "median_tps": {
+        "baseline": 64.4,
+        "candidate": 65.61
+      },
+      "range_tps": {
+        "baseline": [
+          64.4,
+          64.4
+        ],
+        "candidate": [
+          65.61,
+          65.61
+        ]
+      },
+      "speedup": 1.0187888198757764,
+      "all_outputs_identical": true,
+      "acceptance_identical": true
+    }
+  }
+}

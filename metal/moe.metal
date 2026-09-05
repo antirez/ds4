@@ -1053,7 +1053,7 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
         tgpig, slot, token, selected_off, 0, tiisg, sgitg);
 }
 
-template <short N_R0>
+template <short N_R0, bool ApplyWeight = true>
 static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
         device const char *gate,
@@ -1205,7 +1205,7 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         const float u = simd_sum(sumu[row]);
         if (tiisg == 0u) {
             mid[mid_base + row0 + (uint)row] =
-                ds4_glm_swiglu(g, u, args.swiglu_clamp) * weights[selected_off];
+                ds4_glm_swiglu(g, u, args.swiglu_clamp) * (ApplyWeight ? weights[selected_off] : 1.0f);
         }
     }
 

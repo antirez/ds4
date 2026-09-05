@@ -55073,10 +55073,10 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
     QWEN4_ALLOC(logits, (uint64_t)g->n_logit_rows * DS4_N_VOCAB);
     if (mtp) {
-        QWEN4_ALLOC(mtp_e, E);
-        QWEN4_ALLOC(mtp_cat, (hc + 1u) * 2u * E);
-        QWEN4_ALLOC(mtp_proj, (hc + 1u) * E);
-        QWEN4_ALLOC(mtp_R, hc_dim);
+        QWEN4_ALLOC(mtp_e, 2u * E);
+        QWEN4_ALLOC(mtp_cat, 2u * (hc + 1u) * 2u * E);
+        QWEN4_ALLOC(mtp_proj, 2u * (hc + 1u) * E);
+        QWEN4_ALLOC(mtp_R, 2u * hc_dim);
         QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     }
 #undef QWEN4_ALLOC
@@ -55436,6 +55436,17 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         const char *tv = getenv("DS4_QWEN4_TIMING");
         timing = tv ? (atoi(tv) >= 2 ? 2 : 1) : 0;
     }
+    /* Start the GPU while the host encodes the rest of the trunk. The
+     * command queue preserves layer order; zero restores one submission. */
+    uint32_t flush_layer = timing != 2 && n_trunk > 2u ? 2u : 0u;
+    const char *flush_env = getenv("DS4_QWEN4_FLUSH_LAYER");
+    if (timing != 2 && flush_env && flush_env[0]) {
+        char *end = NULL;
+        const unsigned long layer = strtoul(flush_env, &end, 10);
+        if (end != flush_env && *end == '\0' && layer < n_trunk) {
+            flush_layer = (uint32_t)layer;
+        }
+    }
     const double t0 = timing ? now_sec() : 0.0;
     qwen4_graph_stage_inputs(g, m, w, tokens, T);
     const double t1 = timing ? now_sec() : 0.0;
@@ -55481,6 +55492,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         QWEN4_PROF(4);
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
         QWEN4_PROF(5);
+        /* Submit this prefix while the host encodes the remaining layers.
+         * Flush keeps the same ordered queue and retains pending buffers;
+         * end_commands below waits for both batches before inputs are reused. */
+        if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
     }
     if (prof_on && ++prof_calls % 4 == 0) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (T=%u, avg of 4): "
@@ -55571,52 +55586,79 @@ static bool qwen4_graph_state_copy(ds4_qwen4_gpu_graph *g, bool save) {
     return ok;
 }
 
-/* One predictor step at MTP index idx from row `row` of g->R (the trunk's
- * pre-mixer streams at that position) and the embedding of the token that
- * follows.  The nextn layer runs on its own residual; with want_logits the
- * head follows and draft_out receives the argmax. */
-static bool qwen4_graph_mtp_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                 uint32_t row, int next_token, uint32_t idx, bool want_logits,
+/* One or two causal predictor steps at idx, using consecutive rows of the
+ * trunk's pre-mixer streams and the embeddings of their following tokens.
+ * The nextn layer runs on its own residual; want_logits returns the last
+ * row only. Batching catches up an accepted draft and predicts again with
+ * one command submission and one set of weight reads. */
+static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                 uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx, bool want_logits,
                                  float *logits_out, int *draft_out) {
-    if (!g->mtp_R || idx >= g->ctx_cap || row >= g->cap_tokens) return false;
-    const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
+    if (!g->mtp_R || T == 0u || T > 2u || idx > g->ctx_cap || T > g->ctx_cap - idx ||
+        row > g->cap_tokens || T > g->cap_tokens - row) return false;
+    const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
-    ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)E * sizeof(float));
-    ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->R, (uint64_t)row * hc_dim * sizeof(float),
-                                                (uint64_t)hc_dim * sizeof(float));
-    if (!R_row) return false;
-    if (!glm_graph_begin_commands_if_needed()) {
-        ds4_gpu_tensor_free(R_row);
-        return false;
+    for (uint32_t t = 0; t < T; t++) {
+        if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
     }
+    if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float)) ||
+        !glm_graph_begin_commands_if_needed()) return false;
     ds4_gpu_tensor *R_save = g->R;
-    bool ok = ds4_gpu_qwen4_mtp_stage_tensor(g->mtp_cat, g->mtp_e, R_row, m->map, m->size,
+    bool ok = true;
+    const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
+    const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
+    const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *e_row = ds4_gpu_tensor_view(g->mtp_e, t * emb_bytes, emb_bytes);
+        ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(R_save, (uint64_t)(row + t) * hc * emb_bytes, hc * emb_bytes);
+        ds4_gpu_tensor *cat_row = ds4_gpu_tensor_view(g->mtp_cat, t * cat_bytes, cat_bytes);
+        ok = e_row && R_row && cat_row &&
+             ds4_gpu_qwen4_mtp_stage_tensor(cat_row, e_row, R_row, m->map, m->size,
                                              l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
-                                             E, hc, DS4_RMS_EPS) &&
-              qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, hc + 1u) &&
-              ds4_gpu_qwen4_mtp_combine_tensor(g->mtp_R, g->mtp_proj, E, hc);
+                                             E, hc, DS4_RMS_EPS);
+        ds4_gpu_tensor_free(cat_row);
+        ds4_gpu_tensor_free(R_row);
+        ds4_gpu_tensor_free(e_row);
+    }
+    if (ok) ok = qwen4_gemv(g->mtp_proj, m, l->nextn_eh_proj, g->mtp_cat, T * (hc + 1u));
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *proj_row = ds4_gpu_tensor_view(g->mtp_proj, t * proj_bytes, proj_bytes);
+        ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R, t * hc * emb_bytes, hc * emb_bytes);
+        ok = proj_row && R_row && ds4_gpu_qwen4_mtp_combine_tensor(R_row, proj_row, E, hc);
+        ds4_gpu_tensor_free(R_row);
+        ds4_gpu_tensor_free(proj_row);
+    }
     g->R = g->mtp_R;
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, 1);
-    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
-    if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
-    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
-    if (ok) ok = qwen4_graph_moe(g, m, l, 1);
+    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
+    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
+    if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
+    if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
+    if (ok) ok = qwen4_graph_moe(g, m, l, T);
+    ds4_gpu_tensor *last = NULL;
     if (ok && want_logits) {
-        ok = qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
+        last = ds4_gpu_tensor_view(g->mtp_R, (T - 1u) * hc * emb_bytes, hc * emb_bytes);
+        g->R = last;
+        ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
     g->R = R_save;
     if (!ds4_gpu_end_commands()) ok = false;
-    ds4_gpu_tensor_free(R_row);
+    ds4_gpu_tensor_free(last);
     if (ok && want_logits) {
         float *dst = logits_out ? logits_out : g->host_logits;
         ok = ds4_gpu_tensor_read(g->logits, 0, dst, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         if (ok && draft_out) *draft_out = sample_argmax(dst, DS4_N_VOCAB);
     }
-    if (ok) g->mtp_pos = idx + 1u;
+    if (ok) g->mtp_pos = idx + T;
     return ok;
+}
+
+static bool qwen4_graph_mtp_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                 uint32_t row, int next_token, uint32_t idx, bool want_logits,
+                                 float *logits_out, int *draft_out) {
+    return qwen4_graph_mtp_steps(g, m, w, row, &next_token, 1u, idx, want_logits, logits_out, draft_out);
 }
 
 static int generate_qwen4_metal_argmax(
@@ -63839,7 +63881,9 @@ static void qwen4_dump_f32(const char *path, const float *v, uint64_t n) {
 /* --first-token-test for Qwen3.8: DS4_QWEN4_FT_TOKENS (comma-separated ids,
  * default: the prompt) runs the sequential CPU reference; DS4_QWEN4_FT_OUT
  * dumps [n][vocab] f32 logits, DS4_QWEN4_FT_HIDDEN [n][trunk][hc*embd]
- * streams, DS4_QWEN4_MTP_OUT the [n-1][vocab] teacher-forced MTP drafts. */
+ * streams, DS4_QWEN4_MTP_OUT the [n-1][vocab] teacher-forced MTP drafts.
+ * DS4_QWEN4_MTP_BATCH_CHECK also compares sequential and paired GPU drafts
+ * (requires MTP_OUT, GPU=1, and GPU_CHUNK >= 2). */
 static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab,
                                   const ds4_weights *weights, const ds4_tokens *prompt, bool metal) {
     /* DS4_QWEN4_FT_LIST=<file>: batch mode.  Each line is
@@ -63977,6 +64021,12 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         uint32_t chunk = chunk_env ? (uint32_t)atoi(chunk_env) : 1u;
         if (chunk == 0) chunk = 1;
         if (chunk > n_seq) chunk = n_seq;
+        const bool batch_check = getenv("DS4_QWEN4_MTP_BATCH_CHECK") != NULL;
+        if (batch_check && (!draft || chunk < 2u || n_seq < 3u)) {
+            fprintf(stderr, "ds4: MTP batch check needs MTP_OUT, GPU_CHUNK >= 2, and at least 3 tokens\n");
+            free(draft); free(layer_streams); free(streams); free(logits); free(seq);
+            return 1;
+        }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
         if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL)) {
             free(g);
@@ -63986,6 +64036,8 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         float *gpu = xmalloc((uint64_t)V * sizeof(float));
         float worst = 0.0f, mtp_worst = 0.0f;
         uint32_t agree = 0, scored = 0, mtp_agree = 0, mtp_scored = 0;
+        float batch_worst = 0.0f;
+        uint32_t batch_scored = 0;
         for (uint32_t t0 = 0; t0 < n_seq; t0 += chunk) {
             const uint32_t n = t0 + chunk <= n_seq ? chunk : n_seq - t0;
             if (!qwen4_graph_forward_tokens(g, model, weights, seq + t0, n, gpu, false)) {
@@ -64035,6 +64087,30 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
                 printf("  mtp %3u: max|gpu-cpu|=%g top1 cpu=%u gpu=%d%s\n", idx, (double)md, cd, dtok,
                        (int)cd == dtok ? "" : "  <-- MISMATCH");
                 memcpy(cpu_d, gpu, (uint64_t)V * sizeof(float));
+                if (batch_check && (j & 1u)) {
+                    /* Replay the same two positions. Causal attention cannot
+                     * read future entries, so existing KV rows are safe to overwrite. */
+                    const int next_tokens[2] = {seq[idx], seq[idx + 1u]};
+                    int paired = -1;
+                    bool bok = qwen4_graph_mtp_steps(g, model, weights, j - 1u, next_tokens,
+                                                     2u, idx - 1u, true, gpu, &paired);
+                    float err_max = 0.0f;
+                    if (bok) for (uint32_t i = 0; i < V; i++) {
+                        const float err_abs = fabsf(gpu[i] - cpu_d[i]);
+                        if (!isfinite(gpu[i]) || !isfinite(cpu_d[i]) ||
+                            err_abs > 2e-3f + 1e-4f * fabsf(cpu_d[i])) bok = false;
+                        if (err_abs > err_max) err_max = err_abs;
+                    }
+                    if (err_max > batch_worst) batch_worst = err_max;
+                    batch_scored++;
+                    if (!bok || paired != dtok) {
+                        fprintf(stderr, "ds4: MTP batch check failed at %u: max|diff|=%g top1 %d/%d\n",
+                                idx, (double)err_max, dtok, paired);
+                        free(gpu); qwen4_graph_free(g); free(g);
+                        free(draft); free(layer_streams); free(streams); free(logits); free(seq);
+                        return 1;
+                    }
+                }
             }
         }
         printf("Qwen3.8 GPU-vs-CPU: %u tokens (chunk %u), worst max|diff|=%g, top1 agree %u/%u\n",
@@ -64042,6 +64118,10 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         if (draft) {
             printf("Qwen3.8 GPU-vs-CPU MTP: worst max|diff|=%g, top1 agree %u/%u\n",
                    (double)mtp_worst, mtp_agree, mtp_scored);
+        }
+        if (batch_check) {
+            printf("Qwen3.8 MTP batch check: %u pairs passed, worst max|diff|=%g\n",
+                   batch_scored, (double)batch_worst);
         }
         free(gpu);
         qwen4_graph_free(g);
@@ -69807,7 +69887,16 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     if (accept) {
         token_vec_push(&s->checkpoint, d);
         memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
-        if (qwen4_graph_mtp_step(g, m, w, 0, d, pos, false, NULL, NULL)) {
+        if (getenv("DS4_QWEN4_NO_MTP_BATCH") == NULL) {
+            const int parent = sample_argmax(s->logits, V);
+            const int next_tokens[2] = {d, parent};
+            int draft = -1;
+            if (qwen4_graph_mtp_steps(g, m, w, 0, next_tokens, 2u, pos, true, NULL, &draft)) {
+                s->glm_mtp_draft = draft;
+                s->glm_mtp_parent = parent;
+                s->glm_mtp_have = 1;
+            }
+        } else if (qwen4_graph_mtp_step(g, m, w, 0, d, pos, false, NULL, NULL)) {
             qwen4_session_draft(s, 1, sample_argmax(s->logits, V), pos + 1u);
         }
         s->qwen4_spec_accepted++;
