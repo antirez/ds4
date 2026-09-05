@@ -18476,6 +18476,20 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
+__global__ static void attention_visual_unpack_heads_kernel(
+        float *heads, const float *tmp,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+        uint32_t head0, uint32_t head_count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)n_tokens * head_count * head_dim) return;
+    const uint32_t d = i % head_dim;
+    const uint64_t row = i / head_dim;
+    const uint32_t h = row % head_count;
+    const uint32_t t = row / head_count;
+    heads[((uint64_t)t * n_head + head0 + h) * head_dim + d] =
+        tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
+}
+
 extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
         ds4_gpu_tensor *heads,
         const void *model_map,
@@ -18500,7 +18514,9 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
         uint32_t n_head,
         uint32_t head_dim) {
     if (!heads || !model_map || !q || !raw_kv || !tokens || vocab_size == 0 ||
-        n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
+        n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        n_tokens > INT_MAX || n_head > (uint32_t)INT_MAX / head_dim ||
+        n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && (!comp_kv || ratio == 0)) ||
         (use_comp_mask && !comp_mask) || comp_kv_f16 || !g_cublas_ready ||
         sinks_offset > model_size ||
@@ -18530,11 +18546,21 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
 
     if (n_raw > UINT32_MAX - n_comp) return 0;
     const uint32_t n_keys = n_raw + n_comp;
+    if (n_keys > INT_MAX) return 0;
+    /* Keep small calls unchanged. Large visual prefills otherwise retain a
+     * context-sized score matrix for every head, which can exhaust memory.
+     * Heads are independent, so reuse that workspace across head groups. */
+    const uint64_t scores_per_head = (uint64_t)n_tokens * n_keys;
+    const uint64_t small_scores = UINT64_C(256) * 1024 * 1024 / sizeof(float);
+    const uint32_t head_cap = scores_per_head <= small_scores / n_head
+                           ? n_head : min(n_head, 8u);
+    if ((uint64_t)n_tokens * n_keys >
+        UINT64_MAX / head_cap / sizeof(float)) return 0;
     const uint64_t kv_count = (uint64_t)n_keys * head_dim;
     const uint64_t score_count =
-        (uint64_t)n_head * n_tokens * n_keys;
+        (uint64_t)head_cap * n_tokens * n_keys;
     const uint64_t out_count =
-        (uint64_t)n_head * n_tokens * head_dim;
+        (uint64_t)head_cap * n_tokens * head_dim;
     if (kv_count > UINT64_MAX / sizeof(float) ||
         score_count > UINT64_MAX / sizeof(float) ||
         out_count > UINT64_MAX / sizeof(float)) return 0;
@@ -18574,36 +18600,53 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
 
     const float alpha = rsqrtf((float)head_dim);
     const float beta = 0.0f;
-    cublasStatus_t status = cublasSgemmStridedBatched(
-            cuda_cublas_for_tier(logical_tier), CUBLAS_OP_T, CUBLAS_OP_N,
-            (int)n_keys, (int)n_tokens, (int)head_dim,
-            &alpha, kv, (int)head_dim, 0,
-            (const float *)q->ptr, (int)(n_head * head_dim),
-            (long long)head_dim, &beta, scores, (int)n_keys,
-            (long long)n_keys * n_tokens, (int)n_head);
-    if (!cublas_ok(status, "visual attention score gemm")) return 0;
-    dim3 score_grid(n_tokens, n_head, 1u);
-    attention_visual_mixed_softmax_kernel<<<score_grid, 256u>>>(
-            scores, sinks,
-            use_comp_mask ? (const float *)comp_mask->ptr : NULL,
-            device_bounds, use_comp_mask, n_tokens, pos0, first_raw_pos,
-            n_raw, n_comp, ratio, n_keys);
-    if (!cuda_ok(cudaGetLastError(), "visual attention softmax launch"))
-        return 0;
-
     const float one = 1.0f;
-    status = cublasSgemmStridedBatched(
-            cuda_cublas_for_tier(logical_tier), CUBLAS_OP_N, CUBLAS_OP_N,
-            (int)head_dim, (int)n_tokens, (int)n_keys,
-            &one, kv, (int)head_dim, 0, scores, (int)n_keys,
-            (long long)n_keys * n_tokens, &beta, out_tmp, (int)head_dim,
-            (long long)head_dim * n_tokens, (int)n_head);
-    if (!cublas_ok(status, "visual attention value gemm")) return 0;
-    const uint64_t values = (uint64_t)n_tokens * n_head * head_dim;
-    attention_prefill_unpack_heads_kernel<<<
-        (values + 255u) / 256u, 256u>>>(
-            (float *)heads->ptr, out_tmp, n_tokens, n_head, head_dim);
-    return cuda_ok(cudaGetLastError(), "visual attention unpack launch");
+    for (uint32_t head0 = 0; head0 < n_head;) {
+        const uint32_t remaining = n_head - head0;
+        /* Avoid a singleton tail: cuBLAS treats batchCount=1 differently. */
+        const uint32_t head_count = remaining == head_cap + 1u
+                                  ? head_cap - 1u : min(head_cap, remaining);
+        cublasStatus_t status = cublasSgemmStridedBatched(
+                cuda_cublas_for_tier(logical_tier), CUBLAS_OP_T, CUBLAS_OP_N,
+                (int)n_keys, (int)n_tokens, (int)head_dim,
+                &alpha, kv, (int)head_dim, 0,
+                (const float *)q->ptr + (uint64_t)head0 * head_dim,
+                (int)(n_head * head_dim),
+                (long long)head_dim, &beta, scores, (int)n_keys,
+                (long long)n_keys * n_tokens, (int)head_count);
+        if (!cublas_ok(status, "visual attention score gemm")) return 0;
+        dim3 score_grid(n_tokens, head_count, 1u);
+        attention_visual_mixed_softmax_kernel<<<score_grid, 256u>>>(
+                scores, sinks + head0,
+                use_comp_mask ? (const float *)comp_mask->ptr : NULL,
+                device_bounds, use_comp_mask, n_tokens, pos0, first_raw_pos,
+                n_raw, n_comp, ratio, n_keys);
+        if (!cuda_ok(cudaGetLastError(), "visual attention softmax launch"))
+            return 0;
+
+        status = cublasSgemmStridedBatched(
+                cuda_cublas_for_tier(logical_tier), CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)head_dim, (int)n_tokens, (int)n_keys,
+                &one, kv, (int)head_dim, 0, scores, (int)n_keys,
+                (long long)n_keys * n_tokens, &beta, out_tmp, (int)head_dim,
+                (long long)head_dim * n_tokens, (int)head_count);
+        if (!cublas_ok(status, "visual attention value gemm")) return 0;
+        const uint64_t values = (uint64_t)n_tokens * head_count * head_dim;
+        if (head_count == n_head) {
+            attention_prefill_unpack_heads_kernel<<<
+                (values + 255u) / 256u, 256u>>>(
+                    (float *)heads->ptr, out_tmp, n_tokens, n_head, head_dim);
+        } else {
+            attention_visual_unpack_heads_kernel<<<
+                (values + 255u) / 256u, 256u>>>(
+                    (float *)heads->ptr, out_tmp, n_tokens, n_head, head_dim,
+                    head0, head_count);
+        }
+        if (!cuda_ok(cudaGetLastError(), "visual attention unpack launch"))
+            return 0;
+        head0 += head_count;
+    }
+    return 1;
 }
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
