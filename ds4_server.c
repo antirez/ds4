@@ -6051,14 +6051,17 @@ static void append_cors_headers(buf *h) {
         "Access-Control-Allow-Headers: *\r\n");
 }
 
-static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+/* Binary-safe: takes an explicit length instead of strlen(), so it can send
+ * bodies containing NUL bytes (images, fonts, gzip'd assets). */
+static bool http_response_len(int fd, bool enable_cors, int code, const char *type,
+                               const char *body, size_t body_len) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
+                         code == 304 ? "Not Modified" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
-    const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
         "HTTP/1.1 %d %s\r\n"
@@ -6075,6 +6078,10 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     if (ok && body_len) ok = send_all(fd, body, body_len);
     buf_free(&h);
     return ok;
+}
+
+static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+    return http_response_len(fd, enable_cors, code, type, body, body ? strlen(body) : 0);
 }
 
 static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
@@ -6204,6 +6211,23 @@ static int clamp_usage_tokens(int value, int max) {
     return value;
 }
 
+/* llama.cpp-server-compatible "timings" object: the webui reads
+ * prompt_n/prompt_ms/predicted_n/predicted_ms to show tokens and tok/s per
+ * message. The extra per-second and per-token-ms fields match its schema but
+ * aren't required by the current webui build. */
+static void append_timings_json(buf *b, int prompt_tokens, double prompt_ms,
+                                int completion_tokens, double predicted_ms) {
+    if (prompt_ms < 0) prompt_ms = 0;
+    if (predicted_ms < 0) predicted_ms = 0;
+    double prompt_per_second = prompt_ms > 0 ? (double)prompt_tokens / (prompt_ms / 1000.0) : 0.0;
+    double predicted_per_second = predicted_ms > 0 ? (double)completion_tokens / (predicted_ms / 1000.0) : 0.0;
+    buf_printf(b,
+        "{\"prompt_n\":%d,\"prompt_ms\":%.3f,\"prompt_per_token_ms\":%.3f,\"prompt_per_second\":%.3f,"
+        "\"predicted_n\":%d,\"predicted_ms\":%.3f,\"predicted_per_token_ms\":%.3f,\"predicted_per_second\":%.3f}",
+        prompt_tokens, prompt_ms, prompt_tokens > 0 ? prompt_ms / prompt_tokens : 0.0, prompt_per_second,
+        completion_tokens, predicted_ms, completion_tokens > 0 ? predicted_ms / completion_tokens : 0.0, predicted_per_second);
+}
+
 static void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
@@ -6219,6 +6243,46 @@ static void append_openai_usage_json(buf *b, const request *r,
                "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
                cached_tokens, cache_write_tokens);
+}
+
+/* Live per-token timings chunk for the webui's running tok/s ticker: an
+ * empty-choices SSE object carrying only "timings", sent alongside every
+ * content/reasoning delta while generating. Without this the client only
+ * learns speed at the very end (see openai_sse_finish_live) and the
+ * previous turn's numbers stay on screen for the whole next generation. */
+static bool sse_openai_timings_chunk(int fd, const request *r, const char *id,
+                                     int prompt_tokens, double prompt_ms,
+                                     int completion_tokens, double predicted_ms) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[],\"timings\":");
+    append_timings_json(&b, prompt_tokens, prompt_ms, completion_tokens, predicted_ms);
+    buf_puts(&b, "}\n\n");
+
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+/* llama.cpp-server-compatible "prompt_progress" chunk: fed to the webui's
+ * "Processing (N%)" indicator while the prompt is being prefilled, before
+ * any token has been generated. */
+static bool sse_openai_prompt_progress_chunk(int fd, const request *r, const char *id,
+                                             int total, int cache, int processed,
+                                             double time_ms) {
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_printf(&b,
+        ",\"choices\":[],\"prompt_progress\":{\"total\":%d,\"cache\":%d,\"processed\":%d,\"time_ms\":%.3f}}\n\n",
+        total, cache, processed, time_ms);
+
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
 }
 
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
@@ -6332,6 +6396,7 @@ typedef struct {
     bool active;
     bool checked_think_prefix;
     bool guard_second_reasoning;
+    int guard_second_reasoning_tokens;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
@@ -7186,6 +7251,14 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
     if (st->mode == OPENAI_STREAM_TEXT) {
         if (st->guard_second_reasoning) {
+            /* DeepSeek sometimes leaves a short "escaped draft" artifact right
+             * after the first </think>, closed by a stray second </think>
+             * before the real answer. Give that a handful of tokens to show
+             * up; capping by token count (not by byte length) matters because
+             * a normal short reply ("Hi there!") would otherwise sit under
+             * any reasonable byte threshold and still get withheld until
+             * "final", i.e. the whole rest of the message. */
+            const int max_guard_hold_tokens = 8;
             const char *close = strstr(raw + st->emit_pos, "</think>");
             const char *tool = r->has_tools ?
                 find_any_tool_start(raw + st->emit_pos) : NULL;
@@ -7198,7 +7271,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                      st->guard_second_reasoning_tokens < max_guard_hold_tokens) {
+                st->guard_second_reasoning_tokens++;
                 return true;
             } else {
                 st->guard_second_reasoning = false;
@@ -7240,7 +7315,8 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    openai_stream *st, const char *raw,
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
-                                   int completion_tokens) {
+                                   int completion_tokens, double prompt_ms,
+                                   double predicted_ms) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     buf b = {0};
@@ -7256,7 +7332,9 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     json_escape(&b, r->model);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
+    buf_puts(&b, "}],\"timings\":");
+    append_timings_json(&b, prompt_tokens, prompt_ms, completion_tokens, predicted_ms);
+    buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
               sse_done(fd, r, id, prompt_tokens, completion_tokens);
@@ -8106,7 +8184,8 @@ static bool responses_final_response(int fd, bool enable_cors,
 static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens) {
+                           int prompt_tokens, int completion_tokens,
+                           double prompt_ms, double predicted_ms) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -8135,6 +8214,8 @@ static bool final_response(int fd, bool enable_cors,
         buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, ",\"timings\":");
+    append_timings_json(&b, prompt_tokens, prompt_ms, completion_tokens, predicted_ms);
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -9108,6 +9189,8 @@ struct server {
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    const char *webui_dir;
+    const char *model_path;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -10875,6 +10958,7 @@ typedef struct {
     bool stream_failed;
     double last_keepalive;
     job *request_job;
+    const char *id;
 } server_prefill_progress;
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
@@ -11417,6 +11501,18 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
+    if (p->stream && p->fd >= 0 && !p->stream_failed && p->id && p->request_job &&
+        request_uses_openai_live_stream(&p->request_job->req)) {
+        const int api_total = display_start + display_total;
+        const int api_processed = display_start + display_current;
+        if (!sse_openai_prompt_progress_chunk(p->fd, &p->request_job->req, p->id,
+                                              api_total, display_start, api_processed,
+                                              elapsed * 1000.0)) {
+            p->stream_failed = true;
+            job_mark_cancelled(p->request_job);
+            return;
+        }
+    }
     char flags[64];
     log_flags(flags, sizeof(flags), p->responses_protocol,
               p->has_tools, false, false, false);
@@ -12144,6 +12240,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
+    /* Generated before prefill (not just before generation) so the prefill
+     * progress callback can tag its SSE "prompt_progress" chunks with the
+     * same id the eventual completion chunks will use. */
+    char id[96];
+    responses_random_id(id, sizeof(id),
+                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
     server_prefill_progress progress = {
         .srv = s,
         .slot = slot,
@@ -12154,6 +12256,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         .responses_protocol = responses_protocol,
         .t0 = t0,
         .fd = j->fd,
+        .id = id,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
         .request_job = j,
@@ -12324,10 +12427,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
-    char id[96];
-    responses_random_id(id, sizeof(id),
-                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
-
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
@@ -12579,6 +12678,17 @@ decode_again:
                 !openai_sse_stream_update(j->fd, s, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
+                job_mark_cancelled(j);
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                free(piece);
+                stop_decode = true;
+                break;
+            }
+            if (openai_live_chat &&
+                !sse_openai_timings_chunk(j->fd, &j->req, id, prompt_tokens,
+                                          (decode_t0 - t0) * 1000.0, completion,
+                                          (now_sec() - decode_t0) * 1000.0)) {
                 job_mark_cancelled(j);
                 finish = "error";
                 snprintf(err, sizeof(err), "client stream write failed");
@@ -13032,6 +13142,8 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
+    const double prompt_ms = (decode_t0 - t0) * 1000.0;
+    const double predicted_ms = (now_sec() - decode_t0) * 1000.0;
     bool response_ok = !job_cancelled(j);
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
@@ -13042,7 +13154,8 @@ decode_again:
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
-                                                 prompt_tokens, completion);
+                                                 prompt_tokens, completion,
+                                                 prompt_ms, predicted_ms);
         } else if (responses_live_chat) {
             /* If parse recovered a malformed tool call back to plain text,
              * pass parsed_content so the streaming tail can be flushed; in
@@ -13083,7 +13196,8 @@ decode_again:
                                      parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                      parsed_reasoning,
                                      &parsed_calls, final_finish,
-                                     prompt_tokens, completion);
+                                     prompt_tokens, completion,
+                                     prompt_ms, predicted_ms);
     }
     if (job_cancelled(j)) response_ok = false;
     if (!response_ok) {
@@ -13436,6 +13550,143 @@ typedef struct {
     int fd;
 } client_arg;
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* Static asset serving for the webui/ tree (a prebuilt llama.cpp webui
+ * dist/, see --webui-dir). Mirrors llama.cpp's own asset MIME mapping. */
+static const char *mime_from_ext(const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+    ext++;
+    if (!strcmp(ext, "html")) return "text/html; charset=utf-8";
+    if (!strcmp(ext, "css")) return "text/css";
+    if (!strcmp(ext, "js")) return "application/javascript";
+    if (!strcmp(ext, "json")) return "application/json";
+    if (!strcmp(ext, "webmanifest")) return "application/manifest+json";
+    if (!strcmp(ext, "svg")) return "image/svg+xml";
+    if (!strcmp(ext, "png")) return "image/png";
+    if (!strcmp(ext, "jpg") || !strcmp(ext, "jpeg")) return "image/jpeg";
+    if (!strcmp(ext, "ico")) return "image/x-icon";
+    if (!strcmp(ext, "woff")) return "font/woff";
+    if (!strcmp(ext, "woff2")) return "font/woff2";
+    return "application/octet-stream";
+}
+
+static bool webui_path_is_safe(const char *rel_path) {
+    if (!rel_path[0] || rel_path[0] == '/') return false;
+    if (strstr(rel_path, "..")) return false;
+    return true;
+}
+
+static bool serve_webui_asset(server *s, int fd, const char *rel_path) {
+    if (!s->webui_dir || !webui_path_is_safe(rel_path)) {
+        return http_error(fd, s->enable_cors, 404, "not found");
+    }
+    char full[PATH_MAX];
+    int n = snprintf(full, sizeof(full), "%s/%s", s->webui_dir, rel_path);
+    if (n < 0 || (size_t)n >= sizeof(full)) {
+        return http_error(fd, s->enable_cors, 404, "not found");
+    }
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        return http_error(fd, s->enable_cors, 404, "not found");
+    }
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
+        fclose(f);
+        return http_error(fd, s->enable_cors, 404, "not found");
+    }
+    size_t size = (size_t)st.st_size;
+    char *data = xmalloc(size ? size : 1);
+    size_t nread = size ? fread(data, 1, size, f) : 0;
+    fclose(f);
+    if (nread != size) {
+        free(data);
+        return http_error(fd, s->enable_cors, 500, "failed to read asset");
+    }
+    bool ok = http_response_len(fd, s->enable_cors, 200, mime_from_ext(rel_path), data, size);
+    free(data);
+    return ok;
+}
+
+/* GET /health - polled by the webui's connectivity/API-key checks. */
+static bool send_health(server *s, int fd) {
+    return http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"ok\"}\n");
+}
+
+/* Minimal llama.cpp-server-compatible sampling defaults for GET /props.
+ * ds4 doesn't expose per-request sampler introspection, so these are the
+ * request defaults rather than the live values of any in-flight request. */
+static void append_default_generation_params_json(buf *b, const server *s) {
+    buf_printf(b,
+        "{"
+        "\"n_predict\":%d,\"seed\":-1,\"temperature\":0.7,"
+        "\"dynatemp_range\":0.0,\"dynatemp_exponent\":1.0,"
+        "\"top_k\":40,\"top_p\":0.95,\"min_p\":0.05,\"top_n_sigma\":-1.0,"
+        "\"xtc_probability\":0.0,\"xtc_threshold\":0.1,\"typ_p\":1.0,"
+        "\"repeat_last_n\":64,\"repeat_penalty\":1.0,"
+        "\"presence_penalty\":0.0,\"frequency_penalty\":0.0,"
+        "\"dry_multiplier\":0.0,\"dry_base\":1.75,"
+        "\"dry_allowed_length\":2,\"dry_penalty_last_n\":-1,\"dry_sequence_breakers\":[],"
+        "\"mirostat\":0,\"mirostat_tau\":5.0,\"mirostat_eta\":0.1,"
+        "\"stop\":[],\"max_tokens\":%d,\"n_keep\":0,\"n_discard\":0,"
+        "\"ignore_eos\":false,\"stream\":true,\"logit_bias\":[],"
+        "\"n_probs\":0,\"min_keep\":0,\"grammar\":\"\",\"grammar_lazy\":false,"
+        "\"grammar_triggers\":[],\"preserved_tokens\":[],"
+        "\"chat_format\":\"Content Only\",\"reasoning_format\":\"auto\","
+        "\"reasoning_in_content\":false,\"generation_prompt\":\"\","
+        "\"samplers\":[\"penalties\",\"top_k\",\"typ_p\",\"top_p\",\"min_p\",\"temperature\"],"
+        "\"backend_sampling\":false,"
+        "\"speculative.n_max\":16,\"speculative.n_min\":0,\"speculative.p_min\":0.9,"
+        "\"timings_per_token\":false,\"post_sampling_probs\":false,\"lora\":[]"
+        "}",
+        s->default_tokens, s->default_tokens);
+}
+
+/* GET /props - required by the webui at boot: a non-2xx response leaves the
+ * chat input permanently disabled (see ServerStore.fetch/hasPropsError). Role
+ * is reported as "model" (not "router"), which keeps the webui from ever
+ * calling /models/sse, /models/load, /slots, /tools, /cors-proxy: those are
+ * router-mode-only or gated behind the endpoint_* flags below, all false. */
+static bool send_props(server *s, int fd) {
+    const char *model_name = ds4_engine_model_name(s->engine);
+    buf b = {0};
+    buf_puts(&b, "{\"default_generation_settings\":{\"id\":0,\"id_task\":-1,");
+    buf_printf(&b, "\"n_ctx\":%d,", s->ctx_size);
+    buf_puts(&b, "\"speculative\":false,\"is_processing\":false,\"params\":");
+    append_default_generation_params_json(&b, s);
+    buf_puts(&b,
+        ",\"prompt\":\"\",\"next_token\":{\"has_next_token\":false,\"has_new_line\":false,"
+        "\"n_remain\":0,\"n_decoded\":0,\"stopping_word\":\"\"}},");
+    buf_printf(&b, "\"total_slots\":%d,", s->slot_count);
+    buf_puts(&b, "\"model_alias\":");
+    json_escape(&b, model_name);
+    buf_puts(&b, ",\"model_path\":");
+    json_escape(&b, s->model_path ? s->model_path : model_name);
+    buf_puts(&b,
+        ",\"model_ftype\":\"\","
+        "\"role\":\"model\","
+        "\"modalities\":{\"vision\":false,\"audio\":false,\"video\":false},"
+        "\"media_marker\":\"<__media__>\","
+        "\"endpoint_slots\":false,"
+        "\"endpoint_props\":false,"
+        "\"endpoint_metrics\":false,"
+        "\"ui\":true,"
+        "\"chat_template\":\"{% if enable_thinking %}{% endif %}\","
+        "\"chat_template_caps\":{},"
+        "\"bos_token\":\"\","
+        "\"eos_token\":\"\","
+        "\"build_info\":\"ds4\","
+        "\"is_sleeping\":false,"
+        "\"cors_proxy_enabled\":false"
+        "}\n");
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
@@ -13631,8 +13882,23 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/") || !strcmp(hr.path, "/index.html"))) {
+        serve_webui_asset(s, fd, "index.html");
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/props")) {
+        send_props(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/health") || !strcmp(hr.path, "/v1/health"))) {
+        send_health(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -13643,6 +13909,11 @@ static void *client_main(void *arg) {
         server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET")) {
+        serve_webui_asset(s, fd, hr.path + 1);
         http_request_free(&hr);
         goto done;
     }
@@ -13663,6 +13934,14 @@ static void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "GET") && s->webui_dir) {
+        /* Falls through here for every webui asset path (/_app/..., favicon.ico,
+         * manifest.webmanifest, sw.js, ...): each maps 1:1 to a file under
+         * webui_dir, so no route table is needed - serve_webui_asset 404s on
+         * anything not on disk. */
+        serve_webui_asset(s, fd, hr.path[0] == '/' ? hr.path + 1 : hr.path);
+        http_request_free(&hr);
+        goto done;
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
         http_request_free(&hr);
@@ -13770,6 +14049,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    const char *webui_dir;
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -13913,6 +14193,7 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
+        .webui_dir = "webui",
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -14001,6 +14282,10 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--webui-dir")) {
+            c.webui_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--no-webui")) {
+            c.webui_dir = NULL;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -14278,6 +14563,8 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.webui_dir = cfg.webui_dir;
+    s.model_path = cfg.engine.model_path;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -15218,7 +15505,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
                                        raw, strlen(raw), &calls,
-                                       "tool_calls", 10, 8));
+                                       "tool_calls", 10, 8, 0.0, 0.0));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -15267,7 +15554,7 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
         "<think>first pass</think>escaped draft</think>final answer";
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_second_think",
                                        &st, complete, strlen(complete), NULL,
-                                       "stop", 5, 9));
+                                       "stop", 5, 9, 0.0, 0.0));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -15399,7 +15686,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
         "We need to generate a title</think>Free disk space check";
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_title", &st,
                                        raw2, strlen(raw2), NULL,
-                                       "stop", 12, 8));
+                                       "stop", 12, 8, 0.0, 0.0));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
 
@@ -15472,7 +15759,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     TEST_ASSERT(!strncmp(calls.v[0].id, "call_", 5));
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
                                        raw_complete, strlen(raw_complete), &calls,
-                                       "tool_calls", 10, 4));
+                                       "tool_calls", 10, 4, 0.0, 0.0));
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -15542,7 +15829,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
                                        raw, strlen(raw), &calls,
-                                       "tool_calls", 10, 4));
+                                       "tool_calls", 10, 4, 0.0, 0.0));
 
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
