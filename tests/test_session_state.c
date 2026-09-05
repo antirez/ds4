@@ -131,6 +131,44 @@ static void test_glm_attention_budget(void) {
         assert(glm_graph_dense_compact_attention_limit(g) == 2051);
         g->full_kv_cache = false;
     }
+
+    const char *resident_env = getenv("DS4_GLM_FULL_ATTN_CAP");
+    const char *streaming_env = getenv("DS4_GLM_FULL_ATTN_STREAMING_CAP");
+    char *saved_resident = resident_env ? strdup(resident_env) : NULL;
+    char *saved_streaming = streaming_env ? strdup(streaming_env) : NULL;
+    assert(!resident_env || saved_resident);
+    assert(!streaming_env || saved_streaming);
+    assert(setenv("DS4_GLM_FULL_ATTN_CAP", "1024", 1) == 0);
+    assert(setenv("DS4_GLM_FULL_ATTN_STREAMING_CAP", "1024", 1) == 0);
+    assert(glm_graph_full_attention_cap(4096, false) == 1024);
+    assert(glm_graph_full_attention_cap(4096, true) == 1024);
+    const uint32_t selected_capacity =
+        glm_graph_indexer_selected_capacity(4096, false);
+    assert(selected_capacity == 2051);
+    assert(glm_graph_indexer_selected_capacity(1024, false) == 1024);
+    assert(ds4_gpu_init());
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(
+        (uint64_t)selected_capacity * sizeof(uint32_t));
+    assert(selected);
+    assert(ds4_gpu_glm_fill_selected_range_tensor(selected, 1025));
+    uint32_t last = UINT32_MAX;
+    assert(ds4_gpu_tensor_read(selected, 1024u * sizeof(uint32_t),
+                               &last, sizeof(last)));
+    assert(last == 1024);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_cleanup();
+    if (saved_resident) {
+        assert(setenv("DS4_GLM_FULL_ATTN_CAP", saved_resident, 1) == 0);
+    } else {
+        assert(unsetenv("DS4_GLM_FULL_ATTN_CAP") == 0);
+    }
+    if (saved_streaming) {
+        assert(setenv("DS4_GLM_FULL_ATTN_STREAMING_CAP", saved_streaming, 1) == 0);
+    } else {
+        assert(unsetenv("DS4_GLM_FULL_ATTN_STREAMING_CAP") == 0);
+    }
+    free(saved_streaming);
+    free(saved_resident);
     free(g);
     g_ds4_shape = saved_shape;
 }

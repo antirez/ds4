@@ -4621,6 +4621,10 @@ kernel void kernel_glm_attention_indexed_batch_lora_heads_impl(
     }
 }
 
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group16_vec_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t
+kernel_glm_attention_indexed_batch_lora_heads_impl<false, true, 2u>;
+
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads")]]
 kernel glm_attention_indexed_batch_lora_group8_vec_t
 kernel_glm_attention_indexed_batch_lora_heads_impl<true, true, 2u>;

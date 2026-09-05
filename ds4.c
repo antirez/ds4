@@ -37766,6 +37766,18 @@ static uint32_t glm53_graph_indexer_selected_limit(void) {
     return glm_graph_indexer_top_k_limit() + DS4_GLM53_INDEX_POOL_SIZE - 1u;
 }
 
+static uint32_t glm_graph_indexer_selected_capacity(
+        uint32_t ctx_size,
+        bool     expanded_kv) {
+    const uint32_t sparse_limit = ds4_model_is_glm53() ?
+        glm53_graph_indexer_selected_limit() :
+        glm_graph_indexer_top_k_limit();
+    if (ds4_model_is_glm53() && !expanded_kv && ctx_size < sparse_limit) {
+        return ctx_size;
+    }
+    return sparse_limit;
+}
+
 static uint32_t glm53_graph_indexer_pool_cap(uint32_t token_cap) {
     return (token_cap + DS4_GLM53_INDEX_POOL_SIZE - 1u) /
            DS4_GLM53_INDEX_POOL_SIZE;
@@ -38037,6 +38049,7 @@ static uint64_t glm_graph_workspace_add_bytes(
 static uint32_t glm_graph_indexed_decode_split_blocks(void);
 
 static uint64_t glm_graph_workspace_bytes_for_cap(
+        uint32_t ctx_size,
         uint32_t full_attention_cap,
         uint32_t compact_cap,
         bool     ssd_streaming) {
@@ -38051,12 +38064,8 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
         glm_graph_batch_row_cap(full_attention_cap,
                                 (uint32_t)indexed_rows,
                                 expanded_kv);
-    const uint64_t indexer_top_k =
-        ds4_model_is_glm53() && !expanded_kv ?
-            full_attention_cap :
-        ds4_model_is_glm53() ?
-            glm53_graph_indexer_selected_limit() :
-            glm_graph_indexer_top_k_limit();
+    const uint64_t indexer_selected_capacity =
+        glm_graph_indexer_selected_capacity(ctx_size, expanded_kv);
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_KEY_MLA;
     const uint64_t q_nope =
         DS4_N_KEY_MLA > DS4_N_ROT ? (uint64_t)DS4_N_KEY_MLA - DS4_N_ROT : 0;
@@ -38098,7 +38107,9 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
                                           DS4_N_INDEXER_HEAD_DIM,
                                           sizeof(float));
     bytes = glm_graph_workspace_add_bytes(bytes, DS4_N_INDEXER_HEAD, sizeof(float));
-    bytes = glm_graph_workspace_add_bytes(bytes, indexer_top_k, sizeof(uint32_t));
+    bytes = glm_graph_workspace_add_bytes(bytes,
+                                          indexer_selected_capacity,
+                                          sizeof(uint32_t));
     bytes = glm_graph_workspace_add_bytes(bytes, qk_low_elems, sizeof(float));
     bytes = glm_graph_workspace_add_bytes(bytes,
                                           split_attn_blocks * qk_low_elems,
@@ -38230,7 +38241,8 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap_slic
                       glm_graph_full_kv_cache_elem_bytes();
     }
     m.scratch_bytes =
-        glm_graph_workspace_bytes_for_cap(work_ctx,
+        glm_graph_workspace_bytes_for_cap(ctx,
+                                          work_ctx,
                                           compact_cap,
                                           ssd_streaming) +
         glm53_graph_fixed_state_bytes(layer_start, layer_end);
@@ -43471,8 +43483,7 @@ static bool glm_graph_alloc_slice(
     const uint32_t indexer_selected_limit = g->glm53 ?
         glm53_graph_indexer_selected_limit() : indexer_top_k;
     const uint32_t dense_indexer_selected_limit =
-        g->glm53 && !g->full_kv_cache ?
-            g->ctx_cap : indexer_selected_limit;
+        glm_graph_indexer_selected_capacity(g->ctx_size, g->full_kv_cache);
     const uint32_t indexer_selected_pools = g->glm53 ?
         indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE : 0u;
     const uint64_t indexer_selected_bytes =
@@ -44624,8 +44635,22 @@ static bool glm53_graph_kda_attention(
             } else
 #endif
             if (qk_paired) {
-                ok = glm53_graph_matmul(g->kda_v, model, l->kda_v,
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+                ok = ds4_gpu_matmul_q4_K_pair_decode_tensor(
+                        g->kda_q,
+                        g->kda_k,
+                        model->map,
+                        model->size,
+                        l->kda_q->abs_offset,
+                        l->kda_k->abs_offset,
+                        DS4_N_EMBD,
+                        projection,
+                        g->attn_norm) != 0 &&
+                     glm53_graph_matmul(g->kda_v, model, l->kda_v,
                                         DS4_N_EMBD, projection, g->attn_norm);
+#else
+                ok = false;
+#endif
             } else {
                 ok = glm53_graph_matmul(g->kda_q, model, l->kda_q,
                                         DS4_N_EMBD, projection, g->attn_norm) &&

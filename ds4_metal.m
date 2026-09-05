@@ -587,6 +587,7 @@ static id<MTLComputePipelineState> g_glm_attention_indexed_batch_group8_pipeline
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline;
+static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group16_vec_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline;
@@ -9050,6 +9051,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid");
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
+        g_glm_attention_indexed_batch_lora_group16_vec_fullheads_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group16_vec_fullheads");
         g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads");
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline =
@@ -9157,6 +9160,7 @@ int ds4_gpu_init(void) {
             !g_glm_attention_indexed_batch_lora_group8_vec_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline ||
+            !g_glm_attention_indexed_batch_lora_group16_vec_fullheads_pipeline ||
             !g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline ||
@@ -11785,6 +11789,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_attention_indexed_batch_lora_group8_vec_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline = nil;
+        g_glm_attention_indexed_batch_lora_group16_vec_fullheads_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline = nil;
@@ -37570,7 +37575,7 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         const uint32_t heads_per_sg =
             ds4_gpu_glm53_prefill_indexed_attn_heads_per_sg();
         const bool use_wide_head_groups =
-            use_vec_lora && selected_rows_valid && full_head_groups &&
+            use_vec_lora && full_head_groups &&
             heads_per_sg > 1u &&
             qk_rope == 0u &&
             n_head == 64u && qk_nope == 256u &&
@@ -37579,9 +37584,13 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         id<MTLComputePipelineState> pipeline = nil;
         if (use_wide_head_groups) {
             ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN);
-            pipeline = ds4_gpu_hot_pipeline(
+            pipeline = selected_rows_valid ?
+                ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline,
-                    "kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads");
+                    "kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads") :
+                ds4_gpu_hot_pipeline(
+                    g_glm_attention_indexed_batch_lora_group16_vec_fullheads_pipeline,
+                    "kernel_glm_attention_indexed_batch_lora_group16_vec_fullheads");
         } else if (use_vec_lora && selected_rows_valid && full_head_groups) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline,
