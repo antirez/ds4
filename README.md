@@ -129,11 +129,25 @@ The interactive CLI keeps a multi-turn conversation. Use `/help`, `/status`,
 Run each binary with `--help` for its full options.
 
 The welcome screen shows the DwarfStar logo, session settings, and full command
-guide in a layout that adapts to terminal width. `--ui-logo auto` (default) uses
-an image in Ghostty/Kitty and text art elsewhere; `--ui-logo image` or
-`--ui-logo text` selects a style. Text art uses Unicode Braille with an ASCII
-fallback. Images fall back to text with `NO_COLOR`, in terminal multiplexers,
-or when unsupported. Both logo variants are embedded in the executable.
+guide in a layout that adapts to terminal width. Select its style with `--ui-logo`:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` (default) | Image in detected Ghostty/Kitty terminals; otherwise locale-aware text. |
+| `image` | Same selection as `auto`, with a notice when falling back to text. |
+| `braille` | Explicit Unicode Braille, overriding the locale check. Never an image. |
+| `ascii` | Hand-tuned ASCII logo and separators, sized to fit the terminal. Never an image. |
+
+Automatic text fallback uses Braille for UTF-8 locales and ASCII otherwise.
+Locale detection uses the first nonempty `LC_ALL`, `LC_CTYPE`, or `LANG`;
+an unset locale assumes UTF-8. It does not detect missing font glyphs.
+Redirected output and `TERM=dumb` use ASCII even in `braille` mode.
+Images fall back to locale-aware text with `NO_COLOR`, in terminal multiplexers,
+or when the terminal cannot fit the image layout. `NO_COLOR` also disables
+text colors, independently of the selected character set. All logo styles
+use assets embedded in the executable.
+The ASCII version is a stylized interpretation with simplified contours and
+readable lettering; very narrow terminals show just the name.
 
 Once the model is ready, interactive mode clears the terminal and draws the
 welcome screen. Redirected output and non-interactive modes are never cleared.

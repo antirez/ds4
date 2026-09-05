@@ -8,7 +8,8 @@
 typedef enum {
     DS4_CLI_LOGO_AUTO,
     DS4_CLI_LOGO_IMAGE,
-    DS4_CLI_LOGO_TEXT,
+    DS4_CLI_LOGO_BRAILLE,
+    DS4_CLI_LOGO_ASCII,
 } ds4_cli_logo_mode;
 
 typedef struct {

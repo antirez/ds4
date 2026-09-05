@@ -208,16 +208,10 @@ static double logo_coverage(int x, int y, int width, int height) {
     return (double)ink / ((x1 - x0) * (y1 - y0));
 }
 
-static void logo_row(FILE *fp, const cli_ui_style *s, int row, int width, int height) {
+static void logo_braille_row(FILE *fp, const cli_ui_style *s, int row, int width, int height) {
     static const int dots[4][2] = {{0, 3}, {1, 4}, {2, 5}, {6, 7}};
-    static const char ramp[] = " .:-=+*#%@";
     fputs(s->accent, fp);
     for (int x = 0; x < width; x++) {
-        if (!s->unicode) {
-            int index = (int)(logo_coverage(x, row, width, height) * 9 + 0.5);
-            fputc(ramp[index], fp);
-            continue;
-        }
         unsigned int bits = 0;
         for (int dy = 0; dy < 4; dy++) {
             for (int dx = 0; dx < 2; dx++) {
@@ -257,6 +251,9 @@ static void logo_image(FILE *fp, int up, int left, int width) {
 
 void ds4_cli_ui_print_welcome(FILE *fp, const ds4_cli_ui_state *state) {
     cli_ui_style s = cli_ui_make_style(fp);
+    // Explicit text styles override locale detection, not plain-output guards.
+    if (state->logo_mode == DS4_CLI_LOGO_BRAILLE) s.unicode = cli_ui_terminal(fp);
+    else if (state->logo_mode == DS4_CLI_LOGO_ASCII) s.unicode = false;
     char lines[5][160];
     session_lines(state, lines);
     bool side = s.width >= 74;
@@ -271,8 +268,17 @@ void ds4_cli_ui_print_welcome(FILE *fp, const ds4_cli_ui_state *state) {
     int logo_height = larger(1, (int)(logo_width * aspect));
     if (logo_height < logo_width * aspect) logo_height++;
     int body_height = side ? larger(logo_height, SIDEBAR_ROWS) : logo_height;
-    bool image = state->logo_mode != DS4_CLI_LOGO_TEXT && s.images &&
+    bool image = (state->logo_mode == DS4_CLI_LOGO_AUTO ||
+                  state->logo_mode == DS4_CLI_LOGO_IMAGE) && s.images &&
                  (!s.rows || body_height < s.rows);
+    int ascii = 0;
+    if (!image && !s.unicode) {
+        int count = sizeof(ds4_cli_logo_ascii) / sizeof(ds4_cli_logo_ascii[0]);
+        while (ascii + 1 < count && ds4_cli_logo_ascii[ascii].width > logo_width) ascii++;
+        logo_width = smaller(logo_width, ds4_cli_logo_ascii[ascii].width);
+        logo_height = ds4_cli_logo_ascii[ascii].height;
+        body_height = side ? larger(logo_height, SIDEBAR_ROWS) : logo_height;
+    }
     int logo_top = (body_height - logo_height) / 2;
     int details_top = (body_height - SIDEBAR_ROWS) / 2;
     int logo_left = s.margin + (side ? 0 : (s.width - logo_width) / 2);
@@ -289,9 +295,10 @@ void ds4_cli_ui_print_welcome(FILE *fp, const ds4_cli_ui_state *state) {
     fputc('\n', fp);
     for (int row = 0; row < body_height; row++) {
         spaces(fp, logo_left);
-        if (!image && row >= logo_top && row < logo_top + logo_height)
-            logo_row(fp, &s, row - logo_top, logo_width, logo_height);
-        else spaces(fp, logo_width);
+        if (!image && row >= logo_top && row < logo_top + logo_height) {
+            if (s.unicode) logo_braille_row(fp, &s, row - logo_top, logo_width, logo_height);
+            else text_cell(fp, &s, s.accent, ds4_cli_logo_ascii[ascii].rows[row - logo_top], logo_width, true);
+        } else spaces(fp, logo_width);
         if (side) {
             spaces(fp, 4);
             int line = row - details_top;

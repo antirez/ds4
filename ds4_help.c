@@ -270,7 +270,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
-    opt(fp, c, "--ui-logo MODE", "Logo style: auto (default), image, or text. Image uses Kitty graphics; falls back to text elsewhere.");
+    opt(fp, c, "--ui-logo MODE", "Logo style: auto (default), image, braille, or ascii. Image uses Kitty graphics with a text fallback.");
     opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live conversation.");
     fputc('\n', fp);
     if (full) {

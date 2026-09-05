@@ -2240,9 +2240,10 @@ static cli_config parse_options(int argc, char **argv) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (!strcmp(mode, "auto")) c.ui_logo = DS4_CLI_LOGO_AUTO;
             else if (!strcmp(mode, "image")) c.ui_logo = DS4_CLI_LOGO_IMAGE;
-            else if (!strcmp(mode, "text")) c.ui_logo = DS4_CLI_LOGO_TEXT;
+            else if (!strcmp(mode, "braille")) c.ui_logo = DS4_CLI_LOGO_BRAILLE;
+            else if (!strcmp(mode, "ascii")) c.ui_logo = DS4_CLI_LOGO_ASCII;
             else {
-                fprintf(stderr, "ds4: --ui-logo expects auto, image, or text\n");
+                fprintf(stderr, "ds4: --ui-logo expects auto, image, braille, or ascii\n");
                 exit(2);
             }
         } else if (!strcmp(arg, "--warm-weights")) {
