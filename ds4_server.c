@@ -10487,19 +10487,37 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
     return live_tokens->len;
 }
 
-/* Tool-less thinking continuation.
+static bool visible_live_matches_prompt(const visible_live_state *state,
+                                        int live_pos,
+                                        const char *prompt_text,
+                                        size_t prompt_len,
+                                        size_t *visible_len) {
+    if (!state || !state->valid || state->live_tokens != live_pos ||
+        !prompt_text || !state->visible_text || state->visible_len >= prompt_len ||
+        !byte_prefix_match(prompt_text, prompt_len,
+                           state->visible_text, state->visible_len))
+    {
+        return false;
+    }
+    if (visible_len) *visible_len = state->visible_len;
+    return true;
+}
+
+/* Visible chat continuation.
  *
  * Chat/completions and Anthropic do not have a previous_response_id object that
- * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
+ * binds a later request to the last sampled turn.  A later rendered prompt may
+ * nevertheless normalize or omit sampled assistant bytes: hidden reasoning is
+ * omitted after tool-less answers, while reasoning immediately before a tool
+ * call may lose insignificant whitespace during parse-and-replay.  The live KV
+ * state is then richer than, but logically equivalent to, the visible replay.
  *
- * Remembering the visible transcript as a key lets us keep the sampled hidden
- * KV when the next request clearly extends that same visible history.  This is
- * the same byte-prefix idea used by the disk cache: the client-visible text
- * selects the checkpoint, while the payload stays the exact sampled token
- * frontier.  If the visible key does not match, callers fall back to ordinary
- * token/text/disk matching. */
+ * Remembering the visible transcript as a key lets us keep the sampled live KV
+ * when the next request clearly extends that same visible history.  This is the
+ * same byte-prefix idea used by the disk cache: the client-visible text selects
+ * the checkpoint, while the payload stays the exact sampled token frontier. If
+ * the visible key does not match, callers fall back to ordinary token/text/disk
+ * matching. */
 static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
                                                const request *req,
                                                int live_pos,
@@ -10510,14 +10528,9 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
-              slot->thinking_live.visible_text &&
-              slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
-    if (ok) visible_len = slot->thinking_live.visible_len;
+    bool ok = visible_live_matches_prompt(&slot->thinking_live, live_pos,
+                                          req->prompt_text, prompt_len,
+                                          &visible_len);
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -11561,6 +11574,39 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     free(visible);
 }
 
+static char *build_tool_call_visible_text(const request *r,
+                                          const char *content,
+                                          const char *reasoning,
+                                          const tool_calls *calls) {
+    if (!r || !r->prompt_text || !calls || calls->len == 0) return NULL;
+    char *suffix = build_tool_checkpoint_suffix(r, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    free(suffix);
+    return buf_take(&visible);
+}
+
+static void remember_tool_call_checkpoint(server *s, server_slot *slot,
+                                          const job *j, const char *ctx,
+                                          uint64_t trace_id,
+                                          const char *content,
+                                          const char *reasoning,
+                                          const tool_calls *calls) {
+    char *visible = build_tool_call_visible_text(&j->req, content, reasoning,
+                                                 calls);
+    if (!visible) return;
+
+    thinking_live_remember(s, slot, visible);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool-call live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(visible));
+    trace_event(s, trace_id,
+                "tool-call live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), strlen(visible));
+    free(visible);
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -12036,7 +12082,23 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0 && live_vision_match) {
+    }
+    /* Validate a remembered client-visible continuation before attempting a
+     * token rewind. The live state may intentionally contain sampled bytes
+     * absent from the normalized replay, and GLM recurrent state cannot be
+     * rewound safely to an arbitrary common-token position. */
+    if (cached == 0 && live_vision_match) {
+        int thinking_cached =
+            thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
+                                                &effective_prompt);
+        if (thinking_cached > 0) {
+            cached = thinking_cached;
+            cache_source = "chat-visible";
+            thinking_live_continuation = true;
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0 && live_vision_match) {
         const int rewind_to = live_prefix_rewind_target(
             ds4_engine_is_glm_dsa(s->engine), old_pos,
             j->req.prompt.len, common);
@@ -12066,17 +12128,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";
-        }
-    }
-    if (cached == 0 && live_vision_match) {
-        int thinking_cached =
-            thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                &effective_prompt);
-        if (thinking_cached > 0) {
-            cached = thinking_cached;
-            cache_source = "thinking-visible";
-            thinking_live_continuation = true;
-            prompt_for_sync = &effective_prompt;
         }
     }
     int disk_cached = 0;
@@ -12177,7 +12228,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
+                   "ds4-server: visible chat continuation match=visible-prefix cached=%d prompt=%d",
                    cached,
                    prompt_tokens);
     }
@@ -13010,18 +13061,22 @@ decode_again:
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        strcmp(final_finish, "error") && strcmp(final_finish, "length"))
     {
         /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
+         * to this live KV state. Canonicalize the fallback path when exact raw
+         * tool text is unavailable. In either case, remember the canonical
+         * visible transcript so harmless normalization of adjacent reasoning
+         * whitespace does not force the next turn to prefill from token zero.
+         * The byte-prefix check still rejects edits and unrelated branches. */
+        if (should_canonicalize_tool_checkpoint(s, &parsed_calls)) {
+            canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, &parsed_calls);
+        }
+        remember_tool_call_checkpoint(s, slot, j, ctx_span, trace_id,
+                                      parsed_content ? parsed_content : "",
+                                      parsed_reasoning, &parsed_calls);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
     } else if (!parsed_calls.len &&
@@ -16742,6 +16797,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -16751,6 +16807,10 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     buf canonical = {0};
     buf_puts(&canonical, prompt_text);
     buf_puts(&canonical, suffix);
+
+    char *visible = build_tool_call_visible_text(&r, content, reasoning, &calls);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(!strcmp(visible, canonical.ptr));
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
@@ -16770,6 +16830,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
     free(future_prompt);
+    free(visible);
     buf_free(&canonical);
     free(suffix);
     free(prompt_text);
@@ -16815,6 +16876,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
     r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
 
@@ -16826,6 +16888,10 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     buf canonical = {0};
     buf_puts(&canonical, prompt_text);
     buf_puts(&canonical, suffix);
+
+    char *visible = build_tool_call_visible_text(&r, content, reasoning, &calls);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(!strcmp(visible, canonical.ptr));
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
@@ -16846,6 +16912,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
     free(future_prompt);
+    free(visible);
     buf_free(&canonical);
     free(suffix);
     free(prompt_text);
@@ -17937,6 +18004,34 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_visible_live_prefix_accepts_normalized_tool_turn(void) {
+    const char *visible = "prefix):<tool_call>bash</tool_call>";
+    const char *sampled = "prefix):\n<tool_call>bash</tool_call>";
+    const char *next_prompt =
+        "prefix):<tool_call>bash</tool_call><tool_response>ok</tool_response>";
+    visible_live_state state = {
+        .valid = true,
+        .live_tokens = 161095,
+        .visible_text = (char *)visible,
+        .visible_len = strlen(visible),
+    };
+    size_t visible_len = 0;
+
+    TEST_ASSERT(strcmp(sampled, visible) != 0);
+    TEST_ASSERT(visible_live_matches_prompt(&state, 161095, next_prompt,
+                                            strlen(next_prompt), &visible_len));
+    TEST_ASSERT(visible_len == strlen(visible));
+    TEST_ASSERT(!visible_live_matches_prompt(&state, 161094, next_prompt,
+                                             strlen(next_prompt), NULL));
+    TEST_ASSERT(!visible_live_matches_prompt(
+        &state, 161095,
+        "changed):<tool_call>bash</tool_call><tool_response>ok</tool_response>",
+        strlen("changed):<tool_call>bash</tool_call><tool_response>ok</tool_response>"),
+        NULL));
+    TEST_ASSERT(!visible_live_matches_prompt(&state, 161095, visible,
+                                             strlen(visible), NULL));
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -19502,6 +19597,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_visible_live_prefix_accepts_normalized_tool_turn();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
