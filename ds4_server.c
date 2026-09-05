@@ -3090,6 +3090,22 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static int ds4_vision_encode_cached(server *s, ds4_engine *e,
+                                    const uint8_t *encoded, size_t encoded_len,
+                                    ds4_vision_embedding *out,
+                                    char *error, size_t error_cap);
+static uint64_t ds4_vembed_hits_now(server *s);
+static uint64_t ds4_vembed_bytes_now(server *s);
+static void ds4_vembed_log_reuse(uint64_t hits, size_t count,
+                                 uint64_t cache_bytes);
+
+/* Only call on a marker already matched against a server-generated nonce.
+ * Keep its width/offset but give the rendered replay key stable bytes. Literal
+ * marker-shaped user text must stay byte-exact, not become a wildcard. */
+static void canonicalize_image_marker(char *marker) {
+    memset(marker + sizeof("\x1e" "DS4_IMAGE_") - 1, '0', 24);
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3120,22 +3136,26 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
 
     bool ok = true;
     server_inference_lock(s);
+    const uint64_t hits_before = ds4_vembed_hits_now(s);
     for (size_t i = 0; i < count; i++) {
-        if (!ds4_engine_vision_encode_memory(e, inputs[i]->encoded,
-                                             inputs[i]->encoded_len,
-                                             &embeddings[i], err, errlen)) {
+        if (!ds4_vision_encode_cached(s, e, inputs[i]->encoded,
+                                      inputs[i]->encoded_len,
+                                      &embeddings[i], err, errlen)) {
             ok = false;
             break;
         }
     }
+    const uint64_t vembed_hits = ds4_vembed_hits_now(s) - hits_before;
+    const uint64_t vembed_bytes = ds4_vembed_bytes_now(s);
     server_inference_unlock(s);
+    if (ok) ds4_vembed_log_reuse(vembed_hits, count, vembed_bytes);
     if (!ok) goto done;
 
     r->images = xmalloc(count * sizeof(r->images[0]));
     memset(r->images, 0, count * sizeof(r->images[0]));
     const char *cursor = r->prompt_text;
     for (size_t i = 0; i < count; i++) {
-        const char *marker = strstr(cursor, inputs[i]->marker);
+        char *marker = strstr(cursor, inputs[i]->marker);
         if (!marker) {
             snprintf(err, errlen, "image marker was lost while rendering the request");
             ok = false;
@@ -3151,6 +3171,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         }
         r->image_count++;
         cursor = marker + strlen(inputs[i]->marker);
+        canonicalize_image_marker(marker);
     }
     if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
 
@@ -9094,6 +9115,34 @@ struct server_slot {
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+/* Vision embedding cache.  Every multimodal request re-encodes ALL images in
+ * its history through the vision encoder, on every turn, even when the live KV
+ * prefix hits and the bytes are unchanged.  Encoder output is deterministic
+ * for identical encoded bytes on the same engine, so cache the embedding
+ * (immutable after insert) keyed by a 128-bit hash of those bytes and copy it
+ * out on hit.  All access happens under inference_mu (the encode loop already
+ * holds it), so entries need no individual locking.  The byte budget is a
+ * ceiling, not a reservation: memory only materializes for embeddings that
+ * were actually produced, and LRU eviction caps growth; a session that never
+ * encodes images costs nothing.  A vision embedding is a few MiB, so the
+ * slot table caps ordinary embeddings at roughly 205 MiB.  The byte budget is
+ * a hard cap over embeddings plus their exact encoded-byte keys, so unusually
+ * large inputs may make the byte budget bind first.  Both constants can be
+ * lowered at compile time for small hosts. */
+#define DS4_VEMBED_CACHE_SLOTS 64
+#define DS4_VEMBED_CACHE_BYTES (256ull << 20)
+#define DS4_VEMBED_HIDDEN 4096u
+
+typedef struct {
+    uint64_t h1, h2;
+    uint8_t *encoded;            /* exact cache key, owned */
+    size_t encoded_len;
+    ds4_vision_embedding emb;   /* owned deep copy */
+    uint64_t bytes;
+    uint64_t use_seq;
+    bool used;
+} ds4_vembed_entry;
+
 struct server {
     ds4_engine *engine;
     ds4_tp *tp_leader;
@@ -9106,6 +9155,11 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
+    ds4_vembed_entry vembed_cache[DS4_VEMBED_CACHE_SLOTS];
+    uint64_t vembed_seq;
+    uint64_t vembed_bytes;
+    uint64_t vembed_hits;
+    uint64_t vembed_misses;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -9137,6 +9191,164 @@ static void server_inference_lock(server *s) {
 
 static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
+}
+
+/* 128-bit FNV-1a over the encoded image bytes.  This is only a fast candidate
+ * filter: lookup also compares the complete encoded bytes, so a hash collision
+ * is an ordinary cache miss rather than a false image hit. */
+static void ds4_vembed_hash(const uint8_t *p, size_t n,
+                            uint64_t *h1, uint64_t *h2) {
+    uint64_t a = 1469598103934665603ull, b = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        a = (a ^ p[i]) * 1099511628211ull;
+        b = (b + p[i] + (uint64_t)i * 0x9E3779B97F4A7C15ull) *
+            1099511628211ull;
+    }
+    *h1 = a;
+    *h2 = b;
+}
+
+static uint64_t ds4_vembed_emb_bytes(const ds4_vision_embedding *emb) {
+    return (uint64_t)emb->token_count * DS4_VEMBED_HIDDEN * sizeof(float);
+}
+
+static bool ds4_vembed_copy_out(const ds4_vision_embedding *src,
+                                ds4_vision_embedding *dst) {
+    const uint64_t bytes = ds4_vembed_emb_bytes(src);
+    if (!src->data || src->token_count == 0 || bytes == 0) return false;
+    float *copy = malloc((size_t)bytes);
+    if (!copy) return false;
+    memcpy(copy, src->data, (size_t)bytes);
+    memset(dst, 0, sizeof(*dst));
+    dst->data = copy;
+    dst->token_count = src->token_count;
+    dst->layout = src->layout;
+    dst->grid_width = src->grid_width;
+    dst->grid_height = src->grid_height;
+    dst->width = src->width;
+    dst->height = src->height;
+    dst->content_width = src->content_width;
+    dst->content_height = src->content_height;
+    memcpy(dst->fingerprint, src->fingerprint, sizeof(dst->fingerprint));
+    return true;
+}
+
+static bool ds4_vembed_lookup(server *s, uint64_t h1, uint64_t h2,
+                              const uint8_t *encoded, size_t encoded_len,
+                              ds4_vision_embedding *out) {
+    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++) {
+        ds4_vembed_entry *en = &s->vembed_cache[i];
+        if (!en->used || en->h1 != h1 || en->h2 != h2 ||
+            en->encoded_len != encoded_len ||
+            memcmp(en->encoded, encoded, encoded_len) != 0) continue;
+        if (!ds4_vembed_copy_out(&en->emb, out)) return false;
+        en->use_seq = ++s->vembed_seq;
+        s->vembed_hits++;
+        return true;
+    }
+    s->vembed_misses++;
+    return false;
+}
+
+static void ds4_vembed_entry_clear(ds4_vembed_entry *en) {
+    if (!en) return;
+    free(en->encoded);
+    ds4_vision_embedding_free(&en->emb);
+    memset(en, 0, sizeof(*en));
+}
+
+static void ds4_vembed_store(server *s, uint64_t h1, uint64_t h2,
+                             const uint8_t *encoded, size_t encoded_len,
+                             const ds4_vision_embedding *emb) {
+    const uint64_t emb_bytes = ds4_vembed_emb_bytes(emb);
+    if (!encoded || encoded_len == 0 || !emb->data || emb->token_count == 0 ||
+        encoded_len > UINT64_MAX - emb_bytes)
+        return;
+    const uint64_t bytes = emb_bytes + encoded_len;
+    if (bytes > DS4_VEMBED_CACHE_BYTES) return;
+    ds4_vision_embedding copy = {0};
+    if (!ds4_vembed_copy_out(emb, &copy)) return;
+    uint8_t *encoded_copy = malloc(encoded_len);
+    if (!encoded_copy) {
+        ds4_vision_embedding_free(&copy);
+        return;
+    }
+    memcpy(encoded_copy, encoded, encoded_len);
+    while (s->vembed_bytes + bytes > DS4_VEMBED_CACHE_BYTES) {
+        int victim = -1;
+        uint64_t best = UINT64_MAX;
+        for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++) {
+            ds4_vembed_entry *en = &s->vembed_cache[i];
+            if (en->used && en->use_seq < best) { best = en->use_seq; victim = i; }
+        }
+        if (victim < 0) break;
+        ds4_vembed_entry *en = &s->vembed_cache[victim];
+        s->vembed_bytes -= en->bytes;
+        ds4_vembed_entry_clear(en);
+    }
+    int slot = -1;
+    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++)
+        if (!s->vembed_cache[i].used) { slot = i; break; }
+    if (slot < 0) {
+        uint64_t best = UINT64_MAX;
+        for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++)
+            if (s->vembed_cache[i].use_seq < best) { best = s->vembed_cache[i].use_seq; slot = i; }
+        ds4_vembed_entry *en = &s->vembed_cache[slot];
+        s->vembed_bytes -= en->bytes;
+        ds4_vembed_entry_clear(en);
+    }
+    ds4_vembed_entry *en = &s->vembed_cache[slot];
+    memset(en, 0, sizeof(*en));
+    en->h1 = h1;
+    en->h2 = h2;
+    en->encoded = encoded_copy;
+    en->encoded_len = encoded_len;
+    en->emb = copy;
+    en->bytes = bytes;
+    en->use_seq = ++s->vembed_seq;
+    en->used = true;
+    s->vembed_bytes += bytes;
+}
+
+/* Counter snapshots; call only under inference_mu (all cache traffic, and
+ * therefore these counters, mutates under that same lock). */
+static uint64_t ds4_vembed_hits_now(server *s) {
+    return s->vembed_hits;
+}
+
+static uint64_t ds4_vembed_bytes_now(server *s) {
+    return s->vembed_bytes;
+}
+
+/* Log the reuse ratio for one request.  All arguments are values captured
+ * under inference_mu by the caller; the logger itself takes no lock and
+ * reads no shared state, so the before/after counters cannot interleave
+ * with a concurrent request's cache traffic. */
+static void ds4_vembed_log_reuse(uint64_t hits, size_t count,
+                                 uint64_t cache_bytes) {
+    if (hits == 0) return;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: vision encode reuse images=%zu encoder_runs=%llu cache_bytes=%llu MiB",
+               count,
+               (unsigned long long)(count - hits),
+               (unsigned long long)(cache_bytes >> 20));
+}
+
+/* ds4_engine_vision_encode_memory with a process-lifetime result cache.  The
+ * caller owns the returned embedding exactly as with the engine call, so the
+ * cache copy is always a fresh allocation.  Requires inference_mu. */
+static int ds4_vision_encode_cached(server *s, ds4_engine *e,
+                                    const uint8_t *encoded, size_t encoded_len,
+                                    ds4_vision_embedding *out,
+                                    char *error, size_t error_cap) {
+    uint64_t h1, h2;
+    ds4_vembed_hash(encoded, encoded_len, &h1, &h2);
+    if (ds4_vembed_lookup(s, h1, h2, encoded, encoded_len, out)) return 1;
+    if (!ds4_engine_vision_encode_memory(e, encoded, encoded_len, out,
+                                         error, error_cap))
+        return 0;
+    ds4_vembed_store(s, h1, h2, encoded, encoded_len, out);
+    return 1;
 }
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -10073,6 +10285,7 @@ static bool byte_prefix_match(const char *text, size_t text_len,
 }
 
 
+
 static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
     ds4_kvstore_tokens_copy_prefix(dst, src, n);
 }
@@ -10516,7 +10729,14 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
               slot->thinking_live.visible_len < prompt_len &&
               byte_prefix_match(req->prompt_text, prompt_len,
                                 slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
+                                slot->thinking_live.visible_len) &&
+              /* The remembered prefix can carry image sentinels (the live
+               * graph already holds their rows).  Anything AFTER the prefix
+               * is tokenized as plain text here, so a new image appearing
+               * beyond the visible key must not take this path. */
+              memchr(req->prompt_text + slot->thinking_live.visible_len,
+                     '\x1e',
+                     prompt_len - slot->thinking_live.visible_len) == NULL;
     if (ok) visible_len = slot->thinking_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
@@ -11321,12 +11541,18 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
 
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
-                                                const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
-    if (r->prompt_preserves_reasoning) return false;
+                                                const char *finish,
+                                                const char *reasoning) {
+    if (!r || r->kind != REQ_CHAT) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
+    /* Tool-context and reasoning-preserving replays render assistant thinking
+     * back into history: use the preserved-reasoning bridge, which requires
+     * the sampled reasoning bytes.  Plain toolless replays drop reasoning: use
+     * the visible-only bridge. */
+    if (r->has_tools || r->prompt_preserves_reasoning)
+        return reasoning && reasoning[0];
     return true;
 }
 
@@ -11545,10 +11771,53 @@ static char *build_toolless_thinking_visible_text(const request *r,
     return buf_take(&visible);
 }
 
+/* Variant for tool-context replays (and any prompt that already renders
+ * assistant reasoning back into history).  In that regime
+ * render_chat_prompt_text() emits open-think + reasoning + close-think for
+ * history assistant turns, so the bytes the next request will replay for the
+ * turn we just sampled are:
+ *
+ *   prompt-with-final-<think> + reasoning + </think> + visible-content + eos
+ *
+ * Remembering these bytes lets the next request hit the thinking-visible path
+ * and rebuild the effective prompt from the EXACT live token prefix plus a
+ * newly tokenized text suffix.  That is immune to the BPE re-merge divergence
+ * that makes an identical-text replay still miss the token-prefix check
+ * (sampled reasoning tokenizes autoregressively; replay re-tokenizes the whole
+ * string and merges can differ at block boundaries).  Without this bridge a
+ * plain thinking turn in a tool conversation permanently diverges the live
+ * graph from every future replay, forcing full cold re-prefills. */
+static char *build_preserved_thinking_visible_text(const request *r,
+                                                   const char *content,
+                                                   const char *reasoning) {
+    if (!r || !r->prompt_text) return NULL;
+    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+
+    size_t pt_len = strlen(r->prompt_text);
+    const char *think_tag = "<think>";
+    size_t tag_len = strlen(think_tag);
+    if (pt_len < tag_len ||
+        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        return NULL;
+    }
+
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_puts(&visible, reasoning ? reasoning : "");
+    buf_puts(&visible, "</think>");
+    buf_puts(&visible, content ? content : "");
+    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    return buf_take(&visible);
+}
+
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
+                                         uint64_t trace_id, const char *content,
+                                         const char *reasoning) {
+    const bool preserved = j->req.has_tools || j->req.prompt_preserves_reasoning;
+    char *visible = preserved
+        ? build_preserved_thinking_visible_text(&j->req, content, reasoning)
+        : build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
     thinking_live_remember(s, slot, visible);
@@ -13025,9 +13294,11 @@ decode_again:
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
     } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish,
+                                                   parsed_reasoning)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
+                                     parsed_content ? parsed_content : "",
+                                     parsed_reasoning);
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -13844,6 +14115,11 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
+    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++) {
+        ds4_vembed_entry *en = &s->vembed_cache[i];
+        ds4_vembed_entry_clear(en);
+    }
+    s->vembed_bytes = 0;
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
@@ -18236,27 +18512,121 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_vembed_cache_store_hit_evict(void) {
+    static server s;   /* only vembed_* fields are exercised; zero init ok */
+    const uint8_t img1[] = "png-bytes-one";
+    const uint8_t img2[] = "png-bytes-two";
+    const uint8_t img3[] = "png-bytes-three";
+    uint64_t h1, h2;
+
+    ds4_vision_embedding emb = {0};
+    emb.token_count = 2;
+    emb.grid_width = 2;
+    emb.grid_height = 1;
+    emb.data = malloc(ds4_vembed_emb_bytes(&emb));
+    TEST_ASSERT(emb.data != NULL);
+    for (uint64_t i = 0; i < ds4_vembed_emb_bytes(&emb) / sizeof(float); i++)
+        emb.data[i] = (float)(i + 1);
+    emb.fingerprint[0] = 0xAB;
+
+    ds4_vembed_hash(img1, sizeof(img1) - 1, &h1, &h2);
+    ds4_vision_embedding out = {0};
+    TEST_ASSERT(!ds4_vembed_lookup(&s, h1, h2, img1,
+                                   sizeof(img1) - 1, &out));
+    TEST_ASSERT(s.vembed_misses == 1);
+    ds4_vembed_store(&s, h1, h2, img1, sizeof(img1) - 1, &emb);
+    TEST_ASSERT(s.vembed_bytes ==
+                ds4_vembed_emb_bytes(&emb) + sizeof(img1) - 1);
+    TEST_ASSERT(ds4_vembed_lookup(&s, h1, h2, img1,
+                                  sizeof(img1) - 1, &out));
+    TEST_ASSERT(s.vembed_hits == 1);
+    TEST_ASSERT(out.data != emb.data);
+    TEST_ASSERT(out.token_count == 2 && out.grid_width == 2 &&
+                out.fingerprint[0] == 0xAB);
+    TEST_ASSERT(!memcmp(out.data, emb.data, (size_t)ds4_vembed_emb_bytes(&emb)));
+    ds4_vision_embedding_free(&out);
+
+    /* A forced hash+length collision with different bytes must still miss. */
+    TEST_ASSERT(sizeof(img1) == sizeof(img2));
+    TEST_ASSERT(!ds4_vembed_lookup(&s, h1, h2, img2,
+                                   sizeof(img2) - 1, &out));
+    TEST_ASSERT(out.data == NULL);
+
+    /* Cap accounting: an entry that cannot ever fit is not cached. */
+    ds4_vision_embedding big = {0};
+    big.token_count = DS4_VEMBED_CACHE_BYTES / (DS4_VEMBED_HIDDEN * sizeof(float)) + 1;
+    big.data = malloc(1);
+    ds4_vembed_hash(img3, sizeof(img3) - 1, &h1, &h2);
+    ds4_vembed_store(&s, h1, h2, img3, sizeof(img3) - 1, &big);
+    TEST_ASSERT(s.vembed_bytes ==
+                ds4_vembed_emb_bytes(&emb) + sizeof(img1) - 1); /* unchanged */
+    free(big.data);
+
+    free(emb.data);
+    for (int i = 0; i < DS4_VEMBED_CACHE_SLOTS; i++)
+        ds4_vembed_entry_clear(&s.vembed_cache[i]);
+    s.vembed_bytes = 0;
+}
+
+static void test_canonical_image_markers_keep_literal_text_exact(void) {
+    const char *literal_a = "\x1e" "DS4_IMAGE_aaaaaaaaaaaaaaaaaaaaaaaa" "\x1f";
+    const char *literal_b = "\x1e" "DS4_IMAGE_bbbbbbbbbbbbbbbbbbbbbbbb" "\x1f";
+    /* No images: two different literal strings must not select one frontier. */
+    TEST_ASSERT(!byte_prefix_match(literal_b, strlen(literal_b),
+                                   literal_a, strlen(literal_a)));
+
+    server_image_inputs images = {0};
+    char first[SERVER_IMAGE_MARKER_BYTES], second[SERVER_IMAGE_MARKER_BYTES];
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "eA==", first));
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "eA==", second));
+    char prefix[256], replay[256], changed[256];
+    snprintf(prefix, sizeof(prefix), "%s literal %s end", first, literal_a);
+    snprintf(replay, sizeof(replay), "%s literal %s end next", second, literal_a);
+    snprintf(changed, sizeof(changed), "%s literal %s end next", second, literal_b);
+    size_t original_len = strlen(prefix);
+    /* These offsets represent only the known parser-inserted markers. */
+    canonicalize_image_marker(prefix);
+    canonicalize_image_marker(replay);
+    canonicalize_image_marker(changed);
+    TEST_ASSERT(strlen(prefix) == original_len);
+    TEST_ASSERT(strstr(prefix, literal_a) != NULL);
+    TEST_ASSERT(byte_prefix_match(replay, strlen(replay), prefix, original_len));
+    TEST_ASSERT(!byte_prefix_match(changed, strlen(changed), prefix, original_len));
+    TEST_ASSERT(!byte_prefix_match(replay + 1, strlen(replay + 1), prefix, original_len));
+    TEST_ASSERT(!byte_prefix_match(replay, original_len - 1, prefix, original_len));
+    canonicalize_image_marker(prefix); /* Idempotent. */
+    TEST_ASSERT(byte_prefix_match(replay, strlen(replay), prefix, original_len));
+    server_image_inputs_free(&images);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
     thinking_state st = {.inside = true};
 
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", "why"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
 
     st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length", "why"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
 
+    /* Toolless replay drops reasoning: the visible-only bridge still fires
+     * with empty reasoning. */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", ""));
+
+    /* Preserved-reasoning regime needs the sampled bytes to build the key. */
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", ""));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", NULL));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop", "why"));
 
     request_free(&r);
 }
@@ -19148,6 +19518,56 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_free(&history_msgs);
 }
 
+static void test_preserved_thinking_canonical_matches_future_prompt(void) {
+    chat_msgs prefix_msgs = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup("Check the logs.");
+    chat_msgs_push(&prefix_msgs, u1);
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, "{}", NULL,
+                                                DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7 && !memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    const char *reasoning = "Reading the log now...";
+    const char *content = "Nothing failed.";
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.prompt_text = xstrdup(prompt_text);
+    char *visible = build_preserved_thinking_visible_text(&r, content, reasoning);
+    TEST_ASSERT(visible != NULL);
+    request_free(&r);
+
+    chat_msgs history_msgs = {0};
+    chat_msg h_user = {0};
+    h_user.role = xstrdup("user");
+    h_user.content = xstrdup("Check the logs.");
+    chat_msgs_push(&history_msgs, h_user);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup(reasoning);
+    h_asst.content = xstrdup(content);
+    chat_msgs_push(&history_msgs, h_asst);
+    chat_msg h_user2 = {0};
+    h_user2.role = xstrdup("user");
+    h_user2.content = xstrdup("And now?");
+    chat_msgs_push(&history_msgs, h_user2);
+    char *future = render_chat_prompt_text(&history_msgs, "{}", NULL,
+                                           DS4_THINK_HIGH);
+    size_t vlen = strlen(visible);
+    TEST_ASSERT(strlen(future) > vlen);
+    TEST_ASSERT(!memcmp(future, visible, vlen));
+
+    free(visible);
+    free(future);
+    free(prompt_text);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&history_msgs);
+}
+
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
@@ -19268,8 +19688,9 @@ static void test_thinking_canonical_multi_turn(void) {
 
 static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     /* When tools ARE present, reasoning is preserved in re-render.
-     * The toolless thinking live binding should NOT fire (has_tools gate),
-     * and the tool-call replay path handles it.  Verify the template
+     * Plain (no tool-call) thinking turns in a tool conversation now use the
+     * PRESERVED thinking bridge (build_preserved_thinking_visible_text);
+     * tool-call turns keep their own replay path.  Verify the template
      * preserves reasoning when tool_context is true. */
     const char *tool_schemas = "{\"name\":\"bash\"}";
 
@@ -19483,6 +19904,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_preserved_thinking_canonical_matches_future_prompt();
+    test_vembed_cache_store_hit_evict();
+    test_canonical_image_markers_keep_literal_text_exact();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
