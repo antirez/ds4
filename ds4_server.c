@@ -2834,11 +2834,17 @@ static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
 static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
                                        const tool_schema_orders *tool_orders) {
     if (!calls || calls->len == 0) return;
+    /* GLM emits each tool block on its own line.  Preserve a separator already
+     * retained in the content or raw block; otherwise restore one newline. */
+    const char *raw = calls->raw_tool_text;
+    if ((!b->len || b->ptr[b->len - 1] != '\n') &&
+        (!raw || !raw[0] || raw[0] != '\n')) {
+        buf_putc(b, '\n');
+    }
     if (calls->raw_tool_text && calls->raw_tool_text[0]) {
         buf_puts(b, calls->raw_tool_text);
         return;
     }
-    buf_putc(b, '\n');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order =
@@ -11592,8 +11598,8 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
         /* The graph already represents the bytes the next request will render.
-         * Token-level canonicalization would only replace a valid sampled
-         * history with a different BPE spelling of the same transcript. */
+         * Re-tokenizing would only swap a valid sampled history for another
+         * BPE spelling of the same text. */
         free(live_text);
         goto done;
     }
@@ -11740,7 +11746,8 @@ done:
     free(suffix_text);
 }
 
-static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
+static bool should_canonicalize_tool_checkpoint(const server *s,
+                                                const tool_calls *calls) {
     if (!calls || calls->len == 0) return false;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_tool_text && calls->raw_tool_text[0])
@@ -13014,10 +13021,9 @@ decode_again:
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
+         * path where we lack exact sampled replay.  Responses deliberately
+         * skips this path because its previous_response_id contract binds the
+         * next turn to live state. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -16167,6 +16173,124 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_glm_raw_tool_call_keeps_sampled_line_separator(void) {
+    const char *block =
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>";
+    const char *generated[] = {
+        "thinking</think>Visible text:\n"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>",
+        "thinking</think>Visible text:\n\n"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>",
+    };
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    for (size_t i = 0; i < sizeof(generated) / sizeof(generated[0]); i++) {
+        char *content = NULL;
+        char *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, generated[i], false,
+            &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        char *suffix = build_tool_checkpoint_suffix(
+            &r, content, reasoning, &calls);
+        TEST_ASSERT(suffix != NULL);
+        TEST_ASSERT(!strcmp(suffix, generated[i]));
+        free(suffix);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+    request_free(&r);
+
+    /* Tool-only non-thinking suffix builders begin with an empty buffer.  They
+     * still need the protocol separator before the raw tool block. */
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&calls, tc);
+    calls.raw_tool_text = xstrdup(block);
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_NONE;
+    char *checkpoint = build_tool_checkpoint_suffix(&r, "", NULL, &calls);
+    char *visible = build_responses_visible_assistant_suffix(
+        &r, "", NULL, &calls);
+    TEST_ASSERT(checkpoint && checkpoint[0] == '\n');
+    TEST_ASSERT(visible && visible[0] == '\n');
+    TEST_ASSERT(!strcmp(checkpoint + 1, block));
+    TEST_ASSERT(!strcmp(visible + 1, block));
+    free(checkpoint);
+    free(visible);
+    request_free(&r);
+    tool_calls_free(&calls);
+}
+
+static void test_glm_raw_tool_call_full_replay_preserves_separators(void) {
+    const char *generated[] = {
+        "thinking</think>Visible text:\n"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>",
+        "thinking</think>Visible text:\n\n"
+        "<tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>pwd</arg_value></tool_call>",
+    };
+    for (size_t i = 0; i < sizeof(generated) / sizeof(generated[0]); i++) {
+        char *content = NULL;
+        char *reasoning = NULL;
+        tool_calls sampled = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, generated[i], false,
+            &content, &reasoning, &sampled));
+        TEST_ASSERT(sampled.len == 1);
+
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        assign_tool_call_ids(&s, &sampled, API_OPENAI);
+        tool_memory_remember(&s, &sampled);
+
+        chat_msgs msgs = {0};
+        chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        assistant.content = xstrdup(content ? content : "");
+        assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+        tool_call replay = {0};
+        replay.id = xstrdup(sampled.v[0].id);
+        replay.name = xstrdup(sampled.v[0].name);
+        replay.arguments = xstrdup(sampled.v[0].arguments);
+        tool_calls_push(&assistant.calls, replay);
+        chat_msgs_push(&msgs, assistant);
+
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&s, &msgs, &stats);
+        TEST_ASSERT(stats.mem == 1);
+        TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+        char *prompt = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH);
+        buf expected = {0};
+        buf_puts(&expected,
+            "[gMASK]<sop><|system|>Reasoning Effort: High"
+            "<|assistant|><think>");
+        buf_puts(&expected, generated[i]);
+        TEST_ASSERT(prompt && !strcmp(prompt, expected.ptr));
+
+        free(prompt);
+        buf_free(&expected);
+        chat_msgs_free(&msgs);
+        free(content);
+        free(reasoning);
+        tool_calls_free(&sampled);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
 }
 
 static void test_render_glm_groups_tool_results(void) {
@@ -19420,6 +19544,8 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
+    test_glm_raw_tool_call_keeps_sampled_line_separator();
+    test_glm_raw_tool_call_full_replay_preserves_separators();
     test_render_glm_groups_tool_results();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
