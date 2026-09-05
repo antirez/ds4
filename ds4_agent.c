@@ -8484,6 +8484,22 @@ static bool agent_tool_observation_build(agent_worker *w,
         }
     }
     ds4_tokens_copy(tokens, &w->transcript);
+    /* Text-only tool observations must not require a multimodal engine.
+     * ds4_chat_append_multimodal_message() rejects engines that are
+     * neither GLM nor DeepSeek-with-vision, so on a plain text-only
+     * DeepSeek model every tool result append failed. The failure was
+     * misread as "tool result would exceed context", triggering a
+     * compaction that could never help, and ended with a bogus
+     * "context full after compaction" error that idled the agent.
+     * Use the plain chat append path when there are no images. */
+    if (obs->image_count == 0) {
+        const char *text =
+            (obs->part_count && obs->parts[0].text) ? obs->parts[0].text : "";
+        ds4_chat_append_message(w->engine, tokens, "tool", text);
+        free(parts);
+        *spans_out = NULL;
+        return true;
+    }
     /* GLM grounds image tokens in user turns; keep text-only observations in
      * the native tool-response role used by the rest of the agent protocol. */
     bool ok = ds4_chat_append_multimodal_message(
