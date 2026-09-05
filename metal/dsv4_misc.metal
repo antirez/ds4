@@ -2648,6 +2648,123 @@ kernel void kernel_glm_qk_lowrank_q8_0_batch_glm52_t4(
     }
 }
 
+/* GLM 5.3 prefill qk-low, one threadgroup per (head, TT tokens).
+ *
+ * kernel_glm_qk_lowrank_q8_0_batch gives every (head, token) pair its own
+ * threadgroup, so each of the 512 Q8_0 rows of a head's K_b slice is re-read
+ * once per token -- 17.8 GB of weight traffic per layer for 34 GFLOP -- and
+ * each thread runs a single 256-long dependent FMA chain.
+ *
+ * Here a thread owns the same two output rows for TT consecutive tokens: it
+ * walks its 272-byte row once per TT tokens and keeps TT independent
+ * accumulator chains.  Which threadgroup computes which outputs changes;
+ * the arithmetic does not.  Every output still accumulates
+ * `acc += d * (float)qs[qi] * x[base + qi]` over ascending blocks and
+ * ascending qi, written verbatim, so the result is bit-identical to the
+ * reference kernel above.
+ */
+template <uint TT>
+static inline void glm_qk_lowrank_q8_0_batch_tokens_impl(
+        constant ds4_metal_args_glm_qk_lowrank_batch & args,
+        device const char *weight,
+        device const char *q,
+        device char *qk_low,
+        uint tid,
+        uint nth,
+        uint3 tgpig) {
+    constexpr uint kv_lora_dim = 512u;
+    constexpr uint qk_nope = 256u;
+    constexpr uint qk_dim = 256u;
+    constexpr uint row_bytes = 272u;
+    constexpr uint n_blocks = qk_nope >> 5;
+    constexpr uint NR = 2u;
+
+    if (args.kv_lora_dim != kv_lora_dim ||
+        args.qk_nope != qk_nope ||
+        args.qk_dim != qk_dim ||
+        args.row_bytes != row_bytes ||
+        args.weight_type != DS4_METAL_GGUF_Q8_0 ||
+        args.n_tokens == 0u ||
+        nth * NR != kv_lora_dim) {
+        return;
+    }
+
+    const uint head = tgpig.x + args.head_base;
+    const uint token0 = tgpig.y * TT;
+    if (head >= args.n_head || token0 >= args.n_tokens) return;
+
+    const ulong q_token_stride = (ulong)args.n_head * qk_dim;
+    const ulong low_token_stride = (ulong)args.n_head * kv_lora_dim;
+    device const float *xbase = (device const float *)q;
+
+    /* A partial tail tile clamps to the last real token instead of branching:
+     * the clamped columns are read and accumulated, then never stored. */
+    ulong xoff[TT];
+    FOR_UNROLL (uint t = 0; t < TT; t++) {
+        const uint token = min(token0 + t, args.n_tokens - 1u);
+        xoff[t] = token * q_token_stride + head * qk_dim;
+    }
+
+    const uint j0 = tid;
+    const uint j1 = tid + nth;
+    device const char *row0 =
+        weight + ((uint64_t)head * kv_lora_dim + j0) * row_bytes;
+    device const char *row1 =
+        weight + ((uint64_t)head * kv_lora_dim + j1) * row_bytes;
+
+    float acc0[TT];
+    float acc1[TT];
+    FOR_UNROLL (uint t = 0; t < TT; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+
+    for (uint block = 0; block < n_blocks; block++) {
+        device const char *block0 = row0 + (uint64_t)block * 34u;
+        device const char *block1 = row1 + (uint64_t)block * 34u;
+        const float d0 = (float)(*((device const half *)block0));
+        const float d1 = (float)(*((device const half *)block1));
+        device const int8_t *qs0 = (device const int8_t *)(block0 + 2u);
+        device const int8_t *qs1 = (device const int8_t *)(block1 + 2u);
+        const uint base = block << 5;
+        for (uint qi = 0; qi < 32u; qi++) {
+            const uint col = base + qi;
+            FOR_UNROLL (uint t = 0; t < TT; t++) {
+                acc0[t] += d0 * (float)qs0[qi] * xbase[xoff[t] + col];
+                acc1[t] += d1 * (float)qs1[qi] * xbase[xoff[t] + col];
+            }
+        }
+    }
+
+    device float *outbase = (device float *)qk_low;
+    FOR_UNROLL (uint t = 0; t < TT; t++) {
+        const uint token = token0 + t;
+        if (token < args.n_tokens) {
+            device float *out =
+                outbase + token * low_token_stride + head * kv_lora_dim;
+            out[j0] = acc0[t];
+            out[j1] = acc1[t];
+        }
+    }
+}
+
+#define DS4_GLM_QK_LOWRANK_BATCH_TOKENS_KERNEL(TT)                       \
+    kernel void kernel_glm_qk_lowrank_q8_0_batch_t##TT(                  \
+            constant ds4_metal_args_glm_qk_lowrank_batch & args,         \
+            device const char *weight,                                   \
+            device const char *q,                                        \
+            device char *qk_low,                                         \
+            uint tid [[thread_index_in_threadgroup]],                    \
+            ushort3 ntg_u [[threads_per_threadgroup]],                   \
+            uint3 tgpig [[threadgroup_position_in_grid]]) {              \
+        glm_qk_lowrank_q8_0_batch_tokens_impl<TT>(                       \
+                args, weight, q, qk_low, tid, ntg_u.x, tgpig);           \
+    }
+
+DS4_GLM_QK_LOWRANK_BATCH_TOKENS_KERNEL(4)
+DS4_GLM_QK_LOWRANK_BATCH_TOKENS_KERNEL(8)
+DS4_GLM_QK_LOWRANK_BATCH_TOKENS_KERNEL(16)
+
 kernel void kernel_glm_value_project_q8_0(
         constant ds4_metal_args_glm_qk_lowrank & args,
         device const char *weight,
@@ -4082,6 +4199,8 @@ kernel void kernel_glm_attention_indexed_batch_group2(
     }
 }
 
+/* Original one-head reference from 8969dbb. Keep its expressions and
+ * specializations independent of the wider-head implementation below. */
 template <bool assume_valid_rows, bool assume_valid_heads>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
         constant ds4_metal_args_glm_attention_indexed_batch & args,
@@ -4282,6 +4401,229 @@ kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, false>;
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads")]]
 kernel glm_attention_indexed_batch_lora_group8_vec_t
 kernel_glm_attention_indexed_batch_lora_group8_vec_impl<true, true>;
+
+/* Indexed prefill attention over the compact KV cache.
+ *
+ * A threadgroup is 8 simdgroups; heads_per_sg is how many heads one simdgroup
+ * carries, so the threadgroup covers 8 * heads_per_sg heads and every token
+ * needs 64 / (8 * heads_per_sg) staging passes over its selected rows.  At
+ * heads_per_sg 1 each of the 8 head groups re-stages all 2051 selected rows
+ * (2 MB per token), which is 34 GB per layer at a 2048-token chunk; carrying
+ * two heads per simdgroup halves that and each staged row block feeds both.
+ *
+ * Nothing a head computes depends on heads_per_sg: the row order, the four
+ * dot(float4) terms, the simd_sum tree and the online-softmax update are the
+ * same expressions in the same order, so every head's output is bit-identical
+ * across the instantiations. */
+template <bool assume_valid_rows, bool assume_valid_heads, uint heads_per_sg>
+kernel void kernel_glm_attention_indexed_batch_lora_heads_impl(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *q,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const char *k_rope_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        threadgroup half4 *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint group_heads = 8u;
+    constexpr uint stage_rows = 16u;
+    const uint token = tgpig.y;
+    const uint tid = (uint)tid_u;
+    const uint lane = (uint)lane_u;
+    const uint head_in_group = (uint)sg_u;
+    const uint head0 =
+        (tgpig.x * group_heads + head_in_group) * heads_per_sg + args.head_base;
+    if (token >= args.n_tokens ||
+        args.n_selected == 0u ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != 512u ||
+        (args.qk_rope != 0u && args.qk_rope != 64u)) {
+        return;
+    }
+
+    const uint kv_vecs = args.kv_lora_dim >> 2;
+    const uint rope_vecs = args.qk_rope >> 2;
+    const uint qk_dim = args.qk_nope + args.qk_rope;
+    const uint64_t q_token_stride = (uint64_t)args.n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride =
+        (uint64_t)args.n_head * args.kv_lora_dim * sizeof(float);
+
+    threadgroup half4 *kv_shared = scratch;
+    threadgroup float4 *rope_shared =
+        (threadgroup float4 *)(kv_shared + stage_rows * kv_vecs);
+
+    bool valid_head[heads_per_sg];
+    float4 low[heads_per_sg][4];
+    float4 qrope[heads_per_sg];
+    FOR_UNROLL (uint k = 0; k < heads_per_sg; k++) {
+        const uint head = head0 + k;
+        valid_head[k] = assume_valid_heads || head < args.n_head;
+        const uint safe_head = valid_head[k] ? head : 0u;
+        device const float *qh =
+            (device const float *)(q +
+                (uint64_t)token * q_token_stride +
+                (uint64_t)safe_head * qk_dim * sizeof(float));
+        device const float4 *low4 =
+            (device const float4 *)(qk_low +
+                (uint64_t)token * low_token_stride +
+                (uint64_t)safe_head * args.kv_lora_dim * sizeof(float));
+        low[k][0] = 0.0f;
+        low[k][1] = 0.0f;
+        low[k][2] = 0.0f;
+        low[k][3] = 0.0f;
+        qrope[k] = 0.0f;
+        if (valid_head[k]) {
+            low[k][0] = low4[lane + 0u];
+            low[k][1] = low4[lane + 32u];
+            low[k][2] = low4[lane + 64u];
+            low[k][3] = low4[lane + 96u];
+            if (lane < rope_vecs) {
+                qrope[k] = *((device const float4 *)(qh + args.qk_nope + lane * 4u));
+            }
+        }
+    }
+    device const uint32_t *token_selected =
+        selected + (uint64_t)token * args.n_selected;
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (args.qk_rope != 0u && args.ext_factor != 0.0f) {
+        glm_rope_yarn_corr_dims((int)args.qk_rope,
+                                (int)args.n_ctx_orig,
+                                args.freq_base,
+                                args.beta_fast,
+                                args.beta_slow,
+                                corr_dims);
+    }
+
+    float M[heads_per_sg];
+    float S[heads_per_sg];
+    float4 o[heads_per_sg][4];
+    FOR_UNROLL (uint k = 0; k < heads_per_sg; k++) {
+        M[k] = -FLT_MAX / 2.0f;
+        S[k] = 0.0f;
+        o[k][0] = 0.0f;
+        o[k][1] = 0.0f;
+        o[k][2] = 0.0f;
+        o[k][3] = 0.0f;
+    }
+
+    for (uint base = 0u; base < args.n_selected; base += stage_rows) {
+        const uint rows = min(stage_rows, args.n_selected - base);
+        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+            const uint rr = off / kv_vecs;
+            const uint vv = off - rr * kv_vecs;
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            if (valid_row) {
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)row * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            } else {
+                kv_shared[off] = half4(half(0.0f));
+            }
+        }
+        for (uint off = tid; off < rows * rope_vecs; off += 256u) {
+            const uint rr = off / rope_vecs;
+            const uint vv = off - rr * rope_vecs;
+            const uint r = vv * 4u;
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            if (valid_row) {
+                const uint64_t rope_base = (uint64_t)row * args.qk_rope;
+                const float2 y0 =
+                    glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
+                                                              rope_base,
+                                                              r,
+                                                              row,
+                                                              args.qk_rope,
+                                                              args.freq_base,
+                                                              args.freq_scale,
+                                                              args.ext_factor,
+                                                              args.attn_factor,
+                                                              corr_dims[0],
+                                                              corr_dims[1]);
+                const float2 y1 =
+                    glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
+                                                              rope_base,
+                                                              r + 2u,
+                                                              row,
+                                                              args.qk_rope,
+                                                              args.freq_base,
+                                                              args.freq_scale,
+                                                              args.ext_factor,
+                                                              args.attn_factor,
+                                                              corr_dims[0],
+                                                              corr_dims[1]);
+                rope_shared[off] = float4(y0.x, y0.y, y1.x, y1.y);
+            } else {
+                rope_shared[off] = float4(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rr = 0u; rr < rows; rr++) {
+            const uint row = token_selected[base + rr];
+            const bool valid_row = assume_valid_rows || row < args.cache_cap;
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            threadgroup const float4 *rope_row = rope_shared + rr * rope_vecs;
+            /* Verbatim from the one-head kernel, including the repeated
+             * `(float4)kv_row[...]` in the score and in the output update:
+             * naming the converted row once is the same value but lets the
+             * compiler contract the update the other way round, which does
+             * not round the same. */
+            FOR_UNROLL (uint k = 0; k < heads_per_sg; k++) {
+                float partial = 0.0f;
+                if (valid_head[k] && valid_row) {
+                    partial += dot(low[k][0], (float4)kv_row[lane + 0u]);
+                    partial += dot(low[k][1], (float4)kv_row[lane + 32u]);
+                    partial += dot(low[k][2], (float4)kv_row[lane + 64u]);
+                    partial += dot(low[k][3], (float4)kv_row[lane + 96u]);
+                    if (lane < rope_vecs) {
+                        partial += dot(qrope[k], rope_row[lane]);
+                    }
+                }
+                const float sum = simd_sum(partial);
+                const float score =
+                    (valid_head[k] && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+                if (valid_head[k] && valid_row) {
+                    const float new_m = max(M[k], score);
+                    const float old_scale = exp(M[k] - new_m);
+                    const float row_scale = exp(score - new_m);
+                    o[k][0] = o[k][0] * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                    o[k][1] = o[k][1] * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                    o[k][2] = o[k][2] * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                    o[k][3] = o[k][3] * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                    S[k] = S[k] * old_scale + row_scale;
+                    M[k] = new_m;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    FOR_UNROLL (uint k = 0; k < heads_per_sg; k++) {
+        if (valid_head[k]) {
+            const float inv_s = S[k] > 0.0f ? 1.0f / S[k] : 0.0f;
+            device float4 *out4 =
+                (device float4 *)(lora_out +
+                    ((uint64_t)token * args.n_head + head0 + k) *
+                        args.kv_lora_dim * sizeof(float));
+            out4[lane + 0u] = o[k][0] * inv_s;
+            out4[lane + 32u] = o[k][1] * inv_s;
+            out4[lane + 64u] = o[k][2] * inv_s;
+            out4[lane + 96u] = o[k][3] * inv_s;
+        }
+    }
+}
+
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads")]]
+kernel glm_attention_indexed_batch_lora_group8_vec_t
+kernel_glm_attention_indexed_batch_lora_heads_impl<true, true, 2u>;
 
 template <bool assume_valid_heads>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(

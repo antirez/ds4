@@ -565,6 +565,9 @@ static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_sg_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_glm52_t4_pipeline;
+static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_t4_pipeline;
+static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_t8_pipeline;
+static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_t16_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_batch_heads_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_batch_heads_mma_pipeline;
@@ -584,6 +587,7 @@ static id<MTLComputePipelineState> g_glm_attention_indexed_batch_group8_pipeline
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline;
+static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu_f32_pipeline;
@@ -9002,6 +9006,12 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch");
         g_glm_qk_lowrank_batch_glm52_t4_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_glm52_t4");
+        g_glm_qk_lowrank_batch_t4_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_t4");
+        g_glm_qk_lowrank_batch_t8_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_t8");
+        g_glm_qk_lowrank_batch_t16_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_t16");
         g_glm_value_project_q8_0_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_value_project_q8_0");
         g_glm_value_project_q8_0_batch_heads_pipeline =
@@ -9040,6 +9050,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid");
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
+        g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads");
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_causal");
         g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline =
@@ -9123,6 +9135,9 @@ int ds4_gpu_init(void) {
             !g_glm_qk_lowrank_glm52_sg_pipeline ||
             !g_glm_qk_lowrank_batch_pipeline ||
             !g_glm_qk_lowrank_batch_glm52_t4_pipeline ||
+            !g_glm_qk_lowrank_batch_t4_pipeline ||
+            !g_glm_qk_lowrank_batch_t8_pipeline ||
+            !g_glm_qk_lowrank_batch_t16_pipeline ||
             !g_glm_value_project_q8_0_pipeline ||
             !g_glm_value_project_q8_0_batch_heads_pipeline ||
             !g_glm_value_project_q8_0_batch_heads_mma_pipeline ||
@@ -9142,6 +9157,7 @@ int ds4_gpu_init(void) {
             !g_glm_attention_indexed_batch_lora_group8_vec_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline ||
+            !g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline ||
             !g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline ||
             !g_glm_q4_k_pair_swiglu_f32_pipeline ||
@@ -11747,6 +11763,9 @@ void ds4_gpu_cleanup(void) {
         g_glm_qk_lowrank_glm52_sg_pipeline = nil;
         g_glm_qk_lowrank_batch_pipeline = nil;
         g_glm_qk_lowrank_batch_glm52_t4_pipeline = nil;
+        g_glm_qk_lowrank_batch_t4_pipeline = nil;
+        g_glm_qk_lowrank_batch_t8_pipeline = nil;
+        g_glm_qk_lowrank_batch_t16_pipeline = nil;
         g_glm_value_project_q8_0_pipeline = nil;
         g_glm_value_project_q8_0_batch_heads_pipeline = nil;
         g_glm_value_project_q8_0_batch_heads_mma_pipeline = nil;
@@ -11766,6 +11785,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_attention_indexed_batch_lora_group8_vec_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline = nil;
+        g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline = nil;
         g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline = nil;
         g_glm_q4_k_pair_swiglu_f32_pipeline = nil;
@@ -36147,6 +36167,48 @@ int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
                                                qk_dim);
 }
 
+
+/*
+ * Heads one simdgroup carries in the GLM 5.3 Flash indexed prefill attention
+ * kernel; 1 is main's kernel.  DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN
+ * restores it for an A/B run, as does the branch-wide
+ * DS4_METAL_DISABLE_GLM53_FLASH_TUNING.
+ * DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG forces one of the
+ * instantiated widths so the sweep can be repeated.  Read per call so a test
+ * can flip it between dispatches.
+ */
+static uint32_t ds4_gpu_glm53_prefill_indexed_attn_heads_per_sg(void) {
+    if (getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") != NULL ||
+        getenv("DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN") != NULL) {
+        return 1u;
+    }
+    const char *env =
+        getenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG");
+    const int forced = (env && env[0]) ? atoi(env) : 0;
+    if (forced == 1 || forced == 2) return (uint32_t)forced;
+    return 2u;
+}
+
+/*
+ * Tokens per threadgroup for the GLM 5.3 Flash prefill qk-low kernel; 0 keeps
+ * the per-token reference kernel.  DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW
+ * restores it for an A/B run, and the branch-wide
+ * DS4_METAL_DISABLE_GLM53_FLASH_TUNING does the same for every GLM 5.3 Flash
+ * switch at once.  DS4_METAL_GLM53_PREFILL_QK_LOW_TILE forces one of the
+ * instantiated tiles so the sweep can be repeated; anything else keeps the
+ * measured default.  Read per call so a test can flip it between dispatches.
+ */
+static uint32_t ds4_gpu_glm53_prefill_qk_low_token_tile(void) {
+    if (getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") != NULL ||
+        getenv("DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW") != NULL) {
+        return 0u;
+    }
+    const char *env = getenv("DS4_METAL_GLM53_PREFILL_QK_LOW_TILE");
+    const int forced = (env && env[0]) ? atoi(env) : 0;
+    if (forced == 4 || forced == 8 || forced == 16) return (uint32_t)forced;
+    return 8u;
+}
+
 int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
         ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
@@ -36208,12 +36270,45 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
             qk_dim == 256u &&
             row_bytes == 204u &&
             weight_type == DS4_METAL_TENSOR_Q8_0;
-        id<MTLComputePipelineState> pipeline =
-            use_glm52_t4 ?
-                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_glm52_t4_pipeline,
-                                     "kernel_glm_qk_lowrank_q8_0_batch_glm52_t4") :
-                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_pipeline,
-                                     "kernel_glm_qk_lowrank_q8_0_batch");
+        /*
+         * GLM 5.3 Flash prefill (qk_nope 256) has no token tile in the shape
+         * above, so it runs the per-token reference kernel and re-reads each
+         * head's 136 KB K_b slice once per token.  kernel_..._batch_t<TT>
+         * keeps TT consecutive tokens in one threadgroup with the reference
+         * kernel's expression and block order, so it is bit-identical and
+         * divides the weight traffic by TT.  Gated to the resident
+         * single-device GLM 5.3 Flash shape this was measured on.
+         */
+        const uint32_t glm53_token_tile =
+            ds4_gpu_glm53_prefill_qk_low_token_tile();
+        const int use_glm53_token_tile =
+            glm53_token_tile != 0u &&
+            n_tokens >= glm53_token_tile &&
+            n_head == 64u &&
+            kv_lora_dim == 512u &&
+            qk_nope == 256u &&
+            qk_dim == 256u &&
+            row_bytes == 272u &&
+            weight_type == DS4_METAL_TENSOR_Q8_0 &&
+            ds4_gpu_glm53_tuning_available();
+        id<MTLComputePipelineState> pipeline = nil;
+        if (use_glm53_token_tile) {
+            ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_PREFILL_QK_LOW);
+            pipeline = glm53_token_tile == 4u ?
+                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_t4_pipeline,
+                                     "kernel_glm_qk_lowrank_q8_0_batch_t4") :
+                glm53_token_tile == 8u ?
+                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_t8_pipeline,
+                                     "kernel_glm_qk_lowrank_q8_0_batch_t8") :
+                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_t16_pipeline,
+                                     "kernel_glm_qk_lowrank_q8_0_batch_t16");
+        } else if (use_glm52_t4) {
+            pipeline = ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_glm52_t4_pipeline,
+                                            "kernel_glm_qk_lowrank_q8_0_batch_glm52_t4");
+        } else {
+            pipeline = ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_pipeline,
+                                            "kernel_glm_qk_lowrank_q8_0_batch");
+        }
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -36240,7 +36335,13 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:3];
-        if (use_glm52_t4) {
+        if (use_glm53_token_tile) {
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
+                                                  ((NSUInteger)n_tokens + glm53_token_tile - 1u) /
+                                                      glm53_token_tile,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else if (use_glm52_t4) {
             [enc setThreadgroupMemoryLength:4u * 192u * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
                                                   ((NSUInteger)n_tokens + 3u) / 4u,
@@ -37456,8 +37557,32 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             cache_f16 && kv_lora_dim == 512u &&
             (qk_rope == 0u || qk_rope == 64u);
         const bool full_head_groups = (n_head % 8u) == 0u;
+        uint32_t attn_head_base = 0;
+        uint32_t head_count = n_head;
+        ds4_gpu_tp_attn_head_range(n_head, 8u, &attn_head_base, &head_count);
+        /*
+         * Heads one simdgroup carries, so a threadgroup covers 8 * that many
+         * and a token needs 64 / (8 * that many) staging passes over its
+         * selected rows.  Gated to the GLM 5.3 DSA shape this was measured on:
+         * no RoPE tail, 512 latent dimensions, resident, and a head range that
+         * divides evenly.
+         */
+        const uint32_t heads_per_sg =
+            ds4_gpu_glm53_prefill_indexed_attn_heads_per_sg();
+        const bool use_wide_head_groups =
+            use_vec_lora && selected_rows_valid && full_head_groups &&
+            heads_per_sg > 1u &&
+            qk_rope == 0u &&
+            n_head == 64u && qk_nope == 256u &&
+            (head_count % (8u * heads_per_sg)) == 0u &&
+            ds4_gpu_glm53_tuning_available();
         id<MTLComputePipelineState> pipeline = nil;
-        if (use_vec_lora && selected_rows_valid && full_head_groups) {
+        if (use_wide_head_groups) {
+            ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN);
+            pipeline = ds4_gpu_hot_pipeline(
+                    g_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads_pipeline,
+                    "kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads");
+        } else if (use_vec_lora && selected_rows_valid && full_head_groups) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline,
                     "kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
@@ -37501,8 +37626,7 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             .beta_slow = beta_slow,
             .head_base = 0,
         };
-        uint32_t head_count = n_head;
-        ds4_gpu_tp_attn_head_range(n_head, 8u, &args.head_base, &head_count);
+        args.head_base = attn_head_base;
         const NSUInteger scratch_bytes = use_vec_lora ?
             (16u * ((NSUInteger)kv_lora_dim / 4u) * sizeof(uint16_t) * 4u +
              16u * ((NSUInteger)qk_rope / 4u) * sizeof(float) * 4u) :
@@ -37525,7 +37649,10 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:7];
         }
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
+        const NSUInteger heads_per_group =
+            8u * (NSUInteger)(use_wide_head_groups ? heads_per_sg : 1u);
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + heads_per_group - 1u) /
+                                                  heads_per_group,
                                               (NSUInteger)n_tokens,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -38852,9 +38979,37 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
 
         id<MTLComputePipelineState> map_pipeline =
             ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert));
-        id<MTLComputePipelineState> gate_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
-        id<MTLComputePipelineState> up_pipeline = ds4_gpu_routed_mm_pipeline(up_type);
-        id<MTLComputePipelineState> down_pipeline =
+        /*
+         * Each expert's routed rows are matmul'd in 32-row tiles, and with
+         * 288 experts sharing 16384 rows the final tile of an expert has
+         * 16 or fewer rows about half the time.  The CULL_TAIL_SIMDGROUPS
+         * instantiation keeps every thread in staging and at every barrier
+         * but lets the second row-half skip its MMA and store there; the
+         * skipped outputs are padding rows nothing reads, so the result is
+         * unchanged.  Gated to the resident single-device Q4_K expert shape
+         * this was measured on.
+         */
+        const bool use_q4_K_tail_cull =
+            gate_type == DS4_METAL_TENSOR_Q4_K &&
+            up_type == DS4_METAL_TENSOR_Q4_K &&
+            down_type == DS4_METAL_TENSOR_Q4_K &&
+            ds4_gpu_glm53_tuning_available() &&
+            ((n_total_expert == 288u && n_expert == 8u &&
+              expert_in_dim == 4096u && expert_mid_dim == 2048u && out_dim == 4096u) ||
+             (g_test_flags & DS4_GPU_TEST_GLM53_PREFILL) != 0u) &&
+            getenv("DS4_METAL_DISABLE_GLM53_PREFILL_MOE_TAIL_CULL") == NULL &&
+            getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") == NULL;
+        if (use_q4_K_tail_cull) {
+            ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_PREFILL_MOE_TAIL_CULL);
+        }
+        id<MTLComputePipelineState> gate_pipeline = use_q4_K_tail_cull ?
+            ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_tail_cull", false) :
+            ds4_gpu_routed_mm_pipeline(gate_type);
+        id<MTLComputePipelineState> up_pipeline = use_q4_K_tail_cull ?
+            ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32_tail_cull", false) :
+            ds4_gpu_routed_mm_pipeline(up_type);
+        id<MTLComputePipelineState> down_pipeline = use_q4_K_tail_cull ?
+            ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16_tail_cull", false) :
             ds4_gpu_routed_mm_f16_rhs_pipeline(down_type);
         if (!map_pipeline || !gate_pipeline || !up_pipeline || !down_pipeline) {
             return 0;
@@ -47677,6 +47832,51 @@ int ds4_gpu_glm53_kda_decode(
     }
 }
 
+typedef struct {
+    uint32_t n_heads;
+    uint32_t n_rows;
+    uint32_t block_rows;
+    uint32_t n_blocks;
+    uint32_t block_base;
+    float    lower_bound;
+    float    norm_eps;
+} ds4_gpu_glm53_kda_blocked_args;
+
+/*
+ * Rows one threadgroup of the blocked KDA prepare kernel walks; 0 keeps the
+ * serial kernel, which runs one threadgroup per head and leaves an 80-core GPU
+ * about 95% idle.  DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE restores it for
+ * an A/B run, as does the branch-wide DS4_METAL_DISABLE_GLM53_FLASH_TUNING.
+ * DS4_METAL_GLM53_PREFILL_KDA_PREPARE_BLOCK forces one block size so the sweep
+ * can be repeated.  Read per call so a test can flip it between dispatches.
+ */
+static uint32_t ds4_gpu_glm53_prefill_kda_prepare_block(void) {
+    if (getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") != NULL ||
+        getenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE") != NULL) {
+        return 0u;
+    }
+    const char *env = getenv("DS4_METAL_GLM53_PREFILL_KDA_PREPARE_BLOCK");
+    const int forced = (env && env[0]) ? atoi(env) : 0;
+    if (forced >= 4 && forced <= 4096 && (forced & (forced - 1)) == 0) {
+        return (uint32_t)forced;
+    }
+    return 32u;
+}
+
+static double ds4_gpu_kda_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static uint32_t ds4_gpu_glm53_prefill_kda_values_per_sg(void) {
+    if (getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") != NULL ||
+        getenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_RECURRENCE") != NULL) return 1u;
+    const char *env = getenv("DS4_METAL_GLM53_PREFILL_KDA_VALUES_PER_SG");
+    const int forced = env ? atoi(env) : 0;
+    return forced == 1 || forced == 2 || forced == 4 ? (uint32_t)forced : 2u;
+}
+
 int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -47754,8 +47954,13 @@ int ds4_gpu_glm53_kda_prefill(
             &norm_inner, "KDA output norm");
         id<MTLComputePipelineState> prep_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare");
+        const uint32_t kda_values = n_heads == 64u && n_tokens >= 32u &&
+            ds4_gpu_glm53_tuning_available() ?
+            ds4_gpu_glm53_prefill_kda_values_per_sg() : 1u;
         id<MTLComputePipelineState> recurrence_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_recurrence");
+            ds4_gpu_get_pipeline(kda_values == 4u ? "kernel_glm53_kda_prefill_recurrence_v4" :
+                                kda_values == 2u ? "kernel_glm53_kda_prefill_recurrence_v2" :
+                                "kernel_glm53_kda_prefill_recurrence");
         id<MTLComputePipelineState> output_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_output");
         if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
@@ -47763,38 +47968,146 @@ int ds4_gpu_glm53_kda_prefill(
             return 0;
         }
 
+        /*
+         * Blocked prepare: one threadgroup per (block of rows, head) with the
+         * convolution history in registers.  It needs at least two blocks to
+         * be worth the halo pass, and a block start of 3 rows or more so the
+         * halo rows exist.
+         */
+        const uint32_t kda_block_rows = ds4_gpu_glm53_prefill_kda_prepare_block();
+        const uint32_t kda_n_blocks = kda_block_rows != 0u ?
+            1u + (n_tokens - 1u) / kda_block_rows : 0u;
+        id<MTLComputePipelineState> halo_pipeline = nil;
+        id<MTLComputePipelineState> blocked_pipeline = nil;
+        NSUInteger kda_halo_bytes = 0;
+        int use_blocked_prepare =
+            kda_block_rows >= 4u && kda_n_blocks >= 2u &&
+            n_heads == 64u && ds4_gpu_glm53_tuning_available();
+        if (use_blocked_prepare) {
+            halo_pipeline =
+                ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_conv_halo");
+            blocked_pipeline =
+                ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare_blocked");
+            kda_halo_bytes = (NSUInteger)kda_n_blocks * 3u *
+                             (NSUInteger)projection * 3u * sizeof(float);
+            use_blocked_prepare = halo_pipeline != nil && blocked_pipeline != nil &&
+                ds4_gpu_ensure_scratch_buffer(&g_kda_conv_halo_buffer,
+                                              &g_kda_conv_halo_capacity,
+                                              kda_halo_bytes,
+                                              "KDA conv halo") != 0;
+        }
+        ds4_gpu_glm53_kda_blocked_args blocked_args = {
+            .n_heads = n_heads,
+            .n_rows = n_tokens,
+            .block_rows = kda_block_rows,
+            .n_blocks = kda_n_blocks,
+            .block_base = 0,
+            .lower_bound = gate_lower_bound,
+            .norm_eps = norm_eps,
+        };
+
         glm53_gpu_kda_args args = {
             .n_heads = n_heads,
             .n_rows = n_tokens,
             .lower_bound = gate_lower_bound,
             .norm_eps = norm_eps,
         };
+        const int kda_profile = getenv("DS4_METAL_PROFILE_KDA_PREFILL") != NULL;
+        double kda_t0 = 0.0;
+        if (kda_profile) {
+            if (g_batch_cb &&
+                (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0)) return 0;
+            kda_t0 = ds4_gpu_kda_now_sec();
+        }
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
 
-        [enc setComputePipelineState:prep_pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(q)
-                offset:ds4_gpu_tensor_offset(q) atIndex:1];
-        [enc setBuffer:ds4_gpu_tensor_buffer(k)
-                offset:ds4_gpu_tensor_offset(k) atIndex:2];
-        [enc setBuffer:ds4_gpu_tensor_buffer(v)
-                offset:ds4_gpu_tensor_offset(v) atIndex:3];
-        [enc setBuffer:ds4_gpu_tensor_buffer(raw_gate)
-                offset:ds4_gpu_tensor_offset(raw_gate) atIndex:4];
-        [enc setBuffer:qw offset:(NSUInteger)qw_inner atIndex:5];
-        [enc setBuffer:kw offset:(NSUInteger)kw_inner atIndex:6];
-        [enc setBuffer:vw offset:(NSUInteger)vw_inner atIndex:7];
-        [enc setBuffer:a_log offset:(NSUInteger)a_inner atIndex:8];
-        [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:9];
-        [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
-                offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
-        [enc setThreadgroupMemoryLength:264u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (use_blocked_prepare) {
+            ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_PREFILL_KDA_PREPARE);
+            [enc setComputePipelineState:halo_pipeline];
+            [enc setBytes:&blocked_args length:sizeof(blocked_args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k)
+                    offset:ds4_gpu_tensor_offset(k) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v)
+                    offset:ds4_gpu_tensor_offset(v) atIndex:3];
+            [enc setBuffer:g_kda_conv_halo_buffer offset:0 atIndex:4];
+            [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
+                    offset:ds4_gpu_tensor_offset(conv_state) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(kda_n_blocks, 3, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
+            [enc setComputePipelineState:blocked_pipeline];
+            [enc setBytes:&blocked_args length:sizeof(blocked_args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k)
+                    offset:ds4_gpu_tensor_offset(k) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v)
+                    offset:ds4_gpu_tensor_offset(v) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(raw_gate)
+                    offset:ds4_gpu_tensor_offset(raw_gate) atIndex:4];
+            [enc setBuffer:qw offset:(NSUInteger)qw_inner atIndex:5];
+            [enc setBuffer:kw offset:(NSUInteger)kw_inner atIndex:6];
+            [enc setBuffer:vw offset:(NSUInteger)vw_inner atIndex:7];
+            [enc setBuffer:a_log offset:(NSUInteger)a_inner atIndex:8];
+            [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:9];
+            [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
+                    offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
+            [enc setBuffer:g_kda_conv_halo_buffer offset:0 atIndex:11];
+            [enc setThreadgroupMemoryLength:264u * sizeof(float) atIndex:0];
+            uint32_t prepare_blocks = kda_n_blocks;
+            if (g_test_flags & DS4_GPU_TEST_GLM53_KDA_LAST_BLOCK_FIRST) {
+                /* A legal adversarial scheduling order, made deterministic by
+                 * separate serial dispatches of the unchanged prepare kernel. */
+                blocked_args.block_base = kda_n_blocks - 1u;
+                [enc setBytes:&blocked_args length:sizeof(blocked_args) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, n_heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                blocked_args.block_base = 0;
+                [enc setBytes:&blocked_args length:sizeof(blocked_args) atIndex:0];
+                prepare_blocks--;
+            }
+            [enc dispatchThreadgroups:MTLSizeMake(prepare_blocks, n_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [enc setComputePipelineState:prep_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k)
+                    offset:ds4_gpu_tensor_offset(k) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v)
+                    offset:ds4_gpu_tensor_offset(v) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(raw_gate)
+                    offset:ds4_gpu_tensor_offset(raw_gate) atIndex:4];
+            [enc setBuffer:qw offset:(NSUInteger)qw_inner atIndex:5];
+            [enc setBuffer:kw offset:(NSUInteger)kw_inner atIndex:6];
+            [enc setBuffer:vw offset:(NSUInteger)vw_inner atIndex:7];
+            [enc setBuffer:a_log offset:(NSUInteger)a_inner atIndex:8];
+            [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:9];
+            [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
+                    offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
+            [enc setThreadgroupMemoryLength:264u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+
+        if (kda_profile) {
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "KDA prepare")) return 0;
+            if (!owned && ds4_gpu_end_commands() == 0) return 0;
+            const double t = ds4_gpu_kda_now_sec();
+            fprintf(stderr, "ds4: kda stage prepare=%.3f ms\n", (t - kda_t0) * 1000.0);
+            kda_t0 = t;
+            if (!owned && ds4_gpu_begin_commands() == 0) return 0;
+            cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            enc = ds4_gpu_compute_encoder(cb);
+        }
         [enc setComputePipelineState:recurrence_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q)
@@ -47811,9 +48124,24 @@ int ds4_gpu_glm53_kda_prefill(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32, 1)
+        if (kda_values > 1u) {
+            ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_PREFILL_KDA_RECURRENCE);
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32u / kda_values, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
+        if (kda_profile) {
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "KDA recurrence")) return 0;
+            if (!owned && ds4_gpu_end_commands() == 0) return 0;
+            const double t = ds4_gpu_kda_now_sec();
+            fprintf(stderr, "ds4: kda stage recurrence=%.3f ms\n", (t - kda_t0) * 1000.0);
+            kda_t0 = t;
+            if (!owned && ds4_gpu_begin_commands() == 0) return 0;
+            cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            enc = ds4_gpu_compute_encoder(cb);
+        }
         [enc setComputePipelineState:output_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
