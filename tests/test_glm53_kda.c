@@ -489,6 +489,724 @@ static void require_prefill_dispatch(uint32_t feature, bool expected,
  * 33- or 1-token prompt produce.  The dispatch runs through the same selection
  * the graph uses; DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW picks the reference
  * and DS4_METAL_GLM53_PREFILL_QK_LOW_TILE picks the tile. */
+static void check_glm53_qk_lowrank_token_tile(uint8_t *model,
+                                              uint64_t model_bytes,
+                                              uint64_t kb_offset) {
+    enum {
+        QL_HEADS = 64,
+        QL_KV_LORA = 512,
+        QL_QK_NOPE = 256,
+        QL_QK_DIM = 256,
+        QL_ROW_BYTES = 272,      /* 8 Q8_0 blocks of 34 bytes */
+        QL_Q8_0_TYPE = 8,        /* GGUF type code for Q8_0 */
+        QL_MAX_TOKENS = 2048,
+    };
+    static const uint32_t token_counts[] = { 2048u, 1596u, 33u, 1u };
+    static const uint32_t tiles[] = { 4u, 8u, 16u };
+    /* Scales that exercise the sign and the subnormal half range, where a
+     * reassociated product would round differently. */
+    static const uint16_t scale_bits[] = {
+        0x0001u, 0x8001u, 0x03ffu, 0x83ffu, 0x0000u, 0x8000u,
+        0x3c00u, 0xbc00u, 0x1234u, 0x9876u, 0x2c00u, 0xac00u, 0x0400u, 0x8400u,
+    };
+    const uint64_t weight_bytes =
+        (uint64_t)QL_HEADS * QL_KV_LORA * QL_ROW_BYTES;
+    require_ok(kb_offset + weight_bytes <= model_bytes,
+               "qk-low K_b rows fit the fixture model");
+
+    uint64_t rng = 0x9e3779b97f4a7c15ull;
+    for (uint64_t row = 0; row < (uint64_t)QL_HEADS * QL_KV_LORA; row++) {
+        uint8_t *dst = model + kb_offset + row * QL_ROW_BYTES;
+        for (uint32_t b = 0; b < QL_QK_NOPE / 32u; b++) {
+            const uint16_t d =
+                scale_bits[(row * 8u + b) % (sizeof(scale_bits) / sizeof(scale_bits[0]))];
+            memcpy(dst + b * 34u, &d, sizeof(d));
+            int8_t *qs = (int8_t *)(dst + b * 34u + 2u);
+            for (uint32_t i = 0; i < 32u; i++) {
+                rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+                qs[i] = (int8_t)(uint8_t)(rng >> 33);
+            }
+        }
+    }
+
+    const uint64_t q_elems = (uint64_t)QL_MAX_TOKENS * QL_HEADS * QL_QK_DIM;
+    const uint64_t out_elems = (uint64_t)QL_MAX_TOKENS * QL_HEADS * QL_KV_LORA;
+    float *q_host = malloc(q_elems * sizeof(float));
+    float *ref_host = malloc(out_elems * sizeof(float));
+    float *tile_host = malloc(out_elems * sizeof(float));
+    require_ok(q_host && ref_host && tile_host, "qk-low host allocation");
+    for (uint64_t i = 0; i < q_elems; i++) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        q_host[i] = (float)((int32_t)(uint32_t)(rng >> 32) / 1073741824.0) - 1.0f;
+    }
+
+    ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+    ds4_gpu_tensor *ref_gpu = ds4_gpu_tensor_alloc(out_elems * sizeof(float));
+    ds4_gpu_tensor *tile_gpu = ds4_gpu_tensor_alloc(out_elems * sizeof(float));
+    require_ok(q_gpu && ref_gpu && tile_gpu, "qk-low GPU allocation");
+    require_ok(ds4_gpu_tensor_write(q_gpu, 0, q_host, q_elems * sizeof(float)),
+               "qk-low q write");
+
+    /* The decode tile changes output ownership only. Reuse the signed,
+     * subnormal-scale fixture above and verify the active and rollback paths. */
+    require_ok(unsetenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == 0,
+               "clear inherited decode rollback");
+    for (unsigned arm = 0; arm < 3; arm++) {
+        if (arm == 0) setenv("DS4_METAL_DISABLE_GLM53_DECODE_QK_LOW", "1", 1);
+        else unsetenv("DS4_METAL_DISABLE_GLM53_DECODE_QK_LOW");
+        if (arm == 2) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
+        const uint64_t bytes = (uint64_t)QL_HEADS * QL_KV_LORA * sizeof(float);
+        require_ok(ds4_gpu_tensor_fill_f32(tile_gpu, -17.0f, QL_HEADS * QL_KV_LORA),
+                   "decode qk-low poison");
+        require_ok(ds4_gpu_glm_qk_lowrank_typed_tensor(tile_gpu, q_gpu,
+                       model, model_bytes, kb_offset, QL_Q8_0_TYPE,
+                       QL_HEADS, QL_KV_LORA, QL_QK_NOPE, QL_QK_DIM),
+                   "decode qk-low dispatch");
+        require_prefill_dispatch(DS4_GPU_GLM53_DECODE_QK_LOW, arm == 1,
+                                 "decode qk-low coverage");
+        require_ok(ds4_gpu_tensor_read(tile_gpu, 0, tile_host, bytes),
+                   "decode qk-low read");
+        if (arm == 0) memcpy(ref_host, tile_host, bytes);
+        else require_ok(memcmp(ref_host, tile_host, bytes) == 0,
+                        "decode qk-low bitwise output");
+    }
+    unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
+
+    for (size_t c = 0; c < sizeof(token_counts) / sizeof(token_counts[0]); c++) {
+        const uint32_t n_tokens = token_counts[c];
+        const uint64_t bytes =
+            (uint64_t)n_tokens * QL_HEADS * QL_KV_LORA * sizeof(float);
+        char what[96];
+
+        require_ok(setenv("DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW", "1", 1) == 0,
+                   "qk-low reference switch");
+        snprintf(what, sizeof(what), "qk-low reference at %u tokens", n_tokens);
+        require_ok(ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
+                       ref_gpu, q_gpu, model, model_bytes, kb_offset,
+                       QL_Q8_0_TYPE, n_tokens, QL_HEADS, QL_KV_LORA,
+                       QL_QK_NOPE, QL_QK_DIM), what);
+        require_ok(ds4_gpu_tensor_read(ref_gpu, 0, ref_host, bytes), what);
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_QK_LOW, false, what);
+        require_ok(unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW") == 0,
+                   "qk-low reference switch clear");
+
+        const size_t tile_count = sizeof(tiles) / sizeof(tiles[0]);
+        for (size_t t = 0; t <= tile_count; t++) {
+            const bool rollback = t == tile_count;
+            const uint32_t tile = tiles[t % tile_count];
+            if (rollback) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
+            char tile_text[8];
+            snprintf(tile_text, sizeof(tile_text), "%u", tile);
+            require_ok(setenv("DS4_METAL_GLM53_PREFILL_QK_LOW_TILE", tile_text, 1) == 0,
+                       "qk-low tile switch");
+            snprintf(what, sizeof(what), "qk-low tile %u at %u tokens rollback=%u",
+                     tile, n_tokens, rollback);
+            /* A quiet NaN in every output first, so a kernel that skips rows
+             * fails here rather than matching a stale buffer.  Built from bits
+             * because -ffast-math makes the NAN macro undefined. */
+            const uint32_t poison_bits = 0x7fc01234u;
+            float poison;
+            memcpy(&poison, &poison_bits, sizeof(poison));
+            require_ok(ds4_gpu_tensor_fill_f32(tile_gpu, poison,
+                                               (uint64_t)n_tokens * QL_HEADS * QL_KV_LORA),
+                       what);
+            require_ok(ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
+                           tile_gpu, q_gpu, model, model_bytes, kb_offset,
+                           QL_Q8_0_TYPE, n_tokens, QL_HEADS, QL_KV_LORA,
+                           QL_QK_NOPE, QL_QK_DIM), what);
+            require_ok(ds4_gpu_tensor_read(tile_gpu, 0, tile_host, bytes), what);
+            require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_QK_LOW,
+                                      !rollback && n_tokens >= tile, what);
+            if (memcmp(ref_host, tile_host, (size_t)bytes) != 0) {
+                for (uint64_t i = 0; i < bytes / sizeof(float); i++) {
+                    if (memcmp(&ref_host[i], &tile_host[i], sizeof(float)) == 0) continue;
+                    fprintf(stderr,
+                            "%s: output %llu is %.9g, reference %.9g\n",
+                            what, (unsigned long long)i,
+                            (double)tile_host[i], (double)ref_host[i]);
+                    break;
+                }
+                exit(1);
+            }
+        }
+        require_ok(unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") == 0,
+                   "clear aggregate rollback switch");
+        require_ok(unsetenv("DS4_METAL_GLM53_PREFILL_QK_LOW_TILE") == 0,
+                   "qk-low tile switch clear");
+    }
+
+    ds4_gpu_tensor_free(tile_gpu);
+    ds4_gpu_tensor_free(ref_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    free(tile_host);
+    free(ref_host);
+    free(q_host);
+}
+
+/* Optional 48-GiB regression for both 32-bit element-offset wrap boundaries.
+ * Kept out of the ordinary suite so machines with smaller memory can run it.
+ * The last real token must equal a one-token reference, not retain poison or
+ * read token zero after a wrapped input offset. */
+static void check_glm53_qk_lowrank_large_offsets(uint8_t *model,
+                                                uint64_t model_bytes,
+                                                uint64_t kb_offset) {
+    if (!getenv("DS4_TEST_GLM53_LARGE_QK")) return;
+    enum { HEADS = 64, NOPE = 256, LORA = 512, TOKENS = 262145 };
+    const uint64_t q_row = (uint64_t)HEADS * NOPE * sizeof(float);
+    const uint64_t out_row = (uint64_t)HEADS * LORA * sizeof(float);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc((uint64_t)TOKENS * q_row);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)TOKENS * out_row);
+    ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(out_row);
+    require_ok(q && out && ref, "large qk-low allocations (48 GiB required)");
+    ds4_gpu_tensor *q_last = ds4_gpu_tensor_view(q, (TOKENS - 1ull) * q_row, q_row);
+    ds4_gpu_tensor *out_last = ds4_gpu_tensor_view(out, (TOKENS - 1ull) * out_row, out_row);
+    require_ok(q_last && out_last, "large qk-low tail views");
+    require_ok(ds4_gpu_tensor_fill_f32(q, 0.0f, (uint64_t)TOKENS * HEADS * NOPE) &&
+               ds4_gpu_tensor_fill_f32(q_last, 1.0f, HEADS * NOPE) &&
+               ds4_gpu_tensor_fill_f32(out_last, 123.0f, HEADS * LORA), "large qk-low inputs and poison");
+    require_ok(ds4_gpu_glm_qk_lowrank_typed_batch_tensor(ref, q_last,
+        model, model_bytes, kb_offset, 8u, 1, HEADS, LORA, NOPE, NOPE), "large qk-low one-token reference");
+    require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_QK_LOW, false, "large qk-low reference coverage");
+    require_ok(ds4_gpu_glm_qk_lowrank_typed_batch_tensor(out, q,
+        model, model_bytes, kb_offset, 8u, TOKENS, HEADS, LORA, NOPE, NOPE), "large qk-low token tile");
+    require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_QK_LOW, true, "large qk-low tile coverage");
+    float expected[HEADS * LORA], actual[HEADS * LORA];
+    require_ok(ds4_gpu_tensor_read(ref, 0, expected, out_row) &&
+               ds4_gpu_tensor_read(out_last, 0, actual, out_row), "large qk-low readback");
+    require_ok(memcmp(expected, actual, out_row) == 0, "large qk-low tail is bit-identical");
+    ds4_gpu_tensor_free(out_last); ds4_gpu_tensor_free(q_last);
+    ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(q);
+    puts("GLM qk-low 64-bit offset regression: PASS");
+}
+
+/* Exactness oracle for the GLM 5.3 Flash indexed prefill attention head width.
+ *
+ * kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads carries
+ * two heads per simdgroup, so a token stages its selected rows four times
+ * instead of eight.  Each head keeps the one-head kernel's row order, its four
+ * dot(float4) terms, its simd_sum tree and its online-softmax update, so all
+ * 512 outputs of every head must match bit for bit.
+ * DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG picks the width, and
+ * DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN pins main's one-head kernel. */
+static void check_glm53_indexed_attention_head_width(void) {
+    enum {
+        IA_HEADS = 64,
+        IA_LORA = 512,
+        IA_NOPE = 256,
+        IA_CACHE_CAP = 4096,
+        IA_TOKENS = 8,
+        IA_MAX_SELECTED = 2051,
+    };
+    /* 2051 is the model's selection limit; the rest land on a partial trailing
+     * 16-row staging block, which is where a head-width bug would show. */
+    static const uint32_t selected_counts[] = { 2051u, 512u, 33u, 16u, 1u };
+
+    const uint64_t q_elems = (uint64_t)IA_TOKENS * IA_HEADS * IA_NOPE;
+    const uint64_t low_elems = (uint64_t)IA_TOKENS * IA_HEADS * IA_LORA;
+    const uint64_t cache_elems = (uint64_t)IA_CACHE_CAP * IA_LORA;
+    const uint64_t sel_elems = (uint64_t)IA_TOKENS * IA_MAX_SELECTED;
+
+    float *q_host = malloc(q_elems * sizeof(float));
+    float *low_host = malloc(low_elems * sizeof(float));
+    uint16_t *cache_host = malloc(cache_elems * sizeof(uint16_t));
+    uint32_t *sel_host = malloc(sel_elems * sizeof(uint32_t));
+    float *ref_host = malloc(low_elems * sizeof(float));
+    float *dual_host = malloc(low_elems * sizeof(float));
+    require_ok(q_host && low_host && cache_host && sel_host && ref_host && dual_host,
+               "indexed attention host allocation");
+
+    uint64_t rng = 0xda3e39cb94b95bdbull;
+#define IA_NEXT_UNIT() ( \
+    rng = rng * 6364136223846793005ull + 1442695040888963407ull, \
+    (float)((int32_t)(uint32_t)(rng >> 32) / 1073741824.0) - 1.0f)
+    for (uint64_t i = 0; i < q_elems; i++) q_host[i] = IA_NEXT_UNIT();
+    for (uint64_t i = 0; i < low_elems; i++) low_host[i] = IA_NEXT_UNIT();
+    /* Half values kept in the normal range so the truncating encoder above is
+     * exact and the fixture round-trips. */
+    for (uint64_t i = 0; i < cache_elems; i++) {
+        const float unit = IA_NEXT_UNIT();
+        cache_host[i] = f32_to_f16(unit >= 0.0f ? 0.0625f + unit : -0.0625f + unit);
+    }
+    /* Every selected row must be in cache range: this kernel family is the
+     * "valid rows" instantiation and does not re-check them. */
+    for (uint64_t i = 0; i < sel_elems; i++) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        sel_host[i] = (uint32_t)((rng >> 33) % (uint64_t)IA_CACHE_CAP);
+    }
+
+    ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+    ds4_gpu_tensor *low_gpu = ds4_gpu_tensor_alloc(low_elems * sizeof(float));
+    ds4_gpu_tensor *cache_gpu = ds4_gpu_tensor_alloc(cache_elems * sizeof(uint16_t));
+    ds4_gpu_tensor *rope_gpu = ds4_gpu_tensor_alloc(sizeof(float));
+    ds4_gpu_tensor *sel_gpu = ds4_gpu_tensor_alloc(sel_elems * sizeof(uint32_t));
+    ds4_gpu_tensor *ref_gpu = ds4_gpu_tensor_alloc(low_elems * sizeof(float));
+    ds4_gpu_tensor *dual_gpu = ds4_gpu_tensor_alloc(low_elems * sizeof(float));
+    require_ok(q_gpu && low_gpu && cache_gpu && rope_gpu && sel_gpu && ref_gpu && dual_gpu,
+               "indexed attention GPU allocation");
+    require_ok(ds4_gpu_tensor_write(q_gpu, 0, q_host, q_elems * sizeof(float)) &&
+               ds4_gpu_tensor_write(low_gpu, 0, low_host, low_elems * sizeof(float)) &&
+               ds4_gpu_tensor_write(cache_gpu, 0, cache_host, cache_elems * sizeof(uint16_t)) &&
+               ds4_gpu_tensor_write(sel_gpu, 0, sel_host, sel_elems * sizeof(uint32_t)),
+               "indexed attention input write");
+
+    for (size_t c = 0; c < sizeof(selected_counts) / sizeof(selected_counts[0]); c++) {
+        const uint32_t n_selected = selected_counts[c];
+        const uint64_t bytes = low_elems * sizeof(float);
+        char what[96];
+
+        require_ok(setenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG", "1", 1) == 0,
+                   "indexed attention width switch");
+        snprintf(what, sizeof(what), "indexed attention one head at %u rows", n_selected);
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                       ref_gpu, q_gpu, low_gpu, cache_gpu, rope_gpu, sel_gpu,
+                       IA_TOKENS, n_selected, IA_CACHE_CAP, true, IA_HEADS,
+                       IA_LORA, IA_NOPE, 0u, 0u,
+                       10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f), what);
+        require_ok(ds4_gpu_tensor_read(ref_gpu, 0, ref_host, bytes), what);
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN, false, what);
+
+        require_ok(setenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG", "2", 1) == 0,
+                   "indexed attention width switch");
+        snprintf(what, sizeof(what), "indexed attention two heads at %u rows", n_selected);
+        const uint32_t poison_bits = 0x7fc01234u;
+        float poison;
+        memcpy(&poison, &poison_bits, sizeof(poison));
+        require_ok(ds4_gpu_tensor_fill_f32(dual_gpu, poison, low_elems), what);
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                       dual_gpu, q_gpu, low_gpu, cache_gpu, rope_gpu, sel_gpu,
+                       IA_TOKENS, n_selected, IA_CACHE_CAP, true, IA_HEADS,
+                       IA_LORA, IA_NOPE, 0u, 0u,
+                       10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f), what);
+        require_ok(ds4_gpu_tensor_read(dual_gpu, 0, dual_host, bytes), what);
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN, true, what);
+        if (memcmp(ref_host, dual_host, (size_t)bytes) != 0) {
+            for (uint64_t i = 0; i < low_elems; i++) {
+                if (memcmp(&ref_host[i], &dual_host[i], sizeof(float)) == 0) continue;
+                fprintf(stderr,
+                        "%s: token %llu head %llu lane element %llu is %.9g, one-head %.9g\n",
+                        what,
+                        (unsigned long long)(i / (IA_HEADS * IA_LORA)),
+                        (unsigned long long)((i / IA_LORA) % IA_HEADS),
+                        (unsigned long long)(i % IA_LORA),
+                        (double)dual_host[i], (double)ref_host[i]);
+                break;
+            }
+            exit(1);
+        }
+    }
+    require_ok(unsetenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG") == 0,
+               "indexed attention width switch clear");
+#undef IA_NEXT_UNIT
+
+    ds4_gpu_tensor_free(dual_gpu);
+    ds4_gpu_tensor_free(ref_gpu);
+    ds4_gpu_tensor_free(sel_gpu);
+    ds4_gpu_tensor_free(rope_gpu);
+    ds4_gpu_tensor_free(cache_gpu);
+    ds4_gpu_tensor_free(low_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    free(dual_host);
+    free(ref_host);
+    free(sel_host);
+    free(cache_host);
+    free(low_host);
+    free(q_host);
+}
+
+/* Invalid selected IDs must be skipped without changing the order of valid
+ * rows. Compare the guarded API with the same selection compacted through the
+ * valid API, including the original RoPE and partial-head specializations. */
+static void check_glm53_indexed_attention_invalid_rows(void) {
+    enum { CAP = 64, MAX_HEADS = 64, LORA = 512, MAX_Q = 320, VALID = 16 };
+    float q[MAX_HEADS * MAX_Q], low[MAX_HEADS * LORA];
+    uint16_t cache[CAP * LORA], rope[CAP * 64];
+    uint32_t compact[VALID], masked[2 * VALID];
+    float expected[MAX_HEADS * LORA], actual[MAX_HEADS * LORA];
+    for (unsigned i = 0; i < MAX_HEADS * MAX_Q; i++) q[i] = 0.01f * ((int)(i % 17) - 8);
+    for (unsigned i = 0; i < MAX_HEADS * LORA; i++) low[i] = 0.02f * ((int)(i % 19) - 9);
+    for (unsigned i = 0; i < CAP * LORA; i++) cache[i] = f32_to_f16(0.125f * ((int)(i % 13) - 6));
+    for (unsigned i = 0; i < CAP * 64; i++) rope[i] = f32_to_f16(0.125f * ((int)(i % 7) - 3));
+    for (unsigned i = 0; i < VALID; i++) {
+        compact[i] = (i * 7) % CAP;
+        masked[2 * i] = compact[i];
+        masked[2 * i + 1] = i % 2 ? UINT32_MAX : CAP + i;
+    }
+    ds4_gpu_tensor *gq = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *glow = ds4_gpu_tensor_alloc(sizeof(low));
+    ds4_gpu_tensor *gcache = ds4_gpu_tensor_alloc(sizeof(cache));
+    ds4_gpu_tensor *grope = ds4_gpu_tensor_alloc(sizeof(rope));
+    ds4_gpu_tensor *gcompact = ds4_gpu_tensor_alloc(sizeof(compact));
+    ds4_gpu_tensor *gmasked = ds4_gpu_tensor_alloc(sizeof(masked));
+    ds4_gpu_tensor *gout = ds4_gpu_tensor_alloc(sizeof(actual));
+    require_ok(gq && glow && gcache && grope && gcompact && gmasked && gout, "invalid attention allocations");
+    require_ok(ds4_gpu_tensor_write(gq, 0, q, sizeof(q)) &&
+               ds4_gpu_tensor_write(glow, 0, low, sizeof(low)) &&
+               ds4_gpu_tensor_write(gcache, 0, cache, sizeof(cache)) &&
+               ds4_gpu_tensor_write(grope, 0, rope, sizeof(rope)) &&
+               ds4_gpu_tensor_write(gcompact, 0, compact, sizeof(compact)) &&
+               ds4_gpu_tensor_write(gmasked, 0, masked, sizeof(masked)), "invalid attention uploads");
+    for (unsigned h = 0; h < 2; h++) for (unsigned r = 0; r < 2; r++) {
+        const uint32_t heads = h ? 7 : 64, rot = r ? 64 : 0;
+        const uint64_t bytes = (uint64_t)heads * LORA * sizeof(float);
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+            gout, gq, glow, gcache, grope, gcompact, 1, VALID, CAP, true,
+            heads, LORA, 256, rot, 4096, 10000.0f, 1.0f, 1.0f, 1.0f, 32.0f, 1.0f), "compact attention reference");
+        require_ok(ds4_gpu_tensor_read(gout, 0, expected, bytes), "compact attention read");
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN, heads == 64 && rot == 0, "compact attention coverage");
+        require_ok(ds4_gpu_tensor_fill_f32(gout, 123.0f, heads * LORA), "poison masked output");
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+            gout, gq, glow, gcache, grope, gmasked, 1, 2 * VALID, CAP, true,
+            heads, LORA, 256, rot, 4096, 10000.0f, 1.0f, 1.0f, 1.0f, 32.0f, 1.0f), "masked attention");
+        require_ok(ds4_gpu_tensor_read(gout, 0, actual, bytes), "masked attention read");
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN, false, "masked attention fallback");
+        require_ok(memcmp(expected, actual, bytes) == 0, "invalid rows preserve exact valid-row attention");
+    }
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gmasked); ds4_gpu_tensor_free(gcompact);
+    ds4_gpu_tensor_free(grope); ds4_gpu_tensor_free(gcache); ds4_gpu_tensor_free(glow); ds4_gpu_tensor_free(gq);
+}
+
+/* Exactness oracle for the Q4_K routed-expert tail cull.
+ *
+ * kernel_mul_mm_id_q4_K_{f32,f16}_tail_cull differ from the kernels beside
+ * them only in that the SIMDgroup pair owning routed rows 16..31 skips its
+ * MMA and store when the expert's final 32-row tile holds 16 rows or fewer.
+ * Those outputs are padding rows nothing reads, so both the f16 mid and the
+ * summed f32 output must be byte-identical.  The per-expert row counts below
+ * cover every final-tile size that matters: exact multiples of 32, 16 or
+ * fewer, and 17 or more.
+ *
+ * Test mode forces the synthetic shape through the cull and records dispatch
+ * coverage, so unsupported/default-off devices cannot silently compare the
+ * reference with itself. */
+static void check_glm53_routed_moe_tail_cull(uint8_t *model,
+                                             uint64_t model_bytes,
+                                             uint64_t gate_offset,
+                                             uint64_t up_offset,
+                                             uint64_t down_offset) {
+    enum {
+        MOE_EXPERTS = 36,
+        MOE_USED = 8,
+        MOE_DIM = 256,
+        MOE_TOKENS = 384,
+        MOE_Q4_K_ROW_BYTES = 144,          /* one 256-element Q4_K block */
+        MOE_Q4_K_TYPE = 12,                /* GGUF type code for Q4_K */
+        MOE_EXPERT_BYTES = MOE_DIM * MOE_Q4_K_ROW_BYTES,
+    };
+    uint32_t target_rows[MOE_EXPERTS];
+    for (uint32_t i = 0; i < 32u; i++) target_rows[i] = 64u + i;
+    target_rows[32] = 0u;  /* empty expert */
+    target_rows[33] = target_rows[34] = 256u;
+    target_rows[35] = 16u; /* total: 384 tokens * 8 distinct experts */
+    static const uint16_t scale_bits[] = {
+        0x2c00u, 0xac00u, 0x3400u, 0xb400u, 0x1c00u, 0x9c00u, 0x3800u, 0x2400u,
+        0x0001u, 0x8001u, 0x03ffu, 0x83ffu, 0x0000u, 0x8000u,
+    };
+    const uint64_t matrix_bytes = (uint64_t)MOE_EXPERTS * MOE_EXPERT_BYTES;
+    require_ok(down_offset + matrix_bytes <= model_bytes,
+               "routed MoE expert weights fit the fixture model");
+
+    uint64_t rng = 0xc3a5c85c97cb3127ull;
+#define MOE_NEXT_BYTE() ( \
+    rng = rng * 6364136223846793005ull + 1442695040888963407ull, \
+    (uint8_t)(rng >> 33))
+    const uint64_t offsets[3] = { gate_offset, up_offset, down_offset };
+    for (int m = 0; m < 3; m++) {
+        for (uint32_t row = 0; row < MOE_EXPERTS * MOE_DIM; row++) {
+            uint8_t *dst = model + offsets[m] + (uint64_t)row * MOE_Q4_K_ROW_BYTES;
+            const uint16_t d = scale_bits[(row + (uint32_t)m) % (sizeof(scale_bits) / sizeof(scale_bits[0]))];
+            const uint16_t dmin = scale_bits[(row + (uint32_t)m + 3u) % (sizeof(scale_bits) / sizeof(scale_bits[0]))];
+            memcpy(dst + 0, &d, sizeof(d));
+            memcpy(dst + 2, &dmin, sizeof(dmin));
+            for (uint32_t i = 4; i < MOE_Q4_K_ROW_BYTES; i++) dst[i] = MOE_NEXT_BYTE();
+        }
+    }
+
+    const uint64_t x_elems = (uint64_t)MOE_TOKENS * MOE_DIM;
+    const uint64_t route_elems = (uint64_t)MOE_TOKENS * MOE_USED;
+    const uint64_t mid_elems = route_elems * MOE_DIM;
+    const uint64_t out_elems = (uint64_t)MOE_TOKENS * MOE_DIM;
+
+    float *x_host = malloc(x_elems * sizeof(float));
+    int32_t *sel_host = malloc(route_elems * sizeof(int32_t));
+    float *w_host = malloc(route_elems * sizeof(float));
+    float *mid_ref = malloc(mid_elems * sizeof(float));
+    float *mid_cull = malloc(mid_elems * sizeof(float));
+    float *out_ref = malloc(out_elems * sizeof(float));
+    float *out_cull = malloc(out_elems * sizeof(float));
+    require_ok(x_host && sel_host && w_host && mid_ref && mid_cull && out_ref && out_cull,
+               "routed MoE host allocation");
+    for (uint64_t i = 0; i < x_elems; i++) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        x_host[i] = (float)((int32_t)(uint32_t)(rng >> 32) / 1073741824.0) - 1.0f;
+    }
+    for (uint64_t i = 0; i < route_elems; i++) {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        w_host[i] = 0.05f + (float)(rng >> 40) / 8388608.0f;
+    }
+    /* Hand every token the eight experts with the most rows still owed, which
+     * realizes target_rows exactly and keeps a token's experts distinct. */
+    uint32_t remaining[MOE_EXPERTS];
+    memcpy(remaining, target_rows, sizeof(remaining));
+    for (uint32_t t = 0; t < MOE_TOKENS; t++) {
+        bool taken[MOE_EXPERTS] = { false };
+        for (uint32_t s = 0; s < MOE_USED; s++) {
+            uint32_t best = MOE_EXPERTS;
+            for (uint32_t e = 0; e < MOE_EXPERTS; e++) {
+                if (taken[e]) continue;
+                if (best == MOE_EXPERTS || remaining[e] > remaining[best]) best = e;
+            }
+            require_ok(best < MOE_EXPERTS && remaining[best] > 0,
+                       "routed MoE route construction");
+            taken[best] = true;
+            remaining[best]--;
+            sel_host[(uint64_t)t * MOE_USED + s] = (int32_t)best;
+        }
+    }
+#undef MOE_NEXT_BYTE
+
+    ds4_gpu_tensor *x_gpu = ds4_gpu_tensor_alloc(x_elems * sizeof(float));
+    ds4_gpu_tensor *sel_gpu = ds4_gpu_tensor_alloc(route_elems * sizeof(int32_t));
+    ds4_gpu_tensor *w_gpu = ds4_gpu_tensor_alloc(route_elems * sizeof(float));
+    ds4_gpu_tensor *mid_gpu = ds4_gpu_tensor_alloc(mid_elems * sizeof(float));
+    ds4_gpu_tensor *out_gpu = ds4_gpu_tensor_alloc(out_elems * sizeof(float));
+    require_ok(x_gpu && sel_gpu && w_gpu && mid_gpu && out_gpu,
+               "routed MoE GPU allocation");
+    require_ok(ds4_gpu_tensor_write(x_gpu, 0, x_host, x_elems * sizeof(float)) &&
+               ds4_gpu_tensor_write(sel_gpu, 0, sel_host, route_elems * sizeof(int32_t)) &&
+               ds4_gpu_tensor_write(w_gpu, 0, w_host, route_elems * sizeof(float)),
+               "routed MoE input write");
+
+    const uint32_t poison_bits = 0x7fc01234u;
+    float poison;
+    memcpy(&poison, &poison_bits, sizeof(poison));
+    for (int cull = 0; cull < 2; cull++) {
+        const char *what = cull ? "routed MoE tail cull" : "routed MoE reference";
+        if (cull) {
+            require_ok(unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_MOE_TAIL_CULL") == 0, what);
+        } else {
+            require_ok(setenv("DS4_METAL_DISABLE_GLM53_PREFILL_MOE_TAIL_CULL", "1", 1) == 0, what);
+        }
+        require_ok(ds4_gpu_tensor_fill_f32(mid_gpu, poison, mid_elems) &&
+                   ds4_gpu_tensor_fill_f32(out_gpu, poison, out_elems), what);
+        require_ok(ds4_gpu_glm_routed_moe_batch_tensor(
+                       out_gpu, mid_gpu, model, model_bytes,
+                       gate_offset, up_offset, down_offset,
+                       MOE_Q4_K_TYPE, MOE_Q4_K_TYPE, MOE_Q4_K_TYPE,
+                       MOE_EXPERT_BYTES, MOE_Q4_K_ROW_BYTES,
+                       MOE_EXPERT_BYTES, MOE_Q4_K_ROW_BYTES,
+                       MOE_EXPERT_BYTES, MOE_Q4_K_ROW_BYTES,
+                       MOE_DIM, MOE_DIM, MOE_DIM,
+                       sel_gpu, w_gpu, MOE_EXPERTS, MOE_USED,
+                       10.0f, 0u, x_gpu, MOE_TOKENS,
+                       MOE_USED * MOE_DIM, true), what);
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_MOE_TAIL_CULL,
+                                  cull != 0, what);
+        require_ok(ds4_gpu_tensor_read(mid_gpu, 0, cull ? mid_cull : mid_ref,
+                                       mid_elems * sizeof(float)) &&
+                   ds4_gpu_tensor_read(out_gpu, 0, cull ? out_cull : out_ref,
+                                       out_elems * sizeof(float)),
+                   what);
+    }
+    require_ok(unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_MOE_TAIL_CULL") == 0,
+               "routed MoE tail cull switch clear");
+
+    /* The f16 mid occupies the first half of the f32 mid buffer. */
+    if (memcmp(mid_ref, mid_cull, (size_t)(mid_elems * sizeof(uint16_t))) != 0 ||
+        memcmp(out_ref, out_cull, (size_t)(out_elems * sizeof(float))) != 0) {
+        for (uint64_t i = 0; i < out_elems; i++) {
+            if (memcmp(&out_ref[i], &out_cull[i], sizeof(float)) == 0) continue;
+            fprintf(stderr,
+                    "routed MoE tail cull: output %llu is %.9g, reference %.9g\n",
+                    (unsigned long long)i, (double)out_cull[i], (double)out_ref[i]);
+            break;
+        }
+        fprintf(stderr, "routed MoE tail cull is not bit-identical\n");
+        exit(1);
+    }
+
+    ds4_gpu_tensor_free(out_gpu);
+    ds4_gpu_tensor_free(mid_gpu);
+    ds4_gpu_tensor_free(w_gpu);
+    ds4_gpu_tensor_free(sel_gpu);
+    ds4_gpu_tensor_free(x_gpu);
+    free(out_cull);
+    free(out_ref);
+    free(mid_cull);
+    free(mid_ref);
+    free(w_host);
+    free(sel_host);
+    free(x_host);
+}
+
+/* Exactness oracle for the blocked GLM 5.3 KDA prepare kernel.
+ *
+ * kernel_glm53_kda_prefill_prepare_blocked splits the serial kernel's token
+ * loop across (block, head) threadgroups and carries the three-row causal
+ * convolution history in registers instead of shifting it through the device
+ * conv state.  Every value keeps the serial kernel's expression and order, so
+ * the normalized q and k, the silu'd v, the decay gate, the recurrence output
+ * and the outgoing conv and recurrent states must all match bit for bit --
+ * including where the window still reaches into the incoming conv state
+ * (the first three rows) and on the short trailing block.
+ *
+ * This overwrites the KDA convolution fixture weights, so it runs after the
+ * checks that use them. */
+static void check_glm53_kda_prepare_blocked(uint8_t *model,
+                                            uint64_t model_bytes,
+                                            uint64_t q_conv_offset,
+                                            uint64_t k_conv_offset,
+                                            uint64_t v_conv_offset,
+                                            uint64_t a_log_offset,
+                                            uint64_t dt_bias_offset,
+                                            uint64_t norm_offset) {
+    enum { H = 64, D = 128, P = H * D, MAX_TOKENS = 2048 };
+    enum { Q, K, V, GATE, OGATE, BETA, CONV, STATE, OUT, NBUF };
+    /* Production head count, partial blocks, and explicit fallback boundaries. */
+    static const uint32_t tokens[] = { 2048, 1596, 65, 33, 17, 4, 3, 1 };
+    static const struct {
+        uint32_t block, values;
+        bool last_first, profile, batch, split, rollback;
+    } variants[] = {
+        {0, 1, false, false, false, false, false}, /* serial reference */
+        {4, 2, false, false, false, false, false},
+        {16, 2, false, false, false, false, false},
+        {32, 2, false, false, false, false, false},
+        {64, 4, false, false, false, false, false},
+        {32, 2, true, false, false, false, false}, /* deterministic race regression */
+        {32, 2, false, true, false, false, false}, /* profiler with an owned CB */
+        {32, 2, false, true, true, false, false},  /* profiler preserves caller batch */
+        {32, 2, true, false, true, true, false},   /* continue 33 + 32 tokens */
+        {32, 2, false, false, false, false, true}, /* aggregate rollback */
+    };
+    const bool inherited_profile = getenv("DS4_METAL_PROFILE_KDA_PREFILL") != NULL;
+    require_ok(norm_offset + D * sizeof(float) <= model_bytes,
+               "production KDA weights fit fixture");
+    uint64_t rng = 0x2545f4914f6cdd1dull;
+#define KP_UNIT() ( \
+    rng = rng * 6364136223846793005ull + 1442695040888963407ull, \
+    (float)((int32_t)(uint32_t)(rng >> 32) / 1073741824.0) - 1.0f)
+    const uint64_t conv_offsets[] = { q_conv_offset, k_conv_offset, v_conv_offset };
+    for (unsigned m = 0; m < 3; m++) {
+        float *w = (float *)(model + conv_offsets[m]);
+        for (unsigned i = 0; i < P * 4u; i++) w[i] = 0.4f * KP_UNIT();
+    }
+    for (unsigned i = 0; i < P; i++) ((float *)(model + dt_bias_offset))[i] = 0.2f * KP_UNIT();
+    for (unsigned i = 0; i < H; i++) ((float *)(model + a_log_offset))[i] = 0.3f * KP_UNIT();
+    for (unsigned i = 0; i < D; i++) ((float *)(model + norm_offset))[i] = 1.0f + 0.1f * KP_UNIT();
+
+    uint64_t elements[NBUF];
+    float *input[NBUF], *reference[NBUF];
+    ds4_gpu_tensor *gpu[NBUF];
+    for (unsigned b = 0; b < NBUF; b++) {
+        elements[b] = b == BETA ? (uint64_t)MAX_TOKENS * H :
+                      b == CONV ? 9u * P : b == STATE ? (uint64_t)P * D :
+                      (uint64_t)MAX_TOKENS * P;
+        input[b] = malloc(elements[b] * sizeof(float));
+        reference[b] = malloc(elements[b] * sizeof(float));
+        gpu[b] = ds4_gpu_tensor_alloc(elements[b] * sizeof(float));
+        require_ok(input[b] && reference[b] && gpu[b], "KDA oracle allocation");
+        for (uint64_t i = 0; i < elements[b]; i++) input[b][i] = KP_UNIT() * (b == STATE ? 0.1f : 1.0f);
+    }
+#undef KP_UNIT
+    float *actual = malloc((uint64_t)MAX_TOKENS * P * sizeof(float));
+    require_ok(actual != NULL, "KDA readback allocation");
+    static const unsigned compared[] = { Q, K, V, GATE, CONV, STATE, OUT };
+    static const char *const names[] = { "q", "k", "v", "decay", "output gate", "beta", "conv state", "recurrent state", "output" };
+    const uint32_t poison_bits = 0x7fc01234u;
+    float poison;
+    memcpy(&poison, &poison_bits, sizeof(poison));
+    for (unsigned c = 0; c < sizeof(tokens) / sizeof(tokens[0]); c++) {
+        const uint32_t n = tokens[c];
+        uint64_t bytes[NBUF];
+        for (unsigned b = 0; b < NBUF; b++) {
+            bytes[b] = (b == BETA ? (uint64_t)n * H :
+                        (b == CONV || b == STATE) ? elements[b] : (uint64_t)n * P) * sizeof(float);
+        }
+        for (unsigned variant = 0; variant < sizeof(variants) / sizeof(variants[0]); variant++) {
+            if (variants[variant].split && n != 65u) continue;
+            const uint32_t block = variants[variant].block;
+            char what[128], text[16];
+            snprintf(what, sizeof(what), "KDA n=%u block=%u values=%u last-first=%u profile=%u batch=%u split=%u rollback=%u",
+                     n, block, variants[variant].values, variants[variant].last_first, variants[variant].profile,
+                     variants[variant].batch, variants[variant].split, variants[variant].rollback);
+            if (variants[variant].rollback) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
+            else unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
+            if (block == 0u) {
+                setenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE", "1", 1);
+                setenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_RECURRENCE", "1", 1);
+            } else {
+                unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE");
+                unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_RECURRENCE");
+            }
+            snprintf(text, sizeof(text), "%u", block);
+            setenv("DS4_METAL_GLM53_PREFILL_KDA_PREPARE_BLOCK", text, 1);
+            snprintf(text, sizeof(text), "%u", variants[variant].values);
+            setenv("DS4_METAL_GLM53_PREFILL_KDA_VALUES_PER_SG", text, 1);
+            if (variants[variant].profile) setenv("DS4_METAL_PROFILE_KDA_PREFILL", "1", 1);
+            else unsetenv("DS4_METAL_PROFILE_KDA_PREFILL");
+            ds4_gpu_test_set_flags(DS4_GPU_TEST_GLM53_PREFILL |
+                (variants[variant].last_first ? DS4_GPU_TEST_GLM53_KDA_LAST_BLOCK_FIRST : 0u));
+            for (unsigned b = 0; b < OUT; b++) require_ok(ds4_gpu_tensor_write(gpu[b], 0, input[b], bytes[b]), what);
+            require_ok(ds4_gpu_tensor_fill_f32(gpu[OUT], poison, (uint64_t)n * P), what);
+            if (variants[variant].batch) require_ok(ds4_gpu_begin_commands(), what);
+            const unsigned chunks = variants[variant].split ? 2 : 1;
+            for (unsigned chunk = 0; chunk < chunks; chunk++) {
+                const uint32_t offset = chunk == 0 ? 0 : 33;
+                const uint32_t rows = chunks == 1 ? n : chunk == 0 ? 33 : n - 33;
+                ds4_gpu_tensor *views[6];
+                for (unsigned b = Q; b <= BETA; b++) {
+                    const uint64_t stride = (b == BETA ? H : P) * sizeof(float);
+                    views[b] = ds4_gpu_tensor_view(gpu[b], (uint64_t)offset * stride, (uint64_t)rows * stride);
+                    require_ok(views[b] != NULL, what);
+                }
+                ds4_gpu_tensor *out = ds4_gpu_tensor_view(gpu[OUT], (uint64_t)offset * P * sizeof(float), (uint64_t)rows * P * sizeof(float));
+                require_ok(out != NULL, what);
+                require_ok(ds4_gpu_glm53_kda_prefill(out, gpu[CONV], gpu[STATE],
+                    views[Q], views[K], views[V], views[GATE], views[BETA], views[OGATE],
+                    model, model_bytes, q_conv_offset, k_conv_offset, v_conv_offset,
+                    a_log_offset, dt_bias_offset, norm_offset, H, rows, -5.0f, 1e-5f), what);
+                ds4_gpu_tensor_free(out);
+                for (unsigned b = Q; b <= BETA; b++) ds4_gpu_tensor_free(views[b]);
+            }
+            require_ok(ds4_gpu_end_commands() == (variants[variant].batch ? 1 : 0), "KDA preserves command-batch ownership");
+            const uint32_t largest_chunk = chunks == 1 ? n : 33;
+            const uint32_t expected_dispatches = variants[variant].rollback ? 0u :
+                (block != 0u && largest_chunk > block ? DS4_GPU_GLM53_PREFILL_KDA_PREPARE : 0u) |
+                (block != 0u && largest_chunk >= 32u ? DS4_GPU_GLM53_PREFILL_KDA_RECURRENCE : 0u);
+            require_prefill_dispatch(expected_dispatches, true, what);
+            for (unsigned j = 0; j < sizeof(compared) / sizeof(compared[0]); j++) {
+                const unsigned b = compared[j];
+                float *dst = variant == 0 ? reference[b] : actual;
+                require_ok(ds4_gpu_tensor_read(gpu[b], 0, dst, bytes[b]), what);
+                if (variant == 0 || memcmp(reference[b], actual, bytes[b]) == 0) continue;
+                for (uint64_t i = 0; i < bytes[b] / sizeof(float); i++) {
+                    if (memcmp(&reference[b][i], &actual[i], sizeof(float)) == 0) continue;
+                    fprintf(stderr, "%s: %s[%llu] %.9g != %.9g\n", what, names[b],
+                            (unsigned long long)i, actual[i], reference[b][i]);
+                    break;
+                }
+                exit(1);
+            }
+        }
+    }
+    unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
+    unsetenv("DS4_METAL_GLM53_PREFILL_KDA_PREPARE_BLOCK");
+    unsetenv("DS4_METAL_GLM53_PREFILL_KDA_VALUES_PER_SG");
+    unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE");
+    unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_KDA_RECURRENCE");
+    if (inherited_profile) setenv("DS4_METAL_PROFILE_KDA_PREFILL", "1", 1);
+    else unsetenv("DS4_METAL_PROFILE_KDA_PREFILL");
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_GLM53_PREFILL);
+    free(actual);
+    for (unsigned b = 0; b < NBUF; b++) {
+        ds4_gpu_tensor_free(gpu[b]);
+        free(reference[b]);
+        free(input[b]);
+    }
+}
+
+/* Compare every intermediate as score-row ownership changes, including the
+ * indexer's three sentinels and the first count above the tuned limit. */
 static void check_glm53_dsa_score_tile(uint8_t *model, uint64_t model_bytes,
                                        uint64_t value_offset) {
     enum { H = 64, L = 512, V = 256, CAP = 2052, ROW_BYTES = 544 };
@@ -2075,10 +2793,19 @@ int main(void) {
                "clear inherited attention tuning switch for kernel oracles");
     ds4_gpu_test_set_flags(DS4_GPU_TEST_GLM53_PREFILL);
     ds4_gpu_test_glm53_prefill_take_dispatches();
+    check_glm53_qk_lowrank_token_tile(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
+    check_glm53_qk_lowrank_large_offsets(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_bf16_short_rows(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_dsa_score_tile(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_kda_decode_values4(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
     check_glm53_kda_inputs(model, MODEL_BYTES, KI_WEIGHT_OFFSET);
+    check_glm53_indexed_attention_head_width();
+    check_glm53_indexed_attention_invalid_rows();
+    check_glm53_routed_moe_tail_cull(model, MODEL_BYTES, MOE_GATE_OFFSET,
+                                     MOE_UP_OFFSET, MOE_DOWN_OFFSET);
+    check_glm53_kda_prepare_blocked(model, MODEL_BYTES, KP_Q_OFFSET,
+                                    KP_K_OFFSET, KP_V_OFFSET, KP_A_OFFSET,
+                                    KP_DT_OFFSET, KP_NORM_OFFSET);
     check_glm_router_publication(model, MODEL_BYTES, POOL_BIAS_OFFSET);
     ds4_gpu_test_set_flags(0);
 #endif
