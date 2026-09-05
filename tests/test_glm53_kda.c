@@ -681,7 +681,7 @@ static void check_glm53_qk_lowrank_large_offsets(uint8_t *model,
 
 /* Exactness oracle for the GLM 5.3 Flash indexed prefill attention head width.
  *
- * kernel_glm_attention_indexed_batch_lora_group16_vec_valid_fullheads carries
+ * kernel_glm_attention_indexed_batch_lora_group16_vec_fullheads carries
  * two heads per simdgroup, so a token stages its selected rows four times
  * instead of eight.  Each head keeps the one-head kernel's row order, its four
  * dot(float4) terms, its simd_sum tree and its online-softmax update, so all
@@ -727,11 +727,11 @@ static void check_glm53_indexed_attention_head_width(void) {
         const float unit = IA_NEXT_UNIT();
         cache_host[i] = f32_to_f16(unit >= 0.0f ? 0.0625f + unit : -0.0625f + unit);
     }
-    /* Every selected row must be in cache range: this kernel family is the
-     * "valid rows" instantiation and does not re-check them. */
     for (uint64_t i = 0; i < sel_elems; i++) {
         rng = rng * 6364136223846793005ull + 1442695040888963407ull;
-        sel_host[i] = (uint32_t)((rng >> 33) % (uint64_t)IA_CACHE_CAP);
+        sel_host[i] = i % 17u == 0u ? UINT32_MAX :
+                      i % 13u == 0u ? IA_CACHE_CAP + (uint32_t)(i % 97u) :
+                      (uint32_t)((rng >> 33) % (uint64_t)IA_CACHE_CAP);
     }
 
     ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
@@ -757,7 +757,7 @@ static void check_glm53_indexed_attention_head_width(void) {
         require_ok(setenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG", "1", 1) == 0,
                    "indexed attention width switch");
         snprintf(what, sizeof(what), "indexed attention one head at %u rows", n_selected);
-        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_tensor(
                        ref_gpu, q_gpu, low_gpu, cache_gpu, rope_gpu, sel_gpu,
                        IA_TOKENS, n_selected, IA_CACHE_CAP, true, IA_HEADS,
                        IA_LORA, IA_NOPE, 0u, 0u,
@@ -772,7 +772,7 @@ static void check_glm53_indexed_attention_head_width(void) {
         float poison;
         memcpy(&poison, &poison_bits, sizeof(poison));
         require_ok(ds4_gpu_tensor_fill_f32(dual_gpu, poison, low_elems), what);
-        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_tensor(
                        dual_gpu, q_gpu, low_gpu, cache_gpu, rope_gpu, sel_gpu,
                        IA_TOKENS, n_selected, IA_CACHE_CAP, true, IA_HEADS,
                        IA_LORA, IA_NOPE, 0u, 0u,
@@ -792,6 +792,32 @@ static void check_glm53_indexed_attention_head_width(void) {
                 break;
             }
             exit(1);
+        }
+        if (c == 0) {
+            static const char *const rollback_switches[] = {
+                "DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN",
+                "DS4_METAL_DISABLE_GLM53_FLASH_TUNING",
+            };
+            for (size_t r = 0; r < sizeof(rollback_switches) / sizeof(rollback_switches[0]); r++) {
+                require_ok(setenv(rollback_switches[r], "1", 1) == 0,
+                           "indexed attention rollback switch");
+                require_ok(ds4_gpu_tensor_fill_f32(dual_gpu, poison, low_elems),
+                           "indexed attention rollback poison");
+                require_ok(ds4_gpu_glm_attention_indexed_batch_lora_tensor(
+                               dual_gpu, q_gpu, low_gpu, cache_gpu, rope_gpu, sel_gpu,
+                               IA_TOKENS, n_selected, IA_CACHE_CAP, true, IA_HEADS,
+                               IA_LORA, IA_NOPE, 0u, 0u,
+                               10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f),
+                           "indexed attention rollback dispatch");
+                require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN, false,
+                                         "indexed attention rollback coverage");
+                require_ok(ds4_gpu_tensor_read(dual_gpu, 0, dual_host, bytes),
+                           "indexed attention rollback read");
+                require_ok(memcmp(ref_host, dual_host, (size_t)bytes) == 0,
+                           "indexed attention rollback bitwise output");
+                require_ok(unsetenv(rollback_switches[r]) == 0,
+                           "indexed attention rollback switch clear");
+            }
         }
     }
     require_ok(unsetenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG") == 0,
@@ -858,7 +884,9 @@ static void check_glm53_indexed_attention_invalid_rows(void) {
             gout, gq, glow, gcache, grope, gmasked, 1, 2 * VALID, CAP, true,
             heads, LORA, 256, rot, 4096, 10000.0f, 1.0f, 1.0f, 1.0f, 32.0f, 1.0f), "masked attention");
         require_ok(ds4_gpu_tensor_read(gout, 0, actual, bytes), "masked attention read");
-        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN, false, "masked attention fallback");
+        require_prefill_dispatch(DS4_GPU_GLM53_PREFILL_INDEXED_ATTN,
+                                 heads == 64 && rot == 0,
+                                 "masked attention coverage");
         require_ok(memcmp(expected, actual, bytes) == 0, "invalid rows preserve exact valid-row attention");
     }
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gmasked); ds4_gpu_tensor_free(gcompact);
