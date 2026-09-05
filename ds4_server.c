@@ -3511,6 +3511,51 @@ static void anthropic_prepare_live_continuation(request *r,
                                          &r->tool_orders, r->think_mode);
 }
 
+static bool chat_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+/* Prepare the OpenAI chat/completions live-tool fast path.
+ *
+ * Chat/completions has no server-side response object, but the tool_call_id
+ * replayed in trailing role:"tool" messages is still a precise continuation
+ * handle, exactly like Anthropic's tool_use_id.  Clients re-serialise the
+ * assistant tool-call turn (thinking stripped, tool call re-encoded as JSON),
+ * so exact token/text prefix matching fails at the previous generation's tail
+ * even though the visible history is a faithful replay.  When the trailing
+ * tool ids match the live sampled frontier, generate_job() can keep the
+ * sampled KV and append only EOS + tool results + next assistant prefix,
+ * instead of discarding the live slot and re-prefilling from an older
+ * checkpoint.  State is stored in the shared anthropic_live_* request fields;
+ * the matcher and remember/clear sites are protocol-gated. */
+static void chat_prepare_live_continuation(request *r,
+                                           const chat_msgs *msgs) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+    int tail_start = tail_end;
+    while (tail_start > 0 &&
+           chat_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+    stop_list_clear(&r->anthropic_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->anthropic_live_call_ids);
+    }
+    if (r->anthropic_live_call_ids.len == 0) return;
+
+    free(r->anthropic_live_suffix_text);
+    r->anthropic_live_suffix_text =
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -3684,6 +3729,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    chat_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -10428,7 +10474,8 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
                                               ds4_tokens *effective_prompt,
                                               int *matched_ids) {
     if (!s || !slot || !req || !effective_prompt) return 0;
-    if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
+    if (req->api != API_ANTHROPIC && req->api != API_OPENAI) return 0;
+    if (!req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
     if (!anthropic_live_matches_request(s, slot,
                                         &req->anthropic_live_call_ids,
@@ -12014,7 +12061,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     &anthropic_live_match_ids);
         if (cached > 0) {
             anthropic_live_continuation = true;
-            cache_source = "anthropic-tool-output";
+            cache_source = j->req.api == API_ANTHROPIC ? "anthropic-tool-output"
+                                                       : "chat-tool-output";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -12171,7 +12219,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    prompt_tokens);
     } else if (anthropic_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   "ds4-server: %s live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   j->req.api == API_ANTHROPIC ? "anthropic" : "chat",
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
@@ -12998,9 +13047,17 @@ decode_again:
             responses_live_clear(s, slot);
         }
     }
-    if (j->req.api == API_ANTHROPIC) {
+    if (j->req.api == API_ANTHROPIC ||
+        (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT))
+    {
+        /* For OpenAI chat, only remember when the sampled state will survive:
+         * canonicalize_tool_checkpoint() below rewrites the live session when
+         * exact DSML replay is unavailable, which would leave the remembered
+         * frontier pointing at discarded state. */
         if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
+            strcmp(final_finish, "length") &&
+            (j->req.api == API_ANTHROPIC ||
+             !should_canonicalize_tool_checkpoint(s, &parsed_calls)))
         {
             anthropic_live_remember(s, slot, &parsed_calls);
         } else {
@@ -17094,6 +17151,56 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request_free(&r);
 }
 
+static void test_chat_live_tail_renders_tool_results_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("grep_files");
+    tc.arguments = xstrdup("{\"pattern\":\"port\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    /* OpenAI clients reply with role:"tool" messages carrying tool_call_id,
+     * unlike Anthropic's role:"user" tool_result blocks. */
+    chat_msg tool_msg = {0};
+    tool_msg.role = xstrdup("tool");
+    tool_msg.content = xstrdup("3002");
+    chat_msg_add_tool_call_id(&tool_msg, "call_live");
+    chat_msgs_push(&msgs, tool_msg);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "3002</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "grep_files") == NULL);
+
+    /* The prepare step is protocol-gated: an Anthropic request must not take
+     * the chat path. */
+    request r2;
+    request_init(&r2, REQ_CHAT, 128);
+    r2.api = API_ANTHROPIC;
+    r2.think_mode = DS4_THINK_HIGH;
+    chat_prepare_live_continuation(&r2, &msgs);
+    TEST_ASSERT(r2.anthropic_live_call_ids.len == 0);
+    TEST_ASSERT(r2.anthropic_live_suffix_text == NULL);
+    request_free(&r2);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
 static void test_anthropic_tool_result_id_validation(void) {
     server s = {0};
     server_slot slot;
@@ -19469,6 +19576,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_chat_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();
