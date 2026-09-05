@@ -47,10 +47,13 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score quality-llama-score
 
-all: deepseek4-quantize $(QUANTS_SHARED)
+all: deepseek4-quantize glm53-requant-bf16 $(QUANTS_SHARED)
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
+
+glm53-requant-bf16: glm53_requant_bf16.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ glm53_requant_bf16.c quants.c -lm -pthread
 
 $(QUANTS_SHARED): quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SHARED_FLAGS) -fPIC -o $@ quants.c -lm -pthread
@@ -63,5 +66,5 @@ quality-llama-score:
 	$(CXX) $(LLAMA_CPP_CXXFLAGS) -o quality-testing/score_llama quality-testing/score_llama.cpp $(LLAMA_CPP_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize libds4quants.dylib libds4quants.so \
+	rm -f deepseek4-quantize glm53-requant-bf16 libds4quants.dylib libds4quants.so \
 		quality-testing/score_official quality-testing/score_llama

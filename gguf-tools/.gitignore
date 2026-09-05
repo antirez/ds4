@@ -1,4 +1,5 @@
 deepseek4-quantize
+glm53-requant-bf16
 gguf-requantize-dense
 quality-testing/score_official
 quality-testing/score_llama
