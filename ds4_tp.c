@@ -2484,7 +2484,8 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
                              (uint64_t)count * sizeof(int32_t);
     if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX ||
         (type == DS4_TP_FRAME_SYNC &&
-         (count > tp->local_ctx || count > DS4_TP_COMMAND_MAX_TOKENS)) ||
+         ((tp->local_ctx > 0 && count > tp->local_ctx) ||
+          count > DS4_TP_COMMAND_MAX_TOKENS)) ||
         (type == DS4_TP_FRAME_VERIFY &&
          (count == 0 || count > DS4_TP_BATCH_MAX_ROWS))) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
@@ -2701,7 +2702,10 @@ void ds4_tp_command_free(ds4_tp_command *command) {
 static int tp_command_frame_size_allowed(
         const ds4_tp *tp, uint32_t type, uint32_t bytes) {
     if (!tp) return 0;
-    const uint64_t ctx_tokens = tp->peer_ctx < DS4_TP_COMMAND_MAX_TOKENS
+    /* peer_ctx is negotiated by the handshake; before that (and in the
+     * command unit tests) fall back to the absolute cap. */
+    const uint64_t ctx_tokens =
+        tp->peer_ctx > 0 && tp->peer_ctx < DS4_TP_COMMAND_MAX_TOKENS
         ? tp->peer_ctx : DS4_TP_COMMAND_MAX_TOKENS;
     switch (type) {
     case DS4_TP_FRAME_SYNC:
@@ -2712,6 +2716,14 @@ static int tp_command_frame_size_allowed(
         return bytes >= sizeof(ds4_tp_token_command_header) + sizeof(int32_t) &&
             bytes <= sizeof(ds4_tp_token_command_header) +
                      (uint64_t)DS4_TP_BATCH_MAX_ROWS * sizeof(int32_t);
+    case DS4_TP_FRAME_SYNC_MULTIMODAL:
+        /* Tokens plus at most one f32 embedding row per context token;
+         * tp_command_decode_multimodal() re-checks every count against
+         * the frame length before allocating. */
+        return bytes >= sizeof(ds4_tp_multimodal_command_header) &&
+            bytes <= sizeof(ds4_tp_multimodal_command_header) +
+                     ctx_tokens * sizeof(int32_t) +
+                     ctx_tokens * (uint64_t)tp->n_embd * sizeof(float);
     case DS4_TP_FRAME_SESSION_CREATE:
     case DS4_TP_FRAME_REWIND:
         return bytes == sizeof(ds4_tp_value_command);
@@ -2719,6 +2731,7 @@ static int tp_command_frame_size_allowed(
     case DS4_TP_FRAME_INVALIDATE:
         return bytes == sizeof(uint64_t);
     case DS4_TP_FRAME_EVAL:
+    case DS4_TP_FRAME_GLM_MTP:
         return bytes == sizeof(ds4_tp_eval_command);
     case DS4_TP_FRAME_EVAL_BATCH:
         return bytes >= sizeof(ds4_tp_batch_command_header) +
@@ -2929,7 +2942,8 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         const uint64_t item_bytes =
             (uint64_t)h.item_count * sizeof(ds4_tp_batch_item);
         const uint64_t want = sizeof(h) + token_bytes + item_bytes;
-        if (h.prompt_count == 0 || h.prompt_count > tp->peer_ctx ||
+        if (h.prompt_count == 0 ||
+            (tp->peer_ctx > 0 && h.prompt_count > tp->peer_ctx) ||
             h.item_count == 0 ||
             h.item_count > DS4_TP_COMMAND_MAX_BATCH_ITEMS || want != bytes) {
             ok = 0;

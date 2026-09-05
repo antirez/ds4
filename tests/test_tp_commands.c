@@ -48,6 +48,27 @@ int main(void) {
     assert(cmd.type == DS4_TP_FRAME_SYNC && cmd.n_tokens == 3);
     assert(memcmp(cmd.tokens, tokens, sizeof(tokens)) == 0);
     ds4_tp_command_free(&cmd);
+    /* Multimodal sync carries f32 image rows; the worker sizes it against
+     * n_embd and the negotiated context (unset here, so the absolute cap). */
+    leader.n_embd = 8;
+    worker.n_embd = 8;
+    float rows[2 * 8];
+    for (int i = 0; i < 16; i++) rows[i] = 0.5f * i;
+    ds4_vision_span image;
+    memset(&image, 0, sizeof(image));
+    image.token_start = 1;
+    image.embedding.data = rows;
+    image.embedding.token_count = 2;
+    image.embedding.width = 16;
+    image.embedding.height = 16;
+    assert(ds4_tp_send_sync_multimodal(&leader, 42, tokens, 3, &image, 1));
+    assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+    assert(cmd.type == DS4_TP_FRAME_SYNC_MULTIMODAL && cmd.n_tokens == 3);
+    assert(memcmp(cmd.tokens, tokens, sizeof(tokens)) == 0);
+    assert(cmd.n_images == 1 && cmd.images[0].token_start == 1);
+    assert(cmd.images[0].embedding.token_count == 2);
+    assert(memcmp(cmd.images[0].embedding.data, rows, sizeof(rows)) == 0);
+    ds4_tp_command_free(&cmd);
     assert(ds4_tp_send_command_ack(&worker, 42, 0));
     assert(ds4_tp_wait_command_ack(&leader, 42, "rebuild", err, sizeof(err)));
     assert(ds4_tp_send_command_ack(&worker, 42, 1));
