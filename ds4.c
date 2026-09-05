@@ -38740,6 +38740,10 @@ struct ds4_engine {
     bool mtp_ready;
     bool vision_ready;
     bool vision_map_ready;
+    /* Generation of the Metal model-view set at the time vision_map_ready
+     * was last established; a mismatch means the views were cleared and the
+     * sidecar map must be re-registered. */
+    uint64_t vision_map_generation;
     bool share_session_prefill_workspace;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
@@ -63847,12 +63851,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         if (e->vision_ready) {
 #if defined(__APPLE__)
-            e->vision_map_ready = ds4_gpu_set_model_map_range(
+            e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                     e->vision_model.map,
                     e->vision_model.size,
                     e->vision_model.tensor_data_pos,
-                    e->vision_model.size - e->vision_model.tensor_data_pos,
-                    e->vision_model.max_tensor_bytes) != 0;
+                    e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #else
             e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                     e->vision_model.map,
@@ -63860,10 +63863,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->vision_model.tensor_data_pos,
                     e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #endif
+            if (e->vision_map_ready) {
+                e->vision_map_generation = ds4_gpu_model_views_generation();
+            }
             if (!e->vision_map_ready) {
                 fprintf(stderr,
-                        "ds4: %s failed to map the GLM-5.3 vision encoder\n",
-                        ds4_backend_name(e->backend));
+                        "ds4: %s failed to map the %s vision encoder\n",
+                        ds4_backend_name(e->backend),
+                        e->vision_kind == DS4_VISION_DEEPSEEK4 ?
+                        "DeepSeek" : "GLM-5.3");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -64321,14 +64329,15 @@ static int ds4_engine_vision_encode_image(
     if (!e->metal_ready) {
         e->metal_ready = ds4_gpu_init() != 0;
     }
-    if (e->metal_ready && !e->vision_map_ready) {
+    if (e->metal_ready &&
+        (!e->vision_map_ready ||
+         e->vision_map_generation != ds4_gpu_model_views_generation())) {
 #if defined(__APPLE__)
-        e->vision_map_ready = ds4_gpu_set_model_map_range(
+        e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                 e->vision_model.map,
                 e->vision_model.size,
                 e->vision_model.tensor_data_pos,
-                e->vision_model.size - e->vision_model.tensor_data_pos,
-                e->vision_model.max_tensor_bytes) != 0;
+                e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #else
         e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
                 e->vision_model.map,
@@ -64336,6 +64345,9 @@ static int ds4_engine_vision_encode_image(
                 e->vision_model.tensor_data_pos,
                 e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
 #endif
+        if (e->vision_map_ready) {
+            e->vision_map_generation = ds4_gpu_model_views_generation();
+        }
     }
     if (!e->metal_ready || !e->vision_map_ready) {
         if (error && error_cap) {

@@ -692,6 +692,7 @@ static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
 static const void *g_model_map_ptr;
+static const void *g_last_aux_map;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
@@ -933,6 +934,10 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+/* Bumped whenever previously registered model views are invalidated, so
+ * callers holding stale view registrations (e.g. the vision sidecar map)
+ * can detect that their views no longer exist. */
+static uint64_t g_model_views_generation;
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -2076,6 +2081,32 @@ static void ds4_gpu_model_views_clear(void) {
         g_model_views[i].bytes = 0;
     }
     g_model_view_count = 0;
+    g_model_views_generation++;
+}
+
+/* Drop only the views belonging to one GGUF mapping (identified by map
+ * pointer and size) and keep views of other mappings alive (e.g. the
+ * vision sidecar map). Bumps the generation when anything was removed. */
+static void ds4_gpu_model_views_clear_for_map(const void *model_map,
+                                              uint64_t model_size) {
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map == model_map &&
+            g_model_views[i].model_size == model_size) {
+            g_model_views[i].buffer = nil;
+            g_model_views[i].model_map = NULL;
+            g_model_views[i].model_size = 0;
+            g_model_views[i].model_offset = 0;
+            g_model_views[i].bytes = 0;
+            continue;
+        }
+        g_model_views[out] = g_model_views[i];
+        out++;
+    }
+    if (out != g_model_view_count) {
+        g_model_view_count = out;
+        g_model_views_generation++;
+    }
 }
 
 static void ds4_gpu_model_residency_clear(void) {
@@ -12574,6 +12605,55 @@ int ds4_gpu_embed_tokens_hc_tensor(
     return 1;
 }
 
+static int ds4_gpu_model_views_cover_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    size);
+
+uint64_t ds4_gpu_model_views_generation(void) {
+    return g_model_views_generation;
+}
+
+int ds4_gpu_set_aux_model_map_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    map_offset,
+        uint64_t    map_size) {
+    /* Register a secondary GGUF mapping (e.g. the vision encoder sidecar)
+     * WITHOUT replacing the primary model map globals: only append the
+     * views for this map. */
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0) return 0;
+    if (map_offset > model_size || map_size == 0 ||
+        map_size > model_size - map_offset) return 0;
+
+    if (ds4_gpu_model_views_cover_range(model_map,
+                                        model_size,
+                                        map_offset,
+                                        map_size)) {
+        return 1;
+    }
+
+    @autoreleasepool {
+        uint64_t mapped_total = 0;
+        if (!ds4_gpu_add_model_view_range(model_map,
+                                          model_size,
+                                          map_offset,
+                                          map_size,
+                                          0,
+                                          false,
+                                          &mapped_total)) {
+            return 0;
+        }
+        if (!ds4_gpu_finish_model_views(0.0, mapped_total, map_offset)) {
+            return 0;
+        }
+        g_last_aux_map = model_map;
+        return 1;
+    }
+}
+
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0) return 0;
@@ -12648,16 +12728,18 @@ int ds4_gpu_set_model_map_spans(
         const double t0 = ds4_gpu_now_ms();
         max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(model_size, max_tensor_bytes);
 
+        /* Drop only this mapping's views; keep aux/sidecar views (e.g. the
+         * vision encoder) of other mappings alive. */
+        ds4_gpu_model_views_clear_for_map(model_map, model_size);
         ds4_gpu_model_residency_clear();
-        ds4_gpu_model_views_clear();
 
         uint64_t mapped_total = 0;
         uint64_t first_offset = UINT64_MAX;
         for (uint32_t i = 0; i < count; i++) {
             if (offsets[i] > model_size || sizes[i] == 0 || sizes[i] > model_size - offsets[i]) {
                 fprintf(stderr, "ds4: Metal model span %u is outside the GGUF mapping\n", i);
+                ds4_gpu_model_views_clear_for_map(model_map, model_size);
                 ds4_gpu_model_residency_clear();
-                ds4_gpu_model_views_clear();
                 return 0;
             }
             if (offsets[i] < first_offset) first_offset = offsets[i];
@@ -12670,14 +12752,14 @@ int ds4_gpu_set_model_map_spans(
                                               effective_max,
                                               true,
                                               &mapped_total)) {
+                ds4_gpu_model_views_clear_for_map(model_map, model_size);
                 ds4_gpu_model_residency_clear();
-                ds4_gpu_model_views_clear();
                 return 0;
             }
         }
         if (!ds4_gpu_finish_model_views(t0, mapped_total, first_offset)) {
+            ds4_gpu_model_views_clear_for_map(model_map, model_size);
             ds4_gpu_model_residency_clear();
-            ds4_gpu_model_views_clear();
             return 0;
         }
         g_model_map_ptr = model_map;
@@ -12777,9 +12859,16 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
     }
 
     fprintf(stderr,
-            "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
+            "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views "
+            "(map=%p primary=%d aux=%d off=0x%llx len=0x%llx views=%u)\n",
             ds4_gpu_gib(offset),
-            ds4_gpu_gib(end));
+            ds4_gpu_gib(end),
+            model_map,
+            model_map == g_model_map_ptr,
+            model_map == g_last_aux_map,
+            (unsigned long long)offset,
+            (unsigned long long)len,
+            g_model_view_count);
     return nil;
 }
 
