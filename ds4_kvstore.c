@@ -537,15 +537,20 @@ double ds4_kvstore_entry_eviction_score(
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     double effective_hits = (double)e->hits;
+    double freshness = 1.0;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
         effective_hits = 0.0;
+        freshness = 0.0;
     } else if (now > used_at) {
         double elapsed = (double)(now - used_at);
-        effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+        freshness = exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+        effective_hits *= freshness;
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
     }
-    double score = (effective_hits + 1.0) *
+    /* Unused checkpoints must age too. A permanent +1 lets old, denser dumps
+     * evict a just-saved conversation before its first disk lookup. */
+    double score = (effective_hits + freshness) *
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
