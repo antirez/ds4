@@ -54250,6 +54250,7 @@ struct ds4_session {
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
     uint32_t dspark_sched_skip;
+    uint32_t dspark_sched_lifetime_cycles;
     uint32_t dspark_sched_lifetime_accepted;
     double dspark_sched_life_extra_ms;
     double dspark_sched_life_saved_ms;
@@ -54419,6 +54420,7 @@ static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     if (!s) return;
     ds4_session_dspark_scheduler_reset(s);
     s->dspark_sched_skip = 0;
+    s->dspark_sched_lifetime_cycles = 0;
     s->dspark_sched_lifetime_accepted = 0;
     s->dspark_sched_life_extra_ms = 0.0;
     s->dspark_sched_life_saved_ms = 0.0;
@@ -54459,6 +54461,7 @@ static void ds4_session_dspark_scheduler_note(
     }
 
     s->dspark_sched_cycles++;
+    s->dspark_sched_lifetime_cycles++;
     s->dspark_sched_accepted += accepted_drafts;
     if (accepted_drafts != 0) {
         if (s->dspark_sched_lifetime_accepted <=
@@ -54570,16 +54573,29 @@ static void ds4_session_dspark_scheduler_note(
         s->dspark_sched_accepted != 0 &&
         extra_per_accept_ms * 1000.0 > (double)max_ms_per_accept_milli;
     if (low_accept || many_no_draft || slow_accept || measured_unprofitable) {
-        if (ds4_session_dspark_rocm_gfx1151_fast_path(s)) {
+        /* Two windows avoid judging the warmup.  Below 0.5 accepted drafts
+         * per scheduler cycle each verified row costs more than it saves on
+         * Metal: 8k tokens of Italian prose measure 0.25 at this decision,
+         * reasoning 1.25, and code never reaches this branch.  Counters,
+         * not timings, keep greedy scheduling reproducible across runs. */
+        const bool low_lifetime_metal_bypass =
+            s->engine && s->engine->backend == DS4_BACKEND_METAL &&
+            s->dspark_sched_lifetime_cycles >= 2u * window &&
+            2u * s->dspark_sched_lifetime_accepted <
+                s->dspark_sched_lifetime_cycles;
+        if (ds4_session_dspark_rocm_gfx1151_fast_path(s) ||
+            low_lifetime_metal_bypass) {
             s->dspark_sched_bypass = true;
             s->dspark_sched_skip = 0;
             if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
                 fprintf(stderr,
                         "ds4: DSpark scheduler bypass accepted=%u avg=%.3f "
-                        "no_draft=%u\n",
+                        "no_draft=%u lifetime=%u/%u\n",
                         s->dspark_sched_accepted,
                         (double)avg_milli / 1000.0,
-                        s->dspark_sched_no_draft);
+                        s->dspark_sched_no_draft,
+                        s->dspark_sched_lifetime_accepted,
+                        s->dspark_sched_lifetime_cycles);
             }
             ds4_session_dspark_scheduler_reset(s);
             return;
