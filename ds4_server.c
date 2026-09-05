@@ -785,6 +785,7 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    char *retry_identity;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -984,6 +985,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->retry_identity);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -2539,6 +2541,62 @@ bad:
     return true;
 }
 
+/* An exact retry must describe the original messages, not opportunistically
+ * attached tool-memory text. Sampling and transport options do not affect KV.
+ * Image nonces are parser sentinels; image bytes/spans are checked separately
+ * against the session. Use only this request's actual markers, not patterns
+ * that could also occur in user text. */
+static char *chat_retry_identity(const chat_msgs *msgs) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i) buf_putc(&out, ',');
+        buf_putc(&out, '[');
+        json_escape(&out, m->role);
+        buf_putc(&out, ',');
+        /* Split around actual image markers. A text-only imitation cannot
+         * compare equal to the resulting array of text/image boundaries. */
+        buf_putc(&out, '[');
+        const char *cursor = m->content ? m->content : "";
+        for (size_t k = 0; k < m->images.len; k++) {
+            const char *marker = strstr(cursor, m->images.v[k].marker);
+            if (!marker) { buf_free(&out); return NULL; }
+            char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
+            json_escape(&out, prefix);
+            free(prefix);
+            buf_putc(&out, ',');
+            cursor = marker + strlen(m->images.v[k].marker);
+        }
+        json_escape(&out, cursor);
+        buf_puts(&out, "],");
+        if (m->reasoning) json_escape(&out, m->reasoning);
+        else buf_puts(&out, "null");
+        buf_putc(&out, ',');
+        json_escape(&out, m->tool_call_id ? m->tool_call_id : "");
+        buf_puts(&out, ",[");
+        for (int k = 0; k < m->tool_call_ids_len; k++) {
+            if (k) buf_putc(&out, ',');
+            json_escape(&out, m->tool_call_ids[k]);
+        }
+        buf_puts(&out, "],[");
+        for (int k = 0; k < m->calls.len; k++) {
+            const tool_call *tc = &m->calls.v[k];
+            if (k) buf_putc(&out, ',');
+            buf_putc(&out, '[');
+            json_escape(&out, tc->id ? tc->id : "");
+            buf_putc(&out, ',');
+            json_escape(&out, tc->name ? tc->name : "");
+            buf_putc(&out, ',');
+            json_escape(&out, tc->arguments ? tc->arguments : "");
+            buf_putc(&out, ']');
+        }
+        buf_puts(&out, "]]");
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
 static bool append_glm_tool_schema_json(buf *b, const char *json,
                                         bool *emitted) {
     json_args args = {0};
@@ -3682,6 +3740,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    r->retry_identity = chat_retry_identity(&msgs);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -9067,6 +9126,13 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    /* A restored request is an exact retry, not a visible-prefix extension.
+     * Keep its original rendered tokens and the exact restored frontier so
+     * same-length replacement or tool-memory changes cannot authorize reuse.
+     * This binding is resident-only, never exported as a disk text key. */
+    char *retry_identity;
+    ds4_tokens retry_prompt;
+    ds4_tokens retry_frontier;
 } visible_live_state;
 
 struct server_slot {
@@ -9147,6 +9213,12 @@ struct job {
     request req;
     bool done;
     bool cancelled;
+    /* The watcher may observe EOF immediately after a successful terminal
+     * write.  While that write is in flight, its return value owns the commit
+     * decision; after success, a late FIN must not turn a delivered response
+     * into a cancellation rollback. */
+    bool response_write_active;
+    bool response_committed;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -9164,7 +9236,30 @@ static bool job_cancelled(void *ud) {
 static void job_mark_cancelled(job *j) {
     if (!j) return;
     pthread_mutex_lock(&j->mu);
-    j->cancelled = true;
+    if (!j->response_write_active && !j->response_committed) {
+        j->cancelled = true;
+    }
+    pthread_mutex_unlock(&j->mu);
+}
+
+static bool job_begin_response_write(job *j) {
+    if (!j) return false;
+    pthread_mutex_lock(&j->mu);
+    bool ok = !j->cancelled && !j->response_write_active &&
+              !j->response_committed;
+    if (ok) j->response_write_active = true;
+    pthread_mutex_unlock(&j->mu);
+    return ok;
+}
+
+static void job_finish_response_write(job *j, bool ok) {
+    if (!j) return;
+    pthread_mutex_lock(&j->mu);
+    if (j->response_write_active) {
+        j->response_write_active = false;
+        if (ok) j->response_committed = true;
+        else j->cancelled = true;
+    }
     pthread_mutex_unlock(&j->mu);
 }
 
@@ -9398,6 +9493,10 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_len = 0;
     st->live_tokens = 0;
     st->valid = false;
+    free(st->retry_identity);
+    st->retry_identity = NULL;
+    ds4_tokens_free(&st->retry_prompt);
+    ds4_tokens_free(&st->retry_frontier);
 }
 
 static void visible_live_free(visible_live_state *st) {
@@ -9474,6 +9573,58 @@ static void request_live_state_clear(server *s, server_slot *slot) {
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
     thinking_live_clear(s, slot);
+}
+
+/* Called only after rollback/preservation validated the prompt. Ordinary
+ * visible-prefix state is separate: an exact retry must not append
+ * already-consumed tool results. tool_mu is held. */
+static void cancelled_retry_remember_locked(visible_live_state *st,
+                                            const request *req,
+                                            const ds4_tokens *live) {
+    visible_live_clear_locked(st);
+    if (!req || req->api != API_OPENAI || req->kind != REQ_CHAT ||
+        !req->retry_identity || !live || live->len <= 0) return;
+    st->retry_identity = xstrdup(req->retry_identity);
+    ds4_tokens_copy(&st->retry_prompt, &req->prompt);
+    ds4_tokens_copy(&st->retry_frontier, live);
+    st->live_tokens = live->len;
+    st->valid = true;
+}
+
+static bool cancelled_retry_matches(const visible_live_state *st,
+                                     const request *req,
+                                     const ds4_tokens *live) {
+    return st && st->valid && req && req->api == API_OPENAI &&
+        req->kind == REQ_CHAT && st->retry_identity && req->retry_identity &&
+        !strcmp(st->retry_identity, req->retry_identity) &&
+        req->prompt.len == st->retry_prompt.len &&
+        ds4_tokens_starts_with(&req->prompt, &st->retry_prompt) &&
+        live && live->len > 0 && live->len == st->live_tokens &&
+        live->len == st->retry_frontier.len &&
+        ds4_tokens_starts_with(live, &st->retry_frontier);
+}
+
+/* Metadata only: busy sessions are mutable. Ambiguous bindings must not
+ * choose one conversation's hidden frontier by slot order. tool_mu is held. */
+static int cancelled_retry_owner_locked(server *s, const request *req) {
+    int owner = -1;
+    for (int i = 0; i < s->slot_count; i++) {
+        const visible_live_state *st = &s->slots[i].thinking_live;
+        if (!cancelled_retry_matches(st, req, &st->retry_frontier)) continue;
+        if (owner >= 0) return -1;
+        owner = i;
+    }
+    return owner;
+}
+
+/* tool_mu is held; the slot is idle or owned by this worker. */
+static bool cancelled_retry_slot_matches(server_slot *slot,
+                                          const request *req) {
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    return cancelled_retry_matches(&slot->thinking_live, req, live) &&
+        ds4_session_common_prefix(slot->session, live) == live->len &&
+        ds4_session_vision_state_matches(slot->session,
+                                         req->images, req->image_count);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -10933,6 +11084,158 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     *last_completion = completion;
 }
 
+static bool cancel_prompt_frontier_can_be_preserved(
+        int live_pos, int prompt_frontier,
+        bool prompt_frontier_preservable, bool checkpoint_state_matches) {
+    return prompt_frontier_preservable && checkpoint_state_matches &&
+           live_pos == prompt_frontier;
+}
+
+typedef struct {
+    int (*session_pos)(ds4_session *session);
+    int (*checkpoint_pos)(const ds4_cancel_checkpoint *checkpoint);
+    int (*checkpoint_restore)(ds4_session *session,
+                              const ds4_cancel_checkpoint *checkpoint,
+                              char *err, size_t errlen);
+    bool (*state_matches)(ds4_session *session,
+                          const ds4_vision_span *images,
+                          size_t image_count);
+    void (*session_invalidate)(ds4_session *session);
+} cancel_restore_ops;
+
+typedef struct {
+    int live_before;
+    bool restored;
+    bool preserved;
+    char err[160];
+} cancel_restore_result;
+
+static bool cancel_restore_production_state_matches(
+        ds4_session *session, const ds4_vision_span *images,
+        size_t image_count) {
+    return ds4_session_vision_state_matches(session, images, image_count);
+}
+
+static const cancel_restore_ops cancel_restore_production_ops = {
+    .session_pos = ds4_session_pos,
+    .checkpoint_pos = ds4_session_cancel_checkpoint_pos,
+    .checkpoint_restore = ds4_session_cancel_checkpoint_restore,
+    .state_matches = cancel_restore_production_state_matches,
+    .session_invalidate = ds4_session_invalidate,
+};
+
+/* Run while inference_mu is held. Keeping the state transitions behind this
+ * small operations table lets server tests exercise the production decision
+ * path without manufacturing an engine-private GPU session. */
+static void restore_cancelled_prompt_locked(
+        server_slot *slot,
+        const ds4_cancel_checkpoint *checkpoint,
+        const char *checkpoint_err,
+        int prompt_frontier,
+        bool prompt_frontier_preservable,
+        const ds4_vision_span *request_images,
+        size_t request_image_count,
+        const cancel_restore_ops *ops,
+        cancel_restore_result *result) {
+    ds4_session *session = slot->session;
+    memset(result, 0, sizeof(*result));
+    result->live_before = ops->session_pos(session);
+    const int checkpoint_pos = ops->checkpoint_pos(checkpoint);
+    if (checkpoint && checkpoint_pos != prompt_frontier) {
+        snprintf(result->err, sizeof(result->err),
+                 "request checkpoint frontier changed from %d to %d",
+                 prompt_frontier, checkpoint_pos);
+    } else if (checkpoint &&
+        ops->checkpoint_restore(session, checkpoint, result->err,
+                                sizeof(result->err)) == 0) {
+        result->restored = ops->session_pos(session) == checkpoint_pos &&
+                           ops->state_matches(session, request_images,
+                                              request_image_count);
+        if (!result->restored && !result->err[0]) {
+            snprintf(result->err, sizeof(result->err),
+                     "restored frontier failed validation");
+        }
+    } else if (!checkpoint && cancel_prompt_frontier_can_be_preserved(
+                   result->live_before, prompt_frontier,
+                   prompt_frontier_preservable,
+                   ops->state_matches(session, request_images,
+                                      request_image_count))) {
+        /* No decode or destructive post-processing touched the synchronized
+         * prompt frontier. There is nothing to roll back, so retain the valid
+         * checkpoint instead of manufacturing a cache miss. */
+        result->preserved = true;
+    } else if (!checkpoint) {
+        snprintf(result->err, sizeof(result->err), "%s",
+                 checkpoint_err && checkpoint_err[0] ? checkpoint_err :
+                 "request checkpoint unavailable");
+    }
+    if (!result->restored && !result->preserved) {
+        ops->session_invalidate(session);
+    } else if (slot->continued_last_store_tokens > prompt_frontier) {
+        /* Later checkpoints belong to the cancelled tail. They must not
+         * suppress continued saves for a different retry tail. */
+        slot->continued_last_store_tokens = prompt_frontier;
+    }
+}
+
+static bool restore_cancelled_request_checkpoint(
+        server *s, server_slot *slot, job *j,
+        const ds4_cancel_checkpoint *checkpoint,
+        const char *checkpoint_err,
+        int prompt_frontier,
+        bool prompt_frontier_preservable,
+        const char *stage, int completion, uint64_t trace_id) {
+    const ds4_vision_span *request_images = j ? j->req.images : NULL;
+    const size_t request_image_count = j ? j->req.image_count : 0;
+    const bool multimodal = request_image_count != 0;
+    cancel_restore_result result;
+
+    pthread_mutex_lock(&s->inference_mu);
+    restore_cancelled_prompt_locked(
+        slot, checkpoint, checkpoint_err, prompt_frontier,
+        prompt_frontier_preservable, request_images, request_image_count,
+        &cancel_restore_production_ops, &result);
+    pthread_mutex_unlock(&s->inference_mu);
+
+    request_live_state_clear(s, slot);
+    if (result.restored || result.preserved) {
+        pthread_mutex_lock(&s->tool_mu);
+        cancelled_retry_remember_locked(&slot->thinking_live, &j->req,
+                                         ds4_session_tokens(slot->session));
+        pthread_mutex_unlock(&s->tool_mu);
+    }
+
+    const char *action = result.restored ? "restore-prompt" :
+                         result.preserved ? "preserve-prompt" : "invalidate";
+    server_log((result.restored || result.preserved) ?
+               DS4_LOG_KVCACHE : DS4_LOG_WARNING,
+               "ds4-server: slot %d request cancellation stage=%s generated=%d "
+               "prompt_frontier=%d live_before=%d multimodal=%d images=%zu "
+               "disk_fallback=%s action=%s",
+               slot->id,
+               stage ? stage : "unknown",
+               completion,
+               prompt_frontier,
+               result.live_before,
+               multimodal ? 1 : 0,
+               j ? j->req.image_count : 0,
+               (multimodal || !s->kv.enabled) ? "unavailable" : "available",
+               action);
+    if (result.err[0]) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: slot %d cancellation rollback detail=\"%s\"",
+                   slot->id, result.err);
+    }
+    trace_event(s, trace_id,
+                "cancelled stage=%s generated=%d prompt_frontier=%d "
+                "action=%s%s%s",
+                stage ? stage : "unknown", completion,
+                prompt_frontier,
+                action,
+                result.err[0] ? " error=" : "",
+                result.err[0] ? result.err : "");
+    return result.restored || result.preserved;
+}
 typedef struct {
     bool inside;
     char tail[8]; /* Long enough for "</think>". */
@@ -11566,10 +11869,32 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * tool id.  If a client sends a tool call without an id we know, the fallback
  * renderer still builds valid DSML from JSON, and this function either rewrites
  * the short suffix in place or reloads an older disk checkpoint before replay. */
+static bool begin_destructive_tool_checkpoint_rebuild(
+        ds4_session_rewrite_result rewrite_result,
+        ds4_cancel_checkpoint **checkpoint, char *checkpoint_err,
+        size_t checkpoint_errlen, bool *prompt_frontier_preservable) {
+    if (rewrite_result != DS4_SESSION_REWRITE_REBUILD_NEEDED) return false;
+    if (checkpoint) {
+        ds4_session_cancel_checkpoint_free(*checkpoint);
+        *checkpoint = NULL;
+    }
+    if (checkpoint_err && checkpoint_errlen) {
+        snprintf(checkpoint_err, checkpoint_errlen,
+                 "rollback retired before destructive tool checkpoint rebuild");
+    }
+    if (prompt_frontier_preservable) *prompt_frontier_preservable = false;
+    return true;
+}
+
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
-                                         const char *reasoning, const tool_calls *calls) {
+                                         const char *reasoning,
+                                         const tool_calls *calls,
+                                         ds4_cancel_checkpoint **cancel_checkpoint,
+                                         char *cancel_checkpoint_err,
+                                         size_t cancel_checkpoint_errlen,
+                                         bool *prompt_frontier_preservable) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
@@ -11625,6 +11950,9 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
     pthread_mutex_unlock(&s->inference_mu);
+    const bool rebuild_needed = begin_destructive_tool_checkpoint_rebuild(
+        rr, cancel_checkpoint, cancel_checkpoint_err,
+        cancel_checkpoint_errlen, prompt_frontier_preservable);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
@@ -11632,11 +11960,14 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         trace_event(s, trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
-    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+    } else if (rebuild_needed) {
         /* The generated DSML suffix and the canonical prompt share a prefix,
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
-         * a very long conversation from token zero. */
+         * a very long conversation from token zero.  The request-local
+         * cancellation checkpoint omits compressed rows because ordinary
+         * decode only appends them.  This path replaces those rows, so retire
+         * rollback before the first disk load, invalidation, or replay. */
         char *path = NULL;
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
@@ -11979,17 +12310,30 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
-    /* Responses gets the first chance to continue from live state.  This is
+    /* An exact cancelled retry precedes protocol continuation: its restored
+     * frontier already contains the tool results. Responses otherwise gets
+     * the first chance to continue from live state. This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
+    pthread_mutex_lock(&s->tool_mu);
+    const bool cancelled_retry =
+        cancelled_retry_owner_locked(s, &j->req) == slot->id &&
+        cancelled_retry_slot_matches(slot, &j->req);
+    if (cancelled_retry) {
+        ds4_tokens_copy(&effective_prompt,
+                         &slot->thinking_live.retry_frontier);
+        prompt_for_sync = &effective_prompt;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    int cached = cancelled_retry ? old_pos : live_vision_match ?
         responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                               &effective_prompt) : 0;
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
-    if (cached > 0) {
+    const char *cache_source = cancelled_retry ? "cancelled-retry" :
+                              cached > 0 ? "responses-visible" : "none";
+    if (cached > 0 && !cancelled_retry) {
         responses_live_match = "visible-prefix";
         if (responses_live_matches_request(s, slot,
                                            &j->req.responses_live_call_ids,
@@ -12005,10 +12349,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = cached > 0 ? "responses-tool-output" : "none";
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
-    if (cached > 0) {
+    if (cached > 0 && !cancelled_retry) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else if (cached == 0 && live_vision_match) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -12294,7 +12638,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
-        request_live_state_clear(s, slot);
+        restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+            prompt_for_sync->len, true, "prefill-done", 0, trace_id);
         trace_event(s, trace_id, "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
         return;
@@ -12332,6 +12677,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
     responses_stream responses_live = {0};
+    ds4_cancel_checkpoint *cancel_checkpoint = NULL;
+    const int cancel_prompt_frontier = ds4_session_pos(slot->session);
+    bool cancel_prompt_frontier_preservable = true;
     const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
@@ -12343,7 +12691,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "prefill-stream", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12358,7 +12707,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "sse-headers", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12368,7 +12718,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "anthropic-start", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12376,7 +12727,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                cancel_prompt_frontier, true, "openai-role", 0, trace_id);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -12392,12 +12744,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
-                request_live_state_clear(s, slot);
+                restore_cancelled_request_checkpoint(s, slot, j, NULL, NULL,
+                    cancel_prompt_frontier, true, "responses-created", 0, trace_id);
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
         }
     }
+
+    char cancel_checkpoint_err[160] = {0};
 
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed;
@@ -12422,6 +12777,22 @@ decode_again:
     int next_decode_log = 50;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
+    /* Capture only when this pass can mutate the decode frontier.  Empty or
+     * context-full requests have nothing to roll back and should not pay for
+     * the Metal snapshot.  A recovery pass keeps the original checkpoint. */
+    if (!cancel_checkpoint && !cancel_checkpoint_err[0] && max_tokens > 0 &&
+        !g_stop_requested && !job_cancelled(j)) {
+        const double capture_t0 = now_sec();
+        pthread_mutex_lock(&s->inference_mu);
+        const int capture_rc = ds4_session_cancel_checkpoint_capture(
+            slot->session, &cancel_checkpoint, cancel_checkpoint_err,
+            sizeof(cancel_checkpoint_err));
+        pthread_mutex_unlock(&s->inference_mu);
+        trace_event(s, trace_id,
+                    "cancellation checkpoint capture status=%s %.3fms",
+                    capture_rc == 0 ? "ready" : "unavailable",
+                    (now_sec() - capture_t0) * 1000.0);
+    }
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
@@ -12509,7 +12880,6 @@ decode_again:
             toks[0] = token;
             ntok = 1;
         }
-
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             if (job_cancelled(j)) {
@@ -12703,7 +13073,14 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "generation", completion, trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -12817,7 +13194,14 @@ decode_again:
         free(tail);
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "flush", completion, trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         trace_event(s, trace_id, "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -12932,7 +13316,14 @@ decode_again:
             }
         }
         if (job_cancelled(j)) {
-            request_live_state_clear(s, slot);
+            restore_cancelled_request_checkpoint(
+                s, slot, j, cancel_checkpoint,
+                cancel_checkpoint_err,
+                cancel_prompt_frontier,
+                cancel_prompt_frontier_preservable,
+                "response-parse", completion, trace_id);
+            ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+            cancel_checkpoint = NULL;
             trace_event(s, trace_id, "cancelled during response parsing");
             free(parsed_content);
             free(parsed_reasoning);
@@ -12949,6 +13340,11 @@ decode_again:
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            /* Publish before the terminal response: streaming clients may
+             * already know these IDs, and a successful non-streaming client
+             * can submit its follow-up as soon as the write reaches it.  If a
+             * later write fails, the bounded entry is either inert or useful
+             * to a streaming client that already received the ID. */
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
         } else if (j->req.api == API_RESPONSES) {
@@ -12956,7 +13352,14 @@ decode_again:
         }
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "response-publish", completion, trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         trace_event(s, trace_id, "cancelled before publishing response state");
         free(parsed_content);
         free(parsed_reasoning);
@@ -13020,7 +13423,11 @@ decode_again:
          * previous_response_id contract binds the next turn to live state. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
+                                     parsed_reasoning, &parsed_calls,
+                                     &cancel_checkpoint,
+                                     cancel_checkpoint_err,
+                                     sizeof(cancel_checkpoint_err),
+                                     &cancel_prompt_frontier_preservable);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
@@ -13032,7 +13439,8 @@ decode_again:
         thinking_live_clear(s, slot);
     }
 
-    bool response_ok = !job_cancelled(j);
+    const bool response_write_started = job_begin_response_write(j);
+    bool response_ok = response_write_started;
     if (response_ok && j->req.stream) {
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -13085,12 +13493,21 @@ decode_again:
                                      &parsed_calls, final_finish,
                                      prompt_tokens, completion);
     }
-    if (job_cancelled(j)) response_ok = false;
+    if (response_write_started) {
+        job_finish_response_write(j, response_ok);
+    }
     if (!response_ok) {
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
-        request_live_state_clear(s, slot);
+        restore_cancelled_request_checkpoint(
+            s, slot, j, cancel_checkpoint,
+            cancel_checkpoint_err,
+            cancel_prompt_frontier,
+            cancel_prompt_frontier_preservable,
+            "response-write", completion, trace_id);
+        ds4_session_cancel_checkpoint_free(cancel_checkpoint);
+        cancel_checkpoint = NULL;
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13164,6 +13581,7 @@ decode_again:
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
     buf_free(&text);
+    ds4_session_cancel_checkpoint_free(cancel_checkpoint);
     ds4_tokens_free(&effective_prompt);
 }
 
@@ -13200,6 +13618,15 @@ static bool live_state_contains_all(const live_tool_state *state,
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
+    /* Rollback publishes before the worker releases its busy flag. Resolve
+     * the resident retry here so that short handoff cannot send it to an
+     * unrelated idle slot. Never inspect a busy session's mutable tokens. */
+    const int retry_owner = cancelled_retry_owner_locked(s, r);
+    if (retry_owner >= 0) {
+        server_slot *slot = &s->slots[retry_owner];
+        if (slot->busy || slot->assigned ||
+            cancelled_retry_slot_matches(slot, r)) return retry_owner;
+    }
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (r->responses_requires_live_tool_state &&
@@ -18000,6 +18427,464 @@ static void test_client_disconnect_probe(void) {
     TEST_ASSERT(!client_recv_errno_disconnected(EWOULDBLOCK));
 }
 
+static void test_cancel_job_init(job *j);
+static void test_cancel_job_destroy(job *j);
+
+static void test_terminal_response_commit_owns_late_disconnect(void) {
+    job delivered;
+    test_cancel_job_init(&delivered);
+    TEST_ASSERT(job_begin_response_write(&delivered));
+    /* Simulate the watcher observing FIN after the terminal write has begun
+     * but before its successful return has been committed. */
+    job_mark_cancelled(&delivered);
+    TEST_ASSERT(!job_cancelled(&delivered));
+    job_finish_response_write(&delivered, true);
+    TEST_ASSERT(delivered.response_committed);
+    TEST_ASSERT(!job_cancelled(&delivered));
+    job_mark_cancelled(&delivered);
+    TEST_ASSERT(!job_cancelled(&delivered));
+    test_cancel_job_destroy(&delivered);
+
+    job failed;
+    test_cancel_job_init(&failed);
+    TEST_ASSERT(job_begin_response_write(&failed));
+    job_mark_cancelled(&failed);
+    job_finish_response_write(&failed, false);
+    TEST_ASSERT(!failed.response_committed);
+    TEST_ASSERT(job_cancelled(&failed));
+    test_cancel_job_destroy(&failed);
+
+    job already_cancelled;
+    test_cancel_job_init(&already_cancelled);
+    job_mark_cancelled(&already_cancelled);
+    TEST_ASSERT(!job_begin_response_write(&already_cancelled));
+    TEST_ASSERT(job_cancelled(&already_cancelled));
+    test_cancel_job_destroy(&already_cancelled);
+}
+
+static void test_destructive_tool_rebuild_retires_cancel_checkpoint(void) {
+    ds4_cancel_checkpoint *checkpoint = NULL;
+    char err[96] = {0};
+    bool prompt_frontier_preservable = true;
+    TEST_ASSERT(begin_destructive_tool_checkpoint_rebuild(
+        DS4_SESSION_REWRITE_REBUILD_NEEDED, &checkpoint, err, sizeof(err),
+        &prompt_frontier_preservable));
+    TEST_ASSERT(checkpoint == NULL);
+    TEST_ASSERT(strstr(err, "destructive tool checkpoint rebuild") != NULL);
+    TEST_ASSERT(!prompt_frontier_preservable);
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                         prompt_frontier_preservable,
+                                                         true));
+
+    err[0] = '\0';
+    prompt_frontier_preservable = true;
+    TEST_ASSERT(!begin_destructive_tool_checkpoint_rebuild(
+        DS4_SESSION_REWRITE_OK, &checkpoint, err, sizeof(err),
+        &prompt_frontier_preservable));
+    TEST_ASSERT(prompt_frontier_preservable);
+    TEST_ASSERT(err[0] == '\0');
+}
+
+static void test_cancelled_untouched_prompt_is_preserved(void) {
+    TEST_ASSERT(cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                        true, true));
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4097, 4096,
+                                                         true, true));
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                         false, true));
+    TEST_ASSERT(!cancel_prompt_frontier_can_be_preserved(4096, 4096,
+                                                         true, false));
+}
+
+typedef struct {
+    int pos;
+    int restore_to;
+    int restore_rc;
+    bool state_matches;
+    int restore_calls;
+    int match_calls;
+    int invalidate_calls;
+} test_cancel_restore_session;
+
+typedef struct {
+    int pos;
+} test_cancel_restore_checkpoint;
+
+static int test_cancel_restore_pos(ds4_session *opaque) {
+    return ((test_cancel_restore_session *)opaque)->pos;
+}
+
+static int test_cancel_restore_checkpoint_pos(
+        const ds4_cancel_checkpoint *opaque) {
+    if (!opaque) return -1;
+    return ((const test_cancel_restore_checkpoint *)opaque)->pos;
+}
+
+static int test_cancel_restore_apply(
+        ds4_session *opaque, const ds4_cancel_checkpoint *checkpoint,
+        char *err, size_t errlen) {
+    (void)checkpoint;
+    test_cancel_restore_session *session =
+        (test_cancel_restore_session *)opaque;
+    session->restore_calls++;
+    if (session->restore_rc != 0) {
+        snprintf(err, errlen, "injected restore failure");
+        return session->restore_rc;
+    }
+    session->pos = session->restore_to;
+    return 0;
+}
+
+static bool test_cancel_restore_state_matches(
+        ds4_session *opaque, const ds4_vision_span *images,
+        size_t image_count) {
+    (void)images;
+    (void)image_count;
+    test_cancel_restore_session *session =
+        (test_cancel_restore_session *)opaque;
+    session->match_calls++;
+    return session->state_matches;
+}
+
+static void test_cancel_restore_invalidate(ds4_session *opaque) {
+    test_cancel_restore_session *session =
+        (test_cancel_restore_session *)opaque;
+    session->invalidate_calls++;
+}
+
+static const cancel_restore_ops test_cancel_restore_ops = {
+    .session_pos = test_cancel_restore_pos,
+    .checkpoint_pos = test_cancel_restore_checkpoint_pos,
+    .checkpoint_restore = test_cancel_restore_apply,
+    .state_matches = test_cancel_restore_state_matches,
+    .session_invalidate = test_cancel_restore_invalidate,
+};
+
+static cancel_restore_result test_cancel_restore_run(
+        test_cancel_restore_session *session,
+        const test_cancel_restore_checkpoint *checkpoint,
+        int prompt_frontier, bool prompt_frontier_preservable,
+        const char *checkpoint_err) {
+    server_slot slot = {.session = (ds4_session *)session};
+    cancel_restore_result result;
+    restore_cancelled_prompt_locked(
+        &slot,
+        (const ds4_cancel_checkpoint *)checkpoint,
+        checkpoint_err, prompt_frontier, prompt_frontier_preservable,
+        NULL, 0, &test_cancel_restore_ops, &result);
+    return result;
+}
+
+static void test_cancelled_request_restore_orchestration(void) {
+    test_cancel_restore_checkpoint checkpoint = {.pos = 4096};
+    test_cancel_restore_session session = {
+        .pos = 4128,
+        .restore_to = 4096,
+        .state_matches = true,
+    };
+    cancel_restore_result result = test_cancel_restore_run(
+        &session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 1);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 0);
+    TEST_ASSERT(result.live_before == 4128);
+
+    session = (test_cancel_restore_session){
+        .pos = 4128,
+        .restore_to = 4096,
+        .state_matches = false,
+    };
+    result = test_cancel_restore_run(&session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 1);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "failed validation") != NULL);
+
+    session = (test_cancel_restore_session){
+        .pos = 4128,
+        .restore_to = 4096,
+        .restore_rc = 1,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(&session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 1);
+    TEST_ASSERT(session.match_calls == 0);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "injected restore failure") != NULL);
+
+    checkpoint.pos = 4095;
+    session = (test_cancel_restore_session){
+        .pos = 4128,
+        .restore_to = 4096,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(&session, &checkpoint, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 0);
+    TEST_ASSERT(session.match_calls == 0);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "frontier changed") != NULL);
+
+    session = (test_cancel_restore_session){
+        .pos = 4096,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(&session, NULL, 4096, true, NULL);
+    TEST_ASSERT(!result.restored && result.preserved);
+    TEST_ASSERT(session.restore_calls == 0);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 0);
+
+    /* Destructive canonical rebuild retires both the snapshot and permission
+     * to preserve by position. A later cancellation must invalidate. */
+    ds4_cancel_checkpoint *retired = NULL;
+    char checkpoint_err[96] = {0};
+    bool preservable = true;
+    TEST_ASSERT(begin_destructive_tool_checkpoint_rebuild(
+        DS4_SESSION_REWRITE_REBUILD_NEEDED, &retired,
+        checkpoint_err, sizeof(checkpoint_err), &preservable));
+    TEST_ASSERT(!preservable && retired == NULL);
+    session = (test_cancel_restore_session){
+        .pos = 4096,
+        .state_matches = true,
+    };
+    result = test_cancel_restore_run(
+        &session, NULL, 4096, preservable, checkpoint_err);
+    TEST_ASSERT(!result.restored && !result.preserved);
+    TEST_ASSERT(session.restore_calls == 0);
+    TEST_ASSERT(session.match_calls == 1);
+    TEST_ASSERT(session.invalidate_calls == 1);
+    TEST_ASSERT(strstr(result.err, "destructive tool checkpoint rebuild") != NULL);
+}
+
+static void test_cancelled_request_rebases_continued_frontier(void) {
+    server s = {0};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.min_tokens = 512;
+    s.kv.opt.continued_interval_tokens = 16384;
+    s.kv.opt.boundary_align_tokens = 2048;
+    test_cancel_restore_checkpoint checkpoint = {.pos = 16384};
+    test_cancel_restore_session session = {0};
+    server_slot slot = {.session = (ds4_session *)&session};
+    cancel_restore_result result;
+
+    /* The cancelled tail may already have stored one or several intervals.
+     * A lower watermark must not be raised: that would skip an unsaved prompt. */
+    const int saved[] = {0, 8192, 16384, 32768, 65536};
+    for (size_t i = 0; i < sizeof(saved) / sizeof(saved[0]); i++) {
+        session = (test_cancel_restore_session){
+            .pos = 65537, .restore_to = 16384, .state_matches = true,
+        };
+        slot.continued_last_store_tokens = saved[i];
+        restore_cancelled_prompt_locked(
+            &slot, (const ds4_cancel_checkpoint *)&checkpoint, NULL,
+            16384, true, NULL, 0, &test_cancel_restore_ops, &result);
+        TEST_ASSERT(result.restored && !result.preserved);
+        TEST_ASSERT(session.invalidate_calls == 0);
+        const int expected = saved[i] > 16384 ? 16384 : saved[i];
+        TEST_ASSERT(slot.continued_last_store_tokens == expected);
+        TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 32768) == 32768);
+        if (saved[i] < 16384) {
+            TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 16384) == 16384);
+        }
+
+        /* The retry saves a new tail and is cancelled again. Reuse the same
+         * slot and checkpoint rather than testing a newly initialized slot. */
+        session.pos = 32769;
+        kv_cache_slot_note_store(&slot, 32768);
+        restore_cancelled_prompt_locked(
+            &slot, (const ds4_cancel_checkpoint *)&checkpoint, NULL,
+            16384, true, NULL, 0, &test_cancel_restore_ops, &result);
+        TEST_ASSERT(result.restored && !result.preserved);
+        TEST_ASSERT(session.invalidate_calls == 0);
+        TEST_ASSERT(slot.continued_last_store_tokens == 16384);
+        TEST_ASSERT(kv_cache_slot_continued_target(&s, &slot, 32768) == 32768);
+    }
+
+    /* An untouched prompt is also valid without a backend snapshot. */
+    session = (test_cancel_restore_session){.pos = 16384, .state_matches = true};
+    slot.continued_last_store_tokens = 32768;
+    restore_cancelled_prompt_locked(
+        &slot, NULL, NULL, 16384, true, NULL, 0,
+        &test_cancel_restore_ops, &result);
+    TEST_ASSERT(!result.restored && result.preserved);
+    TEST_ASSERT(slot.continued_last_store_tokens == 16384);
+
+    /* Failed restoration or validation must still invalidate. It must not
+     * publish the success-only watermark change. The next cold request resets
+     * bookkeeping through the existing cached == 0 path. */
+    for (int failure = 0; failure < 3; failure++) {
+        session = (test_cancel_restore_session){
+            .pos = 32769,
+            .restore_to = failure == 2 ? 16385 : 16384,
+            .restore_rc = failure == 0 ? 1 : 0,
+            .state_matches = failure != 1,
+        };
+        slot.continued_last_store_tokens = 32768;
+        restore_cancelled_prompt_locked(
+            &slot, (const ds4_cancel_checkpoint *)&checkpoint, NULL,
+            16384, true, NULL, 0, &test_cancel_restore_ops, &result);
+        TEST_ASSERT(!result.restored && !result.preserved);
+        TEST_ASSERT(session.invalidate_calls == 1);
+        TEST_ASSERT(slot.continued_last_store_tokens == 32768);
+    }
+}
+
+static void test_cancelled_retry_identity(void) {
+    const char *wire = "[{\"role\":\"user\",\"content\":\"history\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+        "{\"id\":\"call_a\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"lookup\",\"arguments\":\"{\\\"x\\\":1}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"result\"}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&wire, &msgs));
+    char *key = chat_retry_identity(&msgs);
+    TEST_ASSERT(key != NULL);
+    char *again = chat_retry_identity(&msgs);
+    TEST_ASSERT(!strcmp(key, again));
+    free(again);
+
+    /* The renderer may replace arguments with remembered DSML. This identity
+     * is captured before that attachment and must reject every such edit. */
+    char **fields[] = {
+        &msgs.v[0].content, &msgs.v[1].content,
+        &msgs.v[1].calls.v[0].id, &msgs.v[1].calls.v[0].name,
+        &msgs.v[1].calls.v[0].arguments, &msgs.v[2].tool_call_id,
+        &msgs.v[2].content
+    };
+    for (size_t i = 0; i < sizeof(fields)/sizeof(fields[0]); i++) {
+        char *saved = *fields[i];
+        *fields[i] = "edited";
+        char *edited = chat_retry_identity(&msgs);
+        TEST_ASSERT(strcmp(key, edited));
+        free(edited);
+        *fields[i] = saved;
+    }
+    msgs.v[1].reasoning = xstrdup("explicitly different reasoning");
+    char *edited = chat_retry_identity(&msgs);
+    TEST_ASSERT(strcmp(key, edited));
+    free(edited);
+    free(key);
+    chat_msgs_free(&msgs);
+
+    /* Random image sentinels do not make retries differ. They are removed
+     * only at known image boundaries; arbitrary lookalike text is retained. */
+    server_image_input image = {0};
+    snprintf(image.marker, sizeof(image.marker), "\036DS4_IMAGE_a\037");
+    chat_msg msg = {.role = "user", .content = "before\036DS4_IMAGE_a\037after"};
+    msg.images.v = &image;
+    msg.images.len = 1;
+    msgs = (chat_msgs){.v = &msg, .len = 1};
+    key = chat_retry_identity(&msgs);
+    snprintf(image.marker, sizeof(image.marker), "\036DS4_IMAGE_b\037");
+    msg.content = "before\036DS4_IMAGE_b\037after";
+    again = chat_retry_identity(&msgs);
+    TEST_ASSERT(!strcmp(key, again));
+    free(again);
+    msg.images.len = 0;
+    edited = chat_retry_identity(&msgs);
+    TEST_ASSERT(strcmp(key, edited));
+    free(edited);
+    msg.images.len = 1;
+    msg.content = "beforeafter";
+    TEST_ASSERT(chat_retry_identity(&msgs) == NULL);
+    free(key);
+}
+
+static void test_cancelled_retry_exact_frontier(void) {
+    request req = {.kind = REQ_CHAT, .api = API_OPENAI,
+                   .retry_identity = "exact original messages"};
+    int rendered_ids[] = {1, 2, 3};
+    int live_ids[] = {1, 9, 2, 3}; /* Hidden state omitted in client replay. */
+    req.prompt = (ds4_tokens){.v = rendered_ids, .len = 3, .cap = 3};
+    ds4_tokens live = {.v = live_ids, .len = 4, .cap = 4};
+    visible_live_state st = {0};
+    cancelled_retry_remember_locked(&st, &req, &live);
+    TEST_ASSERT(st.visible_text == NULL); /* Never a visible/disk-prefix key. */
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+    req.stream = true;
+    req.max_tokens = 1024;
+    req.temperature = 1.0f;
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+    req.retry_identity = "edited tool result";
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    req.retry_identity = "exact original messages";
+    rendered_ids[1] = 7; /* Changed rendered tools/thinking/settings. */
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    rendered_ids[1] = 2;
+    live_ids[1] = 7; /* Different cache with the same length. */
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    live_ids[1] = 9;
+    live.len--;
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    live.len++;
+    req.api = API_ANTHROPIC;
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    req.api = API_OPENAI;
+    req.prompt.len--;
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    req.prompt.len++;
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+
+    /* A second cancellation replaces the first binding. Normal state cleanup
+     * after failure, completion or eviction retires all owned allocations. */
+    req.retry_identity = "second request";
+    cancelled_retry_remember_locked(&st, &req, &live);
+    TEST_ASSERT(cancelled_retry_matches(&st, &req, &live));
+    req.retry_identity = "exact original messages";
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    visible_live_clear_locked(&st);
+    TEST_ASSERT(!cancelled_retry_matches(&st, &req, &live));
+    TEST_ASSERT(!st.retry_identity && !st.retry_prompt.v &&
+                !st.retry_frontier.v);
+    cancelled_retry_remember_locked(&st, &req, NULL);
+    TEST_ASSERT(!st.valid);
+    visible_live_free(&st);
+}
+
+static void test_cancelled_retry_dispatch_handoff(void) {
+    server s = {0};
+    server_slot slots[3] = {0};
+    job j = {0};
+    int ids[] = {1, 2, 3};
+    ds4_tokens live = {.v = ids, .len = 3, .cap = 3};
+    s.slots = slots;
+    s.slot_count = 3;
+    j.req.kind = REQ_CHAT;
+    j.req.api = API_OPENAI;
+    j.req.prompt = live;
+    j.req.retry_identity = "same request";
+    slots[1].id = 1;
+    cancelled_retry_remember_locked(&slots[1].thinking_live, &j.req, &live);
+    slots[1].busy = true;
+    /* A published rollback must wait for its worker, not pick slot zero.
+     * The busy session is NULL deliberately: dispatch must not read it. */
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, 1) == INT_MIN);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &j, 1) == INT_MIN);
+    slots[1].busy = false;
+    slots[1].assigned = &j;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+    slots[1].assigned = NULL;
+    /* Once idle, a stale/invalid session cannot claim ownership. */
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    slots[1].busy = true;
+    cancelled_retry_remember_locked(&slots[2].thinking_live, &j.req, &live);
+    TEST_ASSERT(cancelled_retry_owner_locked(&s, &j.req) == -1);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    visible_live_free(&slots[2].thinking_live);
+    j.req.retry_identity = "another request";
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    j.req.retry_identity = "same request";
+    visible_live_clear_locked(&slots[1].thinking_live);
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    visible_live_free(&slots[1].thinking_live);
+}
+
 static void test_cancel_job_init(job *j) {
     memset(j, 0, sizeof(*j));
     j->fd = -1;
@@ -19505,6 +20390,14 @@ static void ds4_server_unit_tests_run(void) {
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
+    test_terminal_response_commit_owns_late_disconnect();
+    test_destructive_tool_rebuild_retires_cancel_checkpoint();
+    test_cancelled_untouched_prompt_is_preserved();
+    test_cancelled_request_restore_orchestration();
+    test_cancelled_request_rebases_continued_frontier();
+    test_cancelled_retry_identity();
+    test_cancelled_retry_exact_frontier();
+    test_cancelled_retry_dispatch_handoff();
     test_cancelled_progress_callback_is_inert();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();

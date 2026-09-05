@@ -54284,6 +54284,29 @@ struct ds4_session {
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+struct ds4_cancel_checkpoint {
+    ds4_session *owner;
+    token_vec checkpoint;
+    ds4_vision_identity *images;
+    size_t image_count;
+    float *logits;
+    int pos;
+#ifndef DS4_NO_GPU
+    /* Compressed rows are append-only: restoring their row counts makes
+     * request-era rows unreachable.  The raw cache is a ring, so generation
+     * can overwrite prompt-era rows and its logical live window must be
+     * copied.  The small compressor accumulators are mutable in place. */
+    uint32_t raw_live;
+    uint32_t raw_cap;
+    uint32_t n_comp[DS4_MAX_LAYER];
+    uint32_t n_index_comp[DS4_MAX_LAYER];
+    ds4_gpu_tensor *raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *attn_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *attn_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *index_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *index_state_score[DS4_MAX_LAYER];
+#endif
+};
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -75090,6 +75113,393 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         accepted, accepted_cap, err, errlen);
     s->dspark_sample_temperature = 0.0f;
     return result;
+#endif
+}
+
+static void cancel_checkpoint_set_err(char *err, size_t errlen,
+                                      const char *msg) {
+    if (err && errlen) snprintf(err, errlen, "%s", msg);
+}
+
+void ds4_session_cancel_checkpoint_free(ds4_cancel_checkpoint *checkpoint) {
+    if (!checkpoint) return;
+#ifndef DS4_NO_GPU
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(checkpoint->raw[il]);
+        ds4_gpu_tensor_free(checkpoint->attn_state_kv[il]);
+        ds4_gpu_tensor_free(checkpoint->attn_state_score[il]);
+        ds4_gpu_tensor_free(checkpoint->index_state_kv[il]);
+        ds4_gpu_tensor_free(checkpoint->index_state_score[il]);
+    }
+#endif
+    token_vec_free(&checkpoint->checkpoint);
+    free(checkpoint->images);
+    free(checkpoint->logits);
+    free(checkpoint);
+}
+
+int ds4_session_cancel_checkpoint_pos(
+        const ds4_cancel_checkpoint *checkpoint) {
+    return checkpoint ? checkpoint->pos : -1;
+}
+
+#ifndef DS4_NO_GPU
+static ds4_gpu_tensor *cancel_checkpoint_alloc_like(
+        const ds4_gpu_tensor *src, uint64_t bytes) {
+    if (!src || bytes == 0) return NULL;
+    const int tier = ds4_gpu_tensor_device(src);
+    /* Metal is a single-device backend and intentionally reports no logical
+     * CUDA/ROCm tier.  Use its ordinary allocator instead of feeding -1 to
+     * the tiered allocator, which can only reject it. */
+    if (tier < 0) return ds4_gpu_tensor_alloc(bytes);
+    return ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+}
+
+static bool cancel_checkpoint_copy_raw_to_backup(
+        ds4_cancel_checkpoint *checkpoint, ds4_session *s, uint32_t il) {
+    ds4_gpu_graph *g = &s->graph;
+    ds4_gpu_tensor *src = g->layer_raw_cache[il];
+    ds4_gpu_tensor *dst = checkpoint->raw[il];
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t raw_first = (uint32_t)checkpoint->pos - checkpoint->raw_live;
+    const uint32_t phys = raw_first % checkpoint->raw_cap;
+    uint32_t first_rows = checkpoint->raw_live;
+    if (first_rows > checkpoint->raw_cap - phys) {
+        first_rows = checkpoint->raw_cap - phys;
+    }
+    const uint32_t second_rows = checkpoint->raw_live - first_rows;
+    return (first_rows == 0 ||
+            ds4_gpu_tensor_copy(dst, 0, src,
+                                (uint64_t)phys * row_bytes,
+                                (uint64_t)first_rows * row_bytes) != 0) &&
+           (second_rows == 0 ||
+            ds4_gpu_tensor_copy(dst,
+                                (uint64_t)first_rows * row_bytes,
+                                src, 0,
+                                (uint64_t)second_rows * row_bytes) != 0);
+}
+
+static bool cancel_checkpoint_restore_raw(
+        const ds4_cancel_checkpoint *checkpoint, ds4_session *s, uint32_t il) {
+    ds4_gpu_graph *g = &s->graph;
+    ds4_gpu_tensor *src = checkpoint->raw[il];
+    ds4_gpu_tensor *dst = g->layer_raw_cache[il];
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t raw_first = (uint32_t)checkpoint->pos - checkpoint->raw_live;
+    const uint32_t phys = raw_first % checkpoint->raw_cap;
+    uint32_t first_rows = checkpoint->raw_live;
+    if (first_rows > checkpoint->raw_cap - phys) {
+        first_rows = checkpoint->raw_cap - phys;
+    }
+    const uint32_t second_rows = checkpoint->raw_live - first_rows;
+    return (first_rows == 0 ||
+            ds4_gpu_tensor_copy(dst,
+                                (uint64_t)phys * row_bytes,
+                                src, 0,
+                                (uint64_t)first_rows * row_bytes) != 0) &&
+           (second_rows == 0 ||
+            ds4_gpu_tensor_copy(dst, 0, src,
+                                (uint64_t)first_rows * row_bytes,
+                                (uint64_t)second_rows * row_bytes) != 0);
+}
+#endif
+
+int ds4_session_cancel_checkpoint_capture(
+        ds4_session *s, ds4_cancel_checkpoint **out,
+        char *err, size_t errlen) {
+    if (!s || !out || *out) {
+        cancel_checkpoint_set_err(err, errlen,
+                                  "invalid cancellation checkpoint capture");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) {
+        cancel_checkpoint_set_err(err, errlen,
+                                  "session has no valid prompt checkpoint");
+        return 1;
+    }
+    if (!s->engine || s->engine->backend != DS4_BACKEND_METAL ||
+        s->engine->distributed.role != DS4_DISTRIBUTED_NONE ||
+        s->distributed || s->engine->tp.active) {
+        cancel_checkpoint_set_err(
+            err, errlen,
+            "request-local cancellation checkpoints require a local Metal session");
+        return 1;
+    }
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        cancel_checkpoint_set_err(
+            err, errlen,
+            "request-local cancellation checkpoints require the DeepSeek graph backend");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    cancel_checkpoint_set_err(err, errlen,
+                              "graph backend support is not compiled in");
+    return 1;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    if (g->raw_cap == 0) {
+        cancel_checkpoint_set_err(err, errlen,
+                                  "session raw KV cache is unavailable");
+        return 1;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g->layer_raw_cache_tp[il]) {
+            cancel_checkpoint_set_err(
+                err, errlen,
+                "request-local cancellation checkpoints do not support duplicated TP caches");
+            return 1;
+        }
+    }
+
+    ds4_cancel_checkpoint *checkpoint = xmalloc_zeroed(1, sizeof(*checkpoint));
+    checkpoint->owner = s;
+    checkpoint->pos = s->checkpoint.len;
+    checkpoint->raw_cap = g->raw_cap;
+    checkpoint->raw_live =
+        session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
+    ds4_tokens_copy(&checkpoint->checkpoint, &s->checkpoint);
+    checkpoint->image_count = s->checkpoint_image_count;
+    if (checkpoint->image_count != 0) {
+        checkpoint->images =
+            xmalloc(checkpoint->image_count * sizeof(checkpoint->images[0]));
+        memcpy(checkpoint->images, s->checkpoint_images,
+               checkpoint->image_count * sizeof(checkpoint->images[0]));
+    }
+    checkpoint->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    memcpy(checkpoint->logits, s->logits,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+
+    bool allocated = true;
+    const uint64_t raw_bytes =
+        (uint64_t)checkpoint->raw_live * DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; allocated && il < DS4_N_LAYER; il++) {
+        checkpoint->n_comp[il] = g->layer_n_comp[il];
+        checkpoint->n_index_comp[il] = g->layer_n_index_comp[il];
+        ds4_gpu_tensor *raw = g->layer_raw_cache[il];
+        if (!raw) continue;
+        checkpoint->raw[il] = cancel_checkpoint_alloc_like(raw, raw_bytes);
+        allocated = checkpoint->raw[il] != NULL;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!allocated || ratio == 0) continue;
+        ds4_gpu_tensor *ak = g->layer_attn_state_kv[il];
+        ds4_gpu_tensor *as = g->layer_attn_state_score[il];
+        checkpoint->attn_state_kv[il] =
+            cancel_checkpoint_alloc_like(ak, ds4_gpu_tensor_bytes(ak));
+        checkpoint->attn_state_score[il] =
+            cancel_checkpoint_alloc_like(as, ds4_gpu_tensor_bytes(as));
+        allocated = checkpoint->attn_state_kv[il] &&
+                    checkpoint->attn_state_score[il];
+        if (!allocated || ratio != 4) continue;
+        ds4_gpu_tensor *ik = g->layer_index_state_kv[il];
+        ds4_gpu_tensor *is = g->layer_index_state_score[il];
+        checkpoint->index_state_kv[il] =
+            cancel_checkpoint_alloc_like(ik, ds4_gpu_tensor_bytes(ik));
+        checkpoint->index_state_score[il] =
+            cancel_checkpoint_alloc_like(is, ds4_gpu_tensor_bytes(is));
+        allocated = checkpoint->index_state_kv[il] &&
+                    checkpoint->index_state_score[il];
+    }
+    if (!allocated) {
+        ds4_session_cancel_checkpoint_free(checkpoint);
+        cancel_checkpoint_set_err(err, errlen,
+                                  "failed to allocate cancellation checkpoint tensors");
+        return 1;
+    }
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!g->layer_raw_cache[il]) continue;
+        ok = cancel_checkpoint_copy_raw_to_backup(checkpoint, s, il);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ok || ratio == 0) continue;
+        ok = ds4_gpu_tensor_copy(
+                 checkpoint->attn_state_kv[il], 0,
+                 g->layer_attn_state_kv[il], 0,
+                 ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il])) != 0 &&
+             ds4_gpu_tensor_copy(
+                 checkpoint->attn_state_score[il], 0,
+                 g->layer_attn_state_score[il], 0,
+                 ds4_gpu_tensor_bytes(g->layer_attn_state_score[il])) != 0;
+        if (ok && ratio == 4) {
+            ok = ds4_gpu_tensor_copy(
+                     checkpoint->index_state_kv[il], 0,
+                     g->layer_index_state_kv[il], 0,
+                     ds4_gpu_tensor_bytes(g->layer_index_state_kv[il])) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     checkpoint->index_state_score[il], 0,
+                     g->layer_index_state_score[il], 0,
+                     ds4_gpu_tensor_bytes(g->layer_index_state_score[il])) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) {
+        ds4_session_cancel_checkpoint_free(checkpoint);
+        cancel_checkpoint_set_err(err, errlen,
+                                  "failed to capture cancellation checkpoint tensors");
+        return 1;
+    }
+    *out = checkpoint;
+    return 0;
+#endif
+}
+
+#ifndef DS4_NO_GPU
+static bool cancel_checkpoint_restore_layout_matches(
+        const ds4_cancel_checkpoint *checkpoint, const ds4_session *s) {
+    if (!checkpoint || !s || !checkpoint->logits ||
+        (checkpoint->image_count != 0 && !checkpoint->images) ||
+        checkpoint->raw_cap == 0 || checkpoint->raw_live > checkpoint->raw_cap ||
+        checkpoint->raw_live > (uint32_t)checkpoint->pos) {
+        return false;
+    }
+    const ds4_gpu_graph *g = &s->graph;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t saved_raw_bytes =
+        (uint64_t)checkpoint->raw_live * row_bytes;
+    const uint64_t live_raw_bytes =
+        (uint64_t)checkpoint->raw_cap * row_bytes;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor *raw = g->layer_raw_cache[il];
+        if (!raw) {
+            if (checkpoint->raw[il] || checkpoint->attn_state_kv[il] ||
+                checkpoint->attn_state_score[il] ||
+                checkpoint->index_state_kv[il] ||
+                checkpoint->index_state_score[il]) return false;
+            continue;
+        }
+        if (g->layer_raw_cache_tp[il] || !checkpoint->raw[il] ||
+            ds4_gpu_tensor_bytes(raw) < live_raw_bytes ||
+            ds4_gpu_tensor_bytes(checkpoint->raw[il]) != saved_raw_bytes) {
+            return false;
+        }
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        ds4_gpu_tensor *ak = g->layer_attn_state_kv[il];
+        ds4_gpu_tensor *as = g->layer_attn_state_score[il];
+        if (!ak || !as || !checkpoint->attn_state_kv[il] ||
+            !checkpoint->attn_state_score[il] ||
+            ds4_gpu_tensor_bytes(ak) !=
+                ds4_gpu_tensor_bytes(checkpoint->attn_state_kv[il]) ||
+            ds4_gpu_tensor_bytes(as) !=
+                ds4_gpu_tensor_bytes(checkpoint->attn_state_score[il])) {
+            return false;
+        }
+        if (ratio != 4) continue;
+        ds4_gpu_tensor *ik = g->layer_index_state_kv[il];
+        ds4_gpu_tensor *is = g->layer_index_state_score[il];
+        if (!ik || !is || !checkpoint->index_state_kv[il] ||
+            !checkpoint->index_state_score[il] ||
+            ds4_gpu_tensor_bytes(ik) !=
+                ds4_gpu_tensor_bytes(checkpoint->index_state_kv[il]) ||
+            ds4_gpu_tensor_bytes(is) !=
+                ds4_gpu_tensor_bytes(checkpoint->index_state_score[il])) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+int ds4_session_cancel_checkpoint_restore(
+        ds4_session *s, const ds4_cancel_checkpoint *checkpoint,
+        char *err, size_t errlen) {
+    if (!s || !checkpoint || checkpoint->owner != s || checkpoint->pos <= 0 ||
+        checkpoint->checkpoint.len != checkpoint->pos) {
+        cancel_checkpoint_set_err(err, errlen,
+                                  "cancellation checkpoint does not belong to this session");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    cancel_checkpoint_set_err(err, errlen,
+                              "graph backend support is not compiled in");
+    return 1;
+#else
+    if (!s->engine || s->engine->backend != DS4_BACKEND_METAL ||
+        s->engine->distributed.role != DS4_DISTRIBUTED_NONE ||
+        ds4_session_is_cpu(s) || ds4_session_is_glm(s) || s->distributed ||
+        s->engine->tp.active ||
+        s->graph.raw_cap != checkpoint->raw_cap) {
+        cancel_checkpoint_set_err(err, errlen,
+                                  "session no longer supports this cancellation checkpoint");
+        return 1;
+    }
+    if (!cancel_checkpoint_restore_layout_matches(checkpoint, s)) {
+        cancel_checkpoint_set_err(
+            err, errlen,
+            "cancellation checkpoint no longer matches the session layout");
+        return 1;
+    }
+    ds4_gpu_graph *g = &s->graph;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!g->layer_raw_cache[il]) continue;
+        if (!checkpoint->raw[il] || g->layer_raw_cache_tp[il]) {
+            ok = false;
+            break;
+        }
+        ok = cancel_checkpoint_restore_raw(checkpoint, s, il);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ok || ratio == 0) continue;
+        ok = checkpoint->attn_state_kv[il] &&
+             checkpoint->attn_state_score[il] &&
+             ds4_gpu_tensor_copy(
+                 g->layer_attn_state_kv[il], 0,
+                 checkpoint->attn_state_kv[il], 0,
+                 ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il])) != 0 &&
+             ds4_gpu_tensor_copy(
+                 g->layer_attn_state_score[il], 0,
+                 checkpoint->attn_state_score[il], 0,
+                 ds4_gpu_tensor_bytes(g->layer_attn_state_score[il])) != 0;
+        if (ok && ratio == 4) {
+            ok = checkpoint->index_state_kv[il] &&
+                 checkpoint->index_state_score[il] &&
+                 ds4_gpu_tensor_copy(
+                     g->layer_index_state_kv[il], 0,
+                     checkpoint->index_state_kv[il], 0,
+                     ds4_gpu_tensor_bytes(g->layer_index_state_kv[il])) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     g->layer_index_state_score[il], 0,
+                     checkpoint->index_state_score[il], 0,
+                     ds4_gpu_tensor_bytes(g->layer_index_state_score[il])) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (!ok) {
+        (void)ds4_gpu_synchronize();
+        /* Copies above mutate recurrent tensors layer by layer.  Once any
+         * backend operation fails, the live session must not remain publicly
+         * reusable with a mixture of restored and request-era state. */
+        ds4_session_invalidate(s);
+        cancel_checkpoint_set_err(err, errlen,
+                                  "failed to restore cancellation checkpoint tensors");
+        return 1;
+    }
+
+    ds4_tokens_copy(&s->checkpoint, &checkpoint->checkpoint);
+    free(s->checkpoint_images);
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+    if (checkpoint->image_count != 0) {
+        s->checkpoint_images =
+            xmalloc(checkpoint->image_count * sizeof(s->checkpoint_images[0]));
+        memcpy(s->checkpoint_images, checkpoint->images,
+               checkpoint->image_count * sizeof(s->checkpoint_images[0]));
+        s->checkpoint_image_count = checkpoint->image_count;
+    }
+    memcpy(s->logits, checkpoint->logits,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_n_comp[il] = checkpoint->n_comp[il];
+        g->layer_n_index_comp[il] = checkpoint->n_index_comp[il];
+    }
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    g->mtp_n_raw = 0;
+    ds4_session_dspark_capture_invalidate(s);
+    metal_graph_dspark_cache_reset(g);
+    session_greedy_splitkv_reset(s);
+    return 0;
 #endif
 }
 
