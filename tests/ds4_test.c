@@ -5388,7 +5388,8 @@ static bool test_logprob_vector_case_disabled(const char *path,
 
 static void test_official_logprob_vectors_run(const char *case_filter) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
-    if (!path || !path[0]) {
+    const bool default_fixture = !path || !path[0];
+    if (default_fixture) {
         path = "tests/test-vectors/flash-0731/official.vec";
     }
     FILE *fp = fopen(path, "rb");
@@ -5416,7 +5417,15 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
 
     test_vec_case vc;
     int ran = 0;
-    while (test_read_vector_case(fp, &vc)) {
+    /* The default vectors describe DeepSeek V4 Flash, not GLM. An explicitly
+     * selected fixture remains available for model-specific comparisons. */
+    const bool compatible_fixture = !default_fixture || !ds4_engine_is_glm_dsa(engine);
+    if (!compatible_fixture) {
+        fprintf(stderr, "ds4-test: DeepSeek API vectors skipped for %s; "
+                        "set DS4_TEST_VECTOR_FILE to a matching fixture\n",
+                ds4_engine_model_name(engine));
+    }
+    while (compatible_fixture && test_read_vector_case(fp, &vc)) {
         if (!test_fill_vector_case(fp, &vc)) break;
         if (case_filter && case_filter[0] && strcmp(vc.id, case_filter)) {
             continue;
@@ -5430,7 +5439,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
         test_logprob_vector_case(engine, &vc);
         ran++;
     }
-    TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
+    TEST_ASSERT(!compatible_fixture || !case_filter || !case_filter[0] || ran == 1);
     ds4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
@@ -5572,12 +5581,13 @@ static int test_local_golden_overlap(const test_local_golden_case *tc,
 
 static float test_local_golden_max_abs(const test_local_golden_case *tc,
                                        const float *cand_logits,
+                                       int vocab,
                                        int n) {
     float max_abs = 0.0f;
     if (n > tc->ntop) n = tc->ntop;
     for (int i = 0; i < n; i++) {
         const int id = tc->top[i].id;
-        if (id < 0) continue;
+        if (id < 0 || id >= vocab) return FLT_MAX;
         const float abs_delta = fabsf(cand_logits[id] - tc->top[i].logit);
         if (abs_delta > max_abs) max_abs = abs_delta;
     }
@@ -5637,7 +5647,7 @@ static void test_local_golden_case_run(ds4_engine *engine,
         const int top20_overlap = test_local_golden_overlap(tc, cand_top, 20);
         const int top64_overlap = test_local_golden_overlap(tc, cand_top, 64);
         const float top20_max_abs =
-            test_local_golden_max_abs(tc, cand_logits, 20);
+            test_local_golden_max_abs(tc, cand_logits, vocab, 20);
 
         fprintf(stderr,
                 "ds4-test: local golden %s top1 ref=%d cand=%d "
@@ -5667,7 +5677,8 @@ static void test_local_golden_case_run(ds4_engine *engine,
 
 static void test_local_golden_vectors(void) {
     const char *path = getenv("DS4_TEST_LOCAL_GOLDEN_FILE");
-    if (!path || !path[0]) {
+    const bool default_fixture = !path || !path[0];
+    if (default_fixture) {
         path = "tests/test-vectors/flash-0731/local-golden.vec";
     }
     FILE *fp = fopen(path, "rb");
@@ -5694,7 +5705,13 @@ static void test_local_golden_vectors(void) {
     }
 
     test_local_golden_case tc;
-    while (test_read_local_golden_case(fp, &tc)) {
+    const bool compatible_fixture = !default_fixture || !ds4_engine_is_glm_dsa(engine);
+    if (!compatible_fixture) {
+        fprintf(stderr, "ds4-test: DeepSeek local golden vectors skipped for %s; "
+                        "set DS4_TEST_LOCAL_GOLDEN_FILE to a matching fixture\n",
+                ds4_engine_model_name(engine));
+    }
+    while (compatible_fixture && test_read_local_golden_case(fp, &tc)) {
         if (!test_fill_local_golden_case(fp, &tc)) break;
         test_local_golden_case_run(engine, &tc);
     }
@@ -6848,6 +6865,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
+    puts("      DeepSeek default fixtures are skipped for GLM; explicit fixtures are always checked.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");

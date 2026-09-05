@@ -1290,7 +1290,34 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     return cb;
 }
 
+/* Encoder acquisitions, as a proxy for dispatch count.  Almost every
+ * primitive here acquires one encoder per dispatch, so the delta between two
+ * runs of differing decode length divided by the token difference is
+ * dispatches per token.  It counts acquisitions, not encoder objects: inside a
+ * batch the same encoder is handed back for every dispatch.  Multiplying the
+ * count by one measured launch cost gives an estimate of launch overhead, not
+ * a floor -- the per-launch cost was measured on one fusion and need not
+ * transfer to every kernel and command-buffer arrangement.  Read with
+ * ds4_gpu_encoder_count(). */
+static uint64_t g_encoder_count;
+
+uint64_t ds4_gpu_encoder_count(void) { return g_encoder_count; }
+
+static void ds4_gpu_encoder_count_print(void) {
+    fprintf(stderr, "ds4: metal compute encoder acquisitions (~dispatches): %llu\n",
+            (unsigned long long)g_encoder_count);
+}
+
+static void ds4_gpu_encoder_count_arm(void) {
+    static int armed = 0;
+    if (armed) return;
+    armed = 1;
+    if (getenv("DS4_METAL_ENCODER_COUNT")) atexit(ds4_gpu_encoder_count_print);
+}
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
+    g_encoder_count++;
+    ds4_gpu_encoder_count_arm();
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (g_timeline_enabled && g_timeline_batch) {
