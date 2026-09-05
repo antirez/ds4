@@ -109,13 +109,14 @@ struct tile_x_sizes {
 };
 
 static int get_mmq_x_max_host(const int cc) {
-    int base = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
+    const int hardware_max = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
             128                     : 64;
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
+    int base = cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 ? 64 : hardware_max;
     // ds4: optional Step-4 experiment hook. DS4_CUDA_MMQ_X_MAX=N clips the
     // tile-width selector to N when sweeping for an sm_120-specific
     // optimum.  Value rounded down to a multiple of 8 (the iteration step
@@ -133,7 +134,7 @@ static int get_mmq_x_max_host(const int cc) {
             }
         }
     }
-    if (g_override > 0 && g_override < base) base = g_override;
+    if (g_override > 0) base = std::min(g_override, hardware_max);
     return base;
 }
 
@@ -161,8 +162,13 @@ static constexpr __device__ int get_mmq_x_max_device() {
 }
 
 static int get_mmq_y_host(const int cc) {
+#if defined(GGML_USE_HIP) && defined(DS4_HIP_MMQ_Y)
+    GGML_UNUSED(cc);
+    return DS4_HIP_MMQ_Y;
+#else
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
+#endif
 }
 
 static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type) {
@@ -176,11 +182,15 @@ if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) {
 
 static constexpr __device__ int get_mmq_y_device() {
 #if defined(GGML_USE_HIP)
+#if defined(DS4_HIP_MMQ_Y)
+    return DS4_HIP_MMQ_Y;
+#else
 #if defined(RDNA1)
     return 64;
 #else
     return 128;
 #endif // defined RDNA1
+#endif // defined(DS4_HIP_MMQ_Y)
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return 128;
@@ -317,7 +327,11 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
+#if defined(DS4_HIP_MMQ_Y)
+    return amd_mfma_available(cc) ? 8 : DS4_HIP_MMQ_Y/16;
+#else
     return amd_mfma_available(cc) ? 8 : 256/warp_size;
+#endif
 }
 #else
 static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
@@ -327,7 +341,11 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(DS4_HIP_MMQ_Y)
+    return DS4_HIP_MMQ_Y/16;
+#else
     return 8;
+#endif
 #else
     return 256/ggml_cuda_get_physical_warp_size();
 #endif // AMD_MFMA_AVAILABLE
@@ -2966,12 +2984,13 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 #pragma unroll
         for (int l = 0; l < QR2_XXS; ++l) {
             const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
+            const uint2 sign_masks =
+                ((const uint2 *) ksigns64)[(aux32 >> (7 * l)) & 0x7fu];
 
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+            const int signs0 = (int)sign_masks.x;
             const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
 
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+            const int signs1 = (int)sign_masks.y;
             const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -3673,6 +3692,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
+    // Invalid columns must be zero before the matrix instruction. Masking
+    // only write-back is too late: stale or NaN tail blocks can contaminate
+    // other values in the same hardware matrix fragment.
+    const int valid_y_words = min(mmq_x, tile_y_max_j + 1) * MMQ_TILE_Y_K;
 
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
 
@@ -3706,7 +3729,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = l < valid_y_words ? by0[l] : 0;
             }
         }
 
@@ -3722,7 +3745,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = l < valid_y_words ? by0[l] : 0;
             }
         }
 

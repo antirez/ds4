@@ -30,7 +30,11 @@
 
 #include "ds4_mmq.h"
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
+#endif
 
 // libds4mmq.a references this ds4_cuda.cu symbol from the q8-fold vec paths
 // (C3 Inc4); the entries under test never reach it, so a "no fold available"
@@ -123,9 +127,9 @@ float time_ms(F &&fn, int reps) {
 // ---------------------------------------------------------------------------
 // Q2_K down leg.
 // ---------------------------------------------------------------------------
-void run_q2k_leg(std::mt19937 &rng, int reps) {
+void run_q2k_leg(std::mt19937 &rng, int reps, int prompt_tokens) {
     const int E = 256, M = 4096, K = 2048;
-    const int n_tokens = 4096 * 6;          // assignments, n_expert_used == 1
+    const int n_tokens = prompt_tokens * 6; // assignments, n_expert_used == 1
     const uint64_t nb_row = (uint64_t)K / 256;
     const uint64_t nblk   = (uint64_t)E * M * nb_row;
     const uint64_t npair  = nblk / 2;
@@ -192,9 +196,9 @@ void run_q2k_leg(std::mt19937 &rng, int reps) {
 // ---------------------------------------------------------------------------
 // IQ2_XXS gate/up pair leg.
 // ---------------------------------------------------------------------------
-void run_iq2_leg(std::mt19937 &rng, int reps) {
+void run_iq2_leg(std::mt19937 &rng, int reps, int prompt_tokens) {
     const int E = 256, M = 2048, K = 4096;
-    const int n_tokens = 4096, n_used = 6;
+    const int n_tokens = prompt_tokens, n_used = 6;
     const uint64_t nb_row = (uint64_t)K / 256;
     const uint64_t nblk   = (uint64_t)E * M * nb_row;
     const uint64_t soa_bytes = ds4_mmq_iq2_xxs_aligned_bytes(M, K, E);
@@ -277,9 +281,10 @@ void run_iq2_leg(std::mt19937 &rng, int reps) {
 
 int main(int argc, char **argv) {
     const int reps = (argc > 1) ? atoi(argv[1]) : 20;
+    const int prompt_tokens = (argc > 2) ? atoi(argv[2]) : 4096;
     std::mt19937 rng(0x5A0Au);
-    run_q2k_leg(rng, reps);
-    run_iq2_leg(rng, reps);
+    run_q2k_leg(rng, reps, prompt_tokens);
+    run_iq2_leg(rng, reps, prompt_tokens);
     printf(g_failures ? "SOA-TILES FAIL (%d)\n" : "SOA-TILES PASS\n", g_failures);
     return g_failures ? 1 : 0;
 }

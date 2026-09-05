@@ -1,0 +1,3 @@
+Questa è una domanda fondamentale sui sistemi operativi moderni. La risposta breve è: **la memoria virtuale è un'astrazione, mentre la memoria fisica (RAM) è una risorsa finita e condivisa.**
+
+Ecco la spiegazione dettagliata del perché la resid

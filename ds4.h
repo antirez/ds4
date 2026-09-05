@@ -127,6 +127,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *vision_path;
     ds4_backend backend;
     int n_threads;
     int context_size;
@@ -172,6 +173,24 @@ typedef struct {
     ds4_distributed_options distributed;
     ds4_tp_options tp;
 } ds4_engine_options;
+
+typedef struct {
+    float *data;
+    uint32_t token_count;
+    uint32_t layout;
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t width;
+    uint32_t height;
+    uint32_t content_width;
+    uint32_t content_height;
+    uint8_t fingerprint[32];
+} ds4_vision_embedding;
+
+typedef struct {
+    uint32_t token_start;
+    ds4_vision_embedding embedding;
+} ds4_vision_span;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
 typedef void (*ds4_generation_done_fn)(void *ud);
@@ -228,14 +247,47 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
+enum { DS4_TP_GATE_MASK_WORDS = 3 };
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
-                                 uint32_t *per_token);
+                                 uint32_t *per_token,
+                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS]);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+bool ds4_engine_has_vision(ds4_engine *e);
+int ds4_engine_vision_encode_file(ds4_engine *e,
+                                  const char *path,
+                                  ds4_vision_embedding *out,
+                                  char *error,
+                                  size_t error_cap);
+int ds4_engine_vision_encode_memory(ds4_engine *e,
+                                    const uint8_t *encoded,
+                                    size_t encoded_len,
+                                    ds4_vision_embedding *out,
+                                    char *error,
+                                    size_t error_cap);
+void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
+int ds4_prompt_append_vision(ds4_engine *e,
+                             ds4_tokens *tokens,
+                             ds4_vision_span *span,
+                             ds4_vision_embedding *embedding,
+                             char *error,
+                             size_t error_cap);
+/* Append one user or tool message whose text parts alternate with images.
+ * text_parts must contain image_count + 1 entries. On success ownership of
+ * each embedding is transferred to the corresponding output span. */
+int ds4_chat_append_multimodal_message(ds4_engine *e,
+                                       ds4_tokens *tokens,
+                                       const char *role,
+                                       const char *const *text_parts,
+                                       ds4_vision_embedding *embeddings,
+                                       size_t image_count,
+                                       ds4_vision_span *spans,
+                                       char *error,
+                                       size_t error_cap);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
@@ -250,6 +302,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_is_glm53(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -283,9 +336,15 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *output_path,
                                int ctx_size,
                                int max_prompts,
-                               int max_tokens);
+                               int max_tokens,
+                               int min_expert_samples);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+int ds4_dump_chat_tokenization(const char *model_path,
+                               const char *system,
+                               const char *prompt,
+                               ds4_think_mode think_mode,
+                               FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -332,6 +391,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
+float ds4_session_directional_steering_ffn(ds4_session *s);
+/* Change steering for future evaluation without rebuilding the existing KV
+ * state. Live changes are currently limited to non-distributed sessions. */
+int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
@@ -359,6 +422,20 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+int ds4_session_sync_multimodal(ds4_session *s,
+                                const ds4_tokens *prompt,
+                                const ds4_vision_span *images,
+                                size_t image_count,
+                                char *err,
+                                size_t errlen);
+/* Return true only when every image that conditioned the live checkpoint has
+ * the same token span and embedding fingerprint in the supplied prompt. */
+bool ds4_session_vision_state_matches(const ds4_session *s,
+                                      const ds4_vision_span *images,
+                                      size_t image_count);
+/* True while a session contains, or is actively syncing, image-conditioned
+ * state. Such state must not be written to the text-keyed disk KV cache. */
+bool ds4_session_has_vision_state(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -366,6 +443,8 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
+int ds4_session_argmax_ignoring_eos(ds4_session *s,
+                                    ds4_think_mode think_mode);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
@@ -430,9 +509,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_eval_speculative_argmax_ignoring_eos(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        ds4_think_mode think_mode,
+        int *accepted, int accepted_cap, char *err, size_t errlen);
 /* Evaluate one already-sampled target token and speculatively extend it.
  * Positive-temperature DSpark normally commits greedily verified draft
- * tokens; dspark_exact_sampling selects exact stochastic p/q acceptance. */
+ * tokens; dspark_exact_sampling selects exact stochastic p/q acceptance for
+ * DSpark or an internal GLM MTP block. */
 int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  int max_tokens, int eos_token,
                                  float temperature, int top_k,
@@ -444,7 +528,12 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               char *err, size_t errlen);
+int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
+                                 char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
+/* Keep the token prefix, restoring recurrent state where possible. Otherwise
+ * the checkpoint becomes invalid: sync the retained prefix before eval.
+ * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);

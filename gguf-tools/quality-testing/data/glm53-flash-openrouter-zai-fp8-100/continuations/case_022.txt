@@ -1,0 +1,13 @@
+# Mutex vs. Atomic Counter
+
+## Atomic Counter
+An atomic counter is a single variable whose operations (increment, decrement, add, compare-and-swap) are guaranteed to be **indivisible** at the hardware level.
+
+```cpp
+std::atomic<int> count{0};
+count++;  // Safe under concurrency — uses a CPU atomic instruction (e.g., lock xadd)
+```
+
+- Uses special CPU instructions (e.g., `LOCK XADD`, `CAS`)
+- Lock-free (usually) — threads never "wait" for a lock; the hardware arbitrates
+- Very fast: typically tens of nan

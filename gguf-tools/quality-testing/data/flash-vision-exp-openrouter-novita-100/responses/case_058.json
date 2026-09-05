@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788193351-TOLAfl6kNu0Eu2op3rxX",
+  "object": "chat.completion",
+  "created": 1788193351,
+  "model": "deepseek/deepseek-v4-flash-vision-exp",
+  "provider": "Novita",
+  "system_fingerprint": "aa8d6caccae4a22492bb51091cfc8eab",
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "Ecco una checklist completa per validare che un modello quantizzato (es. GPTQ, AWQ, GGUF) segua ancora le istruzioni in modo affidabile. La divido in **fasi di test** per coprire sia aspetti funzionali che qualitativi.\n\n---\n\n##",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "completion_tokens": 63,
+    "total_tokens": 88,
+    "cost": 9.416e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 9.416e-05,
+      "upstream_inference_prompt_cost": 1.1e-05,
+      "upstream_inference_completions_cost": 8.316e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

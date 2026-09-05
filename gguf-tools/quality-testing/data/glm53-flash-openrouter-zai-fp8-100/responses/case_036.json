@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762189-02DY4DgBDIp5LB400fZx",
+  "object": "chat.completion",
+  "created": 1787762189,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Piano di test: Chunking di prompt lunghi\n\n## Obiettivo\nVerificare che la suddivisione (chunking) di prompt lunghi preservi coerenza, completezza e qualità delle risposte.\n\n## 1. Preparazione dei dati\n- Selezionare 5-10 prompt lunghi (2.000–50.000 token) di tipologie diverse: documenti tecnici, conversazioni, codice, testi narrativi.\n- Definire le risposte attese (ground truth) per ogni prompt.\n\n## 2. Configur",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 28,
+    "completion_tokens": 128,
+    "total_tokens": 156,
+    "cost": 3.41e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.41e-05,
+      "upstream_inference_prompt_cost": 2.1e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

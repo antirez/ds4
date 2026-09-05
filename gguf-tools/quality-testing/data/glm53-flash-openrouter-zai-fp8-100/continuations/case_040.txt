@@ -1,0 +1,6 @@
+# First Five Measurements for Long-Context Generation Slowness
+
+## 1. Time-to-first-token (TTFT) vs. inter-token latency, split by context length
+Measure both separately across a context-length sweep (e.g., 1k → 128k tokens). This tells you whether the slowdown is in **prefill** (quadratic attention cost over the prompt) or **decode** (per-token cost growing with KV cache size). They have different root causes and fixes.
+
+## 2. KV cache memory footprint vs. available VR

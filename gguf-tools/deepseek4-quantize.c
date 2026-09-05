@@ -46,7 +46,18 @@
 #define DS4_KV_QUANTIZE_IMATRIX_N_ENTRIES "quantize.imatrix.entries_count"
 #define DS4_KV_QUANTIZE_IMATRIX_N_CHUNKS  "quantize.imatrix.chunks_count"
 #define DS4_KV_COMPRESS_RATIOS             "deepseek4.attention.compress_ratios"
+#define DS4_KV_RMS_EPS                     "deepseek4.attention.layer_norm_rms_epsilon"
+#define DS4_KV_CHECKPOINT_VARIANT          "deepseek4.checkpoint_variant"
+#define DS4_KV_VISION_SIDECAR_REQUIRED     "deepseek4.vision.sidecar_required"
+#define DS4_KV_SOURCE_URL                  "general.source.url"
+#define DS4_KV_SOURCE_REVISION             "general.source.revision"
 #define DS4_GGUF_DEFAULT_ALIGNMENT 32
+
+#define DS4_VISION_EXP_SOURCE_URL \
+    "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+#define DS4_VISION_EXP_SOURCE_REVISION \
+    "e46e16bf6035c6f317eb2ac7458eb0362926d402"
+#define DS4_VISION_EXP_NAME "DeepSeek V4 Flash Vision Experimental"
 
 typedef enum {
     GGUF_TYPE_UINT8   = 0,
@@ -351,12 +362,31 @@ static int64_t json_i64(const json_doc *d, int tok) {
     return strtoll(tmp, NULL, 10);
 }
 
+static double json_f64(const json_doc *d, int tok) {
+    char tmp[128];
+    const int n = d->v[tok].end - d->v[tok].start;
+    if (n <= 0 || n >= (int)sizeof(tmp)) die("bad JSON number");
+    memcpy(tmp, d->js + d->v[tok].start, (size_t)n);
+    tmp[n] = '\0';
+    errno = 0;
+    char *end = NULL;
+    double value = strtod(tmp, &end);
+    if (errno != 0 || end == tmp || *end != '\0' || !isfinite(value)) {
+        die("bad JSON number");
+    }
+    return value;
+}
+
 typedef struct {
     uint32_t *compress_ratios;
     uint64_t n_compress_ratios;
+    float rms_eps;
+    bool vision_exp;
+    char *source_revision;
 } hf_model_metadata;
 
-static hf_model_metadata load_hf_model_metadata(const char *hf_dir) {
+static hf_model_metadata load_hf_model_metadata(const char *hf_dir,
+                                                const char *source_revision) {
     hf_model_metadata m = {0};
     char *path = path_join(hf_dir, "config.json");
     size_t len = 0;
@@ -386,6 +416,36 @@ static hf_model_metadata load_hf_model_metadata(const char *hf_dir) {
         m.compress_ratios[j++] = (uint32_t)value;
     }
 
+    int rms_eps = json_obj_get(&d, 0, "rms_norm_eps");
+    if (rms_eps < 0) {
+        fprintf(stderr, "error: missing rms_norm_eps in %s\n", path);
+        exit(1);
+    }
+    double rms = json_f64(&d, rms_eps);
+    if (rms <= 0.0 || rms > 1.0) {
+        fprintf(stderr, "error: invalid rms_norm_eps in %s: %.9g\n", path, rms);
+        exit(1);
+    }
+    m.rms_eps = (float)rms;
+
+    int vision_layers = json_obj_get(&d, 0, "vision_n_layers");
+    if (vision_layers >= 0) {
+        int64_t count_layers = json_i64(&d, vision_layers);
+        if (count_layers != 32) {
+            fprintf(stderr, "error: unsupported vision_n_layers in %s: %" PRId64 "\n",
+                    path, count_layers);
+            exit(1);
+        }
+        m.vision_exp = true;
+        if (!source_revision || strcmp(source_revision, DS4_VISION_EXP_SOURCE_REVISION) != 0) {
+            fprintf(stderr,
+                    "error: Vision-Exp conversion requires --source-revision %s\n",
+                    DS4_VISION_EXP_SOURCE_REVISION);
+            exit(1);
+        }
+    }
+    if (source_revision) m.source_revision = xstrdup(source_revision);
+
     json_free(&d);
     free(text);
     free(path);
@@ -394,6 +454,7 @@ static hf_model_metadata load_hf_model_metadata(const char *hf_dir) {
 
 static void free_hf_model_metadata(hf_model_metadata *m) {
     free(m->compress_ratios);
+    free(m->source_revision);
     memset(m, 0, sizeof(*m));
 }
 
@@ -1669,6 +1730,15 @@ static void write_u64(FILE *fp, uint64_t v) {
     if (fwrite(&v, sizeof(v), 1, fp) != 1) die("write u64 failed");
 }
 
+static void write_f32(FILE *fp, float v) {
+    if (fwrite(&v, sizeof(v), 1, fp) != 1) die("write f32 failed");
+}
+
+static void write_bool(FILE *fp, bool v) {
+    const uint8_t value = v ? 1u : 0u;
+    if (fwrite(&value, sizeof(value), 1, fp) != 1) die("write bool failed");
+}
+
 static void write_gguf_string(FILE *fp, const char *s) {
     uint64_t n = strlen(s);
     write_u64(fp, n);
@@ -1733,6 +1803,7 @@ static gguf_file load_gguf_metadata_with_override(const char *path,
     byte_span *kv_keep = xcalloc((size_t)g.n_kv, sizeof(kv_keep[0]));
     uint64_t n_kv_keep = 0;
     bool found_compress_ratios = false;
+    bool found_rms_eps = false;
 
     off_t kv_start = ftello(fp);
     if (kv_start < 0) die("GGUF ftell failed");
@@ -1742,6 +1813,7 @@ static gguf_file load_gguf_metadata_with_override(const char *path,
         char *key = read_gguf_string_fp(fp);
         uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
         if (strcmp(key, DS4_KV_COMPRESS_RATIOS) == 0) found_compress_ratios = true;
+        if (strcmp(key, DS4_KV_RMS_EPS) == 0) found_rms_eps = true;
         if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
@@ -1765,7 +1837,15 @@ static gguf_file load_gguf_metadata_with_override(const char *path,
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        const bool replace_from_config = metadata && strcmp(key, DS4_KV_COMPRESS_RATIOS) == 0;
+        const bool replace_from_config = metadata &&
+            (strcmp(key, DS4_KV_COMPRESS_RATIOS) == 0 ||
+             strcmp(key, DS4_KV_RMS_EPS) == 0 ||
+             (metadata->vision_exp &&
+              (strcmp(key, "general.name") == 0 ||
+               strcmp(key, DS4_KV_SOURCE_URL) == 0 ||
+               strcmp(key, DS4_KV_SOURCE_REVISION) == 0 ||
+               strcmp(key, DS4_KV_CHECKPOINT_VARIANT) == 0 ||
+               strcmp(key, DS4_KV_VISION_SIDECAR_REQUIRED) == 0)));
         if (!is_imatrix_kv_key(key) && !replace_from_config) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
@@ -1776,6 +1856,9 @@ static gguf_file load_gguf_metadata_with_override(const char *path,
     }
     if (metadata && !found_compress_ratios) {
         die("template has no deepseek4.attention.compress_ratios metadata");
+    }
+    if (metadata && !found_rms_eps) {
+        die("template has no deepseek4.attention.layer_norm_rms_epsilon metadata");
     }
     if (metadata && g.n_layers > metadata->n_compress_ratios) {
         die("config.json compress_ratios is shorter than the template layer count");
@@ -1852,8 +1935,25 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
 }
 
 static size_t extra_hf_metadata_kv_size(const hf_model_metadata *metadata) {
-    return gguf_string_size(DS4_KV_COMPRESS_RATIOS) + 4 + 4 + 8 +
-           (size_t)metadata->n_compress_ratios * 4;
+    size_t n = gguf_string_size(DS4_KV_COMPRESS_RATIOS) + 4 + 4 + 8 +
+               (size_t)metadata->n_compress_ratios * 4;
+    n += gguf_string_size(DS4_KV_RMS_EPS) + 4 + sizeof(float);
+    if (metadata->vision_exp) {
+        n += gguf_string_size("general.name") + 4 +
+             gguf_string_size(DS4_VISION_EXP_NAME);
+        n += gguf_string_size(DS4_KV_SOURCE_URL) + 4 +
+             gguf_string_size(DS4_VISION_EXP_SOURCE_URL);
+        n += gguf_string_size(DS4_KV_SOURCE_REVISION) + 4 +
+             gguf_string_size(metadata->source_revision);
+        n += gguf_string_size(DS4_KV_CHECKPOINT_VARIANT) + 4 +
+             gguf_string_size("vision-exp");
+        n += gguf_string_size(DS4_KV_VISION_SIDECAR_REQUIRED) + 4 + 1;
+    }
+    return n;
+}
+
+static uint64_t extra_hf_metadata_kv_count(const hf_model_metadata *metadata) {
+    return 2u + (metadata->vision_exp ? 5u : 0u);
 }
 
 static void write_hf_metadata_kvs(FILE *fp, const hf_model_metadata *metadata) {
@@ -1864,6 +1964,26 @@ static void write_hf_metadata_kvs(FILE *fp, const hf_model_metadata *metadata) {
     for (uint64_t i = 0; i < metadata->n_compress_ratios; i++) {
         write_u32(fp, metadata->compress_ratios[i]);
     }
+    write_gguf_string(fp, DS4_KV_RMS_EPS);
+    write_u32(fp, GGUF_TYPE_FLOAT32);
+    write_f32(fp, metadata->rms_eps);
+    if (metadata->vision_exp) {
+        write_gguf_string(fp, "general.name");
+        write_u32(fp, GGUF_TYPE_STRING);
+        write_gguf_string(fp, DS4_VISION_EXP_NAME);
+        write_gguf_string(fp, DS4_KV_SOURCE_URL);
+        write_u32(fp, GGUF_TYPE_STRING);
+        write_gguf_string(fp, DS4_VISION_EXP_SOURCE_URL);
+        write_gguf_string(fp, DS4_KV_SOURCE_REVISION);
+        write_u32(fp, GGUF_TYPE_STRING);
+        write_gguf_string(fp, metadata->source_revision);
+        write_gguf_string(fp, DS4_KV_CHECKPOINT_VARIANT);
+        write_u32(fp, GGUF_TYPE_STRING);
+        write_gguf_string(fp, "vision-exp");
+        write_gguf_string(fp, DS4_KV_VISION_SIDECAR_REQUIRED);
+        write_u32(fp, GGUF_TYPE_BOOL);
+        write_bool(fp, true);
+    }
 }
 
 static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
@@ -1871,7 +1991,8 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
                                            const hf_model_metadata *metadata) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = 1 + extra_imatrix_kv_count(im);
+    out.n_kv_extra = extra_hf_metadata_kv_count(metadata) +
+                     extra_imatrix_kv_count(im);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -2013,6 +2134,7 @@ typedef struct {
     char *compare_gguf;
     char *compare_tensor;
     char *imatrix_file;
+    char *source_revision;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -2118,6 +2240,7 @@ static const dspark_name_rule dspark_stage_rules[] = {
 
     {"ffn.gate.weight", "ffn_gate_inp.weight", "emit"},
     {"ffn.gate.bias", "exp_probs_b.bias", "emit"},
+    {"ffn.gate.bias_vl", "visual_router_bias", "consume_visual_sidecar"},
     {"ffn_norm.weight", "ffn_norm.weight", "emit"},
     {"ffn.shared_experts.w1.weight", "ffn_gate_shexp.weight", "emit"},
     {"ffn.shared_experts.w1.scale", "ffn_gate_shexp.weight", "consume_scale"},
@@ -2502,13 +2625,17 @@ static void write_gguf_kv_u32_array(FILE *fp, const char *key, const uint32_t *v
 }
 
 static void dspark_plan_finalize(dspark_support_plan *plan,
-                                 const dspark_support_options *opt) {
+                                 const dspark_support_options *opt,
+                                 const hf_model_metadata *metadata) {
     qsort(plan->tensors, (size_t)plan->len, sizeof(plan->tensors[0]), dspark_plan_cmp);
     plan->alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
-    plan->n_kv = 9;
+    const char *name = metadata->vision_exp ?
+        "DeepSeek V4 Flash Vision Experimental DSpark support" :
+        "DeepSeek V4 Flash DSpark support";
+    plan->n_kv = 9 + (metadata->vision_exp ? 3 : 0);
     plan->kv_bytes =
         gguf_kv_size_string("general.architecture", "deepseek4-dspark") +
-        gguf_kv_size_string("general.name", "DeepSeek V4 Flash DSpark support") +
+        gguf_kv_size_string("general.name", name) +
         gguf_kv_size_u32("general.alignment") +
         gguf_kv_size_u32("dspark.block_size") +
         gguf_kv_size_u32("dspark.markov_rank") +
@@ -2516,6 +2643,15 @@ static void dspark_plan_finalize(dspark_support_plan *plan,
         gguf_kv_size_u32_array("dspark.target_layer_ids", opt->target_layer_count) +
         gguf_kv_size_u32("dspark.stage_count") +
         gguf_kv_size_u32("dspark.n_layers");
+    if (metadata->vision_exp) {
+        plan->kv_bytes +=
+            gguf_kv_size_string(DS4_KV_SOURCE_URL,
+                                DS4_VISION_EXP_SOURCE_URL) +
+            gguf_kv_size_string(DS4_KV_SOURCE_REVISION,
+                                metadata->source_revision) +
+            gguf_kv_size_string(DS4_KV_CHECKPOINT_VARIANT,
+                                "vision-exp");
+    }
 
     size_t tensor_info = 0;
     size_t off = 0;
@@ -2538,7 +2674,8 @@ static void dspark_plan_finalize(dspark_support_plan *plan,
 static dspark_support_plan build_dspark_support_plan(st_db *db,
                                                      const quant_policy *policy,
                                                      const dspark_support_options *opt,
-                                                     int requested_n_experts) {
+                                                     int requested_n_experts,
+                                                     const hf_model_metadata *metadata) {
     (void)opt;
     dspark_support_plan plan = {0};
     str_list names = load_index_weight_names(db->hf_dir);
@@ -2589,7 +2726,7 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
             }
         }
     }
-    dspark_plan_finalize(&plan, opt);
+    dspark_plan_finalize(&plan, opt, metadata);
     return plan;
 }
 
@@ -2646,6 +2783,7 @@ static byte_buf generate_dspark_tensor(st_db *db, const dspark_tensor_plan *tp,
 static void write_dspark_support_gguf(st_db *db,
                                       const dspark_support_plan *plan,
                                       const dspark_support_options *opt,
+                                      const hf_model_metadata *metadata,
                                       const char *out_path,
                                       int n_threads,
                                       const imatrix_store *imatrix) {
@@ -2656,7 +2794,11 @@ static void write_dspark_support_gguf(st_db *db,
     write_u64(fp, (uint64_t)plan->len);
     write_u64(fp, plan->n_kv);
     write_gguf_kv_string(fp, "general.architecture", "deepseek4-dspark");
-    write_gguf_kv_string(fp, "general.name", "DeepSeek V4 Flash DSpark support");
+    write_gguf_kv_string(
+        fp, "general.name",
+        metadata->vision_exp ?
+            "DeepSeek V4 Flash Vision Experimental DSpark support" :
+            "DeepSeek V4 Flash DSpark support");
     write_gguf_kv_u32(fp, "general.alignment", (uint32_t)plan->alignment);
     write_gguf_kv_u32(fp, "dspark.block_size", opt->block_size);
     write_gguf_kv_u32(fp, "dspark.markov_rank", opt->markov_rank);
@@ -2664,6 +2806,14 @@ static void write_dspark_support_gguf(st_db *db,
     write_gguf_kv_u32_array(fp, "dspark.target_layer_ids", opt->target_layers, opt->target_layer_count);
     write_gguf_kv_u32(fp, "dspark.stage_count", (uint32_t)plan->stages);
     write_gguf_kv_u32(fp, "dspark.n_layers", (uint32_t)plan->stages);
+    if (metadata->vision_exp) {
+        write_gguf_kv_string(fp, DS4_KV_SOURCE_URL,
+                             DS4_VISION_EXP_SOURCE_URL);
+        write_gguf_kv_string(fp, DS4_KV_SOURCE_REVISION,
+                             metadata->source_revision);
+        write_gguf_kv_string(fp, DS4_KV_CHECKPOINT_VARIANT,
+                             "vision-exp");
+    }
 
     for (int i = 0; i < plan->len; i++) {
         const tensor_meta *t = &plan->tensors[i].meta;
@@ -2731,6 +2881,7 @@ static void usage(const char *argv0) {
     printf("  --dspark-target-layers CSV DSpark target layer ids metadata, default 40,41,42\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+    printf("  --source-revision SHA  pin the Hugging Face source revision in output metadata\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
     printf("  --routed-w1 TYPE       routed gate expert tensor type\n");
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
@@ -2843,6 +2994,8 @@ static params parse_args(int argc, char **argv) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
+        } else if (strcmp(arg, "--source-revision") == 0) {
+            p.source_revision = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
             ds4q_type t = parse_type(need_value(argc, argv, &i, arg));
             p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = t;
@@ -3013,10 +3166,13 @@ int main(int argc, char **argv) {
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
     if (p.dspark_support) {
+        hf_model_metadata metadata = load_hf_model_metadata(p.hf_dir,
+                                                            p.source_revision);
         st_db db;
         db_open(&db, p.hf_dir);
         dspark_support_plan plan =
-            build_dspark_support_plan(&db, &p.policy, &p.dspark, p.n_experts);
+            build_dspark_support_plan(&db, &p.policy, &p.dspark,
+                                      p.n_experts, &metadata);
         print_dspark_support_plan(&plan, &p.dspark);
         if (p.dry_run) {
             /* Plan only: build_dspark_support_plan reads shard headers, not tensor payloads. */
@@ -3026,6 +3182,7 @@ int main(int argc, char **argv) {
             write_dspark_support_gguf(&db,
                                       &plan,
                                       &p.dspark,
+                                      &metadata,
                                       p.out_gguf,
                                       p.n_threads,
                                       &imatrix);
@@ -3033,13 +3190,15 @@ int main(int argc, char **argv) {
         }
         free_dspark_support_plan(&plan);
         db_close(&db);
+        free_hf_model_metadata(&metadata);
         imatrix_free(&imatrix);
         for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);
         free(p.policy.overrides);
         return 0;
     }
 
-    hf_model_metadata metadata = load_hf_model_metadata(p.hf_dir);
+    hf_model_metadata metadata = load_hf_model_metadata(p.hf_dir,
+                                                        p.source_revision);
     gguf_file tmpl = load_gguf_metadata_with_override(p.template_gguf, &metadata);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {

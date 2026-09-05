@@ -1,3 +1,101 @@
+__global__ static void matmul_f16_tiny_batch_wave_kernel(
+        float *out,
+        const half *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    const half *wr = w + (uint64_t)row * in_dim;
+    const float *xr = x + (uint64_t)tok * in_dim;
+    float sum = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        const float xv = __half2float(__float2half(xr[i]));
+        sum += __half2float(wr[i]) * xv;
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = sum;
+}
+
+template <uint32_t BM, uint32_t BN>
+__global__ static void matmul_f16_smallm_wmma_kernel(
+        float *out, const half *w, const half *x,
+        uint32_t m, uint32_t n, uint32_t k) {
+    static_assert(BM % 16u == 0u && BN % 16u == 0u, "16x16 WMMA tiles");
+    constexpr uint32_t WM = BM / 16u;
+    constexpr uint32_t WN = BN / 16u;
+    constexpr uint32_t WAVES = WM * WN;
+    static_assert(WAVES <= 32u, "at most 1024 wave32 threads");
+
+    __shared__ half sa[BM * 16u];
+    __shared__ half sb[16u * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t wm = wave % WM;
+    const uint32_t wn = wave / WM;
+    const uint32_t m0 = blockIdx.x * BM;
+    const uint32_t n0 = blockIdx.y * BN;
+
+    using fa_t = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, half,
+                                   rocwmma::row_major>;
+    using fb_t = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half,
+                                   rocwmma::col_major>;
+    using fc_t = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+    fa_t a;
+    fb_t b;
+    fc_t c;
+    rocwmma::fill_fragment(c, 0.0f);
+
+    for (uint32_t k0 = 0; k0 < k; k0 += 16u) {
+        for (uint32_t p = tid; p < BM * 8u; p += WAVES * 32u) {
+            const uint32_t j = p * 2u;
+            const uint32_t kk = j & 15u;
+            const uint32_t row = j >> 4u;
+            *reinterpret_cast<uint32_t *>(sa + j) =
+                    *reinterpret_cast<const uint32_t *>(
+                            w + (k0 + kk) + (uint64_t)(m0 + row) * k);
+        }
+        for (uint32_t p = tid; p < 8u * BN; p += WAVES * 32u) {
+            const uint32_t j = p * 2u;
+            const uint32_t kk = j & 15u;
+            const uint32_t col = j >> 4u;
+            *reinterpret_cast<uint32_t *>(sb + j) =
+                    *reinterpret_cast<const uint32_t *>(
+                            x + (k0 + kk) + (uint64_t)(n0 + col) * k);
+        }
+        __syncthreads();
+        rocwmma::load_matrix_sync(a, sa + wm * 16u * 16u, 16u);
+        rocwmma::load_matrix_sync(b, sb + wn * 16u * 16u, 16u);
+        rocwmma::mma_sync(c, a, b, c);
+        __syncthreads();
+    }
+    rocwmma::store_matrix_sync(
+            out + (m0 + wm * 16u) + (uint64_t)(n0 + wn * 16u) * m,
+            c, m, rocwmma::mem_col_major);
+}
+
+__global__ static void matmul_f16_tinym24_wmma_kernel(
+        float *out, const half *w, const half *x) {
+    constexpr uint32_t M=24u, N=2048u, K=16384u, BM=32u, BN=64u, WAVES=8u;
+    __shared__ half sa[BM*16u]; __shared__ half sb[16u*BN]; __shared__ float sc[BM*BN];
+    const uint32_t tid=threadIdx.x, wave=tid>>5u, wm=wave&1u, wn=wave>>1u, n0=blockIdx.x*BN;
+    using fa_t=rocwmma::fragment<rocwmma::matrix_a,16,16,16,half,rocwmma::col_major>;
+    using fb_t=rocwmma::fragment<rocwmma::matrix_b,16,16,16,half,rocwmma::col_major>;
+    using fc_t=rocwmma::fragment<rocwmma::accumulator,16,16,16,float>;
+    fa_t a; fb_t b; fc_t c; rocwmma::fill_fragment(c,0.0f);
+    for (uint32_t k0=0;k0<K;k0+=16u) {
+        for (uint32_t j=tid;j<BM*16u;j+=WAVES*32u) { const uint32_t r=j&31u, k=j>>5u; sa[j]=r<M?w[(uint64_t)r*K+k0+k]:__float2half(0.0f); }
+        for (uint32_t p=tid;p<8u*BN;p+=WAVES*32u) { const uint32_t j=p*2u,k=j&15u,n=j>>4u; *reinterpret_cast<uint32_t*>(sb+j)=*reinterpret_cast<const uint32_t*>(x+k0+k+(uint64_t)(n0+n)*K); }
+        __syncthreads(); rocwmma::load_matrix_sync(a,sa+wm*16u,BM); rocwmma::load_matrix_sync(b,sb+wn*256u,16u); rocwmma::mma_sync(c,a,b,c); __syncthreads();
+    }
+    rocwmma::store_matrix_sync(sc+wm*16u+wn*16u*BM,c,BM,rocwmma::mem_col_major); __syncthreads();
+    for (uint32_t i=tid;i<M*BN;i+=WAVES*32u) { const uint32_t n=i/M,r=i-n*M; out[r+(uint64_t)(n0+n)*M]=sc[r+n*BM]; }
+}
+
 template <uint32_t BT>
 static void cuda_launch_q8_batch_sharedx_bt(
         float *out,
@@ -13,8 +111,12 @@ static void cuda_launch_q8_batch_sharedx_bt(
     const size_t shmem = (size_t)tile * BT * 32u * sizeof(float);
     if (tile == 2u) {
         matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<2u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (tile == 3u) {
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<3u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 4u) {
         matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<4u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (tile == 5u) {
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<5u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 8u) {
         matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<8u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 16u) {
@@ -209,6 +311,11 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+    if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
+        matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w_f16, xh);
+        return cuda_ok(cudaGetLastError(), "q8 f16 tinym24 wmma launch");
+    }
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -388,14 +495,80 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (!g_quality_mode &&
+            g_dspark_verify_mode && n_tok <= 6u &&
+            in_dim <= INT_MAX && out_dim <= INT_MAX &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_DSPARK_Q8_MMVQ") &&
+            ds4_mmq_init(0) == 0 &&
+            ds4_mmq_q8_0_dense_vec(
+                wptr, (const float *)x->ptr, (float *)out->ptr,
+                (int)out_dim, (int)n_tok, (int)in_dim,
+                (cudaStream_t)0) == 0) {
+            return 1;
+        }
+        /* The 2048-row projection hits a 72-VGPR occupancy cliff in exact8;
+         * its retained 24-VGPR kernel is 2.4x faster on gfx1151. */
+        if (!g_quality_mode && (in_dim % 256u) == 0u &&
+            n_tok <= 5u && out_dim != 2048u && out_dim <= UINT32_MAX) {
+            constexpr uint32_t rows_per_block = 32u;
+            const dim3 grid(((uint32_t)out_dim + rows_per_block - 1u) /
+                                rows_per_block,
+                            1u, 1u);
+            const size_t shmem = (size_t)n_tok * 8u * 32u * sizeof(float);
+            if (n_tok == 2u) {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<2u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            } else if (n_tok == 3u) {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<3u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            } else if (n_tok == 4u) {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<4u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            } else {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<5u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            }
+            return cuda_ok(cudaGetLastError(),
+                           "matmul_q8_0 f32 tiny exact8 launch");
+        }
         if (!g_quality_mode && (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
-            const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
+            if (out_dim >= 8192u) {
+                const dim3 grid((uint32_t)((out_dim + 255u) / 256u),
+                                (uint32_t)((n_tok + 63u) / 64u),
+                                1u);
+                matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u><<<grid, 512u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 16w launch");
+            }
+            const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
                             (uint32_t)((n_tok + 63u) / 64u),
                             1u);
-            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<grid, 256u>>>(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     (const float *)x->ptr,
@@ -403,13 +576,18 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     (uint32_t)in_dim,
                     (uint32_t)out_dim,
                     blocks * 34u);
-            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 8w launch");
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
-            const uint32_t block_tile = 16u;
+            const bool exact_tiny = n_tok <= 5u;
+            const uint32_t tile = exact_tiny ? (uint32_t)n_tok :
+                                  n_tok <= 2u ? 2u :
+                                  n_tok <= 4u ? 4u :
+                                  n_tok <= 8u ? 8u :
+                                  n_tok <= 16u ? 16u : 32u;
+            const uint32_t block_tile = n_tok <= 8u ? 8u : 16u;
             cuda_launch_q8_batch_sharedx((float *)out->ptr,
                                          reinterpret_cast<const unsigned char *>(wptr),
                                          (const float *)x->ptr,
@@ -816,14 +994,103 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
     const int ordered_decode = n_tok == 1u;
+    if (n_tok > 1u && n_tok <= 8u && in_dim == 16384u && out_dim == 24u) {
+        const dim3 grid((uint32_t)out_dim, (uint32_t)n_tok, 1u);
+        matmul_f16_tiny_batch_wave_kernel<<<grid, 32u>>>(
+                (float *)out->ptr, w, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        return cuda_ok(cudaGetLastError(), "f16 tiny-batch wave launch");
+    }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+        if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
+            matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);
+            return cuda_ok(cudaGetLastError(), "f16 tinym24 wmma launch");
+        }
+        if (in_dim == 4096u && n_tok == 2048u &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_SMALLM_WMMA")) {
+            if (out_dim == 64u || out_dim == 512u || out_dim == 1024u) {
+                const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
+                matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
+                        (float *)out->ptr, w, xh,
+                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
+                return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
+            }
+            if (out_dim == 256u) {
+                const dim3 grid((uint32_t)out_dim / 128u, (uint32_t)n_tok / 64u, 1u);
+                matmul_f16_smallm_wmma_kernel<128u, 64u><<<grid, 1024u>>>(
+                        (float *)out->ptr, w, xh,
+                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
+                return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
+            }
+        }
+        if (n_tok == 2048u && in_dim == 1024u && out_dim == 8192u &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_LARGEM_WMMA")) {
+            const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
+            matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
+                    (float *)out->ptr, w, xh, (uint32_t)out_dim,
+                    (uint32_t)n_tok, (uint32_t)in_dim);
+            return cuda_ok(cudaGetLastError(), "f16 largem wmma launch");
+        }
         const float alpha = 1.0f;
         const float beta = 0.0f;
+#ifdef __HIP_PLATFORM_AMD__
+        if ((n_tok == 4u ||
+             (g_dspark_verify_mode && n_tok <= 6u)) &&
+            g_rocblas_ready &&
+            g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_NONE &&
+            !__atomic_load_n(&g_rocblas_f16_solutions_disabled, __ATOMIC_RELAXED) &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
+            int32_t solution = 0;
+            if (in_dim == 4096u &&
+                (out_dim == 64u || out_dim == 256u ||
+                 out_dim == 512u || out_dim == 1024u)) {
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -217;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -50;
+            } else if (in_dim == 1024u && out_dim == 8192u) {
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -216;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -49;
+            }
+            if (solution != 0) {
+                const rocblas_status rst = rocblas_gemm_ex(
+                        g_rocblas,
+                        rocblas_operation_transpose,
+                        rocblas_operation_none,
+                        (rocblas_int)out_dim,
+                        (rocblas_int)n_tok,
+                        (rocblas_int)in_dim,
+                        &alpha,
+                        w,
+                        rocblas_datatype_f16_r,
+                        (rocblas_int)in_dim,
+                        xh,
+                        rocblas_datatype_f16_r,
+                        (rocblas_int)in_dim,
+                        &beta,
+                        out->ptr,
+                        rocblas_datatype_f32_r,
+                        (rocblas_int)out_dim,
+                        out->ptr,
+                        rocblas_datatype_f32_r,
+                        (rocblas_int)out_dim,
+                        rocblas_datatype_f32_r,
+                        rocblas_gemm_algo_solution_index,
+                        solution,
+                        0u);
+                if (rst == rocblas_status_success) return 1;
+                __atomic_store_n(&g_rocblas_f16_solutions_disabled, 1, __ATOMIC_RELAXED);
+            }
+        }
+#endif
         cublasStatus_t st = cublasGemmEx(g_cublas,
                                          CUBLAS_OP_T,
                                          CUBLAS_OP_N,

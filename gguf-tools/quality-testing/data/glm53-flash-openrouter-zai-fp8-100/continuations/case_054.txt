@@ -1,0 +1,15 @@
+# Testare che mmap non venga rimappato ripetutamente
+
+Ecco diversi approcci per verificare che un mapping resti stabile:
+
+## 1. Verifica dell'indirizzo restituito
+
+Il test più diretto: chiamare `mmap` una sola volta e verificare che il puntatore non cambi tra le chiamate successive.
+
+```c
+void *addr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+// ... uso ...
+assert(addr == cached_addr);  // se il codice cache-a il mapping
+```
+
+Se il tuo codice

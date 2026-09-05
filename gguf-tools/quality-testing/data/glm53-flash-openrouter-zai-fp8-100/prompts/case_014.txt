@@ -1,0 +1,1 @@
+Spiega perche la cache KV su disco aiuta nelle sessioni agentiche.

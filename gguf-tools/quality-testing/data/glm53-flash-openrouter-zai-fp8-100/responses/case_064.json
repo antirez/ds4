@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762292-ICefBB7ZBI0R7m9agKMv",
+  "object": "chat.completion",
+  "created": 1787762292,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Latency vs. Throughput\n\nThese are two fundamental performance metrics that are often confused but measure very different things.\n\n## Latency\n**The time it takes to complete a single operation** — how long you wait for a response.\n\n- Measured in units of time (milliseconds, seconds)\n- Answers: *\"How fast is one request?\"*\n- Example: If a website takes 200ms to load after you click, the latency is 200ms.\n\n## Throughput\n**The amount of work completed per unit of time** — total capacity.\n\n- Measured in operations/second, requests/second, GB/s",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 21,
+    "completion_tokens": 128,
+    "total_tokens": 149,
+    "cost": 3.3575e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.3575e-05,
+      "upstream_inference_prompt_cost": 1.575e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# Backpressure in Network Servers
+
+**Backpressure** is a mechanism where a slow downstream consumer signals upstream producers to slow down, preventing resource exhaustion.
+
+## The Core Problem
+
+In a server, data flows through stages:
+
+```
+Network → Socket → Application → Database/Processing
+```
+
+If your application reads from the network faster than it can process (e.g., writing to an overloaded database), unprocessed data accumulates in memory. Without backpressure, this leads to:
+
+- **Memory exhaustion** → OOM crashes
+- **Unbounded queues** → ever-growing latency
+- **Cascading failures**
+
+## How Back

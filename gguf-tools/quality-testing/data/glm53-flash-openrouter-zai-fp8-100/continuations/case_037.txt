@@ -1,0 +1,9 @@
+# Matrice di Importanza nella Quantizzazione Low-Bit
+
+La **matrice di importanza** (o vettore di importanza) è uno strumento utilizzato nelle tecniche di quantizzazione a bassa precisione per decidere **quali pesi o attivazioni sono più critici** da preservare durante la compressione del modello.
+
+## Concetto base
+
+Quando si quantizza un modello (es. da FP16 a INT4), si introduce un errore di quantizzazione. L'idea chiave è:
+
+> Non tutti i pesi contribuiscono allo stesso modo all'

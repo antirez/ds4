@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762311-zkeYSo4moXytZcbpJbVy",
+  "object": "chat.completion",
+  "created": 1787762311,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# PR Review Checklist: Memory Lifetimes\n\n## Ownership & Scope\n- [ ] Clear single owner for each allocation (who frees it?)\n- [ ] No double-free or use-after-move possibilities\n- [ ] Ownership transfers documented (function signatures, comments)\n\n## Resource Cleanup\n- [ ] Every `new`/`malloc`/acquire has a matching release path\n- [ ] Early returns and error paths don't leak\n- [ ] RAII / smart pointers / try-with-resources used where available (no manual management without justification)\n- [ ] Destructors/cleanup run even on exceptions or panics\n\n##",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 27,
+    "completion_tokens": 128,
+    "total_tokens": 155,
+    "cost": 3.4025e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.4025e-05,
+      "upstream_inference_prompt_cost": 2.025e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

@@ -95,6 +95,72 @@ int ds4_gpu_parallel_ffn_start(
         uint32_t              shared_dim,
         const ds4_gpu_tensor *x,
         float                 clamp);
+int ds4_gpu_parallel_ffn_start_sliced(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        uint32_t              shared_lane_offset,
+        uint32_t              shared_lane_count,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
+
+/* GPU-decided shared-expert lane split for two-rank TP decode: the split
+ * kernels read the selected expert ids and take complementary lane ranges
+ * sized to balance the bytes each rank streams (shift_q16 = routed expert
+ * bytes / (2 * shared expert bytes) in Q16; 0 reproduces static halves). */
+int ds4_gpu_parallel_ffn_start_split(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp,
+        const ds4_gpu_tensor *selected,
+        uint32_t              tp_rank,
+        uint32_t              tp_world,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              shift_q16);
+
+/* out = a + b into this rank's TP slab slot for (layer, gate), publishing the
+ * gate's checked flag from the same kernel; falls back to ds4_gpu_add_tensor
+ * when the fold does not apply.  Call right before ds4_gpu_tp_gate_encode. */
+int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate);
+
+/* Register that the next TP partial producer for (layer, gate) may publish
+ * the gate's checked flag itself (taken by the attention output K-slice
+ * matvec when its output is that slot; otherwise ignored). */
+void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
+
+/* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
+ * to run only its q task now and fold the kv task into the KV staging
+ * kernel of the same layer; flush runs it standalone if nothing consumed it. */
+void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void);
+int ds4_gpu_kv_norm_task_pending(void);
+int ds4_gpu_kv_norm_task_flush(void);
+int ds4_gpu_kv_norm_task_begin_concurrent(void);
+void ds4_gpu_kv_norm_task_end_concurrent(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
@@ -118,6 +184,11 @@ int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+/* Add a secondary GGUF mapping without replacing the primary model mapping. */
+int ds4_gpu_set_aux_model_map_range(const void *model_map,
+                                    uint64_t model_size,
+                                    uint64_t map_offset,
+                                    uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
@@ -277,12 +348,23 @@ typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, u
  * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
 int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
+                    uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
+/* Single-session flag gates use one exact arrival word per layer/gate, so
+ * decode command buffers may be submitted in layer order without a later
+ * monotonic event signal satisfying an earlier arrival. */
+int ds4_gpu_tp_decode_split_flush_safe(void);
+/* Weight ranges to pull into the GPU cache while the given gate (0 attention,
+ * 1 FFN) waits for the peer: consumed by the next poll gate of that kind. */
+int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
+                                  const void *model_map, uint64_t model_size,
+                                  const uint64_t *offsets, const uint64_t *bytes,
+                                  uint32_t count);
 /* The coordinator-only DSpark support model does not participate in TP.
  * Suspend ownership only while encoding it; base-model verification remains
  * split across both ranks. */
@@ -305,17 +387,6 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                const ds4_gpu_tensor *out_t,
                                ds4_gpu_tensor *in_t,
                                uint64_t bytes);
-/* Split big gate: kick publishes the GPU arrival marker (batch shared
- * event, whose completion semantics make the bounce payload visible to
- * the exchange thread) and queues the exchange, returning the gate seq
- * (0 on failure); wait encodes the release.  Multiple kicks may be in
- * flight; waiting on the last seq covers all earlier kicks (monotonic
- * release event, in-order service thread). */
-uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
-                                  const ds4_gpu_tensor *out_t,
-                                  ds4_gpu_tensor *in_t,
-                                  uint64_t bytes);
-int ds4_gpu_tp_big_gate_wait(uint64_t seq);
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */
 void ds4_gpu_tp_keepalive_pause(int paused);
@@ -328,6 +399,8 @@ void ds4_gpu_tp_set_attn_head_split(int enabled);
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
+/* Submit one trivial command buffer (first-submission costs paid at load). */
+int ds4_gpu_warm_command_queue(void);
 /* Nonzero after any gate exchange failed; the eval must abort. */
 int ds4_gpu_tp_failed(void);
 
@@ -651,6 +724,17 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+int ds4_gpu_matmul_q4_K_pair_decode_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
@@ -1260,6 +1344,37 @@ int ds4_gpu_glm_store_indexer_k_tensor(
         float                 beta_slow,
         bool                  cache_f16);
 
+/* GLM-5.3 pools four normalized indexer keys with a learned, per-channel
+ * softmax. Partial pools are retained in tail_k/tail_gate across calls. */
+int ds4_gpu_glm53_indexer_pool_update_tensor(
+        ds4_gpu_tensor       *pool_cache,
+        ds4_gpu_tensor       *tail_k,
+        ds4_gpu_tensor       *tail_gate,
+        const ds4_gpu_tensor *raw_k,
+        const ds4_gpu_tensor *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              norm_weight_offset,
+        uint64_t              norm_bias_offset,
+        uint64_t              ape_offset,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              head_dim,
+        uint32_t              pool_size,
+        float                 eps,
+        bool                  cache_f16);
+
+int ds4_gpu_glm53_expand_pool_selection_tensor(
+        ds4_gpu_tensor       *raw_selected,
+        const ds4_gpu_tensor *pool_selected,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              selected_pools,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              output_width);
+
 int ds4_gpu_glm_build_kv_cache_tensor(
         ds4_gpu_tensor       *key_cache,
         ds4_gpu_tensor       *value_cache,
@@ -1367,6 +1482,20 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(
         uint32_t              n_rows,
         uint32_t              n_tokens,
         uint32_t              pos0,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16);
+
+int ds4_gpu_glm53_indexer_scores_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              pool_size,
         uint32_t              n_head,
         uint32_t              head_dim,
         float                 scale,
@@ -1681,6 +1810,21 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow);
+
+/* Dense causal MLA over the shared compact latent cache. qk_low and lora_out
+ * are [token, head, kv_lora_dim]; the F16 cache is shared by all heads. */
+int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t              q_row0,
+        uint32_t              n_q,
+        uint32_t              n_kv,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_dim);
 
 int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         ds4_gpu_tensor       *lora_out,
@@ -2131,6 +2275,34 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* DeepSeek Vision-Exp attention over the current prefill chunk. The raw cache
+ * is chronological from raw_start and may include the preceding SWA rows.
+ * Synthetic image spans in tokens are made bidirectional as specified by the
+ * checkpoint; text and compressed keys retain the normal causal masks. */
+int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t                use_comp_mask,
+        const int32_t          *tokens,
+        uint32_t                vocab_size,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2301,6 +2473,32 @@ int ds4_gpu_router_select_batch_tensor(
         float                   expert_weight_scale,
         uint32_t                n_tokens);
 
+/* DeepSeek Vision-Exp prefill may mix ordinary vocabulary IDs and synthetic
+ * image IDs in one batch. Text rows keep the normal/hash route; image rows use
+ * the checkpoint's visual selection bias. Routing weights always come from
+ * the original, unbiased scores. */
+int ds4_gpu_router_select_batch_visual_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const void             *vision_map,
+        uint64_t                vision_size,
+        uint64_t                visual_bias_offset,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *tokens,
+        uint32_t                vocab_size,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens);
+
 int ds4_gpu_glm_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
@@ -2350,6 +2548,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
+        float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         bool                    force_resident);
@@ -2378,6 +2577,7 @@ int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
+        float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
@@ -2408,6 +2608,7 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
+        float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
@@ -2415,6 +2616,10 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_dspark_gfx1151_fast_path(void);
+void ds4_gpu_set_dspark_verify_mode(bool enabled);
+#endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -2696,6 +2901,31 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         float                 eps,
         float                 hc_eps,
         float                 norm_eps);
+int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_prev,
+        const ds4_gpu_tensor *post,
+        const ds4_gpu_tensor *comb,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
 
 #endif
 int ds4_gpu_output_hc_weights_tensor(
@@ -2833,6 +3063,194 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+int ds4_gpu_glm53_embedding_bf16(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        const ds4_gpu_tensor *token_ids,
+        uint32_t              n_tokens,
+        uint32_t              n_embd,
+        uint32_t              n_vocab);
+
+int ds4_gpu_glm53_matmul_bf16(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
+
+int ds4_gpu_glm53_matmul_bf16_qkv(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x);
+
+#ifndef DS4_GLM53_VISION_TYPES_DEFINED
+#define DS4_GLM53_VISION_TYPES_DEFINED
+#define DS4_GLM53_VISION_LAYERS 24u
+
+typedef struct {
+    uint64_t norm1;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t q_norm;
+    uint64_t k_norm;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2;
+    uint64_t gate_weight;
+    uint64_t gate_bias;
+    uint64_t up_weight;
+    uint64_t up_bias;
+    uint64_t down_weight;
+    uint64_t down_bias;
+} ds4_glm53_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t post_norm;
+    uint64_t downsample_weight;
+    uint64_t downsample_bias;
+    uint64_t merger_proj;
+    uint64_t merger_norm;
+    uint64_t merger_norm_bias;
+    uint64_t merger_gate;
+    uint64_t merger_up;
+    uint64_t merger_down;
+    ds4_glm53_vision_layer_weights layer[DS4_GLM53_VISION_LAYERS];
+} ds4_glm53_vision_weights;
+#endif
+
+/* Encode normalized, block-major image patches into 4096-wide language-model
+ * embeddings. GPU implementations keep every intermediate on device. */
+int ds4_gpu_glm53_vision_encode(
+        float                          *out,
+        const float                    *patches,
+        uint32_t                        grid_h,
+        uint32_t                        grid_w,
+        const void                     *model_map,
+        uint64_t                        model_size,
+        const ds4_glm53_vision_weights *weights);
+
+#ifndef DS4_DEEPSEEK4_VISION_TYPES_DEFINED
+#define DS4_DEEPSEEK4_VISION_TYPES_DEFINED
+#define DS4_DEEPSEEK4_VISION_LAYERS 32u
+#define DS4_DEEPSEEK4_LANGUAGE_LAYERS 43u
+#define DS4_DEEPSEEK4_MTP_LAYERS 3u
+
+typedef struct {
+    uint64_t norm1;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2;
+    uint64_t mlp_w1;
+    uint64_t mlp_w2;
+} ds4_deepseek4_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t post_norm;
+    uint64_t aligner_w1;
+    uint64_t aligner_w1_bias;
+    uint64_t aligner_w2;
+    uint64_t aligner_w2_bias;
+    uint64_t image_start;
+    uint64_t image_pad;
+    uint64_t image_newline;
+    uint64_t image_end;
+    uint64_t visual_router_bias[DS4_DEEPSEEK4_LANGUAGE_LAYERS];
+    uint64_t mtp_visual_router_bias[DS4_DEEPSEEK4_MTP_LAYERS];
+    uint64_t hash_router_bias[3];
+    ds4_deepseek4_vision_layer_weights layer[DS4_DEEPSEEK4_VISION_LAYERS];
+} ds4_deepseek4_vision_weights;
+#endif
+
+/* Encode row-major normalized 14x14 RGB patches. The output is the natural
+ * row-major 3x3-aligned grid; N-layout permutation and sentinels are applied
+ * by the prompt layer once the image's token position is known. */
+int ds4_gpu_deepseek4_vision_encode(
+        float                              *out,
+        const float                        *patches,
+        uint32_t                            grid_h,
+        uint32_t                            grid_w,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        const ds4_deepseek4_vision_weights *weights);
+
+/* Replace token rows with projected image embeddings and repeat each row into
+ * every GLM hyperconnection stream. Must be called in an active command batch. */
+int ds4_gpu_glm53_scatter_image_hc(
+        ds4_gpu_tensor       *hc,
+        const ds4_gpu_tensor *image,
+        uint32_t              dst_row,
+        uint32_t              image_row,
+        uint32_t              rows,
+        uint32_t              total_rows,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
+
+/* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
+int ds4_gpu_glm53_kda_decode(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps);
+
+int ds4_gpu_glm53_kda_prefill(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_tokens,
+        float                 gate_lower_bound,
+        float                 norm_eps);
 
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving

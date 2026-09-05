@@ -1,0 +1,5 @@
+To understand the difference between a mutex and an atomic counter, it helps to first understand the problem they both solve: **race conditions** in multi-threaded programming. 
+
+However, they solve this problem in fundamentally different ways and are used for different purposes. 
+
+Here is the short version: **A mutex

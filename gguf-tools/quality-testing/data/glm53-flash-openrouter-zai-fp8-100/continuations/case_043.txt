@@ -1,0 +1,18 @@
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "arguments": {
+      "type": "object"
+    }
+  },
+  "required": ["name", "arguments"]
+}
+```
+
+This defines a tool call with:
+- **`name`** — a required string identifying the function to call
+- **`arguments`** — a required object holding the parameters (left open-ended; you can tighten it with `additionalProperties: false` and specific `properties` per tool)

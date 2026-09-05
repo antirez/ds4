@@ -247,58 +247,6 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
-__global__ static void shared_gate_up_swiglu_q8_0_pair_preq_warp8_kernel(
-        float *gate,
-        float *up,
-        float *mid,
-        const unsigned char *wg,
-        const unsigned char *wu,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        int use_dp4a,
-        int store_gate_up,
-        float clamp) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const unsigned char *gr = wg + row * blocks * 34u;
-    const unsigned char *ur = wu + row * blocks * 34u;
-    float g = 0.0f;
-    float u = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32u;
-        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        const int8_t *xqb = xq + b * 32u;
-        const float xs = xscale[b];
-        const __half *gscale_h = (const __half *)(gr + b * 34u);
-        const int8_t *gqs = (const int8_t *)(gr + b * 34u + 2u);
-        const __half *uscale_h = (const __half *)(ur + b * 34u);
-        const int8_t *uqs = (const int8_t *)(ur + b * 34u + 2u);
-        const int gdot = dot_i8_block(gqs, xqb, bn, use_dp4a);
-        const int udot = dot_i8_block(uqs, xqb, bn, use_dp4a);
-        g += __half2float(*gscale_h) * xs * (float)gdot;
-        u += __half2float(*uscale_h) * xs * (float)udot;
-    }
-    g = warp_sum_f32(g);
-    u = warp_sum_f32(u);
-    if (lane == 0u) {
-        if (store_gate_up) {
-            gate[row] = g;
-            up[row] = u;
-        }
-        float sg = g;
-        float su = u;
-        if (clamp > 1.0e-6f) {
-            sg = fminf(sg, clamp);
-            su = fminf(fmaxf(su, -clamp), clamp);
-        }
-        mid[row] = (sg / (1.0f + expf(-sg))) * su;
-    }
-}
-
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,
@@ -410,31 +358,6 @@ __device__ static float q8_block_sum_w32(float v) {
     if (tid == 0u) sh[0] = v;
     __syncthreads();
     return sh[0];
-}
-
-__global__ static void matmul_q8_0_f32_small_block_w32_kernel(
-        float *out,
-        const unsigned char *w,
-        const float *x,
-        uint32_t n_blocks,
-        uint64_t out_dim,
-        uint64_t row_bytes) {
-    const uint64_t row = (uint64_t)blockIdx.x;
-    if (row >= out_dim) return;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5u;
-    const uint32_t waves_per_block = blockDim.x >> 5u;
-    const unsigned char *wr = w + row * row_bytes;
-    float acc = 0.0f;
-    for (uint32_t b = wave; b < n_blocks; b += waves_per_block) {
-        const unsigned char *blk = wr + (uint64_t)b * 34u;
-        const float d = q8_0_scale_broadcast_w32(blk);
-        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-        acc += d * (float)q * x[((uint64_t)b << 5u) + lane];
-    }
-    acc = q8_block_sum_w32(acc);
-    if (tid == 0u) out[row] = acc;
 }
 
 __global__ static void matmul_q8_0_f32_warp8_kernel(
@@ -669,18 +592,83 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
     }
 }
 
+/* Exact q=2..5 verifier path.  These model dimensions are multiples of the
+ * eight-block K tile, so vectorize the cooperative X copy and fully unroll the
+ * inner tile without changing the F32 accumulation order. */
+template <uint32_t TOK_TILE>
+__launch_bounds__(1024u, 1)
+__global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    constexpr uint32_t BLOCKS_TILE = 8u;
+    constexpr uint32_t ROWS_PER_BLOCK = 32u;
+    constexpr uint32_t FLOAT4S_PER_TOKEN = BLOCKS_TILE * 8u;
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + wave;
+    const bool row_valid = row < out_dim;
+    const unsigned char *wr = w + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; ++u) acc[u] = 0.0f;
+
+    for (uint32_t b0 = 0; b0 < n_blocks; b0 += BLOCKS_TILE) {
+        for (uint32_t j4 = tid;
+             j4 < TOK_TILE * FLOAT4S_PER_TOKEN;
+             j4 += blockDim.x) {
+            const uint32_t u = j4 / FLOAT4S_PER_TOKEN;
+            const uint32_t r4 = j4 - u * FLOAT4S_PER_TOKEN;
+            const float4 xv = *(const float4 *)(x + (uint64_t)u * in_dim +
+                                                (uint64_t)b0 * 32u + r4 * 4u);
+            ((float4 *)shx)[j4] = xv;
+        }
+        __syncthreads();
+        if (row_valid) {
+#pragma unroll
+            for (uint32_t bb = 0; bb < BLOCKS_TILE; ++bb) {
+                const unsigned char *blk = wr + (uint64_t)(b0 + bb) * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+                const float wv = d * (float)q;
+#pragma unroll
+                for (uint32_t u = 0; u < TOK_TILE; ++u) {
+                    acc[u] += wv * shx[(u * BLOCKS_TILE + bb) * 32u + lane];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; ++u) acc[u] = warp_sum_f32(acc[u]);
+    if (lane == 0u && row_valid) {
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; ++u) {
+            out[(uint64_t)u * out_dim + row] = acc[u];
+        }
+    }
+}
+
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
-/* Four-wave, 64x64 output-tile Q8_0 batched GEMM for large prefill chunks.
+/* Configurable wave-row Q8_0 batched GEMM experiment for gfx1151.
  * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
  * F32 activation buffers: each block stages a 64-token x 32-K activation tile
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-__launch_bounds__(128, 2)
-__global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
+template <uint32_t M_TILE, uint32_t WARPS>
+__launch_bounds__(WARPS * 32u, 1)
+__global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
         float *out,
         const unsigned char *w,
         const float *x,
@@ -688,10 +676,8 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         uint32_t in_dim,
         uint32_t out_dim,
         uint64_t row_bytes) {
-    constexpr uint32_t M_TILE = 64u;
     constexpr uint32_t N_TILE = 64u;
     constexpr uint32_t K_TILE = 32u;
-    constexpr uint32_t WARPS = 4u;
     constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
     constexpr uint32_t N_TILES_PER_WARP = N_TILE / 16u;
 
@@ -717,13 +703,16 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
     __shared__ _Float16 lds_x[N_TILE * K_TILE];
 
     for (uint32_t bi = 0; bi < n_blocks; bi++) {
-        for (uint32_t j = tid; j < N_TILE * K_TILE; j += blockDim.x) {
+        for (uint32_t j = tid * 2u; j < N_TILE * K_TILE; j += blockDim.x * 2u) {
             const uint32_t nt = j >> 5u;
             const uint32_t kk = j & 31u;
             const uint32_t tok = block_n + nt;
-            float xv = 0.0f;
-            if (tok < n_tokens) xv = x[(uint64_t)tok * in_dim + bi * 32u + kk];
-            lds_x[j] = (_Float16)xv;
+            half2 xv = __floats2half2_rn(0.0f, 0.0f);
+            if (tok < n_tokens) {
+                const float2 f = *(const float2 *)(x + (uint64_t)tok * in_dim + bi * 32u + kk);
+                xv = __floats2half2_rn(f.x, f.y);
+            }
+            *(half2 *)(lds_x + j) = xv;
         }
         __syncthreads();
 
@@ -781,78 +770,6 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
     }
 }
 
-template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
-__global__ static void matmul_q8_0_f32_batch_wmma_onthefly_kernel(
-        float *out,
-        const unsigned char *w,
-        const float *x,
-        uint32_t n_tokens,
-        uint32_t in_dim,
-        uint32_t out_dim,
-        uint64_t row_bytes) {
-    extern __shared__ unsigned char raw_sh[];
-    half *shA = reinterpret_cast<half *>(raw_sh);
-    half *shB = shA + BM * BK;
-    float *shC = reinterpret_cast<float *>(shB + TILES_N * BK * BN);
-    const uint32_t tid = threadIdx.x;
-    const uint32_t wave = tid >> 5u;
-    const uint32_t t0 = (uint32_t)blockIdx.y * BM;
-    const uint32_t row0 = (uint32_t)blockIdx.x * TILES_N * BN;
-
-    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
-    frag_a a;
-    frag_b b;
-    frag_c acc;
-    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
-
-    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
-        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
-            const uint32_t m = j / BK;
-            const uint32_t kk = j - m * BK;
-            const uint32_t t = t0 + m;
-            shA[j] = (t < n_tokens && k0 + kk < in_dim)
-                ? __float2half(x[(uint64_t)t * in_dim + k0 + kk])
-                : __float2half(0.0f);
-        }
-        for (uint32_t j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
-            const uint32_t tn = j / (BK * BN);
-            const uint32_t rem = j - tn * BK * BN;
-            const uint32_t kk = rem / BN;
-            const uint32_t nn = rem - kk * BN;
-            const uint32_t row = row0 + tn * BN + nn;
-            const uint32_t k = k0 + kk;
-            if (row < out_dim && k < in_dim) {
-                const unsigned char *blk = w + (uint64_t)row * row_bytes + (uint64_t)(k >> 5u) * 34u;
-                const float d = __half2float(*(const half *)blk);
-                const int8_t q = ((const int8_t *)(blk + 2u))[k & 31u];
-                shB[j] = __float2half(d * (float)q);
-            } else {
-                shB[j] = __float2half(0.0f);
-            }
-        }
-        __syncthreads();
-        if (wave < TILES_N) {
-            rocwmma::load_matrix_sync(a, shA, BK);
-            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
-            rocwmma::mma_sync(acc, a, b, acc);
-        }
-        __syncthreads();
-    }
-
-    if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
-    __syncthreads();
-    for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
-        const uint32_t tn = j / (BM * BN);
-        const uint32_t rem = j - tn * BM * BN;
-        const uint32_t m = rem / BN;
-        const uint32_t nn = rem - m * BN;
-        const uint32_t t = t0 + m;
-        const uint32_t row = row0 + tn * BN + nn;
-        if (t < n_tokens && row < out_dim) out[(uint64_t)t * out_dim + row] = shC[j];
-    }
-}
 #endif
 
 __global__ static void matmul_q8_0_pair_f32_warp8_kernel(
@@ -1166,182 +1083,6 @@ __device__ static float q8_0_scale_broadcast_oldhip_w32(const unsigned char *blk
 #endif
 }
 
-__global__ static void matmul_q8_0_hc_partial16_w32_kernel(
-        float *partial,
-        const unsigned char *w,
-        const float *x,
-        uint32_t out_dim,
-        uint64_t row_bytes) {
-    extern __shared__ float shx[];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t split = blockIdx.y;
-    const uint32_t b0 = split << 4;
-    for (uint32_t i = tid; i < 512u; i += blockDim.x) shx[i] = x[((uint64_t)b0 << 5) + i];
-    __syncthreads();
-
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + (uint64_t)row * row_bytes;
-    float acc = 0.0f;
-#pragma unroll
-    for (uint32_t bb = 0; bb < 16u; bb++) {
-        const uint32_t b = b0 + bb;
-        const unsigned char *blk = wr + (uint64_t)b * 34u;
-        const float d = q8_0_scale_broadcast_oldhip_w32(blk);
-        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-        acc += d * (float)q * shx[(bb << 5) + lane];
-    }
-    acc = warp_sum_f32_oldhip_w32(acc);
-    if (lane == 0u) partial[(uint64_t)split * out_dim + row] = acc;
-}
-
-__global__ static void matmul_q8_0_hc_partial_w32_kernel(
-        float *partial,
-        const unsigned char *w,
-        const float *x,
-        uint32_t n_blocks,
-        uint32_t out_dim,
-        uint64_t row_bytes,
-        uint32_t n_splits) {
-    extern __shared__ float shx[];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wave = tid >> 5;
-    const uint32_t rows_per_block = blockDim.x >> 5;
-    const uint32_t split = blockIdx.y;
-    const uint32_t chunk = (n_blocks + n_splits - 1u) / n_splits;
-    const uint32_t b0 = split * chunk;
-    const uint32_t b1 = min(n_blocks, b0 + chunk);
-    const uint32_t chunk_blocks = b1 > b0 ? b1 - b0 : 0u;
-    for (uint32_t i = tid; i < (chunk_blocks << 5); i += blockDim.x) shx[i] = x[((uint64_t)b0 << 5) + i];
-    __syncthreads();
-
-    const uint32_t row = blockIdx.x * rows_per_block + wave;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + (uint64_t)row * row_bytes;
-    float acc = 0.0f;
-    for (uint32_t bb = 0; bb < chunk_blocks; bb++) {
-        const uint32_t b = b0 + bb;
-        const unsigned char *blk = wr + (uint64_t)b * 34u;
-        const float d = q8_0_scale_broadcast_oldhip_w32(blk);
-        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
-        acc += d * (float)q * shx[(bb << 5) + lane];
-    }
-    acc = warp_sum_f32_oldhip_w32(acc);
-    if (lane == 0u) partial[(uint64_t)split * out_dim + row] = acc;
-}
-
-__global__ static void hc_expand_partial_kernel(
-        float *out_hc,
-        float *block_out,
-        const float *partial,
-        const float *residual_hc,
-        const float *split,
-        uint32_t out_dim,
-        uint32_t n_hc,
-        uint32_t n_splits,
-        int store_block_out) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= out_dim) return;
-    float acc = 0.0f;
-    for (uint32_t s = 0; s < n_splits; s++) acc += partial[(uint64_t)s * out_dim + row];
-    if (store_block_out) block_out[row] = acc;
-    const float *post = split + n_hc;
-    const float *comb = split + 2u * n_hc;
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        float v = acc * post[dst];
-        for (uint32_t src = 0; src < n_hc; src++) {
-            v += comb[dst + (uint64_t)src * n_hc] * residual_hc[(uint64_t)src * out_dim + row];
-        }
-        out_hc[(uint64_t)dst * out_dim + row] = v;
-    }
-}
-
-__global__ static void hc_expand_add_partial_kernel(
-        float *out_hc,
-        float *block_out,
-        const float *partial,
-        const float *block_add,
-        const float *residual_hc,
-        const float *split,
-        uint32_t out_dim,
-        uint32_t n_hc,
-        uint32_t n_splits,
-        int store_block_out) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= out_dim) return;
-    float acc = 0.0f;
-    for (uint32_t s = 0; s < n_splits; s++) acc += partial[(uint64_t)s * out_dim + row];
-    if (store_block_out) block_out[row] = acc;
-    const float block = acc + block_add[row];
-    const float *post = split + n_hc;
-    const float *comb = split + 2u * n_hc;
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        float v = block * post[dst];
-        for (uint32_t src = 0; src < n_hc; src++) {
-            v += comb[dst + (uint64_t)src * n_hc] * residual_hc[(uint64_t)src * out_dim + row];
-        }
-        out_hc[(uint64_t)dst * out_dim + row] = v;
-    }
-}
-
-__global__ static void hc_expand_add_partial4_kernel(
-        float *out_hc,
-        float *block_out,
-        const float *partial,
-        const float *block_add,
-        const float *residual_hc,
-        const float *split,
-        uint32_t out_dim,
-        uint32_t n_hc,
-        int store_block_out) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= out_dim) return;
-    float acc = 0.0f;
-#pragma unroll
-    for (uint32_t s = 0; s < 4u; s++) acc += partial[(uint64_t)s * out_dim + row];
-    if (store_block_out) block_out[row] = acc;
-    const float block = acc + block_add[row];
-    const float *post = split + n_hc;
-    const float *comb = split + 2u * n_hc;
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        float v = block * post[dst];
-        for (uint32_t src = 0; src < n_hc; src++) {
-            v += comb[dst + (uint64_t)src * n_hc] * residual_hc[(uint64_t)src * out_dim + row];
-        }
-        out_hc[(uint64_t)dst * out_dim + row] = v;
-    }
-}
-
-__global__ static void hc_expand_partial16_kernel(
-        float *out_hc,
-        float *block_out,
-        const float *partial,
-        const float *residual_hc,
-        const float *split,
-        uint32_t out_dim,
-        uint32_t n_hc,
-        int store_block_out) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= out_dim) return;
-    float acc = 0.0f;
-#pragma unroll
-    for (uint32_t s = 0; s < 16u; s++) acc += partial[(uint64_t)s * out_dim + row];
-    if (store_block_out) block_out[row] = acc;
-    const float *post = split + n_hc;
-    const float *comb = split + 2u * n_hc;
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        float v = acc * post[dst];
-        for (uint32_t src = 0; src < n_hc; src++) {
-            v += comb[dst + (uint64_t)src * n_hc] * residual_hc[(uint64_t)src * out_dim + row];
-        }
-        out_hc[(uint64_t)dst * out_dim + row] = v;
-    }
-}
-
 __global__ static void grouped_q8_0_a_f32_warp8_kernel(
         float *low,
         const unsigned char *w,
@@ -1652,87 +1393,6 @@ __global__ static void grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kern
         }
     }
 }
-
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-template <int TILES_N=8, int BM=16, int BN=16, int BK=16>
-__global__ static void grouped_q8_0_a_f32_batch_wmma_onthefly_kernel(
-        float *low,
-        const unsigned char *w,
-        const float *heads,
-        uint32_t n_tokens,
-        uint32_t n_groups,
-        uint32_t group_dim,
-        uint32_t rank,
-        uint64_t row_bytes) {
-    extern __shared__ unsigned char raw_sh[];
-    half *shA = reinterpret_cast<half *>(raw_sh);
-    half *shB = shA + BM * BK;
-    float *shC = reinterpret_cast<float *>(shB + TILES_N * BK * BN);
-    const uint32_t tid = threadIdx.x;
-    const uint32_t wave = tid >> 5u;
-    const uint32_t row_tiles_per_group = (rank + TILES_N * BN - 1u) / (TILES_N * BN);
-    const uint32_t g = (uint32_t)blockIdx.x / row_tiles_per_group;
-    const uint32_t row_tile = (uint32_t)blockIdx.x - g * row_tiles_per_group;
-    const uint32_t row0 = row_tile * TILES_N * BN;
-    const uint32_t t0 = (uint32_t)blockIdx.y * BM;
-    if (g >= n_groups) return;
-
-    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
-    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
-    frag_a a;
-    frag_b b;
-    frag_c acc;
-    if (wave < TILES_N) rocwmma::fill_fragment(acc, 0.0f);
-
-    for (uint32_t k0 = 0; k0 < group_dim; k0 += BK) {
-        for (uint32_t j = tid; j < BM * BK; j += blockDim.x) {
-            const uint32_t m = j / BK;
-            const uint32_t kk = j - m * BK;
-            const uint32_t t = t0 + m;
-            const uint32_t k = k0 + kk;
-            shA[j] = (t < n_tokens && k < group_dim)
-                ? __float2half(heads[((uint64_t)t * n_groups + g) * group_dim + k])
-                : __float2half(0.0f);
-        }
-        for (uint32_t j = tid; j < TILES_N * BK * BN; j += blockDim.x) {
-            const uint32_t tn = j / (BK * BN);
-            const uint32_t rem = j - tn * BK * BN;
-            const uint32_t kk = rem / BN;
-            const uint32_t nn = rem - kk * BN;
-            const uint32_t row = row0 + tn * BN + nn;
-            const uint32_t k = k0 + kk;
-            if (row < rank && k < group_dim) {
-                const unsigned char *blk = w + ((uint64_t)g * rank + row) * row_bytes + (uint64_t)(k >> 5u) * 34u;
-                const float d = __half2float(*(const half *)blk);
-                const int8_t q = ((const int8_t *)(blk + 2u))[k & 31u];
-                shB[j] = __float2half(d * (float)q);
-            } else {
-                shB[j] = __float2half(0.0f);
-            }
-        }
-        __syncthreads();
-        if (wave < TILES_N) {
-            rocwmma::load_matrix_sync(a, shA, BK);
-            rocwmma::load_matrix_sync(b, shB + wave * BK * BN, BN);
-            rocwmma::mma_sync(acc, a, b, acc);
-        }
-        __syncthreads();
-    }
-
-    if (wave < TILES_N) rocwmma::store_matrix_sync(shC + wave * BM * BN, acc, BN, rocwmma::mem_row_major);
-    __syncthreads();
-    for (uint32_t j = tid; j < TILES_N * BM * BN; j += blockDim.x) {
-        const uint32_t tn = j / (BM * BN);
-        const uint32_t rem = j - tn * BM * BN;
-        const uint32_t m = rem / BN;
-        const uint32_t nn = rem - m * BN;
-        const uint32_t t = t0 + m;
-        const uint32_t row = row0 + tn * BN + nn;
-        if (t < n_tokens && row < rank) low[((uint64_t)t * n_groups + g) * rank + row] = shC[j];
-    }
-}
-#endif
 
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
