@@ -72,6 +72,306 @@ static float bf16_to_f32(uint16_t value) {
     return bits.f;
 }
 
+#ifdef __APPLE__
+/* Normal-range only, and truncating rather than rounding.  Both are fine here:
+ * the compound-producer fixture uses values with at most seven explicit
+ * mantissa bits, well inside the half normal range, so truncation to ten bits
+ * is exact and the encoding round-trips. */
+static uint16_t f32_to_f16(float value) {
+    union { float f; uint32_t u; } b = { .f = value };
+    const uint32_t sign = (b.u >> 16) & 0x8000u;
+    const int32_t  exp  = (int32_t)((b.u >> 23) & 0xffu) - 127 + 15;
+    const uint32_t mant = (b.u >> 13) & 0x3ffu;
+    if (exp <= 0 || exp >= 31) return (uint16_t)sign;
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+static float f16_to_f32(uint16_t value) {
+    const uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+    const uint32_t exp  = (uint32_t)(value >> 10) & 0x1fu;
+    const uint32_t mant = (uint32_t)value & 0x3ffu;
+    union { uint32_t u; float f; } b;
+    b.u = exp == 0 ? sign : (sign | ((exp - 15u + 127u) << 23) | (mant << 13));
+    return b.f;
+}
+#endif
+
+/* Exercises ds4_gpu_glm53_matmul_bf16 at one width.  The reference is
+ * accumulated in double and compared with a relative tolerance; a stride or
+ * indexing error moves a result far more than that, which is what this is
+ * here to catch. */
+static void check_bf16_matmul(const uint8_t *model, size_t model_bytes,
+                              uint64_t offset, uint32_t in_dim,
+                              uint32_t out_dim, uint32_t rows,
+                              const char *what) {
+    uint16_t *w = (uint16_t *)(void *)((uint8_t *)(uintptr_t)model + offset);
+    for (uint32_t o = 0; o < out_dim; o++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            w[(size_t)o * in_dim + i] = f32_to_bf16(
+                0.002f * (float)((int)(o % 11u) - 5) +
+                0.001f * (float)((int)(i % 13u) - 6));
+        }
+    }
+    const size_t x_bytes   = (size_t)rows * in_dim * sizeof(float);
+    const size_t out_bytes = (size_t)rows * out_dim * sizeof(float);
+    float *x        = malloc(x_bytes);
+    float *expected = malloc(out_bytes);
+    float *actual   = malloc(out_bytes);
+    require_ok(x && expected && actual, "wide BF16 host allocation");
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            x[(size_t)r * in_dim + i] =
+                0.02f * (float)((int)(i % 17u) - 8) + 0.005f * (float)r;
+        }
+        for (uint32_t o = 0; o < out_dim; o++) {
+            double sum = 0.0;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                sum += (double)bf16_to_f32(w[(size_t)o * in_dim + i]) *
+                       (double)x[(size_t)r * in_dim + i];
+            }
+            expected[(size_t)r * out_dim + o] = (float)sum;
+        }
+    }
+    ds4_gpu_tensor *gx   = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *gout = ds4_gpu_tensor_alloc(out_bytes);
+    require_ok(gx && gout, "wide BF16 tensor allocation");
+    require_ok(ds4_gpu_tensor_write(gx, 0, x, x_bytes), "wide BF16 input write");
+
+    require_ok(ds4_gpu_glm53_matmul_bf16(gout, model, model_bytes, offset,
+                                         in_dim, out_dim, gx, 1), what);
+    require_ok(ds4_gpu_tensor_read(gout, 0, actual, out_dim * sizeof(float)),
+               "wide BF16 decode output read");
+    for (uint32_t o = 0; o < out_dim; o++) {
+        require_close(what, actual[o], expected[o],
+                      2e-5f * (fabsf(expected[o]) + 1.0f));
+    }
+
+    require_ok(ds4_gpu_glm53_matmul_bf16(gout, model, model_bytes, offset,
+                                         in_dim, out_dim, gx, rows), what);
+    require_ok(ds4_gpu_tensor_read(gout, 0, actual, out_bytes),
+               "wide BF16 prefill output read");
+    for (uint32_t i = 0; i < rows * out_dim; i++) {
+        require_close(what, actual[i], expected[i],
+                      2e-5f * (fabsf(expected[i]) + 1.0f));
+    }
+    ds4_gpu_tensor_free(gx);
+    ds4_gpu_tensor_free(gout);
+    free(x);
+    free(expected);
+    free(actual);
+}
+
+#ifdef __APPLE__
+static void require_prefill_dispatch(uint32_t feature, bool expected,
+                                     const char *what) {
+    const uint32_t dispatched = ds4_gpu_test_glm53_prefill_take_dispatches();
+    require_ok(dispatched == (expected ? feature : 0u), what);
+}
+
+/* Exactness oracle for the GLM 5.3 Flash prefill qk-low token tile.
+ *
+ * kernel_glm_qk_lowrank_q8_0_batch_t<TT> changes only which threadgroup
+ * computes which outputs and how many tokens one thread carries; every output
+ * keeps the reference kernel's expression, block order and column order.  So
+ * each tile must reproduce kernel_glm_qk_lowrank_q8_0_batch bit for bit at the
+ * model's shape, including the partial tail tile that a 1596-token chunk and a
+ * 33- or 1-token prompt produce.  The dispatch runs through the same selection
+ * the graph uses; DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW picks the reference
+ * and DS4_METAL_GLM53_PREFILL_QK_LOW_TILE picks the tile. */
+static void check_glm53_kda_inputs(uint8_t *model, uint64_t model_bytes,
+                                  uint64_t offset) {
+    const uint32_t widths[6] = {8192, 8192, 8192, 128, 128, 64};
+    uint64_t offsets[6], end = offset;
+    ds4_gpu_tensor *out[6];
+    float *reference[6];
+    for (unsigned slot = 0; slot < 6; slot++) {
+        offsets[slot] = end;
+        const uint64_t count = (uint64_t)4096u * widths[slot];
+        end += count * sizeof(uint16_t);
+        require_ok(end <= model_bytes, "KDA input fixture range");
+        uint16_t *w = (uint16_t *)(void *)(model + offsets[slot]);
+        for (uint64_t i = 0; i < count; i++) {
+            const uint32_t h = (uint32_t)(i + slot * 8191u) * 1664525u + 1013904223u;
+            w[i] = (uint16_t)((0x3b00u + h % 2048u) | ((h & 1u) << 15));
+            if (i % 127u == 0) w[i] = (uint16_t)((h & 0x8000u) | (h % 128u));
+        }
+        out[slot] = ds4_gpu_tensor_alloc(widths[slot] * sizeof(float));
+        reference[slot] = malloc(widths[slot] * sizeof(float));
+        require_ok(out[slot] && reference[slot], "KDA input output buffers");
+    }
+    float input[4096], actual[8192];
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(input));
+    require_ok(x != NULL, "KDA input activation buffer");
+    for (unsigned fixture = 0; fixture < 4; fixture++) {
+        for (uint32_t i = 0; i < 4096; i++) {
+            input[i] = (float)((int)((i * 1664525u + 1013904223u) % 4097u) - 2048) * 0.00123f;
+            if (fixture == 1) input[i] = (i & 1u) ? -0.0f : 0.0f;
+            if (fixture == 2) input[i] *= 100000.0f;
+            if (fixture == 3) input[i] = (i & 1u) ? -0.00003f : 0.00003f;
+        }
+        require_ok(ds4_gpu_tensor_write(x, 0, input, sizeof(input)), "KDA input activation write");
+        for (unsigned arm = 0; arm < 4; arm++) {
+            if (arm == 2) setenv("DS4_METAL_DISABLE_GLM53_KDA_INPUTS", "1", 1);
+            if (arm == 3) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
+            for (unsigned i = 0; i < 6; i++)
+                require_ok(ds4_gpu_tensor_fill_f32(out[i], -17.0f, widths[i]), "KDA input poison");
+            const int fused = arm != 0 && ds4_gpu_glm53_kda_inputs_bf16(
+                out, offsets, model, model_bytes, x);
+            require_ok(fused == (arm == 1), "KDA input policy selection");
+            if (!fused) {
+                for (unsigned i = 0; i < 6; i++)
+                    require_ok(ds4_gpu_glm53_matmul_bf16(out[i], model, model_bytes,
+                        offsets[i], 4096, widths[i], x, 1), "KDA input separate reference");
+            }
+            require_prefill_dispatch(DS4_GPU_GLM53_KDA_INPUTS, arm == 1, "KDA input coverage");
+            for (unsigned i = 0; i < 6; i++) {
+                require_ok(ds4_gpu_tensor_read(out[i], 0, actual, widths[i] * sizeof(float)),
+                           "KDA input output read");
+                if (arm == 0) memcpy(reference[i], actual, widths[i] * sizeof(float));
+                else require_ok(memcmp(reference[i], actual, widths[i] * sizeof(float)) == 0,
+                                "KDA input bitwise six projections");
+            }
+            unsetenv("DS4_METAL_DISABLE_GLM53_KDA_INPUTS");
+            unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
+        }
+    }
+    const uint64_t valid = offsets[5];
+    offsets[5] = model_bytes - 1u;
+    require_ok(!ds4_gpu_glm53_kda_inputs_bf16(out, offsets, model, model_bytes, x),
+               "KDA input invalid last weight range");
+    offsets[5] = valid;
+    ds4_gpu_tensor *last = out[5]; out[5] = NULL;
+    require_ok(!ds4_gpu_glm53_kda_inputs_bf16(out, offsets, model, model_bytes, x),
+               "KDA input missing last output");
+    out[5] = last;
+    require_prefill_dispatch(DS4_GPU_GLM53_KDA_INPUTS, false, "KDA input invalid range coverage");
+    for (unsigned i = 0; i < 6; i++) {
+        ds4_gpu_tensor_free(out[i]); free(reference[i]);
+    }
+    ds4_gpu_tensor_free(x);
+}
+
+/* Independent persistent histories catch a scheduling error even when the
+ * current normalized output hides it. Also exercise the untuned shapes. */
+static void check_glm53_kda_decode_values4(uint8_t *model, uint64_t model_bytes,
+                                          uint64_t offset) {
+    enum { H = 64, D = 128, P = H * D, Q = 0, K = P * 16,
+           V = K + P * 16, A = V + P * 16, DT = A + H * 4,
+           NORM = DT + P * 4 };
+    require_ok(offset + NORM + D * sizeof(float) <= model_bytes,
+               "KDA decode values fixture range");
+    float *w = (float *)(void *)(model + offset);
+    for (uint32_t i = 0; i < A / 4; i++)
+        w[i] = (float)((int)((i * 1664525u + 1013904223u) % 1021u) - 510) * 0.001f;
+    for (uint32_t i = 0; i < H; i++) w[A / 4 + i] = -1.5f + (float)(i % 7u) * 0.1f;
+    for (uint32_t i = 0; i < P; i++) w[DT / 4 + i] = (float)((int)(i % 17u) - 8) * 0.1f;
+    for (uint32_t i = 0; i < D; i++) w[NORM / 4 + i] = 0.8f + (float)(i % 23u) * 0.01f;
+    const uint32_t shapes[][2] = {{64, 1}, {64, 2}, {2, 1}};
+    for (unsigned shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++) {
+        const uint32_t heads = shapes[shape][0], rows = shapes[shape][1];
+        const uint32_t n = heads * D * rows;
+        const uint64_t sizes[] = {n * sizeof(float), (uint64_t)n * 9 * sizeof(float),
+                                  (uint64_t)n * D * sizeof(float)};
+        float *actual = malloc(sizes[2]), *reference = malloc(sizes[2]);
+        ds4_gpu_tensor *input[6], *out[3][3];
+        require_ok(actual && reference, "KDA decode values host buffers");
+        for (unsigned i = 0; i < 6; i++) {
+            input[i] = ds4_gpu_tensor_alloc(sizes[0]);
+            require_ok(input[i] != NULL, "KDA decode values input buffer");
+        }
+        for (unsigned b = 0; b < 3; b++) {
+            for (uint64_t j = 0; j < sizes[b] / sizeof(float); j++)
+                actual[j] = (float)((int)((j * 1664525u + 1013904223u) % 2047u) - 1023) * 0.0005f;
+            for (unsigned arm = 0; arm < 3; arm++) {
+                out[arm][b] = ds4_gpu_tensor_alloc(sizes[b]);
+                require_ok(out[arm][b] != NULL, "KDA decode values output buffer");
+                require_ok(ds4_gpu_tensor_write(out[arm][b], 0, actual, sizes[b]),
+                           "KDA decode values initial state");
+            }
+        }
+        for (unsigned step = 0; step < 16; step++) {
+            for (unsigned i = 0; i < 6; i++) {
+                for (uint32_t j = 0; j < n; j++) {
+                    const uint32_t h = (j + step * n + i * n * 7u) * 1664525u + 1013904223u;
+                    actual[j] = step == 7 ? 0.0f : (float)((int)(h % 8191u) - 4095) * 0.0007f;
+                }
+                require_ok(ds4_gpu_tensor_write(input[i], 0, actual, sizes[0]),
+                           "KDA decode values input write");
+            }
+            for (unsigned arm = 0; arm < 3; arm++) {
+                if (arm == 0) setenv("DS4_METAL_DISABLE_GLM53_DECODE_KDA_VALUES4", "1", 1);
+                else unsetenv("DS4_METAL_DISABLE_GLM53_DECODE_KDA_VALUES4");
+                if (arm == 2) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
+                require_ok(ds4_gpu_tensor_fill_f32(out[arm][0], -17.0f, n),
+                           "KDA decode values poison output");
+                require_ok(ds4_gpu_glm53_kda_decode(
+                    out[arm][0], out[arm][1], out[arm][2], input[0], input[1], input[2],
+                    input[3], input[4], input[5], model, model_bytes, offset + Q, offset + K,
+                    offset + V, offset + A, offset + DT, offset + NORM,
+                    heads, rows, -5.0f, 1e-6f), "KDA decode values dispatch");
+                require_prefill_dispatch(DS4_GPU_GLM53_DECODE_KDA_VALUES4,
+                                         arm == 1 && shape == 0, "KDA decode values coverage");
+                unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
+            }
+            for (unsigned b = 0; b < 3; b++) {
+                require_ok(ds4_gpu_tensor_read(out[0][b], 0, reference, sizes[b]),
+                           "KDA decode values reference read");
+                for (unsigned arm = 1; arm < 3; arm++) {
+                    require_ok(ds4_gpu_tensor_read(out[arm][b], 0, actual, sizes[b]),
+                               "KDA decode values candidate read");
+                    require_ok(memcmp(reference, actual, sizes[b]) == 0,
+                               "KDA decode values bitwise output/history/state");
+                }
+            }
+        }
+        for (unsigned i = 0; i < 6; i++) ds4_gpu_tensor_free(input[i]);
+        for (unsigned arm = 0; arm < 3; arm++)
+            for (unsigned b = 0; b < 3; b++) ds4_gpu_tensor_free(out[arm][b]);
+        free(actual); free(reference);
+    }
+}
+
+static void check_glm53_bf16_short_rows(uint8_t *model, uint64_t model_bytes,
+                                        uint64_t weight_offset) {
+    enum { IN = 128, OUT = 8192 };
+    require_ok(weight_offset + (uint64_t)IN * OUT * 2 <= model_bytes,
+               "short BF16 fixture range");
+    uint16_t *w = (uint16_t *)(void *)(model + weight_offset);
+    for (uint32_t i = 0; i < IN * OUT; i++) {
+        const uint32_t h = i * 1664525u + 1013904223u;
+        w[i] = (uint16_t)((0x3b00u + h % 2048u) | ((h & 1u) << 15u));
+    }
+    float input[IN], reference[OUT], actual[OUT];
+    for (uint32_t i = 0; i < IN; i++) input[i] = (float)((int)(i % 17u) - 8) * 0.012345f;
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(input));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(actual));
+    require_ok(x && out, "short BF16 buffers");
+    require_ok(ds4_gpu_tensor_write(x, 0, input, sizeof(input)), "short BF16 input");
+    require_ok(unsetenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == 0,
+               "clear inherited BF16 grouping rollback");
+    for (unsigned arm = 0; arm < 3; arm++) {
+        if (arm == 0) setenv("DS4_METAL_DISABLE_GLM53_BF16_SHORT_ROWS", "1", 1);
+        else unsetenv("DS4_METAL_DISABLE_GLM53_BF16_SHORT_ROWS");
+        if (arm == 2) setenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING", "1", 1);
+        require_ok(ds4_gpu_tensor_fill_f32(out, -17.0f, OUT), "short BF16 poison");
+        require_ok(ds4_gpu_glm53_matmul_bf16(out, model, model_bytes,
+                       weight_offset, IN, OUT, x, 1), "short BF16 dispatch");
+        require_prefill_dispatch(DS4_GPU_GLM53_BF16_SHORT_ROWS, arm == 1,
+                                 "short BF16 grouping coverage");
+        require_ok(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)), "short BF16 read");
+        if (arm == 0) memcpy(reference, actual, sizeof(actual));
+        else require_ok(memcmp(reference, actual, sizeof(actual)) == 0,
+                        "short BF16 bitwise output");
+    }
+    unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING");
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+}
+
+/* Exercise cross-SIMD probability reads and selected-ID publication in the
+ * shared GLM router, including the 512-thread GLM-5.3 sort. */
+#endif /* __APPLE__: these oracles exercise Metal-specific dispatch switches. */
+
 int main(void) {
     enum {
         D = 128,
@@ -96,7 +396,44 @@ int main(void) {
         Q4_OUT = 37,
         Q4_ROWS = 3,
         Q8_OFFSET = 60000,
-        MODEL_BYTES = 65536,
+        /* Real GLM 5.3 widths: 4096 is kda_{q,k,v}, and 512/1024 the
+         * low-rank gate projections. */
+        WIDE512_OFFSET = 65536,   WIDE512_IN = 512,   WIDE512_OUT = 4,
+        WIDE1024_OFFSET = 73728,  WIDE1024_IN = 1024, WIDE1024_OUT = 4,
+        WIDE4096_OFFSET = 90112,  WIDE4096_IN = 4096, WIDE4096_OUT = 2,
+        WIDE_ROWS = 3,
+        /* Compare each compound HC producer against its unfused projection. */
+        HC_N = 16384, HC_MIX = 24, HC_EMBD = 4096, HC_HC = 4,
+        HC_F16W_OFFSET  = 131072,   /* HC_N * HC_MIX * 2 = 786432 */
+        HC_BF16W_OFFSET = 917504,
+        HC_SCALE_OFFSET = 1703936,  /* 3 floats  */
+        HC_BASE_OFFSET  = 1703968,  /* 24 floats */
+        HC_NORM_OFFSET  = 1704064,  /* 4096 floats */
+        /* BF16 matvec + HC-expand epilogue fixture */
+        FUSED_W_OFFSET = 1720448,   /* FUSED_IN * FUSED_OUT * 2 = 131072 */
+        FUSED_IN = 1024, FUSED_OUT = 64, FUSED_HC = 4,
+        /* Q8_0 value rows for the split-vs-generic attention check:
+         * 16 heads x 8 values x 544 bytes = 69632 */
+        SPLIT_V_OFFSET = 1851520,
+        /* GLM 5.3 attn_k_b for the prefill qk-low oracle:
+         * 64 heads x 512 rows x 272 bytes = 8912896 */
+        QK_LOW_KB_OFFSET = 2097152,
+        /* Synthetic Q4_K expert matrices for all tail sizes and an empty expert. */
+        MOE_GATE_OFFSET = 11010048,
+        MOE_UP_OFFSET   = MOE_GATE_OFFSET + 36 * 256 * 144,
+        MOE_DOWN_OFFSET = MOE_UP_OFFSET + 36 * 256 * 144,
+        KP_Q_OFFSET = MOE_DOWN_OFFSET + 36 * 256 * 144,
+        KP_K_OFFSET = KP_Q_OFFSET + 64 * 128 * 4 * 4,
+        KP_V_OFFSET = KP_K_OFFSET + 64 * 128 * 4 * 4,
+        KP_A_OFFSET = KP_V_OFFSET + 64 * 128 * 4 * 4,
+        KP_DT_OFFSET = KP_A_OFFSET + 64 * 4,
+        KP_NORM_OFFSET = KP_DT_OFFSET + 64 * 128 * 4,
+#ifdef __APPLE__
+        KI_WEIGHT_OFFSET = KP_NORM_OFFSET + 128 * 4,
+        MODEL_BYTES = KI_WEIGHT_OFFSET + 4096 * 24896 * 2,
+#else
+        MODEL_BYTES = KP_NORM_OFFSET + 128 * 4,
+#endif
     };
 
     uint8_t *model = mmap(NULL, MODEL_BYTES, PROT_READ | PROT_WRITE,
@@ -179,6 +516,214 @@ int main(void) {
                "BF16 prefill output read");
     for (uint32_t i = 0; i < BF16_ROWS * BF16_OUT; i++)
         require_close("BF16 prefill matmul", bf16_actual[i], bf16_expected[i], 2e-4f);
+
+    /* BF16_IN above is 64; these cover the widths the model actually runs. */
+    check_bf16_matmul(model, MODEL_BYTES, WIDE512_OFFSET, WIDE512_IN,
+                      WIDE512_OUT, WIDE_ROWS, "BF16 matmul in_dim=512");
+    check_bf16_matmul(model, MODEL_BYTES, WIDE1024_OFFSET, WIDE1024_IN,
+                      WIDE1024_OUT, WIDE_ROWS, "BF16 matmul in_dim=1024");
+    check_bf16_matmul(model, MODEL_BYTES, WIDE4096_OFFSET, WIDE4096_IN,
+                      WIDE4096_OUT, WIDE_ROWS, "BF16 matmul in_dim=4096");
+
+#ifdef __APPLE__
+    /*
+     * F16 and BF16 have different reference matvec reductions. Each fused
+     * producer must match its own four-dispatch chain, including every split
+     * weight. Comparing the fused types to each other misses a shared error.
+     */
+    for (unsigned fixture = 0; fixture < 3; fixture++) {
+        static const float exact_both[8] = {
+            0.5f, -0.5f, 1.0f, -1.0f, 1.5f, -1.5f, 0.25f, -0.75f
+        };
+        uint16_t *hc_f16 = (uint16_t *)(model + HC_F16W_OFFSET);
+        uint16_t *hc_bf16 = (uint16_t *)(model + HC_BF16W_OFFSET);
+        for (uint32_t i = 0; i < (uint32_t)(HC_N * HC_MIX); i++) {
+            const uint32_t hash = (i * 1664525u + 1013904223u) ^ (i >> 5u);
+            const float w = exact_both[(hash >> 16u) % 8u] *
+                (fixture == 0 ? 0.03125f : (i % 3u == 0 ? 0.25f : 0.00390625f));
+            union { float f; uint32_t u; } b = { .f = w };
+            hc_f16[i] = f32_to_f16(w);
+            hc_bf16[i] = (uint16_t)(b.u >> 16);
+            /* the encodings must round-trip to the same float, or the
+             * comparison below would be measuring the fixture, not the kernel */
+            require_close("HC fixture encoding", f16_to_f32(hc_f16[i]),
+                          bf16_to_f32(hc_bf16[i]), 0.0f);
+        }
+        float *hc_scale = (float *)(model + HC_SCALE_OFFSET);
+        for (int i = 0; i < 3; i++) hc_scale[i] = 0.5f + 0.25f * (float)i;
+        float *hc_base = (float *)(model + HC_BASE_OFFSET);
+        for (int i = 0; i < HC_MIX; i++) hc_base[i] = 0.125f * (float)((i % 5) - 2);
+        float *hc_norm = (float *)(model + HC_NORM_OFFSET);
+        for (int i = 0; i < HC_EMBD; i++) hc_norm[i] = 1.0f + 0.001f * (float)(i % 7);
+
+        float *hc_x = malloc((size_t)HC_N * sizeof(float));
+        require_ok(hc_x != NULL, "HC residual allocation");
+        for (int i = 0; i < HC_N; i++) {
+            const float x = 0.01f * (float)((i % 23) - 11) + 0.002f * (float)(i % 5);
+            hc_x[i] = fixture == 2 ? 0.0f :
+                x * (fixture == 1 && i % 7 == 0 ? 32.0f : 1.0f);
+        }
+
+        ds4_gpu_tensor *hc_res = ds4_gpu_tensor_alloc((size_t)HC_N * sizeof(float));
+        require_ok(hc_res != NULL, "HC residual tensor");
+        require_ok(ds4_gpu_tensor_write(hc_res, 0, hc_x,
+                                        (size_t)HC_N * sizeof(float)),
+                   "HC residual write");
+
+        for (int pass = 0; pass < 2; pass++) {
+            const uint32_t iters = fixture == 0 ? 1u : 20u;
+            ds4_gpu_tensor *flat = ds4_gpu_tensor_alloc(HC_N * sizeof(float));
+            ds4_gpu_tensor *ref_mix = ds4_gpu_tensor_alloc(HC_MIX * sizeof(float));
+            ds4_gpu_tensor *ref_spl = ds4_gpu_tensor_alloc(HC_MIX * sizeof(float));
+            ds4_gpu_tensor *ref_out = ds4_gpu_tensor_alloc(HC_EMBD * sizeof(float));
+            ds4_gpu_tensor *ref_nrm = ds4_gpu_tensor_alloc(HC_EMBD * sizeof(float));
+            ds4_gpu_tensor *mix = ds4_gpu_tensor_alloc(HC_MIX * sizeof(float));
+            ds4_gpu_tensor *spl = ds4_gpu_tensor_alloc(HC_MIX * sizeof(float));
+            ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(HC_EMBD * sizeof(float));
+            ds4_gpu_tensor *nrm = ds4_gpu_tensor_alloc(HC_EMBD * sizeof(float));
+            require_ok(flat && ref_mix && ref_spl && ref_out && ref_nrm &&
+                       mix && spl && out && nrm, "HC output tensors");
+            require_ok(ds4_gpu_begin_commands(), "HC reference begin");
+            require_ok(ds4_gpu_rms_norm_plain_tensor(flat, hc_res, HC_N, 1.0e-6f), "HC reference RMS");
+            require_ok(pass == 0 ?
+                ds4_gpu_matmul_f16_tensor(ref_mix, model, MODEL_BYTES, HC_F16W_OFFSET, HC_N, HC_MIX, flat, 1) :
+                ds4_gpu_glm53_matmul_bf16(ref_mix, model, MODEL_BYTES, HC_BF16W_OFFSET, HC_N, HC_MIX, flat, 1),
+                "HC reference projection");
+            require_ok(ds4_gpu_hc_split_weighted_sum_tensor(ref_out, ref_spl, ref_mix, hc_res,
+                model, MODEL_BYTES, HC_SCALE_OFFSET, HC_BASE_OFFSET, HC_EMBD, HC_HC, iters, 1.0e-3f),
+                "HC reference split/collapse");
+            require_ok(ds4_gpu_rms_norm_weight_tensor(ref_nrm, ref_out, model, MODEL_BYTES,
+                HC_NORM_OFFSET, HC_EMBD, 1.0e-6f), "HC reference weighted RMS");
+            /* Reuse the same completion counter in one command stream. */
+            for (unsigned repeat = 0; repeat < 3; repeat++) {
+                require_ok(ds4_gpu_tensor_fill_f32(spl, -17.0f, HC_MIX),
+                           "HC poison split before counter reuse");
+                const int rc = pass == 0
+                    ? ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
+                          mix, out, nrm, spl, hc_res, model, MODEL_BYTES,
+                          HC_F16W_OFFSET, HC_SCALE_OFFSET, HC_BASE_OFFSET,
+                          HC_NORM_OFFSET, HC_N, HC_MIX, HC_EMBD, HC_HC,
+                          iters, 1.0e-6f, 1.0e-3f, 1.0e-6f)
+                    : ds4_gpu_hc_rms_norm_mix_split_norm_bf16_tensor(
+                          mix, out, nrm, spl, hc_res, model, MODEL_BYTES,
+                          HC_BF16W_OFFSET, HC_SCALE_OFFSET, HC_BASE_OFFSET,
+                          HC_NORM_OFFSET, HC_N, HC_MIX, HC_EMBD, HC_HC,
+                          iters, 1.0e-6f, 1.0e-3f, 1.0e-6f);
+                require_ok(rc > 0, pass == 0 ? "HC producer f16" : "HC producer bf16");
+            }
+            require_ok(ds4_gpu_end_commands(), "HC producer end");
+            const ds4_gpu_tensor *actual[] = {mix, spl, out, nrm};
+            const ds4_gpu_tensor *reference[] = {ref_mix, ref_spl, ref_out, ref_nrm};
+            const uint32_t counts[] = {HC_MIX, HC_MIX, HC_EMBD, HC_EMBD};
+            const char *names[] = {"mix", "split", "collapse", "pre-norm"};
+            for (unsigned stage = 0; stage < 4; stage++) {
+                float a[HC_EMBD], b[HC_EMBD];
+                const size_t bytes = counts[stage] * sizeof(float);
+                require_ok(ds4_gpu_tensor_read(actual[stage], 0, a, bytes) &&
+                           ds4_gpu_tensor_read(reference[stage], 0, b, bytes), "HC readback");
+                if (memcmp(a, b, bytes) != 0) {
+                    for (uint32_t i = 0; i < counts[stage]; i++) {
+                        if (memcmp(a + i, b + i, sizeof(float)) != 0) {
+                            fprintf(stderr, "HC %s fixture %u %s[%u]: got %.9g, reference %.9g\n",
+                                pass == 0 ? "F16" : "BF16", fixture, names[stage], i, a[i], b[i]);
+                            break;
+                        }
+                    }
+                    exit(1);
+                }
+            }
+            ds4_gpu_tensor_free(mix);
+            ds4_gpu_tensor_free(spl);
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(nrm);
+            ds4_gpu_tensor_free(flat);
+            ds4_gpu_tensor_free(ref_mix);
+            ds4_gpu_tensor_free(ref_spl);
+            ds4_gpu_tensor_free(ref_out);
+            ds4_gpu_tensor_free(ref_nrm);
+        }
+        ds4_gpu_tensor_free(hc_res);
+        free(hc_x);
+    }
+
+    /*
+     * BF16 matvec with the HC expansion folded into its epilogue must equal
+     * the separate matvec followed by ds4_gpu_hc_expand_tensor, exactly.  The
+     * fused kernel reuses the same row accumulation and repeats the expand
+     * arithmetic in the same operand order, so anything but bit-identical
+     * output is a bug -- most likely a stride or an index.
+     */
+    {
+        uint16_t *fw = (uint16_t *)(model + FUSED_W_OFFSET);
+        for (uint32_t o = 0; o < FUSED_OUT; o++) {
+            for (uint32_t i = 0; i < FUSED_IN; i++) {
+                fw[(size_t)o * FUSED_IN + i] = f32_to_bf16(
+                    0.003f * (float)((int)((o * 7u + i) % 17u) - 8));
+            }
+        }
+        float fx[FUSED_IN], fres[FUSED_HC * FUSED_OUT];
+        float fpost[FUSED_HC], fcomb[FUSED_HC * FUSED_HC];
+        for (int i = 0; i < FUSED_IN; i++)
+            fx[i] = 0.01f * (float)((i % 19) - 9);
+        for (int i = 0; i < FUSED_HC * FUSED_OUT; i++)
+            fres[i] = 0.05f * (float)((i % 13) - 6);
+        for (int i = 0; i < FUSED_HC; i++) fpost[i] = 0.25f + 0.125f * (float)i;
+        for (int i = 0; i < FUSED_HC * FUSED_HC; i++)
+            fcomb[i] = 0.1f * (float)((i % 7) - 3);
+
+        ds4_gpu_tensor *tx   = ds4_gpu_tensor_alloc(sizeof(fx));
+        ds4_gpu_tensor *tres = ds4_gpu_tensor_alloc(sizeof(fres));
+        ds4_gpu_tensor *tpost = ds4_gpu_tensor_alloc(sizeof(fpost));
+        ds4_gpu_tensor *tcomb = ds4_gpu_tensor_alloc(sizeof(fcomb));
+        ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(FUSED_OUT * sizeof(float));
+        ds4_gpu_tensor *hc_ref  = ds4_gpu_tensor_alloc(sizeof(fres));
+        ds4_gpu_tensor *out_fus = ds4_gpu_tensor_alloc(FUSED_OUT * sizeof(float));
+        ds4_gpu_tensor *hc_fus  = ds4_gpu_tensor_alloc(sizeof(fres));
+        require_ok(tx && tres && tpost && tcomb && out_ref && hc_ref &&
+                   out_fus && hc_fus, "fused epilogue tensors");
+        require_ok(ds4_gpu_tensor_write(tx, 0, fx, sizeof(fx)) &&
+                   ds4_gpu_tensor_write(tres, 0, fres, sizeof(fres)) &&
+                   ds4_gpu_tensor_write(tpost, 0, fpost, sizeof(fpost)) &&
+                   ds4_gpu_tensor_write(tcomb, 0, fcomb, sizeof(fcomb)),
+                   "fused epilogue inputs");
+
+        require_ok(ds4_gpu_glm53_matmul_bf16(
+                       out_ref, model, MODEL_BYTES, FUSED_W_OFFSET,
+                       FUSED_IN, FUSED_OUT, tx, 1),
+                   "reference BF16 matvec");
+        require_ok(ds4_gpu_hc_expand_tensor(hc_ref, out_ref, tres, tpost, tcomb,
+                                            FUSED_OUT, FUSED_HC),
+                   "reference HC expand");
+
+        const int fused = ds4_gpu_glm53_matmul_bf16_hc_expand4(
+            out_fus, hc_fus, model, MODEL_BYTES, FUSED_W_OFFSET,
+            FUSED_IN, FUSED_OUT, tx, tres, tpost, tcomb, FUSED_HC);
+        if (fused == 0) {
+            fprintf(stderr,
+                    "BF16 matvec + HC expand: not available on this device, skipped\n");
+        } else {
+            float a[FUSED_OUT], b[FUSED_OUT];
+            float ha[FUSED_HC * FUSED_OUT], hb[FUSED_HC * FUSED_OUT];
+            require_ok(ds4_gpu_tensor_read(out_ref, 0, a, sizeof(a)) &&
+                       ds4_gpu_tensor_read(out_fus, 0, b, sizeof(b)) &&
+                       ds4_gpu_tensor_read(hc_ref, 0, ha, sizeof(ha)) &&
+                       ds4_gpu_tensor_read(hc_fus, 0, hb, sizeof(hb)),
+                       "fused epilogue readback");
+            for (int i = 0; i < FUSED_OUT; i++)
+                require_close("fused epilogue block_out", b[i], a[i], 0.0f);
+            for (int i = 0; i < FUSED_HC * FUSED_OUT; i++)
+                require_close("fused epilogue hc stream", hb[i], ha[i], 0.0f);
+        }
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(tres);
+        ds4_gpu_tensor_free(tpost);
+        ds4_gpu_tensor_free(tcomb);
+        ds4_gpu_tensor_free(out_ref);
+        ds4_gpu_tensor_free(hc_ref);
+        ds4_gpu_tensor_free(out_fus);
+        ds4_gpu_tensor_free(hc_fus);
+    }
+#endif /* __APPLE__: fused HC producers and epilogues are Metal-only. */
 
 #ifdef DS4_ROCM_BUILD
     test_block_q4_K *q4_weights = (test_block_q4_K *)(model + Q4_OFFSET);
@@ -998,6 +1543,20 @@ int main(void) {
     ds4_gpu_tensor_free(q);
     ds4_gpu_tensor_free(bf16_out);
     ds4_gpu_tensor_free(bf16_x);
+#ifdef __APPLE__
+    /* Never silently compare the reference with itself because the parent
+     * process has disabled tuning. Each oracle asserts dispatch coverage. */
+    require_ok(unsetenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") == 0,
+               "clear inherited aggregate tuning switch for kernel oracles");
+    require_ok(unsetenv("DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN") == 0,
+               "clear inherited attention tuning switch for kernel oracles");
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_GLM53_PREFILL);
+    ds4_gpu_test_glm53_prefill_take_dispatches();
+    check_glm53_bf16_short_rows(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
+    check_glm53_kda_decode_values4(model, MODEL_BYTES, QK_LOW_KB_OFFSET);
+    check_glm53_kda_inputs(model, MODEL_BYTES, KI_WEIGHT_OFFSET);
+    ds4_gpu_test_set_flags(0);
+#endif
     ds4_gpu_cleanup();
     munmap(model, MODEL_BYTES);
     puts("GLM-5.3 KDA GPU tests: PASS");

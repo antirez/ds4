@@ -417,9 +417,23 @@ static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand_producer_pre_norm_pipeline;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_barrier_cache;
 static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
+static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_bf16_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
+static uint32_t g_test_glm53_prefill_dispatches;
+
+uint32_t ds4_gpu_test_glm53_prefill_take_dispatches(void) {
+    const uint32_t result = g_test_glm53_prefill_dispatches;
+    g_test_glm53_prefill_dispatches = 0;
+    return result;
+}
+
+static void ds4_gpu_note_glm53_prefill_dispatch(uint32_t feature) {
+    if (g_test_flags & DS4_GPU_TEST_GLM53_PREFILL) {
+        g_test_glm53_prefill_dispatches |= feature;
+    }
+}
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
 static id<MTLComputePipelineState> g_unary_sigmoid_pipeline;
 static id<MTLComputePipelineState> g_unary_silu_pipeline;
@@ -682,6 +696,8 @@ static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
+static id<MTLBuffer> g_kda_conv_halo_buffer;
+static NSUInteger    g_kda_conv_halo_capacity;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_moe_packed_rhs_buffer;
@@ -11577,6 +11593,7 @@ void ds4_gpu_cleanup(void) {
         g_hc_split_weighted_sum_pipeline = nil;
         g_hc_split_weighted_sum_norm_pipeline = nil;
         g_dsv4_hc_producer_pre_norm_pipeline = nil;
+        g_dsv4_hc_producer_pre_norm_bf16_pipeline = nil;
         g_hc_weighted_sum_pipeline = nil;
         g_output_hc_weights4_pipeline = nil;
         g_hc_expand_pipeline = nil;
@@ -11764,6 +11781,8 @@ void ds4_gpu_cleanup(void) {
         g_stream_expert_validate_status_buffer = nil;
         g_f16_round_scratch_buffer = nil;
         g_raw_store_round_buffer = nil;
+        g_kda_conv_halo_buffer = nil;
+        g_kda_conv_halo_capacity = 0;
         g_moe_gate_scratch_buffer = nil;
         g_moe_down_scratch_buffer = nil;
         g_moe_id_map_buffer = nil;
@@ -35917,6 +35936,15 @@ int ds4_gpu_glm53_indexer_scores_batch_tensor(
             pool_size, n_head, head_dim, scale, cache_f16);
 }
 
+static bool ds4_gpu_glm53_tuning_available(void) {
+    /* Defaults have been measured and checked for exactness on M3 Ultra only.
+     * Test mode can exercise the same kernels on smaller fixtures; ownership
+     * exclusions still apply so it cannot silently turn on TP or streaming. */
+    return !g_ssd_streaming_mode && g_tp_split_world == 1 &&
+        ((g_test_flags & DS4_GPU_TEST_GLM53_PREFILL) != 0u ||
+         [g_device.name isEqualToString:@"Apple M3 Ultra"]);
+}
+
 int ds4_gpu_glm_qk_lowrank_typed_tensor(
         ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
@@ -44533,7 +44561,11 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
 }
 
 
-int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
+/* The f16 and bf16 producers are the same dispatch with a different mix
+ * weight type; both are 16 bits per element, so every size, stride and buffer
+ * binding below is identical and only the pipeline differs. */
+static int ds4_gpu_hc_rms_norm_mix_split_norm_16bit_tensor(
+        bool                  mix_is_bf16,
         ds4_gpu_tensor       *mix,
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -44608,12 +44640,18 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
             model_map, model_size, norm_weight_offset, out_bytes, &norm_inner);
         if (!mix_weight || !scalebuf || !basebuf || !norm_weight) return 0;
 
-        if (!g_dsv4_hc_producer_pre_norm_pipeline) {
+        if (mix_is_bf16) {
+            if (!g_dsv4_hc_producer_pre_norm_bf16_pipeline) {
+                g_dsv4_hc_producer_pre_norm_bf16_pipeline = ds4_gpu_get_pipeline(
+                    "kernel_dsv4_hc_rms_norm_mix_bf16_cluster2_pre_norm");
+            }
+        } else if (!g_dsv4_hc_producer_pre_norm_pipeline) {
             g_dsv4_hc_producer_pre_norm_pipeline = ds4_gpu_get_pipeline(
                 "kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm");
         }
         id<MTLComputePipelineState> producer =
-            g_dsv4_hc_producer_pre_norm_pipeline;
+            mix_is_bf16 ? g_dsv4_hc_producer_pre_norm_bf16_pipeline
+                        : g_dsv4_hc_producer_pre_norm_pipeline;
         if (!producer || producer.maxTotalThreadsPerThreadgroup < 512u) {
             return 0;
         }
@@ -44939,6 +44977,37 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
     }
     return 1;
 }
+
+#define DS4_HC_PRODUCER_FORWARD_ARGS                                          \
+    mix, out, norm_out, split, residual_hc, model_map, model_size,            \
+    mix_weight_offset, scale_offset, base_offset, norm_weight_offset,         \
+    n, mix_dim, n_embd, n_hc, sinkhorn_iters, eps, hc_eps, norm_eps
+
+int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
+        ds4_gpu_tensor *mix, ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out,
+        ds4_gpu_tensor *split, const ds4_gpu_tensor *residual_hc,
+        const void *model_map, uint64_t model_size,
+        uint64_t mix_weight_offset, uint64_t scale_offset,
+        uint64_t base_offset, uint64_t norm_weight_offset,
+        uint32_t n, uint32_t mix_dim, uint32_t n_embd, uint32_t n_hc,
+        uint32_t sinkhorn_iters, float eps, float hc_eps, float norm_eps) {
+    return ds4_gpu_hc_rms_norm_mix_split_norm_16bit_tensor(
+        false, DS4_HC_PRODUCER_FORWARD_ARGS);
+}
+
+int ds4_gpu_hc_rms_norm_mix_split_norm_bf16_tensor(
+        ds4_gpu_tensor *mix, ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out,
+        ds4_gpu_tensor *split, const ds4_gpu_tensor *residual_hc,
+        const void *model_map, uint64_t model_size,
+        uint64_t mix_weight_offset, uint64_t scale_offset,
+        uint64_t base_offset, uint64_t norm_weight_offset,
+        uint32_t n, uint32_t mix_dim, uint32_t n_embd, uint32_t n_hc,
+        uint32_t sinkhorn_iters, float eps, float hc_eps, float norm_eps) {
+    return ds4_gpu_hc_rms_norm_mix_split_norm_16bit_tensor(
+        true, DS4_HC_PRODUCER_FORWARD_ARGS);
+}
+
+#undef DS4_HC_PRODUCER_FORWARD_ARGS
 
 int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
@@ -45880,6 +45949,13 @@ typedef struct {
     uint32_t n_rows;
 } glm53_gpu_bf16_matmul_args;
 
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim_ab;
+    uint32_t out_dim_c;
+    uint32_t n_rows;
+} glm53_gpu_bf16_trio_args;
+
 int ds4_gpu_glm53_embedding_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -45930,11 +46006,20 @@ int ds4_gpu_glm53_embedding_bf16(
     }
 }
 
-static uint32_t glm53_gpu_bf16_mv_nsg(void) {
-    return ds4_gpu_device_name_contains("M3 Ultra") &&
-           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
-           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
-               ? 4u : 8u;
+static uint32_t glm53_gpu_bf16_mv_nsg(uint32_t in_dim, uint32_t out_dim) {
+    const bool enabled =
+        getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+        getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL;
+    // Each SIMDgroup still owns one complete row. Group more independent
+    // outputs for the short KDA gate projections to reduce scheduling cost.
+    if (enabled && in_dim == 128u && out_dim == 8192u &&
+        ds4_gpu_glm53_tuning_available() &&
+        getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") == NULL &&
+        getenv("DS4_METAL_DISABLE_GLM53_BF16_SHORT_ROWS") == NULL) {
+        ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_BF16_SHORT_ROWS);
+        return 16u;
+    }
+    return enabled && ds4_gpu_device_name_contains("M3 Ultra") ? 4u : 8u;
 }
 
 int ds4_gpu_glm53_matmul_bf16(
@@ -45976,7 +46061,7 @@ int ds4_gpu_glm53_matmul_bf16(
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (use_mv) {
-            const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
+            const uint32_t nsg = glm53_gpu_bf16_mv_nsg(in_dim, out_dim);
             glm53_gpu_bf16_matmul_args args = {
                 .in_dim = in_dim,
                 .out_dim = out_dim,
@@ -46052,7 +46137,7 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
             ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32_qkv");
         if (!weight_q || !weight_k || !weight_v || !pipeline) return 0;
 
-        const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg(in_dim, out_dim);
         glm53_gpu_bf16_matmul_args args = {
             .in_dim = in_dim,
             .out_dim = out_dim,
@@ -46081,6 +46166,271 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned,
                                               "GLM-5.3 BF16 QKV matmul");
+    }
+}
+
+int ds4_gpu_glm53_matmul_bf16_pair(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x_a,
+        const ds4_gpu_tensor *x_b) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Same device scope as the qkv variant this shares a row helper with. */
+    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    uint64_t weights = 0;
+    if (in_dim == 0 || out_dim == 0 ||
+        !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
+        !glm53_gpu_tensor_has(x_a, in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(x_b, in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_a, out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_b, out_dim, sizeof(float))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t weight_bytes = weights * sizeof(uint16_t);
+        uint64_t inner_a = 0, inner_b = 0;
+        id<MTLBuffer> weight_a = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_a_offset, weight_bytes,
+            &inner_a, "BF16 pair matrix A");
+        id<MTLBuffer> weight_b = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_b_offset, weight_bytes,
+            &inner_b, "BF16 pair matrix B");
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32_pair");
+        if (!weight_a || !weight_b || !pipeline) return 0;
+
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg(in_dim, out_dim);
+        glm53_gpu_bf16_matmul_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_rows = 1u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight_a offset:(NSUInteger)inner_a atIndex:1];
+        [enc setBuffer:weight_b offset:(NSUInteger)inner_b atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x_a)
+                offset:ds4_gpu_tensor_offset(x_a) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x_b)
+                offset:ds4_gpu_tensor_offset(x_b) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_a)
+                offset:ds4_gpu_tensor_offset(out_a) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_b)
+                offset:ds4_gpu_tensor_offset(out_b) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
+                                              1u, 2u)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "GLM-5.3 BF16 pair matmul");
+    }
+}
+
+int ds4_gpu_glm53_matmul_bf16_trio(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        ds4_gpu_tensor       *out_c,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_a_offset,
+        uint64_t              weight_b_offset,
+        uint64_t              weight_c_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim_ab,
+        uint32_t              out_dim_c,
+        const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    uint64_t w_ab = 0, w_c = 0;
+    if (in_dim == 0 || out_dim_ab == 0 || out_dim_c == 0 ||
+        out_dim_c > out_dim_ab ||
+        !glm53_gpu_mul_u64(in_dim, out_dim_ab, &w_ab) ||
+        !glm53_gpu_mul_u64(in_dim, out_dim_c, &w_c) ||
+        !glm53_gpu_tensor_has(x, in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_a, out_dim_ab, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_b, out_dim_ab, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_c, out_dim_c, sizeof(float))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        uint64_t inner_a = 0, inner_b = 0, inner_c = 0;
+        id<MTLBuffer> weight_a = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_a_offset,
+            w_ab * sizeof(uint16_t), &inner_a, "BF16 trio matrix A");
+        id<MTLBuffer> weight_b = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_b_offset,
+            w_ab * sizeof(uint16_t), &inner_b, "BF16 trio matrix B");
+        id<MTLBuffer> weight_c = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_c_offset,
+            w_c * sizeof(uint16_t), &inner_c, "BF16 trio matrix C");
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32_trio");
+        if (!weight_a || !weight_b || !weight_c || !pipeline) return 0;
+
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg(in_dim, out_dim_ab);
+        glm53_gpu_bf16_trio_args args = {
+            .in_dim = in_dim,
+            .out_dim_ab = out_dim_ab,
+            .out_dim_c = out_dim_c,
+            .n_rows = 1u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight_a offset:(NSUInteger)inner_a atIndex:1];
+        [enc setBuffer:weight_b offset:(NSUInteger)inner_b atIndex:2];
+        [enc setBuffer:weight_c offset:(NSUInteger)inner_c atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_a)
+                offset:ds4_gpu_tensor_offset(out_a) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_b)
+                offset:ds4_gpu_tensor_offset(out_b) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_c)
+                offset:ds4_gpu_tensor_offset(out_c) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim_ab + nsg - 1u) / nsg,
+                                              1u, 3u)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "GLM-5.3 BF16 trio matmul");
+    }
+}
+
+int ds4_gpu_glm53_kda_inputs_bf16(
+        ds4_gpu_tensor *const outputs[6], const uint64_t weight_offsets[6],
+        const void *model_map, uint64_t model_size, const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_glm53_tuning_available() ||
+        getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") != NULL ||
+        getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") != NULL ||
+        getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") != NULL ||
+        getenv("DS4_METAL_DISABLE_GLM53_KDA_INPUTS") != NULL) return 0;
+    const uint32_t widths[6] = {8192u, 8192u, 8192u, 128u, 128u, 64u};
+    if (!outputs || !weight_offsets || !model_map ||
+        !glm53_gpu_tensor_has(x, 4096u, sizeof(float))) return 0;
+    /* Validate every range before any work is encoded, allowing the caller
+     * to retain the existing QKV/trio chain as its fallback. */
+    for (unsigned i = 0; i < 6; i++) {
+        const uint64_t bytes = (uint64_t)4096u * widths[i] * sizeof(uint16_t);
+        if (!glm53_gpu_tensor_has(outputs[i], widths[i], sizeof(float)) ||
+            weight_offsets[i] > model_size || bytes > model_size - weight_offsets[i]) return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> weights[6];
+        uint64_t inner[6];
+        for (unsigned i = 0; i < 6; i++) {
+            weights[i] = glm53_gpu_weight_buffer(model_map, model_size, weight_offsets[i],
+                (uint64_t)4096u * widths[i] * sizeof(uint16_t), &inner[i], "BF16 KDA input matrix");
+            if (!weights[i]) return 0;
+        }
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_kda_inputs_bf16");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        for (unsigned i = 0; i < 6; i++)
+            [enc setBuffer:weights[i] offset:(NSUInteger)inner[i] atIndex:i];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:6];
+        for (unsigned i = 0; i < 6; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(outputs[i])
+                    offset:ds4_gpu_tensor_offset(outputs[i]) atIndex:7u + i];
+        ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_KDA_INPUTS);
+        [enc dispatchThreadgroups:MTLSizeMake(24896u / 4u, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 KDA input projections");
+    }
+}
+
+int ds4_gpu_glm53_matmul_bf16_hc_expand4(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *hc_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *post,
+        const ds4_gpu_tensor *comb,
+        uint32_t              n_hc) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Same device scope as the qkv and pair variants this shares a row helper
+     * with; every other device keeps the separate matvec and expand. */
+    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    if (n_hc != 4u) return 0;
+    uint64_t weights = 0;
+    if (in_dim == 0 || out_dim == 0 ||
+        !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
+        !glm53_gpu_tensor_has(x, in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(hc_out, (uint64_t)n_hc * out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(residual_hc, (uint64_t)n_hc * out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(post, n_hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(comb, (uint64_t)n_hc * n_hc, sizeof(float))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t weight_bytes = weights * sizeof(uint16_t);
+        uint64_t inner = 0;
+        id<MTLBuffer> weightbuf = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_offset, weight_bytes,
+            &inner, "BF16 matrix with HC expand");
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32_hc_expand4");
+        if (!weightbuf || !pipeline) return 0;
+
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg(in_dim, out_dim);
+        glm53_gpu_bf16_matmul_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_rows = 1u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(residual_hc)
+                offset:ds4_gpu_tensor_offset(residual_hc) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(post)
+                offset:ds4_gpu_tensor_offset(post) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(comb)
+                offset:ds4_gpu_tensor_offset(comb) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(hc_out)
+                offset:ds4_gpu_tensor_offset(hc_out) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "GLM-5.3 BF16 matmul with HC expand");
     }
 }
 
@@ -47007,8 +47357,14 @@ int ds4_gpu_glm53_kda_decode(
         id<MTLBuffer> output_norm = glm53_gpu_weight_buffer(
             model_map, model_size, output_norm_offset, norm_bytes,
             &norm_inner, "KDA output norm");
+        const bool values4 = ds4_gpu_glm53_tuning_available() &&
+            n_heads == 64u && n_rows == 1u &&
+            getenv("DS4_METAL_DISABLE_GLM53_FLASH_TUNING") == NULL &&
+            getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+            getenv("DS4_METAL_DISABLE_GLM53_DECODE_KDA_VALUES4") == NULL;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_decode");
+            ds4_gpu_get_pipeline(values4 ? "kernel_glm53_kda_decode_v4" :
+                                          "kernel_glm53_kda_decode");
         if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
             !pipeline) {
             return 0;
@@ -47020,6 +47376,7 @@ int ds4_gpu_glm53_kda_decode(
             .lower_bound = gate_lower_bound,
             .norm_eps = norm_eps,
         };
+        if (values4) ds4_gpu_note_glm53_prefill_dispatch(DS4_GPU_GLM53_DECODE_KDA_VALUES4);
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;

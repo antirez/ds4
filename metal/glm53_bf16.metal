@@ -26,24 +26,20 @@ kernel void kernel_glm53_embedding_bf16(
             : 0.0f;
 }
 
-static inline void glm53_mul_mv_bf16_f32_row(
-        constant glm53_bf16_matmul_args &args,
+/* The accumulation, split out unchanged so an epilogue kernel can use the sum
+ * before it is stored.  Callers must range-check out_row and token first. */
+static inline float glm53_mul_mv_bf16_f32_row_sum(
+        uint                             in_dim,
         device const ushort             *weights,
         device const float              *x,
-        device float                    *out,
-        uint2                            tgpig,
-        ushort                           lane,
-        ushort                           sg,
-        ushort                           nsg) {
-    const uint out_row = tgpig.x * (uint)nsg + sg;
-    const uint token = tgpig.y;
-    if (out_row >= args.out_dim || token >= args.n_rows) return;
-
-    device const ushort *w = weights + (ulong)out_row * args.in_dim;
-    device const float *xr = x + (ulong)token * args.in_dim;
+        uint                             out_row,
+        uint                             token,
+        ushort                           lane) {
+    device const ushort *w = weights + (ulong)out_row * in_dim;
+    device const float *xr = x + (ulong)token * in_dim;
     float sum = 0.0f;
     uint k = lane;
-    for (; k + 224u < args.in_dim; k += 256u) {
+    for (; k + 224u < in_dim; k += 256u) {
         const ushort w0 = w[k];
         const ushort w1 = w[k + 32u];
         const ushort w2 = w[k + 64u];
@@ -69,10 +65,26 @@ static inline void glm53_mul_mv_bf16_f32_row(
         sum = fma(glm53_bf16_to_f32(w6), x6, sum);
         sum = fma(glm53_bf16_to_f32(w7), x7, sum);
     }
-    for (; k < args.in_dim; k += 32u) {
+    for (; k < in_dim; k += 32u) {
         sum = fma(glm53_bf16_to_f32(w[k]), xr[k], sum);
     }
-    sum = simd_sum(sum);
+    return simd_sum(sum);
+}
+
+static inline void glm53_mul_mv_bf16_f32_row(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights,
+        device const float              *x,
+        device float                    *out,
+        uint2                            tgpig,
+        ushort                           lane,
+        ushort                           sg,
+        ushort                           nsg) {
+    const uint out_row = tgpig.x * (uint)nsg + sg;
+    const uint token = tgpig.y;
+    if (out_row >= args.out_dim || token >= args.n_rows) return;
+    const float sum =
+        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, weights, x, out_row, token, lane);
     if (lane == 0u) out[(ulong)token * args.out_dim + out_row] = sum;
 }
 
@@ -89,6 +101,136 @@ kernel void kernel_glm53_mul_mv_bf16_f32(
         ushort nsg [[simdgroups_per_threadgroup]]) {
     glm53_mul_mv_bf16_f32_row(args, weights, x, out,
                               tgpig, lane, sg, nsg);
+}
+
+/*
+ * BF16 matvec with the HC expansion folded into its epilogue.
+ *
+ * The simdgroup that finishes output row d already holds that row's value in
+ * lane 0, so it can expand it into the four HC streams there instead of
+ * writing it out and having a second dispatch read it straight back.  This is
+ * the shape kernel_dsv4_q8_hc_expand4_q8_0 already uses for DeepSeek, in BF16.
+ *
+ * Decode only: one token, HC = 4.  The arithmetic and the operand order match
+ * kernel_dsv4_hc_expand4 exactly, including that comb is indexed [j][h].
+ */
+kernel void kernel_glm53_mul_mv_bf16_f32_hc_expand4(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights,
+        device const float              *x,
+        device float                    *out,
+        device const float              *residual,
+        device const float              *post,
+        device const float              *comb,
+        device float                    *hc_out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint out_row = tgpig.x * (uint)nsg + sg;
+    const uint token = tgpig.y;
+    if (out_row >= args.out_dim || token >= args.n_rows) return;
+    const float sum =
+        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, weights, x, out_row, token, lane);
+    if (lane != 0u) return;
+    out[(ulong)token * args.out_dim + out_row] = sum;
+
+    const uint n = args.out_dim;
+    const float r0 = residual[0u * n + out_row];
+    const float r1 = residual[1u * n + out_row];
+    const float r2 = residual[2u * n + out_row];
+    const float r3 = residual[3u * n + out_row];
+    for (uint h = 0u; h < 4u; ++h) {
+        float acc = sum * post[h];
+        acc += comb[0u * 4u + h] * r0;
+        acc += comb[1u * 4u + h] * r1;
+        acc += comb[2u * 4u + h] * r2;
+        acc += comb[3u * 4u + h] * r3;
+        hc_out[h * n + out_row] = acc;
+    }
+}
+
+struct glm53_bf16_trio_args {
+    uint in_dim;
+    uint out_dim_ab;
+    uint out_dim_c;
+    uint n_rows;
+};
+
+/*
+ * Three matvecs over one shared input in a single dispatch, where the third
+ * has a shorter output than the first two.  GLM 5.3's KDA gate chain is
+ * exactly that shape: f_a and g_a are [4096 -> 128] and beta is [4096 -> 64],
+ * all reading attn_norm.  The pair kernel could not carry beta because it
+ * assumes one output width for every slot.
+ *
+ * The grid is sized for the wider pair, so the beta slot's upper threadgroups
+ * exit on the bounds check.
+ */
+kernel void kernel_glm53_mul_mv_bf16_f32_trio(
+        constant glm53_bf16_trio_args &args,
+        device const ushort            *weights_a,
+        device const ushort            *weights_b,
+        device const ushort            *weights_c,
+        device const float             *x,
+        device float                   *out_a,
+        device float                   *out_b,
+        device float                   *out_c,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    const uint slot = tgpig.z;
+    device const ushort *w = slot == 0u ? weights_a
+                           : (slot == 1u ? weights_b : weights_c);
+    device float *out = slot == 0u ? out_a : (slot == 1u ? out_b : out_c);
+    const uint out_dim = slot == 2u ? args.out_dim_c : args.out_dim_ab;
+    const uint out_row = tgpig.x * (uint)nsg + sg;
+    const uint token = tgpig.y;
+    if (out_row >= out_dim || token >= args.n_rows) return;
+    const float sum =
+        glm53_mul_mv_bf16_f32_row_sum(args.in_dim, w, x, out_row, token, lane);
+    if (lane == 0u) out[(ulong)token * out_dim + out_row] = sum;
+}
+
+/* Flatten the six independent KDA projections into one grid, avoiding empty
+ * groups for the three short outputs. Each row retains the existing dot. */
+kernel void kernel_glm53_kda_inputs_bf16(
+        device const ushort *weights_q,
+        device const ushort *weights_k,
+        device const ushort *weights_v,
+        device const ushort *weights_f,
+        device const ushort *weights_g,
+        device const ushort *weights_beta,
+        device const float *x,
+        device float *out_q,
+        device float *out_k,
+        device float *out_v,
+        device float *out_f,
+        device float *out_g,
+        device float *out_beta,
+        uint group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    uint row = group * 4u + sg;
+    if (row >= 24896u) return;
+    device const ushort *weights;
+    device float *out;
+    if (row < 8192u) {
+        weights = weights_q; out = out_q;
+    } else if (row < 16384u) {
+        row -= 8192u; weights = weights_k; out = out_k;
+    } else if (row < 24576u) {
+        row -= 16384u; weights = weights_v; out = out_v;
+    } else if (row < 24704u) {
+        row -= 24576u; weights = weights_f; out = out_f;
+    } else if (row < 24832u) {
+        row -= 24704u; weights = weights_g; out = out_g;
+    } else {
+        row -= 24832u; weights = weights_beta; out = out_beta;
+    }
+    const float sum = glm53_mul_mv_bf16_f32_row_sum(4096u, weights, x, row, 0u, lane);
+    if (lane == 0u) out[row] = sum;
 }
 
 kernel void kernel_glm53_mul_mv_bf16_f32_qkv(
@@ -108,6 +250,32 @@ kernel void kernel_glm53_mul_mv_bf16_f32_qkv(
                                      (tgpig.z == 1u ? weights_k : weights_v);
     device float *out = tgpig.z == 0u ? out_q :
                             (tgpig.z == 1u ? out_k : out_v);
+    glm53_mul_mv_bf16_f32_row(args, weights, x, out,
+                              tgpig.xy, lane, sg, nsg);
+}
+
+/*
+ * Two independent matvecs of the same shape in one dispatch, selected by
+ * tgpig.z, exactly as the qkv variant above selects three.  The inputs are
+ * separate pointers rather than one shared row, which lets this serve both
+ * halves of the GLM 5.3 KDA gate chain: f_a/g_a read the same attn_norm row,
+ * while f_b/g_b read the two different low-rank vectors those produce.
+ */
+kernel void kernel_glm53_mul_mv_bf16_f32_pair(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights_a,
+        device const ushort             *weights_b,
+        device const float              *x_a,
+        device const float              *x_b,
+        device float                    *out_a,
+        device float                    *out_b,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    device const ushort *weights = tgpig.z == 0u ? weights_a : weights_b;
+    device const float  *x       = tgpig.z == 0u ? x_a : x_b;
+    device float        *out     = tgpig.z == 0u ? out_a : out_b;
     glm53_mul_mv_bf16_f32_row(args, weights, x, out,
                               tgpig.xy, lane, sg, nsg);
 }
