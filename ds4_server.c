@@ -18474,8 +18474,10 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
+    /* These fixtures exercise identity/prefix policy, not decades of aging. */
+    const uint64_t now = (uint64_t)time(NULL);
     ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
+                            32768, now, now, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -18988,6 +18990,104 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
      * regardless of how old another entry's hit history is. */
     TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+}
+
+static void test_kv_cache_eviction_decays_unused_value(void) {
+    const uint64_t now = 1000u + 16u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
+    kv_entry e = {.tokens = 1024, .file_size = 4096,
+                  .created_at = now, .last_used = now};
+    double fresh = kv_entry_eviction_score(&e, NULL, now, NULL);
+    TEST_ASSERT(fresh == 0.25);
+    e.last_used = now - KV_CACHE_HIT_HALF_LIFE_SECONDS;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == fresh * 0.5);
+    e.last_used = now - 2u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == fresh * 0.25);
+
+    /* Existing hit evidence and anchor preference still matter. */
+    e.hits = 3;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == fresh);
+    e.reason = KV_REASON_COLD;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == fresh * 2.0);
+
+    e.hits = 0;
+    e.reason = KV_REASON_UNKNOWN;
+    e.last_used = 0;
+    e.created_at = now - KV_CACHE_HIT_HALF_LIFE_SECONDS;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == fresh * 0.5);
+    e.created_at = 0;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == 0.0);
+    e.last_used = UINT64_MAX; /* A future timestamp cannot amplify the score. */
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, now, NULL) == fresh);
+    e.last_used = 1;
+    TEST_ASSERT(kv_entry_eviction_score(&e, NULL, UINT64_MAX, NULL) == 0.0);
+}
+
+static void test_kv_cache_eviction_preserves_sequential_shutdown_saves(void) {
+    char tmpl[] = "/tmp/ds4-kv-shutdown-aging-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const char *sha[] = {
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333",
+        "4444444444444444444444444444444444444444",
+    };
+    char *path[4];
+    for (int i = 0; i < 4; i++) {
+        char name[44];
+        snprintf(name, sizeof(name), "%s.kv", sha[i]);
+        path[i] = path_join(dir, name);
+    }
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t fixed = KV_CACHE_FIXED_HEADER + 4u;
+    /* Scaled-down byte costs from long DeepSeek checkpoints. Older, longer
+     * dumps have slightly better density but have not been used in days. */
+    test_kv_stub_file(dir, sha[0], KV_REASON_EVICT, 159734, 0,
+                     now - 11u * KV_CACHE_HIT_HALF_LIFE_SECONDS, 2120u * 1024u);
+    test_kv_stub_file(dir, sha[1], KV_REASON_EVICT, 185855, 0,
+                     now - 10u * KV_CACHE_HIT_HALF_LIFE_SECONDS, 2463u * 1024u);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 5u * 1024u * 1024u;
+
+    kv_cache_evict(&kc, NULL, fixed + 1410u * 1024u, NULL);
+    test_kv_stub_file(dir, sha[2], KV_REASON_SHUTDOWN, 105662, 0,
+                     now, 1410u * 1024u);
+    TEST_ASSERT(access(path[0], F_OK) != 0);
+    TEST_ASSERT(access(path[1], F_OK) == 0);
+    kv_cache_evict(&kc, NULL, fixed + 2595u * 1024u, NULL);
+    test_kv_stub_file(dir, sha[3], KV_REASON_SHUTDOWN, 195932, 0,
+                     now, 2595u * 1024u);
+    TEST_ASSERT(access(path[2], F_OK) == 0);
+    TEST_ASSERT(access(path[1], F_OK) != 0);
+    kv_cache_close(&kc);
+
+    /* A fresh process sees the same survivors, within the same disk budget. */
+    TEST_ASSERT(ds4_kvstore_open(&kc, dir, 5, false,
+                                kv_cache_default_options(), NULL, NULL, NULL));
+    TEST_ASSERT(kc.len == 2);
+    TEST_ASSERT(access(path[2], F_OK) == 0);
+    TEST_ASSERT(access(path[3], F_OK) == 0);
+    uint64_t total = 0;
+    for (int i = 0; i < kc.len; i++) total += kc.entry[i].file_size;
+    TEST_ASSERT(total <= kc.budget_bytes);
+
+    /* Freshness is not a pin: an insufficient budget still forces eviction. */
+    kc.budget_bytes = 3u * 1024u * 1024u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+    total = 0;
+    for (int i = 0; i < kc.len; i++) total += kc.entry[i].file_size;
+    TEST_ASSERT(kc.len == 1);
+    TEST_ASSERT(total <= kc.budget_bytes);
+    kv_cache_close(&kc);
+    for (int i = 0; i < 4; i++) {
+        unlink(path[i]);
+        free(path[i]);
+    }
+    rmdir(dir);
 }
 
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
@@ -19532,6 +19632,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_decays_unused_value();
+    test_kv_cache_eviction_preserves_sequential_shutdown_saves();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
