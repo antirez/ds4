@@ -3,6 +3,13 @@
 Apple M3 Ultra, 80 GPU cores, 512 GB, macOS 26.5.2, Metal backend.
 Model: `GLM-5.3-Flash-Q4_K.gguf`, 177.8 GiB, fully resident, no SSD streaming.
 
+> **Benchmark provenance:** The measurements and model-sized exactness traces
+> in this document belong to the archived experimental series and the bases
+> identified in each campaign, ending with the `b0a147a` rebase. They were not
+> rerun on the later `9ab7053` base. Historical commit IDs and tables remain so
+> the measured artifacts stay identifiable; current runtime descriptions note
+> integration changes where they affect the old interpretation.
+
 The short version: the routed-expert kernels are already close to the hardware
 ceiling, and the largest single consumer of decode bandwidth is not the experts
 at all.  It is the KDA (linear attention) projections, which this artifact
@@ -104,17 +111,14 @@ win; the generic fallback is nearly free.
 
 ## Result of requantizing KDA to Q8_0
 
-`gguf-tools/glm53-requant-bf16` converts the 136 KDA tensors from BF16 to Q8_0
-into a **new file**, copying every other byte verbatim, through the same
-`quants.c` facade the other tools use.  It refuses an output that resolves to
-the input (same path, hard link or symlink), because the input stays mmapped
-for the whole run; there is no in-place mode.
+For this experiment, `gguf-tools/glm53-requant-bf16` converted the 136 KDA
+tensors from BF16 to Q8_0 into a separately addressed GGUF, copying every
+other payload byte verbatim through the same `quants.c` facade the other tools
+use.
 
-    make -C gguf-tools glm53-requant-bf16
-    ./gguf-tools/glm53-requant-bf16 in.gguf out.gguf --type q8_0 --tensors kda
-
-`--tensors` also takes `head` (`output.weight`), `embd` (`token_embd.weight`)
-and `all`; it defaults to `kda`.
+Build instructions, supported tensor groups and target types, and the
+separate-output safety contract are in the
+[GGUF tools guide](../gguf-tools/README.md#requantize-glm-53-bf16-tensors).
 
 8.50 GiB of KDA weights become 4.52 GiB; the file goes 177.8 -> 173.8 GiB.
 
@@ -353,7 +357,7 @@ the 3.99 ms the four-dispatch chain cost.
 ## The budget, re-measured after the fusions
 
 Everything above was measured before the mHC, gate-pairing and HC-expand work.
-Re-run on the current tip, baseline 41.598 ms/token:
+Re-run on the then-current experimental tip, baseline 41.598 ms/token:
 
 | stage | ms | share |
 |---|---:|---:|
@@ -487,9 +491,12 @@ in the selection.
 One thing about its call site was wrong and is fixed regardless: it passed
 `selected_rows_valid = true`, selecting the kernel variant that skips the `row
 < cache_cap` test.  GLM 5.2's selections are always in range.  GLM 5.3's are
-not once more than the 4096-row full-attention window is visible (8192 under
-SSD streaming): beyond it the pool selector supplies 2051 rows padded with
-`UINT32_MAX` sentinels, and the unchecked variant reads those out of bounds.
+not once sparse selection begins: the pool selector supplies 2051 rows padded
+with `UINT32_MAX` sentinels, and the unchecked variant reads those out of
+bounds. On the measured `b0a147a` base that transition followed the 4096-row
+resident work window (8192 under SSD streaming). The rebased graph correctly
+uses the 2051-row dense-equivalence boundary independently of those work caps,
+so checked sentinel handling is required immediately beyond 2051 visible rows.
 On this machine those reads returned values whose effect stayed below the
 greedy threshold -- a build with the check skipped was byte-identical over 128
 tokens on prompts of 1,471, 3,841 and 10,352 tokens -- and the 1.04% deviation
@@ -534,7 +541,7 @@ assumed:
   fixture at 8, 513, 1024, 2048, 2051 and 4096 selected rows, with rows at and
   past `cache_cap` and `UINT32_MAX` sentinels in the selection, and requires
   the outputs to match with `memcmp`;
-- greedy generation from this tip is **byte-identical to main** (110afdd, and
+- greedy generation from the then-current tip is **byte-identical to main** (110afdd, and
   b0a147a after the branch was rebased onto the synced main) over 128
   tokens on a 1,471-token prompt at ctx 4096 (dense window, every row valid),
   a 3,841-token prompt at ctx 8192 (dense window, 3,841 rows) and a
@@ -560,7 +567,7 @@ what made the phase cheap; the arithmetic never changed.
 Decode from the CLI, greedy, 128 tokens, single runs (the interleaved
 benchmark below is the figure to quote):
 
-| prompt | ctx | main | this tip | non-exact split kernel |
+| prompt | ctx | main | archived tip | non-exact split kernel |
 |---|---:|---:|---:|---:|
 | 1,471 tokens | 4096 | 22.21 | **28.25** | 28.67 |
 | 3,841 tokens | 8192 | 19.05 | **27.23** | 28.35 |
@@ -818,6 +825,11 @@ one change, and `DS4_METAL_DISABLE_GLM53_FLASH_TUNING` restores all of them:
 | `DS4_METAL_DISABLE_GLM53_FFN_HC_EXPAND_ADD` | a separate routed+shared add and HC expand in the FFN tail |
 | `DS4_METAL_DISABLE_GLM53_SHARED_DOWN_HC_EXPAND` | the shared down-projection without the routed add and expand |
 | `DS4_METAL_DISABLE_GLM53_DSA_EXACT` | the generic DSA attention kernel |
+| `DS4_METAL_DISABLE_GLM53_PREFILL_QK_LOW` | the per-token QK-low prefill kernel |
+| `DS4_METAL_DISABLE_GLM53_PREFILL_INDEXED_ATTN` | one attention head per SIMDgroup during indexed prefill |
+| `DS4_METAL_DISABLE_GLM53_PREFILL_MOE_TAIL_CULL` | the ordinary Q4_K routed-prefill tiles without tail culling |
+| `DS4_METAL_DISABLE_GLM53_PREFILL_KDA_PREPARE` | the serial per-head KDA prepare kernel |
+| `DS4_METAL_DISABLE_GLM53_PREFILL_KDA_RECURRENCE` | one recurrent KDA value per SIMDgroup |
 | `DS4_METAL_DISABLE_GLM53_FLASH_TUNING` | every path above at once |
 
 Not switchable: the KDA decay hoist, a kernel-internal cleanup that is
@@ -842,8 +854,9 @@ does in practice:
   QAT and weight projection for prefill batches whose attention is entirely
   within the dense window; #954 gains 1.3-1.8% of prefill.  GLM's indexed
   prefill already does this: `use_causal_range_select` is true while the
-  chunk's rows fit the 4096-row window, and the query projection is inside
-  `if (!use_causal_range_select)`.
+  chunk's rows fit the 2051-row dense-equivalent selection, and the query
+  projection is inside `if (!use_causal_range_select)`. The rebased graph can
+  cross that boundary inside one Metal/CUDA layer-major chunk.
 
 The rest of #954 is DeepSeek attention and MoE kernels (raw-layer gathered
 attention, packed32, RB4-staged prefill rows, sum6/attn-out HC fusions) with
@@ -951,9 +964,15 @@ right.  Whether 8192 pays for itself on the streaming path by reducing
 re-streaming is untested here -- `DS4_GLM_FULL_ATTN_STREAMING_CAP` exists to
 try it.
 
+That table predates the `9ab7053` integration. In the rebased graph these
+variables cap full-attention work allocation; they do not move GLM 5.3's
+2051-row dense-to-sparse boundary. Selected-ID storage is sized for
+`min(ctx_size, 2051)` even when either override is smaller, so a small
+experimental work cap cannot under-allocate the dense-equivalent selection.
+
 ### The 256 MiB score scratch does bind, but not where it hurts yet
 
-`DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB` clamps rows scored per
+`DS4_GLM_PREFILL_SCORE_SCRATCH_MB` clamps rows scored per
 dispatch.  It is not dead: score columns are `compact_cap / 4`, so the budget
 starts biting above 131072 allocated context.  Observed, chunk 2048 throughout:
 
@@ -1070,6 +1089,14 @@ tail-culling 32-row tiles). Explicit four-byte Q4_K dequant loads lost 2.48%.
 KDA prefill recurrence with four values per SIMDgroup lost 0.55%; prepare
 blocks of 8/16/64 versus 32 changed -0.16%/-0.002%/+0.03%. All were exact in
 these tests, but none justified replacing the existing defaults.
+
+The retained prefill implementations can be swept with
+`DS4_METAL_GLM53_PREFILL_QK_LOW_TILE` (4, 8, or 16; default 8),
+`DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG` (1 or 2; default 2),
+`DS4_METAL_GLM53_PREFILL_KDA_PREPARE_BLOCK` (a power of two from 4 through
+4096; default 32), and `DS4_METAL_GLM53_PREFILL_KDA_VALUES_PER_SG` (1, 2, or
+4; default 2). The rollback table above names the corresponding reference
+paths; `DS4_METAL_PROFILE_KDA_PREFILL` prints KDA prefill stage timings.
 
 Lossless BF16 weight packing was also exact but essentially flat, both for
 large projections and the HC producer. Reducing the HC producer from sixteen
