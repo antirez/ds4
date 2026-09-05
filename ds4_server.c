@@ -9077,6 +9077,15 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Wall time of the last completed job on this slot, stamped by the slot
+     * worker; drives the staleness tiers in job_slot_score(). */
+    time_t last_used;
+    /* Cached rendered text of the checkpoint, refreshed by the slot worker
+     * after each job; lets the reuse probe (slot_probe_reuse_locked) answer
+     * the memory-text question with a memcmp instead of a detokenization. */
+    char *live_text;
+    size_t live_text_len;
+    int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
 
     job *assigned;
     job *running;
@@ -9500,33 +9509,37 @@ static bool anthropic_live_has_call_id(server *s, const char *id) {
     return found;
 }
 
-static bool responses_live_matches_request(server *s, server_slot *slot,
-                                           const stop_list *ids,
-                                           int live_tokens) {
-    if (!s || !slot || !ids || ids->len == 0) return false;
-    pthread_mutex_lock(&s->tool_mu);
+static bool responses_live_matches_request_locked(server_slot *slot,
+                                                  const stop_list *ids,
+                                                  int live_tokens) {
     bool ok = slot->responses_live.valid &&
               slot->responses_live.live_tokens == live_tokens &&
               slot->responses_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&slot->responses_live.call_ids, ids->v[i]);
     }
-    pthread_mutex_unlock(&s->tool_mu);
     return ok;
 }
 
-static bool anthropic_live_matches_request(server *s, server_slot *slot,
+static bool responses_live_matches_request(server *s, server_slot *slot,
                                            const stop_list *ids,
                                            int live_tokens) {
     if (!s || !slot || !ids || ids->len == 0) return false;
     pthread_mutex_lock(&s->tool_mu);
+    bool ok = responses_live_matches_request_locked(slot, ids, live_tokens);
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static bool anthropic_live_matches_request_locked(server_slot *slot,
+                                                  const stop_list *ids,
+                                                  int live_tokens) {
     bool ok = slot->anthropic_live.valid &&
               slot->anthropic_live.live_tokens == live_tokens &&
               slot->anthropic_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&slot->anthropic_live.call_ids, ids->v[i]);
     }
-    pthread_mutex_unlock(&s->tool_mu);
     return ok;
 }
 
@@ -10360,174 +10373,205 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
-static int live_text_prefix_prompt(server *s, server_slot *slot,
-                                   const request *req,
-                                   ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len <= 0) return 0;
+/* =========================================================================
+ * Live-state reuse probe.
+ *
+ * Single source of truth for "would this request reuse this slot's live KV
+ * state?", evaluated in the same tier order the execution ladder
+ * (generate_job) materializes:
+ *
+ *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
+ *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
+ *   memory-text
+ *
+ * Both slot routing (job_slot_score, under dispatch) and the execution
+ * ladder consume this probe, so routing decisions and execution-time reuse
+ * can never disagree about the conditions.  The probe is deliberately
+ * cheap: a token-prefix compare, id-list matches, and byte-prefix memcmps
+ * against remembered visible transcripts or the per-slot cached rendered
+ * text.  It never tokenizes (that happens once, at materialization time,
+ * for the selected tier only) and never detokenizes (slot_refresh_live_text
+ * maintains the rendered-text cache after each job).
+ *
+ * The tiers, and why they bind a request to a slot without an exact token
+ * prefix match:
+ *
+ * - responses-visible: other clients send the full visible transcript on
+ *   every turn even though the API semantics still make the request a
+ *   continuation; hidden reasoning may be live in KV but absent from the
+ *   replay by design.  The request's rendered text must begin with the
+ *   visible transcript remembered at the live frontier.
+ * - responses-tool-output: some clients send just the new tool outputs
+ *   after a tool call; the call_id set itself is the protocol binding to
+ *   the previous live assistant output.
+ * - anthropic-tool-output: /v1/messages has no server-side response object,
+ *   but tool_use_id is a precise continuation handle inside a live local
+ *   agent loop.
+ * - memory-rewind (GLM only): the prompt is a strict truncation of the
+ *   checkpoint; the live KV is rewound and the final prompt token
+ *   reevaluated.
+ * - memory-token: the checkpoint is an exact token prefix of the prompt.
+ * - thinking-visible: after a tool-less thinking answer the next prompt
+ *   omits the hidden reasoning by design; the remembered visible transcript
+ *   is the key that keeps the sampled hidden KV.
+ * - memory-text: the checkpoint's rendered text is a byte prefix of the
+ *   request text.  Resent history is re-tokenized, and canonical BPE/DSML
+ *   tokenization need not reproduce the sampled token ids; the live graph
+ *   is authoritative, so the checkpoint tokens are kept verbatim and only
+ *   the suffix text is tokenized (full-prompt BPE may have merged across
+ *   the byte boundary).
+ *
+ * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
+ * it while scoring); slot_probe_reuse() is the worker-path wrapper.
+ * ========================================================================= */
 
-    size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
-    const size_t prompt_text_len = strlen(req->prompt_text);
-    if (!byte_prefix_match(req->prompt_text, prompt_text_len,
-                           live_text, live_text_len))
+static int live_prefix_rewind_target(bool backend_can_rewind,
+                                     int old_pos, int prompt_len, int common);
+
+typedef enum {
+    REUSE_NONE = 0,
+    REUSE_RESPONSES_VISIBLE,
+    REUSE_RESPONSES_TOOL_OUTPUT,
+    REUSE_ANTHROPIC_TOOL_OUTPUT,
+    REUSE_MEMORY_REWIND,
+    REUSE_MEMORY_TOKEN,
+    REUSE_THINKING_VISIBLE,
+    REUSE_MEMORY_TEXT,
+} slot_reuse_kind;
+
+typedef struct {
+    slot_reuse_kind kind;
+    int reuse_tokens;   /* live tokens reusable; 0 iff REUSE_NONE */
+    size_t suffix_off;  /* text tiers: byte offset of the new suffix text */
+    int matched_ids;    /* tool-output tiers: number of bound call ids */
+} slot_reuse;
+
+static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
+                                          const request *req) {
+    slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
+    if (!s || !slot || !slot->session || !req) return pr;
+    if (!ds4_session_checkpoint_valid(slot->session)) return pr;
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (!live || live->len <= 0) return pr;
+    const int live_pos = live->len;
+    /* Vision gate (from upstream's multimodal hardening): live KV rows may
+     * be conditioned on images whose fingerprints are not part of any text
+     * or token prefix, so no live tier may be selected when the slot's
+     * vision state does not describe this request.  Baking the check into
+     * the probe (rather than the execution ladder) means routing can no
+     * longer steer an image-bearing request onto a mismatched slot either. */
+    if (!ds4_session_vision_state_matches(slot->session, req->images,
+                                           req->image_count)) return pr;
+    const char *ptext = req->prompt_text;
+    const size_t plen = ptext ? strlen(ptext) : 0;
+
+    if (req->api == API_RESPONSES && ptext &&
+        slot->responses_live.valid &&
+        slot->responses_live.live_tokens == live_pos &&
+        slot->responses_live.visible_text &&
+        slot->responses_live.visible_len < plen &&
+        byte_prefix_match(ptext, plen,
+                          slot->responses_live.visible_text,
+                          slot->responses_live.visible_len))
     {
-        free(live_text);
-        return 0;
+        pr.kind = REUSE_RESPONSES_VISIBLE;
+        pr.reuse_tokens = live_pos;
+        pr.suffix_off = slot->responses_live.visible_len;
+        return pr;
     }
 
-    /* This is the core text-prefix case.  The live graph is authoritative, so
-     * keep its sampled tokenization and tokenize only the request bytes that
-     * come after it.  Reusing req->prompt's token suffix would be wrong: full
-     * prompt BPE may have merged across this byte boundary. */
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + live_text_len,
-        effective_prompt);
-    free(live_text);
-    return live_tokens->len;
+    if (req->api == API_RESPONSES && req->responses_live_suffix_text &&
+        req->responses_live_call_ids.len > 0 &&
+        responses_live_matches_request_locked(slot,
+                                              &req->responses_live_call_ids,
+                                              live_pos))
+    {
+        pr.kind = REUSE_RESPONSES_TOOL_OUTPUT;
+        pr.reuse_tokens = live_pos;
+        pr.matched_ids = req->responses_live_call_ids.len;
+        return pr;
+    }
+
+    if (req->api == API_ANTHROPIC && req->anthropic_live_suffix_text &&
+        req->anthropic_live_call_ids.len > 0 &&
+        anthropic_live_matches_request_locked(slot,
+                                              &req->anthropic_live_call_ids,
+                                              live_pos))
+    {
+        pr.kind = REUSE_ANTHROPIC_TOOL_OUTPUT;
+        pr.reuse_tokens = live_pos;
+        pr.matched_ids = req->anthropic_live_call_ids.len;
+        return pr;
+    }
+
+    const int common = ds4_session_common_prefix(slot->session, &req->prompt);
+    const int rewind_to = live_prefix_rewind_target(
+        ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
+    if (rewind_to >= 0) {
+        pr.kind = REUSE_MEMORY_REWIND;
+        pr.reuse_tokens = rewind_to;
+        return pr;
+    }
+    if (common == live_pos && req->prompt.len >= live_pos) {
+        pr.kind = REUSE_MEMORY_TOKEN;
+        pr.reuse_tokens = common;
+        return pr;
+    }
+
+    if (req->kind == REQ_CHAT && req->api != API_RESPONSES && ptext &&
+        slot->thinking_live.valid &&
+        slot->thinking_live.live_tokens == live_pos &&
+        slot->thinking_live.visible_text &&
+        slot->thinking_live.visible_len < plen &&
+        byte_prefix_match(ptext, plen,
+                          slot->thinking_live.visible_text,
+                          slot->thinking_live.visible_len))
+    {
+        pr.kind = REUSE_THINKING_VISIBLE;
+        pr.reuse_tokens = live_pos;
+        pr.suffix_off = slot->thinking_live.visible_len;
+        return pr;
+    }
+
+    if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
+        slot->live_text_len <= plen &&
+        byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
+    {
+        pr.kind = REUSE_MEMORY_TEXT;
+        pr.reuse_tokens = live_pos;
+        pr.suffix_off = slot->live_text_len;
+        return pr;
+    }
+
+    return pr;
 }
 
-/* Tool-output-only Responses continuation.
- *
- * Some clients send just the new tool outputs after a tool call.  There is no
- * long visible prefix to match in that shape; the call_id itself is the
- * protocol binding to the previous live assistant output.  Use it only when the
- * remembered live frontier and call-id set match exactly. */
-static int responses_live_continuation_prompt(server *s, server_slot *slot,
-                                              const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
-    if (!s || !slot || !req || !effective_prompt) return 0;
-    if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
-    if (req->responses_live_call_ids.len == 0) return 0;
-    if (!responses_live_matches_request(s, slot,
-                                        &req->responses_live_call_ids,
-                                        live_pos)) return 0;
-
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->responses_live_suffix_text,
-        effective_prompt);
-    if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
-    return live_tokens->len;
-}
-
-/* Tool-result Anthropic continuation.
- *
- * /v1/messages has no server-side response object like the OpenAI Responses
- * API, but its tool_use_id is still a precise continuation handle inside a live
- * local agent loop.  When the IDs and live token frontier match, continue from
- * the sampled DSML state and append only the user tool_result suffix. */
-static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
-                                              const request *req,
-                                              int live_pos,
-                                              ds4_tokens *effective_prompt,
-                                              int *matched_ids) {
-    if (!s || !slot || !req || !effective_prompt) return 0;
-    if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
-    if (req->anthropic_live_call_ids.len == 0) return 0;
-    if (!anthropic_live_matches_request(s, slot,
-                                        &req->anthropic_live_call_ids,
-                                        live_pos)) return 0;
-
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->anthropic_live_suffix_text,
-        effective_prompt);
-    if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
-    return live_tokens->len;
-}
-
-/* Visible-replay Responses continuation.
- *
- * Other clients send the full visible transcript on every turn even though the
- * API semantics still make the request a continuation.  For Responses, exact
- * token-prefix matching is the wrong first question: hidden reasoning may be
- * live in KV but absent from the replay by design.  Instead, verify that the
- * request's rendered text begins with the visible transcript remembered at the
- * live frontier.  If it does, continue from the live token prefix and tokenize
- * only the bytes after that visible boundary.
- *
- * If this check fails, DS4 has no special Responses state to trust.  The caller
- * then uses normal token/text/disk matching, which is the correct fallback for
- * cold starts, edits, restarts, or cross-client replays. */
-static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
-                                                const request *req,
-                                                int live_pos,
-                                                ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (req->api != API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
+static slot_reuse slot_probe_reuse(server *s, server_slot *slot,
+                                   const request *req) {
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->responses_live.valid &&
-              slot->responses_live.live_tokens == live_pos &&
-              slot->responses_live.visible_text &&
-              slot->responses_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->responses_live.visible_text,
-                                slot->responses_live.visible_len);
-    if (ok) visible_len = slot->responses_live.visible_len;
+    slot_reuse pr = slot_probe_reuse_locked(s, slot, req);
     pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
-
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
-    return live_tokens->len;
+    return pr;
 }
 
-/* Tool-less thinking continuation.
- *
- * Chat/completions and Anthropic do not have a previous_response_id object that
- * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
- *
- * Remembering the visible transcript as a key lets us keep the sampled hidden
- * KV when the next request clearly extends that same visible history.  This is
- * the same byte-prefix idea used by the disk cache: the client-visible text
- * selects the checkpoint, while the payload stays the exact sampled token
- * frontier.  If the visible key does not match, callers fall back to ordinary
- * token/text/disk matching. */
-static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
-                                               const request *req,
-                                               int live_pos,
-                                               ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
-              slot->thinking_live.visible_text &&
-              slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
-    if (ok) visible_len = slot->thinking_live.visible_len;
-    pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
-
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
-    return live_tokens->len;
+/* Refresh the cached rendered text of the slot's checkpoint.  Called by the
+ * slot worker after each job - the only place the checkpoint is mutated - so
+ * the memory-text probe stays a pure memcmp and never detokenizes under
+ * tool_mu. */
+static void slot_refresh_live_text(server *s, server_slot *slot) {
+    free(slot->live_text);
+    slot->live_text = NULL;
+    slot->live_text_len = 0;
+    slot->live_text_pos = 0;
+    if (!s || !slot || !slot->session ||
+        !ds4_session_checkpoint_valid(slot->session))
+    {
+        return;
+    }
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (!live || live->len <= 0) return;
+    slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
+    if (slot->live_text) slot->live_text_pos = live->len;
 }
 
 /* =========================================================================
@@ -11985,41 +12029,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
-        responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                              &effective_prompt) : 0;
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
-    if (cached > 0) {
-        responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, slot,
-                                           &j->req.responses_live_call_ids,
-                                           old_pos))
-        {
-            responses_live_match_ids = j->req.responses_live_call_ids.len;
-        }
-    }
-    if (cached == 0 && live_vision_match) {
-        cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
-                                                    &responses_live_match_ids);
-        cache_source = cached > 0 ? "responses-tool-output" : "none";
-        if (cached > 0) responses_live_match = "tool-output-ids";
-    }
-    if (cached > 0) {
-        responses_live_continuation = true;
-        prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
-        cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
-                                                    &anthropic_live_match_ids);
-        if (cached > 0) {
-            anthropic_live_continuation = true;
-            cache_source = "anthropic-tool-output";
-            prompt_for_sync = &effective_prompt;
-        }
-    }
-    if (cached == 0 && responses_protocol &&
-        j->req.responses_requires_live_tool_state)
+    /* Reuse probe: the single source of truth for "does this request reuse
+     * this slot's live state?", shared with slot routing (job_slot_score) so
+     * execution and routing can never disagree.  Tier order and conditions
+     * live in slot_probe_reuse_locked(); below we only materialize the tier
+     * the probe selected. */
+    slot_reuse reuse = slot_probe_reuse(s, slot, &j->req);
+
+    if (responses_protocol &&
+        j->req.responses_requires_live_tool_state &&
+        reuse.kind != REUSE_RESPONSES_VISIBLE &&
+        reuse.kind != REUSE_RESPONSES_TOOL_OUTPUT)
     {
         /* The parser saw a valid live call_id, but by worker execution time the
          * live frontier no longer matches.  Since the request did not replay
@@ -12029,68 +12049,110 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
         return;
-    } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
-               j->req.anthropic_requires_live_tool_state)
+    }
+    if (j->req.api == API_ANTHROPIC &&
+        j->req.anthropic_requires_live_tool_state &&
+        reuse.kind != REUSE_ANTHROPIC_TOOL_OUTPUT)
     {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0 && live_vision_match) {
-        const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
-        if (rewind_to >= 0) {
-            pthread_mutex_lock(&s->inference_mu);
-            ds4_session_rewind(slot->session, rewind_to);
-            const bool rewind_valid =
-                ds4_session_common_prefix(slot->session, &j->req.prompt) ==
-                    rewind_to &&
-                (!multimodal ||
-                 ds4_session_vision_state_matches(slot->session,
-                                                  j->req.images,
-                                                  j->req.image_count));
-            pthread_mutex_unlock(&s->inference_mu);
-            if (rewind_valid) {
-                cached = rewind_to;
-                cache_source = "memory-rewind";
-                cache_diag.rewind_to = rewind_to;
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                           old_pos, rewind_to);
-            } else {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
-                           old_pos, rewind_to);
-            }
-        } else {
-            cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
-            cache_source = cached > 0 ? "memory-token" : "none";
-        }
     }
-    if (cached == 0 && live_vision_match) {
-        int thinking_cached =
-            thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                &effective_prompt);
-        if (thinking_cached > 0) {
-            cached = thinking_cached;
-            cache_source = "thinking-visible";
-            thinking_live_continuation = true;
-            prompt_for_sync = &effective_prompt;
+
+    int cached = reuse.reuse_tokens;
+    const char *cache_source = "none";
+    switch (reuse.kind) {
+    case REUSE_RESPONSES_VISIBLE:
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, ds4_session_tokens(slot->session),
+            j->req.prompt_text + reuse.suffix_off, &effective_prompt);
+        cache_source = "responses-visible";
+        responses_live_continuation = true;
+        responses_live_match = "visible-prefix";
+        if (responses_live_matches_request(s, slot,
+                                           &j->req.responses_live_call_ids,
+                                           old_pos))
+        {
+            responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
+        prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_RESPONSES_TOOL_OUTPUT:
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, ds4_session_tokens(slot->session),
+            j->req.responses_live_suffix_text, &effective_prompt);
+        cache_source = "responses-tool-output";
+        responses_live_continuation = true;
+        responses_live_match = "tool-output-ids";
+        responses_live_match_ids = reuse.matched_ids;
+        prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_ANTHROPIC_TOOL_OUTPUT:
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, ds4_session_tokens(slot->session),
+            j->req.anthropic_live_suffix_text, &effective_prompt);
+        cache_source = "anthropic-tool-output";
+        anthropic_live_continuation = true;
+        anthropic_live_match_ids = reuse.matched_ids;
+        prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_MEMORY_REWIND: {
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_rewind(slot->session, reuse.reuse_tokens);
+        /* Rewinding mutates the session, so re-validate before trusting the
+         * frontier: the common prefix must land exactly on the rewind target
+         * and the vision state must still describe the request (upstream's
+         * multimodal hardening).  A failed validation falls through to the
+         * disk cache / cold prefill instead of reusing a bad frontier. */
+        const bool rewind_valid =
+            ds4_session_common_prefix(slot->session, &j->req.prompt) ==
+                reuse.reuse_tokens &&
+            (!multimodal ||
+             ds4_session_vision_state_matches(slot->session,
+                                              j->req.images,
+                                              j->req.image_count));
+        pthread_mutex_unlock(&s->inference_mu);
+        if (rewind_valid) {
+            cache_source = "memory-rewind";
+            cache_diag.rewind_to = reuse.reuse_tokens;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                       old_pos, reuse.reuse_tokens);
+        } else {
+            cached = 0;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                       old_pos, reuse.reuse_tokens);
+        }
+        break;
+    }
+    case REUSE_MEMORY_TOKEN:
+        cache_source = "memory-token";
+        break;
+    case REUSE_THINKING_VISIBLE:
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, ds4_session_tokens(slot->session),
+            j->req.prompt_text + reuse.suffix_off, &effective_prompt);
+        cache_source = "thinking-visible";
+        thinking_live_continuation = true;
+        prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_MEMORY_TEXT:
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, ds4_session_tokens(slot->session),
+            j->req.prompt_text + reuse.suffix_off, &effective_prompt);
+        cache_source = "memory-text";
+        prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_NONE:
+    default:
+        cached = 0;
+        break;
     }
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0 && live_vision_match) {
-        int text_cached = live_text_prefix_prompt(s, slot, &j->req,
-                                                  &effective_prompt);
-        if (text_cached > 0) {
-            cached = text_cached;
-            cache_source = "memory-text";
-            prompt_for_sync = &effective_prompt;
-        }
-    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
@@ -13216,27 +13278,70 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* A resident checkpoint idle longer than this is most likely a finished
+ * conversation: it becomes the preferred eviction victim regardless of its
+ * size (see job_slot_score).  Without this, long-forgotten sessions are
+ * never evicted (evicting them looks expensive), so they pile up on a
+ * long-running server until only short *active* conversations remain as
+ * victims - and prefill thrashing returns. */
+#define SLOT_STALE_AFTER_SEC ((time_t)60 * 60)
+
+/* Score layout for job_slot_score()'s no-reuse tiers (all negative; every
+ * score of a lower tier must stay strictly below every score of the tier
+ * above):
+ *   empty slot:            0
+ *   stale checkpoint:      [-1 - SLOT_IDLE_SCORE_CAP + SLOT_STALE_AFTER_SEC, -1]
+ *                          (more idle = better victim)
+ *   protected checkpoint:  SLOT_PROTECTED_SCORE_BASE - live
+ *                          (shorter = better victim) */
+#define SLOT_IDLE_SCORE_CAP (1 << 20)   /* ~12 days; keeps the tiers apart */
+#define SLOT_PROTECTED_SCORE_BASE (-2 - SLOT_IDLE_SCORE_CAP)
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
-                          int required_slot) {
+                          int required_slot, time_t now) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
-    if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_state_matches(slot->session,
-                                          j->req.images, j->req.image_count)) {
-        return -1;
+    /* Reuse-aware routing: a slot is attractive only when this request would
+     * actually reuse its live state - the same verdict the execution ladder
+     * reaches via slot_probe_reuse_locked() (dispatch holds tool_mu here).
+     * The score is the reusable prefix length, so the slot where more of the
+     * prompt is already resident wins, and any reuse beats an empty slot.
+     *
+     * A request that can reuse nothing must evict a resident checkpoint, so
+     * it goes to the cheapest victim.  "Cheapest" is staleness-aware: a
+     * checkpoint idle past SLOT_STALE_AFTER_SEC is most likely a finished
+     * conversation, so the more idle it is the better a victim it makes,
+     * regardless of size; a fresher checkpoint belongs to an active
+     * conversation, so the shortest one is evicted, losing the least
+     * prefilled work.  Staleness only lowers a checkpoint's priority as a
+     * *victim* - it never blocks reuse: if the owner of a stale checkpoint
+     * continues its conversation, the reuse tier above still pins the slot. */
+    const int live = slot->session &&
+                     ds4_session_checkpoint_valid(slot->session)
+                     ? ds4_session_pos(slot->session) : 0;
+    const int reuse = slot_probe_reuse_locked(s, slot, &j->req).reuse_tokens;
+    if (reuse > 0) return reuse;
+    if (live == 0) return 0;
+    const time_t idle = now > slot->last_used ? now - slot->last_used : 0;
+    if (idle >= SLOT_STALE_AFTER_SEC) {
+        const time_t capped = idle > SLOT_IDLE_SCORE_CAP
+                              ? SLOT_IDLE_SCORE_CAP : idle;
+        return -1 - SLOT_IDLE_SCORE_CAP + (int)capped;
     }
-    int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+    return SLOT_PROTECTED_SCORE_BASE - live;
 }
 
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
+    const time_t now = time(NULL);
     for (;;) {
         job *chosen = NULL;
         job *chosen_prev = NULL;
         server_slot *chosen_slot = NULL;
         int chosen_score = INT_MIN;
+        int chosen_evict_live = 0;
+        time_t chosen_evict_idle = 0;
 
         pthread_mutex_lock(&s->tool_mu);
         job *prev = NULL;
@@ -13245,7 +13350,7 @@ static void dispatch_jobs_locked(server *s) {
             server_slot *best = NULL;
             int best_score = INT_MIN;
             for (int i = 0; i < s->slot_count; i++) {
-                int score = job_slot_score(s, &s->slots[i], j, required);
+                int score = job_slot_score(s, &s->slots[i], j, required, now);
                 if (score > best_score) {
                     best_score = score;
                     best = &s->slots[i];
@@ -13259,8 +13364,16 @@ static void dispatch_jobs_locked(server *s) {
                 break; /* FIFO among jobs that can run now. */
             }
         }
+        /* chosen_score < 0 means the request reuses nothing and is routed
+         * onto a resident checkpoint, evicting it: capture what is lost so
+         * the eviction is directly visible in the log. */
+        if (chosen && chosen_score < 0 && chosen_slot->session &&
+            ds4_session_checkpoint_valid(chosen_slot->session)) {
+            chosen_evict_live = ds4_session_pos(chosen_slot->session);
+            chosen_evict_idle = now > chosen_slot->last_used
+                                ? now - chosen_slot->last_used : 0;
+        }
         pthread_mutex_unlock(&s->tool_mu);
-        (void)chosen_score;
         if (!chosen || !chosen_slot) break;
 
         if (chosen_prev) chosen_prev->next = chosen->next;
@@ -13269,6 +13382,15 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        if (chosen_evict_live > 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "slot %d: request reuses nothing; evicting checkpoint "
+                       "(%d tokens, idle %lld s, %s)",
+                       chosen_slot->id, chosen_evict_live,
+                       (long long)chosen_evict_idle,
+                       chosen_evict_idle >= SLOT_STALE_AFTER_SEC
+                       ? "stale" : "protected");
+        }
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -13335,6 +13457,13 @@ static void *slot_worker_main(void *arg) {
 
         generate_job(s, slot, j);
         job_complete(j);
+        /* The checkpoint may have changed in any way during the job (sync,
+         * rewind, generation, disk load, reset); refresh the rendered-text
+         * cache the memory-text probe relies on before the slot becomes
+         * visible to the router as free again.  Also stamp the activity
+         * time the router's staleness tiers rely on. */
+        slot_refresh_live_text(s, slot);
+        slot->last_used = time(NULL);
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
@@ -13849,6 +13978,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        free(slot->live_text);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -14517,6 +14647,385 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+/* Reuse-aware slot routing: the probe must recognize every way a request
+ * can reuse a slot's live state, and the router must steer requests that can
+ * reuse nothing away from resident checkpoints. */
+static void test_slot_probe_and_routing_scores(void) {
+    server s = {0};
+    server_slot slots[3] = {0};
+    s.slots = slots;
+    s.slot_count = 3;
+    /* All checkpoints freshly used: in the protected staleness tier, where
+     * the eviction cost is the checkpoint length (-live semantics). */
+    const time_t now = 1000000;
+    slots[0].last_used = slots[1].last_used = slots[2].last_used = now;
+
+    /* slot[0]: resident long checkpoint [sys | main-history] (160 tokens).
+     * slot[1]: resident short checkpoint sharing the sys prefix (101 tokens).
+     * slot[2]: empty. */
+    int main_tok[160], short_tok[101], sub_tok[120], ext_tok[102];
+    for (int i = 0; i < 100; i++) main_tok[i] = short_tok[i] = i + 1;
+    for (int i = 100; i < 160; i++) main_tok[i] = 200 + i;
+    short_tok[100] = 300;
+    for (int i = 0; i < 100; i++) sub_tok[i] = i + 1;
+    for (int i = 100; i < 120; i++) sub_tok[i] = 900 + i;
+    for (int i = 0; i < 101; i++) ext_tok[i] = short_tok[i];
+    ext_tok[101] = 301;
+
+    slots[0].session = ds4_session_new_test_checkpoint(main_tok, 160);
+    slots[1].session = ds4_session_new_test_checkpoint(short_tok, 101);
+    slots[2].session = ds4_session_new_test_checkpoint(NULL, 0);
+
+    /* 1. Alien shared-prefix request (a "subagent"): shares 100 tokens with
+     *    both resident checkpoints but can reuse neither.  It must score
+     *    negatively on both (eviction cost, cheapest victim preferred) and
+     *    lose to the empty slot.  With the old raw common-prefix scoring it
+     *    scored +100 on slot[0] - the misroute. */
+    job sub = {0};
+    for (int i = 0; i < 120; i++) ds4_tokens_push(&sub.req.prompt, sub_tok[i]);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &sub.req).kind ==
+                REUSE_NONE);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 160);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 101);
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) == 0);
+
+    /* 2. Extension request: the prompt extends slot[1]'s checkpoint, so it
+     *    pins there (+live), and is an eviction elsewhere. */
+    job ext = {0};
+    for (int i = 0; i < 102; i++) ds4_tokens_push(&ext.req.prompt, ext_tok[i]);
+    slot_reuse pr = slot_probe_reuse_locked(&s, &slots[1], &ext.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TOKEN);
+    TEST_ASSERT(pr.reuse_tokens == 101);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &ext, -1, now) == 101);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &ext, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 160);
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &ext, -1, now) == 0);
+
+    /* 3. Text-bound request (#62 class): the token prefix diverges, but the
+     *    rendered checkpoint text is a byte prefix of the request text.
+     *    The probe must still recognize the binding (REUSE_MEMORY_TEXT) and
+     *    the slot must stay attractive - otherwise single-session chats with
+     *    slots > 1 would ping-pong and re-prefill every turn. */
+    int stale_tok[3] = {5, 6, 7};
+    server_slot tslot = {0};
+    tslot.last_used = now;
+    tslot.session = ds4_session_new_test_checkpoint(stale_tok, 3);
+    tslot.live_text = (char *)"hello world";
+    tslot.live_text_len = 11;
+    tslot.live_text_pos = 3;
+    job txt = {0};
+    ds4_tokens_push(&txt.req.prompt, 5);
+    ds4_tokens_push(&txt.req.prompt, 6);
+    ds4_tokens_push(&txt.req.prompt, 999);  /* token prefix diverges */
+    txt.req.prompt_text = (char *)"hello world again";
+    pr = slot_probe_reuse_locked(&s, &tslot, &txt.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+    TEST_ASSERT(pr.reuse_tokens == 3);
+    TEST_ASSERT(pr.suffix_off == 11);
+    TEST_ASSERT(job_slot_score(&s, &tslot, &txt, -1, now) == 3);
+
+    /* 4. Stale rendered-text cache (checkpoint moved past it) must not bind. */
+    tslot.live_text_pos = 2;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &tslot, &txt.req).kind ==
+                REUSE_NONE);
+
+    ds4_session_free_test_checkpoint(tslot.session);
+    ds4_session_free_test_checkpoint(slots[0].session);
+    ds4_session_free_test_checkpoint(slots[1].session);
+    ds4_session_free_test_checkpoint(slots[2].session);
+    ds4_tokens_free(&sub.req.prompt);
+    ds4_tokens_free(&ext.req.prompt);
+    ds4_tokens_free(&txt.req.prompt);
+}
+
+/* Staleness tiers: a resident checkpoint idle past SLOT_STALE_AFTER_SEC is
+ * most likely a finished conversation, so it becomes the preferred eviction
+ * victim regardless of its size - while staying fully reusable if its own
+ * conversation continues.  This is what keeps long-forgotten sessions from
+ * piling up on a long-running server and pushing active ones out. */
+static void test_slot_routing_staleness_tiers(void) {
+    server s = {0};
+    server_slot slots[4] = {0};
+    s.slots = slots;
+    s.slot_count = 4;
+    const time_t now = 1000000;
+
+    /* slot[0]: long checkpoint (160), idle 2h - stale.
+     * slot[1]: short checkpoint (101), idle 1h - stale.
+     * slot[2]: mid checkpoint (120), idle 1min - protected.
+     * slot[3]: empty. */
+    int long_tok[160], short_tok[101], mid_tok[120];
+    for (int i = 0; i < 160; i++) long_tok[i] = i + 1;
+    for (int i = 0; i < 101; i++) short_tok[i] = 1000 + i;
+    for (int i = 0; i < 120; i++) mid_tok[i] = 2000 + i;
+    slots[0].session = ds4_session_new_test_checkpoint(long_tok, 160);
+    slots[1].session = ds4_session_new_test_checkpoint(short_tok, 101);
+    slots[2].session = ds4_session_new_test_checkpoint(mid_tok, 120);
+    slots[3].session = ds4_session_new_test_checkpoint(NULL, 0);
+    slots[0].last_used = now - 2 * 3600;
+    slots[1].last_used = now - 1 * 3600;
+    slots[2].last_used = now - 60;
+
+    /* Alien request: shares no prefix with any checkpoint, reuses nothing. */
+    job sub = {0};
+    for (int i = 0; i < 50; i++) ds4_tokens_push(&sub.req.prompt, 9000 + i);
+
+    /* 1. The empty slot beats every resident checkpoint. */
+    TEST_ASSERT(job_slot_score(&s, &slots[3], &sub, -1, now) == 0);
+
+    /* 2. Between stale checkpoints the more idle one is the better victim,
+     *    even though it is longer: plain -live scoring would evict slot[1]
+     *    and keep slot[0] forever - the finished-session leak. */
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1, now) ==
+                -1 - SLOT_IDLE_SCORE_CAP + 2 * 3600);
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1, now) ==
+                -1 - SLOT_IDLE_SCORE_CAP + 1 * 3600);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &sub, -1, now) >
+                job_slot_score(&s, &slots[1], &sub, -1, now));
+
+    /* 3. Any stale checkpoint is a better victim than any protected one,
+     *    even a shorter protected one: an active conversation keeps its
+     *    slot while a long-idle finished one is evicted first. */
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &sub, -1, now) >
+                job_slot_score(&s, &slots[2], &sub, -1, now));
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 120);
+
+    /* 4. Boundary: idle == SLOT_STALE_AFTER_SEC is stale, one second less
+     *    is protected. */
+    slots[2].last_used = now - SLOT_STALE_AFTER_SEC;
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) ==
+                -1 - SLOT_IDLE_SCORE_CAP + (int)SLOT_STALE_AFTER_SEC);
+    slots[2].last_used = now - SLOT_STALE_AFTER_SEC + 1;
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 120);
+    slots[2].last_used = now - 60;
+
+    /* 5. The idle component is capped, so an ancient (or never-stamped,
+     *    last_used == 0) checkpoint maxes out at the top of the stale tier
+     *    instead of overflowing into another tier's range. */
+    slots[2].last_used = 0;
+    TEST_ASSERT(job_slot_score(&s, &slots[2], &sub, -1,
+                               now + SLOT_IDLE_SCORE_CAP + 5000) == -1);
+    slots[2].last_used = now - 60;
+
+    /* 6. Staleness never blocks reuse: the owner of a stale checkpoint
+     *    continues its conversation and the slot stays the most
+     *    attractive - staleness only lowers its priority as a victim. */
+    job cont = {0};
+    for (int i = 0; i < 160; i++) ds4_tokens_push(&cont.req.prompt,
+                                                  long_tok[i]);
+    ds4_tokens_push(&cont.req.prompt, 500);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &cont.req).kind ==
+                REUSE_MEMORY_TOKEN);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &cont, -1, now) == 160);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &cont, -1, now) >
+                job_slot_score(&s, &slots[3], &cont, -1, now));
+
+    ds4_session_free_test_checkpoint(slots[0].session);
+    ds4_session_free_test_checkpoint(slots[1].session);
+    ds4_session_free_test_checkpoint(slots[2].session);
+    ds4_session_free_test_checkpoint(slots[3].session);
+    ds4_tokens_free(&sub.req.prompt);
+    ds4_tokens_free(&cont.req.prompt);
+}
+
+static void test_slot_probe_live_state_tiers(void) {
+    server s = {0};
+    int ckpt_tok[10];
+    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+
+    /* 1. responses-visible: the visible transcript remembered at the live
+     *    frontier is a byte prefix of the replayed request text. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.responses_live.valid = true;
+        slot.responses_live.live_tokens = 10;
+        slot.responses_live.visible_text = xstrdup("<sys>turn1 ");
+        slot.responses_live.visible_len = strlen(slot.responses_live.visible_text);
+        job j = {0};
+        j.req.api = API_RESPONSES;
+        j.req.prompt_text = xstrdup("<sys>turn1 turn2");
+        ds4_tokens_push(&j.req.prompt, 999);  /* token prefix diverges */
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_RESPONSES_VISIBLE);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.suffix_off == slot.responses_live.visible_len);
+        /* Wrong frontier: the remembered state must name the live position. */
+        slot.responses_live.live_tokens = 9;
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        live_tool_state_free(&slot.responses_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 2. responses-tool-output: the call-id frontier binds the request even
+     *    with no visible prefix at all. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.responses_live.valid = true;
+        slot.responses_live.live_tokens = 10;
+        id_list_push_unique(&slot.responses_live.call_ids, "call-abc");
+        job j = {0};
+        j.req.api = API_RESPONSES;
+        j.req.responses_live_suffix_text = xstrdup(" tool-out");
+        id_list_push_unique(&j.req.responses_live_call_ids, "call-abc");
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_RESPONSES_TOOL_OUTPUT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.matched_ids == 1);
+        /* A different id set must not bind. */
+        stop_list_clear(&j.req.responses_live_call_ids);
+        free(j.req.responses_live_call_ids.v);
+        memset(&j.req.responses_live_call_ids, 0,
+               sizeof(j.req.responses_live_call_ids));
+        id_list_push_unique(&j.req.responses_live_call_ids, "call-other");
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        live_tool_state_free(&slot.responses_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 3. anthropic-tool-output: same binding via tool_use_id. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.anthropic_live.valid = true;
+        slot.anthropic_live.live_tokens = 10;
+        id_list_push_unique(&slot.anthropic_live.call_ids, "toolu-1");
+        job j = {0};
+        j.req.api = API_ANTHROPIC;
+        j.req.anthropic_live_suffix_text = xstrdup(" result");
+        id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-1");
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_ANTHROPIC_TOOL_OUTPUT);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.matched_ids == 1);
+        live_tool_state_free(&slot.anthropic_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 4. thinking-visible: a chat request whose replay omits hidden thinking
+     *    binds via the remembered visible transcript; skipped for Responses
+     *    (which has its own visible tier). */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.thinking_live.valid = true;
+        slot.thinking_live.live_tokens = 10;
+        slot.thinking_live.visible_text = xstrdup("conv so far");
+        slot.thinking_live.visible_len = strlen(slot.thinking_live.visible_text);
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        j.req.prompt_text = xstrdup("conv so far plus new question");
+        ds4_tokens_push(&j.req.prompt, 999);
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_THINKING_VISIBLE);
+        TEST_ASSERT(pr.reuse_tokens == 10);
+        TEST_ASSERT(pr.suffix_off == slot.thinking_live.visible_len);
+        j.req.api = API_RESPONSES;  /* thinking tier must skip Responses */
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        visible_live_free(&slot.thinking_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 5. Tier precedence: a request matching both responses-visible and
+     *    memory-token is resolved as responses-visible (ladder order). */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.responses_live.valid = true;
+        slot.responses_live.live_tokens = 10;
+        slot.responses_live.visible_text = xstrdup("v ");
+        slot.responses_live.visible_len = 2;
+        job j = {0};
+        j.req.api = API_RESPONSES;
+        j.req.prompt_text = xstrdup("v more");
+        for (int i = 0; i < 10; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        ds4_tokens_push(&j.req.prompt, 11);  /* exact extension: memory-token */
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_RESPONSES_VISIBLE);
+        live_tool_state_free(&slot.responses_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+
+    /* 6. An alien request binds nowhere even when every live-state tier is
+     *    populated: discrimination for shared-prefix subagents. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        slot.thinking_live.valid = true;
+        slot.thinking_live.live_tokens = 10;
+        slot.thinking_live.visible_text = xstrdup("main conv");
+        slot.thinking_live.visible_len = 9;
+        slot.responses_live.valid = true;
+        slot.responses_live.live_tokens = 10;
+        slot.responses_live.visible_text = xstrdup("main conv");
+        slot.responses_live.visible_len = 9;
+        job j = {0};
+        j.req.kind = REQ_CHAT;
+        j.req.api = API_OPENAI;
+        j.req.prompt_text = xstrdup("main different task");
+        for (int i = 0; i < 5; i++) ds4_tokens_push(&j.req.prompt, i + 1);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
+                    REUSE_NONE);
+        slot.last_used = time(NULL);
+        TEST_ASSERT(job_slot_score(&s, &slot, &j, -1, time(NULL)) ==
+                    SLOT_PROTECTED_SCORE_BASE - 10);
+        live_tool_state_free(&slot.responses_live);
+        visible_live_free(&slot.thinking_live);
+        ds4_session_free_test_checkpoint(slot.session);
+        request_free(&j.req);
+    }
+}
+
+static void test_dispatch_routes_alien_request_to_empty_slot(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.batched_mode = true;
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    int main_tok[50];
+    for (int i = 0; i < 50; i++) main_tok[i] = i + 1;
+    slots[0].session = ds4_session_new_test_checkpoint(main_tok, 50);
+    slots[1].session = ds4_session_new_test_checkpoint(NULL, 0);
+
+    /* Alien request sharing no prefix at all: the old router tied at 0 and
+     * picked slot[0] (lowest index), evicting the resident checkpoint. */
+    job j = {0};
+    ds4_tokens_push(&j.req.prompt, 777);
+    ds4_tokens_push(&j.req.prompt, 888);
+    s.head = &j;
+    s.tail = &j;
+
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(slots[1].assigned == &j);
+    TEST_ASSERT(slots[1].busy);
+    TEST_ASSERT(slots[0].assigned == NULL);
+    TEST_ASSERT(s.head == NULL);
+
+    ds4_tokens_free(&j.req.prompt);
+    ds4_session_free_test_checkpoint(slots[0].session);
+    ds4_session_free_test_checkpoint(slots[1].session);
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_cond_destroy(&s.cv);
 }
 
 static void test_multimodal_prefill_resume_frontier(void) {
@@ -19407,6 +19916,10 @@ static void ds4_server_unit_tests_run(void) {
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
+    test_slot_probe_and_routing_scores();
+    test_slot_probe_live_state_tiers();
+    test_slot_routing_staleness_tiers();
+    test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
