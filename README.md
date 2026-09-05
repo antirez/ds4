@@ -123,9 +123,20 @@ root; use `--chdir /path/to/ds4` when launching elsewhere.
 The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
 for API access and multiple sessions.
 
-The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
-`/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
+The interactive CLI keeps a multi-turn conversation. Use `/help`, `/status`,
+`/read FILE`, `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to
+`you >`.
 Run each binary with `--help` for its full options.
+
+The welcome screen shows the DwarfStar logo, session settings, and full command
+guide in a layout that adapts to terminal width. `--ui-logo auto` (default) uses
+an image in Ghostty/Kitty and text art elsewhere; `--ui-logo image` or
+`--ui-logo text` selects a style. Text art uses Unicode Braille with an ASCII
+fallback. Images fall back to text with `NO_COLOR`, in terminal multiplexers,
+or when unsupported. Both logo variants are embedded in the executable.
+
+Once the model is ready, interactive mode clears the terminal and draws the
+welcome screen. Redirected output and non-interactive modes are never cleared.
 
 ### Native coding agent
 

@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -17,7 +18,9 @@ typedef struct {
 } help_colors;
 
 static help_colors help_make_colors(FILE *fp) {
-    bool color = isatty(fileno(fp));
+    const char *term = getenv("TERM");
+    bool color = isatty(fileno(fp)) && getenv("NO_COLOR") == NULL &&
+                 (!term || strcmp(term, "dumb") != 0);
     help_colors c = {0};
     if (!color) return c;
     c.off = "\x1b[0m";
@@ -267,6 +270,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "--ui-logo MODE", "Logo style: auto (default), image, or text. Image uses Kitty graphics; falls back to text elsewhere.");
     opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live conversation.");
     fputc('\n', fp);
     if (full) {
@@ -300,12 +304,14 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
+    opt(fp, c, "/status", "Show the current model and session setup.");
     opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/steer F", "Set FFN steering for subsequent tokens; omit F to show it.");
     opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
-    opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
+    opt(fp, c, "Ctrl+C", "Stop current generation and return to you >.");
     fputc('\n', fp);
 }
 

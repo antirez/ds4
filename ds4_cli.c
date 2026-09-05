@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_cli_ui.h"
 #include "ds4_prompt_prefix.h"
 #include "linenoise.h"
 
@@ -98,6 +99,7 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    ds4_cli_logo_mode ui_logo;
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -562,7 +564,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
         .in_think = ds4_think_mode_enabled(think_mode),
-        .use_color = isatty(fileno(stdout)) != 0,
+        .use_color = ds4_cli_ui_color_enabled(stdout),
         .last_output_newline = true,
     };
     cli_prefill_progress progress = {
@@ -1258,7 +1260,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                 .fp = stdout,
                 .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
                 .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-                .use_color = isatty(fileno(stdout)) != 0,
+                .use_color = ds4_cli_ui_color_enabled(stdout),
                 .last_output_newline = true,
             };
             cli_prefill_progress progress = {
@@ -1288,18 +1290,30 @@ static char *trim_inplace(char *s) {
     return s;
 }
 
-static void print_repl_help(void) {
-    puts("Commands:");
-    puts("  /help          Show this help.");
-    puts("  /think         Use normal thinking mode.");
-    puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
-    puts("  /nothink       Disable thinking mode.");
-    puts("  /ctx N         Set context size for following prompts.");
-    puts("  /power N       Set GPU duty cycle percentage, 1..100.");
-    puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
-    puts("  /read FILE     Submit a text file, PNG, or JPEG.");
-    puts("  /quit, /exit   Leave the prompt.");
-    puts("  Ctrl+C         Stop generation and return to the prompt.");
+static const char *cli_ui_thinking_name(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE: return "off";
+    case DS4_THINK_HIGH: return "high";
+    case DS4_THINK_MAX:  return "max";
+    }
+    return "unknown";
+}
+
+static ds4_cli_ui_state cli_ui_make_state(ds4_engine *engine,
+                                           const cli_config *cfg,
+                                           int power_percent) {
+    ds4_cli_ui_state state = {
+        .model = ds4_engine_model_name(engine),
+        .backend = ds4_backend_name(cfg->engine.backend),
+        .thinking = cli_ui_thinking_name(cli_effective_think_mode(&cfg->gen)),
+        .ctx_size = cfg->gen.ctx_size,
+        .power_percent = power_percent,
+        .ssd_streaming = cfg->engine.ssd_streaming,
+        .vision = ds4_engine_has_vision(engine),
+        .cache_bytes = cfg->engine.ssd_streaming_cache_bytes,
+        .logo_mode = cfg->ui_logo,
+    };
+    return state;
 }
 
 static bool parse_power_percent(const char *arg, int *out) {
@@ -1592,12 +1606,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
+    ds4_cli_ui_print_assistant_prompt(stdout);
+
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
         .in_think = ds4_think_mode_enabled(think_mode),
-        .use_color = isatty(fileno(stdout)) != 0,
+        .use_color = ds4_cli_ui_color_enabled(stdout),
         .last_output_newline = true,
     };
 
@@ -1737,12 +1753,26 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     linenoiseSetMultiLine(1);
     linenoiseHistorySetMaxLen(512);
     linenoiseHistoryLoad(hist);
-    print_repl_help();
+
+    /* Clear only after the model and optional prefix are ready. This keeps
+     * load failures visible, then presents the interactive UI on a clean
+     * screen without emitting terminal escapes into redirected output. */
+    const char *term = getenv("TERM");
+    if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) &&
+        (!term || strcmp(term, "dumb") != 0)) {
+        fflush(stdout);
+        fflush(stderr);
+        linenoiseClearScreen();
+    }
+
+    ds4_cli_ui_state ui_state = cli_ui_make_state(
+        engine, cfg, ds4_session_power(chat.session));
+    ds4_cli_ui_print_welcome(stdout, &ui_state);
 
     int rc = 0;
     for (;;) {
         errno = 0;
-        char *line = linenoise("ds4> ");
+        char *line = linenoise(ds4_cli_ui_user_prompt(stdout));
         if (!line) {
             if (errno == EAGAIN || cli_interrupt_requested()) {
                 cli_interrupt_clear();
@@ -1759,11 +1789,17 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         linenoiseHistorySave(hist);
 
         if (!strcmp(cmd, "/help")) {
-            print_repl_help();
+            ds4_cli_ui_print_commands(stdout);
+        } else if (!strcmp(cmd, "/status")) {
+            ui_state = cli_ui_make_state(
+                engine, cfg, ds4_session_power(chat.session));
+            fputc('\n', stdout);
+            ds4_cli_ui_print_status(stdout, &ui_state);
+            fputc('\n', stdout);
         } else if (!strcmp(cmd, "/think")) {
             cfg->gen.think_mode = DS4_THINK_HIGH;
             repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_HIGH);
-            puts("Thinking mode: high.");
+            ds4_cli_ui_print_notice(stdout, "thinking", "high");
         } else if (!strcmp(cmd, "/think-max")) {
             cfg->gen.think_mode = DS4_THINK_MAX;
             bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
@@ -1771,15 +1807,16 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             repl_chat_apply_think_prefix(engine, &chat,
                                          active ? DS4_THINK_MAX : DS4_THINK_HIGH);
             cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
-            printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
+            ds4_cli_ui_print_notice(stdout, "thinking",
+                                    active ? "max" : "high (context below 393,216)");
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE);
-            puts("Thinking mode: none.");
+            ds4_cli_ui_print_notice(stdout, "thinking", "off");
         } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
-                printf("Power: %d%%.\n", ds4_session_power(chat.session));
+                ds4_cli_ui_print_notice(stdout, "power", "%d%%", ds4_session_power(chat.session));
             } else {
                 int power = 0;
                 if (!parse_power_percent(arg, &power)) {
@@ -1788,15 +1825,15 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     fprintf(stderr, "ds4: failed to set /power\n");
                 } else {
                     cfg->engine.power_percent = power;
-                    printf("Power: %d%%.\n", power);
+                    ds4_cli_ui_print_notice(stdout, "power", "%d%%", power);
                 }
             }
         } else if (!strncmp(cmd, "/steer", 6) &&
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
-                printf("Steering FFN: %g.\n",
-                       (double)ds4_session_directional_steering_ffn(chat.session));
+                ds4_cli_ui_print_notice(stdout, "steering", "FFN %g",
+                    (double)ds4_session_directional_steering_ffn(chat.session));
             } else {
                 float scale = 0.0f;
                 if (!parse_steering_level(arg, &scale)) {
@@ -1804,7 +1841,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 } else if (ds4_session_set_directional_steering_ffn(
                                    chat.session, scale) == 0) {
                     cfg->engine.directional_steering_ffn = scale;
-                    printf("Steering FFN: %g.\n", (double)scale);
+                    ds4_cli_ui_print_notice(stdout, "steering", "FFN %g", (double)scale);
                 }
             }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
@@ -1826,6 +1863,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                                                                       chat.ctx_size);
                 repl_chat_apply_think_prefix(engine, &chat, effective);
                 cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
+                ds4_cli_ui_print_notice(stdout, "context", "%d tokens", cfg->gen.ctx_size);
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
@@ -2198,6 +2236,15 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--ui-logo")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (!strcmp(mode, "auto")) c.ui_logo = DS4_CLI_LOGO_AUTO;
+            else if (!strcmp(mode, "image")) c.ui_logo = DS4_CLI_LOGO_IMAGE;
+            else if (!strcmp(mode, "text")) c.ui_logo = DS4_CLI_LOGO_TEXT;
+            else {
+                fprintf(stderr, "ds4: --ui-logo expects auto, image, or text\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
