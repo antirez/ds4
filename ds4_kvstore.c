@@ -49,10 +49,14 @@
  * store. */
 #define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
 #define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
-/* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
- * waypoints in a single growing conversation. Give them a soft prior so they
- * survive comparable continued entries, while still allowing pressure and poor
- * density to evict them. */
+/* Cold checkpoints are intentional anchors, not just automatic waypoints in a
+ * single growing conversation: they cut at a chat boundary so a whole class of
+ * later prompts can extend them. Give them a soft prior so they survive
+ * comparable continued entries and the live dumps written on eviction or
+ * shutdown, while still allowing pressure and poor density to evict them.
+ * Evict/shutdown dumps are the live tail as it stood, ending in sampled output,
+ * so only a client that replays that exact output can ever extend one; when the
+ * disk is full and nothing has hits, the anchor is the one worth keeping. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
 
 typedef struct {
@@ -524,9 +528,7 @@ static bool kv_cache_incoming_supersedes_continued(
 }
 
 static bool kv_cache_reason_is_anchor(uint8_t reason) {
-    return reason == DS4_KVSTORE_REASON_COLD ||
-           reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+    return reason == DS4_KVSTORE_REASON_COLD;
 }
 
 double ds4_kvstore_entry_eviction_score(

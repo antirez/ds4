@@ -18814,6 +18814,47 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
     rmdir(dir);
 }
 
+/* A cold anchor is usually the smallest file on disk (it cuts at the last
+ * chat boundary before the assistant spoke), while a live dump written on
+ * eviction holds the whole session. On density alone the anchor is always the
+ * first victim, and a full disk then evicts every fresh anchor on the very
+ * next store. The anchor factor must not extend to the dumps. */
+static void test_kv_cache_eviction_prefers_cold_anchor_over_live_dump(void) {
+    char tmpl[] = "/tmp/ds4-kv-cold-over-dump-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *cold_sha = "1111111111111111111111111111111111111111";
+    const char *dump_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, cold_sha, KV_REASON_COLD, 1536, 0, now, 2048);
+    test_kv_stub_file(dir, dump_sha, KV_REASON_EVICT, 2048, 0, now, 2048);
+
+    char cold_name[44], dump_name[44];
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    snprintf(dump_name, sizeof(dump_name), "%.40s.kv", dump_sha);
+    char *cold_path = path_join(dir, cold_name);
+    char *dump_path = path_join(dir, dump_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(cold_path, F_OK) == 0);
+    TEST_ASSERT(access(dump_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(cold_path);
+    unlink(dump_path);
+    free(cold_path);
+    free(dump_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_makes_room_before_store(void) {
     char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -19527,6 +19568,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_prefers_cold_anchor_over_live_dump();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
