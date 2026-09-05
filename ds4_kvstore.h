@@ -16,6 +16,7 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_VISION_IDENTITY   (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -34,10 +35,10 @@ typedef enum {
 } ds4_kvstore_log_type;
 
 typedef struct {
-    /* The file name is the rendered byte prefix, not the token sequence. The
-     * payload still carries the exact tokens and graph state; the hash only
-     * answers "does this checkpoint represent the bytes at the front of the
-     * incoming prompt?" */
+    /* The file name is the cache-key byte prefix, not the token sequence. This
+     * is normally rendered text; callers may prepend identity metadata for
+     * state, such as images, that text alone cannot distinguish. The payload
+     * still carries the exact tokens and graph state. */
     char sha[41];
     char *path;
     uint8_t quant_bits;
@@ -158,6 +159,12 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+int ds4_kvstore_find_text_prefix_filtered(ds4_kvstore *kc,
+                                          const char *prompt_text,
+                                          int model_id, int quant_bits,
+                                          int ctx_size,
+                                          uint8_t required_ext_flags,
+                                          uint8_t forbidden_ext_flags);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -194,6 +201,17 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
                               bool responses_protocol);
+int ds4_kvstore_try_load_text_filtered(
+        ds4_kvstore *kc,
+        ds4_engine *engine,
+        ds4_session *session,
+        const char *prompt_text,
+        ds4_tokens *effective_prompt,
+        ds4_kvstore_load_result *result,
+        const ds4_kvstore_trailer_hooks *hooks,
+        bool responses_protocol,
+        uint8_t required_ext_flags,
+        uint8_t forbidden_ext_flags);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,

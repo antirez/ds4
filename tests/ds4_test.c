@@ -7,6 +7,9 @@
 
 bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
+bool ds4_test_multimodal_sync_finish_policy(void);
+bool ds4_test_vision_identity_carries_exact_state_fingerprint(void);
+bool ds4_test_vision_identity_keeps_retained_hash(void);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -6786,6 +6789,11 @@ static void test_dspark_verify_depth(void) {
 #endif
 
 static void test_server_unit_group(void) {
+#ifndef DS4_NO_GPU
+    TEST_ASSERT(ds4_test_multimodal_sync_finish_policy());
+    TEST_ASSERT(ds4_test_vision_identity_carries_exact_state_fingerprint());
+    TEST_ASSERT(ds4_test_vision_identity_keeps_retained_hash());
+#endif
     ds4_server_unit_tests_run();
 }
 
