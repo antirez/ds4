@@ -37637,7 +37637,7 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM53_INDEX_POOL_SIZE 4u
 #define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
 
-/* These four were compile-time constants with no way to try another value.
+/* These five were compile-time constants with no way to try another value.
  * They interact -- the prefill chunk and the layer-flush threshold are both
  * 2048 and the flush comparison is a strict >, so raising the chunk to 4096
  * also switches per-layer flushing on across every layer -- so each is

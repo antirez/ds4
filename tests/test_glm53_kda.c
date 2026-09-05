@@ -822,6 +822,9 @@ static void check_glm53_indexed_attention_head_width(void) {
     }
     require_ok(unsetenv("DS4_METAL_GLM53_PREFILL_INDEXED_ATTN_HEADS_PER_SG") == 0,
                "indexed attention width switch clear");
+    puts("GLM indexed prefill checked wrapper: optimized two-head dispatch "
+         "is byte-exact vs one-head at 2051/512/33/16/1 rows with "
+         "UINT32_MAX/out-of-range IDs and exact rollbacks: PASS");
 #undef IA_NEXT_UNIT
 
     ds4_gpu_tensor_free(dual_gpu);
@@ -889,6 +892,9 @@ static void check_glm53_indexed_attention_invalid_rows(void) {
                                  "masked attention coverage");
         require_ok(memcmp(expected, actual, bytes) == 0, "invalid rows preserve exact valid-row attention");
     }
+    puts("GLM indexed prefill padded IDs: checked wrapper skipped "
+         "UINT32_MAX/out-of-range rows, retained optimized 64-head/no-RoPE "
+         "dispatch, and matched compact valid-row bytes: PASS");
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gmasked); ds4_gpu_tensor_free(gcompact);
     ds4_gpu_tensor_free(grope); ds4_gpu_tensor_free(gcache); ds4_gpu_tensor_free(glow); ds4_gpu_tensor_free(gq);
 }

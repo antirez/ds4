@@ -155,6 +155,8 @@ static void test_glm_attention_budget(void) {
     assert(ds4_gpu_tensor_read(selected, 1024u * sizeof(uint32_t),
                                &last, sizeof(last)));
     assert(last == 1024);
+    printf("GLM attention cap: configured=1024 selected_capacity=%u "
+           "filled=1025 last=%u: PASS\n", selected_capacity, last);
     ds4_gpu_tensor_free(selected);
     ds4_gpu_cleanup();
     if (saved_resident) {
@@ -255,6 +257,8 @@ static void test_glm_spec_rollback(void) {
             for (int j = 0; j < 128; j++) assert(state[j] == 11);
         }
     }
+    puts("GLM speculative rollback: indexer tail/key cache and KDA conv/"
+         "recurrent state restored across replay: PASS");
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(gate);
     glm_graph_free(g);
