@@ -8,10 +8,11 @@ struct glm53_kda_args {
 };
 
 /*
- * One threadgroup owns one (sequence, head). Four simdgroups update four
- * value rows concurrently; every lane owns four adjacent key columns.
+ * One threadgroup owns one (sequence, head). Four SIMDgroups own disjoint
+ * value rows; every lane owns four adjacent key columns.
  */
-kernel void kernel_glm53_kda_decode(
+template<uint VALUES>
+kernel void kernel_glm53_kda_decode_values(
         constant glm53_kda_args &args,
         device const float   *q_in,
         device const float   *k_in,
@@ -48,6 +49,7 @@ kernel void kernel_glm53_kda_decode(
     threadgroup float *reduce_k = reduce_q + 4u;
     threadgroup float *reduce_o = reduce_k + 4u;
     threadgroup float *beta_shared = reduce_o + 4u;
+    threadgroup float *a_decay_shared = beta_shared + 1u;
 
     const uint projection = args.n_heads * D;
     const uint channel = head * D + tid;
@@ -90,16 +92,18 @@ kernel void kernel_glm53_kda_decode(
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
         sv[tid] = v_acc / (1.0f + exp(-v_acc));
-        const float gate = raw_gate[input_base + tid] + dt_bias[channel];
-        sd[tid] = exp(args.lower_bound *
-                      (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
     }
     if (tid == 0u) {
         beta_shared[0] =
             1.0f / (1.0f + exp(-raw_beta[(ulong)row * args.n_heads + head]));
+        /* head is uniform over the threadgroup, so exp(a_log[head]) is a
+         * single value; every one of the D channels used to recompute it. */
+        a_decay_shared[0] = exp(a_log[head]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup |
-                       mem_flags::mem_device);
+    /* Only threadgroup memory is shared between threads here: the conv-state
+     * writes above are each thread's own channel and no thread reads another's,
+     * so the barrier does not need device scope. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float q_sumsq = sq[tid] * sq[tid];
     float k_sumsq = sk[tid] * sk[tid];
@@ -119,6 +123,9 @@ kernel void kernel_glm53_kda_decode(
     if (tid < D) {
         sq[tid] *= q_scale;
         sk[tid] *= k_scale;
+        const float gate = raw_gate[input_base + tid] + dt_bias[channel];
+        sd[tid] = exp(args.lower_bound *
+                      (1.0f / (1.0f + exp(-a_decay_shared[0] * gate))));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -129,20 +136,49 @@ kernel void kernel_glm53_kda_decode(
     const ulong state_head =
         ((ulong)row * args.n_heads + head) * D * D;
 
-    for (uint value = sg; value < D; value += 4u) {
-        device float4 *hptr =
-            (device float4 *)(state + state_head + (ulong)value * D + k0);
-        float4 h = *hptr * decay4;
-        float hk = dot(h, k4);
-        hk = simd_sum(hk);
-        const float delta_v = (sv[value] - hk) * beta_shared[0];
-        h = fma(k4, float4(delta_v), h);
-        *hptr = h;
-        float hq = simd_sum(dot(h, q4));
-        if (lane == 0u) so[value] = hq;
+    /* Interleave independent value rows to hide load/reduction latency.
+     * Every row retains its original SIMDgroup, dot/FMA sequence, and stores;
+     * normalization still uses the same four-SIMDgroup reduction tree. */
+    if (VALUES == 1u) {
+        for (uint value = sg; value < D; value += 4u) {
+            device float4 *hptr =
+                (device float4 *)(state + state_head + (ulong)value * D + k0);
+            float4 h = *hptr * decay4;
+            float hk = dot(h, k4);
+            hk = simd_sum(hk);
+            const float delta_v = (sv[value] - hk) * beta_shared[0];
+            h = fma(k4, float4(delta_v), h);
+            *hptr = h;
+            float hq = simd_sum(dot(h, q4));
+            if (lane == 0u) so[value] = hq;
+        }
+    } else {
+        for (uint value = sg; value < D; value += 4u * VALUES) {
+            device float4 *hptr[VALUES];
+            float4 h[VALUES];
+            float hk[VALUES];
+            FOR_UNROLL (uint i = 0; i < VALUES; i++) {
+                hptr[i] = (device float4 *)(state + state_head + (ulong)(value + i * 4u) * D + k0);
+                h[i] = *hptr[i] * decay4;
+            }
+            FOR_UNROLL (uint i = 0; i < VALUES; i++) {
+                hk[i] = dot(h[i], k4);
+                hk[i] = simd_sum(hk[i]);
+            }
+            FOR_UNROLL (uint i = 0; i < VALUES; i++) {
+                const float delta_v = (sv[value + i * 4u] - hk[i]) * beta_shared[0];
+                h[i] = fma(k4, float4(delta_v), h[i]);
+                *hptr[i] = h[i];
+            }
+            FOR_UNROLL (uint i = 0; i < VALUES; i++) {
+                const float hq = simd_sum(dot(h[i], q4));
+                if (lane == 0u) so[value + i * 4u] = hq;
+            }
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup |
-                       mem_flags::mem_device);
+    /* Likewise: the state writes above are not re-read in this kernel, only
+     * so[] crosses simdgroups. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float o_sumsq = so[tid] * so[tid];
     o_sumsq = simd_sum(o_sumsq);
@@ -158,6 +194,12 @@ kernel void kernel_glm53_kda_decode(
         out[index] = so[tid] * o_scale * output_norm[tid] * gate;
     }
 }
+
+typedef decltype(kernel_glm53_kda_decode_values<1u>) glm53_kda_decode_values_t;
+template [[host_name("kernel_glm53_kda_decode")]]
+kernel glm53_kda_decode_values_t kernel_glm53_kda_decode_values<1u>;
+template [[host_name("kernel_glm53_kda_decode_v4")]]
+kernel glm53_kda_decode_values_t kernel_glm53_kda_decode_values<4u>;
 
 kernel void kernel_glm53_kda_prefill_prepare(
         constant glm53_kda_args &args,
