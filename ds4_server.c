@@ -5690,6 +5690,23 @@ static void trim_const_span(const char **start, const char **end) {
     while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
 }
 
+/* GLM's <arg_value> wire format carries no type information, so a value such
+ * as 10, true, null, [], or {...} is indistinguishable from plain text on the
+ * wire. Heuristically detect a complete non-string JSON value and emit it raw,
+ * mirroring the DSML string="false" path through json_minify_raw_value; plain
+ * text and JSON string literals stay quoted JSON strings. Returns true only
+ * when the entire value is one valid non-string JSON value, so the raw branch
+ * never emits an unquoted fragment (issue #569). */
+static bool glm_arg_value_is_raw_json(const char *s) {
+    if (!s) return false;
+    const char *p = s;
+    json_ws(&p);
+    if (*p == '"') return false;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
 static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
                                            char **content_out,
@@ -5795,7 +5812,8 @@ static bool parse_glm_generated_message_ex(const char *text,
             }
             char *raw_value = xstrndup(p, (size_t)(value_end - p));
             char *value = dsml_unescape_text(raw_value);
-            tool_call_json_args_add(&args, key, value, "true");
+            const char *is_string = glm_arg_value_is_raw_json(value) ? "false" : "true";
+            tool_call_json_args_add(&args, key, value, is_string);
             free(key);
             free(raw_value);
             free(value);
@@ -16334,10 +16352,59 @@ static void test_parse_glm_tool_call_message(void) {
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
     TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\"") != NULL);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": \"10\"") != NULL);
+    /* issue #569: a numeric arg_value is emitted raw, not string-quoted. */
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": 10") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": \"10\"") == NULL);
     TEST_ASSERT(calls.raw_tool_text &&
                 !strncmp(calls.raw_tool_text, "\n\n<tool_call>bash",
                          strlen("\n\n<tool_call>bash")));
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+/* Issue #569 gate: GLM tool-call arguments must emit proper JSON types so a
+ * schema-validating client (zod/ajv, Chatwise) accepts the call. The wire
+ * format carries no type info, so number/array/object/bool/null arg_values are
+ * detected heuristically and emitted raw; plain text stays a JSON string. */
+static void test_parse_glm_tool_call_arg_types(void) {
+    const char *generated =
+        "<tool_call>web_search"
+        "<arg_key>query</arg_key><arg_value>blue sky</arg_value>"
+        "<arg_key>max_results</arg_key><arg_value>10</arg_value>"
+        "<arg_key>exclude_domains</arg_key><arg_value>[]</arg_value>"
+        "<arg_key>include_domains</arg_key><arg_value>[\"a.com\", \"b.com\"]</arg_value>"
+        "<arg_key>safe_search</arg_key><arg_value>true</arg_value>"
+        "<arg_key>cursor</arg_key><arg_value>null</arg_value>"
+        "<arg_key>opts</arg_key><arg_value>{\"k\": 1}</arg_value>"
+        "</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, generated, false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    const char *args = calls.v[0].arguments;
+    fprintf(stderr, "ds4-test: glm arg-types arguments=%s\n", args ? args : "(null)");
+
+    /* Plain text stays a quoted JSON string. */
+    TEST_ASSERT(strstr(args, "\"query\": \"blue sky\"") != NULL);
+    /* Number is raw, not quoted. */
+    TEST_ASSERT(strstr(args, "\"max_results\": 10") != NULL);
+    TEST_ASSERT(strstr(args, "\"max_results\": \"10\"") == NULL);
+    /* Empty and non-empty arrays are raw, not quoted. */
+    TEST_ASSERT(strstr(args, "\"exclude_domains\": []") != NULL);
+    TEST_ASSERT(strstr(args, "\"exclude_domains\": \"[]\"") == NULL);
+    TEST_ASSERT(strstr(args, "\"include_domains\": [\"a.com\",\"b.com\"]") != NULL);
+    /* Boolean and null are raw, not quoted. */
+    TEST_ASSERT(strstr(args, "\"safe_search\": true") != NULL);
+    TEST_ASSERT(strstr(args, "\"safe_search\": \"true\"") == NULL);
+    TEST_ASSERT(strstr(args, "\"cursor\": null") != NULL);
+    /* Object is raw and minified. */
+    TEST_ASSERT(strstr(args, "\"opts\": {\"k\":1}") != NULL);
 
     free(content);
     free(reasoning);
@@ -19456,6 +19523,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
+    test_parse_glm_tool_call_arg_types();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
