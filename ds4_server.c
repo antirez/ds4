@@ -11198,8 +11198,8 @@ static int server_session_sync(server *s, server_slot *slot,
 
 static int server_multimodal_resume_frontier(int live, int common,
                                              int prompt_len,
-                                             bool image_state_matches) {
-    return common == live && prompt_len >= live && image_state_matches
+                                             bool image_prefix_matches) {
+    return common == live && prompt_len >= live && image_prefix_matches
            ? live : 0;
 }
 
@@ -11212,7 +11212,7 @@ static int server_multimodal_resume_pos(ds4_session *session,
     const int common = ds4_session_common_prefix(session, prompt);
     return server_multimodal_resume_frontier(
         live, common, prompt->len,
-        ds4_session_vision_state_matches(session, images, image_count));
+        ds4_session_vision_prefix_matches(session, images, image_count));
 }
 
 static int server_session_sync_multimodal(server *s, server_slot *slot,
@@ -11963,9 +11963,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    const bool live_vision_match =
+    const bool live_vision_exact_match =
         ds4_session_vision_state_matches(slot->session,
                                          j->req.images, j->req.image_count);
+    const bool live_vision_prefix_match =
+        ds4_session_vision_prefix_matches(slot->session,
+                                          j->req.images, j->req.image_count);
+    const int multimodal_prefix_cached = server_multimodal_resume_frontier(
+        old_pos, common, j->req.prompt.len, live_vision_prefix_match);
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
@@ -11985,7 +11990,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
+    int cached = live_vision_exact_match ?
         responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                               &effective_prompt) : 0;
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
@@ -11998,7 +12003,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && live_vision_exact_match) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
@@ -12008,7 +12013,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else if (live_vision_exact_match) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -12036,7 +12041,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0 && live_vision_match) {
+    } else if (cached == 0 && live_vision_exact_match) {
         const int rewind_to = live_prefix_rewind_target(
             ds4_engine_is_glm_dsa(s->engine), old_pos,
             j->req.prompt.len, common);
@@ -12068,7 +12073,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0 && live_vision_match) {
+    /* A tool may append a newly produced image after the live frontier.  The
+     * existing KV remains valid when every prior image identity matches and
+     * the prompt tokens extend the checkpoint exactly.  Keep protocol/text
+     * reconstruction tiers above exact-image-only: only this exact token
+     * continuation may introduce a new image. */
+    if (cached == 0 && multimodal_prefix_cached > 0) {
+        cached = multimodal_prefix_cached;
+        cache_source = cached > 0 ? "memory-token" : "none";
+    }
+    if (cached == 0 && live_vision_exact_match) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                 &effective_prompt);
@@ -12082,7 +12096,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && live_vision_exact_match) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
         if (text_cached > 0) {
@@ -12096,13 +12110,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   live_vision_match ? "match" : "mismatch",
+                   live_vision_exact_match ? "exact-match" :
+                   live_vision_prefix_match ? "prefix-match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
-                   j->req.image_count, cached, prompt_for_sync->len);
+                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=%s",
+                   j->req.image_count, cached, prompt_for_sync->len,
+                   live_vision_exact_match ? "fingerprint-exact-match" :
+                                             "fingerprint-prefix-match");
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
@@ -13221,12 +13238,19 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
-    if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_state_matches(slot->session,
-                                          j->req.images, j->req.image_count)) {
-        return -1;
-    }
+    const int live = ds4_session_pos(slot->session);
+    const bool vision_exact = ds4_session_vision_state_matches(
+        slot->session, j->req.images, j->req.image_count);
+    const bool vision_prefix = ds4_session_vision_prefix_matches(
+        slot->session, j->req.images, j->req.image_count);
+    if (live > 0 && !vision_prefix) return -1;
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+    /* A newly appended image may bind to this slot only when the prompt is a
+     * true extension of its entire live token frontier.  If earlier text was
+     * edited, execution cannot reuse the slot and routing must not pretend it
+     * can merely because some shorter token prefix still matches. */
+    if (live > 0 && !vision_exact &&
+        (common != live || j->req.prompt.len < live)) return -1;
     return common;
 }
 
@@ -14524,6 +14548,86 @@ static void test_multimodal_prefill_resume_frontier(void) {
     TEST_ASSERT(server_multimodal_resume_frontier(160, 159, 170, true) == 0);
     TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 159, true) == 0);
     TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 170, false) == 0);
+}
+
+static void test_multimodal_appended_image_reuses_live_frontier(void) {
+    int live_tokens[160];
+    int prompt_tokens[165];
+    for (int i = 0; i < 160; i++) {
+        live_tokens[i] = i + 1;
+        prompt_tokens[i] = live_tokens[i];
+    }
+    for (int i = 160; i < 165; i++) prompt_tokens[i] = 1000 + i;
+
+    ds4_vision_span original = {0};
+    original.token_start = 20;
+    original.embedding.token_count = 4;
+    memset(original.embedding.fingerprint, 0xa5,
+           sizeof(original.embedding.fingerprint));
+    ds4_session *session = ds4_session_new_test_vision_checkpoint(
+        live_tokens, 160, &original, 1);
+    TEST_ASSERT(session != NULL);
+
+    ds4_vision_span images[2] = {original, {0}};
+    images[1].token_start = 160;
+    images[1].embedding.token_count = 4;
+    memset(images[1].embedding.fingerprint, 0x5a,
+           sizeof(images[1].embedding.fingerprint));
+    ds4_tokens prompt = {.v = prompt_tokens, .len = 165, .cap = 165};
+
+    /* This is the Pi read-tool case: old image state is unchanged and the
+     * newly returned image begins after the 160-token live checkpoint. */
+    TEST_ASSERT(ds4_session_vision_prefix_matches(session, images, 2));
+    TEST_ASSERT(!ds4_session_vision_state_matches(session, images, 2));
+    TEST_ASSERT(server_multimodal_resume_pos(session, &prompt,
+                                             images, 2) == 160);
+    server s = {0};
+    server_slot slot = {.session = session};
+    job j = {0};
+    j.req.prompt = prompt;
+    j.req.images = images;
+    j.req.image_count = 2;
+    TEST_ASSERT(job_slot_score(&s, &slot, &j, -1) == 160);
+
+    prompt_tokens[159] ^= 1;
+    TEST_ASSERT(server_multimodal_resume_pos(session, &prompt,
+                                             images, 2) == 0);
+    TEST_ASSERT(job_slot_score(&s, &slot, &j, -1) == -1);
+    prompt_tokens[159] ^= 1;
+
+    /* Removing, moving, or replacing an old image remains a hard mismatch. */
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(session, images, 0));
+    images[0].token_start++;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(session, images, 2));
+    images[0] = original;
+    images[0].embedding.fingerprint[0] ^= 0xff;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(session, images, 2));
+    TEST_ASSERT(server_multimodal_resume_pos(session, &prompt,
+                                             images, 2) == 0);
+    TEST_ASSERT(job_slot_score(&s, &slot, &j, -1) == -1);
+    images[0] = original;
+
+    /* A nominally new image inserted inside already-computed tokens is also
+     * unsafe, even when every old image still matches byte-for-byte. */
+    images[1].token_start = 159;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(session, images, 2));
+    TEST_ASSERT(server_multimodal_resume_pos(session, &prompt,
+                                             images, 2) == 0);
+
+    /* The predicate is independently defensive: appended spans must remain
+     * ordered and non-overlapping even before sync-time validation runs. */
+    ds4_vision_span three_images[3] = {original, {0}, {0}};
+    three_images[1] = images[1];
+    three_images[1].token_start = 160;
+    three_images[2] = images[1];
+    three_images[2].token_start = 163;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(session, three_images, 3));
+    three_images[2].token_start = 164;
+    TEST_ASSERT(ds4_session_vision_prefix_matches(session, three_images, 3));
+    three_images[2].embedding.token_count = 0;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(session, three_images, 3));
+
+    ds4_session_free_test_checkpoint(session);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -19406,6 +19510,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
+    test_multimodal_appended_image_reuses_live_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();

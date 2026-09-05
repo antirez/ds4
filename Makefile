@@ -67,6 +67,11 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
+# ds4_test needs opaque-session constructors that must not ship in production
+# binaries. Build the core with test fixtures instead of exporting them from
+# the normal ds4.o.
+TEST_CORE_OBJS = ds4_test_core.o $(filter-out ds4.o,$(CORE_OBJS))
+
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
@@ -279,6 +284,9 @@ endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_test_core.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+	$(CC) $(CFLAGS) -DDS4_SERVER_TEST -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_image.c
@@ -637,11 +645,11 @@ test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 endif
 
-ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(DS4_LINK) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(TEST_CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
 ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)

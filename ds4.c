@@ -66392,24 +66392,32 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  */
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 
-static bool ds4_session_vision_prefix_matches(
+bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
         size_t                 image_count) {
     if (!s || (image_count != 0 && !images)) return false;
     if (!s->checkpoint_valid) return true;
     if (s->checkpoint_image_count > image_count) return false;
-    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
-        const ds4_vision_identity *old = &s->checkpoint_images[i];
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
         const ds4_vision_span *current = &images[i];
+        const uint64_t end = (uint64_t)current->token_start +
+                             current->embedding.token_count;
+        if (current->embedding.token_count == 0 ||
+            current->token_start < previous_end) return false;
+        previous_end = end;
+
+        if (i >= s->checkpoint_image_count) {
+            if (current->token_start < (uint32_t)s->checkpoint.len)
+                return false;
+            continue;
+        }
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
         if (old->token_start != current->token_start ||
             old->token_count != current->embedding.token_count ||
             memcmp(old->fingerprint, current->embedding.fingerprint,
                    sizeof(old->fingerprint)) != 0) return false;
-    }
-    if (s->checkpoint_image_count < image_count) {
-        const ds4_vision_span *next = &images[s->checkpoint_image_count];
-        if (next->token_start < (uint32_t)s->checkpoint.len) return false;
     }
     return true;
 }
@@ -75142,6 +75150,41 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }
+
+#ifdef DS4_SERVER_TEST
+/* Test fixture support.  The test target links a dedicated ds4_test_core.o,
+ * so these helpers are absent from normal ds4 and ds4-server binaries. */
+ds4_session *ds4_session_new_test_vision_checkpoint(
+        const int *tokens, int n,
+        const ds4_vision_span *images, size_t image_count) {
+    if (n < 0 || (n != 0 && !tokens) ||
+        (image_count != 0 && !images)) return NULL;
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    s->checkpoint_valid = true;
+    if (image_count != 0) {
+        s->checkpoint_images = xcalloc(image_count,
+                                       sizeof(s->checkpoint_images[0]));
+        s->checkpoint_image_count = image_count;
+        for (size_t i = 0; i < image_count; i++) {
+            s->checkpoint_images[i].token_start = images[i].token_start;
+            s->checkpoint_images[i].token_count =
+                images[i].embedding.token_count;
+            memcpy(s->checkpoint_images[i].fingerprint,
+                   images[i].embedding.fingerprint,
+                   sizeof(s->checkpoint_images[i].fingerprint));
+        }
+    }
+    return s;
+}
+
+void ds4_session_free_test_checkpoint(ds4_session *s) {
+    if (!s) return;
+    token_vec_free(&s->checkpoint);
+    free(s->checkpoint_images);
+    free(s);
+}
+#endif
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;

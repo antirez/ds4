@@ -428,14 +428,28 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
-/* Return true only when every image that conditioned the live checkpoint has
- * the same token span and embedding fingerprint in the supplied prompt. */
+/* Return true when every image that conditioned the live checkpoint has the
+ * same token span and embedding fingerprint in the supplied prompt. All spans
+ * must be ordered and non-overlapping; every extra span must start at or beyond
+ * the live token frontier. */
+bool ds4_session_vision_prefix_matches(const ds4_session *s,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
+/* Return true only when the supplied prompt has exactly the same image state
+ * as the live checkpoint. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+#ifdef DS4_SERVER_TEST
+/* Lightweight checkpoint shell for server cache-routing tests. */
+ds4_session *ds4_session_new_test_vision_checkpoint(
+        const int *tokens, int n,
+        const ds4_vision_span *images, size_t image_count);
+void ds4_session_free_test_checkpoint(ds4_session *s);
+#endif
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
