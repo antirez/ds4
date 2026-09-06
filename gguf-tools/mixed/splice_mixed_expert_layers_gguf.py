@@ -61,6 +61,7 @@ GGML_QUANT_SIZES = {
     12: (256, 144, "Q4_K"),
     16: (256, 66, "IQ2_XXS"),
     26: (1, 4, "I32"),
+    39: (32, 17, "MXFP4"),
 }
 
 EXPERT_TENSOR_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
