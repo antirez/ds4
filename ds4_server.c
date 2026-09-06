@@ -13408,18 +13408,36 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* Rank an idle slot for a job by the prompt tokens it would reuse minus the
+ * resident tokens it would destroy. Dispatching to a slot rebuilds everything
+ * past the common prefix, so the (resident - common) tokens of whatever
+ * conversation lived there are lost to that conversation's next turn. Scoring
+ * by common prefix alone let a shared chat-template preamble outbid an empty
+ * slot, so two conversations that alternate (each doing tool work while the
+ * other generates) ping-ponged through slot 0 and re-prefilled from scratch
+ * every turn while slot 1 idled. A conversation continuing in its own slot
+ * has common == resident and always scores highest; a new conversation
+ * prefers an empty slot (0) over evicting anything larger than twice its
+ * shared preamble. Ties still resolve to the lowest slot id. */
+static int slot_reuse_score(int common, int resident) {
+    if (common < 0) common = 0;
+    if (resident < common) resident = common;
+    return common - (resident - common);
+}
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
-    if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_state_matches(slot->session,
-                                          j->req.images, j->req.image_count)) {
-        return -1;
+    const int resident = ds4_session_pos(slot->session);
+    int common = 0;
+    if (resident > 0 &&
+        ds4_session_vision_state_matches(slot->session,
+                                         j->req.images, j->req.image_count)) {
+        common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     }
-    int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+    return slot_reuse_score(common, resident);
 }
 
 static void dispatch_jobs_locked(server *s) {
@@ -14823,6 +14841,28 @@ static void test_server_bind_slot(server *s, server_slot *slot) {
     slot->id = 0;
     s->slots = slot;
     s->slot_count = 1;
+}
+
+static void test_slot_reuse_score(void) {
+    /* Two empty slots tie at 0 (dispatch then takes the lowest id). */
+    TEST_ASSERT(slot_reuse_score(0, 0) == 0);
+    /* A conversation continuing in its own slot beats an empty one. */
+    TEST_ASSERT(slot_reuse_score(30000, 30000) > slot_reuse_score(0, 0));
+    /* ...and beats another slot that only shares the template preamble. */
+    TEST_ASSERT(slot_reuse_score(30000, 30000) > slot_reuse_score(400, 5000));
+    /* A new conversation sharing only a 400-token preamble with a 30k
+     * resident conversation must take the empty slot, not evict it. */
+    TEST_ASSERT(slot_reuse_score(400, 30000) < slot_reuse_score(0, 0));
+    /* With no empty slot, evict the one that loses fewer tokens. */
+    TEST_ASSERT(slot_reuse_score(400, 5000) > slot_reuse_score(400, 30000));
+    /* Reusing most of a slot still wins over an empty one (tool-call
+     * continuation where the tail was rewritten). */
+    TEST_ASSERT(slot_reuse_score(9000, 10000) > slot_reuse_score(0, 0));
+    /* Vision mismatch is scored as a full eviction (common forced to 0). */
+    TEST_ASSERT(slot_reuse_score(0, 5000) < slot_reuse_score(0, 0));
+    /* Defensive clamps. */
+    TEST_ASSERT(slot_reuse_score(-5, 10) == slot_reuse_score(0, 10));
+    TEST_ASSERT(slot_reuse_score(10, 5) == slot_reuse_score(10, 10));
 }
 
 static void test_batched_prefill_round_robin(void) {
@@ -19845,6 +19885,7 @@ static void test_metrics_text(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_metrics_text();
+    test_slot_reuse_score();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
