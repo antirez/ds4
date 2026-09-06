@@ -11979,6 +11979,19 @@ __device__ static float softplus_dev(float x) {
     return log1pf(expf(x));
 }
 
+/* Keep malformed router inputs out of the fixed-size top-k ordering. */
+__device__ __forceinline__ static float router_prob_dev(float logit) {
+    const float p = sqrtf(softplus_dev(logit));
+    return isfinite(p) ? p : 0.0f;
+}
+
+__device__ __forceinline__ static float router_bias_dev(
+        const float *bias, int has_bias, int index) {
+    if (!has_bias) return 0.0f;
+    const float value = bias[index];
+    return isfinite(value) ? value : 0.0f;
+}
+
 __global__ static void router_select_kernel(
         int32_t *selected,
         float *weights,
@@ -11999,7 +12012,7 @@ __global__ static void router_select_kernel(
     int32_t *sel = selected + (uint64_t)t * 6;
     float *w = weights + (uint64_t)t * 6;
 
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (int i = 0; i < 256; i++) prob[i] = router_prob_dev(log[i]);
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
@@ -12009,9 +12022,10 @@ __global__ static void router_select_kernel(
     } else {
         for (int i = 0; i < 6; i++) sel[i] = -1;
         for (int i = 0; i < 256; i++) {
-            float score = prob[i] + (has_bias ? bias[i] : 0.0f);
+            float score = prob[i] + router_bias_dev(bias, has_bias, i);
             for (int j = 0; j < 6; j++) {
-                if (sel[j] < 0 || score > prob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
+                if (sel[j] < 0 || score > prob[sel[j]] +
+                                      router_bias_dev(bias, has_bias, sel[j])) {
                     for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
                     sel[j] = i;
                     break;
@@ -12053,7 +12067,7 @@ __global__ static void router_select_parallel_kernel(
     float *w = weights + (uint64_t)t * 6;
     __shared__ float sprob[256];
 
-    const float p = sqrtf(softplus_dev(log[i]));
+    const float p = router_prob_dev(log[i]);
     sprob[i] = p;
     prob[i] = p;
     __syncthreads();
@@ -12067,9 +12081,10 @@ __global__ static void router_select_parallel_kernel(
     } else {
         for (int j = 0; j < 6; j++) sel[j] = -1;
         for (int e = 0; e < 256; e++) {
-            float score = sprob[e] + (has_bias ? bias[e] : 0.0f);
+            float score = sprob[e] + router_bias_dev(bias, has_bias, e);
             for (int j = 0; j < 6; j++) {
-                if (sel[j] < 0 || score > sprob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
+                if (sel[j] < 0 || score > sprob[sel[j]] +
+                                      router_bias_dev(bias, has_bias, sel[j])) {
                     for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
                     sel[j] = e;
                     break;
@@ -12188,9 +12203,9 @@ __global__ static void router_select_warp_topk_kernel(
     #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
+        const float p = router_prob_dev(log[e]);
         local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
+        local_score[j] = p + router_bias_dev(bias, has_bias, e);
         sprob[row_in_block][e] = p;
         prob[e] = p;
     }
