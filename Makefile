@@ -136,6 +136,56 @@ bench-cuda-q4-prefill-dequant: tests/test_cuda_q4_prefill_dequant
 bench-rocm-q4-prefill-dequant: tests/test_rocm_q4_prefill_dequant
 	./tests/test_rocm_q4_prefill_dequant --bench
 
+.PHONY: test-metal-raw-kv-ring test-cuda-raw-kv-ring test-rocm-raw-kv-ring test-metal-moe-contracts test-rocm-iq2-prefill test-rocm-mxfp4-lds-ownership test-cuda-kernel-contracts test-gpu-raw-kv-ownership
+
+tests/test_metal_raw_kv_ring.o: tests/test_gpu_raw_kv_ring.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_metal_raw_kv_ring: tests/test_metal_raw_kv_ring.o ds4_image.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-metal-raw-kv-ring: tests/test_metal_raw_kv_ring
+	./tests/test_metal_raw_kv_ring
+
+tests/test_cuda_raw_kv_ring.o: tests/test_gpu_raw_kv_ring.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_cuda_raw_kv_ring: tests/test_cuda_raw_kv_ring.o ds4_image.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-cuda-raw-kv-ring: tests/test_cuda_raw_kv_ring
+	./tests/test_cuda_raw_kv_ring
+
+tests/test_rocm_raw_kv_ring.o: tests/test_gpu_raw_kv_ring.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_raw_kv_ring: tests/test_rocm_raw_kv_ring.o ds4_image.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-raw-kv-ring: tests/test_rocm_raw_kv_ring
+	./tests/test_rocm_raw_kv_ring
+
+test-metal-moe-contracts: tests/test_metal_ssd_decode_kernels
+	./tests/test_metal_ssd_decode_kernels --moe-contracts
+
+tests/test_rocm_iq2_prefill.o: tests/test_rocm_iq2_prefill.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_iq2_prefill: tests/test_rocm_iq2_prefill.o ds4_image.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-iq2-prefill: tests/test_rocm_iq2_prefill
+	./tests/test_rocm_iq2_prefill
+
+test-rocm-mxfp4-lds-ownership:
+	python3 tests/test_rocm_mxfp4_lds_ownership.py
+
+test-cuda-kernel-contracts:
+	python3 tests/test_cuda_kernel_contracts.py
+
+test-gpu-raw-kv-ownership:
+	python3 tests/test_gpu_raw_kv_ownership.py
+
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-q4-dense-pair-bench metal-q4-prefill-pair-bench metal-q4-mm-tail-cull-bench metal-q4-attn-out-a-direct-bench metal-iq2-moe-tail-cull-bench metal-iq2-moe-top8-pair-bench check-mxfp4-half-lut test-mxfp4-metal
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
@@ -1441,6 +1491,7 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	./tests/test_quality_api
 
 clean:
+	rm -f tests/test_metal_raw_kv_ring tests/test_cuda_raw_kv_ring tests/test_rocm_raw_kv_ring tests/test_rocm_iq2_prefill
 	rm -f tests/test_q4_prefill_reduce_host tests/test_q4_prefill_reduce_host_fast tests/test_cuda_q4_prefill_reduce
 	rm -f tests/test_rocm_q4_dot_host tests/test_rocm_q4_dot_host_fast
 	rm -f tests/test_rocm_q4_qb_epilogue_host tests/test_rocm_q4_qb_epilogue_host_fast tests/test_rocm_q4_qb_epilogue

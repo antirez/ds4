@@ -615,6 +615,7 @@ int main(void) {
             const char *name;
             const char *value;
         } variant_envs[] = {
+            { "DS4_ROCM_ENABLE_MXFP4_LDSB", "1" },
             { "DS4_ROCM_ENABLE_MXFP4_TILE4", "1" },
             { "DS4_ROCM_ENABLE_MXFP4_ROW64", "1" },
             { "DS4_ROCM_MXFP4_DOWN_RGROUP", "4" },

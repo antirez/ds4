@@ -1758,9 +1758,11 @@ kernel void kernel_glm_q5_K_down_f32(
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[selected_base + slot];
         if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                                args.tp_rank, args.tp_world)) continue;
         device const block_q5_K *x =
             (device const block_q5_K *)(down +
-                (uint64_t)(uint)expert * args.down_expert_bytes +
+                (uint64_t)(uint)(expert - args.tp_expert_base) * args.down_expert_bytes +
                 (uint64_t)row0 * args.down_row_bytes);
         device const float *y = mid + mid_base + (uint64_t)slot * args.mid_dim;
         device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
@@ -2356,9 +2358,11 @@ kernel void kernel_glm_q6_K_down_f32(
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[selected_base + slot];
         if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                                args.tp_rank, args.tp_world)) continue;
         device const block_q6_K *x =
             (device const block_q6_K *)(down +
-                (uint64_t)(uint)expert * args.down_expert_bytes +
+                (uint64_t)(uint)(expert - args.tp_expert_base) * args.down_expert_bytes +
                 (uint64_t)row0 * args.down_row_bytes);
         device const float *yy = mid + mid_base + (uint64_t)slot * args.mid_dim;
 
@@ -10109,6 +10113,35 @@ template [[host_name("kernel_mul_mm_id_addr_q2_K_f16")]]    kernel mul_mm_id_add
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mxfp4_f16")]]   kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
 
+// Gather each expert's activation tile once for reuse by all output tiles.
+// The map stores interleaved (count, route base) pairs and compact route IDs.
+template<typename T>
+kernel void kernel_moe_pack_rhs(
+        constant ds4_metal_args_mul_mm_id &args,
+        device const char *src,
+        device const uint *tpe,
+        device const int *ids,
+        device const uint *work,
+        device half *dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    constexpr int N = 32;
+    const uint wi = row/N;
+    if (wi >= work[0]) return;
+    const uint2 item = ((device const uint2 *)(work + 2))[wi];
+    if (!ds4_tp_owns_expert(item.x, args.ne02, args.tp_rank, args.tp_world)) return;
+    const uint ri = min(item.y + row%N, tpe[2u*item.x] - 1);
+    const int id = ids[tpe[2u*item.x + 1u] + ri];
+    device const T *x = (device const T *)(src +
+        args.nb12*(id/args.ne20) + args.nb11*((id%args.ne20)%args.ne11));
+    for (uint k = tid; k < (uint)args.ne00; k += 128)
+        dst[(uint64_t)row*args.ne00 + k] = (half)x[k];
+}
+
+typedef decltype(kernel_moe_pack_rhs<float>) moe_pack_rhs_t;
+template [[host_name("kernel_moe_pack_rhs_f32")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<float>;
+template [[host_name("kernel_moe_pack_rhs_f16")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<half>;
+
 #ifdef DS4_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill. It uses
 // the same direct-RHS idea as dense matmul: dequantize the Q8_0 or Q4_K low
@@ -10237,41 +10270,13 @@ kernel void kernel_attn_out_low_mpp_direct_rhs(
     }
 }
 
-// Gather each expert's activation tile once for reuse by all output tiles.
-template<typename T>
-kernel void kernel_moe_pack_rhs(
-        constant ds4_metal_args_mul_mm_id &args,
-        device const char *src,
-        device const uint *counts,
-        device const int *ids,
-        device const uint *work,
-        device half *dst,
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]]) {
-    constexpr int N = 32;
-    const uint wi = row/N;
-    if (wi >= work[0]) return;
-    const uint2 item = ((device const uint2 *)(work + 2))[wi];
-    if (!ds4_tp_owns_expert(item.x, args.ne02, args.tp_rank, args.tp_world)) return;
-    const uint ri = min(item.y + row%N, counts[item.x] - 1);
-    const int id = ids[item.x*args.ne21 + ri];
-    device const T *x = (device const T *)(src +
-        args.nb12*(id/args.ne20) + args.nb11*((id%args.ne20)%args.ne11));
-    for (uint k = tid; k < (uint)args.ne00; k += 128)
-        dst[(uint64_t)row*args.ne00 + k] = (half)x[k];
-}
-
-typedef decltype(kernel_moe_pack_rhs<float>) moe_pack_rhs_t;
-template [[host_name("kernel_moe_pack_rhs_f32")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<float>;
-template [[host_name("kernel_moe_pack_rhs_f16")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<half>;
-
 template<typename block_q, short nl,
          void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 kernel void kernel_mul_mm_id_mpp_packed(
         constant ds4_metal_args_mul_mm_id &args,
         device const char *src0,
         device const half *src1,
-        device const uint *counts,
+        device const uint *tpe,
         device const int *ids,
         device float *dst,
         device const uint *work,
@@ -10283,11 +10288,12 @@ kernel void kernel_mul_mm_id_mpp_packed(
     const uint2 item = ((device const uint2 *)(work + 2))[group.x];
     const int expert = item.x, r0 = group.y*M, r1 = item.y;
     const int nr0 = min(M, args.ne0 - r0);
-    const int nr1 = min(N, (int)counts[expert] - r1);
+    const int nr1 = min(N, (int)tpe[2u*expert] - r1);
+    const uint route_base = tpe[2u*expert + 1u];
     if (nr0 <= 0 || nr1 <= 0) return;
     if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) {
         for (int i = tid; i < nr1*nr0; i += 128) {
-            const int id = ids[expert*args.ne21 + r1 + i/nr0];
+            const int id = ids[route_base + r1 + i/nr0];
             dst[(uint64_t)(id/args.ne20)*args.ne1*args.ne0 +
                 (id%args.ne20)*args.ne0 + r0 + i%nr0] = 0;
         }
@@ -10333,7 +10339,7 @@ kernel void kernel_mul_mm_id_mpp_packed(
     acc.store(tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = tid; i < nr1*nr0; i += 128) {
-        const int id = ids[expert*args.ne21 + r1 + i/nr0];
+        const int id = ids[route_base + r1 + i/nr0];
         dst[(uint64_t)(id/args.ne20)*args.ne1*args.ne0 +
             (id%args.ne20)*args.ne0 + r0 + i%nr0] =
             ((threadgroup float *)shmem)[(i/nr0)*M + i%nr0];

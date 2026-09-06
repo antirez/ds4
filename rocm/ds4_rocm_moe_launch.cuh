@@ -1632,8 +1632,10 @@ static int routed_moe_launch(
             }
         }
         const uint32_t iq2_gate_scalar_max = iq2_gate_hot_count != 0u ? iq2_gate_hot_threshold : 0u;
+        /* Only the Q2 down path consumes half intermediates. IQ2 down
+         * quantizes mid->ptr as F32, so its hot experts must write there. */
         const int use_iq2_hot_f16_mid =
-            ((use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
+            iq2_path && ((use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
               iq2_gate_hot_threshold == iq2_down_hot_threshold) ||
              use_rocm_mmq_gateup) &&
             (out_dim & 1u) == 0u && !g_quality_mode;

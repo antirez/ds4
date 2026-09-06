@@ -2437,6 +2437,8 @@ int ds4_gpu_store_raw_kv_tensor(
         uint32_t                row,
         uint32_t                head_dim);
 
+/* Store with float(half(x)) rounding. If the batch exceeds raw_cap, retain
+ * only its final raw_cap rows at (pos0 + source_row) % raw_cap. */
 int ds4_gpu_store_raw_kv_batch_tensor(
         ds4_gpu_tensor       *raw_cache,
         const ds4_gpu_tensor *kv,

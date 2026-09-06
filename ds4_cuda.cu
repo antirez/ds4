@@ -11820,12 +11820,13 @@ __global__ static void matmul_q8_0_preq_batch_tok2_exact_kernel(
  * the remaining levels. Fuzz-verified bitwise against both reference
  * kernels across shapes, including blocks < T and ragged out_dim/n_tok.
  * Rollback: DS4_CUDA_NO_Q8_MMA=1. */
-__device__ __forceinline__ static uint32_t ldu32_unaligned(const uint8_t *p) {
+/* Q8_0 blocks and their qs offsets are two-byte aligned. Read exactly the
+ * requested four bytes, including the final word of an unpadded weight row. */
+__device__ __forceinline__ static uint32_t ldu32_half_aligned(const uint8_t *p) {
     const uintptr_t addr = (uintptr_t)p;
-    const uint32_t *base = (const uint32_t *)(addr & ~(uintptr_t)3);
-    const uint32_t lo = base[0];
-    const uint32_t hi = base[1];
-    return __funnelshift_r(lo, hi, (uint32_t)(addr & 3u) * 8u);
+    if ((addr & 3u) == 0u) return *(const uint32_t *)p;
+    const uint16_t *halves = (const uint16_t *)p;
+    return (uint32_t)halves[0] | ((uint32_t)halves[1] << 16u);
 }
 
 __device__ __forceinline__ static void mma_m16n8k32_s8(
@@ -11932,8 +11933,8 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
                 const uint32_t a2 = a_lo_ok ? *(const uint32_t *)(ablk_lo + 16u + koff) : 0u;
                 const uint32_t a3 = a_hi_ok ? *(const uint32_t *)(ablk_hi + 16u + koff) : 0u;
                 const uint8_t *bq = (const uint8_t *)(b_wr + (uint64_t)b * 34u + 2u);
-                const uint32_t b0 = ldu32_unaligned(bq + koff);
-                const uint32_t b1 = ldu32_unaligned(bq + 16u + koff);
+                const uint32_t b0 = ldu32_half_aligned(bq + koff);
+                const uint32_t b1 = ldu32_half_aligned(bq + 16u + koff);
                 int32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                 mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
                 /* term = ws * xs * dot, same expression as reference */
@@ -13012,11 +13013,13 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
 
 __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_tokens * head_dim;
+    const uint32_t first = n_tokens > raw_cap ? n_tokens - raw_cap : 0u;
+    uint64_t n = (uint64_t)(n_tokens - first) * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
-    uint32_t t = gid / head_dim;
-    uint32_t row = (pos0 + t) % raw_cap;
+    /* Only the surviving suffix owns ring rows, so no writers can collide. */
+    uint32_t t = first + gid / head_dim;
+    uint32_t row = ((uint64_t)pos0 + t) % raw_cap;
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
 }
 
@@ -20479,16 +20482,24 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(logits_row);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus ||
+        ds4_tensor_device_idx(out_idx) != logical_tier) {
+        return 0;
+    }
+    int dev_save = 0;
+    if (cudaGetDevice(&dev_save) != cudaSuccess) return 0;
+    const int target_device = g_gpu[logical_tier].device_id;
+    if (target_device != dev_save && cudaSetDevice(target_device) != cudaSuccess) {
+        return 0;
+    }
     const unsigned char *w1_row = (const unsigned char *)cuda_resolve_weight_ptr(
             model_map, w1_offset + (uint64_t)prev_token * row_bytes,
             row_bytes, logical_tier, "markov_w1_row");
     const unsigned char *w2 = (const unsigned char *)cuda_resolve_weight_ptr(
             model_map, w2_offset, (uint64_t)vocab * row_bytes,
             logical_tier, "markov_w2");
-    if (!w1_row || !w2) return 0;
-    int dev_save = 0;
-    if (cudaGetDevice(&dev_save) != cudaSuccess) return 0;
-    if (logical_tier != dev_save && cudaSetDevice(logical_tier) != cudaSuccess) {
+    if (!w1_row || !w2) {
+        if (target_device != dev_save) (void)cudaSetDevice(dev_save);
         return 0;
     }
     int rc = cudaMemsetAsync(out_idx->ptr, 0,
@@ -20500,7 +20511,7 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
                 w1_row, w2, vocab, rank_blocks, NULL, NULL);
         rc = cuda_ok(cudaGetLastError(), "dspark markov argmax launch");
     }
-    if (logical_tier != dev_save) (void)cudaSetDevice(dev_save);
+    if (target_device != dev_save) (void)cudaSetDevice(dev_save);
     return rc;
 }
 
@@ -23682,10 +23693,11 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
+    if (!raw_cache || !kv || raw_cap == 0 || n_tokens == 0 || head_dim == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
-    uint64_t n = (uint64_t)n_tokens * head_dim;
+    const uint32_t stored_tokens = n_tokens < raw_cap ? n_tokens : raw_cap;
+    uint64_t n = (uint64_t)stored_tokens * head_dim;
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }

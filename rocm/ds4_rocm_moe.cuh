@@ -2307,11 +2307,14 @@ __global__ static void moe_gate_up_mid_mxfp4_expert_row8_ldsB_kernel(
     const uint32_t row_in = qwarp & 7u;                /* row within the block's 8 */
     const uint32_t tok_grp = qwarp >> 3u;              /* 4 token groups of 8 per round */
     const uint32_t row = row0 + row_in;
-    const uint32_t avail = count - local_start;
+    /* Tile starts advance by 128; each CTA owns only its tile, not the
+     * remaining suffix of the expert's assignments. */
+    const uint32_t avail = min(count - local_start, 128u);
+    const uint32_t tile_end = local_start + avail;
 
     for (uint32_t round = 0u; round * 32u < avail; round++) {
         const uint32_t t0 = local_start + round * 32u + tok_grp * 8u;
-        uint32_t np = (t0 < count) ? count - t0 : 0u;
+        uint32_t np = (t0 < tile_end) ? tile_end - t0 : 0u;
         if (np > 8u) np = 8u;
         uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         const cuda_block_q8_K *xqb[8] = { xq, xq, xq, xq, xq, xq, xq, xq };

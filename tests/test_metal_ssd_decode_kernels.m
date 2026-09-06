@@ -37,10 +37,38 @@ typedef struct {
 } act_args;
 typedef struct { uint16_t d, dmin; uint8_t scales[12], qs[128]; } q4_block;
 typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+typedef struct { uint16_t d, dmin; uint8_t scales[12], qh[32], qs[128]; } q5_block;
+typedef struct { uint8_t ql[128], qh[64]; int8_t scales[16]; uint16_t d; } q6_block;
+typedef struct {
+    uint32_t in_dim, mid_dim, out_dim, n_total_expert, n_expert_used, n_tokens;
+    uint32_t mid_token_stride, down_type;
+    float swiglu_clamp;
+    int32_t tp_rank, tp_world, tp_expert_base;
+    uint64_t gate_expert_bytes, gate_row_bytes, up_expert_bytes, up_row_bytes;
+    uint64_t down_expert_bytes, down_row_bytes;
+} glm_args;
+typedef struct {
+    int32_t ne02, ne10, ne11;
+    uint64_t nb11, nb12;
+    int32_t ne21, ne20;
+    uint64_t nb21;
+} map_args;
+typedef struct {
+    int32_t ne00, ne02;
+    uint64_t nb01, nb02, nb03;
+    int32_t ne11;
+    uint64_t nb10, nb11, nb12, nb13;
+    int32_t ne20, ne21, ne0, ne1;
+    int16_t r2, r3;
+    int32_t tp_rank, tp_world, tp_expert_base;
+} mm_id_args;
 _Static_assert(sizeof(mv_args) == 112, "mul_mv ABI");
 _Static_assert(sizeof(id_args) == 136, "mul_mv_id ABI");
 _Static_assert(sizeof(act_args) == 48, "SwiGLU ABI");
 _Static_assert(sizeof(q4_block) == 144 && sizeof(q8_block) == 34, "quant ABI");
+_Static_assert(sizeof(q5_block) == 176 && sizeof(q6_block) == 210, "GLM quant ABI");
+_Static_assert(sizeof(glm_args) == 96 && sizeof(map_args) == 48 &&
+               sizeof(mm_id_args) == 104, "GLM/map ABI");
 
 static void require(int ok, const char *message) {
     if (!ok) { fprintf(stderr, "SSD kernel test: %s\n", message); exit(1); }
@@ -596,12 +624,175 @@ static void bench_projection(projection_fixture *f, id<MTLCommandQueue> queue) {
            100.*(median[1]/median[0]-1.), median[2], median[3], 100.*(median[3]/median[2]-1.));
 }
 
+/* A full expert buffer with remote ids masked out is the oracle for a
+ * rank-local binding. Poisoned remote mid rows catch missing ownership checks
+ * without requiring a second machine or a distributed session. */
+static void test_glm_down_tp(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                             id<MTLLibrary> lib, BOOL q6, int tokens) {
+    enum { E = 8, K = 256, ROWS = 17, TOP = 6, STRIDE = TOP*K + 8 };
+    const NSUInteger row_bytes = q6 ? sizeof(q6_block) : sizeof(q5_block);
+    const NSUInteger expert_bytes = ROWS * row_bytes;
+    id<MTLBuffer> full = buffer(dev, E * expert_bytes);
+    uint32_t seed = 197;
+    for (int b = 0; b < E*ROWS; b++) {
+        if (q6) {
+            q6_block *w = (q6_block *)data(full) + b;
+            for (int i = 0; i < 128; i++) w->ql[i] = random_u32(&seed) >> 24;
+            for (int i = 0; i < 64; i++) w->qh[i] = random_u32(&seed) >> 24;
+            for (int i = 0; i < 16; i++) w->scales[i] = (int)(random_u32(&seed)%31)-15;
+            w->d = 0x2000 + b;
+        } else {
+            q5_block *w = (q5_block *)data(full) + b;
+            for (int i = 0; i < 128; i++) w->qs[i] = random_u32(&seed) >> 24;
+            for (int i = 0; i < 32; i++) w->qh[i] = random_u32(&seed) >> 24;
+            for (int i = 0; i < 12; i++) w->scales[i] = random_u32(&seed) >> 24;
+            w->d = 0x2000 + b; w->dmin = 0x1800 + b;
+        }
+    }
+    id<MTLComputePipelineState> p = pipeline(dev, lib,
+        q6 ? @"kernel_glm_q6_K_down_f32" : @"kernel_glm_q5_K_down_f32", 2);
+    const int32_t selected[TOP] = {0, 4, 7, 3, -1, E};
+    for (int rank = 0; rank < 2; rank++) {
+        id<MTLBuffer> local = buffer(dev, E/2 * expert_bytes);
+        memcpy(data(local), (char *)data(full) + rank*E/2*expert_bytes, E/2*expert_bytes);
+        id<MTLBuffer> ids[2] = {buffer(dev, tokens*TOP*4), buffer(dev, tokens*TOP*4)};
+        id<MTLBuffer> mid = output(dev, tokens*STRIDE);
+        for (int t = 0; t < tokens; t++) for (int s = 0; s < TOP; s++) {
+            const int e = selected[(s+t)%TOP];
+            const BOOL owned = e >= rank*E/2 && e < (rank+1)*E/2;
+            ((int32_t *)data(ids[0]))[t*TOP+s] = owned ? e : -1;
+            ((int32_t *)data(ids[1]))[t*TOP+s] = e;
+            if (owned) for (int k = 0; k < K; k++)
+                ((float *)data(mid))[t*STRIDE+s*K+k] = ((k*13+s*7+t)%97-48)/64.f;
+        }
+        id<MTLBuffer> out[2] = {output(dev, tokens*ROWS), output(dev, tokens*ROWS)};
+        const uint64_t full_hash = hash(full), local_hash = hash(local), mid_hash = hash(mid);
+        for (int arm = 0; arm < 2; arm++) {
+            glm_args args = {.in_dim=K, .mid_dim=K, .out_dim=ROWS,
+                .n_total_expert=E, .n_expert_used=TOP, .n_tokens=tokens,
+                .mid_token_stride=STRIDE, .down_type=q6 ? 14 : 13,
+                .tp_rank=arm ? rank : 0, .tp_world=arm ? 2 : 1,
+                .tp_expert_base=arm ? rank*E/2 : 0,
+                .down_expert_bytes=expert_bytes, .down_row_bytes=row_bytes};
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:p];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:arm ? local : full offset:GUARD atIndex:1];
+            [enc setBuffer:ids[arm] offset:GUARD atIndex:2];
+            [enc setBuffer:mid offset:GUARD atIndex:3];
+            [enc setBuffer:out[arm] offset:GUARD atIndex:4];
+            const int rows_per_group = q6 ? 4 : 8;
+            [enc dispatchThreadgroups:MTLSizeMake((ROWS+rows_per_group-1)/rows_per_group, tokens, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
+            [enc endEncoding]; finish(cb);
+        }
+        equal_output(out[0], out[1], tokens, ROWS, ROWS);
+        require(hash(full) == full_hash && hash(local) == local_hash && hash(mid) == mid_hash,
+                "GLM down input mutated");
+    }
+}
+
+/* Check the production map and pack kernels against token/slot identities,
+ * including duplicate routes, empty experts, partial tiles and both RHS types.
+ * Packing itself uses no TensorOps, so this runs on pre-M5 hardware as well. */
+static void test_moe_pack(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                          id<MTLLibrary> lib, BOOL f16, int rhs_slots) {
+    enum { E = 16, T = 37, TOP = 6, K = 40, PAIRS = T*TOP };
+    const NSUInteger tpe_bytes = E*2*4, ids_bytes = PAIRS*4;
+    const NSUInteger work_off = (tpe_bytes + ids_bytes + 7) & ~7ul;
+    const NSUInteger tiles_cap = (PAIRS + 31*E + 31)/32;
+    id<MTLBuffer> map = buffer(dev, work_off + 8 + tiles_cap*8);
+    id<MTLBuffer> ids = buffer(dev, PAIRS*4);
+    int32_t *selected = data(ids);
+    for (int t = 0; t < T; t++) for (int s = 0; s < TOP; s++)
+        selected[t*TOP+s] = s < 3 ? 9 : (t*7+s*3)%13;
+    map_args ma = {.ne02=E, .ne10=K, .ne11=1, .ne21=T, .ne20=TOP, .nb21=TOP*4};
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline(dev, lib, @"kernel_mul_mm_id_map0_ne20_6", 2)];
+    [enc setBytes:&ma length:sizeof(ma) atIndex:0];
+    [enc setBuffer:ids offset:GUARD atIndex:1];
+    [enc setBuffer:map offset:GUARD atIndex:2];
+    [enc setBuffer:map offset:GUARD+tpe_bytes atIndex:3];
+    [enc setBuffer:map offset:GUARD+work_off atIndex:4];
+    [enc setThreadgroupMemoryLength:E*TOP*2 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(E, 1, 1)];
+    [enc endEncoding]; finish(cb);
+    uint32_t counts[E] = {0}, bases[E], route_ids[PAIRS], tile_experts[PAIRS], tile_starts[PAIRS];
+    uint32_t route = 0, tiles = 0;
+    const uint32_t *tpe = data(map);
+    const int32_t *mapped_ids = (const int32_t *)((const char *)data(map) + tpe_bytes);
+    const uint32_t *work = (const uint32_t *)((const char *)data(map) + work_off);
+    for (int e = 0; e < E; e++) {
+        bases[e] = route;
+        for (int i = 0; i < PAIRS; i++) if (selected[i] == e) {
+            counts[e]++;
+            require(mapped_ids[route] == i, "map lost token/slot identity");
+            route_ids[route++] = i;
+        }
+        require(tpe[2*e] == counts[e] && tpe[2*e+1] == bases[e], "map count/base mismatch");
+        for (uint32_t r = 0; r < counts[e]; r += 32) {
+            require(work[2+2*tiles] == (uint32_t)e && work[3+2*tiles] == r, "map tile mismatch");
+            tile_experts[tiles] = e; tile_starts[tiles++] = r;
+        }
+    }
+    require(route == PAIRS && work[0] == tiles, "map total mismatch");
+    const NSUInteger element_bytes = f16 ? 2 : 4;
+    id<MTLBuffer> src = buffer(dev, T*rhs_slots*K*element_bytes);
+    for (int i = 0; i < T*rhs_slots*K; i++) {
+        const float v = (i%997-498)/97.f;
+        if (f16) ((_Float16 *)data(src))[i] = (_Float16)v;
+        else ((float *)data(src))[i] = v;
+    }
+    const uint64_t src_hash = hash(src), map_hash = hash(map);
+    id<MTLComputePipelineState> p = pipeline(dev, lib,
+        f16 ? @"kernel_moe_pack_rhs_f16" : @"kernel_moe_pack_rhs_f32", 2);
+    for (int rank = -1; rank < 2; rank++) {
+        id<MTLBuffer> packed = buffer(dev, tiles_cap*32*K*2);
+        mm_id_args args = {.ne00=K, .ne02=E, .ne11=rhs_slots,
+            .nb10=element_bytes, .nb11=K*element_bytes, .nb12=rhs_slots*K*element_bytes,
+            .ne20=TOP, .ne21=T, .tp_rank=rank < 0 ? 0 : rank, .tp_world=rank < 0 ? 1 : 2};
+        cb = [queue commandBuffer]; enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:p];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:src offset:GUARD atIndex:1];
+        [enc setBuffer:map offset:GUARD atIndex:2];
+        [enc setBuffer:map offset:GUARD+tpe_bytes atIndex:3];
+        [enc setBuffer:map offset:GUARD+work_off atIndex:4];
+        [enc setBuffer:packed offset:GUARD atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(tiles_cap*32, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding]; finish(cb);
+        for (NSUInteger tile = 0; tile < tiles_cap; tile++) for (int row = 0; row < 32; row++) {
+            const BOOL owned = tile < tiles && (rank < 0 || tile_experts[tile]/(E/2) == (uint32_t)rank);
+            for (int k = 0; k < K; k++) {
+                uint16_t expected = 0xa5a5;
+                if (owned) {
+                    const uint32_t e = tile_experts[tile], r = tile_starts[tile]+row;
+                    const uint32_t id = route_ids[bases[e] + (r < counts[e] ? r : counts[e]-1)];
+                    const NSUInteger index = (id/TOP*rhs_slots + id%TOP%rhs_slots)*K+k;
+                    const _Float16 value = f16 ? ((_Float16 *)data(src))[index] : (_Float16)((float *)data(src))[index];
+                    memcpy(&expected, &value, sizeof(expected));
+                }
+                require(((uint16_t *)data(packed))[(tile*32+row)*K+k] == expected,
+                        "packed RHS row/slot/tail mismatch");
+            }
+        }
+        const uint8_t *bytes = packed.contents;
+        for (int i = 0; i < GUARD; i++)
+            require(bytes[i] == 0xa5 && bytes[packed.length-GUARD+i] == 0xa5, "pack guard overwritten");
+    }
+    require(hash(src) == src_hash && hash(map) == map_hash, "pack input mutated");
+}
+
 int main(int argc, char **argv) {
     BOOL bench = argc == 2 && strcmp(argv[1], "--bench-q8-mv") == 0;
     BOOL bench_q4 = argc == 2 && strcmp(argv[1], "--bench-q4-token-pair") == 0;
     BOOL bench_single = argc == 2 && strcmp(argv[1], "--bench-q4-single-vec") == 0;
-    if (argc > 1 && !bench && !bench_q4 && !bench_single) {
-        fprintf(stderr, "usage: %s [--bench-q8-mv|--bench-q4-token-pair|--bench-q4-single-vec]\n", argv[0]);
+    BOOL moe_contracts = argc == 2 && strcmp(argv[1], "--moe-contracts") == 0;
+    if (argc > 1 && !bench && !bench_q4 && !bench_single && !moe_contracts) {
+        fprintf(stderr, "usage: %s [--bench-q8-mv|--bench-q4-token-pair|--bench-q4-single-vec|--moe-contracts]\n", argv[0]);
         return 2;
     }
     @autoreleasepool {
@@ -615,6 +806,14 @@ int main(int argc, char **argv) {
         id<MTLLibrary> lib = [dev newLibraryWithSource:source options:[MTLCompileOptions new] error:&error];
         if (!lib) fprintf(stderr, "%s\n", error.description.UTF8String);
         require(lib != nil, "Metal library compilation failed");
+        if (argc == 1 || moe_contracts) {
+            for (int q6 = 0; q6 < 2; q6++) for (int tokens = 1; tokens <= 3; tokens += 2)
+                test_glm_down_tp(dev, queue, lib, q6, tokens);
+            for (int f16 = 0; f16 < 2; f16++) for (int slots = 1; slots <= SLOTS; slots += SLOTS-1)
+                test_moe_pack(dev, queue, lib, f16, slots);
+            printf("MoE contracts: Q5/Q6 rank-local down and compact-map F32/F16 packing passed.\n");
+            if (moe_contracts) return 0;
+        }
         int cases = 0;
         for (int addr = 0; addr < 2; ++addr) {
             NSString *base = addr ? @"kernel_mul_mv_addr_q4_K_pair_swiglu_f32" :

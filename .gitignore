@@ -20,6 +20,10 @@
 /tests/test_gpu_lookup_cache_strict
 /tests/test_gpu_model_cache
 /tests/test_gpu_xdev
+/tests/test_metal_raw_kv_ring
+/tests/test_cuda_raw_kv_ring
+/tests/test_rocm_raw_kv_ring
+/tests/test_rocm_iq2_prefill
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
 /tests/cuda_long_context_smoke

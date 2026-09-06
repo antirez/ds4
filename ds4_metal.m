@@ -29320,10 +29320,12 @@ static void ds4_gpu_set_rows_thread_shape(
 static int ds4_gpu_encode_f16_round_copy_for_raw_store(
         id<MTLCommandBuffer>   cb,
         const ds4_gpu_tensor *src,
+        uint64_t               src_off,
         uint32_t               n) {
     id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(src);
     const uint64_t src_bytes = (uint64_t)n * sizeof(float);
-    if (!srcbuf || ds4_gpu_tensor_bytes(src) < src_bytes) {
+    if (!srcbuf || src_off > ds4_gpu_tensor_bytes(src) ||
+        src_bytes > ds4_gpu_tensor_bytes(src) - src_off) {
         fprintf(stderr, "ds4: Metal raw KV store received undersized source buffer\n");
         return 0;
     }
@@ -29340,7 +29342,7 @@ static int ds4_gpu_encode_f16_round_copy_for_raw_store(
 
     if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
                                          srcbuf,
-                                         ds4_gpu_tensor_offset(src),
+                                         ds4_gpu_tensor_offset(src) + (NSUInteger)src_off,
                                          g_f16_round_scratch_buffer,
                                          0,
                                          n)) {
@@ -29470,7 +29472,7 @@ int ds4_gpu_store_raw_kv_tensor(
         if (!cb) return 0;
 
         const int32_t row_i32 = (int32_t)row;
-        if (!ds4_gpu_encode_f16_round_copy_for_raw_store(cb, kv, head_dim) ||
+        if (!ds4_gpu_encode_f16_round_copy_for_raw_store(cb, kv, 0, head_dim) ||
             !ds4_gpu_encode_set_rows_f32_i32(cb, raw_cache,
                                                g_raw_store_round_buffer,
                                                0,
@@ -29644,6 +29646,7 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                head_dim) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!raw_cache || !kv || raw_cap == 0 || n_tokens == 0 || head_dim == 0 || raw_cap > INT32_MAX) return 0;
+    if ((uint64_t)n_tokens * head_dim > UINT64_MAX / sizeof(float)) return 0;
 
     @autoreleasepool {
         const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
@@ -29652,17 +29655,22 @@ int ds4_gpu_store_raw_kv_batch_tensor(
             return 0;
         }
 
+        /* Only the newest raw_cap rows survive in the ring. Giving each
+         * destination one writer also avoids races between wrapped rows. */
+        const uint32_t n_store = n_tokens < raw_cap ? n_tokens : raw_cap;
+        const uint32_t first = n_tokens - n_store;
+        const uint64_t src_off = (uint64_t)first * head_dim * sizeof(float);
         int32_t rows_stack[512];
         int32_t *rows = rows_stack;
-        if (n_tokens > (uint32_t)(sizeof(rows_stack) / sizeof(rows_stack[0]))) {
-            rows = malloc((size_t)n_tokens * sizeof(*rows));
+        if (n_store > (uint32_t)(sizeof(rows_stack) / sizeof(rows_stack[0]))) {
+            rows = malloc((size_t)n_store * sizeof(*rows));
             if (!rows) {
                 fprintf(stderr, "ds4: failed to allocate raw KV set_rows index list\n");
                 return 0;
             }
         }
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            rows[t] = (int32_t)((pos0 + t) % raw_cap);
+        for (uint32_t t = 0; t < n_store; t++) {
+            rows[t] = (int32_t)(((uint64_t)pos0 + first + t) % raw_cap);
         }
 
         int owned = 0;
@@ -29672,14 +29680,14 @@ int ds4_gpu_store_raw_kv_batch_tensor(
             return 0;
         }
 
-        const uint64_t n = (uint64_t)n_tokens * head_dim;
+        const uint64_t n = (uint64_t)n_store * head_dim;
         const int ok = n <= UINT32_MAX &&
-            ds4_gpu_encode_f16_round_copy_for_raw_store(cb, kv, (uint32_t)n) &&
+            ds4_gpu_encode_f16_round_copy_for_raw_store(cb, kv, src_off, (uint32_t)n) &&
             ds4_gpu_encode_set_rows_f32_i32(cb, raw_cache,
                                                g_raw_store_round_buffer,
                                                0,
                                                rows,
-                                               n_tokens,
+                                               n_store,
                                                raw_cap,
                                                head_dim);
         if (rows != rows_stack) free(rows);
@@ -40590,8 +40598,10 @@ static int ds4_gpu_encode_moe_packed_rhs(
     if (!cb || !args || !src || !g_moe_id_map_buffer ||
         args->ne00 <= 0 || args->ne20 <= 0 || args->ne21 <= 0 || args->ne02 <= 0)
         return 0;
-    const uint64_t rows = (uint64_t)args->ne20*args->ne21;
-    const uint64_t tiles = (rows + 31u*(uint64_t)args->ne02 + 31u)/32u;
+    ds4_gpu_mul_mm_id_map_layout layout;
+    if (!ds4_gpu_make_mul_mm_id_map_layout(args, &layout) ||
+        g_moe_id_map_bytes < layout.total_bytes) return 0;
+    const uint64_t tiles = layout.work_cap;
     const uint64_t row_bytes = (uint64_t)args->ne00*sizeof(uint16_t);
     const NSUInteger tile_n = 32u;
     if (tiles > NSUIntegerMax/tile_n/row_bytes) return 0;
@@ -40599,9 +40609,6 @@ static int ds4_gpu_encode_moe_packed_rhs(
     if (bytes > 256u*1024u*1024u ||
         !ds4_gpu_ensure_scratch_buffer(&g_moe_packed_rhs_buffer,
             &g_moe_packed_rhs_bytes, bytes, "ds4_moe_packed_rhs")) return 0;
-    const NSUInteger counts_bytes = (NSUInteger)args->ne02*sizeof(uint32_t);
-    const NSUInteger ids_bytes = (NSUInteger)args->ne02*args->ne21*sizeof(int32_t);
-    const NSUInteger work_offset = (counts_bytes + ids_bytes + 7u) & ~7u;
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
         f16 ? "kernel_moe_pack_rhs_f16" : "kernel_moe_pack_rhs_f32");
     if (!pipeline) return 0;
@@ -40610,8 +40617,8 @@ static int ds4_gpu_encode_moe_packed_rhs(
     [enc setBytes:args length:sizeof(*args) atIndex:0];
     [enc setBuffer:src offset:offset atIndex:1];
     [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:2];
-    [enc setBuffer:g_moe_id_map_buffer offset:counts_bytes atIndex:3];
-    [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:4];
+    [enc setBuffer:g_moe_id_map_buffer offset:layout.tpe_bytes atIndex:3];
+    [enc setBuffer:g_moe_id_map_buffer offset:layout.work_offset atIndex:4];
     [enc setBuffer:g_moe_packed_rhs_buffer offset:0 atIndex:5];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tiles*tile_n, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
