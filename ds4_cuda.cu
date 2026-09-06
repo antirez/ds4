@@ -9598,6 +9598,38 @@ __device__ __forceinline__ void attention_compact_topk_stable(
     }
 }
 
+/* Preserve KV values and top-k slot order, including duplicates. Moving the
+ * selected rows once avoids repeating scattered memory reads across heads.
+ * The consumer below remains the original attention arithmetic. */
+__global__ static void attention_indexed_decode_gather_kernel(
+        float *staged, int32_t *staged_topk,
+        const float *raw, const float *comp, const int32_t *topk,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t visible_comp, uint32_t top_k, uint32_t head_dim) {
+    const uint32_t row = blockIdx.x;
+    const float *source = NULL;
+    if (row < n_raw) {
+        source = raw + (uint64_t)((raw_start + row) % raw_cap) * head_dim;
+    } else {
+        const uint32_t slot = row - n_raw;
+        const int32_t original = slot < top_k ? topk[slot] : -1;
+        const bool valid = original >= 0 && (uint32_t)original < visible_comp;
+        if (threadIdx.x == 0) staged_topk[slot] = valid ? (int32_t)slot : -1;
+        if (valid) source = comp + (uint64_t)original * head_dim;
+    }
+    float *dest = staged + (uint64_t)row * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+        dest[d] = source ? source[d] : 0.0f;
+}
+
+static bool cuda_tensor_overlaps_single_tmp(const ds4_gpu_tensor *tensor) {
+    if (!g_cuda_tmp || !tensor || !tensor->bytes) return false;
+    const uintptr_t base = (uintptr_t)g_cuda_tmp;
+    const uintptr_t ptr = (uintptr_t)tensor->ptr;
+    return ptr >= base ? ptr - base < g_cuda_tmp_bytes
+                       : base - ptr < tensor->bytes;
+}
+
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -18252,6 +18284,46 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                  n_head,
                                                                  head_dim);
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
+    }
+    /* Opt in only for the measured single-token shape. Other shapes and
+     * multi-device/capture calls retain the existing path. Scratch shares
+     * the established ordered allocator; no cross-call activation registry
+     * or retained pointer is introduced. Do not overwrite an input/output
+     * supplied from that slab. */
+    const char *gather = getenv("DS4_CUDA_INDEXED_DECODE_GATHER");
+    if (gather && strcmp(gather, "1") == 0 &&
+        g_n_gpus == 1 && logical_tier == 0 && !g_decode_graph_capturing &&
+        n_tokens == 1u && n_head == 64u && head_dim == 512u &&
+        top_k <= 512u &&
+        n_raw <= 256u && pos0 < UINT32_MAX && n_raw <= pos0 + 1u &&
+        ds4_tensor_device_idx(q) == 0 && ds4_tensor_device_idx(raw_kv) == 0 &&
+        ds4_tensor_device_idx(comp_kv) == 0 && ds4_tensor_device_idx(topk) == 0 &&
+        !cuda_tensor_overlaps_single_tmp(heads) &&
+        !cuda_tensor_overlaps_single_tmp(q) &&
+        !cuda_tensor_overlaps_single_tmp(raw_kv) &&
+        !cuda_tensor_overlaps_single_tmp(comp_kv) &&
+        !cuda_tensor_overlaps_single_tmp(topk)) {
+        const uint64_t kv_bytes = (uint64_t)(n_raw + 512u) * head_dim * sizeof(float);
+        float *staged = (float *)cuda_tmp_alloc_on(
+                logical_tier, kv_bytes + 512u * sizeof(int32_t),
+                "indexed decode KV gather");
+        if (staged) {
+            int32_t *staged_topk = (int32_t *)((char *)staged + kv_bytes);
+            const uint32_t visible = ratio ? std::min(n_comp, (pos0 + 1u) / ratio) : n_comp;
+            attention_indexed_decode_gather_kernel<<<n_raw + 512u, 256>>>(
+                    staged, staged_topk, (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr, topk_ptr, n_raw, raw_cap,
+                    raw_start, visible, top_k, head_dim);
+            if (!cuda_ok(cudaGetLastError(), "indexed decode gather launch")) return 0;
+            attention_indexed_mixed_kernel<<<dim3(1, n_head), 256>>>(
+                    (float *)heads->ptr, sinks, (const float *)q->ptr, staged,
+                    staged + (uint64_t)n_raw * head_dim, staged_topk,
+                    1u, pos0, n_raw, n_raw, 0u, 512u, top_k,
+                    window, 0u, n_head, head_dim);
+            return cuda_ok(cudaGetLastError(), "gathered indexed decode launch");
+        }
+        /* Failure to obtain optional staging must not remove the original
+         * attention implementation's ability to execute this request. */
     }
     dim3 grid(n_tokens, n_head, 1);
     attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
