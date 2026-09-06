@@ -54,3 +54,7 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/tests/test_qwen38_gdn
+/tests/test_qwen38_hc
+/tests/test_qwen38_ple_hash
+/tests/test_qwen38_qsa
