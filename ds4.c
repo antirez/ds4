@@ -40655,6 +40655,7 @@ static int sample_argmax_filtered(
             continue;
         }
         const float v = logits[i];
+        if (!isfinite(v)) continue;
         if (best < 0 || v > best_v) {
             best_v = v;
             best = (int)i;
@@ -40954,6 +40955,18 @@ static int sample_top_p_min_p(
 }
 
 #ifdef DS4_TEST_HOOKS
+int ds4_test_sample_logits_masked(const float *logits, uint32_t n_vocab,
+                                  float temperature, int top_k,
+                                  float top_p, float min_p,
+                                  const uint32_t *allow_mask, size_t allow_words,
+                                  const uint32_t *deny_mask, size_t deny_words,
+                                  uint64_t *rng, float *prob_scratch) {
+    if (!logits || !rng || n_vocab == 0 || !allow_mask) return -1;
+    return sample_top_p_min_p_filtered(logits, n_vocab, temperature, top_k,
+                                       top_p, min_p, allow_mask, allow_words,
+                                       deny_mask, deny_words, rng, prob_scratch);
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,

@@ -11,18 +11,12 @@
 #include "llguidance.h"
 #endif
 
-#ifndef UINT32_C
-#include <stdint.h>
-#endif
-
 struct ds4_llguidance {
 #ifdef DS4_USE_LLGUIDANCE
     LlgTokenizer *tokenizer;
     LlgMatcher *matcher;
-    const uint32_t *leading_ws_mask;
-    size_t leading_ws_words;
+    ds4_llguidance_cache *cache;
     size_t mask_words;
-    int n_vocab;
     int eos_token;
     bool deny_leading_ws;
     bool started;
@@ -41,16 +35,40 @@ bool ds4_llguidance_available(void) {
 
 #ifdef DS4_USE_LLGUIDANCE
 
-typedef struct {
+struct ds4_llguidance_cache {
     ds4_engine *engine;
+    pthread_mutex_t mu;
+    size_t refs;
     LlgTokenizer *tokenizer;
     uint32_t *leading_ws_mask;
-    size_t leading_ws_words;
+    size_t mask_words;
     int n_vocab;
-} ds4_llg_cache;
+};
 
-static pthread_mutex_t g_llg_cache_mu = PTHREAD_MUTEX_INITIALIZER;
-static ds4_llg_cache g_llg_cache = {0};
+ds4_llguidance_cache *ds4_llguidance_cache_create(ds4_engine *e) {
+    if (!e) return NULL;
+    ds4_llguidance_cache *cache = calloc(1, sizeof(*cache));
+    if (!cache) return NULL;
+    if (pthread_mutex_init(&cache->mu, NULL) != 0) {
+        free(cache);
+        return NULL;
+    }
+    cache->engine = e;
+    cache->refs = 1;
+    return cache;
+}
+
+void ds4_llguidance_cache_free(ds4_llguidance_cache *cache) {
+    if (!cache) return;
+    pthread_mutex_lock(&cache->mu);
+    const bool last = --cache->refs == 0;
+    pthread_mutex_unlock(&cache->mu);
+    if (!last) return;
+    if (cache->tokenizer) llg_free_tokenizer(cache->tokenizer);
+    free(cache->leading_ws_mask);
+    pthread_mutex_destroy(&cache->mu);
+    free(cache);
+}
 
 static void set_err(char *err, size_t errlen, const char *fmt, ...) {
     if (!err || errlen == 0) return;
@@ -239,111 +257,75 @@ static LlgTokenizer *build_tokenizer(ds4_engine *e,
     return tok;
 }
 
-static LlgTokenizer *cached_tokenizer_clone(ds4_engine *e,
-                                            const uint32_t **leading_ws_mask_out,
-                                            size_t *leading_ws_words_out,
-                                            int *n_vocab_out,
-                                            char *err,
-                                            size_t errlen) {
-    LlgTokenizer *clone = NULL;
-    pthread_mutex_lock(&g_llg_cache_mu);
-    if (g_llg_cache.engine != e || !g_llg_cache.tokenizer) {
-        if (g_llg_cache.tokenizer) llg_free_tokenizer(g_llg_cache.tokenizer);
-        free(g_llg_cache.leading_ws_mask);
-        memset(&g_llg_cache, 0, sizeof(g_llg_cache));
-
-        uint32_t *leading_ws = NULL;
-        size_t leading_ws_words = 0;
-        int n_vocab = 0;
-        LlgTokenizer *tok = build_tokenizer(e, &leading_ws, &leading_ws_words,
-                                            &n_vocab, err, errlen);
-        if (!tok) {
-            pthread_mutex_unlock(&g_llg_cache_mu);
+/* Each clone retains the immutable vocabulary data as well as the tokenizer. */
+static LlgTokenizer *cached_tokenizer_clone(ds4_llguidance_cache *cache,
+                                            char *err, size_t errlen) {
+    pthread_mutex_lock(&cache->mu);
+    if (!cache->tokenizer) {
+        cache->tokenizer = build_tokenizer(cache->engine, &cache->leading_ws_mask,
+                                           &cache->mask_words, &cache->n_vocab,
+                                           err, errlen);
+        if (!cache->tokenizer) {
+            pthread_mutex_unlock(&cache->mu);
             return NULL;
         }
-        g_llg_cache.engine = e;
-        g_llg_cache.tokenizer = tok;
-        g_llg_cache.leading_ws_mask = leading_ws;
-        g_llg_cache.leading_ws_words = leading_ws_words;
-        g_llg_cache.n_vocab = n_vocab;
     }
-
-    clone = llg_clone_tokenizer(g_llg_cache.tokenizer);
-    if (leading_ws_mask_out) *leading_ws_mask_out = g_llg_cache.leading_ws_mask;
-    if (leading_ws_words_out) *leading_ws_words_out = g_llg_cache.leading_ws_words;
-    if (n_vocab_out) *n_vocab_out = g_llg_cache.n_vocab;
-    pthread_mutex_unlock(&g_llg_cache_mu);
+    LlgTokenizer *clone = llg_clone_tokenizer(cache->tokenizer);
+    if (clone) cache->refs++;
+    pthread_mutex_unlock(&cache->mu);
     if (!clone) set_err(err, errlen, "llguidance tokenizer clone failed");
     return clone;
 }
 
-ds4_llguidance *ds4_llguidance_create(ds4_engine *e,
+ds4_llguidance *ds4_llguidance_create(ds4_llguidance_cache *cache,
                                       const char *constraint_type,
                                       const char *constraint_data,
-                                      char *err,
-                                      size_t errlen) {
-    if (!e || !constraint_type || !constraint_type[0]) {
+                                      char *err, size_t errlen) {
+    if (!cache || !constraint_type || !constraint_type[0]) {
         set_err(err, errlen, "invalid structured output constraint");
         return NULL;
     }
-
-    const uint32_t *leading_ws_mask = NULL;
-    size_t leading_ws_words = 0;
-    int n_vocab = 0;
-    LlgTokenizer *tok = cached_tokenizer_clone(e, &leading_ws_mask,
-                                               &leading_ws_words,
-                                               &n_vocab, err, errlen);
-    if (!tok) return NULL;
+    ds4_llguidance *g = calloc(1, sizeof(*g));
+    if (!g) {
+        set_err(err, errlen, "out of memory");
+        return NULL;
+    }
+    g->tokenizer = cached_tokenizer_clone(cache, err, errlen);
+    if (!g->tokenizer) goto bad;
+    g->cache = cache;
 
     LlgConstraintInit init;
-    llg_constraint_init_set_defaults(&init, tok);
+    llg_constraint_init_set_defaults(&init, g->tokenizer);
     const char *log_level = getenv("LLGUIDANCE_LOG_LEVEL");
     if (!log_level || !log_level[0]) log_level = getenv("DS4_LLGUIDANCE_LOG_LEVEL");
     if (log_level && log_level[0]) init.log_stderr_level = (uint32_t)atoi(log_level);
 
-    LlgMatcher *matcher = llg_new_matcher(&init, constraint_type,
-                                          constraint_data ? constraint_data : "");
-    const char *llg_err = matcher ? llg_matcher_get_error(matcher) : "allocation failed";
+    g->matcher = llg_new_matcher(&init, constraint_type,
+                                 constraint_data ? constraint_data : "");
+    const char *llg_err = g->matcher ? llg_matcher_get_error(g->matcher) : "allocation failed";
     if (llg_err) {
         set_err(err, errlen, "llguidance grammar error: %s", llg_err);
-        if (matcher) llg_free_matcher(matcher);
-        llg_free_tokenizer(tok);
-        return NULL;
+        goto bad;
     }
-
-    const size_t mask_bytes = llg_matcher_get_mask_byte_size(matcher);
-    const size_t expected = ((size_t)n_vocab + 31u) / 32u * sizeof(uint32_t);
-    if (mask_bytes != expected) {
+    const size_t mask_bytes = llg_matcher_get_mask_byte_size(g->matcher);
+    if (mask_bytes != cache->mask_words * sizeof(uint32_t)) {
         set_err(err, errlen, "llguidance mask size mismatch");
-        llg_free_matcher(matcher);
-        llg_free_tokenizer(tok);
-        return NULL;
+        goto bad;
     }
-
-    ds4_llguidance *g = calloc(1, sizeof(*g));
-    if (!g) {
-        set_err(err, errlen, "out of memory");
-        llg_free_matcher(matcher);
-        llg_free_tokenizer(tok);
-        return NULL;
-    }
-    g->tokenizer = tok;
-    g->matcher = matcher;
-    g->leading_ws_mask = leading_ws_mask;
-    g->leading_ws_words = leading_ws_words;
-    g->mask_words = mask_bytes / sizeof(uint32_t);
-    g->n_vocab = n_vocab;
-    g->eos_token = ds4_token_eos(e);
-    g->deny_leading_ws =
-        constraint_uses_json_leading_ws_rule(constraint_type);
-    g->started = false;
+    g->mask_words = cache->mask_words;
+    g->eos_token = ds4_token_eos(cache->engine);
+    g->deny_leading_ws = constraint_uses_json_leading_ws_rule(constraint_type);
     return g;
+bad:
+    ds4_llguidance_free(g);
+    return NULL;
 }
 
 void ds4_llguidance_free(ds4_llguidance *g) {
     if (!g) return;
     if (g->matcher) llg_free_matcher(g->matcher);
     if (g->tokenizer) llg_free_tokenizer(g->tokenizer);
+    ds4_llguidance_cache_free(g->cache);
     free(g);
 }
 
@@ -376,11 +358,11 @@ int ds4_llguidance_sample(ds4_llguidance *g,
     size_t deny_words = 0;
     if (g->deny_leading_ws &&
         !g->started &&
-        mask_has_non_denied_token(allow, g->mask_words, g->leading_ws_mask,
-                                  g->leading_ws_words, g->n_vocab))
+        mask_has_non_denied_token(allow, g->mask_words, g->cache->leading_ws_mask,
+                                  g->cache->mask_words, g->cache->n_vocab))
     {
-        deny = g->leading_ws_mask;
-        deny_words = g->leading_ws_words;
+        deny = g->cache->leading_ws_mask;
+        deny_words = g->cache->mask_words;
     }
 
     int token = ds4_session_sample_masked(s, temperature, top_k, top_p, min_p,
@@ -413,12 +395,21 @@ bool ds4_llguidance_accept(ds4_llguidance *g,
 
 #else
 
-ds4_llguidance *ds4_llguidance_create(ds4_engine *e,
+ds4_llguidance_cache *ds4_llguidance_cache_create(ds4_engine *e) {
+    (void)e;
+    return NULL;
+}
+
+void ds4_llguidance_cache_free(ds4_llguidance_cache *cache) {
+    (void)cache;
+}
+
+ds4_llguidance *ds4_llguidance_create(ds4_llguidance_cache *cache,
                                       const char *constraint_type,
                                       const char *constraint_data,
                                       char *err,
                                       size_t errlen) {
-    (void)e;
+    (void)cache;
     (void)constraint_type;
     (void)constraint_data;
     if (err && errlen) {

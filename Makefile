@@ -37,7 +37,7 @@ LLGUIDANCE_LDLIBS := $(LLGUIDANCE_LIB)
 ifneq ($(UNAME_S),Darwin)
 LLGUIDANCE_LDLIBS += -ldl
 endif
-CFLAGS += -DDS4_USE_LLGUIDANCE -I$(LLGUIDANCE_DIR)/parser
+LLGUIDANCE_CFLAGS := -DDS4_USE_LLGUIDANCE -I$(LLGUIDANCE_DIR)/parser
 LDLIBS += $(LLGUIDANCE_LDLIBS)
 DS4_LLGUIDANCE_DEPS := $(LLGUIDANCE_LIB)
 endif
@@ -274,19 +274,19 @@ test-rocm:
 	./tests/test_prompt_prefix
 
 ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
-	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ $(filter-out $(LLGUIDANCE_CONFIG),$^) $(DS4_LINK_LIBS)
 
 ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(SERVER_EXTRA_OBJS) $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
-	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ $(filter-out $(LLGUIDANCE_CONFIG),$^) $(DS4_LINK_LIBS)
 
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
-	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ $(filter-out $(LLGUIDANCE_CONFIG),$^) $(DS4_LINK_LIBS)
 
 ds4-eval: ds4_eval.o ds4_eval_cases.o ds4_help.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
-	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ $(filter-out $(LLGUIDANCE_CONFIG),$^) $(DS4_LINK_LIBS)
 
 ds4-agent: ds4_agent.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(DS4_LLGUIDANCE_DEPS)
-	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ $(filter-out $(LLGUIDANCE_CONFIG),$^) $(DS4_LINK_LIBS)
 
 gguf-tools/quality-testing/score_official.o: gguf-tools/quality-testing/score_official.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(QUALITY_CFLAGS)) $(ROCM_HOST_CFLAGS) -I. -c -o $@ $<
@@ -362,7 +362,7 @@ ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvst
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_llguidance.o: ds4_llguidance.c ds4_llguidance.h ds4.h $(DS4_LLGUIDANCE_DEPS)
-	$(CC) $(CFLAGS) -c -o $@ ds4_llguidance.c
+	$(CC) $(CFLAGS) $(LLGUIDANCE_CFLAGS) -c -o $@ ds4_llguidance.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
@@ -733,11 +733,11 @@ tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 .PHONY: test-frontends
-test-frontends: ds4_test ds4_agent_test
+test-frontends: ds4_test ds4_agent_test test-llguidance
 	./ds4_test --server
 	./ds4_agent_test
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
+test: test-llguidance ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -796,7 +796,36 @@ ds4_test.o ds4_agent_test.o \
 ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
+# Only the adapter needs the llguidance preprocessor flags. A changed option
+# or checkout rebuilds it and relinks frontends, including when switching back
+# to a configuration used earlier. Unchanged settings leave timestamps alone.
+LLGUIDANCE_CONFIG := .llguidance-config
+LLGUIDANCE_CONFIG_VALUE := $(LLGUIDANCE)|$(abspath $(LLGUIDANCE_DIR))|$(LLGUIDANCE_TAG)
+# Phony only on a configuration change, so even same-second switches rebuild
+# correctly on make versions with coarse timestamp resolution.
+ifneq ($(shell cat $(LLGUIDANCE_CONFIG) 2>/dev/null),$(LLGUIDANCE_CONFIG_VALUE))
+.PHONY: $(LLGUIDANCE_CONFIG)
+endif
+
+$(LLGUIDANCE_CONFIG):
+	@printf '%s\n' '$(LLGUIDANCE_CONFIG_VALUE)' > $@.tmp
+	@mv $@.tmp $@
+
+ds4_llguidance.o tests/test_llguidance.o: $(LLGUIDANCE_CONFIG)
+ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_test ds4_agent_test: $(LLGUIDANCE_CONFIG)
+
+tests/test_llguidance.o: tests/test_llguidance.c ds4_llguidance.h ds4.h
+	$(CC) $(CFLAGS) $(LLGUIDANCE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_llguidance: tests/test_llguidance.o ds4_llguidance.o $(DS4_LLGUIDANCE_DEPS) $(LLGUIDANCE_CONFIG)
+	$(CC) $(CFLAGS) -o $@ $(filter %.o,$^) $(LDLIBS)
+
+.PHONY: test-llguidance
+test-llguidance: tests/test_llguidance
+	./tests/test_llguidance
+
 clean:
+	rm -f $(LLGUIDANCE_CONFIG) $(LLGUIDANCE_CONFIG).tmp tests/test_llguidance
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe
