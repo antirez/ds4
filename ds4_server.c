@@ -12182,6 +12182,49 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     free(visible);
 }
 
+/* Match clients that omit reasoning, while keeping the exact sampled KV.
+ * Tool decoding stops at </tool_call>, BEFORE the assistant end token. Leave
+ * <|im_end|> out of the visible key so the next suffix actually evaluates it. */
+static char *build_qwen_tool_turn_visible_text(const request *r,
+                                               const char *finish,
+                                               bool inside_thinking,
+                                               const char *content,
+                                               const tool_calls *calls) {
+    if (!r || !calls || calls->len == 0) return NULL;
+    if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
+    if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) return NULL;
+    if (!r->prompt_text || !r->prompt_text[0]) return NULL;
+    if (!calls->raw_tool_text || !calls->raw_tool_text[0]) return NULL;
+    /* Use the decode finish, not the parser's promoted tool_calls status:
+     * repaired/truncated output and unclosed reasoning are not this frontier. */
+    if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return NULL;
+    char *suffix = build_qwen_assistant_suffix(r, content, NULL, false, calls);
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
+    free(suffix);
+    return buf_take(&visible);
+}
+
+static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
+                                                       job *j, const char *ctx,
+                                                       const char *finish,
+                                                       bool inside_thinking,
+                                                       const char *content,
+                                                       const tool_calls *calls) {
+    char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
+                                                     inside_thinking, content, calls);
+    if (!visible) return false;
+    thinking_live_remember(s, slot, visible);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session),
+               strlen(visible));
+    free(visible);
+    return true;
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -13719,7 +13762,13 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
+        if (!remember_qwen_tool_turn_visible_checkpoint(
+                s, slot, j, ctx_span, finish, thinking.inside,
+                parsed_content ? parsed_content : "",
+                &parsed_calls))
+        {
+            thinking_live_clear(s, slot);
+        }
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
@@ -16836,6 +16885,70 @@ static void test_qwen_reasoning_effort_levels(void) {
     free(medium);
     free(max);
     chat_msgs_free(&msgs);
+}
+
+static void test_qwen_tool_visible_checkpoint_boundary(void) {
+    for (int thinking = 0; thinking < 2; thinking++) {
+        for (int with_content = 0; with_content < 2; with_content++) {
+            chat_msgs msgs = {0};
+            chat_msg user = {0};
+            user.role = xstrdup("user");
+            user.content = xstrdup("run it");
+            chat_msgs_push(&msgs, user);
+            request r = {0};
+            r.kind = REQ_CHAT;
+            r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+            r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+            r.prompt_text = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            chat_msg assistant = {0};
+            assistant.role = xstrdup("assistant");
+            assistant.content = xstrdup(with_content ? "Running." : "");
+            tool_call call = {0};
+            call.name = xstrdup("bash");
+            call.arguments = xstrdup("{}");
+            tool_calls_push(&assistant.calls, call);
+            assistant.calls.raw_tool_text = xstrdup(
+                "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
+            char *visible = build_qwen_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls);
+            TEST_ASSERT(visible != NULL);
+            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+                &r, "length", false, assistant.content, &assistant.calls) == NULL);
+            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+                &r, "tool_calls", true, assistant.content, &assistant.calls) == NULL);
+            r.image_count = 1;
+            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            r.image_count = 0;
+            r.api = API_RESPONSES;
+            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            chat_msgs_push(&msgs, assistant);
+            chat_msg tool = {0};
+            tool.role = xstrdup("tool");
+            tool.content = xstrdup("ok");
+            chat_msgs_push(&msgs, tool);
+            char *next = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+            if (visible && !strncmp(next, visible, strlen(visible))) {
+                /* The live frontier ends at the sampled tool block. The new
+                 * suffix must supply exactly the missing assistant boundary. */
+                const char *tail = next + strlen(visible);
+                const char *boundary = "<|im_end|>\n<|im_start|>user\n<tool_response>";
+                TEST_ASSERT(!strncmp(tail, boundary, strlen(boundary)));
+            }
+            if (thinking) {
+                msgs.v[1].reasoning = xstrdup("hidden reasoning");
+                char *with_reasoning = render_qwen_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+                TEST_ASSERT(visible && strncmp(with_reasoning, visible, strlen(visible)) != 0);
+                free(with_reasoning);
+            }
+            free(next);
+            free(visible);
+            free(r.prompt_text);
+            chat_msgs_free(&msgs);
+        }
+    }
 }
 
 static void test_render_qwen_tool_round_trip(void) {
@@ -20738,6 +20851,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
+    test_qwen_tool_visible_checkpoint_boundary();
     test_parse_qwen_tool_call_message();
     test_qwen_tool_checkpoint_round_trip();
     test_qwen_sampled_tool_text_after_think_renders_exactly();
