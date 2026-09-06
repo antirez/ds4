@@ -6699,7 +6699,7 @@ static dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_
                 return DSML_DECODE_STRUCTURAL;
             }
         }
-        return DSML_DECODE_STRUCTURAL;
+        pos++;
     }
 }
 #endif
@@ -6759,6 +6759,12 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     return;
                 }
+                /* A lone trailing byte may open param_end.  Hold the cursor:
+                 * dt->pos persists, so a consumed byte can never be re-matched. */
+                if (raw_len - dt->pos == 1 && raw[dt->pos] == dt->syn->param_end[0]) {
+                    dt->decode = DSML_DECODE_STRING_BODY;
+                    return;
+                }
                 dt->pos++;
             }
             dt->decode = DSML_DECODE_STRING_BODY;
@@ -6776,6 +6782,10 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                     }
                     if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
                         dt->decode = DSML_DECODE_STRUCTURAL;
+                        return;
+                    }
+                    if (raw_len - dt->pos == 1 && raw[dt->pos] == dt->syn->param_end[0]) {
+                        dt->decode = DSML_DECODE_JSON_STRUCTURAL;
                         return;
                     }
                 }
@@ -6857,8 +6867,10 @@ structural:
                 return;
             }
 
+            /* dt->pos persists across calls, so the loop must always advance:
+             * parking here would hide every later byte. */
             dt->decode = DSML_DECODE_STRUCTURAL;
-            return;
+            dt->pos++;
         }
     }
 }
@@ -17521,6 +17533,193 @@ static void test_dsml_decode_state_separates_structure_and_payload(void) {
     TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
 }
 
+/* Production feeds the whole accumulated buffer on every token and relies on the
+ * persisted dt->pos, so these tests feed growing prefixes: a one-shot feed cannot
+ * observe a stuck or over-advanced cursor. */
+static void test_dsml_feed_prefixes(dsml_decode_tracker *dt, const char *text,
+                                    size_t step) {
+    size_t n = strlen(text);
+    for (size_t end = 0; end < n; ) {
+        end += step;
+        if (end > n) end = n;
+        dsml_decode_tracker_update(dt, text, end);
+    }
+}
+
+static void test_dsml_tracker_recovers_from_stray_bytes(void) {
+    const char *fixtures[] = {
+        /* stray prose immediately after the start tag */
+        DS4_TOOL_CALLS_START "\nLet me check that.\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+
+        /* near-miss invoke tag missing the DSML sentinel */
+        DS4_TOOL_CALLS_START "\n<invoke name=\"bash\">\n</invoke>\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+
+        /* prose between </parameter> and </invoke> */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">ls" DS4_PARAM_END "\n"
+        "that should do it\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+
+        /* stray code fence before the close */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_INVOKE_END "\n```\n" DS4_TOOL_CALLS_END,
+
+        /* prose between two complete invokes */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_INVOKE_END "\n"
+        "and one more\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+    };
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+        dsml_decode_tracker tracker;
+        dsml_decode_tracker_init(&tracker);
+        test_dsml_feed_prefixes(&tracker, fixtures[i], 1);
+        TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+        TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+    }
+
+    /* Recovery must not depend on how much text follows the unrecognised
+     * byte, however many close markers it contains. */
+    {
+        buf big = {0};
+        buf_puts(&big, DS4_TOOL_CALLS_START "\noops ");
+        for (int i = 0; i < 2000; i++) buf_puts(&big, "loop ");
+        buf_puts(&big, DS4_TOOL_CALLS_END);
+        dsml_decode_tracker tracker;
+        dsml_decode_tracker_init(&tracker);
+        test_dsml_feed_prefixes(&tracker, big.ptr, 7);
+        TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+        TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+        buf_free(&big);
+    }
+}
+
+static void test_dsml_tracker_recognizes_split_close_tag(void) {
+    /* A piece can end exactly on the '<' of a closing parameter tag; the cursor
+     * must hold there or the close becomes unmatchable. */
+    const char *body =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/a.py" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    test_dsml_feed_prefixes(&tracker, body, 1);   /* guarantees a lone '<' prefix */
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+
+    /* The reference reports STRING_BODY here too, since raw_suffix_partial_lit
+     * never tests a length-one suffix. */
+    const char *upto_lt =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/a.py<";
+    dsml_decode_tracker_init(&tracker);
+    test_dsml_feed_prefixes(&tracker, upto_lt, 1);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_STRING_BODY);
+    TEST_ASSERT(dsml_decode_state_for_text(upto_lt, strlen(upto_lt)) == tracker.decode);
+
+    /* JSON parameter, same boundary.  This state is greedy, unlike the string
+     * case. */
+    const char *json_at_lt =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[]<";
+    dsml_decode_tracker_init(&tracker);
+    test_dsml_feed_prefixes(&tracker, json_at_lt, 1);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRUCTURAL);
+    TEST_ASSERT(dsml_decode_state_for_text(json_at_lt, strlen(json_at_lt)) ==
+                tracker.decode);
+
+    const char *json_body =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[{\"a\":1}]" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END;
+    dsml_decode_tracker_init(&tracker);
+    test_dsml_feed_prefixes(&tracker, json_body, 1);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+}
+
+static uint64_t test_dsml_rng_next(uint64_t *st) {
+    uint64_t x = *st;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *st = x;
+    return x;
+}
+
+static void test_dsml_tracker_matches_reference_across_splits(void) {
+    /* The incremental tracker and the one-shot reference recognizer must agree
+     * on every prefix, for every split.  Both therefore have to advance past
+     * unrecognized structural bytes; changing one alone makes them disagree. */
+    const char *fixtures[] = {
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">ls -la /tmp" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+
+        DS4_TOOL_CALLS_START "\nstray prose\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[{\"newText\":\"a<b\"}]" DS4_PARAM_END "\n"
+        "trailing prose\n"
+        DS4_INVOKE_END "\n```\n" DS4_TOOL_CALLS_END,
+
+        DS4_TOOL_CALLS_START_SHORT "\n"
+        DS4_INVOKE_START_SHORT " name=\"bash\">\n"
+        DS4_INVOKE_END_SHORT "\n" DS4_TOOL_CALLS_END_SHORT,
+
+        "<tool_calls>\n<invoke name=\"bash\">\n"
+        "<parameter name=\"command\" string=\"true\">echo hi</parameter>\n"
+        "</invoke>\n</tool_calls>",
+
+        /* String payload containing a bare '<', so split points land on a lone
+         * '<' at a string-body tail, where the single-byte hold applies. */
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"code\" string=\"true\">if (a < b) { x(); }" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+    };
+    uint64_t st = 0x9E3779B97F4A7C15ull;
+    for (size_t f = 0; f < sizeof(fixtures) / sizeof(fixtures[0]); f++) {
+        const char *text = fixtures[f];
+        size_t n = strlen(text);
+        for (int trial = 0; trial < 64; trial++) {
+            dsml_decode_tracker tr;
+            dsml_decode_tracker_init(&tr);
+            size_t end = 0;
+            while (end < n) {
+                end += 1 + (size_t)(test_dsml_rng_next(&st) % 7);
+                if (end > n) end = n;
+                dsml_decode_tracker_update(&tr, text, end);
+                /* Once the block closes the tracker latches DONE, while the
+                 * reference re-scans from the first start tag on every call, so
+                 * the invariant only holds up to and including the close.
+                 * Compare decode only, never pos: the reference's partial-hold
+                 * iterates all three dialects while the tracker uses only
+                 * dt->syn, so their positions legitimately diverge. */
+                if (tr.mode == DSML_TRACK_DONE) break;
+                TEST_ASSERT(tr.decode == dsml_decode_state_for_text(text, end));
+            }
+        }
+        dsml_decode_tracker done;
+        dsml_decode_tracker_init(&done);
+        test_dsml_feed_prefixes(&done, text, 1);
+        TEST_ASSERT(done.mode == DSML_TRACK_DONE);
+        TEST_ASSERT(done.decode == DSML_DECODE_OUTSIDE);
+    }
+}
+
 static void test_tool_memory_max_ids_prunes_oldest(void) {
     const char *a_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">a</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
     const char *b_dsml = "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">b</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
@@ -19479,6 +19678,9 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_visible_suffix_matches_client_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
+    test_dsml_tracker_recovers_from_stray_bytes();
+    test_dsml_tracker_recognizes_split_close_tag();
+    test_dsml_tracker_matches_reference_across_splits();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
