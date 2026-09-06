@@ -1586,8 +1586,8 @@ static void test_q4k_ordered_exact(arena_t *a, uint32_t T, uint32_t F, bool shar
         } else {
             require_ok(unsetenv(env_names[0]) == 0, "enable ordered Q4K mid");
             if (defaults) {
-                /* T1 may choose NR1/NSG8 on M3 Ultra; T2 verification keeps
-                 * NR2/NSG2. Both defaults must match the original arithmetic. */
+                /* T1 and T2 may choose NR1/NSG8 on M3 Ultra. Both defaults
+                 * must match the original arithmetic. */
                 require_ok(unsetenv(env_names[1]) == 0 && unsetenv(env_names[2]) == 0,
                            "select default Q4K mid geometry");
             } else {
@@ -1754,6 +1754,58 @@ static void test_mtp(arena_t *a, uint32_t E, uint32_t hc) {
     check_tensor(name, gout, R_ref, (uint64_t)hc * E, 1e-6);
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gproj); ds4_gpu_tensor_free(gcat); ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(ge);
     free(R_ref); free(cat); free(proj); free(R); free(e); free(g_e); free(g_h);
+}
+
+/* A split immediately below the large-prefill boundary uses the original
+ * scan geometry. Compare every output and state value across that boundary,
+ * including the first-token snapshot used by speculative verification. */
+static void test_gdn_prefill_dispatch(void) {
+    const uint32_t Hk = 16u, Hv = 48u, D = 128u;
+    const uint64_t C = (2u * Hk + Hv) * D, V = Hv * D, S = V * D;
+    for (uint32_t T = 8191u; T <= 8193u; T++) {
+        float *qkv = rand_vec(T * C, 0.05f);
+        float *initial = rand_vec(S, 0.01f);
+        ds4_gpu_tensor *gqkv = upload(qkv, T * C);
+        ds4_gpu_tensor *ga = upload(NULL, (uint64_t)T * Hv);
+        ds4_gpu_tensor *gb = upload(NULL, (uint64_t)T * Hv);
+        ds4_gpu_tensor *gs = upload(initial, S);
+        ds4_gpu_tensor *go = upload(NULL, T * V);
+        ds4_gpu_tensor *gsnap = upload(NULL, S);
+        require_ok(ds4_gpu_tensor_fill_f32(ga, 0.95f, (uint64_t)T * Hv) &&
+                   ds4_gpu_tensor_fill_f32(gb, 0.25f, (uint64_t)T * Hv), "GDN prefill gates");
+        free(qkv);
+        float *ref_out = NULL, *ref_state = NULL, *ref_snap = NULL;
+        for (uint32_t mode = 0; mode < 2u; mode++) {
+            require_ok(ds4_gpu_tensor_write(gs, 0, initial, S * sizeof(float)), "GDN prefill reset");
+            const uint32_t chunk = mode == 0u ? T - 2u : T;
+            for (uint32_t pos = 0; pos < T; pos += chunk) {
+                const uint32_t n = T - pos < chunk ? T - pos : chunk;
+                ds4_gpu_tensor *q = ds4_gpu_tensor_view(gqkv, pos * C * sizeof(float), n * C * sizeof(float));
+                ds4_gpu_tensor *a = ds4_gpu_tensor_view(ga, (uint64_t)pos * Hv * sizeof(float), (uint64_t)n * Hv * sizeof(float));
+                ds4_gpu_tensor *b = ds4_gpu_tensor_view(gb, (uint64_t)pos * Hv * sizeof(float), (uint64_t)n * Hv * sizeof(float));
+                ds4_gpu_tensor *o = ds4_gpu_tensor_view(go, pos * V * sizeof(float), n * V * sizeof(float));
+                require_ok(q && a && b && o, "GDN prefill views");
+                require_ok(ds4_gpu_qwen4_gdn_scan_tensor(o, gs, q, a, b, n, Hk, Hv, D,
+                                                       pos == 0u ? gsnap : NULL, 0u), "GDN prefill scan");
+                ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(a);
+                ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(o);
+            }
+            float *out = download(go, T * V), *state = download(gs, S), *snap = download(gsnap, S);
+            if (mode == 0u) {
+                ref_out = out; ref_state = state; ref_snap = snap;
+            } else {
+                require_ok(memcmp(out, ref_out, T * V * sizeof(float)) == 0 &&
+                           memcmp(state, ref_state, S * sizeof(float)) == 0 &&
+                           memcmp(snap, ref_snap, S * sizeof(float)) == 0,
+                           "GDN prefill byte-exact output/state/snapshot");
+                free(out); free(state); free(snap);
+            }
+        }
+        printf("  GDN prefill T=%u: byte-exact split/batch output, state and snapshot\n", T);
+        free(ref_out); free(ref_state); free(ref_snap); free(initial);
+        ds4_gpu_tensor_free(gqkv); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb);
+        ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gsnap);
+    }
 }
 
 static double bench_now(void) {
@@ -2291,6 +2343,7 @@ int main(void) {
     test_mtp(&arena, 2560, 4);
     test_mtp(&arena, 64, 4);
     test_hc_norm_reuse(&arena);
+    test_gdn_prefill_dispatch();
     printf("all qwen4 kernel tests passed\n");
     return 0;
 }

@@ -1,0 +1,4154 @@
+{
+  "baseline_revision": "ecf1da3c9516d0d78a31c61ba8cba8b535488caa",
+  "selected": {
+    "base_revision": "ecf1da3c9516d0d78a31c61ba8cba8b535488caa",
+    "source_sha256": {
+      "ds4.c": "eec87c4e311c2c2cba3d4f327670bbb20a10dc4ee1ead815d0a681a5d4476341",
+      "ds4_metal.m": "02cfb27d0c56015e5af37c81de11da47d8e7484e68e791198180566d7c4d5efa",
+      "metal/qwen4.metal": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+      "metal/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "tests/test_qwen4_kernels.c": "2e5cfc7bacab51c81428282a3e7d557337363b9632b4995854251273052fd684",
+      "speed-bench/qwen38_mtp_compare.py": "84bd7985f5c46eec2bdbb561c0e061fa7f27609f24d73568dcda21c49cfb5445"
+    },
+    "files": {
+      "engine.patch": "1640a5a60d4df192bcbd9d46d8a5061df9d1d138d3528192806b9739726e8161",
+      "test_qwen4_spec": "a9724fbfdc18c18163de19319aa33662c565badef27480b9f3b4303bd95273a8",
+      "ds4.o": "48e641dd6f4c4e23c4235300acf2e223df02fd8d840071bf8d54c11d4a0bb2a1",
+      "test_qwen4_kernels": "4c29afb070a0feb9eb3c1318db6249156f4805c890408cc4ef1c8a6785d759b6",
+      "moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "ds4-bench": "ce18c44f7de42b6ed21b87401e55f1f062cdbb1b09c229e885d35e06d957f41b",
+      "qwen4.metal": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+      "ds4_metal.o": "7e0361d613478d29d13b6ebba2b7e492eed7d3dea1e00d908331866c00b92236",
+      "ds4": "ba54dffcdbfdb7360c200164af0d8287bf849de7ff4e9d98a3e6d27f96eae558"
+    }
+  },
+  "model_inputs": {
+    "model": {
+      "path": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+      "size": 74879771648,
+      "mtime_ns": 1788521688167774811
+    },
+    "ple": {
+      "path": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+      "size": 32000157440,
+      "mtime_ns": 1788438131000000000
+    },
+    "prompt": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+    "prompt_sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f"
+  },
+  "tests": {
+    "selected-kernels.log": {
+      "sha256": "0c3bcd5bfa46742cc7337465baee15171202e7303d2f8ff009086cb5a206ddf8",
+      "completion": "all qwen4 kernel tests passed"
+    },
+    "selected-spec.log": {
+      "sha256": "57b8f3d59c91280e6df6bf06e0e939e22e75595f2cff183bfae699c3739dea34",
+      "completion": "qwen4 speculative planner tests: ok"
+    }
+  },
+  "short_performance": {
+    "started_utc": "2026-09-06T10:03:34.060401+00:00",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "model": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+    "ctx": 8192,
+    "ple": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+    "configs": {
+      "baseline": {
+        "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+        "binary_sha256": "a6f229c327621e42ca8eb99d850d56c021a3b40801372f85b0b9fb063fab5a09",
+        "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+        "source_sha256": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+        "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+        "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+      },
+      "candidate": {
+        "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+        "binary_sha256": "ba54dffcdbfdb7360c200164af0d8287bf849de7ff4e9d98a3e6d27f96eae558",
+        "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+        "source_sha256": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+        "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+        "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+      }
+    },
+    "shared_metal_sha256": {
+      "metal/argsort.metal": "0c868f5cbf751f889bb73aa5ac8599ff2b4359d9ed9aabd035043550256df790",
+      "metal/bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+      "metal/concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+      "metal/cpy.metal": "53aad2024bd30543ad9d4bac3dbd718830482e76ce4f9f563fee17d558a2ac02",
+      "metal/deepseek4_vision.metal": "c660082cb41fe767c26a396881c1b228c2d6d4b140eb09c81881efbabfd1b682",
+      "metal/dense.metal": "03fb317ec831bbada5af603b6608a8a0d883a6540cefa581098dda894944c801",
+      "metal/dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+      "metal/dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+      "metal/dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+      "metal/dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+      "metal/flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+      "metal/generate_mxfp4_half_lut.py": "a20b9b79d993b16b3bcb4a9658c86618ce4cd33739838fe6aa47bf947f42194e",
+      "metal/get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+      "metal/glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+      "metal/glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+      "metal/glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+      "metal/glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+      "metal/norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+      "metal/qwen4_vision.metal": "b37c7fc2c66131bf5817621920a6b5b30271af21160e7da33edc71e2d5c7fb4b",
+      "metal/repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+      "metal/set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+      "metal/softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+      "metal/sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+      "metal/unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+    },
+    "candidate_env": {},
+    "records": [
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": -1,
+        "warmup": true,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 139.54,
+        "decode_tps": 61.43,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.274798165948596,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": -1,
+        "warmup": true,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 139.9,
+        "decode_tps": 62.84,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 6.798710500006564,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": 0,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 139.9,
+        "decode_tps": 61.36,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.391421833017375,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": 0,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 139.89,
+        "decode_tps": 62.68,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.355925459007267,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "fibonacci",
+        "repeat": 0,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "400",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "List the first 30 Fibonacci numbers with indices.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 134.18,
+        "decode_tps": 74.54,
+        "cycles": 201,
+        "accepted": 198,
+        "wall_s": 8.197334583033808,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "candidate",
+        "case": "fibonacci",
+        "repeat": 0,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "400",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "List the first 30 Fibonacci numbers with indices.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 133.84,
+        "decode_tps": 76.4,
+        "cycles": 201,
+        "accepted": 198,
+        "wall_s": 8.04521933401702,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "baseline",
+        "case": "explanation",
+        "repeat": 0,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "256",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 175.08,
+        "decode_tps": 65.92,
+        "cycles": 144,
+        "accepted": 110,
+        "wall_s": 6.729610415990464,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "candidate",
+        "case": "explanation",
+        "repeat": 0,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "256",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 175.03,
+        "decode_tps": 67.61,
+        "cycles": 144,
+        "accepted": 110,
+        "wall_s": 6.645424125017598,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": 1,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 139.75,
+        "decode_tps": 62.93,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.349265500030015,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": 1,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 140.1,
+        "decode_tps": 61.49,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.364932583004702,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "fibonacci",
+        "repeat": 1,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "400",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "List the first 30 Fibonacci numbers with indices.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 133.76,
+        "decode_tps": 76.63,
+        "cycles": 201,
+        "accepted": 198,
+        "wall_s": 8.052585917001124,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "baseline",
+        "case": "fibonacci",
+        "repeat": 1,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "400",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "List the first 30 Fibonacci numbers with indices.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 134.06,
+        "decode_tps": 74.66,
+        "cycles": 201,
+        "accepted": 198,
+        "wall_s": 8.173807750048582,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "candidate",
+        "case": "explanation",
+        "repeat": 1,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "256",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 174.41,
+        "decode_tps": 67.12,
+        "cycles": 144,
+        "accepted": 110,
+        "wall_s": 6.660108166979626,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "baseline",
+        "case": "explanation",
+        "repeat": 1,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "256",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 174.81,
+        "decode_tps": 66.07,
+        "cycles": 144,
+        "accepted": 110,
+        "wall_s": 6.73408629198093,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "baseline",
+        "case": "hamlet",
+        "repeat": 2,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 140.82,
+        "decode_tps": 61.47,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.3591992080328055,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "candidate",
+        "case": "hamlet",
+        "repeat": 2,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "120",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 140.26,
+        "decode_tps": 62.98,
+        "cycles": 56,
+        "accepted": 37,
+        "wall_s": 4.329734708997421,
+        "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+      },
+      {
+        "config": "baseline",
+        "case": "fibonacci",
+        "repeat": 2,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "400",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "List the first 30 Fibonacci numbers with indices.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 134.3,
+        "decode_tps": 74.7,
+        "cycles": 201,
+        "accepted": 198,
+        "wall_s": 8.197766875033267,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "candidate",
+        "case": "fibonacci",
+        "repeat": 2,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "400",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "List the first 30 Fibonacci numbers with indices.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 134.24,
+        "decode_tps": 76.52,
+        "cycles": 201,
+        "accepted": 198,
+        "wall_s": 8.057468875020277,
+        "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+      },
+      {
+        "config": "baseline",
+        "case": "explanation",
+        "repeat": 2,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "256",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 174.87,
+        "decode_tps": 65.77,
+        "cycles": 144,
+        "accepted": 110,
+        "wall_s": 6.778920708980877,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      },
+      {
+        "config": "candidate",
+        "case": "explanation",
+        "repeat": 2,
+        "warmup": false,
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-n",
+          "256",
+          "--temp",
+          "0",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-p",
+          "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+        ],
+        "prefill_tps": 173.76,
+        "decode_tps": 67.48,
+        "cycles": 144,
+        "accepted": 110,
+        "wall_s": 6.6884086659993045,
+        "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+      }
+    ],
+    "prompt_file": null,
+    "summary": {
+      "hamlet": {
+        "median_tps": {
+          "baseline": 61.47,
+          "candidate": 62.93
+        },
+        "prefill_median_tps": {
+          "baseline": 140.1,
+          "candidate": 139.89
+        },
+        "range_tps": {
+          "baseline": [
+            61.36,
+            61.49
+          ],
+          "candidate": [
+            62.68,
+            62.98
+          ]
+        },
+        "speedup": 1.0237514234585976,
+        "all_outputs_identical": true,
+        "acceptance_identical": true
+      },
+      "fibonacci": {
+        "median_tps": {
+          "baseline": 74.66,
+          "candidate": 76.52
+        },
+        "prefill_median_tps": {
+          "baseline": 134.18,
+          "candidate": 133.84
+        },
+        "range_tps": {
+          "baseline": [
+            74.54,
+            74.7
+          ],
+          "candidate": [
+            76.4,
+            76.63
+          ]
+        },
+        "speedup": 1.0249129386552371,
+        "all_outputs_identical": true,
+        "acceptance_identical": true
+      },
+      "explanation": {
+        "median_tps": {
+          "baseline": 65.92,
+          "candidate": 67.48
+        },
+        "prefill_median_tps": {
+          "baseline": 174.87,
+          "candidate": 174.41
+        },
+        "range_tps": {
+          "baseline": [
+            65.77,
+            66.07
+          ],
+          "candidate": [
+            67.12,
+            67.61
+          ]
+        },
+        "speedup": 1.0236650485436893,
+        "all_outputs_identical": true,
+        "acceptance_identical": true
+      }
+    }
+  },
+  "mtp_frontier_means": [
+    {
+      "context": 4096,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1152.33,
+            1153.02
+          ],
+          "candidate": [
+            1148.85,
+            1150.9
+          ]
+        },
+        "means": {
+          "baseline": 1152.675,
+          "candidate": 1149.875
+        },
+        "change_percent": -0.24291322358860334
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            52.78,
+            52.48
+          ],
+          "candidate": [
+            53.79,
+            53.78
+          ]
+        },
+        "means": {
+          "baseline": 52.629999999999995,
+          "candidate": 53.785
+        },
+        "change_percent": 2.194565836975104
+      }
+    },
+    {
+      "context": 8192,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1127.01,
+            1122.83
+          ],
+          "candidate": [
+            1125.69,
+            1125.91
+          ]
+        },
+        "means": {
+          "baseline": 1124.92,
+          "candidate": 1125.8000000000002
+        },
+        "change_percent": 0.07822778508694839
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            51.59,
+            51.29
+          ],
+          "candidate": [
+            52.61,
+            52.58
+          ]
+        },
+        "means": {
+          "baseline": 51.44,
+          "candidate": 52.595
+        },
+        "change_percent": 2.245334370139962
+      }
+    },
+    {
+      "context": 16384,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1178.35,
+            1175.48
+          ],
+          "candidate": [
+            1185.28,
+            1186.03
+          ]
+        },
+        "means": {
+          "baseline": 1176.915,
+          "candidate": 1185.655
+        },
+        "change_percent": 0.7426194754931226
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            52.59,
+            52.41
+          ],
+          "candidate": [
+            53.75,
+            53.79
+          ]
+        },
+        "means": {
+          "baseline": 52.5,
+          "candidate": 53.769999999999996
+        },
+        "change_percent": 2.4190476190476096
+      }
+    },
+    {
+      "context": 32768,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1180.16,
+            1179.95
+          ],
+          "candidate": [
+            1185.83,
+            1186.8
+          ]
+        },
+        "means": {
+          "baseline": 1180.055,
+          "candidate": 1186.315
+        },
+        "change_percent": 0.5304837486388436
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            49.42,
+            49.37
+          ],
+          "candidate": [
+            50.48,
+            50.46
+          ]
+        },
+        "means": {
+          "baseline": 49.394999999999996,
+          "candidate": 50.47
+        },
+        "change_percent": 2.176333637007799
+      }
+    },
+    {
+      "context": 65536,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1174.89,
+            1172.59
+          ],
+          "candidate": [
+            1180.88,
+            1181.11
+          ]
+        },
+        "means": {
+          "baseline": 1173.74,
+          "candidate": 1180.995
+        },
+        "change_percent": 0.6181096324569202
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            47.67,
+            47.7
+          ],
+          "candidate": [
+            48.6,
+            48.81
+          ]
+        },
+        "means": {
+          "baseline": 47.685,
+          "candidate": 48.705
+        },
+        "change_percent": 2.1390374331550666
+      }
+    },
+    {
+      "context": 131072,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1158.65,
+            1159.31
+          ],
+          "candidate": [
+            1166.04,
+            1165.98
+          ]
+        },
+        "means": {
+          "baseline": 1158.98,
+          "candidate": 1166.01
+        },
+        "change_percent": 0.6065678441388167
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            51.22,
+            51.15
+          ],
+          "candidate": [
+            52.16,
+            52.14
+          ]
+        },
+        "means": {
+          "baseline": 51.185,
+          "candidate": 52.15
+        },
+        "change_percent": 1.885317964247335
+      }
+    },
+    {
+      "context": 262144,
+      "prefill_tps": {
+        "observations": {
+          "baseline": [
+            1129.26,
+            1128.0
+          ],
+          "candidate": [
+            1135.67,
+            1135.95
+          ]
+        },
+        "means": {
+          "baseline": 1128.63,
+          "candidate": 1135.81
+        },
+        "change_percent": 0.6361695152529823
+      },
+      "gen_tps": {
+        "observations": {
+          "baseline": [
+            45.4,
+            45.37
+          ],
+          "candidate": [
+            46.36,
+            46.28
+          ]
+        },
+        "means": {
+          "baseline": 45.385,
+          "candidate": 46.32
+        },
+        "change_percent": 2.0601520326098965
+      }
+    }
+  ],
+  "forward_performance": {
+    "arguments": {
+      "name": "performance-forward-262k",
+      "diagnostic": false,
+      "target_only": false,
+      "max_context": 262144,
+      "start_context": 4096,
+      "tokens": 128,
+      "reverse": false,
+      "candidate_dir": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected",
+      "force_snapshot": true
+    },
+    "driver_sha256": "e407ac050ca1168e14d194519a1fb2769c4f8b231fdc761685fad4f5a62d03c0",
+    "files": {
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/ds4-bench-baseline": "ee42c0fc0899c14f3a1894d2200c6d88f9c42e0f3f77016e461153b9c00b60eb",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/ds4-bench-candidate": "86ada91e4a672d6efb4bd31a4d6fd745f143b801cc0324cd32dcc5b5dc50d875",
+      "/Users/ifioravanti/github/ds4/ds4.o": "48e641dd6f4c4e23c4235300acf2e223df02fd8d840071bf8d54c11d4a0bb2a1",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4_metal.o": "7e0361d613478d29d13b6ebba2b7e492eed7d3dea1e00d908331866c00b92236",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4_metal.o": "d1e8b5ade38dcb2a56d0b12e60889e2f8b1118b6254b284b63236e4802553003",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+    },
+    "runs": [
+      {
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/ds4-bench-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/baseline/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/baseline/frontier-logits",
+          "--mtp"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_BENCH_FORCE_SNAPSHOT": "1"
+        },
+        "returncode": 0,
+        "wall_s": 256.3916300419951,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1152.33",
+            "gen_tokens": "128",
+            "gen_tps": "52.78",
+            "gen_first_ms": "44.500",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.45",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1127.01",
+            "gen_tokens": "128",
+            "gen_tps": "51.59",
+            "gen_first_ms": "44.644",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.22",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1178.35",
+            "gen_tokens": "128",
+            "gen_tps": "52.59",
+            "gen_first_ms": "45.354",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.26",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1180.16",
+            "gen_tokens": "128",
+            "gen_tps": "49.42",
+            "gen_first_ms": "45.618",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "50.00",
+            "kvcache_bytes": "1151486044"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1174.89",
+            "gen_tokens": "128",
+            "gen_tps": "47.67",
+            "gen_first_ms": "49.032",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.26",
+            "kvcache_bytes": "2183940188"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1158.65",
+            "gen_tokens": "128",
+            "gen_tps": "51.22",
+            "gen_first_ms": "48.766",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.92",
+            "kvcache_bytes": "4248848476"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1129.26",
+            "gen_tokens": "128",
+            "gen_tps": "45.40",
+            "gen_first_ms": "47.334",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.89",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      {
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/ds4-bench-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/candidate/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-forward-262k/candidate/frontier-logits",
+          "--mtp"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_BENCH_FORCE_SNAPSHOT": "1"
+        },
+        "returncode": 0,
+        "wall_s": 254.82523729099194,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1148.85",
+            "gen_tokens": "128",
+            "gen_tps": "53.79",
+            "gen_first_ms": "45.122",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "54.50",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1125.69",
+            "gen_tokens": "128",
+            "gen_tps": "52.61",
+            "gen_first_ms": "44.952",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.27",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1185.28",
+            "gen_tokens": "128",
+            "gen_tps": "53.75",
+            "gen_first_ms": "45.764",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "54.47",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1185.83",
+            "gen_tokens": "128",
+            "gen_tps": "50.48",
+            "gen_first_ms": "44.564",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.07",
+            "kvcache_bytes": "1151486044"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1180.88",
+            "gen_tokens": "128",
+            "gen_tps": "48.60",
+            "gen_first_ms": "50.230",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.25",
+            "kvcache_bytes": "2183940188"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1166.04",
+            "gen_tokens": "128",
+            "gen_tps": "52.16",
+            "gen_first_ms": "51.932",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.96",
+            "kvcache_bytes": "4248848476"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1135.67",
+            "gen_tokens": "128",
+            "gen_tps": "46.36",
+            "gen_first_ms": "47.240",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "46.87",
+            "kvcache_bytes": "0"
+          }
+        ]
+      }
+    ],
+    "token_ids_identical": true,
+    "frontier_logits": [
+      {
+        "file": "frontier_004096.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_008192.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_016384.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_032768.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_065536.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_131072.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_262144.logits.json",
+        "identical": true
+      }
+    ]
+  },
+  "reverse_performance": {
+    "arguments": {
+      "name": "performance-reverse-262k",
+      "diagnostic": false,
+      "target_only": false,
+      "max_context": 262144,
+      "start_context": 4096,
+      "tokens": 128,
+      "reverse": true,
+      "candidate_dir": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected",
+      "force_snapshot": true
+    },
+    "driver_sha256": "e407ac050ca1168e14d194519a1fb2769c4f8b231fdc761685fad4f5a62d03c0",
+    "files": {
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/ds4-bench-baseline": "6d4570e49fac6cc650c6f27532df3e503567eedee5d19210a6d9586ab17bddb0",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/ds4-bench-candidate": "67da84165f471de33c21d8fff05762ee63e6aef827832f1fb03f3230b05a8417",
+      "/Users/ifioravanti/github/ds4/ds4.o": "48e641dd6f4c4e23c4235300acf2e223df02fd8d840071bf8d54c11d4a0bb2a1",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4_metal.o": "7e0361d613478d29d13b6ebba2b7e492eed7d3dea1e00d908331866c00b92236",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4_metal.o": "d1e8b5ade38dcb2a56d0b12e60889e2f8b1118b6254b284b63236e4802553003",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+    },
+    "runs": [
+      {
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/ds4-bench-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/candidate/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/candidate/frontier-logits",
+          "--mtp"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_BENCH_FORCE_SNAPSHOT": "1"
+        },
+        "returncode": 0,
+        "wall_s": 254.6896226250101,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1150.90",
+            "gen_tokens": "128",
+            "gen_tps": "53.78",
+            "gen_first_ms": "47.211",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "54.54",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1125.91",
+            "gen_tokens": "128",
+            "gen_tps": "52.58",
+            "gen_first_ms": "45.238",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.25",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1186.03",
+            "gen_tokens": "128",
+            "gen_tps": "53.79",
+            "gen_first_ms": "45.331",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "54.50",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1186.80",
+            "gen_tokens": "128",
+            "gen_tps": "50.46",
+            "gen_first_ms": "46.330",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.09",
+            "kvcache_bytes": "1151486044"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1181.11",
+            "gen_tokens": "128",
+            "gen_tps": "48.81",
+            "gen_first_ms": "47.519",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.41",
+            "kvcache_bytes": "2183940188"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1165.98",
+            "gen_tokens": "128",
+            "gen_tps": "52.14",
+            "gen_first_ms": "51.262",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.93",
+            "kvcache_bytes": "4248848476"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1135.95",
+            "gen_tokens": "128",
+            "gen_tps": "46.28",
+            "gen_first_ms": "48.224",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "46.80",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      {
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/ds4-bench-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/baseline/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/performance-reverse-262k/baseline/frontier-logits",
+          "--mtp"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_BENCH_FORCE_SNAPSHOT": "1"
+        },
+        "returncode": 0,
+        "wall_s": 256.4692839169875,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1153.02",
+            "gen_tokens": "128",
+            "gen_tps": "52.48",
+            "gen_first_ms": "46.053",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.16",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1122.83",
+            "gen_tokens": "128",
+            "gen_tps": "51.29",
+            "gen_first_ms": "44.711",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.91",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1175.48",
+            "gen_tokens": "128",
+            "gen_tps": "52.41",
+            "gen_first_ms": "47.616",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.12",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1179.95",
+            "gen_tokens": "128",
+            "gen_tps": "49.37",
+            "gen_first_ms": "45.574",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.95",
+            "kvcache_bytes": "1151486044"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1172.59",
+            "gen_tokens": "128",
+            "gen_tps": "47.70",
+            "gen_first_ms": "47.534",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.26",
+            "kvcache_bytes": "2183940188"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1159.31",
+            "gen_tokens": "128",
+            "gen_tps": "51.15",
+            "gen_first_ms": "47.921",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.83",
+            "kvcache_bytes": "4248848476"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1128.00",
+            "gen_tokens": "128",
+            "gen_tps": "45.37",
+            "gen_first_ms": "47.357",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.85",
+            "kvcache_bytes": "0"
+          }
+        ]
+      }
+    ],
+    "token_ids_identical": true,
+    "frontier_logits": [
+      {
+        "file": "frontier_004096.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_008192.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_016384.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_032768.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_065536.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_131072.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_262144.logits.json",
+        "identical": true
+      }
+    ]
+  },
+  "target_performance": {
+    "arguments": {
+      "name": "target-performance-262k",
+      "diagnostic": false,
+      "target_only": true,
+      "max_context": 262144,
+      "start_context": 4096,
+      "tokens": 128,
+      "reverse": false,
+      "candidate_dir": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected",
+      "force_snapshot": true
+    },
+    "driver_sha256": "e407ac050ca1168e14d194519a1fb2769c4f8b231fdc761685fad4f5a62d03c0",
+    "files": {
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/ds4-bench-baseline": "10766e32016ac84db216095b8017fbe8b824200d74766986b518b8f36e5d960b",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/ds4-bench-candidate": "b7008fb048964d70e68f4549aa5b7d7689cb8c7d3566acb8b7bbab57bf00d2cf",
+      "/Users/ifioravanti/github/ds4/ds4.o": "48e641dd6f4c4e23c4235300acf2e223df02fd8d840071bf8d54c11d4a0bb2a1",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4_metal.o": "7e0361d613478d29d13b6ebba2b7e492eed7d3dea1e00d908331866c00b92236",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4_metal.o": "d1e8b5ade38dcb2a56d0b12e60889e2f8b1118b6254b284b63236e4802553003",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+    },
+    "runs": [
+      {
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/ds4-bench-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/baseline/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/baseline/frontier-logits"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_BENCH_FORCE_SNAPSHOT": "1"
+        },
+        "returncode": 0,
+        "wall_s": 254.09319158404833,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1152.97",
+            "gen_tokens": "128",
+            "gen_tps": "48.91",
+            "gen_first_ms": "30.059",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.21",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1145.49",
+            "gen_tokens": "128",
+            "gen_tps": "48.86",
+            "gen_first_ms": "29.634",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.15",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1182.11",
+            "gen_tokens": "128",
+            "gen_tps": "48.82",
+            "gen_first_ms": "29.822",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.11",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1181.73",
+            "gen_tokens": "128",
+            "gen_tps": "48.56",
+            "gen_first_ms": "29.728",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.85",
+            "kvcache_bytes": "1151486044"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1175.76",
+            "gen_tokens": "128",
+            "gen_tps": "48.24",
+            "gen_first_ms": "30.112",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.53",
+            "kvcache_bytes": "2183940188"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1160.49",
+            "gen_tokens": "128",
+            "gen_tps": "47.40",
+            "gen_first_ms": "30.447",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.67",
+            "kvcache_bytes": "4248848476"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1129.39",
+            "gen_tokens": "128",
+            "gen_tps": "45.23",
+            "gen_first_ms": "32.139",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.49",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      {
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/ds4-bench-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/candidate/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/target-performance-262k/candidate/frontier-logits"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_BENCH_FORCE_SNAPSHOT": "1"
+        },
+        "returncode": 0,
+        "wall_s": 252.99860750004882,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1151.25",
+            "gen_tokens": "128",
+            "gen_tps": "48.87",
+            "gen_first_ms": "30.931",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.18",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1145.39",
+            "gen_tokens": "128",
+            "gen_tps": "48.76",
+            "gen_first_ms": "30.706",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.07",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1191.76",
+            "gen_tokens": "128",
+            "gen_tps": "48.62",
+            "gen_first_ms": "29.963",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.91",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1188.77",
+            "gen_tokens": "128",
+            "gen_tps": "48.45",
+            "gen_first_ms": "30.150",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.74",
+            "kvcache_bytes": "1151486044"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1183.00",
+            "gen_tokens": "128",
+            "gen_tps": "48.12",
+            "gen_first_ms": "30.219",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.40",
+            "kvcache_bytes": "2183940188"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1167.28",
+            "gen_tokens": "128",
+            "gen_tps": "47.29",
+            "gen_first_ms": "30.574",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.56",
+            "kvcache_bytes": "4248848476"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1136.02",
+            "gen_tokens": "128",
+            "gen_tps": "45.15",
+            "gen_first_ms": "32.277",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.41",
+            "kvcache_bytes": "0"
+          }
+        ]
+      }
+    ],
+    "token_ids_identical": null,
+    "target_text_identical": true,
+    "frontier_logits": [
+      {
+        "file": "frontier_004096.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_008192.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_016384.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_032768.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_065536.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_131072.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_262144.logits.json",
+        "identical": true
+      }
+    ]
+  },
+  "numerical_262k": {
+    "arguments": {
+      "name": "diagnostic-doubling-262k",
+      "diagnostic": true,
+      "target_only": false,
+      "max_context": 262144,
+      "start_context": 4096,
+      "tokens": 128,
+      "reverse": false,
+      "candidate_dir": "OUT/qwen38-mtp-round3/selected"
+    },
+    "driver_sha256": "e407ac050ca1168e14d194519a1fb2769c4f8b231fdc761685fad4f5a62d03c0",
+    "files": {
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/ds4-bench-baseline": "7125c813d90352ddae6a0669fa5010a72501d464cff5c4ca2a33336a95dbb4b5",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/ds4-bench-candidate": "c49f1f8d5f314793addfdf25efddeca1589ba1b1e339e89d8199e68a127e9e18",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/ds4_diag.o": "7422fd5b5efefb316f040901447558b77e048083a43f56656cfcf4766f0ce16b",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4_metal.o": "7e0361d613478d29d13b6ebba2b7e492eed7d3dea1e00d908331866c00b92236",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4_metal.o": "d1e8b5ade38dcb2a56d0b12e60889e2f8b1118b6254b284b63236e4802553003",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+      "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+    },
+    "runs": [
+      {
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/ds4-bench-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/baseline/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/baseline/frontier-logits",
+          "--mtp"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/baseline/logits.bin"
+        },
+        "returncode": 0,
+        "wall_s": 451.68019033403834,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1152.42",
+            "gen_tokens": "128",
+            "gen_tps": "52.07",
+            "gen_first_ms": "45.778",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.74",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1128.58",
+            "gen_tokens": "128",
+            "gen_tps": "50.95",
+            "gen_first_ms": "44.584",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.56",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1177.84",
+            "gen_tokens": "128",
+            "gen_tps": "51.82",
+            "gen_first_ms": "45.744",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.48",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1179.51",
+            "gen_tokens": "128",
+            "gen_tps": "48.78",
+            "gen_first_ms": "46.424",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "49.35",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1175.14",
+            "gen_tokens": "128",
+            "gen_tps": "47.22",
+            "gen_first_ms": "45.665",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "47.73",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1160.20",
+            "gen_tokens": "128",
+            "gen_tps": "50.68",
+            "gen_first_ms": "46.013",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "51.30",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1116.49",
+            "gen_tokens": "128",
+            "gen_tps": "44.88",
+            "gen_first_ms": "49.671",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "45.39",
+            "kvcache_bytes": "0"
+          }
+        ]
+      },
+      {
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/ds4-bench-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--prompt-file",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp/bench-262k/promessi_sposi.txt",
+          "--ctx-start",
+          "4096",
+          "--ctx-max",
+          "262144",
+          "--ctx-alloc",
+          "262401",
+          "--gen-tokens",
+          "128",
+          "--step-mul",
+          "2",
+          "--csv",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/candidate/speed.csv",
+          "--show-output",
+          "--dump-frontier-logits-dir",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/candidate/frontier-logits",
+          "--mtp"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/diagnostic-doubling-262k/candidate/logits.bin"
+        },
+        "returncode": 0,
+        "wall_s": 460.88398145802785,
+        "speed": [
+          {
+            "ctx_tokens": "4096",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1143.26",
+            "gen_tokens": "128",
+            "gen_tps": "53.09",
+            "gen_first_ms": "46.210",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.80",
+            "kvcache_bytes": "248088668"
+          },
+          {
+            "ctx_tokens": "8192",
+            "prefill_tokens": "4096",
+            "prefill_tps": "1118.39",
+            "gen_tokens": "128",
+            "gen_tps": "52.00",
+            "gen_first_ms": "45.350",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.65",
+            "kvcache_bytes": "377145436"
+          },
+          {
+            "ctx_tokens": "16384",
+            "prefill_tokens": "8192",
+            "prefill_tps": "1158.61",
+            "gen_tokens": "128",
+            "gen_tps": "53.14",
+            "gen_first_ms": "45.352",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "53.84",
+            "kvcache_bytes": "635258972"
+          },
+          {
+            "ctx_tokens": "32768",
+            "prefill_tokens": "16384",
+            "prefill_tps": "1166.61",
+            "gen_tokens": "128",
+            "gen_tps": "50.02",
+            "gen_first_ms": "44.536",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "50.60",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "65536",
+            "prefill_tokens": "32768",
+            "prefill_tps": "1167.33",
+            "gen_tokens": "128",
+            "gen_tps": "48.33",
+            "gen_first_ms": "46.022",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "48.89",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "131072",
+            "prefill_tokens": "65536",
+            "prefill_tps": "1140.95",
+            "gen_tokens": "128",
+            "gen_tps": "51.62",
+            "gen_first_ms": "46.620",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "52.29",
+            "kvcache_bytes": "0"
+          },
+          {
+            "ctx_tokens": "262144",
+            "prefill_tokens": "131072",
+            "prefill_tps": "1083.86",
+            "gen_tokens": "128",
+            "gen_tps": "45.77",
+            "gen_first_ms": "47.590",
+            "gen_steady_tokens": "127",
+            "gen_steady_tps": "46.26",
+            "kvcache_bytes": "0"
+          }
+        ]
+      }
+    ],
+    "token_ids_identical": true,
+    "frontier_logits": [
+      {
+        "file": "frontier_004096.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_008192.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_016384.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_032768.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_065536.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_131072.logits.json",
+        "identical": true
+      },
+      {
+        "file": "frontier_262144.logits.json",
+        "identical": true
+      }
+    ],
+    "logits": {
+      "records": 1230,
+      "vectors": 1828,
+      "exact_records": 1230,
+      "max_abs": 0.0
+    }
+  },
+  "sampling": {
+    "runs": [
+      {
+        "case": "sampling",
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "120",
+          "--temp",
+          "0.7",
+          "--seed",
+          "123",
+          "--top-p",
+          "0.8",
+          "--mtp-exact-sampling"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/sampling-baseline.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "sampling",
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "120",
+          "--temp",
+          "0.7",
+          "--seed",
+          "123",
+          "--top-p",
+          "0.8",
+          "--mtp-exact-sampling"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/sampling-candidate.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "tail1",
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "1",
+          "--temp",
+          "0"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/tail1-baseline.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "tail1",
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "1",
+          "--temp",
+          "0"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/tail1-candidate.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "tail2",
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "2",
+          "--temp",
+          "0"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/tail2-baseline.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "tail2",
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "2",
+          "--temp",
+          "0"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/tail2-candidate.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "tail3",
+        "name": "baseline",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-baseline",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "3",
+          "--temp",
+          "0"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/tail3-baseline.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      },
+      {
+        "case": "tail3",
+        "name": "candidate",
+        "command": [
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-candidate",
+          "-m",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+          "--ple",
+          "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+          "--metal",
+          "--ctx",
+          "8192",
+          "-p",
+          "Write a three-sentence summary of the plot of Hamlet.",
+          "--nothink",
+          "--mtp",
+          "--mtp-timing",
+          "-n",
+          "3",
+          "--temp",
+          "0"
+        ],
+        "environment": {
+          "DS4_METAL_QWEN4_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/qwen4.metal",
+          "DS4_METAL_MOE_SOURCE": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/moe.metal",
+          "DS4_ROUND3_LOGITS": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/tail3-candidate.bin",
+          "DS4_QWEN4_SPEC_TRACE": "1"
+        },
+        "returncode": 0
+      }
+    ],
+    "comparisons": {
+      "sampling": {
+        "records": 142,
+        "vectors": 197,
+        "exact_records": 142,
+        "max_abs": 0.0,
+        "outputs_identical": true,
+        "traces_identical": true,
+        "traces": [
+          "ds4: spec pos 35 token 65640 plain",
+          "ds4: spec pos 36 token 9296 draft 1112 accept",
+          "ds4: spec pos 38 token 369 plain",
+          "ds4: spec pos 39 token 25152 draft 539 accept",
+          "ds4: spec pos 41 token 36049 draft 1238 reject",
+          "ds4: spec pos 43 token 35811 plain",
+          "ds4: spec pos 44 token 1238 draft 780 accept",
+          "ds4: spec pos 46 token 6764 draft 725 accept",
+          "ds4: spec pos 48 token 19261 plain",
+          "ds4: spec pos 49 token 20352 draft 421 accept",
+          "ds4: spec pos 51 token 551 draft 557 accept",
+          "ds4: spec pos 53 token 30353 draft 539 accept",
+          "ds4: spec pos 55 token 9296 plain",
+          "ds4: spec pos 56 token 1112 draft 725 accept",
+          "ds4: spec pos 58 token 36252 draft 11 accept",
+          "ds4: spec pos 60 token 59242 draft 8883 accept",
+          "ds4: spec pos 62 token 11 draft 852 accept",
+          "ds4: spec pos 64 token 682 draft 2394 accept",
+          "ds4: spec pos 66 token 29494 draft 279 accept",
+          "ds4: spec pos 68 token 42176 draft 321 accept",
+          "ds4: spec pos 70 token 11876 draft 9296 accept",
+          "ds4: spec pos 72 token 1112 draft 725 accept",
+          "ds4: spec pos 74 token 6351 draft 13 accept",
+          "ds4: spec pos 76 token 2832 draft 2003 accept",
+          "ds4: spec pos 78 token 539 draft 264 accept",
+          "ds4: spec pos 80 token 12229 draft 364 accept",
+          "ds4: spec pos 82 token 34875 draft 11 accept",
+          "ds4: spec pos 84 token 9296 draft 1112 accept",
+          "ds4: spec pos 86 token 1115 draft 607 accept",
+          "ds4: spec pos 88 token 82 draft 49977 accept",
+          "ds4: spec pos 90 token 321 draft 62929 accept",
+          "ds4: spec pos 92 token 942 draft 264 accept",
+          "ds4: spec pos 94 token 1432 draft 7432 reject",
+          "ds4: spec pos 96 token 7440 draft 279 reject",
+          "ds4: spec pos 98 token 8883 draft 725 accept",
+          "ds4: spec pos 100 token 32732 draft 11 accept",
+          "ds4: spec pos 102 token 6187 draft 310 accept",
+          "ds4: spec pos 104 token 264 draft 3878 reject",
+          "ds4: spec pos 106 token 314 draft 8897 accept",
+          "ds4: spec pos 108 token 421 draft 5469 reject",
+          "ds4: spec pos 110 token 279 draft 6107 accept",
+          "ds4: spec pos 112 token 314 draft 3679 accept",
+          "ds4: spec pos 114 token 5587 plain",
+          "ds4: spec pos 115 token 11 draft 2583 accept",
+          "ds4: spec pos 117 token 496 draft 734 accept",
+          "ds4: spec pos 119 token 34738 draft 321 accept",
+          "ds4: spec pos 121 token 4770 plain",
+          "ds4: spec pos 122 token 156490 draft 13 accept",
+          "ds4: spec pos 124 token 561 draft 3255 reject",
+          "ds4: spec pos 126 token 42960 plain",
+          "ds4: spec pos 127 token 440 draft 264 accept",
+          "ds4: spec pos 129 token 18023 draft 63101 accept",
+          "ds4: spec pos 131 token 303 draft 864 accept",
+          "ds4: spec pos 133 token 9296 draft 1112 accept",
+          "ds4: spec pos 135 token 5326 plain",
+          "ds4: spec pos 136 token 27868 draft 59242 accept",
+          "ds4: spec pos 138 token 8883 draft 694 accept",
+          "ds4: spec pos 140 token 8460 draft 494 reject",
+          "ds4: spec pos 142 token 494 draft 279 reject",
+          "ds4: spec pos 144 token 68117 draft 19601 reject",
+          "ds4: spec pos 146 token 11 draft 9101 accept",
+          "ds4: spec pos 148 token 279 draft 42176 reject",
+          "ds4: spec pos 150 token 310 draft 780 reject",
+          "ds4: spec pos 152 token 258 draft 68367 accept",
+          "ds4: spec pos 154 token 13 plain"
+        ],
+        "counters": [
+          [
+            [
+              "55",
+              "44"
+            ]
+          ],
+          [
+            [
+              "55",
+              "44"
+            ]
+          ]
+        ]
+      },
+      "tail1": {
+        "records": 3,
+        "vectors": 3,
+        "exact_records": 3,
+        "max_abs": 0.0,
+        "outputs_identical": true,
+        "traces_identical": true,
+        "traces": [
+          "ds4: spec pos 35 token 65640 plain"
+        ],
+        "counters": [
+          [],
+          []
+        ]
+      },
+      "tail2": {
+        "records": 5,
+        "vectors": 5,
+        "exact_records": 5,
+        "max_abs": 0.0,
+        "outputs_identical": true,
+        "traces_identical": true,
+        "traces": [
+          "ds4: spec pos 35 token 65640 plain",
+          "ds4: spec pos 36 token 9296 plain"
+        ],
+        "counters": [
+          [],
+          []
+        ]
+      },
+      "tail3": {
+        "records": 5,
+        "vectors": 6,
+        "exact_records": 5,
+        "max_abs": 0.0,
+        "outputs_identical": true,
+        "traces_identical": true,
+        "traces": [
+          "ds4: spec pos 35 token 65640 plain",
+          "ds4: spec pos 36 token 9296 draft 1112 accept"
+        ],
+        "counters": [
+          [
+            [
+              "1",
+              "1"
+            ]
+          ],
+          [
+            [
+              "1",
+              "1"
+            ]
+          ]
+        ]
+      }
+    },
+    "binaries": {
+      "baseline": {
+        "link": [
+          "cc",
+          "-o",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-baseline",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/ds4_diag.o",
+          "ds4_cli.o",
+          "ds4_help.o",
+          "ds4_gpu_args.o",
+          "ds4_prompt_prefix.o",
+          "linenoise.o",
+          "ds4_image.o",
+          "ds4_distributed.o",
+          "ds4_tp.o",
+          "ds4_ssd.o",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4_metal.o",
+          "ds4_layer_pack.o",
+          "-lm",
+          "-pthread",
+          "-framework",
+          "Foundation",
+          "-framework",
+          "Metal"
+        ],
+        "sha256": "d04528f68f64d48c0beb8713a60dbe76beae71ad854cd18c1f6bd4eda563a40f"
+      },
+      "candidate": {
+        "link": [
+          "cc",
+          "-o",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected-sampling/ds4-candidate",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/ds4_diag.o",
+          "ds4_cli.o",
+          "ds4_help.o",
+          "ds4_gpu_args.o",
+          "ds4_prompt_prefix.o",
+          "linenoise.o",
+          "ds4_image.o",
+          "ds4_distributed.o",
+          "ds4_tp.o",
+          "ds4_ssd.o",
+          "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/selected/ds4_metal.o",
+          "ds4_layer_pack.o",
+          "-lm",
+          "-pthread",
+          "-framework",
+          "Foundation",
+          "-framework",
+          "Metal"
+        ],
+        "sha256": "f10fac3f40fefe36e1ba98b965c2c828c98033a11de0d484b0979e1a6a96a85d"
+      }
+    }
+  },
+  "selection_screens": {
+    "nr1-t2-screen": {
+      "started_utc": "2026-09-06T09:27:06.721208+00:00",
+      "platform": "macOS-27.0-arm64-arm-64bit",
+      "model": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+      "ctx": 8192,
+      "ple": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+      "configs": {
+        "baseline": {
+          "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "binary_sha256": "a6f229c327621e42ca8eb99d850d56c021a3b40801372f85b0b9fb063fab5a09",
+          "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "source_sha256": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+          "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+        },
+        "candidate": {
+          "binary": "/Users/ifioravanti/github/ds4/ds4",
+          "binary_sha256": "a6f229c327621e42ca8eb99d850d56c021a3b40801372f85b0b9fb063fab5a09",
+          "source": "/Users/ifioravanti/github/ds4/metal/qwen4.metal",
+          "source_sha256": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+          "moe_source": "/Users/ifioravanti/github/ds4/metal/moe.metal",
+          "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+        }
+      },
+      "shared_metal_sha256": {
+        "metal/argsort.metal": "0c868f5cbf751f889bb73aa5ac8599ff2b4359d9ed9aabd035043550256df790",
+        "metal/bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+        "metal/concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+        "metal/cpy.metal": "53aad2024bd30543ad9d4bac3dbd718830482e76ce4f9f563fee17d558a2ac02",
+        "metal/deepseek4_vision.metal": "c660082cb41fe767c26a396881c1b228c2d6d4b140eb09c81881efbabfd1b682",
+        "metal/dense.metal": "03fb317ec831bbada5af603b6608a8a0d883a6540cefa581098dda894944c801",
+        "metal/dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+        "metal/dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+        "metal/dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+        "metal/dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+        "metal/flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+        "metal/generate_mxfp4_half_lut.py": "a20b9b79d993b16b3bcb4a9658c86618ce4cd33739838fe6aa47bf947f42194e",
+        "metal/get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+        "metal/glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+        "metal/glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+        "metal/glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+        "metal/glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+        "metal/norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+        "metal/qwen4_vision.metal": "b37c7fc2c66131bf5817621920a6b5b30271af21160e7da33edc71e2d5c7fb4b",
+        "metal/repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+        "metal/set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+        "metal/softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+        "metal/sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+        "metal/unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+      },
+      "candidate_env": {
+        "DS4_QWEN4_Q4K_MID_NR": "1",
+        "DS4_QWEN4_Q4K_MID_NSG": "8"
+      },
+      "records": [
+        {
+          "config": "baseline",
+          "case": "hamlet",
+          "repeat": -1,
+          "warmup": true,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 138.76,
+          "decode_tps": 61.02,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 34.65723708301084,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "candidate",
+          "case": "hamlet",
+          "repeat": -1,
+          "warmup": true,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 140.02,
+          "decode_tps": 62.96,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 6.915830500016455,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "baseline",
+          "case": "hamlet",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 139.83,
+          "decode_tps": 61.56,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 4.382753334008157,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "candidate",
+          "case": "hamlet",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 139.99,
+          "decode_tps": 62.98,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 4.319164375017863,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "baseline",
+          "case": "fibonacci",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "List the first 30 Fibonacci numbers with indices.",
+            "-n",
+            "400",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 133.78,
+          "decode_tps": 74.7,
+          "cycles": 201,
+          "accepted": 198,
+          "wall_s": 8.228226833976805,
+          "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+        },
+        {
+          "config": "candidate",
+          "case": "fibonacci",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "List the first 30 Fibonacci numbers with indices.",
+            "-n",
+            "400",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 133.19,
+          "decode_tps": 76.45,
+          "cycles": 201,
+          "accepted": 198,
+          "wall_s": 8.08350333297858,
+          "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+        },
+        {
+          "config": "baseline",
+          "case": "explanation",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 176.07,
+          "decode_tps": 65.99,
+          "cycles": 144,
+          "accepted": 110,
+          "wall_s": 6.783280625008047,
+          "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+        },
+        {
+          "config": "candidate",
+          "case": "explanation",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 175.53,
+          "decode_tps": 67.31,
+          "cycles": 144,
+          "accepted": 110,
+          "wall_s": 6.684970040980261,
+          "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+        },
+        {
+          "config": "candidate",
+          "case": "hamlet",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 140.1,
+          "decode_tps": 62.95,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 4.305843750014901,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "baseline",
+          "case": "hamlet",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 140.07,
+          "decode_tps": 61.43,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 4.332531083957292,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "candidate",
+          "case": "fibonacci",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "List the first 30 Fibonacci numbers with indices.",
+            "-n",
+            "400",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 134.33,
+          "decode_tps": 76.53,
+          "cycles": 201,
+          "accepted": 198,
+          "wall_s": 8.090330375009216,
+          "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+        },
+        {
+          "config": "baseline",
+          "case": "fibonacci",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "List the first 30 Fibonacci numbers with indices.",
+            "-n",
+            "400",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 134.06,
+          "decode_tps": 74.62,
+          "cycles": 201,
+          "accepted": 198,
+          "wall_s": 8.209202625032049,
+          "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+        },
+        {
+          "config": "candidate",
+          "case": "explanation",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 176.12,
+          "decode_tps": 67.48,
+          "cycles": 144,
+          "accepted": 110,
+          "wall_s": 6.614416583033744,
+          "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+        },
+        {
+          "config": "baseline",
+          "case": "explanation",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 176.52,
+          "decode_tps": 65.82,
+          "cycles": 144,
+          "accepted": 110,
+          "wall_s": 6.640236625040416,
+          "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+        },
+        {
+          "config": "baseline",
+          "case": "hamlet",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 139.37,
+          "decode_tps": 61.53,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 4.400619874999393,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "candidate",
+          "case": "hamlet",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Write a three-sentence summary of the plot of Hamlet.",
+            "-n",
+            "120",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 140.41,
+          "decode_tps": 62.96,
+          "cycles": 56,
+          "accepted": 37,
+          "wall_s": 4.326530499965884,
+          "output_sha256": "d11f9ce3df9ff2e1ea9a0c520403a453e97e2f32421d1196de26377b865da0b7"
+        },
+        {
+          "config": "baseline",
+          "case": "fibonacci",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "List the first 30 Fibonacci numbers with indices.",
+            "-n",
+            "400",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 134.9,
+          "decode_tps": 74.68,
+          "cycles": 201,
+          "accepted": 198,
+          "wall_s": 8.147087332967203,
+          "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+        },
+        {
+          "config": "candidate",
+          "case": "fibonacci",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "List the first 30 Fibonacci numbers with indices.",
+            "-n",
+            "400",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 134.1,
+          "decode_tps": 76.37,
+          "cycles": 201,
+          "accepted": 198,
+          "wall_s": 8.008577124972362,
+          "output_sha256": "10a592df12556e0be8696c72527fcca7a79dde1d676b6a8753004e6e82945954"
+        },
+        {
+          "config": "baseline",
+          "case": "explanation",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 175.4,
+          "decode_tps": 65.91,
+          "cycles": 144,
+          "accepted": 110,
+          "wall_s": 6.7257341659860685,
+          "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+        },
+        {
+          "config": "candidate",
+          "case": "explanation",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "8192",
+            "-p",
+            "Explain how a computer sends a web request over TCP and receives the response. Write four clear paragraphs for a programmer learning networking.",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 175.0,
+          "decode_tps": 67.54,
+          "cycles": 144,
+          "accepted": 110,
+          "wall_s": 6.651844375010114,
+          "output_sha256": "3e24cf4106eba2c5e501a6987e719a5e98756a6c43aaf620f89592db7c7154fc"
+        }
+      ],
+      "summary": {
+        "hamlet": {
+          "median_tps": {
+            "baseline": 61.53,
+            "candidate": 62.96
+          },
+          "range_tps": {
+            "baseline": [
+              61.43,
+              61.56
+            ],
+            "candidate": [
+              62.95,
+              62.98
+            ]
+          },
+          "speedup": 1.0232406955956443,
+          "all_outputs_identical": true,
+          "acceptance_identical": true
+        },
+        "fibonacci": {
+          "median_tps": {
+            "baseline": 74.68,
+            "candidate": 76.45
+          },
+          "range_tps": {
+            "baseline": [
+              74.62,
+              74.7
+            ],
+            "candidate": [
+              76.37,
+              76.53
+            ]
+          },
+          "speedup": 1.023701124799143,
+          "all_outputs_identical": true,
+          "acceptance_identical": true
+        },
+        "explanation": {
+          "median_tps": {
+            "baseline": 65.91,
+            "candidate": 67.48
+          },
+          "range_tps": {
+            "baseline": [
+              65.82,
+              65.99
+            ],
+            "candidate": [
+              67.31,
+              67.54
+            ]
+          },
+          "speedup": 1.0238203610984677,
+          "all_outputs_identical": true,
+          "acceptance_identical": true
+        }
+      }
+    },
+    "long-performance": {
+      "started_utc": "2026-09-06T09:34:58.602890+00:00",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "model": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+      "ctx": 65536,
+      "ple": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+      "configs": {
+        "baseline": {
+          "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+          "binary_sha256": "a6f229c327621e42ca8eb99d850d56c021a3b40801372f85b0b9fb063fab5a09",
+          "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/qwen4.metal",
+          "source_sha256": "afe6619cb55a847acf5eb5d48392a275cdab84d019d2d812aa8819fdfe6e761b",
+          "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/moe.metal",
+          "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+        },
+        "candidate": {
+          "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+          "binary_sha256": "a11a23fbfc9227bb613a035f837d12e672c67dc8f9a3718ef5a1891c0591a539",
+          "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/qwen4.metal",
+          "source_sha256": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+          "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/moe.metal",
+          "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+        }
+      },
+      "shared_metal_sha256": {
+        "metal/argsort.metal": "0c868f5cbf751f889bb73aa5ac8599ff2b4359d9ed9aabd035043550256df790",
+        "metal/bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+        "metal/concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+        "metal/cpy.metal": "53aad2024bd30543ad9d4bac3dbd718830482e76ce4f9f563fee17d558a2ac02",
+        "metal/deepseek4_vision.metal": "c660082cb41fe767c26a396881c1b228c2d6d4b140eb09c81881efbabfd1b682",
+        "metal/dense.metal": "03fb317ec831bbada5af603b6608a8a0d883a6540cefa581098dda894944c801",
+        "metal/dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+        "metal/dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+        "metal/dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+        "metal/dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+        "metal/flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+        "metal/generate_mxfp4_half_lut.py": "a20b9b79d993b16b3bcb4a9658c86618ce4cd33739838fe6aa47bf947f42194e",
+        "metal/get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+        "metal/glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+        "metal/glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+        "metal/glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+        "metal/glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+        "metal/norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+        "metal/qwen4_vision.metal": "b37c7fc2c66131bf5817621920a6b5b30271af21160e7da33edc71e2d5c7fb4b",
+        "metal/repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+        "metal/set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+        "metal/softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+        "metal/sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+        "metal/unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+      },
+      "candidate_env": {},
+      "records": [
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": -1,
+          "warmup": true,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.4,
+          "decode_tps": 55.25,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.227040083962493,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": -1,
+          "warmup": true,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.75,
+          "decode_tps": 56.48,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.494178499968257,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1171.93,
+          "decode_tps": 55.23,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.293760416971054,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.72,
+          "decode_tps": 56.55,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.22022666601697,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.22,
+          "decode_tps": 56.43,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.263988625025377,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1171.92,
+          "decode_tps": 55.3,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.290182834025472,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/baseline/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.24,
+          "decode_tps": 55.39,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.313187708030455,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.71,
+          "decode_tps": 56.37,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.2112156249932,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        }
+      ],
+      "prompt_file": {
+        "path": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+        "sha256": "666f97a1ca568c782d4242c4de1235fa3c707492e6b9ba4da6bc78fb62de98ad"
+      },
+      "summary": {
+        "prompt-file": {
+          "median_tps": {
+            "baseline": 55.3,
+            "candidate": 56.43
+          },
+          "prefill_median_tps": {
+            "baseline": 1171.93,
+            "candidate": 1172.71
+          },
+          "range_tps": {
+            "baseline": [
+              55.23,
+              55.39
+            ],
+            "candidate": [
+              56.37,
+              56.55
+            ]
+          },
+          "speedup": 1.0204339963833635,
+          "all_outputs_identical": true,
+          "acceptance_identical": true
+        }
+      }
+    },
+    "gdn-performance": {
+      "started_utc": "2026-09-06T09:41:00.577232+00:00",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "model": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+      "ctx": 65536,
+      "ple": "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+      "configs": {
+        "baseline": {
+          "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+          "binary_sha256": "a11a23fbfc9227bb613a035f837d12e672c67dc8f9a3718ef5a1891c0591a539",
+          "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/qwen4.metal",
+          "source_sha256": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+          "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/moe.metal",
+          "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+        },
+        "candidate": {
+          "binary": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/ds4",
+          "binary_sha256": "10b04245ed5ec7c8083014afd87216c2da4c83d1c9d7cc6abebc57fea355b739",
+          "source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/qwen4.metal",
+          "source_sha256": "5ffd5a96a50820b84e98c57bfefce33536b2434b307ea0c4edb2684989db2dac",
+          "moe_source": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/moe.metal",
+          "moe_source_sha256": "ffec4f2b07c8581e7b85e31ca64f10dad895a7b77b1c0c819d41a805753a782f"
+        }
+      },
+      "shared_metal_sha256": {
+        "metal/argsort.metal": "0c868f5cbf751f889bb73aa5ac8599ff2b4359d9ed9aabd035043550256df790",
+        "metal/bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+        "metal/concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+        "metal/cpy.metal": "53aad2024bd30543ad9d4bac3dbd718830482e76ce4f9f563fee17d558a2ac02",
+        "metal/deepseek4_vision.metal": "c660082cb41fe767c26a396881c1b228c2d6d4b140eb09c81881efbabfd1b682",
+        "metal/dense.metal": "03fb317ec831bbada5af603b6608a8a0d883a6540cefa581098dda894944c801",
+        "metal/dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+        "metal/dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+        "metal/dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+        "metal/dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+        "metal/flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+        "metal/generate_mxfp4_half_lut.py": "a20b9b79d993b16b3bcb4a9658c86618ce4cd33739838fe6aa47bf947f42194e",
+        "metal/get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+        "metal/glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+        "metal/glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+        "metal/glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+        "metal/glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+        "metal/norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+        "metal/qwen4_vision.metal": "b37c7fc2c66131bf5817621920a6b5b30271af21160e7da33edc71e2d5c7fb4b",
+        "metal/repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+        "metal/set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+        "metal/softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+        "metal/sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+        "metal/unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+      },
+      "candidate_env": {},
+      "records": [
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": -1,
+          "warmup": true,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1173.08,
+          "decode_tps": 56.57,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.194145999965258,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": -1,
+          "warmup": true,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1179.23,
+          "decode_tps": 56.66,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 24.655722916999366,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1173.61,
+          "decode_tps": 56.77,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.143234791990835,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": 0,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1179.69,
+          "decode_tps": 56.45,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.114773374982178,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1179.3,
+          "decode_tps": 56.45,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.14703004102921,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": 1,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1172.63,
+          "decode_tps": 56.49,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.226351999968756,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "baseline",
+          "case": "prompt-file",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1171.99,
+          "decode_tps": 56.53,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.217132167017553,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        },
+        {
+          "config": "candidate",
+          "case": "prompt-file",
+          "repeat": 2,
+          "warmup": false,
+          "command": [
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/gdn-candidate/ds4",
+            "-m",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-Q4KImatrix-MTP-qwen4exp-pleext.gguf",
+            "--metal",
+            "--ctx",
+            "65536",
+            "-n",
+            "256",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "--mtp-timing",
+            "--prompt-file",
+            "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+            "--raw-prompt",
+            "--ple",
+            "/Users/ifioravanti/models/qwen38-q4k-imatrix/Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
+          ],
+          "prefill_tps": 1179.13,
+          "decode_tps": 56.31,
+          "cycles": 161,
+          "accepted": 94,
+          "wall_s": 22.194321374990977,
+          "output_sha256": "e4f2898d1b6ef452ee73a8bc07bf666b0896c94bc0bd5bdc47ef3759efb7394c"
+        }
+      ],
+      "prompt_file": {
+        "path": "/Users/ifioravanti/github/ds4/OUT/qwen38-mtp-round3/long-prompt.txt",
+        "sha256": "666f97a1ca568c782d4242c4de1235fa3c707492e6b9ba4da6bc78fb62de98ad"
+      },
+      "summary": {
+        "prompt-file": {
+          "median_tps": {
+            "baseline": 56.53,
+            "candidate": 56.45
+          },
+          "prefill_median_tps": {
+            "baseline": 1172.63,
+            "candidate": 1179.3
+          },
+          "range_tps": {
+            "baseline": [
+              56.49,
+              56.77
+            ],
+            "candidate": [
+              56.31,
+              56.45
+            ]
+          },
+          "speedup": 0.9985848222182913,
+          "all_outputs_identical": true,
+          "acceptance_identical": true
+        }
+      }
+    }
+  },
+  "discarded_run": {
+    "path": "OUT/qwen38-mtp-round3/diagnostic-262k",
+    "reason": "Stopped baseline-only run: missing --step-mul 2 selected linear 2048-token steps."
+  },
+  "post_measurement_cleanup": {
+    "harness": "speed-bench/qwen38_mtp_compare.py",
+    "measured_sha256": "84bd7985f5c46eec2bdbb561c0e061fa7f27609f24d73568dcda21c49cfb5445",
+    "final_sha256": "e5203e2dd09b2a3d07cb26e278d41bdeb3e65454b5e1d5fc2f8922c61d7f1390",
+    "change": "Reject acceptance-counter drift even when generated output matches; runtime and kernel sources unchanged.",
+    "checks": [
+      {
+        "candidate_accepted": 1,
+        "returncode": 0,
+        "summary": {
+          "median_tps": {
+            "baseline": 50.0,
+            "candidate": 50.0
+          },
+          "prefill_median_tps": {
+            "baseline": 100.0,
+            "candidate": 100.0
+          },
+          "range_tps": {
+            "baseline": [
+              50.0,
+              50.0
+            ],
+            "candidate": [
+              50.0,
+              50.0
+            ]
+          },
+          "speedup": 1.0,
+          "all_outputs_identical": true,
+          "acceptance_identical": true
+        },
+        "raw_prompt_and_token_budget_verified": true,
+        "stderr": ""
+      },
+      {
+        "candidate_accepted": 0,
+        "returncode": 1,
+        "summary": {
+          "median_tps": {
+            "baseline": 50.0,
+            "candidate": 50.0
+          },
+          "prefill_median_tps": {
+            "baseline": 100.0,
+            "candidate": 100.0
+          },
+          "range_tps": {
+            "baseline": [
+              50.0,
+              50.0
+            ],
+            "candidate": [
+              50.0,
+              50.0
+            ]
+          },
+          "speedup": 1.0,
+          "all_outputs_identical": true,
+          "acceptance_identical": false
+        },
+        "raw_prompt_and_token_budget_verified": true,
+        "stderr": "Acceptance parity failed; inspect the saved counters before accepting the speedup\n"
+      }
+    ]
+  }
+}

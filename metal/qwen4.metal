@@ -151,7 +151,10 @@ kernel void kernel_qwen4_hc_norm_reuse(
     if (s >= args.n_hc || tok >= args.n_tokens) return;
     const uint E = args.n_embd, dim = E * args.n_hc;
     const uint nth = ntg.x, nsg = nth / 32;
-    threadgroup float red[5][32];
+    threadgroup float red[32];
+    /* This kernel uses 128 threads. Keep each chunk's four SIMD partials
+     * separate so its readers need no barrier before the next chunk writes. */
+    threadgroup float inject_red[QWEN4_HC_CHUNKS][4][4];
     device const float *r = R + ((uint64_t)tok * args.n_hc + s) * E;
     device const float *g = gamma + s * E;
     device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
@@ -159,10 +162,10 @@ kernel void kernel_qwen4_hc_norm_reuse(
     float ss = 0.0f;
     for (uint i = tid; i < E; i += nth) ss += r[i] * r[i];
     ss = simd_sum(ss);
-    if (tiisg == 0) red[0][sgitg] = ss;
+    if (tiisg == 0) red[sgitg] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float tot = 0.0f;
-    for (uint q = 0; q < nsg; q++) tot += red[0][q];
+    for (uint q = 0; q < nsg; q++) tot += red[q];
     const float inv = rsqrt(tot / (float)E + args.eps);
     const uint per = (E + QWEN4_HC_CHUNKS - 1) / QWEN4_HC_CHUNKS;
     for (uint chunk = 0; chunk < QWEN4_HC_CHUNKS; chunk++) {
@@ -178,17 +181,14 @@ kernel void kernel_qwen4_hc_norm_reuse(
         for (uint j = 0; j < 4; j++) {
             if (j >= args.n_inject) break;
             const float a = simd_sum(acc[j]);
-            if (tiisg == 0) red[1 + j][sgitg] = a;
+            if (tiisg == 0) inject_red[chunk][j][sgitg] = a;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid < args.n_inject) {
             float a = 0.0f;
-            for (uint q = 0; q < nsg; q++) a += red[1 + tid][q];
+            for (uint q = 0; q < nsg; q++) a += inject_red[chunk][tid][q];
             inj_part[((uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS + s * QWEN4_HC_CHUNKS + chunk) * args.n_inject + tid] = a;
         }
-        /* Every partial reader must finish before the next chunk overwrites
-         * the shared injection reductions. */
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

@@ -5,7 +5,29 @@
 Qwen3.8-Flash-Next (`qwen4exp` in GGUF terms) runs on its own Metal graph:
 36 gated delta-net layers and 12 gated GQA layers with the QSA block-sparse
 indexer, four-stream hyper-connections, the hashed per-layer n-gram table,
-512-expert MoE with a shared expert, and the built-in MTP block. Build the
+512-expert MoE with a shared expert, and the built-in MTP block.
+
+## Download and run
+
+The [DS4 Q4 release](https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4)
+contains one combined main/MTP GGUF and a required external PLE sidecar,
+about 107 GB (100 GiB) together on disk:
+
+```sh
+./download_model.sh qwen38-q4k
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+./ds4-server --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp --mtp-exact-sampling
+```
+
+The downloader links `ds4flash.gguf` to the combined model. Both ordinary and
+MTP decode use this same GGUF and PLE sidecar; omit `--mtp` for ordinary decode.
+Adjust the PLE path if you set `DS4_GGUF_DIR`. The external PLE table is mapped
+separately, allowing this release to run on 128 GB Macs; context size and other
+workloads still affect memory use.
+
+## Build your own GGUF
+
+Build the
 GGUF from the Hugging Face checkpoint with the converter in `gguf-tools/`;
 the stock `ggml-org` Q8_0 GGUF also loads once its two parts are merged with
 `llama-gguf-split --merge`:
@@ -70,8 +92,10 @@ checks, set `DS4_QWEN4_NO_MTP_BATCH=1`, `DS4_QWEN4_NO_HC_PAIR=1`,
 `DS4_QWEN4_NO_GDN_R4=1` (decode only), or `DS4_QWEN4_NO_Q4K_MID=1`.
 The GDN verification layout uses eight SIMD groups on M3 Ultra;
 `DS4_QWEN4_GDN_NSG` overrides the decode group count from 1 to 8.
+GDN prefill uses four SIMD groups on M3 Ultra for batches of at least 8192
+tokens with 16 key heads, 48 value heads and head width 128.
 `DS4_QWEN4_Q4K_MID_NR` selects 1 or 2 rows per SIMD group for Q4_K gate/up.
-One-token decode on M3 Ultra defaults to one row and eight SIMD groups;
+One- and two-token decode on M3 Ultra default to one row and eight SIMD groups;
 other batches and devices retain two rows and two SIMD groups.
 `DS4_QWEN4_Q4K_MID_NSG` overrides the group count from 1 to 8. Setting
 `DS4_QWEN4_Q4K_MID_NR=2` restores the former layout without an NSG override.
@@ -94,6 +118,9 @@ Hyper-connection normalization reuses each stream's RMS for batches of at least
 8192 tokens on M3 Ultra with embedding size 2560, four streams and four injection
 outputs. It preserves the original chunk reductions. `DS4_QWEN4_HC_NORM_REUSE=0`
 disables reuse; `=1` enables it for batches larger than two tokens.
+Separate scratch for each chunk removes redundant overwrite barriers without
+changing the reduction order. See [the latest MTP optimization report](../speed-bench/qwen38-mtp-round3.md)
+for full-vocabulary numerical checks and prefill/decode measurements through 262K.
 
 `--batched-session N` keeps N sessions resident; their decode steps run one
 after another rather than as one grouped batch, so it buys concurrency, not
@@ -136,12 +163,13 @@ and performance handoff live in [QWEN38_FLASH_NEXT.md](../QWEN38_FLASH_NEXT.md)
 and [QWEN38_PERF_HANDOFF.md](../QWEN38_PERF_HANDOFF.md), and its source is kept
 in-tree (`ds4_qwen4.c`/`ds4_qwen4.h`, unreferenced by the build).
 
-The canonical runtime model is the Q4_K-imatrix `pleext` build run with the
-external PLE sidecar, for example:
+The published Q4_K-imatrix build combines the main and MTP weights and uses
+the external PLE sidecar, as shown in [Download and run](#download-and-run).
+To select it explicitly instead of using the default symlink:
 
 ```
-./ds4 -m Qwen3.8-Flash-Next-Q4KImatrix-qwen4exp-pleext.gguf \
-      --ple Qwen3.8-Flash-Next-PLE-Q4_1.gguf --metal
+./ds4 -m gguf/Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf \
+      --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --metal --mtp
 ```
 
 Models still in the old fast-pack format can be converted with

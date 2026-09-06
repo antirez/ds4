@@ -47597,11 +47597,14 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
     }
     const bool decode_r4 = n_tokens <= 2u && getenv("DS4_QWEN4_NO_GDN_R4") == NULL;
     if (head_dim == 128u && (n_tokens > 8u || decode_r4)) {
-        /* Four value rows share Q/K loads per SIMD group. M3 Ultra prefers
-         * eight groups for two-token verification; retain the prefill layout. */
+        /* SIMD groups own independent value rows, so changing their grouping
+         * preserves the recurrent arithmetic. M3 Ultra prefers eight groups
+         * for verification and four at the measured large-prefill shape. */
         const uint32_t default_nsg = n_tokens == 2u && ds4_gpu_device_name_contains("M3 Ultra") ? 8u : 1u;
         const uint32_t nsg = n_tokens <= 2u ?
-            (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GDN_NSG", default_nsg, 1u, 8u) : 1u;
+            (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_GDN_NSG", default_nsg, 1u, 8u) :
+            n_tokens >= 8192u && n_k_head == 16u && n_v_head == 48u &&
+            ds4_gpu_device_name_contains("M3 Ultra") ? 4u : 1u;
         return qwen4_dispatch(QWEN4_K_GDN_SCAN_R4, &args, sizeof(args), bd, 6,
                               MTLSizeMake((head_dim + 4u * nsg - 1u) / (4u * nsg), n_v_head, 1),
                               MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -47978,9 +47981,9 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     }
     const bool q4k = weight_type == 12u && getenv("DS4_QWEN4_NO_Q4K_MID") == NULL;
     const bool m3_ultra = q4k && ds4_gpu_device_name_contains("M3 Ultra");
-    /* The NR1 gain was measured for one-token decode; retain NR2 for T2
-     * MTP verification and other batches unless explicitly overridden. */
-    const uint32_t default_nr = m3_ultra && n_tokens == 1u ? 1u : 2u;
+    /* One row per SIMD group improves both single-token decode and the
+     * two-token MTP verifier on M3 Ultra without changing dot-product order. */
+    const uint32_t default_nr = m3_ultra && n_tokens <= 2u ? 1u : 2u;
     const uint64_t nr_env = q4k ? ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NR", default_nr, 1u, UINT64_MAX) : 2u;
     const uint32_t nr = nr_env == 1u || nr_env == 2u ? (uint32_t)nr_env : default_nr;
     /* NR2 without an NSG override restores the former ordered dispatch. */

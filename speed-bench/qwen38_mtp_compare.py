@@ -51,10 +51,16 @@ def main():
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--case", choices=CASES, action="append")
+    ap.add_argument("--prompt-file", type=Path, help="benchmark a longer raw prompt instead of the built-in cases")
+    ap.add_argument("--tokens", type=int, default=256, help="generated tokens for --prompt-file (default: 256)")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.repeats < 1:
         ap.error("--repeats must be positive")
+    if args.prompt_file and args.case:
+        ap.error("--prompt-file and --case are mutually exclusive")
+    if args.tokens < 3:
+        ap.error("--tokens must be at least 3 to exercise MTP verification")
     overrides = {}
     for item in args.candidate_env:
         key, sep, value = item.partition("=")
@@ -79,13 +85,17 @@ def main():
         "shared_metal_sha256": {str(p.relative_to(ROOT)): sha256(p) for p in sorted((ROOT / "metal").glob("*"))
                                 if p.is_file() and p.name not in ("qwen4.metal", "moe.metal")},
         "candidate_env": overrides, "records": [],
+        "prompt_file": ({"path": str(args.prompt_file.resolve()), "sha256": sha256(args.prompt_file)}
+                        if args.prompt_file else None),
     }
 
     def run(name, case, repeat):
         binary, source, moe_source = configs[name]
-        prompt, tokens = CASES[case]
+        prompt, tokens = (None, args.tokens) if args.prompt_file else CASES[case]
         cmd = [str(binary), "-m", str(args.model.resolve()), "--metal", "--ctx", str(args.ctx),
-               "-p", prompt, "-n", str(tokens), "--temp", "0", "--nothink", "--mtp", "--mtp-timing"]
+               "-n", str(tokens), "--temp", "0", "--nothink", "--mtp", "--mtp-timing"]
+        cmd += (["--prompt-file", str(args.prompt_file.resolve()), "--raw-prompt"]
+                if args.prompt_file else ["-p", prompt])
         if args.ple:
             cmd += ["--ple", str(args.ple.resolve())]
         # Only explicit overrides participate; inherited diagnostic and tuning
@@ -113,7 +123,7 @@ def main():
         print(f"{name}/{case}/r{repeat}: {rec['decode_tps']:.2f} t/s, "
               f"accepted {rec['accepted']}/{rec['cycles']}", flush=True)
 
-    cases = args.case or list(CASES)
+    cases = ["prompt-file"] if args.prompt_file else args.case or list(CASES)
     for name in configs:
         run(name, cases[0], -1)
     for repeat in range(args.repeats):
@@ -126,6 +136,9 @@ def main():
         medians = {name: statistics.median(r["decode_tps"] for r in records if r["config"] == name)
                    for name in configs}
         summary = {"median_tps": medians,
+                   "prefill_median_tps": {
+                       name: statistics.median(r["prefill_tps"] for r in records if r["config"] == name)
+                       for name in configs},
                    "range_tps": {name: [min(r["decode_tps"] for r in records if r["config"] == name),
                                          max(r["decode_tps"] for r in records if r["config"] == name)]
                                  for name in configs},
@@ -137,6 +150,8 @@ def main():
     (args.out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
     if not all(s["all_outputs_identical"] for s in report["summary"].values()):
         raise SystemExit("Output parity failed; inspect the saved stdout files before accepting the speedup")
+    if not all(s["acceptance_identical"] for s in report["summary"].values()):
+        raise SystemExit("Acceptance parity failed; inspect the saved counters before accepting the speedup")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model).
 It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and
-**DeepSeek V4 PRO**. It is self-contained and
+**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal). It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
@@ -159,7 +159,18 @@ Flash 0731; GLM 5.3 Flash adds vision to the same text model.
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
-Speculative decoding is opt-in. GLM uses `--mtp`; Flash DSpark needs a matching
+Qwen3.8 uses one combined main/MTP GGUF plus a required external PLE sidecar:
+
+```sh
+./download_model.sh qwen38-q4k
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+```
+
+The download updates `ds4flash.gguf` to the combined model. Omit `--mtp` for
+ordinary decode with the same files. See [Qwen setup](docs/QWEN38_FLASH_NEXT.md)
+for details; if using `DS4_GGUF_DIR`, adjust the PLE path accordingly.
+
+Speculative decoding is opt-in. GLM and Qwen use `--mtp`; Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
 difference between default opportunistic sampling and `--mtp-exact-sampling`.
@@ -213,11 +224,11 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 ## Detailed Guides
 
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, and matching encoders.
+- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and measured Metal optimizations.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM MTP, and sampling.
+- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.

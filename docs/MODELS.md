@@ -43,6 +43,22 @@ path, including pipeline execution for models too large for one host.
 
 To build weights rather than download them, see [GGUF tools](../gguf-tools/README.md).
 
+## Qwen3.8 Flash Next
+
+`./download_model.sh qwen38-q4k` downloads the combined main/MTP GGUF and its
+required external PLE sidecar from
+[the DS4 release](https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4).
+Together they use about 107 GB (100 GiB) on disk. This model runs on Metal.
+The script links `ds4flash.gguf` to the combined GGUF:
+
+```sh
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+```
+
+Omit `--mtp` for ordinary decode; both modes use the same model and sidecar.
+Adjust the PLE path if you set `DS4_GGUF_DIR`. See [Qwen setup](QWEN38_FLASH_NEXT.md)
+for memory, conversion, vision, and sampling details.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |

@@ -32,7 +32,6 @@ GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
-QWEN38_Q4K_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out.gguf"
 QWEN38_Q4K_MTP_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf"
 QWEN38_PLE_FILE="Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
 
@@ -174,11 +173,11 @@ Targets:
        with --vision; this target does not update ./ds4flash.gguf.
 
   qwen38-q4k
-       Qwen3.8-Flash-Next DS4 Q4_K imatrix build: the base
-       GGUF, the MTP speculative-decoding variant, and the external PLE
-       n-gram sidecar — about 180 GB on disk together. Routed gate/up
-       experts are imatrix Q4_K, routed down MXFP4, dense Q8_0. Both GGUFs
-       need --ple at runtime; the MTP file additionally takes --mtp
+       Qwen3.8-Flash-Next DS4 Q4_K imatrix build: one combined main/MTP
+       GGUF and the external PLE n-gram sidecar — about 107 GB (100 GiB)
+       on disk together. Routed gate/up experts are imatrix Q4_K,
+       routed down MXFP4, dense Q8_0. Use --ple at runtime; the same
+       GGUF supports ordinary decode or optional speculation with --mtp
        (--mtp-exact-sampling for exact sampling under speculation).
        Fits 128 GB Macs (~68 GiB resident).
 
@@ -196,6 +195,9 @@ After main-model downloads the script updates:
 Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
+
+Qwen3.8 also requires its PLE sidecar; add --mtp to enable speculation:
+  ./ds4 --ple <download directory>/$QWEN38_PLE_FILE --mtp
 
 After downloading DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
@@ -310,8 +312,8 @@ case "$MODEL" in
         ;;
     qwen38-q4k)
         REPO=$QWEN38_REPO
-        MODEL_FILE=$QWEN38_Q4K_FILE
-        MODEL_FILES="$QWEN38_Q4K_FILE $QWEN38_Q4K_MTP_FILE $QWEN38_PLE_FILE"
+        MODEL_FILE=$QWEN38_Q4K_MTP_FILE
+        MODEL_FILES="$MODEL_FILE $QWEN38_PLE_FILE"
         FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)
@@ -502,3 +504,7 @@ fi
 
 echo
 echo "Done."
+if [ "$MODEL" = qwen38-q4k ]; then
+    echo "Run with the required PLE sidecar (omit --mtp for ordinary decode):"
+    printf '  ./ds4 --ple "%s/%s" --mtp\n' "$OUT_DIR" "$QWEN38_PLE_FILE"
+fi
