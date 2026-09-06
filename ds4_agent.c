@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -11294,16 +11295,46 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
             if (rc < 0) return false;
         }
         /* stdin may be in non-blocking mode (set by editor_start).
-         * Temporarily switch to blocking so fgets can wait for input. */
+         * Temporarily switch to blocking so the read below can wait for input. */
         int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         if (saved_flags >= 0 && (saved_flags & O_NONBLOCK)) {
             fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
         }
-        bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        /* Read the line by hand rather than with fgets, and accept CR as well
+         * as LF.  The terminal may still be in linenoise raw mode here --
+         * editor_stop() leaves cooked mode, but linenoiseRestoreRawMode() can
+         * put it back -- and raw mode clears ICRNL, so Enter arrives as '\r'
+         * and never as '\n'.  fgets waits for '\n' forever, so the prompt hangs
+         * and each Enter just echoes another ^M.  Terminating on either
+         * character is correct in both modes: with ICRNL on, a lone '\r' has
+         * already been translated and cannot appear. */
+        size_t used = 0;
+        bool got_line = false, saw_eof = false;
+        for (;;) {
+            char ch;
+            ssize_t n = read(STDIN_FILENO, &ch, 1);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (n == 0) { saw_eof = true; break; }
+            if (ch == '\r' || ch == '\n') { got_line = true; break; }
+            if (used + 1 < sizeof(buf)) buf[used++] = ch;
+        }
+        buf[used] = '\0';
         if (saved_flags >= 0 && (saved_flags & O_NONBLOCK)) {
             fcntl(STDIN_FILENO, F_SETFL, saved_flags);
         }
-        if (!got_line) return false;
+        /* Raw mode also clears ECHO, so neither the answer nor the newline was
+         * echoed.  Terminate the prompt line ourselves in that case only --
+         * with ECHO on the terminal already emitted one and a second would
+         * leave a blank line. */
+        struct termios tio;
+        if (tcgetattr(STDIN_FILENO, &tio) == 0 && !(tio.c_lflag & ECHO)) {
+            printf("\n");
+            fflush(stdout);
+        }
+        if (!got_line && (saw_eof || used == 0)) return false;
         char *p = buf;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == 'y' || *p == 'Y') return true;
