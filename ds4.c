@@ -66143,6 +66143,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
+        if (g->placement) {
+            const int seed_tier = input_hc ? g->placement[layer_start + 1u]
+                                           : g->emb_tier;
+            if (!metal_graph_set_active_tier_no_copy(g, seed_tier)) {
+                if (errlen) snprintf(err, errlen,
+                                     "%s layer-slice decode could not select input GPU tier %d",
+                                     ds4_backend_name(e->backend), seed_tier);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+        }
+
         bool ok = true;
         if (g->ssd_streaming && !input_hc) {
             g->streaming_static_decode_map_current = false;
@@ -66252,6 +66264,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .cap = (int)n_tokens,
     };
 
+    if (g->placement) {
+        const int seed_tier = input_hc ? g->placement[layer_start + 1u]
+                                       : g->emb_tier;
+        if (!metal_graph_set_active_tier_no_copy(g, seed_tier)) {
+            if (errlen) snprintf(err, errlen,
+                                 "%s layer-slice could not select input GPU tier %d",
+                                 ds4_backend_name(e->backend), seed_tier);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+    }
+
     bool ok = true;
     if (g->ssd_streaming && !input_hc) {
         g->streaming_static_decode_map_current = false;
@@ -66271,8 +66295,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     }
 
     ds4_gpu_tensor *last_hc = NULL;
-    ds4_gpu_tensor *saved_cur = NULL;
-    const int src_tier = g->active_tier;
     const bool batch_selected_addr =
         g->ssd_streaming &&
         layer_start == 0 &&
@@ -66312,7 +66334,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     }
     if (ok && output_logits) {
-        saved_cur = g->cur_hc_by_tier[src_tier];
+        const int src_tier = g->active_tier;
+        ds4_gpu_tensor *saved_cur = g->cur_hc_by_tier[src_tier];
         last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g), n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
         if (ok && g->ssd_streaming) {
@@ -66328,7 +66351,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     }
     if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
-    if (saved_cur) g->cur_hc_by_tier[src_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 
     if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
