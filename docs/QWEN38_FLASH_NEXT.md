@@ -167,7 +167,38 @@ mmproj file with `./download_model.sh qwen38-vision` (it comes from
 multiples of 32 pixels within 64 to 1024 tokens (`DS4_QWEN4_IMAGE_MAX_TOKENS`
 raises the cap), encoded on the GPU, and takes the model's 3D rope positions;
 live KV reuse keys on the image fingerprints. `make test-qwen4-vision`
-compares the tower with the Hugging Face implementation.
+compares the tower with the Hugging Face implementation using the same GGUF
+weights, dequantized to float32. It separately reports GGUF-versus-original
+checkpoint quality and Metal-versus-original agreement. Both comparisons use
+the unchanged minimum per-token cosine threshold of 0.99; implementation
+parity gates the default exit status. Add `--require-quality` to also fail on
+GGUF-versus-original quality loss. A passing implementation check alone does
+not mean the quantized encoder matches the original checkpoint.
+
+For a small suite including OCR, diagrams, a photograph, and resizing:
+
+```sh
+make tests/test_qwen4_vision
+uv run --with numpy --with torch --with torchvision --with pillow \
+  --with safetensors --with transformers --with gguf tests/qwen4_vision_ref.py \
+  --snapshot /path/to/HF-checkpoint \
+  --mmproj gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
+  --image tests/vision-fixtures/qwen38/orbit.png \
+  --image tests/vision-fixtures/qwen38/maple.png \
+  --image tests/vision-fixtures/glm53/diagram.png \
+  --image tests/vision-fixtures/glm53/text.png \
+  --image tests/vision-fixtures/glm53/earth.jpg \
+  --image tests/vision-fixtures/glm53/screenshot.png \
+  --json-report /tmp/qwen38-vision-parity.json
+```
+
+Transformers must include `qwen4_exp`; the reference runs on CPU. Repeat
+`--image` to add cases. The original single-image `--out` embedding dump is
+still supported. Metric checks without model weights run with
+`uv run --with numpy python -m unittest discover -s tests -p test_qwen4_vision_ref.py`.
+JPEG decoder agreement with Pillow, including progressive scans, subsampling,
+and image edges, is checked separately with
+`uv run --with numpy --with pillow python -m unittest discover -s tests -p test_jpeg_decode.py`.
 
 To check CLI `/read` image turns and text follow-ups with ordinary and MTP
 decode, use two different PNG or JPEG images with the model-backed regression:
