@@ -56033,8 +56033,31 @@ uint64_t ds4_engine_tokenizer_fingerprint(ds4_engine *e) {
     pthread_mutex_lock(&e->tokenizer_fp_mu);
     if (!e->tokenizer_fp_ready) {
         uint64_t h = 14695981039346656037ull;
-        h = tokenizer_fp_hash_bytes(h, e->vocab.token,
-                                    (size_t)e->vocab.n_vocab * sizeof(ds4_str));
+        /* Hash tokenizer CONTENT, never in-memory struct bytes: pointer
+         * fields change with every process mapping, which would make the
+         * fingerprint restart-unstable and reject valid checkpoints after
+         * an ordinary server restart. */
+        h = tokenizer_fp_hash_bytes(h, &e->vocab.n_vocab, sizeof(e->vocab.n_vocab));
+        for (int ti = 0; ti < e->vocab.n_vocab; ti++) {
+            h = tokenizer_fp_hash_bytes(h, &e->vocab.token[ti].len,
+                                        sizeof(e->vocab.token[ti].len));
+            h = tokenizer_fp_hash_bytes(h, e->vocab.token[ti].ptr,
+                                        (size_t)e->vocab.token[ti].len);
+        }
+        /* Merge ranks: the open-addressed slot order is a deterministic
+         * function of the GGUF merge list, so hashing slots in index order
+         * (key bytes + rank) is stable across processes. */
+        h = tokenizer_fp_hash_bytes(h, &e->vocab.merge_rank.used,
+                                    sizeof(e->vocab.merge_rank.used));
+        h = tokenizer_fp_hash_bytes(h, &e->vocab.merge_rank.cap,
+                                    sizeof(e->vocab.merge_rank.cap));
+        for (uint64_t mi = 0; mi < e->vocab.merge_rank.cap; mi++) {
+            str_i32_entry *en = &e->vocab.merge_rank.entry[mi];
+            if (!en->used) continue;
+            h = tokenizer_fp_hash_bytes(h, &en->key.len, sizeof(en->key.len));
+            h = tokenizer_fp_hash_bytes(h, en->key.ptr, (size_t)en->key.len);
+            h = tokenizer_fp_hash_bytes(h, &en->value, sizeof(en->value));
+        }
         for (size_t pi = 0; pi < sizeof(DS4_TOKENIZER_FP_PROBES) /
                                    sizeof(DS4_TOKENIZER_FP_PROBES[0]); pi++) {
             ds4_tokens t = {0};
