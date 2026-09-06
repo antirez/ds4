@@ -3252,6 +3252,125 @@ int ds4_gpu_glm53_kda_prefill(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+/* Qwen 3.8 Gated DeltaNet layer pass (conv+norm prepare, delta-rule
+ * recurrence, SiLU-gated RMSNorm output). Serves both prefill chunks and
+ * single-token decode; q/k/v/raw_alpha are rewritten in place. */
+int ds4_gpu_qwen38_gdn(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_alpha,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_qk_heads,
+        uint32_t              n_v_heads,
+        uint32_t              n_tokens,
+        float                 norm_eps);
+
+/* Qwen 3.8 QSA dense-attention layer pass (exact up to the 2048-token
+ * indexer budget): in-place q norm+RoPE, f16 KV append, causal GQA
+ * attention with the fused sigmoid output gate. */
+int ds4_gpu_qwen38_qsa(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        ds4_gpu_tensor       *q,
+        const ds4_gpu_tensor *out_gate,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              n_q_heads,
+        uint32_t              n_kv_heads,
+        uint32_t              head_dim,
+        uint32_t              rope_dim,
+        uint32_t              n_rows,
+        uint32_t              pos0,
+        uint32_t              cache_cap,
+        float                 rope_freq_base,
+        float                 norm_eps);
+
+/* Qwen 3.8 lowrank gated-residual (hyper-connection) and PLE primitives.
+ * The lowrank/inject projections themselves run through the ordinary dense
+ * matmul entry points; these kernels cover the grouped norm, the
+ * silu/sigmoid mixing glue, the stream injection, the PLE stream gate and
+ * the dilated PLE conv with its rolling 9-slot state. */
+int ds4_gpu_qwen38_hc_group_norm(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_streams,
+        uint32_t              n_embd,
+        uint32_t              n_rows,
+        float                 norm_eps);
+int ds4_gpu_qwen38_hc_mix_silu(
+        ds4_gpu_tensor *x,
+        uint32_t        n_streams,
+        uint32_t        width,
+        uint32_t        n_rows);
+int ds4_gpu_qwen38_hc_combine(
+        ds4_gpu_tensor       *mixed,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *normed,
+        uint32_t              n_streams,
+        uint32_t              n_embd,
+        uint32_t              n_rows);
+int ds4_gpu_qwen38_hc_inject(
+        ds4_gpu_tensor       *h,
+        const ds4_gpu_tensor *y,
+        const ds4_gpu_tensor *inject,
+        uint32_t              n_streams,
+        uint32_t              n_embd,
+        uint32_t              n_rows);
+int ds4_gpu_qwen38_ple_gate(
+        ds4_gpu_tensor       *gated,
+        const ds4_gpu_tensor *key_normed,
+        const ds4_gpu_tensor *query_normed,
+        const ds4_gpu_tensor *value,
+        uint32_t              n_streams,
+        uint32_t              n_embd,
+        uint32_t              n_rows);
+/* Qwen 3.8 MoE router: top-k by logit with softmax weights renormalized
+ * over the selected experts (no bias, no scale). */
+int ds4_gpu_qwen38_router_select_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              n_tokens);
+int ds4_gpu_qwen38_add_sigmoid_rows(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *s,
+        uint32_t              n_embd,
+        uint32_t              n_rows);
+int ds4_gpu_qwen38_ple_conv(
+        ds4_gpu_tensor       *gated_out,
+        const ds4_gpu_tensor *gated_normed,
+        ds4_gpu_tensor       *conv_state,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_offset,
+        uint32_t              n_streams,
+        uint32_t              n_embd,
+        uint32_t              n_rows);
+
 /* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
  * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
  * fork's per-layer decode graph capture.  The key identifies a captured
