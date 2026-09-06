@@ -32,7 +32,97 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### Current main comparison (September 6, M3 Ultra)
+
+The rebased branch is still faster for this PR's original `ds4-bench`
+workload: pooled prefill improves **3.65%**, with **3.27–3.81%** gains at
+every measured frontier. Classic steady decode improves only **0.33%**;
+treat that as near-flat, not a new decode-speed headline. Both repeats favor
+the branch at all four frontiers, but two repeats do not establish statistical
+significance or performance on other hardware.
+
+Baseline: current `origin/main` / `upstream/main`,
+`9ab705347c1775e7599ede7eb81a6255ec7dccb5`. Candidate: rebased
+`perf/metal-pre-m5-decode-prefill`,
+`fbbd9e129e0c896ad7ca281f1cec30ab605a8371`. Each was built from a clean
+detached worktree with `make -j8 ds4-bench` and run from its own worktree so
+the executable and runtime-loaded Metal shaders belong to the same commit.
+`ds4_bench.c` and the prompt are identical between the two commits.
+
+Hardware: M3 Ultra, 80 GPU cores, 512 GiB; macOS 27.0 (26A5425a), Xcode
+27.0 (27A5252f). Both builds use the same 145.26 GiB
+`DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf`.
+
+This repeats the four-frontier 2K–8K command from PR #954, not the historical
+64K sweep or the separate warmed 2K/8K smoke. Run from each matching worktree:
+
+```sh
+env -i PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+  ./ds4-bench -m /absolute/path/to/ds4flash.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 2048 --ctx-max 8192 --step-incr 2048 --gen-tokens 128 \
+  --csv result.csv
+```
+
+Run order was main / branch / branch / main, with approximately one minute
+idle between sweeps, one benchmark process at a time, and no profiling,
+diagnostic switches, explicit `--warm-weights`, or extra untimed warmup.
+The first row measures fresh 2048-token prefill; subsequent rows measure
+only the newest 2048-token append. Context allocation is 8321 tokens and
+prefill chunk capacity is 4096. Snapshot save/restore is outside the timers.
+
+Per-frontier prefill, main → branch (t/s; two-run equal-work pooled rates):
+
+- 2048: 642.13 → 663.16 (**+3.27%**).
+- 4096: 586.98 → 609.36 (**+3.81%**).
+- 6144: 579.56 → 601.23 (**+3.74%**).
+- 8192: 572.89 → 594.33 (**+3.74%**).
+
+Classic generation including host selection/bookkeeping, main → branch:
+
+- 2048: 43.14 → 43.67 t/s (+1.22%).
+- 4096: 39.62 → 39.76 t/s (+0.35%).
+- 6144: 39.36 → 39.48 t/s (+0.29%).
+- 8192: 39.05 → 39.16 t/s (+0.28%).
+
+Across both complete sweeps, pooled prefill is 594.19 → 615.88 t/s
+(+3.65%); generation is 40.23 → 40.44 t/s (+0.52%). Steady evaluation
+after the first token, excluding host selection, is 40.36 → 40.49 t/s
+(+0.33%), with per-frontier changes of +0.27–0.44%. No throughput frontier
+regressed in these repeats. Pooling uses total tokens divided by the sum of
+`tokens / reported_tps`, not an arithmetic average of rates; the CSV's
+two-decimal rounding limits aggregate precision.
+
+The first main run's 2K first-token evaluation took 70.602 ms, versus
+24.414 ms in its repeat and 24.196/24.514 ms on the branch. All measurements
+are retained. That startup outlier inflates the 2K aggregate-generation
+delta; no first-token-latency speedup is claimed.
+
+Separate, untimed-for-comparison runs with `--dump-frontier-logits-dir` and
+`--show-output` matched all **517,120 finite Float32 prefill logits**
+bit-for-bit across the four frontiers, including all four argmax IDs.
+All four generated-text transcripts also match byte-for-byte (1632 bytes
+total; 128 generated tokens per frontier). Text equality is not a token-ID
+equality assertion, and these dumps do not contain per-decode logits.
+Normal `ds4-bench` calls
+individual `ds4_session_eval` operations and does **not** exercise the
+session-chain API; these results therefore do not remeasure the CLI or
+session-chain gains described in the historical sections below.
+
+Raw CSVs: [main run 1](m3_ultra_mxfp4_20260906/main-r1.csv),
+[branch run 1](m3_ultra_mxfp4_20260906/branch-r1.csv),
+[branch run 2](m3_ultra_mxfp4_20260906/branch-r2.csv),
+[main run 2](m3_ultra_mxfp4_20260906/main-r2.csv).
+The [summary](m3_ultra_mxfp4_20260906/summary.json) retains every sample,
+per-frontier ranges and pooled metrics;
+the [protocol](m3_ultra_mxfp4_20260906/protocol.json) records source,
+binary, shader-tree and prompt identities. Historical CSVs are unchanged.
+
 ### MXFP4 prefill pruning and session-chain decode (September 6, M3 Ultra)
+
+The same-binary screens below predate the current-main comparison above and
+isolate individual rollback switches; they are not fresh main-versus-branch
+numbers.
 
 Measured on M3 Ultra (80 GPU cores, 512 GiB), macOS/Xcode 27 beta, using
 the 145.26 GiB 0731 MXFP4-experts / F16 HC-compressor-indexer /
