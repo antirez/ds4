@@ -118,6 +118,60 @@
 #include <stdint.h>
 #include "linenoise.h"
 
+static struct {
+    char *text;
+    size_t len, cap;
+    int fd, depth;
+} terminal_update;
+
+static int terminalWrite(int fd, const char *text, size_t len) {
+    while (len) {
+        ssize_t n = write(fd, text, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { if (!n) errno = EIO; return -1; }
+        text += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+int linenoiseWrite(int fd, const char *text, size_t len) {
+    if (!terminal_update.depth || terminal_update.fd != fd)
+        return terminalWrite(fd, text, len);
+    if (len > SIZE_MAX - terminal_update.len) { errno = ENOMEM; return -1; }
+    size_t need = terminal_update.len + len;
+    if (need > terminal_update.cap) {
+        size_t cap = need <= SIZE_MAX / 2 ? need * 2 : need;
+        char *p = realloc(terminal_update.text, cap);
+        if (!p) return -1;
+        terminal_update.text = p;
+        terminal_update.cap = cap;
+    }
+    if (len) memcpy(terminal_update.text + terminal_update.len, text, len);
+    terminal_update.len = need;
+    return 0;
+}
+
+void linenoiseBeginUpdate(int fd) {
+    if (terminal_update.depth++) return;
+    terminal_update.fd = fd;
+    terminal_update.len = 0;
+    linenoiseWrite(fd, "\x1b[?2026h", 8);
+}
+
+void linenoiseEndUpdate(void) {
+    if (!terminal_update.depth || terminal_update.depth > 1) {
+        if (terminal_update.depth) terminal_update.depth--;
+        return;
+    }
+    linenoiseWrite(terminal_update.fd, "\x1b[?2026l", 8);
+    terminal_update.depth = 0;
+    terminalWrite(terminal_update.fd, terminal_update.text, terminal_update.len);
+    free(terminal_update.text);
+    terminal_update.text = NULL;
+    terminal_update.len = terminal_update.cap = 0;
+}
+
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE (1024*1024)      // That will get dynamically allocated
 #define LINENOISE_INITIAL_BUFLEN 4096
@@ -195,6 +249,25 @@ static uint32_t utf8DecodeChar(const char *s, size_t *len) {
     }
     *len = 1;
     return *p; /* Fallback for invalid sequences. */
+}
+
+/* Zero means more bytes are needed. Invalid sequences consume one byte. */
+size_t linenoiseUtf8Decode(const char *s, size_t len, uint32_t *cp) {
+    if (!len) return 0;
+    unsigned char lead = (unsigned char)s[0];
+    size_t n = (size_t)utf8ByteLen(s[0]);
+    *cp = 0xfffd;
+    if (lead < 0x80) { *cp = lead; return 1; }
+    if (lead < 0xc2 || lead > 0xf4) return 1;
+    for (size_t i = 1; i < n && i < len; i++)
+        if (((unsigned char)s[i] & 0xc0) != 0x80) return 1;
+    if (len < n) return 0;
+    size_t decoded;
+    uint32_t value = utf8DecodeChar(s, &decoded);
+    if (value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) ||
+        (n == 3 && value < 0x800) || (n == 4 && value < 0x10000)) return 1;
+    *cp = value;
+    return n;
 }
 
 /* Check if codepoint is a variation selector (emoji style modifiers). */
@@ -313,49 +386,8 @@ static size_t utf8PrevCharLen(const char *buf, size_t pos) {
  * grapheme cluster at the current position. */
 static size_t utf8NextCharLen(const char *buf, size_t pos, size_t len) {
     if (pos >= len) return 0;
-
-    size_t total = 0;
-    size_t curpos = pos;
-
-    /* Get the first codepoint. */
-    size_t cplen;
-    uint32_t cp = utf8DecodeChar(buf + curpos, &cplen);
-    total += cplen;
-    curpos += cplen;
-
-    int isRI = isRegionalIndicator(cp);
-
-    /* Consume any extending characters that follow. */
-    while (curpos < len) {
-        size_t nextlen;
-        uint32_t nextcp = utf8DecodeChar(buf + curpos, &nextlen);
-
-        if (isZWJ(nextcp) && curpos + nextlen < len) {
-            /* ZWJ: include it and the following character. */
-            total += nextlen;
-            curpos += nextlen;
-            /* Get the character after ZWJ. */
-            nextcp = utf8DecodeChar(buf + curpos, &nextlen);
-            total += nextlen;
-            curpos += nextlen;
-            continue;  /* Check for more extending after the joined char. */
-        } else if (isGraphemeExtend(nextcp)) {
-            /* Variation selector, skin tone, combining mark, etc. */
-            total += nextlen;
-            curpos += nextlen;
-            continue;
-        } else if (isRI && isRegionalIndicator(nextcp)) {
-            /* Second regional indicator for a flag pair. */
-            total += nextlen;
-            curpos += nextlen;
-            isRI = 0;  /* Only pair once. */
-            continue;
-        } else {
-            break;
-        }
-    }
-
-    return total;
+    size_t n = linenoiseNextGrapheme(buf + pos, len - pos, NULL);
+    return n ? n : 1;
 }
 
 /* Return the display width of a Unicode codepoint. This is a heuristic
@@ -416,6 +448,34 @@ static int utf8CharWidth(uint32_t cp) {
     return 1; /* Default: single width */
 }
 
+int linenoiseCharacterWidth(uint32_t cp) {
+    return utf8CharWidth(cp);
+}
+
+size_t linenoiseNextGrapheme(const char *s, size_t len, int *width) {
+    uint32_t cp;
+    size_t used = linenoiseUtf8Decode(s, len, &cp);
+    if (!used) { if (width) *width = 0; return 0; }
+    int w = utf8CharWidth(cp), regional = isRegionalIndicator(cp), joined = 0;
+    while (used < len) {
+        size_t n = linenoiseUtf8Decode(s + used, len - used, &cp);
+        if (!n) break;
+        if (joined) {
+            if (utf8CharWidth(cp) > w) w = utf8CharWidth(cp);
+            joined = 0;
+        } else if (isZWJ(cp)) {
+            joined = 1;
+        } else if (isGraphemeExtend(cp)) {
+            if (cp == 0xfe0f && w) w = 2;
+        } else if (regional && isRegionalIndicator(cp)) {
+            regional = 0;
+        } else break;
+        used += n;
+    }
+    if (width) *width = w;
+    return used;
+}
+
 /* If s[] points at an ANSI CSI escape sequence (e.g. a color change like
  * ESC [ 1 ; 32 m), return its length in bytes. Otherwise return 0.
  *
@@ -440,49 +500,25 @@ static size_t ansiEscapeLen(const char *s, size_t len) {
  * as zero-width. */
 static size_t utf8StrWidth(const char *s, size_t len) {
     size_t width = 0;
-    size_t i = 0;
-    int after_zwj = 0;  /* Track if previous char was ZWJ */
-
-    while (i < len) {
-        size_t clen;
-        uint32_t cp = utf8DecodeChar(s + i, &clen);
-
-        /* Skip ANSI CSI escape sequences entirely: they produce no
-         * glyph, so they must not contribute to the display width.
-         * Checked before the ZWJ state so a stray ZWJ immediately
-         * followed by ESC cannot swallow the ESC byte. */
-        if (cp == 0x1b) {
+    for (size_t i = 0; i < len;) {
+        if (s[i] == 0x1b) {
             size_t skip = ansiEscapeLen(s + i, len - i);
-            if (skip > 0) {
-                i += skip;
-                continue;
-            }
+            if (skip) { i += skip; continue; }
         }
-
-        if (after_zwj) {
-            /* Character after ZWJ: don't add width, it's joined.
-             * But do check for extending chars after it. */
-            after_zwj = 0;
-        } else {
-            width += utf8CharWidth(cp);
-        }
-
-        /* Check if this is a ZWJ - next char will be joined. */
-        if (isZWJ(cp)) {
-            after_zwj = 1;
-        }
-
-        i += clen;
+        int w = 0;
+        size_t n = linenoiseNextGrapheme(s + i, len - i, &w);
+        if (!n) break;
+        width += (size_t)w;
+        i += n;
     }
     return width;
 }
 
 /* Return the display width of a single UTF-8 character at position 's'. */
 static int utf8SingleCharWidth(const char *s, size_t len) {
-    if (len == 0) return 0;
-    size_t clen;
-    uint32_t cp = utf8DecodeChar(s, &clen);
-    return utf8CharWidth(cp);
+    int width = 0;
+    linenoiseNextGrapheme(s, len, &width);
+    return width;
 }
 
 enum KEY_ACTION{
@@ -786,9 +822,10 @@ static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseComple
  * the input was consumed by the completeLine() function to navigate the
  * possible completions, and the caller should read for the next characters
  * from stdin. */
+static int linenoiseEditGrow(struct linenoiseState *l, size_t needed);
+
 static int completeLine(struct linenoiseState *ls, int keypressed) {
     linenoiseCompletions lc = { 0, NULL };
-    int nwritten;
     char c = keypressed;
 
     completionCallback(ls->buf,&lc);
@@ -817,9 +854,15 @@ static int completeLine(struct linenoiseState *ls, int keypressed) {
             default:
                 /* Update buffer and return */
                 if (ls->completion_idx < lc.len) {
-                    nwritten = snprintf(ls->buf,ls->buflen,"%s",
-                        lc.cvec[ls->completion_idx]);
-                    ls->len = ls->pos = nwritten;
+                    size_t len = strlen(lc.cvec[ls->completion_idx]);
+                    if (linenoiseEditGrow(ls, len) == -1) {
+                        linenoiseBeep();
+                        ls->in_completion = 0;
+                        c = 0;
+                        break;
+                    }
+                    memcpy(ls->buf, lc.cvec[ls->completion_idx], len + 1);
+                    ls->len = ls->pos = len;
                     linenoiseFoldClear(ls);
                 }
                 ls->in_completion = 0;
@@ -924,11 +967,8 @@ static int linenoiseStatusRows(struct linenoiseState *l) {
 static size_t abAppendUtf8Clipped(struct abuf *ab, const char *s, size_t len,
                                   size_t maxcols) {
     size_t i = 0, width = 0;
-    int after_zwj = 0;
     while (i < len) {
-        size_t clen;
-        uint32_t cp = utf8DecodeChar(s + i, &clen);
-        if (cp == 0x1b) {
+        if (s[i] == 0x1b) {
             size_t skip = ansiEscapeLen(s + i, len - i);
             if (skip > 0) {
                 abAppend(ab, s + i, (int)skip);
@@ -937,22 +977,26 @@ static size_t abAppendUtf8Clipped(struct abuf *ab, const char *s, size_t len,
             }
         }
 
-        int cwidth = after_zwj ? 0 : utf8CharWidth(cp);
+        int cwidth;
+        size_t clen = linenoiseNextGrapheme(s + i, len - i, &cwidth);
+        if (!clen) break;
         if (width + (size_t)cwidth > maxcols) break;
         abAppend(ab, s + i, (int)clen);
         width += cwidth;
-        after_zwj = isZWJ(cp);
-        if (!isZWJ(cp) && after_zwj) after_zwj = 0;
         i += clen;
     }
     return width;
 }
 
 static void refreshStatusLinePart(struct abuf *ab, struct linenoiseState *l,
-                                  const char *s, size_t len) {
+                                  const char *s, size_t len, int row) {
     size_t width = 0;
     size_t cols = l->cols ? l->cols : 80;
-    abAppend(ab, "\r\n", 2);
+    if (row > 0) {
+        char seq[64];
+        int n = snprintf(seq, sizeof(seq), "\x1b[%d;1H", row);
+        abAppend(ab, seq, n);
+    } else abAppend(ab, "\r\n", 2);
     /* Fill the complete status row explicitly.  Some terminals do not paint
      * cells cleared by EL with the current SGR background, so relying on
      * ESC[0K makes an inverse-video status line stop at the text.  Disable
@@ -969,15 +1013,35 @@ static void refreshStatusLinePart(struct abuf *ab, struct linenoiseState *l,
     abAppend(ab, "\x1b[?7h", 5);
 }
 
-static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l) {
+static void refreshStatusLine(struct abuf *ab, struct linenoiseState *l, int row) {
     const char *p = l->status;
     while (p && *p) {
         const char *nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        refreshStatusLinePart(ab, l, p, len);
+        refreshStatusLinePart(ab, l, p, len, row);
+        if (row > 0) row++;
         if (!nl) break;
         p = nl + 1;
     }
+}
+
+int linenoiseRefreshStatus(struct linenoiseState *l) {
+    if (!l->oldrows || l->screen_cursor_row <= 0 || l->screen_cursor_col <= 0 ||
+        l->oldstatusrows != (size_t)linenoiseStatusRows(l)) return 0;
+    char seq[64];
+    struct abuf ab;
+    abInit(&ab);
+    int last_input_row = l->screen_cursor_row - l->oldrpos + (int)l->oldrows;
+    int n = snprintf(seq, sizeof(seq), "\x1b[0m\x1b[%d;1H", last_input_row);
+    abAppend(&ab, seq, n);
+    refreshStatusLine(&ab, l, last_input_row + 1);
+    n = snprintf(seq, sizeof(seq), "\x1b[0m\x1b[%d;%dH", l->screen_cursor_row, l->screen_cursor_col);
+    abAppend(&ab, seq, n);
+    linenoiseBeginUpdate(l->ofd);
+    linenoiseWrite(l->ofd, ab.b, ab.len);
+    linenoiseEndUpdate();
+    abFree(&ab);
+    return 1;
 }
 
 /* A fold is a display-only replacement for a range in l->buf. The edited
@@ -1409,7 +1473,7 @@ static void refreshSingleLine(struct linenoiseState *l, int flags) {
         abAppend(&ab,seq,strlen(seq));
     }
 
-    if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
+    if (linenoiseWrite(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
     abFree(&ab);
     free(render);
 }
@@ -1485,7 +1549,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
      * phase first, then let the owner resize/reposition the prompt area before
      * this refresh writes the new prompt. */
     if ((flags & REFRESH_WRITE) && l->layout_callback) {
-        if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover. */
+        if (linenoiseWrite(fd,ab.b,ab.len) == -1) {} /* Can't recover. */
         abFree(&ab);
         abInit(&ab);
         layout_prompt_row =
@@ -1532,7 +1596,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
         lndebug("rpos2 %d", rpos2);
 
         if (linenoiseStatusActive(l)) {
-            refreshStatusLine(&ab, l);
+            refreshStatusLine(&ab, l, layout_prompt_row > 0 ? layout_prompt_row + rows : 0);
         }
 
         /* Set column. */
@@ -1581,7 +1645,7 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
         l->screen_cursor_col = 0;
     }
 
-    if (write(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
+    if (linenoiseWrite(fd,ab.b,ab.len) == -1) {} /* Can't recover from write error. */
     abFree(&ab);
     free(render);
 }
@@ -1589,10 +1653,14 @@ static void refreshMultiLine(struct linenoiseState *l, int flags) {
 /* Calls the two low level functions refreshSingleLine() or
  * refreshMultiLine() according to the selected mode. */
 static void refreshLineWithFlags(struct linenoiseState *l, int flags) {
+    struct winsize ws;
+    if (ioctl(l->ofd, TIOCGWINSZ, &ws) == 0 && ws.ws_col) l->cols = ws.ws_col;
+    linenoiseBeginUpdate(l->ofd);
     if (mlmode || linenoiseStatusActive(l) || l->oldstatusrows)
         refreshMultiLine(l,flags);
     else
         refreshSingleLine(l,flags);
+    linenoiseEndUpdate();
 }
 
 /* Utility function to avoid specifying REFRESH_ALL all the times. */
@@ -1618,6 +1686,11 @@ void linenoiseShow(struct linenoiseState *l) {
  * used by clients that want Ctrl+C to cancel the current edit without tearing
  * down the line editor. */
 void linenoiseEditClear(struct linenoiseState *l) {
+    l->pending_key_len = 0;
+    free(l->paste_buf);
+    l->paste_buf = NULL;
+    l->paste_len = l->paste_cap = l->paste_match = 0;
+    l->paste_active = l->paste_overflowed = 0;
     l->buf[0] = '\0';
     l->len = 0;
     l->pos = 0;
@@ -1701,9 +1774,9 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen) {
                 /* Avoid a full update of the line in the trivial case:
                  * single-width char, no hints, fits in one line. */
                 if (maskmode == 1) {
-                    if (write(l->ofd,"*",1) == -1) return -1;
+                    if (linenoiseWrite(l->ofd,"*",1) == -1) return -1;
                 } else {
-                    if (write(l->ofd,c,clen) == -1) return -1;
+                    if (linenoiseWrite(l->ofd,c,clen) == -1) return -1;
                 }
                 return 0;
             }
@@ -1970,6 +2043,10 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
     l->queued_input_len = 0;
     l->queued_input_pos = 0;
     l->queued_input_cap = 0;
+    l->pending_key_len = 0;
+    l->paste_buf = NULL;
+    l->paste_len = l->paste_cap = l->paste_match = 0;
+    l->paste_active = l->paste_overflowed = 0;
     linenoiseFoldClear(l);
 
     /* Enter raw mode. */
@@ -1995,7 +2072,7 @@ int linenoiseEditStart(struct linenoiseState *l, int stdin_fd, int stdout_fd, ch
      * initially is just an empty string. */
     linenoiseHistoryAdd("");
 
-    if (write(l->ofd,prompt,l->plen) == -1) return -1;
+    if (linenoiseWrite(l->ofd,prompt,l->plen) == -1) return -1;
     l->oldrows = 1;
     return 0;
 }
@@ -2050,13 +2127,13 @@ static int pasteBufferAppend(struct linenoiseState *l, char **buf, size_t *cap,
 
 /* Read a bracketed paste until ESC[201~ and insert the real bytes. If folding
  * is needed, remember the inserted range so only rendering is shortened. */
-static void linenoiseEditPaste(struct linenoiseState *l) {
+static int linenoiseEditPaste(struct linenoiseState *l) {
     static const char END[] = "\x1b[201~";
     const size_t ENDLEN = sizeof(END)-1;
-    char *buf = NULL;
-    size_t cap = 0, len = 0, match = 0;
+    char *buf = l->paste_buf;
+    size_t cap = l->paste_cap, len = l->paste_len, match = l->paste_match;
     size_t maxlen = l->buflen_max ? l->buflen_max : l->buflen;
-    int overflowed = 0;
+    int overflowed = l->paste_overflowed;
 
     maxlen = maxlen > l->len ? maxlen - l->len : 0;
     if (maxlen > PASTE_MAX_BYTES) maxlen = PASTE_MAX_BYTES;
@@ -2065,7 +2142,17 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
 
     while (1) {
         char c;
-        if (linenoiseReadByte(l, &c) != 1) break;
+        int n = linenoiseReadByte(l, &c);
+        if (n != 1) {
+            if (n < 0 && errno == EINTR) continue;
+            l->paste_buf = buf;
+            l->paste_cap = cap;
+            l->paste_len = len;
+            l->paste_match = match;
+            l->paste_overflowed = overflowed;
+            l->paste_active = 1;
+            return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+        }
 
         /* Track a possible ESC[201~ terminator without copying it into the
          * paste. If it turns out to be ordinary input, flush the partial
@@ -2092,12 +2179,16 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
             overflowed = 1;
     }
 
+    l->paste_buf = NULL;
+    l->paste_len = l->paste_cap = l->paste_match = 0;
+    l->paste_active = l->paste_overflowed = 0;
+
     if (overflowed) {
         free(buf);
         linenoiseBeep();
-        return;
+        return 1;
     }
-    if (buf == NULL) return;
+    if (buf == NULL) return 1;
 
     {
         /* Normalize pasted CR and CRLF to LF, so the edit buffer uses one
@@ -2114,12 +2205,27 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
         len = w;
     }
 
+    /* Paste is text input. Reject malformed UTF-8 and terminal controls rather
+     * than putting invisible commands or partial characters in the edit buffer. */
+    for (size_t pos = 0; pos < len;) {
+        uint32_t cp;
+        size_t n = linenoiseUtf8Decode(buf + pos, len - pos, &cp);
+        if (!n || (n == 1 && (unsigned char)buf[pos] >= 0x80) ||
+            (cp < 32 && cp != '\n' && cp != '\t') || cp == 127 ||
+            (cp >= 0x80 && cp <= 0x9f)) {
+            free(buf);
+            linenoiseBeep();
+            return 1;
+        }
+        pos += n;
+    }
+
     if (!maskmode && shouldFoldText(buf,len)) {
         size_t start = l->pos;
         if (linenoiseEditInsertNoRefresh(l,buf,len) == -1) {
             free(buf);
             linenoiseBeep();
-            return;
+            return 1;
         }
         linenoiseFoldAdd(l,start,start+len);
         refreshLine(l);
@@ -2127,6 +2233,7 @@ static void linenoiseEditPaste(struct linenoiseState *l) {
         linenoiseEditInsert(l,buf,len);
     }
     free(buf);
+    return 1;
 }
 
 char *linenoiseEditMore = "If you see this, you are misusing the API: when linenoiseEditFeed() is called, if it returns linenoiseEditMore the user is yet editing the line. See the README file for more information.";
@@ -2156,23 +2263,72 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
 
     char c;
     int nread;
-    char seq[3];
+    char seq[32] = {0};
+    size_t seq_len = 0;
 
-    nread = linenoiseReadByte(l, &c);
+    if (l->paste_active)
+        return linenoiseEditPaste(l) < 0 ? NULL : linenoiseEditMore;
+
+    do { nread = linenoiseReadByte(l, &c); } while (nread < 0 && errno == EINTR);
     if (nread < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? linenoiseEditMore : NULL;
     } else if (nread == 0) {
         return NULL;
     }
 
-    /* Only autocomplete when the callback is set. completeLine()
-     * returns the character to be handled next, or zero when the
-     * key was consumed to navigate completions. */
-    if ((l->in_completion || c == 9 /* TAB */) && completionCallback != NULL) {
-        int retval = completeLine(l,c);
-        /* Read next character when 0 */
-        if (retval == 0) return linenoiseEditMore;
-        c = retval;
+    /* Resolve completion on the first byte of a key, including UTF-8. An ESC
+     * cancels the preview immediately but can still begin a navigation key. */
+    if (!l->pending_key_len && (l->in_completion || c == '\t') && completionCallback) {
+        int next = completeLine(l, c);
+        if (!next && c != ESC) return linenoiseEditMore;
+        if (next) c = (char)next;
+    }
+
+    /* Packet boundaries are unrelated to characters or keys. Keep incomplete
+     * input in the editor, rather than blocking the application's event loop. */
+    if (l->pending_key_len && l->pending_key[0] != ESC) {
+        if (((unsigned char)c & 0xc0) != 0x80) {
+            l->pending_key_len = 0;
+            if (linenoiseEditInsert(l, "\xef\xbf\xbd", 3)) return NULL;
+        } else {
+            l->pending_key[l->pending_key_len++] = c;
+            size_t need = (size_t)utf8ByteLen(l->pending_key[0]);
+            if (l->pending_key_len < need) return linenoiseEditMore;
+            size_t decoded;
+            uint32_t cp = utf8DecodeChar(l->pending_key, &decoded);
+            int valid = cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff) &&
+                        (need != 2 || cp >= 0x80) && (need != 3 || cp >= 0x800) &&
+                        (need != 4 || cp >= 0x10000);
+            l->pending_key_len = 0;
+            if (linenoiseEditInsert(l, valid ? l->pending_key : "\xef\xbf\xbd", valid ? need : 3))
+                return NULL;
+            return linenoiseEditMore;
+        }
+    }
+    if (l->pending_key_len) {
+        if (l->pending_key_len == 1 && c != '[' && c != 'O') {
+            l->pending_key_len = 0; /* Preserve the character after a lone ESC. */
+        } else {
+            l->pending_key[l->pending_key_len++] = c;
+            if (l->pending_key_len > 2 && c >= '@' && c <= '~') {
+                seq_len = l->pending_key_len - 1;
+                memcpy(seq, l->pending_key + 1, seq_len);
+                l->pending_key_len = 0;
+                c = ESC;
+            } else {
+                if (l->pending_key_len == sizeof(l->pending_key)) l->pending_key_len = 0;
+                return linenoiseEditMore;
+            }
+        }
+    }
+    if (!seq_len && (c == ESC || (unsigned char)c >= 0xc2)) {
+        if ((unsigned char)c > 0xf4) {
+            if (linenoiseEditInsert(l, "\xef\xbf\xbd", 3)) return NULL;
+        } else {
+            l->pending_key[0] = c;
+            l->pending_key_len = 1;
+        }
+        return linenoiseEditMore;
     }
 
     switch(c) {
@@ -2240,39 +2396,13 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
         linenoiseEditHistoryNext(l, LINENOISE_HISTORY_NEXT);
         break;
     case ESC:    /* escape sequence */
-        /* Read the next two bytes representing the escape sequence.
-         * Use two calls to handle slow terminals returning the two
-         * chars at different times. */
-        if (linenoiseReadByte(l, seq) != 1) break;
-        if (linenoiseReadByte(l, seq + 1) != 1) break;
-
-        /* ESC [ sequences. */
-        if (seq[0] == '[') {
-            if (seq[1] >= '0' && seq[1] <= '9') {
-                char param[8];
-                size_t plen = 1;
-                char final = 0;
-
-                param[0] = seq[1];
-                while (plen < sizeof(param)) {
-                    char p;
-                    if (linenoiseReadByte(l, &p) != 1) break;
-                    if (p >= '0' && p <= '9') {
-                        param[plen++] = p;
-                    } else {
-                        final = p;
-                        break;
-                    }
-                }
-                if (final == '~') {
-                    if (plen == 1 && param[0] == '3') {
-                        linenoiseEditDelete(l);
-                    } else if (plen == 3 && memcmp(param,"200",3) == 0) {
-                        linenoiseEditPaste(l);
-                    }
-                }
+        if (seq[0] == '[' || seq[0] == 'O') {
+            if (seq_len == 3 && !memcmp(seq, "[3~", 3)) {
+                linenoiseEditDelete(l);
+            } else if (seq_len == 5 && !memcmp(seq, "[200~", 5)) {
+                if (linenoiseEditPaste(l) < 0) return NULL;
             } else {
-                switch(seq[1]) {
+                switch(seq[seq_len - 1]) {
                 case 'A': /* Up */
                     linenoiseEditHistoryNext(l, LINENOISE_HISTORY_PREV);
                     break;
@@ -2295,35 +2425,11 @@ char *linenoiseEditFeed(struct linenoiseState *l) {
             }
         }
 
-        /* ESC O sequences. */
-        else if (seq[0] == 'O') {
-            switch(seq[1]) {
-            case 'H': /* Home */
-                linenoiseEditMoveHome(l);
-                break;
-            case 'F': /* End*/
-                linenoiseEditMoveEnd(l);
-                break;
-            }
-        }
         break;
     default:
-        /* Handle UTF-8 multi-byte sequences. When we receive the first byte
-         * of a multi-byte UTF-8 character, read the remaining bytes to
-         * complete the sequence before inserting. */
-        {
-            char utf8[4];
-            int utf8len = utf8ByteLen(c);
-            utf8[0] = c;
-            if (utf8len > 1) {
-                /* Read remaining bytes of the UTF-8 sequence. */
-                int i;
-                for (i = 1; i < utf8len; i++) {
-                    if (linenoiseReadByte(l, utf8+i) != 1) break;
-                }
-            }
-            if (linenoiseEditInsert(l, utf8, utf8len)) return NULL;
-        }
+        if ((unsigned char)c >= 0x80) {
+            if (linenoiseEditInsert(l, "\xef\xbf\xbd", 3)) return NULL;
+        } else if ((unsigned char)c >= 32 && linenoiseEditInsert(l, &c, 1)) return NULL;
         break;
     case CTRL_U: /* Ctrl+u, delete the whole line. */
         l->buf[0] = '\0';
@@ -2381,6 +2487,11 @@ void linenoiseEditStop(struct linenoiseState *l) {
         if (write(l->ofd, "\r\x1b[0K", 5) == -1) {}
     }
     free(l->queued_input);
+    free(l->paste_buf);
+    l->paste_buf = NULL;
+    l->paste_len = l->paste_cap = l->paste_match = 0;
+    l->paste_active = l->paste_overflowed = 0;
+    l->pending_key_len = 0;
     l->queued_input = NULL;
     l->queued_input_len = 0;
     l->queued_input_pos = 0;

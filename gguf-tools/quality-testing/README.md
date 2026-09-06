@@ -224,3 +224,34 @@ Output fields:
   local top-N for the same position.
 - `api_top_mae`: local-vs-API logprob MAE over mapped API top alternatives.
 - `api_pair_rate`: pairwise ordering agreement among mapped API alternatives.
+
+## 6. Validate regression artifacts
+
+Two standard-library Python tools check saved artifacts without running inference. For matched `score_official` runs with API logprob coverage, require the complete intended manifest and finite, consistent counts and scores:
+
+```sh
+python3 gguf-tools/quality-testing/validate_scores.py \
+  --manifest gguf-tools/quality-testing/data/flash/manifest.tsv \
+  --baseline /tmp/old.tsv --candidate /tmp/new.tsv --strict-identical > /tmp/scores.json
+```
+
+Exit 0 with `--strict-identical` requires every per-case value to match; omit it to report valid differences without deciding their acceptability. Unlike `compare_scores.py`, validation rejects missing/duplicate cases, malformed fields and changed coverage denominators. This stricter mode requires the current four-column manifest and scorer TSV format with nonzero API coverage; use the existing comparator for continuation-only references without API logprobs.
+
+Compare complete vocabulary dumps from `ds4-bench --dump-frontier-logits-dir`:
+
+```sh
+python3 gguf-tools/quality-testing/compare_frontier_logits.py \
+  /tmp/old-logits /tmp/new-logits --frontiers 2048 4096 --ctx 8192 \
+  --model /models/model.gguf --backend rocm --quality false --quant-bits 2 --vocab 129280 \
+  --output /tmp/frontiers.json
+```
+
+Supply the exact expected metadata: `ctx` is allocated capacity; each frontier is total context, and prefill is its increase from the previous frontier (initially zero). Each directory must contain exactly the requested dumps. Exit 0 requires complete finite float32 bit identity; exit 1 reports drift, invalid artifacts or an operational error. JSON distinguishes `identical`, `drift` and `invalid`, with full-vector hashes, differing counts and maximum absolute differences. The output path must be new. The parser follows the writer's nine-significant-digit float format and preserves signed zero.
+
+Matching argmax is insufficient: a measured 8K–64K comparison retained all four argmax IDs while full vectors differed, with maximum absolute difference 7.45228. This is numerical drift, not by itself proof of worse generation quality. Record prompt/weight hashes, source/build identity, settings and successful run completion separately; these tools cannot recover that provenance from score tables or dumps, and do not replace model-quality checks.
+
+Run the host-only positive and negative controls:
+
+```sh
+python3 -m unittest discover -s gguf-tools/quality-testing/tests -v
+```

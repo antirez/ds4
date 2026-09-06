@@ -1303,7 +1303,18 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 const float alpha = 1.0f;
                 const float beta0 = 0.0f;
                 const float beta1 = 1.0f;
-                cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                cublasStatus_t st = (cublasStatus_t)-1;
+#ifdef __HIP_PLATFORM_AMD__
+                if (g_dspark_verify_mode && !g_glm_model && !g_quality_mode &&
+                    n_tokens >= 2u && n_tokens <= 6u &&
+                    rank == 1024u && group_dim == 4096u && n_groups == 8u &&
+                    g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+                    ds4_rocm_is_gfx1151() &&
+                    hipblaslt_dspark_attention_a(low_h, out_a_f16, heads_h, n_tokens)) {
+                    st = CUBLAS_STATUS_SUCCESS;
+                }
+#endif
+                if (st != CUBLAS_STATUS_SUCCESS) st = cublasGemmStridedBatchedEx(g_cublas,
                                                                CUBLAS_OP_T,
                                                                CUBLAS_OP_N,
                                                                (int)rank,

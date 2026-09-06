@@ -1,18 +1,8 @@
-// test_iq2_aligned_entry.cu — M1-Inc1 integration parity gate.
-//
-// A/B of the PRODUCTION aligned entry (ds4_mmq_iq2_xxs_aligned_moe_vec, fed
-// the artifact layout the weight server builds under --repack-iq2-aligned)
-// against the production raw-layout vec entry (ds4_mmq_iq2_xxs_moe_vec) at
-// the decode shape.  Both entries quantize the activation through
-// quantize_row_q8_1_cuda, so only the float accumulation order differs.
-//
-// The kernel-level A/B with hand-rolled quantize lives in
-// proto_iq2_aligned.cu (the original +12% proof); this test locks the
-// integrated entry + artifact layout contract.
-//
-// Build (box):
-//   nvcc -O3 --use_fast_math -std=c++17 -arch=sm_121 -I.. \
-//        test_iq2_aligned_entry.cu ../*.o -lcudart -lcuda -o test_iq2_aligned_entry
+// Production aligned IQ2/Q2 MoE parity, including small verifier batches.
+// Compare raw and aligned entries, fused gate/up and separate token rows.
+// Both entries use the same Q8_1 activation quantizer.
+// Build/run: make test-cuda-dspark-moe CUDA_ARCH=sm_121
+// Use --check-only to skip timing loops under Compute Sanitizer.
 
 #include "ds4_mmq.h"
 
@@ -30,19 +20,67 @@
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     printf("CUDA ERR %s @%d: %s\n", #x, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
 
+static int test_q2_down(cudaStream_t stream, std::mt19937 &rng) {
+    const int rows = 256, columns = 2048, experts = 64;
+    const size_t pairs = (size_t)experts * (rows / 2) * (columns / 256);
+    std::vector<uint8_t> artifact(ds4_mmq_q2_k_aligned_bytes(rows, columns, experts));
+    for (auto &byte : artifact) byte = (uint8_t)rng();
+    for (size_t i = 0; i < pairs * 8; i += 2) {
+        const uint16_t scale = 0x2400;
+        memcpy(artifact.data() + i, &scale, 2);
+    }
+    void *aligned, *raw;
+    CK(cudaMalloc(&aligned, artifact.size()));
+    CK(cudaMalloc(&raw, (size_t)experts * rows * (columns / 256) * 84));
+    CK(cudaMemcpy(aligned, artifact.data(), artifact.size(), cudaMemcpyHostToDevice));
+    if (ds4_mmq_q2_K_aligned_derepack(aligned, raw, rows, columns, experts, stream)) return 1;
+    int bad = 0;
+    for (int tokens = 1; tokens <= 8; tokens++) {
+        const int assignments = tokens * 6;
+        std::vector<float> x((size_t)assignments * columns);
+        for (float &v : x) v = ((int)(rng() % 2000) - 1000) / 500.0f;
+        std::vector<int32_t> ids(assignments);
+        for (int i = 0; i < assignments; i++) ids[i] = (i * 7) % experts;
+        ids.back() = -1;
+        float *dx, *a, *b;
+        int32_t *di;
+        const size_t out_bytes = (size_t)assignments * rows * sizeof(float);
+        CK(cudaMalloc(&dx, x.size() * sizeof(float)));
+        CK(cudaMalloc(&di, ids.size() * sizeof(int32_t)));
+        CK(cudaMalloc(&a, out_bytes));
+        CK(cudaMalloc(&b, out_bytes));
+        CK(cudaMemcpyAsync(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+        CK(cudaMemcpyAsync(di, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (ds4_mmq_q2_K_aligned_moe_vec(aligned, dx, di, a, rows, columns,
+                                        assignments, experts, 1, stream) ||
+            ds4_mmq_q2_K_moe_vec(raw, dx, di, b, rows, columns,
+                                 assignments, experts, 1, stream)) return 1;
+        CK(cudaStreamSynchronize(stream));
+        std::vector<float> got(out_bytes / sizeof(float)), ref(got.size());
+        CK(cudaMemcpy(got.data(), a, out_bytes, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(ref.data(), b, out_bytes, cudaMemcpyDeviceToHost));
+        if (memcmp(got.data(), ref.data(), out_bytes)) bad++;
+        CK(cudaFree(dx)); CK(cudaFree(di)); CK(cudaFree(a)); CK(cudaFree(b));
+    }
+    CK(cudaFree(aligned)); CK(cudaFree(raw));
+    printf("Q2 down assignments 6..48: exact failures=%d\n", bad);
+    return bad;
+}
+
 int main(int argc, char **argv) {
+    const bool parity_only = argc > 1 && !strcmp(argv[1], "--check-only");
     const int M = 2048, K = 4096;
     const int n_experts = 256;
     const int n_slots = 6;
     const int n_idsets = 32;
-    const int iters = 2000;
+    const int iters = parity_only ? 1 : 2000;
     const int nb = K / 256;
     const long long row_bytes = (long long)nb * 66;
     const double slot_gb = (double)n_slots * M * row_bytes / 1e9;
 
     if (ds4_mmq_init(0) != 0) { printf("ds4_mmq_init failed\n"); return 1; }
 
-    std::mt19937 rng(argc > 1 ? (uint32_t)atoi(argv[1]) : 1234u);
+    std::mt19937 rng(argc > 1 && !parity_only ? (uint32_t)atoi(argv[1]) : 1234u);
 
     // Random bytes are valid IQ2_XXS content; keep block scales sane.
     std::vector<uint8_t> W((size_t)n_experts * M * row_bytes);
@@ -114,7 +152,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         CK(cudaEventRecord(e0, stream));
-        const int dr_iters = 50;
+        const int dr_iters = parity_only ? 1 : 50;
         for (int i = 0; i < dr_iters; i++)
             (void)ds4_mmq_iq2_xxs_aligned_derepack(dArt, dRaw2, M, K, n_experts, stream);
         CK(cudaEventRecord(e1, stream));
@@ -221,6 +259,7 @@ int main(int argc, char **argv) {
         double max_rel = 0.0, max_abs = 0.0; int bad = 0;
         for (size_t i = 0; i < ref.size(); i++) {
             const double a = ref[i], b = got[i];
+            if (!std::isfinite(a) || !std::isfinite(b)) { bad++; continue; }
             const double ad = fabs(a - b);
             const double rd = ad / (fabs(a) > 1e-3 ? fabs(a) : 1e-3);
             if (ad > max_abs) max_abs = ad;
@@ -254,23 +293,34 @@ int main(int argc, char **argv) {
     }
     int bad_mid = count_bad(em, om, nullptr, nullptr);
 
-    // ---- multi-token parity (batch_eval-hang fix, 2026-07-03): aligned vs
-    // raw production entries at n_tokens=4, flat assignment layout
-    // [tok*n_slots+slot], including one -1 router id (NaN-path guard).
-    int bad4 = 0, bad4_mid = 0;
-    {
-        const int n_tok = 4, n_asg = n_tok * n_slots;
+    // Tiny verifier batches: distinct, shared and partly overlapping experts.
+    // Deduplicating gate/up must be exact against separate one-token calls.
+    // Use different gate/up matrices so swapped operands cannot pass.
+    std::vector<uint8_t> up_art = ART;
+    for (size_t i = dq_bytes; i < up_art.size(); i++) up_art[i] ^= 0x35;
+    uint8_t *dRawUp;
+    CK(cudaMalloc(&dRawUp, W.size()));
+    CK(cudaMemcpyAsync(dArt2, up_art.data(), up_art.size(), cudaMemcpyHostToDevice, stream));
+    if (ds4_mmq_iq2_xxs_aligned_derepack(dArt2, dRawUp, M, K, n_experts, stream)) return 1;
+    int bad4 = 0, bad4_mid = 0, bad_dedup = test_q2_down(stream, rng);
+    for (int n_tok = 1; n_tok <= 8; n_tok++) {
+      for (int overlap = 0; overlap < 3; overlap++) {
+        const int n_asg = n_tok * n_slots;
         std::vector<float> X4((size_t)n_tok * K);
         for (auto &v : X4) v = ((float)(rng() % 2000) - 1000.0f) / 500.0f;
         std::vector<int32_t> ids4(n_asg);
-        for (int a = 0; a < n_asg; a++) ids4[a] = (a * 7 + 3) % n_experts;
-        ids4[13] = -1;  // router NaN path: both entries must write a clean 0 row
+        for (int a = 0; a < n_asg; a++) {
+            ids4[a] = overlap == 0 ? (a * 7 + 3) % n_experts :
+                (a % n_slots + (overlap == 2 ? 2 * (a / n_slots) : 0)) % n_experts;
+        }
+        if (n_asg > 13) ids4[13] = -1;
         std::vector<float> w4(n_asg);
         for (int a = 0; a < n_asg; a++) w4[a] = 0.25f + 0.05f * a;
-        float *dX4, *dOut4B, *dOut4A, *dMid4, *dW4; int32_t *dIds4;
+        float *dX4, *dOut4B, *dOut4A, *dUp4B, *dMid4, *dW4; int32_t *dIds4;
         CK(cudaMalloc(&dX4, sizeof(float) * X4.size()));
         CK(cudaMalloc(&dOut4B, sizeof(float) * n_asg * M));
         CK(cudaMalloc(&dOut4A, sizeof(float) * n_asg * M));
+        CK(cudaMalloc(&dUp4B, sizeof(float) * n_asg * M));
         CK(cudaMalloc(&dMid4, sizeof(float) * n_asg * M));
         CK(cudaMalloc(&dW4, sizeof(float) * n_asg));
         CK(cudaMalloc(&dIds4, sizeof(int32_t) * n_asg));
@@ -281,8 +331,10 @@ int main(int argc, char **argv) {
         int r2 = ds4_mmq_iq2_xxs_aligned_moe_vec(dArt, dX4, dIds4, dOut4A, M, K, n_tok, n_experts, n_slots, stream);
         int r3 = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(dArt, dArt2, dX4, dIds4, dW4, dMid4,
                                                              M, K, n_tok, n_experts, n_slots, clampv, stream);
-        if (r1 != 0 || r2 != 0 || r3 != 0) {
-            printf("multi-token entries rc=%d/%d/%d\n", r1, r2, r3);
+        int r4 = ds4_mmq_iq2_xxs_moe_vec(dRawUp, dX4, dIds4, dUp4B,
+                                         M, K, n_tok, n_experts, n_slots, stream);
+        if (r1 != 0 || r2 != 0 || r3 != 0 || r4 != 0) {
+            printf("multi-token entries rc=%d/%d/%d/%d\n", r1, r2, r3, r4);
             return 1;
         }
         CK(cudaStreamSynchronize(stream));
@@ -290,11 +342,24 @@ int main(int argc, char **argv) {
         CK(cudaMemcpy(ob4.data(), dOut4B, sizeof(float) * ob4.size(), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(oa4.data(), dOut4A, sizeof(float) * oa4.size(), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(om4.data(), dMid4, sizeof(float) * om4.size(), cudaMemcpyDeviceToHost));
-        bad4 = count_bad(ob4, oa4, nullptr, nullptr);
+        std::vector<float> up4(om4.size());
+        CK(cudaMemcpy(up4.data(), dUp4B, sizeof(float) * up4.size(), cudaMemcpyDeviceToHost));
+        bad4 += count_bad(ob4, oa4, nullptr, nullptr);
+        for (int t = 0; t < n_tok; t++) {
+            if (ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
+                    dArt, dArt2, dX4 + t * K, dIds4 + t * n_slots,
+                    dW4 + t * n_slots, dMid4 + t * n_slots * M,
+                    M, K, 1, n_experts, n_slots, clampv, stream) != 0) return 1;
+        }
+        CK(cudaStreamSynchronize(stream));
+        std::vector<float> serial_mid(om4.size());
+        CK(cudaMemcpy(serial_mid.data(), dMid4, sizeof(float) * serial_mid.size(),
+                      cudaMemcpyDeviceToHost));
+        if (memcmp(om4.data(), serial_mid.data(), sizeof(float) * om4.size())) bad_dedup++;
         std::vector<float> em4((size_t)n_asg * M);
         for (int a = 0; a < n_asg; a++) {
             for (int r = 0; r < M; r++) {
-                float g = ob4[(size_t)a * M + r], u = g;
+                float g = ob4[(size_t)a * M + r], u = up4[(size_t)a * M + r];
                 if (!std::isfinite(g)) g = 0.0f;
                 if (!std::isfinite(u)) u = 0.0f;
                 if (clampv > 1.0e-6f) {
@@ -306,10 +371,12 @@ int main(int argc, char **argv) {
                 em4[(size_t)a * M + r] = silu * u * w4[a];
             }
         }
-        bad4_mid = count_bad(em4, om4, nullptr, nullptr);
+        bad4_mid += count_bad(em4, om4, nullptr, nullptr);
         CK(cudaFree(dX4)); CK(cudaFree(dOut4B)); CK(cudaFree(dOut4A));
-        CK(cudaFree(dMid4)); CK(cudaFree(dW4)); CK(cudaFree(dIds4));
+        CK(cudaFree(dMid4)); CK(cudaFree(dW4)); CK(cudaFree(dIds4)); CK(cudaFree(dUp4B));
+      }
     }
+    CK(cudaFree(dRawUp));
 
     printf("TEST_IQ2_ALIGNED_ENTRY  M=%d K=%d slots=%d experts=%d iters=%d (weights/iter %.1f MB)\n",
            M, K, n_slots, n_experts, iters, slot_gb * 1000.0);
@@ -322,8 +389,8 @@ int main(int argc, char **argv) {
     printf("  fused    entry   : %.4f ms  -> %6.1f GB/s   (vs 2x aligned %+.1f%%)\n",
            ms_fused, 2.0 * slot_gb / (ms_fused / 1e3), 100.0 * (2.0f * ms_al / ms_fused - 1.0));
     printf("  parity: aligned max_rel=%.3e max_abs=%.3e bad=%d | pair bad=%d | fused-mid bad=%d"
-           " | ntok4 bad=%d ntok4-mid bad=%d -> %s\n",
-           max_rel, max_abs, bad, bad_pair, bad_mid, bad4, bad4_mid,
-           (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 && bad4_mid == 0) ? "PASS" : "FAIL");
-    return (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 && bad4_mid == 0) ? 0 : 2;
+           " | tiny-batch bad=%d mid bad=%d dedup-exact bad=%d -> %s\n",
+           max_rel, max_abs, bad, bad_pair, bad_mid, bad4, bad4_mid, bad_dedup,
+           (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 && bad4_mid == 0 && bad_dedup == 0) ? "PASS" : "FAIL");
+    return (bad == 0 && bad_pair == 0 && bad_mid == 0 && bad4 == 0 && bad4_mid == 0 && bad_dedup == 0) ? 0 : 2;
 }

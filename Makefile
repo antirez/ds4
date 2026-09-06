@@ -46,6 +46,7 @@ NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=
 else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
+
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
@@ -158,6 +159,16 @@ tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
 test-metal-moe-prefill: tests/test_metal_moe_prefill
 	./tests/test_metal_moe_prefill
 
+tests/test_metal_ssd_experts.o: tests/test_metal_ssd_experts.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_metal_ssd_experts: tests/test_metal_ssd_experts.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-metal-ssd-experts
+test-metal-ssd-experts: tests/test_metal_ssd_experts
+	./tests/test_metal_ssd_experts
+
 tests/test_metal_dense_mpp.o: tests/test_metal_dense_mpp.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
@@ -269,6 +280,16 @@ tests/test_cuda_q8_scratch: tests/test_cuda_q8_scratch.o $(CORE_OBJS)
 .PHONY: test-cuda-q8-scratch
 test-cuda-q8-scratch: tests/test_cuda_q8_scratch
 	./tests/test_cuda_q8_scratch
+
+tests/test_cuda_dspark_moe.o: cuda/mmq/test/test_iq2_aligned_entry.cu cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Icuda/mmq -c -o $@ $<
+
+tests/test_cuda_dspark_moe: tests/test_cuda_dspark_moe.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-dspark-moe
+test-cuda-dspark-moe: tests/test_cuda_dspark_moe
+	./tests/test_cuda_dspark_moe
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_cli_ui.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_cli_ui.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -464,6 +485,13 @@ endif
 .PHONY: test-glm-attention
 test-glm-attention: tests/test_glm_attention
 	./tests/test_glm_attention
+
+tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_ssd_cache.c ds4_ssd.c
+
+.PHONY: test-ssd-cache
+test-ssd-cache: tests/test_ssd_cache
+	./tests/test_ssd_cache
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
@@ -670,6 +698,11 @@ tests/test_prompt_prefix.o: tests/test_prompt_prefix.c ds4_prompt_prefix.h
 tests/test_prompt_prefix: tests/test_prompt_prefix.o ds4_prompt_prefix.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+.PHONY: test-frontends
+test-frontends: ds4_test ds4_agent_test
+	./ds4_test --server
+	./ds4_agent_test
+
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
@@ -724,11 +757,19 @@ test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_offi
 	$(CC) $(QUALITY_CFLAGS) -I. -ffunction-sections -fdata-sections -o tests/test_quality_api tests/test_quality_api.c -Wl,$(if $(filter Darwin,$(UNAME_S)),-dead_strip,--gc-sections) -lm
 	./tests/test_quality_api
 
+ds4.o ds4_cpu.o ds4_agent.o ds4_agent_cpu.o ds4_server.o ds4_server_cpu.o \
+ds4_test.o ds4_agent_test.o \
+ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
+tests/test_session_state_gpu.o: ds4_tool_text.h
+
 clean:
+	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_cuda_q8_scratch
+	rm -f tests/test_cuda_dspark_moe
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
+	rm -f tests/test_ssd_cache
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_metal_tp_spec
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

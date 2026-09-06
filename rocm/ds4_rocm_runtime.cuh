@@ -5862,6 +5862,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
+    hipblaslt_dspark_a_clear();
     hipblaslt_gemm_plan_clear();
 #endif
     if (g_cublas_ready) {

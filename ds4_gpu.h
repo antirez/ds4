@@ -2619,6 +2619,8 @@ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_dspark_gfx1151_fast_path(void);
 void ds4_gpu_set_dspark_verify_mode(bool enabled);
+#elif !defined(__APPLE__)
+int ds4_gpu_device_is_spark(void);
 #endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(

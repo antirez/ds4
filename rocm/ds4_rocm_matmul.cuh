@@ -1007,6 +1007,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if ((n_tok == 2048u || n_tok == 4096u) &&
+            hipblaslt_prefill_solution_index((uint32_t)out_dim, (uint32_t)n_tok,
+                                            (uint32_t)in_dim) >= 0 &&
+            !g_glm_model && !g_quality_mode &&
+            g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+            ds4_rocm_is_gfx1151()) {
+            if (hipblaslt_gemm_tn_f16_out_f32_prefill((float *)out->ptr, w, xh,
+                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim)) return 1;
+        }
+#endif
         if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
             ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
             matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);

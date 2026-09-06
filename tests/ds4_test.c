@@ -199,6 +199,30 @@ static void test_session_snapshot_roundtrip(void) {
     TEST_ASSERT(snapshot.ptr != NULL && snapshot.len > 0);
     if (!snapshot.ptr || snapshot.len == 0) goto cleanup;
 
+    FILE *payload = tmpfile();
+    TEST_ASSERT(payload != NULL);
+    if (!payload) goto cleanup;
+    TEST_ASSERT(ds4_session_save_payload(reference, payload, err, sizeof(err)) == 0);
+    TEST_ASSERT(ftello(payload) == (off_t)snapshot.len);
+    rewind(payload);
+    uint8_t payload_chunk[4096];
+    bool payload_matches = true;
+    for (uint64_t offset = 0; offset < snapshot.len; ) {
+        size_t bytes = snapshot.len - offset > sizeof(payload_chunk) ?
+            sizeof(payload_chunk) : (size_t)(snapshot.len - offset);
+        if (fread(payload_chunk, 1, bytes, payload) != bytes ||
+            memcmp(payload_chunk, snapshot.ptr + offset, bytes) != 0) {
+            fprintf(stderr, "ds4-test: snapshot payload differs at offset %llu\n",
+                    (unsigned long long)offset);
+            payload_matches = false;
+            break;
+        }
+        offset += bytes;
+    }
+    fclose(payload);
+    TEST_ASSERT(payload_matches);
+    if (!payload_matches) goto cleanup;
+
     if (test_glm_mtp) {
         for (int cycle = 0; cycle < GLM_MTP_SNAPSHOT_CYCLES; cycle++) {
             const int first = ds4_session_argmax(reference);
@@ -6325,8 +6349,8 @@ static void test_think_tool_recovery(void) {
     bool complete = false;
     for (size_t i = 0; generated[i]; i++) {
         buf_append(&text, generated + i, 1);
-        complete = complete_tool_call_inside_thinking(text.ptr, text.len,
-                                                      &scan_from);
+        complete = complete_tool_call_inside_thinking(
+            SERVER_MODEL_SYNTAX_DEEPSEEK, text.ptr, text.len, &scan_from);
         TEST_ASSERT(complete == (generated[i + 1] == '\0'));
     }
     TEST_ASSERT(complete);
@@ -6388,6 +6412,9 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool decode_ok = true;
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = r->model_syntax;
 
     for (int i = 0; i < r->max_tokens; i++) {
         int token = ds4_session_sample(session, r->temperature, r->top_k,
@@ -6407,7 +6434,8 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
         buf_append(&text, piece, piece_len);
         free(piece);
         if (r->has_tools) {
-            observe_tool_markers(text.ptr ? text.ptr : "",
+            dsml_decode_tracker_update(&tracker, text.ptr, text.len);
+            observe_tool_markers(&tracker, text.ptr ? text.ptr : "",
                                  &saw_tool_start, &saw_tool_end, NULL);
             if (saw_tool_end) {
                 finish = "tool_calls";
@@ -6553,7 +6581,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
     *out_len = 0;
     *max_chunk = 0;
     ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    TEST_ASSERT(ds4_session_create(&session, engine, prompt->len + max_tokens + 16) == 0);
     if (!session) return false;
 
     char err[160];
@@ -6595,7 +6623,7 @@ static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prom
     *worst_gap = 0.0f;
     *worst_at = -1;
     ds4_session *session = NULL;
-    TEST_ASSERT(ds4_session_create(&session, engine, 32768) == 0);
+    TEST_ASSERT(ds4_session_create(&session, engine, prompt->len + n + 16) == 0);
     if (!session) return false;
 
     char err[160];
@@ -6661,6 +6689,7 @@ static ds4_engine *test_open_dspark_engine(const char *support_path) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .quality = false,
+        .prefill_chunk = 512,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
         .ssd_streaming_cache_experts =

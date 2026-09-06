@@ -3696,6 +3696,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     // only write-back is too late: stale or NaN tail blocks can contaminate
     // other values in the same hardware matrix fragment.
     const int valid_y_words = min(mmq_x, tile_y_max_j + 1) * MMQ_TILE_Y_K;
+#if defined(GGML_USE_HIP) && defined(__gfx1151__)
+    // Load scheduling can change fast-math accumulation order. Keep the
+    // established path outside the larger gfx1151 IQ2 prefill templates.
+    constexpr bool fast_y_loads = type == GGML_TYPE_IQ2_XXS && mmq_x >= 32;
+    const bool full_y_tile = tile_y_max_j >= mmq_x - 1;
+    const int linear_tid = threadIdx.y*warp_size + threadIdx.x;
+    constexpr int nthreads = nwarps * warp_size;
+
+    // Seed invalid columns once. Both K stages refresh only the valid prefix,
+    // and the existing barriers keep the suffix zero before every matrix op.
+    if (fast_y_loads && !full_y_tile) {
+        for (int l = valid_y_words + linear_tid; l < mmq_x * MMQ_TILE_Y_K; l += nthreads) {
+            tile_y[l] = 0;
+        }
+    }
+#endif
 
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
 
@@ -3725,12 +3741,35 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#if defined(GGML_USE_HIP) && defined(__gfx1151__)
+            if constexpr (fast_y_loads) {
+                if (full_y_tile) {
+#pragma unroll
+                    for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nthreads) {
+                        const int l = l0 + linear_tid;
+                        tile_y[l] = by0[l];
+                    }
+                } else {
+                    for (int l = linear_tid; l < valid_y_words; l += nthreads) {
+                        tile_y[l] = by0[l];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = l < valid_y_words ? by0[l] : 0;
+                }
+            }
+#else
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = l < valid_y_words ? by0[l] : 0;
             }
+#endif
         }
 
         __syncthreads();
@@ -3741,12 +3780,35 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#if defined(GGML_USE_HIP) && defined(__gfx1151__)
+            if constexpr (fast_y_loads) {
+                if (full_y_tile) {
+#pragma unroll
+                    for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nthreads) {
+                        const int l = l0 + linear_tid;
+                        tile_y[l] = by0[l];
+                    }
+                } else {
+                    for (int l = linear_tid; l < valid_y_words; l += nthreads) {
+                        tile_y[l] = by0[l];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = l < valid_y_words ? by0[l] : 0;
+                }
+            }
+#else
 #pragma unroll
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = l < valid_y_words ? by0[l] : 0;
             }
+#endif
         }
 
         __syncthreads();

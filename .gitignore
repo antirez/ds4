@@ -27,6 +27,7 @@
 /tests/test_metal_session_batch
 /tests/test_metal_tp_spec
 /tests/test_metal_moe_prefill
+/tests/test_metal_ssd_experts
 /tests/test_metal_dense_mpp
 /tests/test_mxfp4_cuda
 /tests/test_mxfp4_dot
@@ -35,6 +36,7 @@
 /tests/test_sampling
 /tests/test_quality_api
 /tests/test_cuda_q8_scratch
+/tests/test_cuda_dspark_moe
 /tests/test_session_state
 /tests/test_session_state_gpu
 /tests/test_tp_commands

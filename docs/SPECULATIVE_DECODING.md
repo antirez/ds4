@@ -37,9 +37,13 @@ the main model can be resident or SSD-streamed. DSpark replaces the legacy
 one-stage MTP drafter for that run; the two are not stacked.
 
 Resident M5 paths batch supported verifier expert rows, including two-Mac TP.
+On DGX Spark, resident Q2 also batches the seed with longer drafts and uses
+small-batch Q8 and expert kernels. No extra flags are needed.
 The scheduler can back off when drafting is unproductive. Defaults select the
 fast paths; diagnostic environment variables are not needed for normal use.
 Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
+
+For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
 ## GLM: built-in MTP
 

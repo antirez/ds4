@@ -60,6 +60,15 @@ static void run(int rows, int columns, int tokens, bool pair, cudaStream_t strea
     ds4_mmq_set_aligned_q81_scratch(nullptr, 0);
     launch();
     const auto reference = read();
+    if (!pair && tokens > 1) {
+        for (int token = 0; token < tokens; token++) {
+            assert(ds4_mmq_q8_0_aligned_dense_vec(
+                w0, x + token * columns, out + token * rows,
+                rows, 1, columns, stream) == 0);
+        }
+        const auto separate = read();
+        assert(memcmp(reference.data(), separate.data(), count * sizeof(float)) == 0);
+    }
     for (size_t capacity : {size_t(1), size_t(64 * 1024)}) {
         ds4_mmq_set_aligned_q81_scratch(scratch, capacity);
         CHECK(cudaMemsetAsync(out, 0x7f, count * sizeof(float), stream));
@@ -102,7 +111,8 @@ int main() {
     CHECK(cudaStreamCreate(&stream));
     for (int rows : {128, 129, 2048}) {
         for (int columns : {1024, 4096}) {
-            for (int tokens : {1, 2, 8}) run(rows, columns, tokens, false, stream);
+            for (int tokens = 1; tokens <= 8; tokens++)
+                run(rows, columns, tokens, false, stream);
             run(rows, columns, 1, true, stream);
         }
     }

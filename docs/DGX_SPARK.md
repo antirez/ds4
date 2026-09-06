@@ -47,6 +47,37 @@ For Flash 0731, [DSpark](SPECULATIVE_DECODING.md) uses the separate 0731 support
 file. Vision Experimental has a different drafter. GLM uses its built-in MTP
 block with `--mtp`. None is enabled by default.
 
+## Flash Q2 with DSpark
+
+September 6, 2026, fully resident Flash 0731: median generation speed from
+three runs of 256 tokens, 4K allocated context and a 512-token prefill chunk.
+
+| Prompt | Temperature | Ordinary decode | DSpark |
+| --- | ---: | ---: | ---: |
+| C hash table | 0 | 19.72 t/s | 31.41 t/s |
+| C hash table | 1 | 19.53 t/s | 29.98 t/s |
+| Unpredictable prose | 1 | 19.53 t/s | 18.81 t/s |
+
+Longer coding runs reached about 33 t/s. Poor draft acceptance can still make
+DSpark slower. Temperature 1 uses the default opportunistic policy; these are
+not exact-sampling results. DSpark does not accelerate prefill.
+
+To reproduce the greedy coding case after downloading `ds4f-q2` and
+`ds4f-dspark`:
+
+```sh
+./ds4 --cuda -m ds4flash.gguf \
+  --dspark --mtp-model gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --ctx 4096 --prefill-chunk 512 --nothink --temp 0 --seed 12345 -n 256 \
+  -p 'Write a complete C hash table implementation with string keys, insert, find, delete, and a test main. Output only C code.'
+```
+
+For the temperature-1 rows, use `--temp 1 --top-p 0.95 --min-p 0.05`.
+The [QA record](../QA_BEFORE_RELEASES.md#16-speed-regression) includes the previous
+implementation, continued-context checks and quality comparisons.
+
+## Larger models and serving
+
 CUDA also has [SSD streaming](SSD_STREAMING.md) paths for larger weights.
 Memory fit and speed depend on the model layout; start with Q2 for normal use.
 
