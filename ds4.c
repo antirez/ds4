@@ -30730,6 +30730,18 @@ static bool metal_graph_encode_layer_attention_batch(
             uint32_t use_comp_mask = 0;
             bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
+            /* Verify-shaped batches (DSpark/MTP suffix re-verification, never
+             * more than a few draft tokens) must pick the same dense-vs-indexed
+             * branch that single-token decode would for the same n_comp, or the
+             * verifier attends over a different candidate set than the decode
+             * path it's supposed to be reproducing.  Real multi-thousand-token
+             * prefill chunks keep the original DS4_N_INDEXER_TOP_K cutover --
+             * decode's amortization argument for going sparse earlier hasn't
+             * been separately validated at that scale. */
+            const bool verify_shaped_batch = n_tokens <= 8;
+            const uint32_t indexer_dense_threshold = verify_shaped_batch
+                ? metal_graph_decode_indexer_sparse_threshold(g)
+                : DS4_N_INDEXER_TOP_K;
 
             ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                      metal_graph_batch_kv(g),
@@ -30737,7 +30749,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM) != 0;
-            if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+            if (ok && ratio == 4 && n_comp > indexer_dense_threshold) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary(NULL,
@@ -71210,6 +71222,29 @@ static int ds4_session_eval_dspark_speculative_stochastic(
         }
         ds4_session_dspark_scheduler_note(
             s, 0, false, DS4_DSPARK_STOCH_EXTRA_MS());
+        DS4_DSPARK_STOCH_FINISH();
+        return n_accept;
+    }
+    if (draft_n == 1) {
+        /* Position 0 just got accepted above and it's the entire draft, so
+         * there is nothing left for the batched verifier to check -- the
+         * only remaining work is committing drafts[0] and obtaining next-
+         * token logits, which a plain decode step gives at a fraction of
+         * the cost of a full multi-layer batch dispatch at n_tokens == 1
+         * (mirrors the position-0-rejection cheap path just above). */
+        if (ds4_session_eval_probe_tp(s, drafts[0], false, err, errlen) != 0) {
+            DS4_DSPARK_STOCH_FINISH();
+            return -1;
+        }
+        accepted[n_accept++] = drafts[0];
+        if (stats_enabled) {
+            s->dspark_stats.full_accepts++;
+            s->dspark_stats.direct_full_commits++;
+            s->dspark_stats.accepted_draft_tokens += 1;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 1);
+        }
+        ds4_session_dspark_scheduler_note(
+            s, 1, false, DS4_DSPARK_STOCH_EXTRA_MS());
         DS4_DSPARK_STOCH_FINISH();
         return n_accept;
     }

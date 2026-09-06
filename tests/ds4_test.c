@@ -6812,6 +6812,102 @@ static void test_dspark_verify_depth(void) {
     ds4_engine_close(engine);
     test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
 }
+
+/* Regression for the indexer sparse-threshold mismatch between decode
+ * (metal_graph_decode_indexer_sparse_threshold(), 1024) and the batched
+ * verify path (previously a bare DS4_N_INDEXER_TOP_K, 512): a ratio-4 layer
+ * with n_comp in (512,1024] used to attend densely in decode but sparsely
+ * (indexer top-k) in DSpark's verify batch -- a different candidate set for
+ * what's supposed to be the same computation.  Sizes the prompt so ratio-4
+ * layers land n_comp in that exact window, then reuses the verify-depth
+ * oracle: every committed speculative token must replay as a (near-)argmax
+ * under plain decode. */
+static void test_dspark_indexer_threshold_boundary(void) {
+    const char *support = getenv("DS4_TEST_DSPARK");
+    if (!support || !support[0]) {
+        fprintf(stderr, "ds4-test: dspark-indexer-threshold-boundary skipped (set DS4_TEST_DSPARK to a DSpark support GGUF)\n");
+        return;
+    }
+
+    char *saved_scheduler = test_save_env("DS4_DSPARK_SCHEDULER");
+    setenv("DS4_DSPARK_SCHEDULER", "0", 1);
+
+    char *full_text = test_read_file("tests/long_context_story_prompt.txt");
+    TEST_ASSERT(full_text != NULL);
+
+    ds4_engine *engine = test_open_dspark_engine(support);
+    ds4_tokens prompt = {0};
+    int *spec = NULL;
+
+    if (engine && full_text) {
+        const int draft_depth = ds4_engine_mtp_draft_tokens(engine);
+        TEST_ASSERT(draft_depth > 2);
+
+        /* ~13000 bytes of this story (English prose, ~5.8 bytes/word here)
+         * tokenizes to roughly 2600-2900 tokens -- n_comp ~650-725 for
+         * ratio-4 layers after prefill, comfortably inside (512,1024] with
+         * headroom for the ~128 generated tokens (+~32 rows) to stay under
+         * the 1024 ceiling too. */
+        const size_t slice_bytes = 13000;
+        size_t full_len = strlen(full_text);
+        size_t use_len = slice_bytes < full_len ? slice_bytes : full_len;
+        char *slice = malloc(use_len + 1);
+        TEST_ASSERT(slice != NULL);
+        if (slice) {
+            memcpy(slice, full_text, use_len);
+            slice[use_len] = '\0';
+
+            ds4_chat_begin(engine, &prompt);
+            ds4_chat_append_message(engine, &prompt, "user", slice);
+            ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+            TEST_ASSERT(prompt.len > 0);
+            free(slice);
+
+            fprintf(stderr,
+                    "ds4-test: dspark-indexer-threshold-boundary prompt.len=%d n_comp~%d\n",
+                    prompt.len, prompt.len / 4);
+            TEST_ASSERT(prompt.len / 4 > 512 && prompt.len / 4 <= 1024);
+
+            const int maxgen = 128;
+            spec = malloc((size_t)maxgen * sizeof(*spec));
+            TEST_ASSERT(spec != NULL);
+            if (draft_depth > 2 && spec && prompt.len > 0) {
+                int nspec = 0, max_chunk = 0;
+                const bool ok_spec = test_mtp_capture_speculative(engine, &prompt,
+                                                                  maxgen,
+                                                                  spec, &nspec,
+                                                                  &max_chunk);
+                TEST_ASSERT(ok_spec);
+                TEST_ASSERT(nspec > 32);
+
+                float worst_gap = 0.0f;
+                int worst_at = -1;
+                const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt,
+                                                                spec, nspec,
+                                                                &worst_gap,
+                                                                &worst_at);
+                TEST_ASSERT(ok_check);
+                fprintf(stderr,
+                        "ds4-test: dspark-indexer-threshold-boundary nspec=%d max_chunk=%d worst_argmax_gap=%.3f at=%d\n",
+                        nspec, max_chunk, worst_gap, worst_at);
+                /* Tighter than the other verify-depth tests' 2.0f tolerance:
+                 * attending over the wrong candidate set (indexed top-512
+                 * instead of dense-1024) measured ~0.9 on this model/prompt,
+                 * while the correct dense path measures exactly 0.0 (same
+                 * computation as decode, not just numerically close to it).
+                 * 0.05f still absorbs ordinary batched-vs-single-token
+                 * floating-point reduction-order noise. */
+                TEST_ASSERT(worst_gap <= 0.05f);
+            }
+        }
+    }
+
+    free(spec);
+    free(full_text);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
+}
 #endif
 
 static void test_server_unit_group(void) {
@@ -6843,6 +6939,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
+    {"--dspark-indexer-threshold-boundary", "dspark-indexer-threshold-boundary", "DSpark batched verify matches decode's indexer sparse-threshold for n_comp in (512,1024]", test_dspark_indexer_threshold_boundary},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
@@ -6879,7 +6976,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
-    puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
+    puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth and --dspark-indexer-threshold-boundary.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");
     puts("  DS4_TEST_CONTINUED_PREFILL_STEPS=N   Number of consecutive large suffixes to test.");
     puts("  DS4_TEST_CONTINUED_PREFILL_ALLOW_COARSE=1  Permit coarse short-suffix progress for baseline timing.");
