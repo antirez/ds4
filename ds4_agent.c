@@ -1015,6 +1015,10 @@ static const char agent_tools_prompt_edit_upto[] =
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
+    "Long bash output is truncated: a <head -N file> or <tail -N file> block contains only "
+    "the first or last N lines, never the whole output. The complete output is saved in the "
+    "file named by output_path. When a result carries a truncation WARNING, read that file "
+    "(read, grep, sed) before relying on anything the shown lines do not prove.\n\n"
     "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
     "The first web call may ask the user for permission to start Chrome.\n\n"
     "### Available Tool Schemas\n\n"
@@ -8125,6 +8129,16 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
             agent_buf_puts(&out, head);
             if (head[0] && head[strlen(head) - 1] != '\n') agent_buf_puts(&out, "\n");
             agent_buf_puts(&out, "</head>\n");
+            /* This branch is also taken while a job is still running, where
+             * nothing has been dropped, so warn only on real truncation. */
+            if (truncated) {
+                snprintf(line, sizeof(line),
+                         "WARNING: output truncated. Only the first %d of %d lines "
+                         "are shown above; the rest was NOT shown. Read %s before "
+                         "drawing conclusions that depend on the full output.\n",
+                         shown_lines, display_lines, job->path);
+                agent_buf_puts(&out, line);
+            }
         }
         free(head);
     } else {
@@ -8142,6 +8156,14 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
         if (tail[0] && tail[strlen(tail) - 1] != '\n') agent_buf_puts(&out, "\n");
         snprintf(line, sizeof(line), "</tail>\n");
         agent_buf_puts(&out, line);
+        if (display_lines > tail_lines) {
+            snprintf(line, sizeof(line),
+                     "WARNING: output truncated. Only the last %d of %d lines "
+                     "are shown above; earlier lines were NOT shown. Read %s "
+                     "before drawing conclusions that depend on the full output.\n",
+                     tail_lines, display_lines, job->path);
+            agent_buf_puts(&out, line);
+        }
         free(tail);
     }
     if (job->running) {
