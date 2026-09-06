@@ -17,6 +17,7 @@ about 107 GB (100 GiB) together on disk:
 ./download_model.sh qwen38-q4k
 ./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
 ./ds4-server --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp --mtp-exact-sampling
+./ds4-agent --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
 ```
 
 The downloader links `ds4flash.gguf` to the combined model. Both ordinary and
@@ -24,6 +25,14 @@ MTP decode use this same GGUF and PLE sidecar; omit `--mtp` for ordinary decode.
 Adjust the PLE path if you set `DS4_GGUF_DIR`. The external PLE table is mapped
 separately, allowing this release to run on 128 GB Macs; context size and other
 workloads still affect memory use.
+
+Use `ds4-agent` for native terminal and web tools. Its `bash` tool executes
+commands; `google_search` and `visit_page` use a visible Chrome browser.
+Starting that browser requires approval in interactive mode. A
+`--non-interactive` run cannot approve browser startup; HTTP fetching through
+`bash`/`curl` does not require Chrome. With `ds4-server`, the API client must
+provide tool definitions, execute returned calls and send back their results.
+See the [terminal and web smoke tests](../speed-bench/qwen38-real-tools.md).
 
 Vision needs llama.cpp's mmproj encoder, which is a separate download:
 
