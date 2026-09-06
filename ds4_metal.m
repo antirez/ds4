@@ -12695,6 +12695,10 @@ int ds4_gpu_set_model_map_spans(
     }
 }
 
+int ds4_gpu_set_primary_model_map(const void *model_map, uint64_t model_size) {
+    return model_map && model_size != 0;
+}
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }

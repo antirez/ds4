@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -43,11 +45,32 @@
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
 #define DS4_TP_PROTOCOL_VERSION 10u
 
+
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
+#define DS4_TP_MAX_TIMEOUT_SEC 86400u
+#define DS4_TP_COMMAND_MAX_TOKENS 1048576u
+#define DS4_TP_COMMAND_MAX_BATCH_ITEMS 4096u
+
+/* Frontend signal handlers set this so peer waits and the worker's blocking
+ * control read do not outlive a service stop.  It is process-global because
+ * TP bring-up happens before either frontend owns a session object. */
+static volatile sig_atomic_t g_tp_stop_requested;
+
+void ds4_tp_request_stop(void) {
+    g_tp_stop_requested = 1;
+}
+
+bool ds4_tp_stop_requested(void) {
+    return g_tp_stop_requested != 0;
+}
+
+void ds4_tp_clear_stop_request(void) {
+    g_tp_stop_requested = 0;
+}
 
 typedef struct {
     uint32_t magic;
@@ -60,6 +83,10 @@ typedef struct {
     uint32_t version;
     uint32_t role;
     uint32_t rdma_ok;    /* this side has a usable verbs device */
+    uint32_t nhi_ok;     /* this side explicitly selected an NHI device */
+    uint32_t nhi_ring_frames;
+    uint32_t nhi_msg_frames;
+    uint32_t transport;
     uint64_t gguf_bytes;
     uint32_t model_id;
     uint32_t n_layer;
@@ -179,7 +206,9 @@ struct ds4_tp {
     int control_fd;
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
+    bool nhi_active;
     uint32_t peer_ctx;
+    uint32_t local_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
     uint64_t vec_bytes;
@@ -260,7 +289,37 @@ static int tp_read_full(int fd, void *buf, size_t len) {
     return 1;
 }
 
-static void tp_socket_tune(int fd) {
+static int tp_read_full_stoppable(int fd, void *buf, size_t len) {
+    char *p = buf;
+    while (len) {
+        if (ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            return 0;
+        }
+        ssize_t r = read(fd, p, len);
+        if (r < 0) {
+            if (errno == EINTR && !ds4_tp_stop_requested()) continue;
+            if (errno == EINTR) errno = ECANCELED;
+            return 0;
+        }
+        if (r == 0) return 0;
+        p += r;
+        len -= (size_t)r;
+    }
+    return 1;
+}
+
+static int tp_read_frame_header_stoppable(int fd, uint32_t *type,
+                                          uint32_t *bytes) {
+    ds4_tp_frame_header h;
+    if (!tp_read_full_stoppable(fd, &h, sizeof(h))) return 0;
+    if (h.magic != DS4_TP_MAGIC) return 0;
+    *type = h.type;
+    *bytes = h.bytes;
+    return 1;
+}
+
+static int tp_socket_tune(int fd, uint64_t timeout_sec) {
     int one = 1;
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -271,6 +330,16 @@ static void tp_socket_tune(int fd) {
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    struct timeval timeout = {
+        .tv_sec = (time_t)timeout_sec,
+        .tv_usec = 0,
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) != 0)
+        return 0;
+    return 1;
 }
 
 static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
@@ -326,13 +395,88 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
     return fd;
 }
 
+static int tp_poll_deadline(int fd, short events, double deadline) {
+    for (;;) {
+        if (ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            return 0;
+        }
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0.0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        double ms_double = remaining * 1000.0;
+        if (ms_double > (double)INT_MAX) ms_double = (double)INT_MAX;
+        int timeout_ms = (int)ms_double;
+        if (timeout_ms < 1) timeout_ms = 1;
+        struct pollfd pfd = { .fd = fd, .events = events, .revents = 0 };
+        const int rc = poll(&pfd, 1, timeout_ms);
+        if (rc > 0) return 1;
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+        if (errno == EINTR && ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            return 0;
+        }
+        if (errno != EINTR) return 0;
+    }
+}
+
+static int tp_accept_deadline(int listener, double timeout_sec,
+                              char *err, size_t errlen) {
+    const double deadline = tp_now_sec() + timeout_sec;
+    for (;;) {
+        if (!tp_poll_deadline(listener, POLLIN, deadline)) {
+            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            return -1;
+        }
+        const int fd = accept(listener, NULL, NULL);
+        if (fd >= 0) return fd;
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            return -1;
+        }
+    }
+}
+
+static int tp_connect_one_deadline(int fd, const struct sockaddr *addr,
+                                   socklen_t addrlen, double deadline) {
+    const int old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0 || fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) != 0)
+        return 0;
+    if (connect(fd, addr, addrlen) == 0) {
+        if (fcntl(fd, F_SETFL, old_flags) != 0) return 0;
+        return 1;
+    }
+    if (errno != EINPROGRESS && errno != EWOULDBLOCK) return 0;
+    if (!tp_poll_deadline(fd, POLLOUT, deadline)) return 0;
+    int socket_error = 0;
+    socklen_t socket_error_len = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                   &socket_error, &socket_error_len) != 0)
+        return 0;
+    if (socket_error != 0) {
+        errno = socket_error;
+        return 0;
+    }
+    if (fcntl(fd, F_SETFL, old_flags) != 0) return 0;
+    return 1;
+}
+
 static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
-    double deadline = tp_now_sec() + timeout_sec;
+    const double deadline = tp_now_sec() + timeout_sec;
     int last_errno = 0;
     uint32_t attempts = 0;
     do {
+        if (ds4_tp_stop_requested()) {
+            errno = ECANCELED;
+            break;
+        }
         struct addrinfo hints = {0}, *res = NULL;
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
@@ -341,12 +485,17 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
             for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
                 int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
                 if (fd < 0) continue;
-                if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+                double attempt_deadline = tp_now_sec() + 5.0;
+                if (attempt_deadline > deadline) attempt_deadline = deadline;
+                if (tp_connect_one_deadline(fd, ai->ai_addr,
+                                            ai->ai_addrlen,
+                                            attempt_deadline)) {
                     freeaddrinfo(res);
                     return fd;
                 }
                 last_errno = errno;
                 close(fd);
+                if (tp_now_sec() >= deadline) break;
             }
             freeaddrinfo(res);
         }
@@ -357,7 +506,7 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
                     gai != 0 ? gai_strerror(gai) :
                     last_errno ? strerror(last_errno) : "no address worked");
         }
-        usleep(200 * 1000);
+        if (tp_now_sec() < deadline) usleep(200 * 1000);
     } while (tp_now_sec() < deadline);
     tp_set_err(err, errlen, "tp connect %s:%d: %s", host, port,
                last_errno ? strerror(last_errno) : "unreachable");
@@ -392,8 +541,11 @@ void ds4_tp_usage(FILE *fp) {
     fprintf(fp,
         "Tensor parallelism (two identical machines):\n"
         "  --tensor-parallel           Use --role/--listen/--coordinator for a 50/50 TP pair.\n"
-        "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
+        "  --transport <auto|rdma|tcp|nhi>\n"
+        "                              Gate transport (default auto; ROCm requires nhi).\n"
         "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
+        "  --nhi-device <path>         Select the local thunderbolt-stream device.\n"
+        "  --nhi-ring-frames <n>       Imported NHI ring geometry (default 4096).\n"
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
@@ -418,6 +570,7 @@ int ds4_tp_parse_cli_arg(
         if (!strcmp(v, "auto")) opt->transport = DS4_TP_TRANSPORT_AUTO;
         else if (!strcmp(v, "rdma")) opt->transport = DS4_TP_TRANSPORT_RDMA;
         else if (!strcmp(v, "tcp")) opt->transport = DS4_TP_TRANSPORT_TCP;
+        else if (!strcmp(v, "nhi")) opt->transport = DS4_TP_TRANSPORT_NHI;
         else {
             tp_set_err(err, errlen, "invalid %s value: %s", arg, v);
             return DS4_TP_CLI_ERROR;
@@ -425,6 +578,24 @@ int ds4_tp_parse_cli_arg(
     } else if (!strcmp(arg, "--rdma-device")) {
         if (i + 1 >= argc) goto missing;
         opt->rdma_device = argv[++i];
+    } else if (!strcmp(arg, "--nhi-device")) {
+        if (i + 1 >= argc) goto missing;
+        opt->nhi_device = argv[++i];
+        if (!opt->nhi_device[0]) {
+            tp_set_err(err, errlen, "--nhi-device requires a nonempty path");
+            return DS4_TP_CLI_ERROR;
+        }
+    } else if (!strcmp(arg, "--nhi-ring-frames")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(argv[++i], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || value == 0 ||
+            value > UINT32_MAX || (value % DS4_TP_NHI_MSG_FRAMES) != 0) {
+            tp_set_err(err, errlen, "invalid --nhi-ring-frames %s", argv[i]);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->nhi_ring_frames = (uint32_t)value;
     } else if (!strcmp(arg, "--rdma-gid-index")) {
         if (i + 1 >= argc) goto missing;
         char *end = NULL;
@@ -513,6 +684,8 @@ int ds4_tp_adopt_distributed_options(
         return 0;
     }
 
+    if (!tp->nhi_device && dist->nhi_device)
+        tp->nhi_device = dist->nhi_device;
     memset(dist, 0, sizeof(*dist));
     return 1;
 }
@@ -524,7 +697,8 @@ int ds4_tp_validate_engine_options(
 {
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
-            opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
+            opt->tp.rdma_device || opt->tp.nhi_device ||
+            opt->tp.nhi_ring_frames != 0 || opt->tp.rdma_gid_index_set ||
             opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");
@@ -532,8 +706,32 @@ int ds4_tp_validate_engine_options(
         }
         return 1;
     }
-    if (opt->backend != DS4_BACKEND_METAL) {
-        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+    bool backend_ok = opt->backend == DS4_BACKEND_METAL &&
+                      opt->tp.transport != DS4_TP_TRANSPORT_NHI;
+#ifdef DS4_ROCM_BUILD
+    backend_ok = backend_ok ||
+                 (opt->backend == DS4_BACKEND_CUDA &&
+                  opt->tp.transport == DS4_TP_TRANSPORT_NHI);
+#endif
+    if (!backend_ok) {
+        tp_set_err(err, errlen,
+#ifdef DS4_ROCM_BUILD
+                   "ROCm tensor parallelism requires --transport nhi"
+#else
+                   "tensor parallelism requires the Metal backend"
+#endif
+        );
+        return 0;
+    }
+    if (opt->tp.transport == DS4_TP_TRANSPORT_NHI && !opt->tp.nhi_device) {
+        tp_set_err(err, errlen,
+                   "--transport nhi requires --nhi-device PATH");
+        return 0;
+    }
+    if (opt->tp.transport != DS4_TP_TRANSPORT_NHI &&
+        (opt->tp.nhi_device || opt->tp.nhi_ring_frames != 0)) {
+        tp_set_err(err, errlen,
+                   "--nhi-device/--nhi-ring-frames require --transport nhi");
         return 0;
     }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
@@ -1685,6 +1883,11 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .version = DS4_TP_PROTOCOL_VERSION,
         .role = (uint32_t)tp->opt.role,
         .rdma_ok = (uint32_t)rdma_ok,
+        .nhi_ok = (uint32_t)(tp->opt.transport == DS4_TP_TRANSPORT_NHI &&
+                             tp->opt.nhi_device != NULL),
+        .nhi_ring_frames = tp->opt.nhi_ring_frames,
+        .nhi_msg_frames = DS4_TP_NHI_MSG_FRAMES,
+        .transport = (uint32_t)tp->opt.transport,
         .gguf_bytes = id->gguf_bytes,
         .model_id = id->model_id,
         .n_layer = id->n_layer,
@@ -1752,9 +1955,34 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     memcpy(tp->gate_slot_mask, id->gate_slot_mask,
            sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
-    /* Transport decision: RDMA only when both sides can. */
-    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
+    if (theirs.transport != mine.transport) {
+        tp_set_err(err, errlen,
+                   "tp hello: transport mismatch (peer=%u local=%u)",
+                   theirs.transport, mine.transport);
+        return 0;
+    }
+    tp->nhi_active = mine.nhi_ok && theirs.nhi_ok;
+    if (tp->opt.transport == DS4_TP_TRANSPORT_NHI) {
+        if (!tp->nhi_active) {
+            tp_set_err(err, errlen,
+                       "tp: --transport nhi but %s side has no configured device",
+                       mine.nhi_ok ? "the peer" : "this");
+            return 0;
+        }
+        if (theirs.nhi_ring_frames != mine.nhi_ring_frames ||
+            theirs.nhi_msg_frames != mine.nhi_msg_frames) {
+            tp_set_err(err, errlen,
+                       "tp hello: NHI geometry mismatch "
+                       "(peer ring=%u msg=%u, local ring=%u msg=%u)",
+                       theirs.nhi_ring_frames, theirs.nhi_msg_frames,
+                       mine.nhi_ring_frames, mine.nhi_msg_frames);
+            return 0;
+        }
+    }
+    /* Legacy data plane: RDMA only when both AUTO/RDMA peers can. */
+    const int want_rdma = tp->opt.transport == DS4_TP_TRANSPORT_AUTO ||
+                          tp->opt.transport == DS4_TP_TRANSPORT_RDMA;
+    tp->rdma_active = !tp->nhi_active && want_rdma && rdma_ok && theirs.rdma_ok;
     if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
         tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
                    rdma_ok ? "the peer" : "this");
@@ -1777,12 +2005,26 @@ int ds4_tp_create(
         return 0;
     }
     tp->opt = *opt;
+    if (tp->opt.nhi_ring_frames == 0)
+        tp->opt.nhi_ring_frames = DS4_TP_NHI_DEFAULT_RING_FRAMES;
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+    tp->local_ctx = id->ctx_size;
     tp->control_fd = -1;
     tp->data_fd = -1;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
-    if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
+    if (tmo) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(tmo, &end, 10);
+        if (errno != 0 || !end || *end != '\0' || value == 0 ||
+            value > DS4_TP_MAX_TIMEOUT_SEC) {
+            tp_set_err(err, errlen, "tp: invalid DS4_TP_TIMEOUT_SEC %s", tmo);
+            ds4_tp_free(tp);
+            return 0;
+        }
+        tp->timeout_sec = (uint64_t)value;
+    }
     tp->gate_timeout_ms = DS4_TP_DEFAULT_GATE_TIMEOUT_MS;
     const char *gate_tmo = getenv("DS4_TP_GATE_TIMEOUT_MS");
     if (gate_tmo) {
@@ -1792,7 +2034,8 @@ int ds4_tp_create(
 
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
-    if (opt->transport != DS4_TP_TRANSPORT_TCP &&
+    if ((opt->transport == DS4_TP_TRANSPORT_AUTO ||
+         opt->transport == DS4_TP_TRANSPORT_RDMA) &&
         (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG)
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
 #endif
@@ -1803,17 +2046,19 @@ int ds4_tp_create(
         if (listener < 0) goto fail;
         fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
                 opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
-            goto fail;
-        }
+        tp->control_fd = tp_accept_deadline(
+            listener, (double)tp->timeout_sec, err, errlen);
+        if (tp->control_fd < 0) goto fail;
     } else {
         tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
                                  (double)tp->timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
     }
-    tp_socket_tune(tp->control_fd);
+    if (!tp_socket_tune(tp->control_fd, tp->timeout_sec)) {
+        tp_set_err(err, errlen, "tp control socket timeout setup: %s",
+                   strerror(errno));
+        goto fail;
+    }
 
     if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
 
@@ -1827,7 +2072,8 @@ int ds4_tp_create(
          * interleave with gate payloads.  Created under RDMA too for
          * headers, verify-block gates, and transport fallback. */
         if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
+            tp->data_fd = tp_accept_deadline(
+                listener, (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) {
                 tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
                 goto fail;
@@ -1837,7 +2083,11 @@ int ds4_tp_create(
                                   (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) goto fail;
         }
-        tp_socket_tune(tp->data_fd);
+        if (!tp_socket_tune(tp->data_fd, tp->timeout_sec)) {
+            tp_set_err(err, errlen, "tp data socket timeout setup: %s",
+                       strerror(errno));
+            goto fail;
+        }
         if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
             tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
             goto fail;
@@ -1846,7 +2096,7 @@ int ds4_tp_create(
     if (listener >= 0) close(listener);
     fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp",
+            tp->nhi_active ? "nhi" : (tp->rdma_active ? "rdma" : "tcp"),
             (unsigned long long)tp->gate_timeout_ms);
     *out = tp;
     return 1;
@@ -1889,12 +2139,34 @@ void ds4_tp_free(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
+bool ds4_tp_is_nhi(const ds4_tp *tp) { return tp && tp->nhi_active; }
+const char *ds4_tp_nhi_device(const ds4_tp *tp) {
+    return tp && tp->nhi_active ? tp->opt.nhi_device : NULL;
+}
+uint32_t ds4_tp_nhi_ring_frames(const ds4_tp *tp) {
+    return tp && tp->nhi_active ? tp->opt.nhi_ring_frames : 0;
+}
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
 void ds4_tp_mark_failed(ds4_tp *tp) {
     if (tp) atomic_store_explicit(&tp->failed, true, memory_order_release);
+}
+
+int ds4_tp_nhi_ready_barrier(ds4_tp *tp, char *err, size_t errlen) {
+    if (!tp || !tp->nhi_active) return tp != NULL;
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_NHI_READY, NULL, 0)) {
+        tp_set_err(err, errlen, "tp NHI ready send failed");
+        return 0;
+    }
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_NHI_READY || bytes != 0) {
+        tp_set_err(err, errlen, "tp NHI ready barrier failed");
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------------
@@ -2210,7 +2482,12 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
                                  uint32_t count) {
     const uint64_t bytes64 = sizeof(ds4_tp_token_command_header) +
                              (uint64_t)count * sizeof(int32_t);
-    if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX) return 0;
+    if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX ||
+        (type == DS4_TP_FRAME_SYNC &&
+         ((tp->local_ctx > 0 && count > tp->local_ctx) ||
+          count > DS4_TP_COMMAND_MAX_TOKENS)) ||
+        (type == DS4_TP_FRAME_VERIFY &&
+         (count == 0 || count > DS4_TP_BATCH_MAX_ROWS))) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes ? bytes : 1u);
     if (!payload) return 0;
@@ -2224,6 +2501,8 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
 }
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
+    if (!tp || ctx_size <= 0 || (uint32_t)ctx_size > tp->local_ctx ||
+        (uint32_t)ctx_size > DS4_TP_COMMAND_MAX_TOKENS) return 0;
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
@@ -2325,7 +2604,9 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count) {
     const uint64_t bytes64 = sizeof(ds4_tp_batch_command_header) +
                              (uint64_t)count * sizeof(*items);
-    if (!tp || !items || count == 0 || bytes64 > UINT32_MAX) return 0;
+    if (!tp || !items || count == 0 ||
+        count > DS4_TP_COMMAND_MAX_BATCH_ITEMS ||
+        bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes);
     if (!payload) return 0;
@@ -2346,7 +2627,11 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
     const uint64_t item_bytes = (uint64_t)count * sizeof(*items);
     const uint64_t bytes64 = sizeof(ds4_tp_mixed_command_header) +
                              prompt_bytes + item_bytes;
-    if (!tp || !prompt || prompt_count == 0 || !items || count == 0 ||
+    if (!tp || !prompt || prompt_count == 0 ||
+        prompt_count > tp->local_ctx ||
+        prompt_count > DS4_TP_COMMAND_MAX_TOKENS ||
+        !items || count == 0 ||
+        count > DS4_TP_COMMAND_MAX_BATCH_ITEMS ||
         bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes);
@@ -2395,7 +2680,12 @@ int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    if (!tp || !tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0))
+        return 0;
+    if (!tp->nhi_active) return 1;
+    uint32_t type = 0, bytes = 0;
+    return tp_read_frame_header(tp->control_fd, &type, &bytes) &&
+           type == DS4_TP_FRAME_NHI_CLOSED && bytes == 0;
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -2407,6 +2697,60 @@ void ds4_tp_command_free(ds4_tp_command *command) {
     free(command->images);
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
+}
+
+static int tp_command_frame_size_allowed(
+        const ds4_tp *tp, uint32_t type, uint32_t bytes) {
+    if (!tp) return 0;
+    /* peer_ctx is negotiated by the handshake; before that (and in the
+     * command unit tests) fall back to the absolute cap. */
+    const uint64_t ctx_tokens =
+        tp->peer_ctx > 0 && tp->peer_ctx < DS4_TP_COMMAND_MAX_TOKENS
+        ? tp->peer_ctx : DS4_TP_COMMAND_MAX_TOKENS;
+    switch (type) {
+    case DS4_TP_FRAME_SYNC:
+        return bytes >= sizeof(ds4_tp_token_command_header) &&
+            bytes <= sizeof(ds4_tp_token_command_header) +
+                     ctx_tokens * sizeof(int32_t);
+    case DS4_TP_FRAME_VERIFY:
+        return bytes >= sizeof(ds4_tp_token_command_header) + sizeof(int32_t) &&
+            bytes <= sizeof(ds4_tp_token_command_header) +
+                     (uint64_t)DS4_TP_BATCH_MAX_ROWS * sizeof(int32_t);
+    case DS4_TP_FRAME_SYNC_MULTIMODAL:
+        /* Tokens plus at most one f32 embedding row per context token;
+         * tp_command_decode_multimodal() re-checks every count against
+         * the frame length before allocating. */
+        return bytes >= sizeof(ds4_tp_multimodal_command_header) &&
+            bytes <= sizeof(ds4_tp_multimodal_command_header) +
+                     ctx_tokens * sizeof(int32_t) +
+                     ctx_tokens * (uint64_t)tp->n_embd * sizeof(float);
+    case DS4_TP_FRAME_SESSION_CREATE:
+    case DS4_TP_FRAME_REWIND:
+        return bytes == sizeof(ds4_tp_value_command);
+    case DS4_TP_FRAME_SESSION_DESTROY:
+    case DS4_TP_FRAME_INVALIDATE:
+        return bytes == sizeof(uint64_t);
+    case DS4_TP_FRAME_EVAL:
+    case DS4_TP_FRAME_GLM_MTP:
+        return bytes == sizeof(ds4_tp_eval_command);
+    case DS4_TP_FRAME_EVAL_BATCH:
+        return bytes >= sizeof(ds4_tp_batch_command_header) +
+                        sizeof(ds4_tp_batch_item) &&
+            bytes <= sizeof(ds4_tp_batch_command_header) +
+                     (uint64_t)DS4_TP_COMMAND_MAX_BATCH_ITEMS *
+                         sizeof(ds4_tp_batch_item);
+    case DS4_TP_FRAME_MIXED_BATCH:
+        return bytes >= sizeof(ds4_tp_mixed_command_header) + sizeof(int32_t) +
+                        sizeof(ds4_tp_batch_item) &&
+            bytes <= sizeof(ds4_tp_mixed_command_header) +
+                     ctx_tokens * sizeof(int32_t) +
+                     (uint64_t)DS4_TP_COMMAND_MAX_BATCH_ITEMS *
+                         sizeof(ds4_tp_batch_item);
+    case DS4_TP_FRAME_STOP:
+        return bytes == 0;
+    default:
+        return 0;
+    }
 }
 
 static int tp_command_decode_tokens(ds4_tp_command *command,
@@ -2509,16 +2853,28 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
-        tp_set_err(err, errlen, "tp: control channel closed");
+    if (!tp_read_frame_header_stoppable(tp->control_fd, &ftype, &bytes)) {
+        tp_set_err(err, errlen, "tp: %s",
+                   ds4_tp_stop_requested() ? "shutdown requested" :
+                       "control channel closed");
+        return 0;
+    }
+    if (!tp_command_frame_size_allowed(tp, ftype, bytes)) {
+        ds4_tp_mark_failed(tp);
+        shutdown(tp->control_fd, SHUT_RDWR);
+        tp_set_err(err, errlen,
+                   "tp: invalid or oversized command frame type %u (%u bytes)",
+                   ftype, bytes);
         return 0;
     }
     uint8_t *payload = NULL;
     if (bytes != 0) {
         payload = malloc(bytes);
-        if (!payload || !tp_read_full(tp->control_fd, payload, bytes)) {
+        if (!payload || !tp_read_full_stoppable(tp->control_fd, payload, bytes)) {
             free(payload);
-            tp_set_err(err, errlen, "tp: truncated command frame");
+            tp_set_err(err, errlen, "tp: %s",
+                       ds4_tp_stop_requested() ? "shutdown requested" :
+                           "truncated command frame");
             return 0;
         }
     }
@@ -2568,7 +2924,8 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         memcpy(&h, payload, sizeof(h));
         const uint64_t want = sizeof(h) +
                               (uint64_t)h.count * sizeof(ds4_tp_batch_item);
-        if (h.count == 0 || want != bytes) { ok = 0; break; }
+        if (h.count == 0 || h.count > DS4_TP_COMMAND_MAX_BATCH_ITEMS ||
+            want != bytes) { ok = 0; break; }
         command->items = malloc((size_t)h.count * sizeof(*command->items));
         if (!command->items) { ok = -1; break; }
         memcpy(command->items, payload + sizeof(h),
@@ -2585,7 +2942,10 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         const uint64_t item_bytes =
             (uint64_t)h.item_count * sizeof(ds4_tp_batch_item);
         const uint64_t want = sizeof(h) + token_bytes + item_bytes;
-        if (h.prompt_count == 0 || h.item_count == 0 || want != bytes) {
+        if (h.prompt_count == 0 ||
+            (tp->peer_ctx > 0 && h.prompt_count > tp->peer_ctx) ||
+            h.item_count == 0 ||
+            h.item_count > DS4_TP_COMMAND_MAX_BATCH_ITEMS || want != bytes) {
             ok = 0;
             break;
         }
@@ -2779,6 +3139,11 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
 
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, sizeof(err))) {
+        if (ds4_tp_stop_requested()) {
+            ds4_log(stderr, DS4_LOG_DEFAULT,
+                    "tp worker: shutdown requested before leader connect");
+            return 0;
+        }
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: %s", err);
         return 1;
     }
@@ -2793,22 +3158,31 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         malloc((size_t)vocab * sizeof(*logits)) : NULL;
     if (ds4_engine_tp_vocab_split(engine) && !logits) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: logits buffer allocation failed");
+        ds4_engine_tp_unbind(engine);
         ds4_tp_free(tp);
         return 1;
     }
     ds4_log(stderr, DS4_LOG_OK, "tp worker ready for mirrored sessions");
 
     int rc = 0;
+    bool normal_stop = false;
     ds4_tokens prompt = {0};
     while (1) {
         ds4_tp_command command;
         if (!ds4_tp_recv_command(tp, &command, err, sizeof(err))) {
+            if (ds4_tp_stop_requested()) {
+                ds4_log(stderr, DS4_LOG_DEFAULT,
+                        "tp worker: shutdown requested");
+                normal_stop = true;
+                break;
+            }
             ds4_log(stderr, DS4_LOG_ERROR, "tp worker: %s", err);
             rc = 1;
             break;
         }
         if (command.type == DS4_TP_FRAME_STOP) {
             ds4_log(stderr, DS4_LOG_DEFAULT, "tp worker: leader finished");
+            normal_stop = true;
             ds4_tp_command_free(&command);
             break;
         }
@@ -2965,6 +3339,13 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     free(sessions.v);
     free(logits);
+    /* NHI teardown is receiver-last: worker quiesces and closes its GPU
+     * data plane while the leader keeps its device open, then acknowledges
+     * over the still-live TCP control channel. */
+    ds4_engine_tp_unbind(engine);
+    if (normal_stop && ds4_tp_is_nhi(tp) &&
+        !tp_send_frame(tp->control_fd, DS4_TP_FRAME_NHI_CLOSED, NULL, 0))
+        rc = 1;
     ds4_tp_free(tp);
     return rc;
 }

@@ -7,6 +7,8 @@
 
 bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
+bool ds4_test_frontier_rewind_api_null(void);
+bool ds4_test_frontier_rewind_exactness(ds4_engine *engine, const ds4_tokens *prompt);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -6783,6 +6785,34 @@ static void test_dspark_verify_depth(void) {
     ds4_engine_close(engine);
     test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
 }
+
+static void test_frontier_rewind_api_null(void) {
+    TEST_ASSERT(ds4_test_frontier_rewind_api_null());
+}
+
+/* Model-backed exactness: needs a DeepSeek GPU engine (the default DS4_TEST_MODEL).
+ * Skips silently when the engine cannot be opened or the backend is CPU/GLM
+ * (ds4_test_frontier_rewind_exactness itself returns false in that case, which
+ * we distinguish from a real failure by checking the capability here). */
+static void test_frontier_rewind_exactness(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    if (!ds4_engine_supports_frontier_rewind(engine)) {
+        fprintf(stderr, "ds4-test: frontier-rewind-exactness skipped (not a DeepSeek GPU engine)\n");
+        return;
+    }
+
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user",
+                            "Count from one to thirty, one number per line.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len >= 2);
+    if (prompt.len >= 2) {
+        TEST_ASSERT(ds4_test_frontier_rewind_exactness(engine, &prompt));
+    }
+    ds4_tokens_free(&prompt);
+}
 #endif
 
 static void test_server_unit_group(void) {
@@ -6814,6 +6844,8 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
+    {"--frontier-rewind-api-null", "frontier-rewind-api-null", "frontier rewind API guards (NULL/CPU/GLM) are model-free and safe", test_frontier_rewind_api_null},
+    {"--frontier-rewind-exactness", "frontier-rewind-exactness", "DeepSeek strict-prefix rewind reproduces the fresh-session continuation", test_frontier_rewind_exactness},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

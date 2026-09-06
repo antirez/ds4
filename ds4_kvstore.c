@@ -1,5 +1,11 @@
 #include "ds4_kvstore.h"
 
+static ds4_kvstore_metrics_fn g_kvstore_metrics_fn;
+
+void ds4_kvstore_set_metrics_fn(ds4_kvstore_metrics_fn fn) {
+    g_kvstore_metrics_fn = fn;
+}
+
 /* Shared disk KV checkpoint file support.
  *
  * The low-level file layout and payload helpers are intentionally shared.  The
@@ -1136,6 +1142,13 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         }
         unlink(tmp);
     } else {
+        if (g_kvstore_metrics_fn) {
+            g_kvstore_metrics_fn(
+                store_tokens.len,
+                original_len - store_tokens.len,
+                (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len +
+                         payload_bytes + trailer_bytes) / (1024.0 * 1024.0));
+        }
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
                 kv_log_name(kc),

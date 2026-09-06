@@ -204,6 +204,70 @@ __global__ static void attention_prefill_raw_kernel(
     }
 }
 
+/* Row-range variant of attention_prefill_raw_kernel used by TP attention row
+ * splitting.  blockIdx.x is the query row local to this rank's slice; the
+ * absolute token position is q_row0 + blockIdx.x, which drives the causal /
+ * window bounds and the raw_kv row addressing.  q and heads are already
+ * row-range views, so they are indexed by the local row.  Arithmetic is
+ * identical to the full-batch kernel. */
+__global__ static void attention_prefill_raw_range_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t q_row0,
+        uint32_t n_q,
+        uint32_t window,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    uint32_t i = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    if (i >= n_q || h >= n_head) return;
+    uint32_t t = q_row0 + i;
+    uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+    uint32_t raw_start = t + 1u - raw_count;
+    const float *qh = q + ((uint64_t)i * n_head + h) * head_dim;
+    __shared__ float scores[256];
+    __shared__ float partial[128];
+    __shared__ float max_s;
+    __shared__ float denom;
+    float scale = rsqrtf((float)head_dim);
+    float local_max = sinks[h];
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+        scores[r] = dot * scale;
+        local_max = fmaxf(local_max, scores[r]);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float den = expf(sinks[h] - max_s);
+        for (uint32_t r = 0; r < raw_count; r++) {
+            scores[r] = expf(scores[r] - max_s);
+            den += scores[r];
+        }
+        denom = den;
+    }
+    __syncthreads();
+    float *oh = heads + ((uint64_t)i * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
+        }
+        oh[d] = acc / denom;
+    }
+}
+
 __global__ static void attention_prefill_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -276,6 +340,92 @@ __global__ static void attention_prefill_mixed_kernel(
     if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
     __syncthreads();
     float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
+        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        oh[d] = acc / denom;
+    }
+}
+
+/* Row-range variant of attention_prefill_mixed_kernel used by TP attention
+ * row splitting.  blockIdx.x is the query row local to this rank's slice; the
+ * absolute token position t = q_row0 + local row drives the causal/window
+ * bounds, the raw_kv row addressing and the compressed-row visibility
+ * (visible_comp = (t + 1) / ratio).  q and heads are row-range views indexed
+ * by the local row; raw_kv holds all n_tokens rows and comp_kv all n_comp
+ * rows.  The static-mixed path never uses a comp mask, so this kernel omits
+ * it; arithmetic is otherwise identical to the full-batch kernel. */
+__global__ static void attention_prefill_mixed_range_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t q_row0,
+        uint32_t n_q,
+        uint32_t n_tokens,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    uint32_t i = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    if (i >= n_q || h >= n_head) return;
+    const uint32_t t = q_row0 + i;
+    if (t >= n_tokens) return;
+    const float *qh = q + ((uint64_t)i * n_head + h) * head_dim;
+    uint32_t raw_start = (window != 0 && t + 1u > window) ? t + 1u - window : 0u;
+    uint32_t raw_count = t + 1u - raw_start;
+    uint32_t visible_comp = (t + 1u) / ratio;
+    if (visible_comp > n_comp) visible_comp = n_comp;
+    __shared__ float scores[DS4_ROCM_ATTENTION_PREFILL_MIXED_SCORE_CAP];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    float scale = rsqrtf((float)head_dim);
+    float local_max = sinks[h];
+    uint32_t n_score = raw_count + visible_comp;
+    if (n_score > DS4_ROCM_ATTENTION_PREFILL_MIXED_SCORE_CAP) return;
+
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        const float *kvrow = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+        scores[r] = dot * scale;
+        local_max = fmaxf(local_max, scores[r]);
+    }
+    for (uint32_t c = threadIdx.x; c < visible_comp; c += blockDim.x) {
+        const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+        const float s = dot * scale;
+        scores[raw_count + c] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t s = threadIdx.x; s < n_score; s += blockDim.x) {
+        scores[s] = expf(scores[s] - max_s);
+        den_local += scores[s];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + expf(sinks[h] - max_s);
+    __syncthreads();
+    float *oh = heads + ((uint64_t)i * n_head + h) * head_dim;
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
@@ -1766,6 +1916,124 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     }
     if (valid_head) {
         float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        out4[lane +  0u] = o0;
+        out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2;
+        out4[lane + 96u] = o3;
+    }
+}
+
+/* Row-range variant of the heads8 online raw-attention kernel used by TP
+ * attention row splitting.  blockIdx.x is the query row local to this rank's
+ * slice; the absolute token position q_row0 + blockIdx.x drives the causal /
+ * window bounds and the raw_kv row addressing.  q and heads are row-range
+ * views indexed by the local row.  Raw-only (no compressed rows), matching the
+ * full-batch raw path that calls the static-mixed kernel with n_comp == 0.
+ * Arithmetic is identical to attention_static_mixed_heads8_online_kernel. */
+__global__ static void attention_prefill_raw_heads8_online_range_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t q_row0,
+        uint32_t n_q,
+        uint32_t window,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    uint32_t i = blockIdx.x;
+    uint32_t head_group = blockIdx.y;
+    if (i >= n_q || head_dim != 512u) return;
+    const uint32_t t = q_row0 + i;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * 8u + warp;
+    const bool valid_head = head < n_head;
+
+    __shared__ float4 kv_shared[4 * 128];
+
+    const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
+    const uint32_t raw_start = t + 1u - raw_count;
+    const uint32_t n_score = raw_count;
+    const float scale = rsqrtf((float)head_dim);
+
+    __shared__ float scores[8 * 768];
+    if (n_score > 768u) return;
+
+    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
+        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = row0 + rr;
+            const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+        if (valid_head) {
+            const float *qh = q + ((uint64_t)i * n_head + head) * head_dim;
+            const float *kvf = (const float *)kv_shared;
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                float dot = 0.0f;
+#pragma unroll 16
+                for (uint32_t d = lane; d < 512u; d += 32u) dot += qh[d] * kvf[(uint64_t)rr * 512u + d];
+                dot = warp_sum_f32(dot);
+                if (lane == 0u) scores[warp * 768u + row0 + rr] = dot * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    float max_s = valid_head ? sinks[head] : -INFINITY;
+    if (valid_head) {
+        const float *score_row = scores + warp * 768u;
+        for (uint32_t k = lane; k < n_score; k += 32u) max_s = fmaxf(max_s, score_row[k]);
+        max_s = warp_max_f32(max_s);
+        max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0);
+    }
+    float den = 0.0f;
+    if (valid_head) {
+        float *score_row = scores + warp * 768u;
+        for (uint32_t k = lane; k < n_score; k += 32u) {
+            float p = expf(score_row[k] - max_s);
+            score_row[k] = p;
+            den += p;
+        }
+        den = warp_sum_f32(den);
+        den += expf(sinks[head] - max_s);
+        den = __shfl_sync(FULL_WARP_MASK, den, 0);
+    }
+
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
+        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = row0 + rr;
+            const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+        if (valid_head) {
+            const float *score_row = scores + warp * 768u;
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const float p = den == 0.0f ? 0.0f : score_row[row0 + rr] / den;
+                const float4 *kv4 = kv_shared + rr * 128u;
+                float4 k0 = kv4[lane +  0u];
+                float4 k1 = kv4[lane + 32u];
+                float4 k2 = kv4[lane + 64u];
+                float4 k3 = kv4[lane + 96u];
+                o0.x += k0.x * p; o0.y += k0.y * p; o0.z += k0.z * p; o0.w += k0.w * p;
+                o1.x += k1.x * p; o1.y += k1.y * p; o1.z += k1.z * p; o1.w += k1.w * p;
+                o2.x += k2.x * p; o2.y += k2.y * p; o2.z += k2.z * p; o2.w += k2.w * p;
+                o3.x += k3.x * p; o3.y += k3.y * p; o3.z += k3.z * p; o3.w += k3.w * p;
+            }
+        }
+        __syncthreads();
+    }
+    if (valid_head) {
+        float4 *out4 = (float4 *)(heads + ((uint64_t)i * n_head + head) * head_dim);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;

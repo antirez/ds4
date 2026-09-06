@@ -15,13 +15,14 @@
  * mirrors every ds4_session_sync()/ds4_session_eval() call to rank 1 (worker)
  * over a TCP control socket, so both engines execute the identical graph
  * sequence.
- * Inside each decoded token, partial block outputs are exchanged through a
- * registered memory slab: two-sided RDMA SEND/RECV when RDMA over
- * Thunderbolt is available, or a full-duplex TCP exchange as fallback.
+ * Inside each decoded token, partial block outputs use either the legacy
+ * registered slab (two-sided RDMA or full-duplex TCP) or ROCm's imported NHI
+ * TX/RX pools with in-band GPU stamps.  TCP remains the control plane for
+ * rank/model negotiation, mirrored commands, startup, and ordered teardown.
  *
- * Layering: ds4.c calls the session-mirroring and slab entry points;
- * ds4_metal.m only ever sees ds4_tp_gate_exchange() through a callback
- * registered with the GPU gate machinery.  Nothing here touches tensors.
+ * Layering: ds4.c owns GPU tensors and the NHI data-plane handle; ds4_tp.c
+ * owns only the backend-independent lockstep/control protocol and legacy slab
+ * transports.
  */
 
 typedef struct ds4_tp ds4_tp;
@@ -32,6 +33,8 @@ enum {
     DS4_TP_GATES_PER_LAYER = 2,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
+    DS4_TP_NHI_MSG_FRAMES = 64,
+    DS4_TP_NHI_DEFAULT_RING_FRAMES = 4096,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -92,7 +95,12 @@ int ds4_tp_validate_engine_options(
 
 /* Connection bring-up.  The leader listens and accepts one worker; the
  * worker dials with retry.  Both then exchange and validate identities.
- * Blocking; call after the engine is loaded (identity needs the shape). */
+ * Blocking; call after the engine is loaded (identity needs the shape).
+ * Frontends with a SIGINT/SIGTERM handler should call ds4_tp_request_stop()
+ * so these waits and the worker's blocking control read exit promptly. */
+void ds4_tp_request_stop(void);
+bool ds4_tp_stop_requested(void);
+void ds4_tp_clear_stop_request(void);
 int ds4_tp_create(
         ds4_tp **out,
         const ds4_tp_options *opt,
@@ -103,6 +111,9 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+bool ds4_tp_is_nhi(const ds4_tp *tp);
+const char *ds4_tp_nhi_device(const ds4_tp *tp);
+uint32_t ds4_tp_nhi_ring_frames(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
@@ -178,6 +189,9 @@ int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
 int ds4_tp_send_stop(ds4_tp *tp);
+/* Bind-time barrier: both NHI devices are imported+enabled and both GPU gate
+ * services are installed before either rank may issue the first SUBMIT_TX. */
+int ds4_tp_nhi_ready_barrier(ds4_tp *tp, char *err, size_t errlen);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
  * DS4_TP_FRAME_SYNC the token array is returned in *tokens / *n_tokens
@@ -205,6 +219,10 @@ typedef enum {
     DS4_TP_FRAME_RDMA_WARM = 19,
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
+    /* Renumbered above upstream's GLM_MTP (=21): the NHI handshake
+     * frames are only ever exchanged between paired builds of this branch. */
+    DS4_TP_FRAME_NHI_READY = 22,
+    DS4_TP_FRAME_NHI_CLOSED = 23,
 } ds4_tp_frame_type;
 
 typedef struct {
