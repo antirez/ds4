@@ -3286,13 +3286,6 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
 
-static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
-        const chat_msgs *msgs, int start,
-        ds4_think_mode think_mode) {
-    return render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
-                                            msgs, start, NULL, think_mode);
-}
-
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);

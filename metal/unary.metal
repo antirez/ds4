@@ -191,7 +191,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SIGMOID) {
-            dst_ptr[i0] = (T) (1 / (1 + exp(-x)));
+            dst_ptr[i0] = (T) ds4_sigmoid_stable(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_GELU) {
@@ -207,7 +207,7 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SILU) {
-            dst_ptr[i0] = (T) (x / (1 + exp(-x)));
+            dst_ptr[i0] = (T) ds4_silu(x);
         }
 
         if (FC_OP == OP_UNARY_NUM_ELU) {

@@ -109,12 +109,10 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
-#include <stdlib.h>
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <unistd.h>
 #include <stdint.h>
 #include "linenoise.h"
 
@@ -122,7 +120,6 @@
 #define LINENOISE_MAX_LINE (1024*1024)      // That will get dynamically allocated
 #define LINENOISE_INITIAL_BUFLEN 4096
 #define PASTE_FOLD_THRESHOLD 200            // Min bytes to fold a single-line paste.
-#define PASTE_FOLD_CONTEXT 8                // Context chars kept around generic folds.
 #define HISTORY_FOLD_THRESHOLD 4096         // Min bytes to fold single-line history.
 #define HISTORY_FOLD_MULTILINE_LINES 16     // Min lines to fold shorter history.
 #define HISTORY_FOLD_CONTEXT 96             // Context chars kept around history folds.
@@ -486,14 +483,12 @@ static int utf8SingleCharWidth(const char *s, size_t len) {
 }
 
 enum KEY_ACTION{
-	KEY_NULL = 0,	    /* NULL */
 	CTRL_A = 1,         /* Ctrl+a */
 	CTRL_B = 2,         /* Ctrl-b */
 	CTRL_C = 3,         /* Ctrl-c */
 	CTRL_D = 4,         /* Ctrl-d */
 	CTRL_E = 5,         /* Ctrl-e */
 	CTRL_F = 6,         /* Ctrl-f */
-	CTRL_H = 8,         /* Ctrl-h */
 	TAB = 9,            /* Tab */
 	CTRL_K = 11,        /* Ctrl+k */
 	CTRL_L = 12,        /* Ctrl+l */
@@ -514,24 +509,7 @@ int linenoiseHistoryAdd(const char *line);
 #define REFRESH_ALL (REFRESH_CLEAN|REFRESH_WRITE) // Do both.
 static void refreshLine(struct linenoiseState *l);
 
-/* Debugging macro. */
-#if 0
-FILE *lndebug_fp = NULL;
-#define lndebug(...) \
-    do { \
-        if (lndebug_fp == NULL) { \
-            lndebug_fp = fopen("/tmp/lndebug.txt","a"); \
-            fprintf(lndebug_fp, \
-            "[%d %d %d] p: %d, rows: %d, rpos: %d, max: %d, oldmax: %d\n", \
-            (int)l->len,(int)l->pos,(int)l->oldpos,plen,rows,rpos, \
-            (int)l->oldrows,old_rows); \
-        } \
-        fprintf(lndebug_fp, ", " __VA_ARGS__); \
-        fflush(lndebug_fp); \
-    } while (0)
-#else
 #define lndebug(fmt, ...)
-#endif
 
 /* ======================= Low level terminal handling ====================== */
 

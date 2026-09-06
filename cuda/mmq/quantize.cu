@@ -366,6 +366,77 @@ static __global__ void quantize_mmq_q8_1(
     }
 }
 
+#if !defined(GGML_USE_HIP)
+// Q4 grouped attention-A has one hot, fixed source geometry:
+// [token][group=8][K=4096].  The generic MMQ quantizer launches four-warp
+// CTAs, each producing four 128-value block_q8_1_mmq records.  This kernel
+// keeps the exact DS4 arithmetic and byte layout, but uses eight warps and
+// lets each warp produce two consecutive records.  One CTA therefore covers
+// 2048 source values and the launch uses four times fewer CTAs, without the
+// 16-warp geometry that regressed on GB10.
+__launch_bounds__(8*WARP_SIZE)
+static __global__ void quantize_mmq_q8_1_q4_grouped_k4096_g8x2(
+        const float * __restrict__ x, void * __restrict__ vy, const int ne1) {
+    constexpr int k_groups = 8;
+    constexpr int k_values = 4096;
+    constexpr int k_q8_blocks = k_values / (4*QK8_1);
+    constexpr int k_warps = 8;
+    constexpr int k_blocks_per_warp = 2;
+    constexpr int k_blocks_per_cta = k_warps * k_blocks_per_warp;
+    static_assert(WARP_SIZE == 32, "CUDA Q8_1 quantizer requires 32-lane warps");
+    static_assert(k_q8_blocks == 32, "unexpected grouped Q8_1 block count");
+    static_assert(2*k_blocks_per_cta == k_q8_blocks,
+                  "two CTAs must cover one grouped activation row");
+
+    const int token = (int)blockIdx.x;
+    const int group = (int)blockIdx.z;
+    const int warp = (int)threadIdx.x / WARP_SIZE;
+    const int lane = (int)threadIdx.x % WARP_SIZE;
+    const uint32_t input_base =
+        ((uint32_t)token * k_groups + (uint32_t)group) * k_values;
+    const float4 * __restrict__ x4 = (const float4 *)x;
+    block_q8_1_mmq * __restrict__ y = (block_q8_1_mmq *)vy;
+
+#pragma unroll
+    for (int j = 0; j < k_blocks_per_warp; ++j) {
+        const int q8_block =
+            (int)blockIdx.y * k_blocks_per_cta + j * k_warps + warp;
+        const uint32_t input = input_base +
+            (uint32_t)q8_block * (4*QK8_1) + (uint32_t)lane * 4u;
+        const float4 xi = x4[input / 4u];
+
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            amax = fmaxf(
+                amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        }
+
+        float sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+
+        const float d_inv = 127.0f / amax;
+        char4 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+
+        const int ib = (group*k_q8_blocks + q8_block)*ne1 + token;
+        ((char4 *)y[ib].qs)[lane] = q;
+        if ((lane % 8) == 0) {
+            y[ib].ds4[lane / 8] = make_half2(1.0f / d_inv, sum);
+        }
+    }
+}
+#endif
+
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -411,6 +482,22 @@ void quantize_mmq_q8_1_cuda(
             break;
     }
 }
+
+#if !defined(GGML_USE_HIP)
+void quantize_mmq_q8_1_q4_grouped_k4096_g8x2_cuda(
+        const float * x, void * vy, int ne1, cudaStream_t stream) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(vy);
+    GGML_ASSERT(ne1 > 0 && ne1 <= INT32_MAX / (8*4096));
+
+    constexpr int k_warps = 8;
+    constexpr int k_grid_y = 2;
+    const dim3 num_blocks(ne1, k_grid_y, 8);
+    const dim3 block_size(k_warps*WARP_SIZE, 1, 1);
+    quantize_mmq_q8_1_q4_grouped_k4096_g8x2<<<
+        num_blocks, block_size, 0, stream>>>(x, vy, ne1);
+}
+#endif
 
 void quantize_mmq_fp4_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,

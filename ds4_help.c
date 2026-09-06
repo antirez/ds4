@@ -172,7 +172,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots; NGB also reserves two full prefill layers. Either may be reduced to fit the model, graph, context, and backend working set.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots without the two-layer reserve; NGB is an accounted routed budget that includes it. Either may be reduced by the final memory check. Metal SSD+DSpark can A/B a support-aware pre-cap with DS4_METAL_DSPARK_SAFE_EXPERT_COUNT=1. Auto: 80% working set minus fixed weights.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");

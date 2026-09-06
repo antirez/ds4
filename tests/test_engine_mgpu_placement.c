@@ -39,6 +39,29 @@ int ds4_test_classify_multi_tier(const ds4_test_fake_tensor *tensors,
                                   int *out_multi_tier,
                                   int *out_n_entries);
 int ds4_test_tensor_to_entry(const char *name, int name_len);
+int ds4_test_dspark_runtime_policy(ds4_backend backend,
+                                   ds4_distributed_role distributed_role);
+bool ds4_test_streaming_manual_cache_cap_count(
+        uint32_t requested_count,
+        uint64_t per_expert_bytes,
+        uint64_t safe_cache_bytes,
+        uint32_t *effective_count_out,
+        uint64_t *requested_bytes_out,
+        uint64_t *effective_bytes_out);
+bool ds4_test_streaming_manual_cache_count_cap_enabled(void);
+bool ds4_test_streaming_manual_cache_count_cap_eligible(
+        ds4_backend backend,
+        bool ssd_streaming,
+        bool dspark_enabled,
+        bool support_is_dspark,
+        uint32_t cache_experts,
+        uint64_t cache_bytes);
+uint64_t ds4_test_streaming_dspark_active_support_reserve_bytes(
+        uint64_t support_model_bytes);
+uint32_t ds4_test_streaming_manual_cache_nonfatal_effective_count(
+        uint32_t requested_count,
+        bool safe_cache_known,
+        uint32_t candidate_count);
 
 /* Ctx-aware variants and calibration helpers. Declared here (not in
  * ds4.h) matching the existing DS4_TEST_HOOKS pattern. */
@@ -182,6 +205,25 @@ static void test_null_config(void) {
     CHECK(rc == 0, "NULL cfg returns success");
     CHECK(multi_tier == 0, "NULL cfg -> multi_tier 0");
     CHECK(n_entries == 0, "NULL cfg -> n_entries 0");
+}
+
+static void test_dspark_runtime_policy(void) {
+    fprintf(stderr, "RUN: test_dspark_runtime_policy\n");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_METAL,
+                                        DS4_DISTRIBUTED_NONE) == 0,
+          "DSpark supports a local Metal graph backend");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CUDA,
+                                        DS4_DISTRIBUTED_NONE) == 0,
+          "DSpark supports a local CUDA/ROCm graph backend");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CPU,
+                                        DS4_DISTRIBUTED_NONE) != 0,
+          "DSpark rejects the CPU backend");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CUDA,
+                                        DS4_DISTRIBUTED_COORDINATOR) != 0,
+          "DSpark rejects a distributed coordinator");
+    CHECK(ds4_test_dspark_runtime_policy(DS4_BACKEND_CUDA,
+                                        DS4_DISTRIBUTED_WORKER) != 0,
+          "DSpark rejects a distributed worker");
 }
 
 /* Build a synthetic, model-shaped tensor list: 1 embedding + 43 layers
@@ -582,6 +624,113 @@ static void test_glm_memory_guard_budget(void) {
     restore_env_value("DS4_GLM_MEMORY_GUARD", old_guard);
 }
 
+static void test_streaming_manual_cache_count_cap(void) {
+    fprintf(stderr, "RUN: test_streaming_manual_cache_count_cap\n");
+    const uint64_t mib = 1024ull * 1024ull;
+    const uint64_t per_expert = 7ull * mib;
+    uint32_t count = UINT32_MAX;
+    uint64_t requested = UINT64_MAX;
+    uint64_t effective = UINT64_MAX;
+
+    CHECK(ds4_test_streaming_manual_cache_cap_count(
+                  100, per_expert, 100ull * per_expert,
+                  &count, &requested, &effective),
+          "numeric cache count converts to bytes without a cap");
+    CHECK(count == 100, "safe numeric cache count is preserved");
+    CHECK(requested == 100ull * per_expert,
+          "numeric request byte conversion is exact");
+    CHECK(effective == requested,
+          "uncapped effective bytes equal requested bytes");
+
+    CHECK(ds4_test_streaming_manual_cache_cap_count(
+                  100, per_expert, 15ull * per_expert + per_expert / 2ull,
+                  &count, &requested, &effective),
+          "numeric cache count accepts a fractional-slot byte limit");
+    CHECK(count == 15, "safe byte limit rounds down to whole expert slots");
+    CHECK(effective == 15ull * per_expert,
+          "capped count converts back to exact bytes");
+
+    CHECK(ds4_test_streaming_manual_cache_cap_count(
+                  3, per_expert, per_expert - 1ull,
+                  &count, &requested, &effective),
+          "sub-slot safe limit is represented without overflow");
+    CHECK(count == 0 && effective == 0,
+          "sub-slot safe limit never forces one unsafe expert");
+
+    count = 123;
+    requested = 456;
+    effective = 789;
+    CHECK(!ds4_test_streaming_manual_cache_cap_count(
+                   UINT32_MAX, UINT64_MAX, UINT64_MAX,
+                   &count, &requested, &effective),
+          "numeric request multiplication overflow is rejected");
+    CHECK(count == 0 && requested == 0 && effective == 0,
+          "overflow failure clears all conversion outputs");
+
+    const char *env = "DS4_METAL_DSPARK_SAFE_EXPERT_COUNT";
+    char *saved = save_env_value(env);
+    unsetenv(env);
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_enabled(),
+          "numeric cache safety cap is disabled by default during A/B");
+    setenv(env, "0", 1);
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_enabled(),
+          "zero does not enable the numeric cache safety cap");
+    setenv(env, "true", 1);
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_enabled(),
+          "ambiguous truthy text does not enable the safety cap");
+    setenv(env, "1", 1);
+    CHECK(ds4_test_streaming_manual_cache_count_cap_enabled(),
+          "the documented exact value 1 enables the safety cap");
+    restore_env_value(env, saved);
+
+    CHECK(ds4_test_streaming_manual_cache_count_cap_eligible(
+                  DS4_BACKEND_METAL, true, true, true, 1032, 0),
+          "Metal SSD+DSpark numeric count is eligible for the opt-in cap");
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_eligible(
+                   DS4_BACKEND_CUDA, true, true, true, 1032, 0),
+          "CUDA numeric count is not eligible");
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_eligible(
+                   DS4_BACKEND_METAL, false, true, true, 1032, 0),
+          "non-streaming Metal is not eligible");
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_eligible(
+                   DS4_BACKEND_METAL, true, false, true, 1032, 0),
+          "Metal support model without --dspark is not eligible");
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_eligible(
+                   DS4_BACKEND_METAL, true, true, false, 1032, 0),
+          "non-DSpark support model is not eligible");
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_eligible(
+                   DS4_BACKEND_METAL, true, true, true, 0, 0),
+          "automatic cache selection is not a numeric-count request");
+    CHECK(!ds4_test_streaming_manual_cache_count_cap_eligible(
+                   DS4_BACKEND_METAL, true, true, true, 0, 32ull << 30),
+          "NGB cache budget is not eligible");
+
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    CHECK(ds4_test_streaming_dspark_active_support_reserve_bytes(0) == 0,
+          "absent support mapping reserves zero bytes");
+    CHECK(ds4_test_streaming_dspark_active_support_reserve_bytes(gib) == gib,
+          "small support mapping is reserved in full");
+    CHECK(ds4_test_streaming_dspark_active_support_reserve_bytes(2ull * gib) ==
+                  2ull * gib,
+          "support reserve includes the exact 2 GiB boundary");
+    CHECK(ds4_test_streaming_dspark_active_support_reserve_bytes(6ull * gib) ==
+                  2ull * gib,
+          "large mmap-backed support model is limited to 2 GiB active reserve");
+
+    CHECK(ds4_test_streaming_manual_cache_nonfatal_effective_count(
+                  1032, true, 341) == 341,
+          "measured non-zero candidate may cap a numeric request");
+    CHECK(ds4_test_streaming_manual_cache_nonfatal_effective_count(
+                  1032, false, 341) == 1032,
+          "unknown safe budget preserves the explicit request");
+    CHECK(ds4_test_streaming_manual_cache_nonfatal_effective_count(
+                  1032, true, 0) == 1032,
+          "sub-slot safe budget remains non-fatal");
+    CHECK(ds4_test_streaming_manual_cache_nonfatal_effective_count(
+                  100, true, 200) == 100,
+          "policy never grows an explicit numeric request");
+}
+
 static void test_cuda_tp_prefill_default_accounting(void) {
     fprintf(stderr, "RUN: test_cuda_tp_prefill_default_accounting\n");
 
@@ -706,6 +855,7 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
+    test_dspark_runtime_policy();
     test_forced_two_tier_no_spill();
     test_cpu_spill();
     test_zero_budget_guard();
@@ -715,6 +865,7 @@ int main(void) {
     test_glm_per_layer_cache_accounting();
     test_glm_session_count_accounting();
     test_glm_memory_guard_budget();
+    test_streaming_manual_cache_count_cap();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
 

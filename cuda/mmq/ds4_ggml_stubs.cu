@@ -7,6 +7,7 @@
 // CUDA uses stream-ordered allocation. HIP retains stream-local allocations
 // because returning live MMQ scratch to its asynchronous pool is unreliable.
 
+#include "ds4_mmq.h"
 #include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
 #if defined(GGML_USE_HIP)
@@ -23,6 +24,20 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+
+/* Standalone MMQ tests do not link ds4_cuda.cu.  Full ds4 links its strong,
+ * stream-aware registry implementation over this fail-closed weak miss. */
+#if defined(__GNUC__)
+extern "C" __attribute__((weak)) int ds4_cuda_q8_fold_take_q81(
+        const void *src, uint64_t in_dim, cudaStream_t stream,
+        const void **q81) {
+    (void)src;
+    (void)in_dim;
+    (void)stream;
+    if (q81) *q81 = nullptr;
+    return 0;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // Device info singleton.
@@ -132,10 +147,6 @@ static thread_local cudaStream_t t_ds4_pool_stream = cudaStreamPerThread;
 
 extern "C" void ds4_pool_set_stream(cudaStream_t stream) {
     t_ds4_pool_stream = stream;
-}
-
-extern "C" cudaStream_t ds4_pool_get_stream(void) {
-    return t_ds4_pool_stream;
 }
 
 namespace {

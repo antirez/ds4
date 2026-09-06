@@ -1,4 +1,192 @@
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+
+/* The gfx1151 WMMA attention kernels deliberately stay behind per-path
+ * opt-ins until their approximate-F16 arithmetic has a wider prompt oracle.
+ * The common rollback wins over both opt-ins.  Environment values are read on
+ * every call so an in-process A/B harness can switch arms without rebuilding
+ * or reinitializing the backend. */
+static const char *const DS4_ROCM_GFX1151_WMMA_RING_ENABLE_ENV =
+    "DS4_ROCM_ENABLE_GFX1151_PREFILL_WMMA_RING";
+static const char *const DS4_ROCM_GFX1151_WMMA_INDEXED_ENABLE_ENV =
+    "DS4_ROCM_ENABLE_GFX1151_PREFILL_WMMA_INDEXED";
+static const char *const DS4_ROCM_GFX1151_WMMA_DISABLE_ENV =
+    "DS4_ROCM_DISABLE_GFX1151_PREFILL_WMMA_ATTN";
+
+enum {
+    DS4_ROCM_ATTN_ENV_UNSET = -1,
+    DS4_ROCM_ATTN_ENV_INVALID = -2,
+};
+
+static pthread_mutex_t g_rocm_attention_wmma_notice_mu =
+    PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_rocm_attention_wmma_notice_mask;
+
+static int rocm_attention_wmma_notice_once(uint32_t bit) {
+    pthread_mutex_lock(&g_rocm_attention_wmma_notice_mu);
+    const int report = (g_rocm_attention_wmma_notice_mask & bit) == 0u;
+    g_rocm_attention_wmma_notice_mask |= bit;
+    pthread_mutex_unlock(&g_rocm_attention_wmma_notice_mu);
+    return report;
+}
+
+static int rocm_attention_env_value_eq(
+        const char *value, size_t value_len, const char *literal) {
+    const size_t literal_len = strlen(literal);
+    if (value_len != literal_len) return 0;
+    for (size_t i = 0; i < value_len; i++) {
+        if (tolower((unsigned char)value[i]) !=
+            tolower((unsigned char)literal[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Return -1 for unset, 0/1 for recognized booleans, and -2 for invalid.
+ * Empty is an explicit presence opt-in; conventional false spellings remain
+ * safe and invalid values fail closed. */
+static int rocm_attention_env_bool_value(
+        const char *name, uint32_t invalid_notice_bit) {
+    const char *value = name ? getenv(name) : NULL;
+    if (!value) return DS4_ROCM_ATTN_ENV_UNSET;
+    while (isspace((unsigned char)*value)) value++;
+    size_t value_len = strlen(value);
+    while (value_len != 0u &&
+           isspace((unsigned char)value[value_len - 1u])) {
+        value_len--;
+    }
+    if (value_len == 0u) return 1;
+    if (rocm_attention_env_value_eq(value, value_len, "1") ||
+        rocm_attention_env_value_eq(value, value_len, "true") ||
+        rocm_attention_env_value_eq(value, value_len, "yes") ||
+        rocm_attention_env_value_eq(value, value_len, "on")) {
+        return 1;
+    }
+    if (rocm_attention_env_value_eq(value, value_len, "0") ||
+        rocm_attention_env_value_eq(value, value_len, "false") ||
+        rocm_attention_env_value_eq(value, value_len, "no") ||
+        rocm_attention_env_value_eq(value, value_len, "off")) {
+        return 0;
+    }
+    if (rocm_attention_wmma_notice_once(invalid_notice_bit)) {
+        const size_t shown_len = value_len < 96u ? value_len : 96u;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "invalid boolean environment value "
+                "%s=%.*s%s; gfx1151 WMMA attention remains disabled\n",
+                name,
+                (int)shown_len,
+                value,
+                shown_len == value_len ? "" : "...");
+    }
+    return DS4_ROCM_ATTN_ENV_INVALID;
+}
+
+/* Cache a successful device-property query per host thread and active device.
+ * This is intentionally not a process-global, unkeyed architecture flag:
+ * HIP's active device is thread-local and callers may switch devices. */
+static int rocm_attention_runtime_is_gfx1151_wave32(
+        int report_unavailable) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    int device = -1;
+    const cudaError_t device_err = cudaGetDevice(&device);
+    if (device_err != cudaSuccess || device < 0) {
+        if (report_unavailable &&
+            rocm_attention_wmma_notice_once(1u << 3)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "cannot query active device for "
+                    "gfx1151 WMMA attention; using fallback: %s\n",
+                    cudaGetErrorString(device_err));
+        }
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    static thread_local int cached_device = -1;
+    static thread_local int cached_eligible = -1;
+    if (cached_device == device && cached_eligible >= 0) {
+        if (!cached_eligible && report_unavailable &&
+            rocm_attention_wmma_notice_once(1u << 5)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "gfx1151 WMMA attention requested on "
+                    "a cached unsupported device; using fallback\n");
+        }
+        return cached_eligible;
+    }
+
+    cudaDeviceProp prop = {};
+    const cudaError_t prop_err = cudaGetDeviceProperties(&prop, device);
+    if (prop_err != cudaSuccess) {
+        if (report_unavailable &&
+            rocm_attention_wmma_notice_once(1u << 4)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "cannot query device properties for "
+                    "gfx1151 WMMA attention; using fallback: %s\n",
+                    cudaGetErrorString(prop_err));
+        }
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    static const char kGfx1151[] = "gfx1151";
+    const int arch_matches =
+        strncmp(prop.gcnArchName, kGfx1151, sizeof(kGfx1151) - 1u) == 0 &&
+        (prop.gcnArchName[sizeof(kGfx1151) - 1u] == '\0' ||
+         prop.gcnArchName[sizeof(kGfx1151) - 1u] == ':');
+    cached_device = device;
+    cached_eligible = arch_matches && prop.warpSize == 32 ? 1 : 0;
+    if (!cached_eligible && report_unavailable &&
+        rocm_attention_wmma_notice_once(1u << 5)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "gfx1151 WMMA attention requested on "
+                "unsupported device arch=%s warpSize=%d; using fallback\n",
+                prop.gcnArchName,
+                prop.warpSize);
+    }
+    return cached_eligible;
+#else
+    (void)report_unavailable;
+    return 0;
+#endif
+}
+
+static int rocm_attention_gfx1151_wmma_enabled(
+        const char *enable_env,
+        uint32_t enable_invalid_notice_bit,
+        uint32_t enabled_notice_bit) {
+    const int enable = rocm_attention_env_bool_value(
+        enable_env, enable_invalid_notice_bit);
+    if (enable == DS4_ROCM_ATTN_ENV_INVALID || enable != 1) return 0;
+    const int disable = rocm_attention_env_bool_value(
+        DS4_ROCM_GFX1151_WMMA_DISABLE_ENV, 1u << 2);
+    if (disable == DS4_ROCM_ATTN_ENV_INVALID) return 0;
+    if (disable == 1) {
+        if (enable == 1 && rocm_attention_wmma_notice_once(1u << 6)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "gfx1151 WMMA attention disabled by "
+                    "%s (overrides %s)\n",
+                    DS4_ROCM_GFX1151_WMMA_DISABLE_ENV,
+                    enable_env);
+        }
+        return 0;
+    }
+    if (g_quality_mode) {
+        if (rocm_attention_wmma_notice_once(1u << 7)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "gfx1151 WMMA attention is unavailable "
+                    "in quality mode; using fallback\n");
+        }
+        return 0;
+    }
+    if (!rocm_attention_runtime_is_gfx1151_wave32(1)) return 0;
+    if (rocm_attention_wmma_notice_once(enabled_notice_bit)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "gfx1151 wave32 WMMA attention enabled "
+                "by %s (32 heads/workgroup, 80 keys/tile, float2 KV staging)\n",
+                enable_env);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -17,10 +205,10 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
+    if (!raw_cache || !kv || raw_cap == 0 || n_tokens == 0 || head_dim == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
-    uint64_t n = (uint64_t)n_tokens * head_dim;
+    uint64_t n = (uint64_t)(n_tokens < raw_cap ? n_tokens : raw_cap) * head_dim;
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
@@ -37,20 +225,28 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
         uint32_t              raw_start,
         uint32_t              n_head,
         uint32_t              head_dim) {
+    uint64_t sink_bytes = 0;
+    uint64_t head_elems = 0;
+    uint64_t head_bytes = 0;
+    uint64_t raw_bytes = 0;
+    const bool sizes_ok =
+        cuda_u64_mul_checked(n_head, sizeof(float), &sink_bytes) &&
+        cuda_u64_mul3_checked(n_tokens, n_head, head_dim, &head_elems) &&
+        cuda_u64_mul_checked(head_elems, sizeof(float), &head_bytes) &&
+        cuda_u64_mul3_checked(raw_cap, head_dim, sizeof(float), &raw_bytes);
     if (!heads || !q || !raw_kv || !model_map ||
+        !sizes_ok ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || n_head == 0 || head_dim == 0 ||
-        sinks_offset > model_size ||
-        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
-        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < raw_bytes) {
         return 0;
     }
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map,
             sinks_offset,
-            (uint64_t)n_head * sizeof(float),
+            sink_bytes,
             "dspark_attn_sinks");
     if (!sinks) return 0;
 
@@ -80,8 +276,8 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
     if (verify_left > 0) {
         verify_left--;
         (void)cudaDeviceSynchronize();
-        const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
-        const uint64_t kn = (uint64_t)raw_cap * head_dim;
+        const uint64_t qn = head_elems;
+        const uint64_t kn = raw_bytes / sizeof(float);
         std::vector<float> hq(qn), hkv(kn), hout(qn), hsink(n_head);
         (void)cudaMemcpy(hq.data(), q->ptr, qn * sizeof(float),
                          cudaMemcpyDeviceToHost);
@@ -89,7 +285,7 @@ extern "C" int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(
                          cudaMemcpyDeviceToHost);
         (void)cudaMemcpy(hout.data(), heads->ptr, qn * sizeof(float),
                          cudaMemcpyDeviceToHost);
-        (void)cudaMemcpy(hsink.data(), sinks, (uint64_t)n_head * sizeof(float),
+        (void)cudaMemcpy(hsink.data(), sinks, sink_bytes,
                          cudaMemcpyDeviceToHost);
         double max_abs = 0.0;
         double max_rel = 0.0;
@@ -367,30 +563,37 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int fast_window_attention = !g_quality_mode;
-    const bool use_wmma_ring =
-            ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_WMMA32_RING");
-    if (use_wmma_ring && !use_comp_mask && n_tokens > 1u &&
-        head_dim == 512u && fast_window_attention) {
-        dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
-        attention_mixed_heads16_wmma_kernel<2, 32><<<grid, 512>>>((float *)heads->ptr,
-                                                                  sinks,
-                                                                  (const float *)q->ptr,
-                                                                  (const float *)raw_kv->ptr,
-                                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                  NULL,
-                                                                  n_tokens,
-                                                                  pos0,
-                                                                  n_raw,
-                                                                  raw_cap,
-                                                                  raw_start,
-                                                                  n_comp,
-                                                                  0,
-                                                                  window,
-                                                                  ratio,
-                                                                  n_head,
-                                                                  head_dim);
-        return cuda_ok(cudaGetLastError(), "attention ring wmma32 launch");
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    if (!use_comp_mask && n_tokens > 1u && head_dim == 512u &&
+        n_head == 64u && (uint64_t)n_raw <= (uint64_t)pos0 + n_tokens &&
+        rocm_attention_gfx1151_wmma_enabled(
+            DS4_ROCM_GFX1151_WMMA_RING_ENABLE_ENV,
+            1u << 0,
+            1u << 8)) {
+        dim3 grid(n_tokens, 2u, 1u);
+        attention_mixed_heads16_wmma_kernel<2, 32, true>
+            <<<grid, 512>>>((float *)heads->ptr,
+                            sinks,
+                            (const float *)q->ptr,
+                            (const float *)raw_kv->ptr,
+                            n_comp ? (const float *)comp_kv->ptr
+                                   : (const float *)raw_kv->ptr,
+                            NULL,
+                            n_tokens,
+                            pos0,
+                            n_raw,
+                            raw_cap,
+                            raw_start,
+                            n_comp,
+                            0u,
+                            window,
+                            ratio,
+                            n_head,
+                            head_dim);
+        return cuda_ok(cudaGetLastError(),
+                       "attention raw-ring gfx1151 wmma32 tile80 launch");
     }
+#endif
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -569,75 +772,35 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         head_dim == 512 &&
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (n_head == 64u && top_k == 512u &&
+            (uint64_t)n_raw <= (uint64_t)pos0 + n_tokens &&
+            rocm_attention_gfx1151_wmma_enabled(
+                DS4_ROCM_GFX1151_WMMA_INDEXED_ENABLE_ENV,
+                1u << 1,
+                1u << 9)) {
+            dim3 grid(n_tokens, 2u, 1u);
+            attention_mixed_heads16_wmma_kernel<1, 32, true>
+                <<<grid, 512>>>((float *)heads->ptr,
+                                sinks,
+                                (const float *)q->ptr,
+                                (const float *)raw_kv->ptr,
+                                (const float *)comp_kv->ptr,
+                                topk_ptr,
+                                n_tokens,
+                                pos0,
+                                n_raw,
+                                raw_cap,
+                                raw_start,
+                                n_comp,
+                                top_k,
+                                window,
+                                ratio,
+                                n_head,
+                                head_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "attention indexed gfx1151 wmma32 tile80 launch");
+        }
         if (!g_quality_mode && n_head <= 64u) {
-            const bool use_wmma32 =
-                    ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_WMMA32_INDEXED");
-            if (use_wmma32) {
-                dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
-                const bool use_vec2 =
-                        ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_F32_VEC2");
-                if (use_vec2) {
-                    attention_mixed_heads16_wmma_kernel<1, 32, true><<<grid, 512>>>((float *)heads->ptr,
-                                                                            sinks,
-                                                                            (const float *)q->ptr,
-                                                                            (const float *)raw_kv->ptr,
-                                                                            (const float *)comp_kv->ptr,
-                                                                            topk_ptr,
-                                                                            n_tokens,
-                                                                            pos0,
-                                                                            n_raw,
-                                                                            raw_cap,
-                                                                            raw_start,
-                                                                            n_comp,
-                                                                            top_k,
-                                                                            window,
-                                                                            ratio,
-                                                                            n_head,
-                                                                            head_dim);
-                    return cuda_ok(cudaGetLastError(), "attention indexed wmma32 f32 vec2 launch");
-                }
-                attention_mixed_heads16_wmma_kernel<1, 32><<<grid, 512>>>((float *)heads->ptr,
-                                                                            sinks,
-                                                                            (const float *)q->ptr,
-                                                                            (const float *)raw_kv->ptr,
-                                                                            (const float *)comp_kv->ptr,
-                                                                            topk_ptr,
-                                                                            n_tokens,
-                                                                            pos0,
-                                                                            n_raw,
-                                                                            raw_cap,
-                                                                            raw_start,
-                                                                            n_comp,
-                                                                            top_k,
-                                                                            window,
-                                                                            ratio,
-                                                                            n_head,
-                                                                            head_dim);
-                return cuda_ok(cudaGetLastError(), "attention indexed wmma32 launch");
-            }
-            const char *wmma_env = getenv("DS4_ROCM_ATTN_WMMA16_INDEXED");
-            const bool use_wmma = wmma_env && wmma_env[0] != '\0' && wmma_env[0] != '0';
-            if (use_wmma) {
-                dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-                attention_mixed_heads16_wmma_kernel<1, 16><<<grid, 256>>>((float *)heads->ptr,
-                                                                        sinks,
-                                                                        (const float *)q->ptr,
-                                                                        (const float *)raw_kv->ptr,
-                                                                        (const float *)comp_kv->ptr,
-                                                                        topk_ptr,
-                                                                        n_tokens,
-                                                                        pos0,
-                                                                        n_raw,
-                                                                        raw_cap,
-                                                                        raw_start,
-                                                                        n_comp,
-                                                                        top_k,
-                                                                        window,
-                                                                        ratio,
-                                                                        n_head,
-                                                                        head_dim);
-                return cuda_ok(cudaGetLastError(), "attention indexed wmma16 launch");
-            }
             dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 32><<<grid, 1024>>>((float *)heads->ptr,
                                                                                 sinks,

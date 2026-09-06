@@ -1258,6 +1258,11 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* gfx1151/wave32 mixed-attention core. MODE 0 handles contiguous prefill,
+ * MODE 1 indexed mixed attention, and MODE 2 the causal raw ring. The tuned
+ * MODE 1/2 vector path remains controlled by the capability-checked launch
+ * gates in ds4_rocm_attention_launch.cuh. */
 template <int MODE, uint32_t HEADS, bool F32_VEC2 = false>
 __global__ static void attention_mixed_heads16_wmma_kernel(
         float *heads,
@@ -1277,6 +1282,10 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
+    static_assert(MODE >= 0 && MODE <= 2,
+                  "gfx1151 WMMA attention mode is invalid");
+    static_assert(HEADS == 16u || HEADS == 32u,
+                  "gfx1151 WMMA attention requires 16 or 32 heads/workgroup");
     constexpr uint32_t KEYS = 80u;
     constexpr uint32_t DIMS = 64u;
     constexpr uint32_t TILE = 16u;
@@ -1284,6 +1293,19 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
     constexpr uint32_t HEAD_TILES = HEADS / TILE;
     constexpr uint32_t KEY_TILES = KEYS / TILE;
     constexpr uint32_t WORKGROUP = HEADS * 16u;
+    constexpr size_t SHARED_BYTES =
+        (size_t)HEADS * STRIDE * sizeof(half) +
+        (size_t)KEYS * STRIDE * sizeof(half) +
+        (size_t)HEADS * STRIDE * sizeof(float) +
+        (size_t)HEADS * 3u * sizeof(float) +
+        256u * sizeof(uint32_t) +
+        DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP * sizeof(uint32_t) +
+        3u * sizeof(uint32_t);
+    static_assert(KEYS % TILE == 0u && DIMS % TILE == 0u &&
+                      HEADS % TILE == 0u && WORKGROUP <= 512u,
+                  "gfx1151 WMMA attention tile geometry changed");
+    static_assert(SHARED_BYTES <= 64u * 1024u,
+                  "gfx1151 WMMA attention exceeds the validated LDS budget");
     const uint32_t t = (uint32_t)blockIdx.x;
     const uint32_t head_base = (uint32_t)blockIdx.y * HEADS;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -1648,6 +1670,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         }
     }
 }
+#endif
 
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,

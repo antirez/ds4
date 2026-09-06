@@ -34,6 +34,35 @@ extern "C" {
 int ds4_mmq_init(int device);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
+// Producer-fold registry bridge implemented by the full CUDA runtime.
+// A hit returns the canonical Q8_1 sidecar for this exact activation pointer
+// and stream. It is valid only for single-token unpadded rows; registry slots
+// are refreshed by each producer layer and consumed once. The standalone MMQ
+// library provides a weak, fail-closed miss so its tests do not need to link
+// ds4_cuda.cu; full ds4 overrides it with the stream-aware implementation.
+int ds4_cuda_q8_fold_take_q81(
+    const void   *src,
+    uint64_t      in_dim,
+    cudaStream_t  stream,
+    const void  **q81);
+
+// Opt-in grouped-MMQ Q8_1 arena controlled by
+// DS4_CUDA_MMQ_Q81_PERSISTENT. Unset and =0 keep the stream-pool path.
+// cleanup drains the owner device before freeing and is safe across reinit;
+// report/counters expose host-dispatch coverage (graph replays excluded).
+int  ds4_mmq_q81_persistent_cleanup(void);
+int  ds4_mmq_q81_persistent_preflight_for_test(int device, size_t required);
+void ds4_mmq_q81_persistent_report(void);
+void ds4_mmq_q81_persistent_counters(
+    uint64_t *candidates,
+    uint64_t *uses,
+    uint64_t *hits,
+    uint64_t *pool_fallbacks,
+    uint64_t *allocations,
+    uint64_t *resizes,
+    size_t   *arena_bytes,
+    size_t   *high_water);
+
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
 //   1 if mmq is faster than dequant+cublas for this shape on this device,
 //   0 otherwise (caller should fall back to its existing dequant+cublas path).
@@ -157,6 +186,122 @@ int ds4_mmq_q4_K_dense(
     int           M,
     int           N,
     int           K,
+    cudaStream_t  stream);
+
+#if !defined(GGML_USE_HIP)
+// CUDA benchmark/test boundary for separating activation quantization from
+// the Q4_K MMQ kernel.  The scratch layout is canonical block_q8_1_mmq DS4
+// ([K/128][N]) plus a zeroed 128-column tail.  These helpers never transfer
+// model weights and never synchronize the stream.
+size_t ds4_mmq_q4_K_q8_1_scratch_bytes(int N, int K);
+
+int ds4_mmq_q4_K_quantize_q8_1_for_test(
+    const float * X_f32,
+    void        * q8_ds4,
+    size_t        q8_bytes,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Return non-zero only when the current device's canonical Q4_K MMQ picker
+// selects m128n128 for this activation-column count. Kernel A/B harnesses use
+// this to reject tail geometries whose Stream-K tile partition is different.
+int ds4_mmq_q4_K_dense_preq_reference_m128n128_for_test(int N);
+
+// Enqueue-only A/B arms over a caller-owned, already-quantized activation.
+// The reference may disable stream-K for a complete-K control; the 16-warp
+// candidate helper follows the production canonical stream-K/fixup policy.
+// Passing caller-owned reference fixup storage keeps pool alloc/free nodes out
+// of CUDA-event kernel benchmarks; null/zero retains the production pool.
+// Zero is success; nonzero is rejection/failure.
+int ds4_mmq_q4_K_dense_preq_reference_for_test(
+    const void  * W_q4_K,
+    const void  * q8_ds4,
+    size_t        q8_bytes,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           use_stream_k,
+    void        * stream_k_fixup,
+    size_t        stream_k_fixup_bytes,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_dense_preq_16warp_for_test(
+    const void  * W_q4_K,
+    const void  * q8_ds4,
+    size_t        q8_bytes,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Byte-parity boundary for the fixed [N][8][4096] grouped attention-A Q8_1
+// producer.  use_specialized=0 launches the canonical strided quantizer;
+// nonzero launches the K4096/G8x2 candidate.  Both write the same canonical
+// group-major block_q8_1_mmq DS4 payload and never synchronize the stream.
+size_t ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(int N);
+
+int ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+    const float * X_f32,
+    void        * q8_ds4,
+    size_t        q8_bytes,
+    int           N,
+    int           use_specialized,
+    cudaStream_t  stream);
+#endif
+
+// Two dense Q4_K MMQ projections that share one token-tiled Q8_1
+// activation buffer.  This is the prefill sibling of
+// ds4_mmq_q4_K_dense_pair_vec: N is not limited to the MMVQ batch ceiling,
+// M0 and M1 may differ, and each leg preserves ds4_mmq_q4_K_dense's
+// reduction and output layout. The two output ranges must be disjoint.
+// On CUDA, the opt-in 16-warp experiment selects each leg independently
+// (down to M=512) when its output-tile grid retains at least 80% SM-wave
+// efficiency; below canonical's whole-tile cutoff it mirrors canonical
+// stream-K partitioning and fixup. REQUIRE rejects the pair before allocation
+// unless both legs can use the candidate.
+// Shape/capability rejection returns DS4_MMQ_NOT_APPLICABLE before enqueue;
+// negative values report an attempted-path launch failure.
+int ds4_mmq_q4_K_dense_pair(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Prefill attention output-A with W=[groups][M][K],
+// X=[N][groups][K], and out=[N][groups][M].  It quantizes the strided source
+// in one launch and writes each group directly to the final token-major
+// layout, while preserving the established per-group MMQ reduction tree.
+int ds4_mmq_q4_K_grouped_dense(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+// Opt-in sibling of ds4_mmq_q4_K_grouped_dense that submits all groups in one
+// grid, with group selected by grid.z.  Stream-k coordinates and fixup storage
+// are isolated per grid.z slice, preserving the reduction tree and output bits
+// of the established one-launch-per-group implementation.
+int ds4_mmq_q4_K_grouped_dense_single_grid(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           n_groups,
     cudaStream_t  stream);
 
 int ds4_mmq_mxfp4_dense(
@@ -328,6 +473,42 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     const void    * W_gate_soa,
     const void    * W_up_soa,
     const void    * W_down_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    float         * mid_f32,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
+/* Optional fused entries return this before enqueueing work when their
+ * capability/shape/scratch preflight cannot engage.  Callers may safely retry
+ * a materialized fallback only for this result; zero is success and negative
+ * values may follow partial enqueue. */
+#define DS4_MMQ_NOT_APPLICABLE 1
+
+/* Raw-layout twin of ds4_mmq_iq2_xxs_q2_K_moe_fused_soa.  This is the
+ * grouped SSD entry: callers may pass a compact expert table together with
+ * ids remapped into [0, n_experts).  Gate/up/down use canonical GGUF block
+ * layouts while the routing map, activation quantize, and expert bounds are
+ * built only once for the complete fused pipeline.  As with router top-k,
+ * ids for one token must be unique.
+ *
+ * Capability/shape failures return DS4_MMQ_NOT_APPLICABLE before enqueue.
+ * Once work has been submitted, failures are negative and must not be
+ * retried on the same stream as a materialized fallback. */
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+    const void    * W_gate_raw,
+    const void    * W_up_raw,
+    const void    * W_down_raw,
     const float   * X_f32,
     const int32_t * ids,
     const float   * router_weights,
@@ -577,6 +758,11 @@ int ds4_mmq_q2_K_aligned_derepack(
 // they do not replace).  n_tokens == 1 and K % 1024 == 0 only; other shapes
 // return non-zero so the caller can fall back to ds4_mmq_q8_0_dense_vec.
 uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K);
+
+// Enable decode shapes validated on integrated sm_121 (GB10). The CUDA
+// backend sets this after device discovery; other devices retain the generic
+// aligned kernel. DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT is the runtime rollback.
+void ds4_mmq_set_gb10_optimizations(int enabled);
 
 int ds4_mmq_q8_0_aligned_dense_vec(
     const void  * W_aligned,
@@ -872,13 +1058,120 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// On NVIDIA Turing+, aligned N=1 calls fuse output sanitization into the
+// canonical MMVQ store, skipping the pre-clear and standalone sanitizer.
+// DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE (presence, even "0") restores both.
+// Prefill, other quant types and the K1024 persistent experiment are unchanged.
+int ds4_mmq_q4_K_dense_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Full-runtime form of ds4_mmq_q4_K_dense_vec. The CUDA model resolver
+// supplies weight_device_resident from allocation/cache provenance so the
+// exact K1024 persistent candidate can reject mapped-host/HMM weights without
+// issuing cudaPointerGetAttributes on every decode dispatch. Only a positive
+// hint admits that candidate; zero/negative provenance remains fail-closed and
+// canonical MMVQ stays available. The legacy entry
+// above performs its own pointer-attribute query for standalone callers and
+// benchmarks that allocate W with cudaMalloc.
+int ds4_mmq_q4_K_dense_vec_with_weight_residency(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    int           weight_device_resident,
+    cudaStream_t  stream);
+
+// Exact grouped one-row Q4_K MMVQ for AProjQ4 attention-A on a single GB10.
+// W is [n_groups][M][K], X is [n_groups][K], and out is
+// [n_groups][M].  Each group retains the canonical dense_vec reduction tree;
+// only Q8_1 quantization and launch setup are shared.  Returns
+// DS4_MMQ_NOT_APPLICABLE before enqueue when its GB10/scratch/shape gates do
+// not hold.
+// On eligible NVIDIA aligned row cohorts, the default specialized store
+// also removes the ids producer, output clear and standalone sanitizer.
+// DS4_CUDA_DISABLE_Q4_GROUPED_MMVQ_FUSION (any defined value) restores those
+// three operations without disabling grouped dispatch. Scratch size and the
+// batch opt-in below are unchanged; this switch is independent of the dense
+// DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE rollback.
+int ds4_mmq_q4_K_grouped_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           K,
+    int           n_groups,
+    cudaStream_t  stream);
+
+// Token-aware form of the exact grouped Q4_K entry above.  X and out are
+// token-major: [n_tokens][n_groups][K] and
+// [n_tokens][n_groups][M].  Internally (token, group) is flattened into the
+// MMVQ channel dimension while ncols_dst remains one.  This is deliberate:
+// every pair therefore retains the canonical one-row Q8_1 quantization,
+// Q4_K K partition, peer-warp fold and reduction tree.  The GB10 path accepts
+// at most eight tokens and is opt-in with
+// DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1.  Either
+// DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH=1 or the existing grouped/global kill
+// switches disables it.  DS4_MMQ_NOT_APPLICABLE is returned before enqueue
+// whenever a gate or scratch-capacity check fails.
+// The graph-level diagnostic
+// DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH=1 turns such ineligibility into a
+// visible failure when this attention-output path is reached.
+int ds4_mmq_q4_K_grouped_batch_vec(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           K,
+    int           n_tokens,
+    int           n_groups,
+    cudaStream_t  stream);
+
+// On a single GB10, the exact AProjQ4 Q-b shape (M=32768, N=1, K=1024)
+// can opt into a persistent-CTA form with
+// DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1.  The rollback switch
+// DS4_CUDA_NO_Q4_K1024_PERSISTENT=1 is authoritative when both are set.
+// DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1 makes an unavailable exact-shape
+// dispatch fail before any CUDA work is enqueued instead of silently running
+// canonical MMVQ. DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE=1 forces a candidate,
+// compares it bit-for-bit with canonical MMVQ, and retains canonical output;
+// run it with DS4_CUDA_DECODE_GRAPHS=0. Set
+// DS4_CUDA_Q4_K1024_PERSISTENT_STATS=1 for the atexit counter summary.
+// DS4_CUDA_NO_Q4_GB10_FAST=1 is the umbrella rollback for this and the
+// GB10 Q4 activation scratch. The candidate additionally requires W to be in
+// CUDA device allocation/cache storage; mapped host and managed/HMM pointers
+// retain canonical MMVQ. Other shapes and devices retain canonical MMVQ.
+void ds4_mmq_q4_K_k1024_persistent_counters(
+    uint64_t *candidates,
+    uint64_t *uses,
+    uint64_t *fallbacks,
+    uint64_t *require_failures,
+    uint64_t *oracle_calls,
+    uint64_t *oracle_mismatches,
+    uint64_t *oracle_skips);
+
+// Two independent dense Q4_K projections that share the canonical Q8_1
+// activation quantization.  Each output is dispatched through the same MMVQ
+// entry as ds4_mmq_q4_K_dense_vec, so its reduction and output bits are
+// unchanged; M0 and M1 may differ (the DS4 Q-A/KV decode shape does).
+// Shape/capability rejection returns DS4_MMQ_NOT_APPLICABLE before enqueue;
+// negative values report an attempted-path launch failure.
 int ds4_mmq_q4_K_dense_pair_vec(
     const void  * W0_q4_K,
     const void  * W1_q4_K,
     const float * X_f32,
     float       * out0_f32,
     float       * out1_f32,
-    int           M,
+    int           M0,
+    int           M1,
+    int           N,
     int           K,
     cudaStream_t  stream);
 

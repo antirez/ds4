@@ -30,11 +30,14 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
 
 __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_tokens * head_dim;
+    /* Older rows in an oversized batch are overwritten by the suffix.
+     * Store that suffix alone so every ring element has a single writer. */
+    const uint32_t stored_tokens = min(n_tokens, raw_cap);
+    uint64_t n = (uint64_t)stored_tokens * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
-    uint32_t t = gid / head_dim;
-    uint32_t row = (pos0 + t) % raw_cap;
+    uint32_t t = n_tokens - stored_tokens + gid / head_dim;
+    uint32_t row = ((uint64_t)pos0 + t) % raw_cap;
     const uint16_t hb = f32_to_f16_bits_hip_round(kv[(uint64_t)t * head_dim + d]);
     raw[(uint64_t)row * head_dim + d] = f16_bits_to_f32(hb);
 }

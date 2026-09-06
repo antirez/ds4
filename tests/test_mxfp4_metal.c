@@ -2,12 +2,15 @@
 
 #include "ds4_gpu.h"
 
+#include <ctype.h>
+#include <float.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #define MXFP4_TYPE 39u
@@ -41,6 +44,50 @@ static float e8m0_to_f32(uint8_t e) {
     float value;
     memcpy(&value, &bits, sizeof(value));
     return value;
+}
+
+static uint32_t f32_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static int env_bool_enabled(const char *value) {
+    if (!value) return 0;
+    while (isspace((unsigned char)*value)) value++;
+    size_t len = strlen(value);
+    while (len > 0 && isspace((unsigned char)value[len - 1])) len--;
+    if (len == 0) return 1;
+    if ((len == 1 && value[0] == '0') ||
+        (len == 5 && strncasecmp(value, "false", len) == 0) ||
+        (len == 2 && strncasecmp(value, "no", len) == 0) ||
+        (len == 3 && strncasecmp(value, "off", len) == 0)) {
+        return 0;
+    }
+    return 1;
+}
+
+static float sigmoid_stable(float x) {
+    if (x >= 0.0f) {
+        const float e = expf(-x);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
+static float silu_stable(float x) {
+    return x * sigmoid_stable(x);
+}
+
+static float silu_reference_f64(float x) {
+    const double xd = (double)x;
+    if (xd >= 0.0) {
+        const double e = exp(-xd);
+        return (float)(xd / (1.0 + e));
+    }
+    const double e = exp(xd);
+    return (float)(xd * (e / (1.0 + e)));
 }
 
 static float dot_mxfp4(const block_mxfp4 *row, const float *x) {
@@ -105,6 +152,116 @@ static int compare_values(const char *name, const float *actual,
             "MXFP4 Metal %-4s max_abs=%g rms=%g at=%llu\n",
             name, max_abs, rms, (unsigned long long)max_index);
     return max_abs <= tolerance;
+}
+
+static int test_silu_stable_metal(void) {
+    const float gate[] = {
+        -100.0f,
+        -92.0f,
+        -89.0f,
+        nextafterf(-87.0f, -FLT_MAX),
+        -87.0f,
+        nextafterf(-87.0f, FLT_MAX),
+        -80.0f,
+        -10.0f,
+        -1.0f,
+        -0.0f,
+        0.0f,
+        1.0f,
+        10.0f,
+    };
+    float up[sizeof(gate) / sizeof(gate[0])];
+    float actual[sizeof(gate) / sizeof(gate[0])];
+    float expected[sizeof(gate) / sizeof(gate[0])];
+    const uint32_t count = (uint32_t)(sizeof(gate) / sizeof(gate[0]));
+    const int require_ieee = env_bool_enabled(getenv("DS4_METAL_MATH_SAFE"));
+
+    for (uint32_t i = 0; i < count; i++) {
+        up[i] = 1.0f;
+        expected[i] = silu_reference_f64(gate[i]);
+    }
+
+    ds4_gpu_tensor *gate_tensor = ds4_gpu_tensor_alloc(sizeof(gate));
+    ds4_gpu_tensor *up_tensor = ds4_gpu_tensor_alloc(sizeof(up));
+    ds4_gpu_tensor *out_tensor = ds4_gpu_tensor_alloc(sizeof(actual));
+    int ok = gate_tensor && up_tensor && out_tensor;
+    if (ok) ok = ds4_gpu_tensor_write(gate_tensor, 0, gate, sizeof(gate));
+    if (ok) ok = ds4_gpu_tensor_write(up_tensor, 0, up, sizeof(up));
+    if (ok) {
+        ok = ds4_gpu_swiglu_tensor(out_tensor, gate_tensor, up_tensor,
+                                   count, 0.0f, 1.0f);
+    }
+    if (ok) ok = ds4_gpu_tensor_read(out_tensor, 0, actual, sizeof(actual));
+
+    for (uint32_t i = 0; ok && i < count; i++) {
+        const uint32_t actual_bits = f32_bits(actual[i]);
+        const uint32_t expected_bits = f32_bits(expected[i]);
+        const uint32_t actual_abs_bits = actual_bits & 0x7fffffffu;
+        const float expected_abs = fabsf(expected[i]);
+        if ((actual_bits & 0x7f800000u) == 0x7f800000u) {
+            fprintf(stderr,
+                    "MXFP4 Metal stable SiLU mismatch i=%u x=%g actual=%g expected=%g\n",
+                    i, gate[i], actual[i], expected[i]);
+            ok = 0;
+            break;
+        }
+        if (expected_abs > 0.0f && expected_abs < FLT_MIN) {
+            // The final SiLU value itself is subnormal and may be flushed by
+            // Metal even in math-safe mode. Safe mode must retain its sign.
+            if (actual_abs_bits == 0u) {
+                const int sign_mismatch =
+                    require_ieee && ((actual_bits ^ expected_bits) >> 31u) != 0u;
+                if (sign_mismatch) {
+                    fprintf(stderr,
+                            "MXFP4 Metal stable SiLU subnormal-zero sign mismatch "
+                            "i=%u x=%g actual_bits=0x%08x expected_bits=0x%08x\n",
+                            i, gate[i], actual_bits, expected_bits);
+                    ok = 0;
+                }
+                continue;
+            }
+
+            const double rel = fabs(((double)actual[i] - (double)expected[i]) /
+                                    (double)expected[i]);
+            if ((actual_bits >> 31u) == 0u || rel > 2.0e-2) {
+                fprintf(stderr,
+                        "MXFP4 Metal stable SiLU subnormal mismatch "
+                        "i=%u x=%g actual=%g expected=%g rel=%g strict=%d\n",
+                        i, gate[i], actual[i], expected[i], rel, require_ieee);
+                ok = 0;
+            }
+            continue;
+        }
+        if (expected[i] == 0.0f) {
+            const int sign_mismatch =
+                require_ieee && ((actual_bits ^ expected_bits) >> 31u) != 0u;
+            if (actual_abs_bits != 0u || sign_mismatch) {
+                fprintf(stderr,
+                        "MXFP4 Metal stable SiLU zero mismatch "
+                        "i=%u x=%g actual_bits=0x%08x expected_bits=0x%08x strict=%d\n",
+                        i, gate[i], actual_bits, expected_bits, require_ieee);
+                ok = 0;
+            }
+            continue;
+        }
+
+        const double rel = fabs(((double)actual[i] - (double)expected[i]) /
+                                (double)expected[i]);
+        const double rel_limit = expected_abs < 1.0e-20f ? 5.0e-4 : 5.0e-5;
+        if (rel > rel_limit) {
+            fprintf(stderr,
+                    "MXFP4 Metal stable SiLU relative mismatch "
+                    "i=%u x=%g actual=%g expected=%g rel=%g limit=%g\n",
+                    i, gate[i], actual[i], expected[i], rel, rel_limit);
+            ok = 0;
+        }
+    }
+
+    ds4_gpu_tensor_free(out_tensor);
+    ds4_gpu_tensor_free(up_tensor);
+    ds4_gpu_tensor_free(gate_tensor);
+    if (ok) fprintf(stderr, "MXFP4 Metal numerically stable SiLU tail PASS\n");
+    return ok;
 }
 
 int main(void) {
@@ -178,7 +335,7 @@ int main(void) {
                 x);
             const float g = fminf(gate_ref[pair], 7.0f);
             const float u = fmaxf(-7.0f, fminf(up_ref[pair], 7.0f));
-            mid_ref[pair] = (g / (1.0f + expf(-g))) * u * weights[slot];
+            mid_ref[pair] = silu_stable(g) * u * weights[slot];
         }
     }
     for (uint32_t row = 0; row < DIM; row++) {
@@ -191,7 +348,9 @@ int main(void) {
         }
     }
 
-    int ok = ds4_gpu_init() && ds4_gpu_set_model_map(model, model_size);
+    int ok = ds4_gpu_init();
+    if (ok) ok = test_silu_stable_metal();
+    if (ok) ok = ds4_gpu_set_model_map(model, model_size);
     ok = ok && ds4_gpu_test_decode_pipeline_fast_lookup();
     if (ok) {
         fprintf(stderr,

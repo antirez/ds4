@@ -38,6 +38,9 @@ These existing sweeps use 2048-token intervals and 128 generation tokens per
 frontier. They are recorded baselines, not measurements of every subsequent
 commit. Full data: [M5 Max](../speed-bench/m5_max.csv) and
 [DGX Spark](../speed-bench/gb10.csv).
+The DGX Spark values below include the branch's recorded CUDA optimizations;
+their methodology and validation are in
+[the GB10 report](../speed-bench/ds4_gb10_q2_cuda_port_results.md).
 
 | Machine | Context | Prefill | Generation |
 | --- | ---: | ---: | ---: |
@@ -45,10 +48,10 @@ commit. Full data: [M5 Max](../speed-bench/m5_max.csv) and
 | M5 Max, 128 GB | 16384 | 572.53 t/s | 36.14 t/s |
 | M5 Max, 128 GB | 32768 | 557.04 t/s | 34.36 t/s |
 | M5 Max, 128 GB | 65536 | 398.50 t/s | 27.64 t/s |
-| DGX Spark, 128 GB | 2048 | 825.76 t/s | 18.05 t/s |
-| DGX Spark, 128 GB | 16384 | 872.44 t/s | 15.10 t/s |
-| DGX Spark, 128 GB | 32768 | 855.94 t/s | 14.43 t/s |
-| DGX Spark, 128 GB | 65536 | 822.98 t/s | 13.84 t/s |
+| DGX Spark, 128 GB | 2048 | 832.86 t/s | 20.58 t/s |
+| DGX Spark, 128 GB | 16384 | 883.81 t/s | 16.80 t/s |
+| DGX Spark, 128 GB | 32768 | 865.40 t/s | 15.99 t/s |
+| DGX Spark, 128 GB | 65536 | 833.44 t/s | 15.27 t/s |
 
 ![M5 Max Flash Q2 throughput](../speed-bench/m5_max_ts.svg)
 

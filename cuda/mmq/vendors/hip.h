@@ -58,6 +58,7 @@
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
@@ -97,7 +98,10 @@
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaMemGetInfo hipMemGetInfo
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
 #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaSetDevice hipSetDevice
 #define cuDeviceGet hipDeviceGet
 #define CUdevice hipDevice_t

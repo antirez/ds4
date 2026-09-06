@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "ds4.h"
 
@@ -81,8 +80,6 @@ int ds4_tp_adopt_distributed_options(
         ds4_distributed_options *dist,
         char *err,
         size_t errlen);
-void ds4_tp_usage(FILE *fp);
-
 /* Validates option combinations that TP cannot run with (SSD streaming,
  * distributed mode, MTP drafting, CPU backend). */
 int ds4_tp_validate_engine_options(
@@ -103,7 +100,6 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
-uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 
@@ -189,9 +185,7 @@ typedef enum {
     DS4_TP_FRAME_REWIND = 3,
     DS4_TP_FRAME_INVALIDATE = 4,
     DS4_TP_FRAME_STOP = 5,
-    DS4_TP_FRAME_HASH = 6,
     DS4_TP_FRAME_RDMA_INFO = 7,
-    DS4_TP_FRAME_SYNC_ACK = 8,
     DS4_TP_FRAME_RDMA_READY = 9,
     DS4_TP_FRAME_LOGITS = 10,
     DS4_TP_FRAME_VERIFY = 11,
@@ -227,10 +221,6 @@ int ds4_tp_recv_command(
         char *err,
         size_t errlen);
 void ds4_tp_command_free(ds4_tp_command *command);
-
-/* Debug lockstep check: both sides send their hidden-state hash for a token
- * and compare.  Returns 0 on transport failure, -1 on hash mismatch. */
-int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen);
 
 /* Vocab-split output head: the worker ships its logits half to the leader
  * after every eval (and after a sync) on the control socket. */

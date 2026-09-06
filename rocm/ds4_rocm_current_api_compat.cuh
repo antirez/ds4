@@ -117,6 +117,9 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    if (enabled && !g_ssd_streaming_mode) {
+        (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+    }
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();

@@ -6,6 +6,7 @@
  *   - ds4_gpu_lookup_cache at range bases and at interior offsets
  *     (proves the subrange pointer offset arithmetic is right)
  *   - device-id resolution
+ *   - selected-expert batched-I/O policy, planner, scatter and byte oracle
  *   - on multi-GPU boxes: caching on device 1 and active-device
  *     preference in lookup */
 
@@ -26,6 +27,234 @@
     } while (0)
 
 int main(void) {
+    int enabled = -1;
+    int required = -1;
+    int oracle = -1;
+    int fused = -1;
+    int owned_forced = -1;
+    int multi_gpu_forced = -1;
+    int capture = -1;
+    CHECK(!ds4_cuda_test_q8_hc_expand_env_value(NULL) &&
+          !ds4_cuda_test_q8_hc_expand_env_value("") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("0") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("false") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("NO") &&
+          !ds4_cuda_test_q8_hc_expand_env_value("off") &&
+          ds4_cuda_test_q8_hc_expand_env_value("1") &&
+          ds4_cuda_test_q8_hc_expand_env_value("true"),
+          "Q8 HC value-aware environment parser");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 0, 1, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 0 && multi_gpu_forced == 0 &&
+          capture == 0,
+          "Q8 HC defaults to fused");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 1, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 0 && owned_forced == 0 && multi_gpu_forced == 0,
+          "Q8 HC split opt-in on single GPU");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              1, 1, 1, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 0 && multi_gpu_forced == 0,
+          "Q8 HC force-fused dominates conflicting split request");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 2, 0, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 0 && multi_gpu_forced == 1,
+          "Q8 HC multi-GPU remains fused");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 1, 1, 0, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 1 && owned_forced == 1 && multi_gpu_forced == 0,
+          "Q8 HC owned dispatch remains fused");
+    CHECK(ds4_cuda_test_q8_hc_expand_policy(
+              0, 1, 1, 0, 1, &fused, &owned_forced,
+              &multi_gpu_forced, &capture) &&
+          fused == 0 && capture == 1,
+          "Q8 HC split graph-capture policy matches eager policy");
+    CHECK(!ds4_cuda_test_stream_selected_batch_env_value(NULL) &&
+          !ds4_cuda_test_stream_selected_batch_env_value("") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("0") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("false") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("FALSE") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("no") &&
+          !ds4_cuda_test_stream_selected_batch_env_value("off") &&
+          ds4_cuda_test_stream_selected_batch_env_value("1") &&
+          ds4_cuda_test_stream_selected_batch_env_value("true"),
+          "selected-expert batched-I/O value-aware environment parser");
+    CHECK(ds4_cuda_test_stream_selected_batch_policy(
+              1, 0, 0, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 0 && oracle == 0,
+          "selected-expert batched-I/O enable policy");
+    CHECK(ds4_cuda_test_stream_selected_batch_policy(
+              0, 0, 1, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 1 && oracle == 0,
+          "selected-expert batched-I/O require policy");
+    CHECK(ds4_cuda_test_stream_selected_batch_policy(
+              1, 1, 1, 1, &enabled, &required, &oracle) &&
+          enabled == 0 && required == 0 && oracle == 0,
+          "selected-expert batched-I/O disable-dominant policy");
+    CHECK(!ds4_cuda_test_stream_selected_event_env_value(NULL) &&
+          !ds4_cuda_test_stream_selected_event_env_value("") &&
+          !ds4_cuda_test_stream_selected_event_env_value("0") &&
+          !ds4_cuda_test_stream_selected_event_env_value("false") &&
+          !ds4_cuda_test_stream_selected_event_env_value("NO") &&
+          !ds4_cuda_test_stream_selected_event_env_value("off") &&
+          ds4_cuda_test_stream_selected_event_env_value("1") &&
+          ds4_cuda_test_stream_selected_event_env_value("true"),
+          "selected-expert event-pipeline value-aware environment parser");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              1, 0, 0, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 0 && oracle == 0,
+          "selected-expert event-pipeline enable policy");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              0, 0, 1, 0, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 1 && oracle == 0,
+          "selected-expert event-pipeline require policy");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              0, 0, 0, 1, &enabled, &required, &oracle) &&
+          enabled == 1 && required == 0 && oracle == 1,
+          "selected-expert event-pipeline oracle policy");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline_policy(
+              1, 1, 1, 1, &enabled, &required, &oracle) &&
+          enabled == 0 && required == 0 && oracle == 0,
+          "selected-expert event-pipeline disable-dominant policy");
+    int stats = -1;
+    CHECK(!ds4_cuda_test_stream_expert_persistent_env_value(NULL) &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("0") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("false") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("NO") &&
+          !ds4_cuda_test_stream_expert_persistent_env_value("off") &&
+          ds4_cuda_test_stream_expert_persistent_env_value("1") &&
+          ds4_cuda_test_stream_expert_persistent_env_value("true"),
+          "persistent expert planner value-aware environment parser");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              1, 0, 0, 0, 0,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 1 && required == 0 && stats == 0 && oracle == 0,
+          "persistent expert planner enable policy");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              0, 0, 1, 1, 1,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 1 && required == 1 && stats == 1 && oracle == 1,
+          "persistent expert planner require/stats/oracle policy");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              0, 0, 0, 1, 0,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 0 && required == 0 && stats == 1 && oracle == 0,
+          "persistent expert planner stats-only policy");
+    CHECK(ds4_cuda_test_stream_expert_persistent_policy(
+              1, 1, 1, 1, 1,
+              &enabled, &required, &stats, &oracle) &&
+          enabled == 0 && required == 0 && stats == 0 && oracle == 0,
+          "persistent expert planner disable-dominant policy");
+    ds4_cuda_stream_expert_persistent_report persistent_before;
+    memset(&persistent_before, 0, sizeof(persistent_before));
+    ds4_cuda_stream_expert_persistent_get_report(&persistent_before);
+    CHECK(ds4_cuda_test_stream_expert_persistent_planner(),
+          "persistent expert LRU/free-list transaction planner oracle");
+    ds4_cuda_stream_expert_persistent_report persistent_after;
+    memset(&persistent_after, 0, sizeof(persistent_after));
+    ds4_cuda_stream_expert_persistent_get_report(&persistent_after);
+    CHECK(persistent_after.oracle_runs == persistent_before.oracle_runs + 1u &&
+          persistent_after.oracle_failures ==
+              persistent_before.oracle_failures &&
+          persistent_after.plan_attempts > persistent_before.plan_attempts &&
+          persistent_after.plans_built > persistent_before.plans_built &&
+          persistent_after.commits > persistent_before.commits &&
+          persistent_after.rollbacks > persistent_before.rollbacks &&
+          persistent_after.hits > persistent_before.hits &&
+          persistent_after.misses > persistent_before.misses &&
+          persistent_after.duplicates > persistent_before.duplicates &&
+          persistent_after.free_assignments >
+              persistent_before.free_assignments &&
+          persistent_after.evictions > persistent_before.evictions &&
+          persistent_after.rejects > persistent_before.rejects &&
+          persistent_after.budget_rejects >
+              persistent_before.budget_rejects &&
+          persistent_after.class_rejects >
+              persistent_before.class_rejects &&
+          persistent_after.protected_rejects >
+              persistent_before.protected_rejects &&
+          persistent_after.key_misses > persistent_before.key_misses &&
+          persistent_after.overflow_rejects >
+              persistent_before.overflow_rejects,
+          "persistent expert planner invariant coverage counters");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
+              1, 0, 0, 0, &enabled, &required, &stats) &&
+          enabled == 1 && required == 0 && stats == 0,
+          "IQ2 SSD grouped-MMQ enable policy");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
+              0, 0, 1, 1, &enabled, &required, &stats) &&
+          enabled == 1 && required == 1 && stats == 1,
+          "IQ2 SSD grouped-MMQ require and stats policy");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_policy(
+              1, 1, 1, 1, &enabled, &required, &stats) &&
+          enabled == 0 && required == 0 && stats == 0,
+          "IQ2 SSD grouped-MMQ disable-dominant policy");
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_eligibility(
+              1, 1, 1, 1, 0, 0, 0, 1,
+              32u, 6u, 1, 1, 1),
+          "IQ2 SSD grouped-MMQ canonical eligibility");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 1u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 31u, 6u, 1, 1, 1) &&
+          ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 1, 1, 1),
+          "IQ2 SSD grouped-MMQ REQUIRE candidate excludes decode/tail");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 5u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 0, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 1, 0, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_candidate(
+               1, 1, 1, 0, 32u, 6u, 1, 1, 0),
+          "IQ2 SSD grouped-MMQ REQUIRE excludes non-candidate layouts");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               31u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               32u, 5u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               32u, 6u, 0, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 1, 0, 0, 1,
+               32u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 1, 1,
+               32u, 6u, 1, 1, 1) &&
+          !ds4_cuda_test_iq2_ssd_grouped_eligibility(
+               1, 1, 1, 1, 0, 0, 0, 1,
+               32u, 6u, 1, 1, 0),
+          "IQ2 SSD grouped-MMQ exclusion matrix");
+    const uint64_t iq2_row = 16u * 66u;
+    const uint64_t iq2_expert = 2048u * iq2_row;
+    const uint64_t q2_row = 8u * 84u;
+    const uint64_t q2_expert = 4096u * q2_row;
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+              16u, 10u, iq2_expert, iq2_row,
+              q2_expert, q2_row, 4096u, 2048u, 4096u),
+          "IQ2 SSD grouped-MMQ canonical raw layout");
+    CHECK(!ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+               12u, 10u, iq2_expert, iq2_row,
+               q2_expert, q2_row, 4096u, 2048u, 4096u) &&
+          !ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+               16u, 10u, iq2_expert, iq2_row + 2u,
+               q2_expert, q2_row, 4096u, 2048u, 4096u) &&
+          !ds4_cuda_test_iq2_ssd_grouped_raw_layout(
+               16u, 10u, iq2_expert, iq2_row,
+               q2_expert + 84u, q2_row, 4096u, 2048u, 4096u),
+          "IQ2 SSD grouped-MMQ raw-layout rejection matrix");
+    CHECK(ds4_cuda_test_stream_selected_batch_plan(),
+          "selected-expert batched-I/O planner");
+
     int dev_count = 0;
     (void)cudaGetDeviceCount(&dev_count);
     fprintf(stderr, "test_gpu_model_cache: %d CUDA devices visible\n",
@@ -36,6 +265,109 @@ int main(void) {
     }
 
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
+    ds4_cuda_q8_hc_expand_report q8_hc_before;
+    memset(&q8_hc_before, 0, sizeof(q8_hc_before));
+    ds4_cuda_q8_hc_expand_get_report(&q8_hc_before);
+    CHECK(ds4_cuda_test_q8_hc_expand_oracle(),
+          "Q8 HC fused/split graph-capture parity oracle");
+    ds4_cuda_q8_hc_expand_report q8_hc_after;
+    memset(&q8_hc_after, 0, sizeof(q8_hc_after));
+    ds4_cuda_q8_hc_expand_get_report(&q8_hc_after);
+    CHECK(q8_hc_after.oracle_runs == q8_hc_before.oracle_runs + 1u &&
+          q8_hc_after.oracle_failures == q8_hc_before.oracle_failures,
+          "Q8 HC oracle coverage counters");
+    ds4_gpu_set_streaming_expert_cache_budget(3u);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(40u);
+    CHECK(ds4_gpu_stream_expert_cache_configured_count() == 0u &&
+          ds4_gpu_stream_expert_cache_budget_for_expert_size(16u, 8u) == 0u &&
+          ds4_gpu_stream_expert_cache_current_count() == 0u,
+          "persistent expert arena remains runtime-inert before loader wiring");
+    ds4_cuda_stream_expert_persistent_report arena_before;
+    memset(&arena_before, 0, sizeof(arena_before));
+    ds4_cuda_stream_expert_persistent_get_report(&arena_before);
+    CHECK(ds4_cuda_test_stream_expert_persistent_arena(),
+          "persistent expert device arena allocation/reuse/reinit oracle");
+    ds4_cuda_stream_expert_persistent_report arena_after;
+    memset(&arena_after, 0, sizeof(arena_after));
+    ds4_cuda_stream_expert_persistent_get_report(&arena_after);
+    CHECK(arena_after.arena_allocations >=
+              arena_before.arena_allocations + 2u &&
+          arena_after.arena_reuses > arena_before.arena_reuses &&
+          arena_after.arena_releases >= arena_before.arena_releases + 2u &&
+          arena_after.arena_failures == arena_before.arena_failures &&
+          arena_after.arena_oracle_runs ==
+              arena_before.arena_oracle_runs + 1u &&
+          arena_after.arena_oracle_failures ==
+              arena_before.arena_oracle_failures,
+          "persistent expert device arena coverage counters");
+    ds4_cuda_stream_expert_persistent_report runtime_before;
+    memset(&runtime_before, 0, sizeof(runtime_before));
+    ds4_cuda_stream_expert_persistent_get_report(&runtime_before);
+    CHECK(ds4_cuda_test_stream_expert_persistent_runtime(),
+          "persistent expert cold/hit/mixed/eviction/fault runtime oracle");
+    ds4_cuda_stream_expert_persistent_report runtime_after;
+    memset(&runtime_after, 0, sizeof(runtime_after));
+    ds4_cuda_stream_expert_persistent_get_report(&runtime_after);
+    CHECK(runtime_after.runtime_oracle_runs ==
+              runtime_before.runtime_oracle_runs + 1u &&
+          runtime_after.runtime_oracle_failures ==
+              runtime_before.runtime_oracle_failures &&
+          runtime_after.epochs_attempted >=
+              runtime_before.epochs_attempted + 7u &&
+          runtime_after.epochs_published ==
+              runtime_before.epochs_published + 5u &&
+          runtime_after.all_hit_epochs ==
+              runtime_before.all_hit_epochs + 2u &&
+          runtime_after.miss_epochs == runtime_before.miss_epochs + 3u &&
+          runtime_after.miss_experts >= runtime_before.miss_experts + 5u &&
+          runtime_after.weight_bytes_uploaded >=
+              runtime_before.weight_bytes_uploaded + 200u &&
+          runtime_after.remap_bytes_uploaded >=
+              runtime_before.remap_bytes_uploaded + 44u &&
+          runtime_after.upload_failures ==
+              runtime_before.upload_failures + 1u &&
+          runtime_after.slot_invalidations >=
+              runtime_before.slot_invalidations + 2u &&
+          runtime_after.poisons >= runtime_before.poisons + 1u &&
+          runtime_after.persistent_dispatches >=
+              runtime_before.persistent_dispatches + 5u,
+          "persistent expert runtime coverage counters");
+    ds4_cuda_iq2_ssd_grouped_report lease_before;
+    memset(&lease_before, 0, sizeof(lease_before));
+    ds4_cuda_iq2_ssd_grouped_get_report(&lease_before);
+    CHECK(ds4_cuda_test_iq2_ssd_grouped_lease(),
+          "IQ2 SSD compact-binding consume/reuse lease oracle");
+    ds4_cuda_iq2_ssd_grouped_report lease_after;
+    memset(&lease_after, 0, sizeof(lease_after));
+    ds4_cuda_iq2_ssd_grouped_get_report(&lease_after);
+    CHECK(lease_after.lease_records > lease_before.lease_records &&
+          lease_after.lease_waits > lease_before.lease_waits &&
+          lease_after.lease_drains > lease_before.lease_drains,
+          "IQ2 SSD compact-binding lease coverage counters");
+    CHECK(ds4_cuda_test_stream_selected_event_pipeline(),
+          "selected-expert compute/readback/upload event ordering oracle");
+    ds4_cuda_stream_selected_event_pipeline_report event_report;
+    memset(&event_report, 0, sizeof(event_report));
+    ds4_cuda_stream_selected_event_pipeline_get_report(&event_report);
+    CHECK(event_report.candidates >= 1 &&
+          event_report.signals >= 1 &&
+          event_report.readbacks >= 1 &&
+          event_report.uploads >= 1 &&
+          event_report.compute_waits >= 1 &&
+          event_report.oracle_runs >= 1 &&
+          event_report.oracle_failures == 0,
+          "selected-expert event-pipeline coverage counters");
+    CHECK(ds4_cuda_test_stream_selected_batch_copy(),
+          "selected-expert batched-I/O scatter + byte oracle");
+    ds4_cuda_stream_selected_batch_io_report batch_report;
+    memset(&batch_report, 0, sizeof(batch_report));
+    ds4_cuda_stream_selected_batch_io_get_report(&batch_report);
+    CHECK(batch_report.oracle_runs >= 2 &&
+          batch_report.oracle_failures == 0 &&
+          batch_report.tasks >= 9 &&
+          batch_report.segments >= batch_report.tasks &&
+          batch_report.reads >= 7 && batch_report.bytes >= 18u * 1024u,
+          "selected-expert batched-I/O coverage counters");
 
     /* Build a synthetic 1-MiB "model" in host memory. */
     const size_t total = 1024 * 1024;

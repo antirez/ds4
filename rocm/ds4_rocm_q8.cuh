@@ -104,33 +104,6 @@ __global__ static void matmul_q8_0_preq_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
-__global__ static void matmul_q8_0_preq_warp8_kernel(
-        float *out,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        int use_dp4a) {
-    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
-    uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + row * blocks * 34;
-    float acc = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        uint64_t i0 = b * 32;
-        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        const __half *scale_h = (const __half *)(wr + b * 34);
-        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-        const int8_t *xqb = xq + b * 32;
-        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
-    }
-    acc = warp_sum_f32(acc);
-    if (lane == 0) out[row] = acc;
-}
-
 __global__ static void matmul_q8_0_preq_rows_w32_kernel(
         float *out,
         const unsigned char *w,
@@ -204,56 +177,6 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
-__global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
-        float *out_hc,
-        float *block_out,
-        const float *block_add,
-        const float *residual_hc,
-        const float *split,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint32_t n_embd,
-        uint32_t n_hc,
-        uint64_t blocks,
-        int has_add,
-        int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + row * blocks * 34;
-    float acc = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32;
-        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        const __half *scale_h = (const __half *)(wr + b * 34);
-        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-        const int8_t *xqb = xq + b * 32;
-        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
-    }
-    acc = warp_sum_f32(acc);
-    if (lane == 0) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
-        float block_v = acc;
-        if (has_add) block_v += block_add[d];
-        const float *post = split + n_hc;
-        const float *comb = split + 2u * n_hc;
-        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
-            float hc_acc = block_v * post[dst_hc];
-            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-                const float comb_v = comb[dst_hc + (uint64_t)src_hc * n_hc];
-                const float res_v = residual_hc[(uint64_t)src_hc * n_embd + d];
-                hc_acc += comb_v * res_v;
-            }
-            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
-        }
-    }
-}
-
 __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         float *out,
         const unsigned char *w,
@@ -299,22 +222,6 @@ __device__ static float q8_0_scale_broadcast_w32(const unsigned char *blk) {
 #else
     return __shfl_sync(FULL_WARP_MASK, d, 0, 32);
 #endif
-}
-
-__device__ static float q8_block_sum_w32(float v) {
-    __shared__ float sh[32];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t wid = tid >> 5u;
-    const uint32_t nwarp = (blockDim.x + 31u) >> 5u;
-    v = warp_sum_f32(v);
-    if (lane == 0u) sh[wid] = v;
-    __syncthreads();
-    v = (tid < nwarp) ? sh[lane] : 0.0f;
-    if (wid == 0u) v = warp_sum_f32(v);
-    if (tid == 0u) sh[0] = v;
-    __syncthreads();
-    return sh[0];
 }
 
 __global__ static void matmul_q8_0_f32_warp8_kernel(

@@ -221,6 +221,9 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
+- [Environment variables](ENVIRONMENT_VARIABLES.md): runtime controls and rollback switches.
+- Branch details: [DSpark runtime and testers](docs/BRANCH_DSPARK.md),
+  [SSD and quantized kernels](docs/BRANCH_SSD_KERNELS.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 

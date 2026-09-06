@@ -1168,25 +1168,6 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                               hooks, err, err_len);
 }
 
-bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
-                                       ds4_engine *engine,
-                                       ds4_session *session,
-                                       const ds4_kvstore_trailer_hooks *hooks,
-                                       char *err,
-                                       size_t err_len) {
-    const ds4_tokens *tokens = ds4_session_tokens(session);
-    if (!tokens) return false;
-    const int target = ds4_kvstore_continued_store_target(kc, tokens->len);
-    if (target == 0) return false;
-    if (ds4_kvstore_store_live_prefix(kc, engine, session, tokens, target,
-                                      "continued", hooks, err, err_len))
-    {
-        ds4_kvstore_note_store(kc, target);
-        return true;
-    }
-    return false;
-}
-
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;

@@ -43,7 +43,6 @@ typedef enum {
 bool ds4_dist_enabled(const ds4_dist_options *opt);
 ds4_dist_options *ds4_dist_options_create(void);
 void ds4_dist_options_free(ds4_dist_options *opt);
-void ds4_dist_usage(FILE *fp);
 ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         const char *arg,
         int *index,

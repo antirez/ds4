@@ -866,6 +866,185 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
     ds4_gpu_tensor_free(raw);
 }
 
+#if defined(__APPLE__)
+typedef struct {
+    volatile uint32_t *sequence_count;
+    volatile uint32_t *sequence;
+    volatile uint32_t  calls;
+    uint32_t           marker;
+} test_metal_progress_callback_ctx;
+
+static void test_metal_progress_callback(void *opaque) {
+    test_metal_progress_callback_ctx *ctx = opaque;
+    const uint32_t slot = __atomic_fetch_add(
+        ctx->sequence_count, 1u, __ATOMIC_ACQ_REL);
+    if (slot < 2u) {
+        __atomic_store_n(
+            ctx->sequence + slot, ctx->marker, __ATOMIC_RELEASE);
+    }
+    (void)__atomic_fetch_add(&ctx->calls, 1u, __ATOMIC_ACQ_REL);
+}
+
+static void test_metal_flush_commands_progress_exact(void) {
+    enum {
+        n = 257,
+        guard = 19,
+        alloc_n = n + guard,
+    };
+    const uint64_t active_bytes = (uint64_t)n * sizeof(float);
+    const uint64_t alloc_bytes = (uint64_t)alloc_n * sizeof(float);
+    const uint32_t tmp_poison = 0x7fc1a500u;
+    const uint32_t out_poison = 0x7fc25a00u;
+    float a_host[alloc_n];
+    float b_host[alloc_n];
+    float c_host[alloc_n];
+    float tmp_host[alloc_n];
+    float out_host[alloc_n];
+    float expected_tmp[n];
+    float expected_out[n];
+
+    for (uint32_t i = 0; i < alloc_n; i++) {
+        a_host[i] = (float)((int)(i % 17u) - 8) * 0.5f;
+        b_host[i] = (float)((int)((i * 5u) % 23u) - 11) * 0.25f;
+        c_host[i] = (float)((int)((i * 7u) % 29u) - 14) * 0.125f;
+        const uint32_t tmp_bits = tmp_poison + (i & 0xffu);
+        const uint32_t out_bits = out_poison + (i & 0xffu);
+        memcpy(tmp_host + i, &tmp_bits, sizeof(tmp_bits));
+        memcpy(out_host + i, &out_bits, sizeof(out_bits));
+        if (i < n) {
+            expected_tmp[i] = a_host[i] + b_host[i];
+            expected_out[i] = expected_tmp[i] + c_host[i];
+        }
+    }
+
+    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *c = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *tmp_base = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *out_base = ds4_gpu_tensor_alloc(alloc_bytes);
+    ds4_gpu_tensor *tmp = tmp_base
+        ? ds4_gpu_tensor_view(tmp_base, 0u, active_bytes) : NULL;
+    ds4_gpu_tensor *out = out_base
+        ? ds4_gpu_tensor_view(out_base, 0u, active_bytes) : NULL;
+    TEST_ASSERT(a && b && c && tmp_base && out_base && tmp && out);
+
+    volatile uint32_t sequence_count = 0u;
+    volatile uint32_t sequence[2] = {0u, 0u};
+    test_metal_progress_callback_ctx callback0 = {
+        .sequence_count = &sequence_count,
+        .sequence = sequence,
+        .calls = 0u,
+        .marker = 1u,
+    };
+    test_metal_progress_callback_ctx callback1 = {
+        .sequence_count = &sequence_count,
+        .sequence = sequence,
+        .calls = 0u,
+        .marker = 2u,
+    };
+
+    bool submitted = false;
+    if (a && b && c && tmp_base && out_base && tmp && out) {
+        TEST_ASSERT(ds4_gpu_tensor_write(a, 0u, a_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(b, 0u, b_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(c, 0u, c_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        tmp_base, 0u, tmp_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        out_base, 0u, out_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_commands_active() == 0);
+
+        const int begun = ds4_gpu_begin_commands();
+        TEST_ASSERT(begun != 0);
+        const int first = begun
+            ? ds4_gpu_add_tensor(tmp, a, b, n) : 0;
+        TEST_ASSERT(first != 0);
+        const int flushed0 = first
+            ? ds4_gpu_flush_commands_progress(
+                  test_metal_progress_callback, &callback0)
+            : 0;
+        TEST_ASSERT(flushed0 != 0);
+        const int second = flushed0
+            ? ds4_gpu_add_tensor(out, tmp, c, n) : 0;
+        TEST_ASSERT(second != 0);
+        const int flushed1 = second
+            ? ds4_gpu_flush_commands_progress(
+                  test_metal_progress_callback, &callback1)
+            : 0;
+        TEST_ASSERT(flushed1 != 0);
+        submitted = flushed1 != 0;
+
+        const int drained = ds4_gpu_commands_active()
+            ? ds4_gpu_end_commands() : 0;
+        TEST_ASSERT(drained != 0);
+        TEST_ASSERT(ds4_gpu_commands_active() == 0);
+    }
+
+    test_float_compare_stats tmp_stats = {0};
+    test_float_compare_stats out_stats = {0};
+    size_t guard_mismatches = 0u;
+    if (submitted && tmp_base && out_base) {
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        tmp_base, 0u, tmp_host, alloc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        out_base, 0u, out_host, alloc_bytes) != 0);
+        tmp_stats = test_compare_float_bits(expected_tmp, tmp_host, n);
+        out_stats = test_compare_float_bits(expected_out, out_host, n);
+        for (uint32_t i = n; i < alloc_n; i++) {
+            uint32_t tmp_bits = 0u;
+            uint32_t out_bits = 0u;
+            memcpy(&tmp_bits, tmp_host + i, sizeof(tmp_bits));
+            memcpy(&out_bits, out_host + i, sizeof(out_bits));
+            if (tmp_bits != tmp_poison + (i & 0xffu) ||
+                out_bits != out_poison + (i & 0xffu)) {
+                guard_mismatches++;
+            }
+        }
+    }
+
+    const uint32_t calls0 =
+        __atomic_load_n(&callback0.calls, __ATOMIC_ACQUIRE);
+    const uint32_t calls1 =
+        __atomic_load_n(&callback1.calls, __ATOMIC_ACQUIRE);
+    const uint32_t completed =
+        __atomic_load_n(&sequence_count, __ATOMIC_ACQUIRE);
+    const uint32_t observed0 =
+        __atomic_load_n(sequence + 0u, __ATOMIC_ACQUIRE);
+    const uint32_t observed1 =
+        __atomic_load_n(sequence + 1u, __ATOMIC_ACQUIRE);
+    const bool distinct_contexts =
+        (observed0 == 1u && observed1 == 2u) ||
+        (observed0 == 2u && observed1 == 1u);
+    fprintf(stderr,
+            "ds4-test: Metal progress flush exact callbacks=%u/%u "
+            "completed=%u order=%u,%u tmp=%zu out=%zu guard=%zu\n",
+            calls0, calls1, completed, observed0, observed1,
+            tmp_stats.mismatch_count, out_stats.mismatch_count,
+            guard_mismatches);
+    TEST_ASSERT(calls0 == 1u);
+    TEST_ASSERT(calls1 == 1u);
+    TEST_ASSERT(completed == 2u);
+    /* Completion-handler ordering across different command buffers is not a
+     * public contract.  The dependent tensor result proves GPU submission
+     * order; here only prove that both distinct contexts were delivered. */
+    TEST_ASSERT(distinct_contexts);
+    TEST_ASSERT(tmp_stats.mismatch_count == 0u && tmp_stats.max_ulp == 0u);
+    TEST_ASSERT(out_stats.mismatch_count == 0u && out_stats.max_ulp == 0u);
+    TEST_ASSERT(guard_mismatches == 0u);
+
+    if (ds4_gpu_commands_active()) {
+        TEST_ASSERT(ds4_gpu_end_commands() != 0);
+    }
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(tmp);
+    ds4_gpu_tensor_free(out_base);
+    ds4_gpu_tensor_free(tmp_base);
+    ds4_gpu_tensor_free(c);
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(a);
+}
+#endif
+
 static void test_dspark_cache_window_crop(void) {
     TEST_ASSERT(ds4_test_dspark_cache_window_crop());
 }
@@ -1010,6 +1189,1070 @@ static void test_metal_q8_0_decode_pair_exact(void) {
 }
 
 #if defined(__APPLE__)
+static void test_fill_q4_K_weights(uint8_t *weights,
+                                   uint32_t in_dim,
+                                   uint32_t out_dim,
+                                   uint32_t seed) {
+    /* GGUF Q4_K block: f16 d, f16 dmin, 12 packed scales, 128 quants. */
+    const uint32_t block_elems = 256u;
+    const uint32_t block_bytes = 144u;
+    TEST_ASSERT(weights != NULL);
+    TEST_ASSERT((in_dim % block_elems) == 0u);
+    if (!weights || (in_dim % block_elems) != 0u) return;
+
+    const uint32_t blocks_per_row = in_dim / block_elems;
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < blocks_per_row; block++) {
+            uint8_t *q = weights +
+                ((uint64_t)row * blocks_per_row + block) * block_bytes;
+            const uint32_t key =
+                seed + row * 1009u + block * 313u + (row ^ (block * 17u));
+            const uint16_t d = test_float_to_f16(
+                0.0025f + (float)(key % 13u) / 4096.0f);
+            const uint16_t dmin = test_float_to_f16(
+                0.0010f + (float)((key >> 3u) % 7u) / 8192.0f);
+            memcpy(q + 0u, &d, sizeof(d));
+            memcpy(q + 2u, &dmin, sizeof(dmin));
+            for (uint32_t i = 0; i < 12u; i++) {
+                q[4u + i] = (uint8_t)(
+                    1u + ((key + i * 23u + (i ^ row) * 5u) % 0xfeu));
+            }
+            for (uint32_t i = 0; i < 128u; i++) {
+                q[16u + i] = (uint8_t)(
+                    key + i * 37u + (i >> 2u) * 11u + row * 3u);
+            }
+        }
+    }
+}
+
+static void test_metal_q8_0_decode_rows_exact(void) {
+    /* The exact-N output head must preserve the canonical one-row Q8_0
+     * arithmetic for every speculative row, including the output tail. */
+    const uint32_t in_dim = 4096u;
+    const uint32_t out_dim = 259u;
+    const uint32_t max_rows = 5u;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, page);
+    const uint64_t x_row_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t x_bytes = (uint64_t)max_rows * x_row_bytes;
+    const uint64_t out_bytes = (uint64_t)max_rows * out_row_bytes;
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw,
+                               (size_t)page,
+                               (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+    memset(weights_raw, 0, (size_t)weight_alloc);
+    test_fill_q8_0_weights(weights_raw, in_dim, out_dim, 173u);
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *reference = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *batched = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(reference != NULL);
+    TEST_ASSERT(batched != NULL);
+    if (!x || !reference || !batched) {
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(reference);
+        ds4_gpu_tensor_free(batched);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *reference_host = malloc((size_t)out_bytes);
+    float *batched_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(reference_host != NULL);
+    TEST_ASSERT(batched_host != NULL);
+    if (!x_host || !reference_host || !batched_host) {
+        free(x_host);
+        free(reference_host);
+        free(batched_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(reference);
+        ds4_gpu_tensor_free(batched);
+        free(weights_raw);
+        return;
+    }
+
+    for (uint32_t row = 0; row < max_rows; row++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const uint32_t mix =
+                i * 29u + row * 101u + ((i + row * 17u) ^ (i >> 3u)) * 7u;
+            x_host[(uint64_t)row * in_dim + i] =
+                (float)((int)(mix % 191u) - 95) / 113.0f;
+        }
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+
+    for (uint32_t row = 0; row < max_rows; row++) {
+        ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
+                x, (uint64_t)row * x_row_bytes, x_row_bytes);
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+                reference, (uint64_t)row * out_row_bytes, out_row_bytes);
+        TEST_ASSERT(x_row != NULL);
+        TEST_ASSERT(out_row != NULL);
+        if (x_row && out_row) {
+            TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(
+                            out_row, weights_raw, weight_alloc, 0,
+                            in_dim, out_dim, x_row, 1) != 0);
+        }
+        ds4_gpu_tensor_free(x_row);
+        ds4_gpu_tensor_free(out_row);
+    }
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference, 0, reference_host, out_bytes) != 0);
+
+    for (uint32_t n_rows = 2u; n_rows <= max_rows; n_rows++) {
+        memset(batched_host, 0xa5, (size_t)out_bytes);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        batched, 0, batched_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        batched, weights_raw, weight_alloc, 0,
+                        in_dim, out_dim, x, n_rows) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        batched, 0, batched_host, out_bytes) != 0);
+
+        const size_t compared = (size_t)n_rows * out_dim;
+        const test_float_compare_stats stats = test_compare_float_bits(
+                reference_host, batched_host, compared);
+        if (stats.mismatch_count != 0) {
+            fprintf(stderr,
+                    "ds4-test: Metal Q8_0 exact-%u rows mismatches=%zu/%zu "
+                    "max_ulp=%u max_abs=%g\n",
+                    n_rows,
+                    stats.mismatch_count,
+                    compared,
+                    stats.max_ulp,
+                    stats.max_abs);
+        }
+        TEST_ASSERT(memcmp(reference_host,
+                           batched_host,
+                           compared * sizeof(float)) == 0);
+    }
+
+    free(x_host);
+    free(reference_host);
+    free(batched_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(reference);
+    ds4_gpu_tensor_free(batched);
+    free(weights_raw);
+}
+
+static void test_fill_q8_0_constant_weights(uint8_t *weights,
+                                             uint32_t in_dim,
+                                             uint32_t out_dim,
+                                             int8_t quant) {
+    const uint32_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = (uint64_t)blocks * 34u;
+    const uint16_t scale_bits = test_float_to_f16(1.0f / 256.0f);
+    for (uint32_t row = 0; row < out_dim; row++) {
+        uint8_t *dst = weights + (uint64_t)row * row_bytes;
+        for (uint32_t block = 0; block < blocks; block++) {
+            memcpy(dst + (uint64_t)block * 34u,
+                   &scale_bits,
+                   sizeof(scale_bits));
+            memset(dst + (uint64_t)block * 34u + 2u,
+                   (unsigned char)quant,
+                   32u);
+        }
+    }
+}
+
+static bool test_metal_q8_attention_output_static_batch_exact_case(
+        uint32_t n_tokens) {
+    const int failures_before = test_failures;
+    /*
+     * The production AProjQ8 static kernel receives a flattened z coordinate:
+     *
+     *     pair = token * n_groups + group
+     *
+     * Only pair % n_groups may select Woa.  Keep a second, sign-inverted Woa
+     * immediately after the real one so the old pair-as-group bug is a safe,
+     * deterministic wrong read for token 1 instead of an out-of-bounds Metal
+     * access.  The public batch API also runs the small Q8 output projection;
+     * both its low intermediate and final output must match the generic direct
+     * kernel bit for bit.
+     */
+    const uint32_t group_dim = 4096u;
+    const uint32_t rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t out_dim = 32u;
+    const uint32_t alloc_tokens = n_tokens + 1u;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_a_bytes = (uint64_t)(group_dim / 32u) * 34u;
+    const uint64_t group_a_bytes = (uint64_t)rank * row_a_bytes;
+    const uint64_t out_a_bytes = (uint64_t)n_groups * group_a_bytes;
+    const uint64_t shadow_a_offset = out_a_bytes;
+    const uint64_t out_b_offset = 2u * out_a_bytes;
+    const uint64_t row_b_bytes = (uint64_t)(low_dim / 32u) * 34u;
+    const uint64_t out_b_bytes = (uint64_t)out_dim * row_b_bytes;
+    const uint64_t model_bytes =
+        test_round_up_u64(out_b_offset + out_b_bytes, page);
+    const uint64_t heads_bytes =
+        (uint64_t)alloc_tokens * n_groups * group_dim * sizeof(float);
+    const uint64_t low_bytes =
+        (uint64_t)alloc_tokens * low_dim * sizeof(float);
+    const uint64_t out_bytes =
+        (uint64_t)alloc_tokens * out_dim * sizeof(float);
+    const uint64_t active_low_bytes =
+        (uint64_t)n_tokens * low_dim * sizeof(float);
+    const uint64_t active_out_bytes =
+        (uint64_t)n_tokens * out_dim * sizeof(float);
+    const char *disable_direct_env =
+        "DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT";
+    const char *disable_ports_env =
+        "DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS";
+    const char *disable_static_env =
+        "DS4_METAL_DISABLE_PRE_M5_ATTN_OUT_LOW_Q8_STATIC";
+
+    _Static_assert(4096u / 32u * 34u == 4352u,
+                   "production AProjQ8 row size changed");
+    _Static_assert(8u * 1024u * 4352u == 35651584u,
+                   "production AProjQ8 Woa size changed");
+
+    char *saved_disable_direct = test_save_env(disable_direct_env);
+    char *saved_disable_ports = test_save_env(disable_ports_env);
+    char *saved_disable_static = test_save_env(disable_static_env);
+    void *model_raw = NULL;
+    float *heads_host = NULL;
+    float *reference_low_host = NULL;
+    float *candidate_low_host = NULL;
+    float *reference_out_host = NULL;
+    float *candidate_out_host = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *reference_low = NULL;
+    ds4_gpu_tensor *candidate_low = NULL;
+    ds4_gpu_tensor *reference_out = NULL;
+    ds4_gpu_tensor *candidate_out = NULL;
+    ds4_gpu_tensor *group_tmp = NULL;
+    ds4_gpu_tensor *low_tmp = NULL;
+
+    TEST_ASSERT(row_a_bytes == 4352u);
+    TEST_ASSERT(out_a_bytes == 35651584u);
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    if (!model_raw) goto cleanup;
+    memset(model_raw, 0, (size_t)model_bytes);
+    for (uint32_t group = 0; group < n_groups; group++) {
+        test_fill_q8_0_constant_weights(
+            (uint8_t *)model_raw + (uint64_t)group * group_a_bytes,
+            group_dim,
+            rank,
+            (int8_t)(group + 1u));
+        test_fill_q8_0_constant_weights(
+            (uint8_t *)model_raw + shadow_a_offset +
+                (uint64_t)group * group_a_bytes,
+            group_dim,
+            rank,
+            (int8_t)-(int8_t)(group + 1u));
+    }
+    test_fill_q8_0_constant_weights(
+        (uint8_t *)model_raw + out_b_offset,
+        low_dim,
+        out_dim,
+        1);
+
+    heads_host = malloc((size_t)heads_bytes);
+    reference_low_host = malloc((size_t)low_bytes);
+    candidate_low_host = malloc((size_t)low_bytes);
+    reference_out_host = malloc((size_t)out_bytes);
+    candidate_out_host = malloc((size_t)out_bytes);
+    heads = ds4_gpu_tensor_alloc(heads_bytes);
+    reference_low = ds4_gpu_tensor_alloc(low_bytes);
+    candidate_low = ds4_gpu_tensor_alloc(low_bytes);
+    reference_out = ds4_gpu_tensor_alloc(out_bytes);
+    candidate_out = ds4_gpu_tensor_alloc(out_bytes);
+    group_tmp = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * group_dim * sizeof(float));
+    low_tmp = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * rank * sizeof(float));
+    TEST_ASSERT(heads_host && reference_low_host && candidate_low_host &&
+                reference_out_host && candidate_out_host && heads &&
+                reference_low && candidate_low && reference_out &&
+                candidate_out && group_tmp && low_tmp);
+    if (!heads_host || !reference_low_host || !candidate_low_host ||
+        !reference_out_host || !candidate_out_host || !heads ||
+        !reference_low || !candidate_low || !reference_out ||
+        !candidate_out || !group_tmp || !low_tmp) {
+        goto cleanup;
+    }
+
+    for (uint64_t i = 0; i < heads_bytes / sizeof(float); i++) {
+        const uint32_t token = (uint32_t)(i / ((uint64_t)n_groups * group_dim));
+        const uint32_t key =
+            (uint32_t)i * 17u + token * 131u + ((uint32_t)i >> 4u);
+        heads_host[i] = (float)(1u + key % 13u) / 128.0f;
+    }
+    memset(reference_low_host, 0xa5, (size_t)low_bytes);
+    memset(candidate_low_host, 0xa5, (size_t)low_bytes);
+    memset(reference_out_host, 0xa5, (size_t)out_bytes);
+    memset(candidate_out_host, 0xa5, (size_t)out_bytes);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    heads, 0, heads_host, heads_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    reference_low, 0, reference_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    candidate_low, 0, candidate_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    reference_out, 0, reference_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    candidate_out, 0, candidate_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+    ds4_gpu_set_quality(false);
+
+    TEST_ASSERT(unsetenv(disable_direct_env) == 0);
+    TEST_ASSERT(unsetenv(disable_ports_env) == 0);
+    TEST_ASSERT(unsetenv(disable_static_env) == 0);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_ATTN_OUT_LOW_Q8_STATIC);
+    TEST_ASSERT(ds4_gpu_attention_output_q8_batch_tensor(
+                    candidate_out,
+                    candidate_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    n_tokens) == 1);
+
+    ds4_gpu_test_set_flags(0);
+    TEST_ASSERT(setenv(disable_static_env, "1", 1) == 0);
+    TEST_ASSERT(ds4_gpu_attention_output_q8_batch_tensor(
+                    reference_out,
+                    reference_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    n_tokens) == 1);
+
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference_low, 0, reference_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    candidate_low, 0, candidate_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference_out, 0, reference_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    candidate_out, 0, candidate_out_host, out_bytes) != 0);
+
+    const size_t low_count = (size_t)n_tokens * low_dim;
+    const size_t out_count = (size_t)n_tokens * out_dim;
+    const test_float_compare_stats low_stats = test_compare_float_bits(
+        reference_low_host, candidate_low_host, low_count);
+    const test_float_compare_stats out_stats = test_compare_float_bits(
+        reference_out_host, candidate_out_host, out_count);
+    size_t tail_byte_mismatch = 0;
+    for (uint64_t i = active_low_bytes; i < low_bytes; i++) {
+        if (((const uint8_t *)reference_low_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+        if (((const uint8_t *)candidate_low_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+    }
+    for (uint64_t i = active_out_bytes; i < out_bytes; i++) {
+        if (((const uint8_t *)reference_out_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+        if (((const uint8_t *)candidate_out_host)[i] != 0xa5u) {
+            tail_byte_mismatch++;
+        }
+    }
+    fprintf(stderr,
+            "ds4-test: Metal Q8 static attention-output exact-%u "
+            "low=%zu/%zu max_ulp=%u max_abs=%g "
+            "out=%zu/%zu max_ulp=%u max_abs=%g tail_bytes=%zu\n",
+            n_tokens,
+            low_stats.mismatch_count,
+            low_count,
+            low_stats.max_ulp,
+            low_stats.max_abs,
+            out_stats.mismatch_count,
+            out_count,
+            out_stats.max_ulp,
+            out_stats.max_abs,
+            tail_byte_mismatch);
+    TEST_ASSERT(low_stats.mismatch_count == 0 && low_stats.max_ulp == 0);
+    TEST_ASSERT(out_stats.mismatch_count == 0 && out_stats.max_ulp == 0);
+    TEST_ASSERT(tail_byte_mismatch == 0);
+
+cleanup:
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(low_tmp);
+    ds4_gpu_tensor_free(group_tmp);
+    ds4_gpu_tensor_free(candidate_out);
+    ds4_gpu_tensor_free(reference_out);
+    ds4_gpu_tensor_free(candidate_low);
+    ds4_gpu_tensor_free(reference_low);
+    ds4_gpu_tensor_free(heads);
+    free(candidate_out_host);
+    free(reference_out_host);
+    free(candidate_low_host);
+    free(reference_low_host);
+    free(heads_host);
+    free(model_raw);
+    test_restore_env(disable_static_env, saved_disable_static);
+    test_restore_env(disable_ports_env, saved_disable_ports);
+    test_restore_env(disable_direct_env, saved_disable_direct);
+    return test_failures == failures_before;
+}
+
+static void test_metal_q8_attention_output_static_batch_exact(void) {
+    /* The shadow Woa makes the old bug safe at N=2; stop there on failure. */
+    if (test_metal_q8_attention_output_static_batch_exact_case(2u)) {
+        (void)test_metal_q8_attention_output_static_batch_exact_case(31u);
+    }
+}
+
+static void test_metal_q4_attention_output_tiny_batch_exact_case(
+        uint32_t out_b_type) {
+    /*
+     * The opt-in AProjQ4 tiny batch must be the exact composition of the two
+     * canonical one-row projections for both deployed output quantizations.
+     * Keep a sixth poisoned row in every destination so each N=2..5 case also
+     * checks dispatch bounds.
+     */
+    TEST_ASSERT(out_b_type == 8u || out_b_type == 12u);
+    if (out_b_type != 8u && out_b_type != 12u) return;
+    const uint32_t group_dim = 256u;
+    const uint32_t rank = 128u;
+    const uint32_t n_groups = 2u;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t out_dim = 67u;
+    const uint32_t max_rows = 5u;
+    const uint32_t alloc_rows = max_rows + 1u;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_a_bytes = (uint64_t)(group_dim / 256u) * 144u;
+    const uint64_t out_a_bytes =
+        (uint64_t)n_groups * rank * row_a_bytes;
+    const uint64_t out_b_offset = test_round_up_u64(out_a_bytes, page);
+    const uint64_t row_b_bytes = out_b_type == 8u
+        ? (uint64_t)(low_dim / 32u) * 34u
+        : (uint64_t)(low_dim / 256u) * 144u;
+    const uint64_t out_b_bytes = (uint64_t)out_dim * row_b_bytes;
+    const uint64_t model_bytes =
+        test_round_up_u64(out_b_offset + out_b_bytes, page);
+    const uint64_t heads_row_bytes =
+        (uint64_t)n_groups * group_dim * sizeof(float);
+    const uint64_t low_row_bytes = (uint64_t)low_dim * sizeof(float);
+    const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t heads_bytes = (uint64_t)alloc_rows * heads_row_bytes;
+    const uint64_t low_bytes = (uint64_t)alloc_rows * low_row_bytes;
+    const uint64_t out_bytes = (uint64_t)alloc_rows * out_row_bytes;
+    const char *enable_env =
+        "DS4_METAL_ENABLE_Q4_ATTN_OUT_TINY_BATCH";
+    const char *disable_env =
+        "DS4_METAL_DISABLE_Q4_ATTN_OUT_TINY_BATCH";
+    const char *require_env =
+        "DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH";
+    const char *disable_classic_env =
+        "DS4_METAL_DISABLE_Q4_MV_CLASSIC";
+
+    char *saved_enable = test_save_env(enable_env);
+    char *saved_disable = test_save_env(disable_env);
+    char *saved_require = test_save_env(require_env);
+    char *saved_disable_classic = test_save_env(disable_classic_env);
+    void *model_raw = NULL;
+    float *heads_host = NULL;
+    float *reference_low_host = NULL;
+    float *reference_out_host = NULL;
+    float *candidate_low_host = NULL;
+    float *candidate_out_host = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *reference_low = NULL;
+    ds4_gpu_tensor *reference_out = NULL;
+    ds4_gpu_tensor *candidate_low = NULL;
+    ds4_gpu_tensor *candidate_out = NULL;
+    ds4_gpu_tensor *group_tmp = NULL;
+    ds4_gpu_tensor *low_tmp = NULL;
+
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    if (!model_raw) goto cleanup;
+    memset(model_raw, 0, (size_t)model_bytes);
+    test_fill_q4_K_weights((uint8_t *)model_raw,
+                           group_dim,
+                           n_groups * rank,
+                           211u);
+    if (out_b_type == 8u) {
+        test_fill_q8_0_weights(
+            (uint8_t *)model_raw + out_b_offset, low_dim, out_dim, 307u);
+    } else {
+        test_fill_q4_K_weights(
+            (uint8_t *)model_raw + out_b_offset, low_dim, out_dim, 307u);
+    }
+
+    heads_host = malloc((size_t)heads_bytes);
+    reference_low_host = malloc((size_t)low_bytes);
+    reference_out_host = malloc((size_t)out_bytes);
+    candidate_low_host = malloc((size_t)low_bytes);
+    candidate_out_host = malloc((size_t)out_bytes);
+    heads = ds4_gpu_tensor_alloc(heads_bytes);
+    reference_low = ds4_gpu_tensor_alloc(low_bytes);
+    reference_out = ds4_gpu_tensor_alloc(out_bytes);
+    candidate_low = ds4_gpu_tensor_alloc(low_bytes);
+    candidate_out = ds4_gpu_tensor_alloc(out_bytes);
+    group_tmp = ds4_gpu_tensor_alloc(
+        (uint64_t)alloc_rows * group_dim * sizeof(float));
+    low_tmp = ds4_gpu_tensor_alloc(
+        (uint64_t)alloc_rows * rank * sizeof(float));
+    TEST_ASSERT(heads_host && reference_low_host && reference_out_host &&
+                candidate_low_host && candidate_out_host && heads &&
+                reference_low && reference_out && candidate_low &&
+                candidate_out && group_tmp && low_tmp);
+    if (!heads_host || !reference_low_host || !reference_out_host ||
+        !candidate_low_host || !candidate_out_host || !heads ||
+        !reference_low || !reference_out || !candidate_low ||
+        !candidate_out || !group_tmp || !low_tmp) {
+        goto cleanup;
+    }
+
+    for (uint32_t row = 0; row < alloc_rows; row++) {
+        for (uint32_t i = 0; i < n_groups * group_dim; i++) {
+            const uint32_t key =
+                i * 41u + row * 271u + ((i >> 2u) ^ (row * 19u));
+            heads_host[(uint64_t)row * n_groups * group_dim + i] =
+                (float)((int)(key % 257u) - 128) / 137.0f;
+        }
+    }
+    memset(reference_low_host, 0, (size_t)low_bytes);
+    memset(reference_out_host, 0, (size_t)out_bytes);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    heads, 0, heads_host, heads_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    reference_low, 0, reference_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    reference_out, 0, reference_out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+    ds4_gpu_set_quality(false);
+    TEST_ASSERT(unsetenv(disable_classic_env) == 0);
+
+    for (uint32_t row = 0; row < max_rows; row++) {
+        ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view(
+            heads, (uint64_t)row * heads_row_bytes, heads_row_bytes);
+        ds4_gpu_tensor *low_row = ds4_gpu_tensor_view(
+            reference_low, (uint64_t)row * low_row_bytes, low_row_bytes);
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            reference_out, (uint64_t)row * out_row_bytes, out_row_bytes);
+        TEST_ASSERT(heads_row && low_row && out_row);
+        if (heads_row && low_row && out_row) {
+            TEST_ASSERT(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                            low_row,
+                            model_raw,
+                            model_bytes,
+                            0,
+                            group_dim,
+                            rank,
+                            0,
+                            n_groups,
+                            heads_row,
+                            0) != 0);
+            if (out_b_type == 8u) {
+                TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(
+                                out_row,
+                                model_raw,
+                                model_bytes,
+                                out_b_offset,
+                                low_dim,
+                                out_dim,
+                                low_row,
+                                1) != 0);
+            } else {
+                TEST_ASSERT(ds4_gpu_matmul_quant_tensor(
+                                out_row,
+                                model_raw,
+                                model_bytes,
+                                out_b_offset,
+                                out_b_type,
+                                low_dim,
+                                out_dim,
+                                low_row,
+                                1) != 0);
+            }
+        }
+        ds4_gpu_tensor_free(heads_row);
+        ds4_gpu_tensor_free(low_row);
+        ds4_gpu_tensor_free(out_row);
+    }
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference_low, 0, reference_low_host, low_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(
+                    reference_out, 0, reference_out_host, out_bytes) != 0);
+
+    /* The API itself is fail-closed; the graph caller owns the row fallback. */
+    TEST_ASSERT(unsetenv(enable_env) == 0);
+    TEST_ASSERT(unsetenv(disable_env) == 0);
+    TEST_ASSERT(unsetenv(require_env) == 0);
+    TEST_ASSERT(ds4_gpu_attention_output_q4_K_batch_tensor(
+                    candidate_out,
+                    candidate_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    out_b_type,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    2u) == 0);
+
+    TEST_ASSERT(setenv(enable_env, "1", 1) == 0);
+    for (uint32_t n_rows = 2u; n_rows <= max_rows; n_rows++) {
+        for (uint64_t i = 0; i < (uint64_t)alloc_rows * low_dim; i++) {
+            const uint32_t bits = 0x7fc10000u + (uint32_t)(i & 0xffffu);
+            memcpy(&candidate_low_host[i], &bits, sizeof(bits));
+        }
+        for (uint64_t i = 0; i < (uint64_t)alloc_rows * out_dim; i++) {
+            const uint32_t bits = 0x7fc20000u + (uint32_t)(i & 0xffffu);
+            memcpy(&candidate_out_host[i], &bits, sizeof(bits));
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        candidate_low, 0, candidate_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        candidate_out, 0, candidate_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_attention_output_q4_K_batch_tensor(
+                        candidate_out,
+                        candidate_low,
+                        group_tmp,
+                        low_tmp,
+                        model_raw,
+                        model_bytes,
+                        0,
+                        out_b_offset,
+                        out_b_type,
+                        group_dim,
+                        rank,
+                        n_groups,
+                        out_dim,
+                        heads,
+                        n_rows) == 1);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        candidate_low, 0, candidate_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        candidate_out, 0, candidate_out_host, out_bytes) != 0);
+
+        const size_t low_count = (size_t)n_rows * low_dim;
+        const size_t out_count = (size_t)n_rows * out_dim;
+        const test_float_compare_stats low_stats = test_compare_float_bits(
+            reference_low_host, candidate_low_host, low_count);
+        const test_float_compare_stats out_stats = test_compare_float_bits(
+            reference_out_host, candidate_out_host, out_count);
+        size_t low_oob_mismatch = 0;
+        size_t out_oob_mismatch = 0;
+        for (uint64_t i = (uint64_t)n_rows * low_dim;
+             i < (uint64_t)alloc_rows * low_dim;
+             i++) {
+            uint32_t bits = 0;
+            memcpy(&bits, &candidate_low_host[i], sizeof(bits));
+            if (bits != 0x7fc10000u + (uint32_t)(i & 0xffffu)) {
+                low_oob_mismatch++;
+            }
+        }
+        for (uint64_t i = (uint64_t)n_rows * out_dim;
+             i < (uint64_t)alloc_rows * out_dim;
+             i++) {
+            uint32_t bits = 0;
+            memcpy(&bits, &candidate_out_host[i], sizeof(bits));
+            if (bits != 0x7fc20000u + (uint32_t)(i & 0xffffu)) {
+                out_oob_mismatch++;
+            }
+        }
+        fprintf(stderr,
+                "ds4-test: Metal Q4 attention-output out_b=%s exact-%u "
+                "low=%zu/%zu out=%zu/%zu low_oob=%zu out_oob=%zu\n",
+                out_b_type == 8u ? "Q8_0" : "Q4_K",
+                n_rows,
+                low_stats.mismatch_count,
+                low_count,
+                out_stats.mismatch_count,
+                out_count,
+                low_oob_mismatch,
+                out_oob_mismatch);
+        TEST_ASSERT(low_stats.mismatch_count == 0 && low_stats.max_ulp == 0);
+        TEST_ASSERT(out_stats.mismatch_count == 0 && out_stats.max_ulp == 0);
+        TEST_ASSERT(low_oob_mismatch == 0);
+        TEST_ASSERT(out_oob_mismatch == 0);
+    }
+
+    /* REQUIRE is a fail-closed model-oracle gate and implies enable for the
+     * exact N=2..5 scope. */
+    TEST_ASSERT(unsetenv(enable_env) == 0);
+    TEST_ASSERT(setenv(require_env, "1", 1) == 0);
+    TEST_ASSERT(ds4_gpu_attention_output_q4_K_batch_tensor(
+                    candidate_out,
+                    candidate_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    out_b_type,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    2u) == 1);
+
+    if (out_b_type == 12u) {
+        /* A required candidate must hard-fail rather than bypass an explicit
+         * request for the alternate Q4 schedule. */
+        TEST_ASSERT(unsetenv(disable_env) == 0);
+        TEST_ASSERT(setenv(disable_classic_env, "1", 1) == 0);
+        TEST_ASSERT(ds4_gpu_attention_output_q4_K_batch_tensor(
+                        candidate_out,
+                        candidate_low,
+                        group_tmp,
+                        low_tmp,
+                        model_raw,
+                        model_bytes,
+                        0,
+                        out_b_offset,
+                        out_b_type,
+                        group_dim,
+                        rank,
+                        n_groups,
+                        out_dim,
+                        heads,
+                        2u) == -1);
+        TEST_ASSERT(unsetenv(disable_classic_env) == 0);
+    }
+
+    /* The unconditional kill switch wins over REQUIRE and makes the
+     * model-oracle run fail instead of silently selecting the fallback. */
+    TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+    TEST_ASSERT(ds4_gpu_attention_output_q4_K_batch_tensor(
+                    candidate_out,
+                    candidate_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    out_b_type,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    2u) == -1);
+
+    /* Without REQUIRE the same kill switch retains the ordinary fallback. */
+    TEST_ASSERT(unsetenv(require_env) == 0);
+    TEST_ASSERT(setenv(enable_env, "1", 1) == 0);
+    TEST_ASSERT(ds4_gpu_attention_output_q4_K_batch_tensor(
+                    candidate_out,
+                    candidate_low,
+                    group_tmp,
+                    low_tmp,
+                    model_raw,
+                    model_bytes,
+                    0,
+                    out_b_offset,
+                    out_b_type,
+                    group_dim,
+                    rank,
+                    n_groups,
+                    out_dim,
+                    heads,
+                    2u) == 0);
+
+cleanup:
+    ds4_gpu_tensor_free(low_tmp);
+    ds4_gpu_tensor_free(group_tmp);
+    ds4_gpu_tensor_free(candidate_out);
+    ds4_gpu_tensor_free(candidate_low);
+    ds4_gpu_tensor_free(reference_out);
+    ds4_gpu_tensor_free(reference_low);
+    ds4_gpu_tensor_free(heads);
+    free(candidate_out_host);
+    free(candidate_low_host);
+    free(reference_out_host);
+    free(reference_low_host);
+    free(heads_host);
+    free(model_raw);
+    test_restore_env(disable_classic_env, saved_disable_classic);
+    test_restore_env(require_env, saved_require);
+    test_restore_env(disable_env, saved_disable);
+    test_restore_env(enable_env, saved_enable);
+}
+
+static void test_metal_q4_attention_output_tiny_batch_exact(void) {
+    test_metal_q4_attention_output_tiny_batch_exact_case(8u);
+    test_metal_q4_attention_output_tiny_batch_exact_case(12u);
+}
+
+static void test_metal_dspark_device_proposer_q8(void) {
+    /* Keep this fixture small while exercising the complete public contract:
+     * six on-device draft steps, a confidence stop after a verified prefix,
+     * and stable lowest-token tie breaking in the Markov argmax. */
+    _Static_assert(sizeof(ds4_gpu_dspark_device_proposal) == 64u,
+                   "DSpark device proposal ABI must stay 64 bytes");
+    _Static_assert(DS4_GPU_DSPARK_MAX_DRAFTS == 6u,
+                   "DSpark device proposer test covers the six-token limit");
+    _Static_assert(offsetof(ds4_gpu_dspark_device_proposal, tokens) == 0u &&
+                   offsetof(ds4_gpu_dspark_device_proposal,
+                            confidence_logits) == 24u &&
+                   offsetof(ds4_gpu_dspark_device_proposal,
+                            proposal_len) == 48u &&
+                   offsetof(ds4_gpu_dspark_device_proposal,
+                            confidence_len) == 52u &&
+                   offsetof(ds4_gpu_dspark_device_proposal, status) == 56u &&
+                   offsetof(ds4_gpu_dspark_device_proposal, reserved) == 60u,
+                   "DSpark device proposal field offsets changed");
+
+    const uint32_t vocab = 64u;
+    const uint32_t rank = 32u;
+    const uint32_t hidden_dim = 32u;
+    const uint32_t max_drafts = DS4_GPU_DSPARK_MAX_DRAFTS;
+    const uint32_t first_prev_token = 17u;
+    const uint32_t tied_token_lo = 3u;
+    const uint32_t tied_token_hi = 11u;
+    const float reused_confidence = 8.0f;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t markov_row_bytes = (uint64_t)(rank / 32u) * 34u;
+    const uint64_t markov_bytes = (uint64_t)vocab * markov_row_bytes;
+    const uint64_t confidence_bytes =
+        (uint64_t)((hidden_dim + rank) / 32u) * 34u;
+    const uint64_t w1_offset = 0u;
+    const uint64_t w2_offset = test_round_up_u64(markov_bytes, page);
+    const uint64_t confidence_offset =
+        test_round_up_u64(w2_offset + markov_bytes, page);
+    const uint64_t model_bytes = test_round_up_u64(
+        confidence_offset + confidence_bytes, page);
+    const uint64_t logits_bytes =
+        (uint64_t)max_drafts * vocab * sizeof(float);
+    const uint64_t hidden_bytes =
+        (uint64_t)max_drafts * hidden_dim * sizeof(float);
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw,
+                               (size_t)page,
+                               (size_t)model_bytes) == 0);
+    if (!model_raw) return;
+    /* Zero is a valid Q8_0 block (zero half scale and zero quants).  It makes
+     * every Markov correction and computed confidence exactly zero while the
+     * kernels still traverse all Q8 blocks. */
+    memset(model_raw, 0, (size_t)model_bytes);
+
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_alloc(logits_bytes);
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_alloc(hidden_bytes);
+    ds4_gpu_tensor *result =
+        ds4_gpu_tensor_alloc(DS4_GPU_DSPARK_DEVICE_PROPOSAL_BYTES);
+    TEST_ASSERT(logits != NULL);
+    TEST_ASSERT(hidden != NULL);
+    TEST_ASSERT(result != NULL);
+    if (!logits || !hidden || !result) {
+        ds4_gpu_tensor_free(logits);
+        ds4_gpu_tensor_free(hidden);
+        ds4_gpu_tensor_free(result);
+        free(model_raw);
+        return;
+    }
+
+    float *logits_host = malloc((size_t)logits_bytes);
+    float *hidden_host = malloc((size_t)hidden_bytes);
+    TEST_ASSERT(logits_host != NULL);
+    TEST_ASSERT(hidden_host != NULL);
+    if (!logits_host || !hidden_host) {
+        free(logits_host);
+        free(hidden_host);
+        ds4_gpu_tensor_free(logits);
+        ds4_gpu_tensor_free(hidden);
+        ds4_gpu_tensor_free(result);
+        free(model_raw);
+        return;
+    }
+
+    for (uint32_t draft = 0u; draft < max_drafts; draft++) {
+        for (uint32_t token = 0u; token < vocab; token++) {
+            logits_host[(uint64_t)draft * vocab + token] =
+                -4.0f - (float)(token % 7u) * 0.03125f;
+        }
+        logits_host[(uint64_t)draft * vocab + tied_token_lo] = 5.0f;
+        logits_host[(uint64_t)draft * vocab + tied_token_hi] = 5.0f;
+        for (uint32_t i = 0u; i < hidden_dim; i++) {
+            hidden_host[(uint64_t)draft * hidden_dim + i] =
+                (float)((int)((draft * 19u + i * 13u) % 37u) - 18) / 23.0f;
+        }
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    logits, 0, logits_host, logits_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    hidden, 0, hidden_host, hidden_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+    ds4_gpu_set_quality(false);
+
+    char *saved_enable =
+        test_save_env("DS4_METAL_DSPARK_DEVICE_PROPOSER");
+    char *saved_kill =
+        test_save_env("DS4_METAL_DSPARK_NO_DEVICE_PROPOSER");
+    setenv("DS4_METAL_DSPARK_DEVICE_PROPOSER", "1", 1);
+    unsetenv("DS4_METAL_DSPARK_NO_DEVICE_PROPOSER");
+
+    ds4_gpu_dspark_device_proposal public_result;
+    bool full_six_ok = false;
+    for (uint32_t n_drafts = 1u; n_drafts <= max_drafts; n_drafts++) {
+        memset(&public_result, 0xa5, sizeof(public_result));
+        TEST_ASSERT(ds4_gpu_tensor_write(result,
+                                          0,
+                                          &public_result,
+                                          sizeof(public_result)) != 0);
+        const int ok = ds4_gpu_dspark_markov_confidence_q8_tensor(
+                result,
+                logits,
+                hidden,
+                model_raw,
+                model_bytes,
+                w1_offset,
+                w2_offset,
+                confidence_offset,
+                first_prev_token,
+                vocab,
+                rank,
+                hidden_dim,
+                n_drafts,
+                0.25f,
+                1,
+                reused_confidence);
+        TEST_ASSERT(ok != 0);
+        if (!ok) break;
+        TEST_ASSERT(ds4_gpu_tensor_read(result,
+                                         0,
+                                         &public_result,
+                                         sizeof(public_result)) != 0);
+        TEST_ASSERT(public_result.status == 1u);
+        TEST_ASSERT(public_result.reserved == 0u);
+        TEST_ASSERT(public_result.proposal_len == n_drafts);
+        TEST_ASSERT(public_result.confidence_len == n_drafts);
+        for (uint32_t i = 0u; i < max_drafts; i++) {
+            if (i < n_drafts) {
+                TEST_ASSERT(public_result.tokens[i] ==
+                            (int32_t)tied_token_lo);
+                TEST_ASSERT(public_result.confidence_logits[i] ==
+                            (i == 0u ? reused_confidence : 0.0f));
+            } else {
+                TEST_ASSERT(public_result.tokens[i] == -1);
+                TEST_ASSERT(public_result.confidence_logits[i] == 0.0f);
+            }
+        }
+        if (n_drafts == max_drafts) full_six_ok = true;
+    }
+    TEST_ASSERT(full_six_ok);
+
+    /* Draft zero passes via the supplied confidence.  Draft one computes a
+     * zero logit (p=0.5), fails the 0.75 threshold, and therefore leaves a
+     * one-token proposal with two evaluated confidence rows. */
+    memset(&public_result, 0xa5, sizeof(public_result));
+    TEST_ASSERT(ds4_gpu_tensor_write(result,
+                                      0,
+                                      &public_result,
+                                      sizeof(public_result)) != 0);
+    const int stop_ok = ds4_gpu_dspark_markov_confidence_q8_tensor(
+            result,
+            logits,
+            hidden,
+            model_raw,
+            model_bytes,
+            w1_offset,
+            w2_offset,
+            confidence_offset,
+            first_prev_token,
+            vocab,
+            rank,
+            hidden_dim,
+            max_drafts,
+            0.75f,
+            1,
+            reused_confidence);
+    TEST_ASSERT(stop_ok != 0);
+    if (stop_ok) {
+        TEST_ASSERT(ds4_gpu_tensor_read(result,
+                                         0,
+                                         &public_result,
+                                         sizeof(public_result)) != 0);
+        TEST_ASSERT(public_result.status == 1u);
+        TEST_ASSERT(public_result.reserved == 0u);
+        TEST_ASSERT(public_result.proposal_len == 1u);
+        TEST_ASSERT(public_result.confidence_len == 2u);
+        TEST_ASSERT(public_result.tokens[0] == (int32_t)tied_token_lo);
+        TEST_ASSERT(public_result.confidence_logits[0] == reused_confidence);
+        TEST_ASSERT(public_result.confidence_logits[1] == 0.0f);
+        for (uint32_t i = 1u; i < max_drafts; i++) {
+            TEST_ASSERT(public_result.tokens[i] == -1);
+            if (i > 1u) {
+                TEST_ASSERT(public_result.confidence_logits[i] == 0.0f);
+            }
+        }
+    }
+
+    setenv("DS4_METAL_DSPARK_NO_DEVICE_PROPOSER", "1", 1);
+    TEST_ASSERT(ds4_gpu_dspark_markov_confidence_q8_tensor(
+                    result,
+                    logits,
+                    hidden,
+                    model_raw,
+                    model_bytes,
+                    w1_offset,
+                    w2_offset,
+                    confidence_offset,
+                    first_prev_token,
+                    vocab,
+                    rank,
+                    hidden_dim,
+                    1u,
+                    0.25f,
+                    1,
+                    reused_confidence) == 0);
+    test_restore_env("DS4_METAL_DSPARK_NO_DEVICE_PROPOSER", saved_kill);
+    test_restore_env("DS4_METAL_DSPARK_DEVICE_PROPOSER", saved_enable);
+
+    fprintf(stderr,
+            "ds4-test: Metal DSpark device proposer full6=%d stop_prefix=%u "
+            "confidence_rows=%u tie=%u<%u\n",
+            full_six_ok ? 1 : 0,
+            stop_ok ? public_result.proposal_len : 0u,
+            stop_ok ? public_result.confidence_len : 0u,
+            tied_token_lo,
+            tied_token_hi);
+
+    free(logits_host);
+    free(hidden_host);
+    ds4_gpu_tensor_free(logits);
+    ds4_gpu_tensor_free(hidden);
+    ds4_gpu_tensor_free(result);
+    free(model_raw);
+}
+
 static void test_metal_f16_compressor_pair_state_store_exact_case(
         uint32_t width,
         uint32_t ratio,
@@ -1393,6 +2636,669 @@ static void test_metal_f16_compressor_pair_state_store_exact(void) {
         1024, 4, 11, 1, 29, true);
     test_metal_f16_compressor_pair_state_store_exact_case(
         512, 128, 255, 1, 43, false);
+}
+
+static void test_metal_f16_compressor_quad_state_store_exact_case(
+        uint32_t width0,
+        uint32_t pos,
+        uint32_t ape0_type,
+        uint32_t ape1_type,
+        uint32_t seed) {
+    const uint32_t in_dim = 4096u;
+    const uint32_t ratio = 4u;
+    const uint32_t width1 = 256u;
+    const uint32_t state_rows = 2u * ratio;
+    const uint32_t widths[4] = {width0, width0, width1, width1};
+    const uint32_t ape_types[2] = {ape0_type, ape1_type};
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t weight_bytes[4] = {
+        (uint64_t)width0 * in_dim * sizeof(uint16_t),
+        (uint64_t)width0 * in_dim * sizeof(uint16_t),
+        (uint64_t)width1 * in_dim * sizeof(uint16_t),
+        (uint64_t)width1 * in_dim * sizeof(uint16_t),
+    };
+    uint64_t weight_offsets[4] = {0};
+    for (uint32_t i = 1; i < 4u; i++) {
+        weight_offsets[i] = test_round_up_u64(
+            weight_offsets[i - 1u] + weight_bytes[i - 1u], page);
+    }
+    const uint64_t ape0_offset = test_round_up_u64(
+        weight_offsets[3] + weight_bytes[3], page);
+    const uint64_t ape0_bytes = (uint64_t)ratio * width0 *
+        (ape0_type == 1u ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t ape1_offset = test_round_up_u64(
+        ape0_offset + ape0_bytes, page);
+    const uint64_t ape1_bytes = (uint64_t)ratio * width1 *
+        (ape1_type == 1u ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t ape_offsets[2] = {ape0_offset, ape1_offset};
+    const uint32_t ape_widths[2] = {width0, width1};
+    const uint64_t model_bytes = test_round_up_u64(
+        ape1_offset + ape1_bytes, page);
+    const uint64_t x_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t max_state_count = (uint64_t)state_rows * width0;
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *ref_out[4] = {0};
+    ds4_gpu_tensor *quad_out[4] = {0};
+    ds4_gpu_tensor *ref_state[4] = {0};
+    ds4_gpu_tensor *quad_state[4] = {0};
+    bool allocated = model_raw != NULL && x != NULL;
+    for (uint32_t i = 0; i < 4u; i++) {
+        const uint64_t out_bytes =
+            (uint64_t)widths[i] * sizeof(float);
+        const uint64_t state_bytes =
+            (uint64_t)state_rows * widths[i] * sizeof(float);
+        ref_out[i] = ds4_gpu_tensor_alloc(out_bytes);
+        quad_out[i] = ds4_gpu_tensor_alloc(out_bytes);
+        ref_state[i] = ds4_gpu_tensor_alloc(state_bytes);
+        quad_state[i] = ds4_gpu_tensor_alloc(state_bytes);
+        TEST_ASSERT(ref_out[i] != NULL);
+        TEST_ASSERT(quad_out[i] != NULL);
+        TEST_ASSERT(ref_state[i] != NULL);
+        TEST_ASSERT(quad_state[i] != NULL);
+        allocated = allocated && ref_out[i] && quad_out[i] &&
+                    ref_state[i] && quad_state[i];
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *ref_host = malloc((size_t)max_state_count * sizeof(float));
+    float *quad_host = malloc((size_t)max_state_count * sizeof(float));
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(ref_host != NULL);
+    TEST_ASSERT(quad_host != NULL);
+    allocated = allocated && x_host && ref_host && quad_host;
+
+    const char *force_pair_env =
+        "DS4_METAL_ENABLE_COMPRESSOR_PAIR_STATE_STORE";
+    const char *disable_pair_state_env =
+        "DS4_METAL_DISABLE_M3_COMPRESSOR_PAIR_STATE_STORE";
+    const char *disable_pair_proj_env =
+        "DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ";
+    const char *disable_store_env =
+        "DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE";
+    char *saved_force_pair = test_save_env(force_pair_env);
+    char *saved_disable_pair_state = test_save_env(disable_pair_state_env);
+    char *saved_disable_pair_proj = test_save_env(disable_pair_proj_env);
+    char *saved_disable_store = test_save_env(disable_store_env);
+
+    test_float_compare_stats out_stats[4] = {{0}};
+    test_float_compare_stats state_stats[4] = {{0}};
+    if (allocated) {
+        memset(model_raw, 0, (size_t)model_bytes);
+        for (uint32_t matrix = 0; matrix < 4u; matrix++) {
+            uint16_t *weights = (uint16_t *)(
+                (uint8_t *)model_raw + weight_offsets[matrix]);
+            for (uint32_t o = 0; o < widths[matrix]; o++) {
+                for (uint32_t i = 0; i < in_dim; i++) {
+                    const int value =
+                        (int)((o * (17u + 2u * matrix) +
+                               i * (23u + 4u * matrix) +
+                               (o ^ (i >> (matrix & 3u))) *
+                                   (3u + 2u * matrix) +
+                               seed * (29u + matrix)) % 127u) - 63;
+                    weights[(uint64_t)o * in_dim + i] =
+                        test_float_to_f16(
+                            (float)value / (96.0f + 8.0f * matrix));
+                }
+            }
+        }
+
+        for (uint32_t which = 0; which < 2u; which++) {
+            const uint64_t count =
+                (uint64_t)ratio * ape_widths[which];
+            if (ape_types[which] == 1u) {
+                uint16_t *ape = (uint16_t *)(
+                    (uint8_t *)model_raw + ape_offsets[which]);
+                for (uint64_t i = 0; i < count; i++) {
+                    const int value =
+                        (int)((i * (13u + 2u * which) +
+                               (i ^ (i >> 3u)) * (7u + 2u * which) +
+                               seed * (17u + which)) % 61u) - 30;
+                    ape[i] = test_float_to_f16(
+                        (float)value / (80.0f + 8.0f * which));
+                }
+            } else {
+                float *ape = (float *)(
+                    (uint8_t *)model_raw + ape_offsets[which]);
+                for (uint64_t i = 0; i < count; i++) {
+                    const int value =
+                        (int)((i * (13u + 2u * which) +
+                               (i ^ (i >> 3u)) * (7u + 2u * which) +
+                               seed * (17u + which)) % 61u) - 30;
+                    ape[i] =
+                        (float)value / (80.0f + 8.0f * which);
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int value =
+                (int)((i * 29u + (i ^ (i >> 4u)) * 9u +
+                       seed * 11u) % 127u) - 63;
+            x_host[i] = (float)value / 88.0f;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+
+        for (uint32_t buffer = 0; buffer < 4u; buffer++) {
+            const uint64_t out_bytes =
+                (uint64_t)widths[buffer] * sizeof(float);
+            const uint64_t state_count =
+                (uint64_t)state_rows * widths[buffer];
+            const uint64_t state_bytes = state_count * sizeof(float);
+            for (uint32_t i = 0; i < widths[buffer]; i++) {
+                const uint32_t poison =
+                    0x7fc00001u + ((buffer * 1024u + i) & 0x3fffu);
+                memcpy(ref_host + i, &poison, sizeof(poison));
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            ref_out[buffer], 0, ref_host,
+                            out_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            quad_out[buffer], 0, ref_host,
+                            out_bytes) != 0);
+
+            for (uint64_t i = 0; i < state_count; i++) {
+                const int value =
+                    (int)((i * (5u + 2u * buffer) +
+                           seed * (13u + buffer)) % 193u) - 96;
+                ref_host[i] =
+                    (float)value / (64.0f + 8.0f * buffer);
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            ref_state[buffer], 0, ref_host,
+                            state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            quad_state[buffer], 0, ref_host,
+                            state_bytes) != 0);
+        }
+
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+        ds4_gpu_set_quality(false);
+        TEST_ASSERT(setenv(force_pair_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(disable_pair_state_env) == 0);
+        TEST_ASSERT(unsetenv(disable_pair_proj_env) == 0);
+        TEST_ASSERT(unsetenv(disable_store_env) == 0);
+
+        TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+                        ref_out[0], ref_out[1],
+                        ref_state[0], ref_state[1],
+                        model_raw, model_bytes,
+                        weight_offsets[0], weight_offsets[1],
+                        ape_offsets[0], ape_types[0],
+                        in_dim, width0, x, ratio, pos) == 1);
+        TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+                        ref_out[2], ref_out[3],
+                        ref_state[2], ref_state[3],
+                        model_raw, model_bytes,
+                        weight_offsets[2], weight_offsets[3],
+                        ape_offsets[1], ape_types[1],
+                        in_dim, width1, x, ratio, pos) == 1);
+        TEST_ASSERT(ds4_gpu_matmul_f16_quad_compressor_store_tensor(
+                        quad_out[0], quad_out[1],
+                        quad_out[2], quad_out[3],
+                        quad_state[0], quad_state[1],
+                        quad_state[2], quad_state[3],
+                        model_raw, model_bytes,
+                        weight_offsets[0], weight_offsets[1],
+                        weight_offsets[2], weight_offsets[3],
+                        ape_offsets[0], ape_types[0],
+                        ape_offsets[1], ape_types[1],
+                        in_dim, width0, width1, x, ratio, pos) == 1);
+
+        for (uint32_t buffer = 0; buffer < 4u; buffer++) {
+            const uint64_t out_bytes =
+                (uint64_t)widths[buffer] * sizeof(float);
+            const uint64_t state_count =
+                (uint64_t)state_rows * widths[buffer];
+            const uint64_t state_bytes = state_count * sizeof(float);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            ref_out[buffer], 0, ref_host,
+                            out_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            quad_out[buffer], 0, quad_host,
+                            out_bytes) != 0);
+            out_stats[buffer] = test_compare_float_bits(
+                ref_host, quad_host, widths[buffer]);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            ref_state[buffer], 0, ref_host,
+                            state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            quad_state[buffer], 0, quad_host,
+                            state_bytes) != 0);
+            state_stats[buffer] = test_compare_float_bits(
+                ref_host, quad_host, (size_t)state_count);
+        }
+    }
+
+    test_restore_env(force_pair_env, saved_force_pair);
+    test_restore_env(disable_pair_state_env, saved_disable_pair_state);
+    test_restore_env(disable_pair_proj_env, saved_disable_pair_proj);
+    test_restore_env(disable_store_env, saved_disable_store);
+
+    size_t out_mismatches = 0;
+    size_t state_mismatches = 0;
+    uint32_t max_out_ulp = 0;
+    uint32_t max_state_ulp = 0;
+    for (uint32_t i = 0; i < 4u; i++) {
+        out_mismatches += out_stats[i].mismatch_count;
+        state_mismatches += state_stats[i].mismatch_count;
+        if (out_stats[i].max_ulp > max_out_ulp) {
+            max_out_ulp = out_stats[i].max_ulp;
+        }
+        if (state_stats[i].max_ulp > max_state_ulp) {
+            max_state_ulp = state_stats[i].max_ulp;
+        }
+        TEST_ASSERT(out_stats[i].mismatch_count == 0);
+        TEST_ASSERT(state_stats[i].mismatch_count == 0);
+    }
+    fprintf(stderr,
+            "ds4-test: compressor quad state-store exact width=%u/256 "
+            "pos_mod4=%u ape=%s/%s outputs=%zu states=%zu "
+            "max_ulp=%u/%u\n",
+            width0, pos % ratio,
+            ape0_type == 1u ? "f16" : "f32",
+            ape1_type == 1u ? "f16" : "f32",
+            out_mismatches, state_mismatches,
+            max_out_ulp, max_state_ulp);
+
+    free(quad_host);
+    free(ref_host);
+    free(x_host);
+    for (uint32_t i = 0; i < 4u; i++) {
+        ds4_gpu_tensor_free(quad_state[i]);
+        ds4_gpu_tensor_free(ref_state[i]);
+        ds4_gpu_tensor_free(quad_out[i]);
+        ds4_gpu_tensor_free(ref_out[i]);
+    }
+    ds4_gpu_tensor_free(x);
+    free(model_raw);
+}
+
+static void test_metal_f16_compressor_quad_state_store_exact(void) {
+    test_metal_f16_compressor_quad_state_store_exact_case(
+        1024u, 8u, 1u, 0u, 59u);
+    test_metal_f16_compressor_quad_state_store_exact_case(
+        512u, 11u, 0u, 1u, 71u);
+}
+
+static void test_metal_q8_qkv_compressor_compound_exact_case(
+        uint32_t ratio,
+        uint32_t pos,
+        uint32_t ape0_type,
+        uint32_t ape1_type,
+        uint32_t seed,
+        bool     batched_commands) {
+    enum {
+        Q_A_WEIGHT = 0,
+        KV_WEIGHT,
+        COMP0_KV_WEIGHT,
+        COMP0_SCORE_WEIGHT,
+        COMP1_KV_WEIGHT,
+        COMP1_SCORE_WEIGHT,
+        COMP0_APE,
+        COMP1_APE,
+        MODEL_RANGE_COUNT,
+    };
+    const uint32_t in_dim = 4096u;
+    const uint32_t q_rank = 77u;
+    const uint32_t kv_dim = 19u;
+    const uint32_t width0 = ratio == 4u ? 1024u : 512u;
+    const uint32_t width1 = ratio == 4u ? 256u : 0u;
+    const uint32_t state_rows = ratio == 4u ? 2u * ratio : ratio;
+    const uint32_t n_comp_outputs = width1 != 0u ? 4u : 2u;
+    const uint32_t comp_widths[4] = {
+        width0, width0, width1, width1,
+    };
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t q8_row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t f16_row_bytes =
+        (uint64_t)in_dim * sizeof(uint16_t);
+    uint64_t range_bytes[MODEL_RANGE_COUNT] = {
+        (uint64_t)q_rank * q8_row_bytes,
+        (uint64_t)kv_dim * q8_row_bytes,
+        (uint64_t)width0 * f16_row_bytes,
+        (uint64_t)width0 * f16_row_bytes,
+        (uint64_t)width1 * f16_row_bytes,
+        (uint64_t)width1 * f16_row_bytes,
+        (uint64_t)ratio * width0 *
+            (ape0_type == 1u ? sizeof(uint16_t) : sizeof(float)),
+        (uint64_t)ratio * width1 *
+            (ape1_type == 1u ? sizeof(uint16_t) : sizeof(float)),
+    };
+    uint64_t range_offsets[MODEL_RANGE_COUNT] = {0};
+    uint64_t cursor = 0;
+    for (uint32_t i = 0; i < MODEL_RANGE_COUNT; i++) {
+        if (range_bytes[i] == 0u) continue;
+        range_offsets[i] = test_round_up_u64(cursor, page);
+        cursor = range_offsets[i] + range_bytes[i];
+    }
+    const uint64_t model_bytes = test_round_up_u64(cursor, page);
+    const uint64_t x_bytes = (uint64_t)in_dim * sizeof(float);
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *ref_q =
+        ds4_gpu_tensor_alloc((uint64_t)q_rank * sizeof(float));
+    ds4_gpu_tensor *ref_kv =
+        ds4_gpu_tensor_alloc((uint64_t)kv_dim * sizeof(float));
+    ds4_gpu_tensor *fused_q =
+        ds4_gpu_tensor_alloc((uint64_t)q_rank * sizeof(float));
+    ds4_gpu_tensor *fused_kv =
+        ds4_gpu_tensor_alloc((uint64_t)kv_dim * sizeof(float));
+    ds4_gpu_tensor *ref_out[4] = {0};
+    ds4_gpu_tensor *fused_out[4] = {0};
+    ds4_gpu_tensor *ref_state[4] = {0};
+    ds4_gpu_tensor *fused_state[4] = {0};
+    bool allocated = model_raw && x && ref_q && ref_kv && fused_q && fused_kv;
+    for (uint32_t i = 0; i < n_comp_outputs; i++) {
+        const uint64_t out_bytes =
+            (uint64_t)comp_widths[i] * sizeof(float);
+        const uint64_t state_bytes =
+            (uint64_t)state_rows * comp_widths[i] * sizeof(float);
+        ref_out[i] = ds4_gpu_tensor_alloc(out_bytes);
+        fused_out[i] = ds4_gpu_tensor_alloc(out_bytes);
+        ref_state[i] = ds4_gpu_tensor_alloc(state_bytes);
+        fused_state[i] = ds4_gpu_tensor_alloc(state_bytes);
+        TEST_ASSERT(ref_out[i] && fused_out[i] &&
+                    ref_state[i] && fused_state[i]);
+        allocated = allocated && ref_out[i] && fused_out[i] &&
+                    ref_state[i] && fused_state[i];
+    }
+
+    uint64_t host_count = (uint64_t)state_rows * width0;
+    if (host_count < q_rank) host_count = q_rank;
+    if (host_count < kv_dim) host_count = kv_dim;
+    float *x_host = malloc((size_t)x_bytes);
+    float *ref_host = malloc((size_t)host_count * sizeof(float));
+    float *fused_host = malloc((size_t)host_count * sizeof(float));
+    TEST_ASSERT(x_host && ref_host && fused_host);
+    allocated = allocated && x_host && ref_host && fused_host;
+
+    const char *force_pair_env =
+        "DS4_METAL_ENABLE_COMPRESSOR_PAIR_STATE_STORE";
+    const char *disable_pair_state_env =
+        "DS4_METAL_DISABLE_M3_COMPRESSOR_PAIR_STATE_STORE";
+    const char *disable_pair_proj_env =
+        "DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ";
+    const char *disable_store_env =
+        "DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE";
+    const char *q8_nsg_env = "DS4_METAL_Q8_MV_NSG";
+    char *saved_force_pair = test_save_env(force_pair_env);
+    char *saved_disable_pair_state = test_save_env(disable_pair_state_env);
+    char *saved_disable_pair_proj = test_save_env(disable_pair_proj_env);
+    char *saved_disable_store = test_save_env(disable_store_env);
+    char *saved_q8_nsg = test_save_env(q8_nsg_env);
+
+    size_t q_mismatches = 0;
+    size_t kv_mismatches = 0;
+    size_t out_mismatches = 0;
+    size_t state_mismatches = 0;
+    uint32_t max_ulp = 0;
+    if (allocated) {
+        memset(model_raw, 0, (size_t)model_bytes);
+        test_fill_q8_0_weights(
+            (uint8_t *)model_raw + range_offsets[Q_A_WEIGHT],
+            in_dim, q_rank, seed + 1u);
+        test_fill_q8_0_weights(
+            (uint8_t *)model_raw + range_offsets[KV_WEIGHT],
+            in_dim, kv_dim, seed + 3u);
+
+        for (uint32_t matrix = 0; matrix < n_comp_outputs; matrix++) {
+            uint16_t *weights = (uint16_t *)(
+                (uint8_t *)model_raw +
+                range_offsets[COMP0_KV_WEIGHT + matrix]);
+            const uint32_t width = comp_widths[matrix];
+            for (uint32_t o = 0; o < width; o++) {
+                for (uint32_t i = 0; i < in_dim; i++) {
+                    const int value =
+                        (int)((o * (13u + 2u * matrix) +
+                               i * (19u + 4u * matrix) +
+                               (o ^ (i >> (matrix & 3u))) *
+                                   (5u + 2u * matrix) +
+                               seed * (23u + matrix)) % 127u) - 63;
+                    weights[(uint64_t)o * in_dim + i] =
+                        test_float_to_f16(
+                            (float)value / (88.0f + 8.0f * matrix));
+                }
+            }
+        }
+
+        const uint32_t ape_types[2] = {ape0_type, ape1_type};
+        const uint32_t ape_widths[2] = {width0, width1};
+        const uint32_t ape_ranges[2] = {COMP0_APE, COMP1_APE};
+        for (uint32_t which = 0; which < 2u; which++) {
+            if (ape_widths[which] == 0u) continue;
+            const uint64_t count =
+                (uint64_t)ratio * ape_widths[which];
+            if (ape_types[which] == 1u) {
+                uint16_t *ape = (uint16_t *)(
+                    (uint8_t *)model_raw + range_offsets[ape_ranges[which]]);
+                for (uint64_t i = 0; i < count; i++) {
+                    const int value =
+                        (int)((i * (11u + 2u * which) +
+                               (i ^ (i >> 3u)) * (7u + 2u * which) +
+                               seed * (17u + which)) % 61u) - 30;
+                    ape[i] = test_float_to_f16(
+                        (float)value / (72.0f + 8.0f * which));
+                }
+            } else {
+                float *ape = (float *)(
+                    (uint8_t *)model_raw + range_offsets[ape_ranges[which]]);
+                for (uint64_t i = 0; i < count; i++) {
+                    const int value =
+                        (int)((i * (11u + 2u * which) +
+                               (i ^ (i >> 3u)) * (7u + 2u * which) +
+                               seed * (17u + which)) % 61u) - 30;
+                    ape[i] =
+                        (float)value / (72.0f + 8.0f * which);
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int value =
+                (int)((i * 29u + (i ^ (i >> 4u)) * 9u +
+                       seed * 11u) % 127u) - 63;
+            x_host[i] = (float)value / 84.0f;
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+
+        for (uint32_t buffer = 0; buffer < n_comp_outputs; buffer++) {
+            const uint32_t width = comp_widths[buffer];
+            const uint64_t out_bytes =
+                (uint64_t)width * sizeof(float);
+            const uint64_t state_count =
+                (uint64_t)state_rows * width;
+            const uint64_t state_bytes = state_count * sizeof(float);
+            for (uint32_t i = 0; i < width; i++) {
+                const uint32_t poison =
+                    0x7fc10001u + ((buffer * 2048u + i) & 0x7fffu);
+                memcpy(ref_host + i, &poison, sizeof(poison));
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            ref_out[buffer], 0, ref_host,
+                            out_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            fused_out[buffer], 0, ref_host,
+                            out_bytes) != 0);
+            for (uint64_t i = 0; i < state_count; i++) {
+                const int value =
+                    (int)((i * (5u + 2u * buffer) +
+                           seed * (13u + buffer)) % 193u) - 96;
+                ref_host[i] =
+                    (float)value / (64.0f + 8.0f * buffer);
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            ref_state[buffer], 0, ref_host,
+                            state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                            fused_state[buffer], 0, ref_host,
+                            state_bytes) != 0);
+        }
+
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+        ds4_gpu_set_quality(false);
+        TEST_ASSERT(setenv(force_pair_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(disable_pair_state_env) == 0);
+        TEST_ASSERT(unsetenv(disable_pair_proj_env) == 0);
+        TEST_ASSERT(unsetenv(disable_store_env) == 0);
+        TEST_ASSERT(unsetenv(q8_nsg_env) == 0);
+
+        TEST_ASSERT(ds4_gpu_matmul_q8_0_pair_tensor(
+                        ref_q, ref_kv,
+                        model_raw, model_bytes,
+                        range_offsets[Q_A_WEIGHT],
+                        range_offsets[KV_WEIGHT],
+                        in_dim, q_rank, kv_dim, x, 1u) == 1);
+        TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+                        ref_out[0], ref_out[1],
+                        ref_state[0], ref_state[1],
+                        model_raw, model_bytes,
+                        range_offsets[COMP0_KV_WEIGHT],
+                        range_offsets[COMP0_SCORE_WEIGHT],
+                        range_offsets[COMP0_APE], ape0_type,
+                        in_dim, width0, x, ratio, pos) == 1);
+        if (width1 != 0u) {
+            TEST_ASSERT(ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+                            ref_out[2], ref_out[3],
+                            ref_state[2], ref_state[3],
+                            model_raw, model_bytes,
+                            range_offsets[COMP1_KV_WEIGHT],
+                            range_offsets[COMP1_SCORE_WEIGHT],
+                            range_offsets[COMP1_APE], ape1_type,
+                            in_dim, width1, x, ratio, pos) == 1);
+        }
+
+        bool commands_open = false;
+        if (batched_commands) {
+            commands_open = ds4_gpu_begin_commands() != 0;
+            TEST_ASSERT(commands_open);
+        }
+        const int fused =
+            ds4_gpu_qkv_pair_quad_compressor_store_tensor(
+                fused_q, fused_kv,
+                fused_out[0], fused_out[1],
+                width1 != 0u ? fused_out[2] : NULL,
+                width1 != 0u ? fused_out[3] : NULL,
+                fused_state[0], fused_state[1],
+                width1 != 0u ? fused_state[2] : NULL,
+                width1 != 0u ? fused_state[3] : NULL,
+                model_raw, model_bytes,
+                range_offsets[Q_A_WEIGHT],
+                range_offsets[KV_WEIGHT],
+                range_offsets[COMP0_KV_WEIGHT],
+                range_offsets[COMP0_SCORE_WEIGHT],
+                range_offsets[COMP1_KV_WEIGHT],
+                range_offsets[COMP1_SCORE_WEIGHT],
+                range_offsets[COMP0_APE], ape0_type,
+                range_offsets[COMP1_APE], ape1_type,
+                in_dim, q_rank, kv_dim, width0, width1,
+                x, ratio, pos);
+        if (commands_open) {
+            TEST_ASSERT(ds4_gpu_end_commands() != 0);
+        }
+        TEST_ASSERT(fused == 1);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_q, 0, ref_host,
+                        (uint64_t)q_rank * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_q, 0, fused_host,
+                        (uint64_t)q_rank * sizeof(float)) != 0);
+        test_float_compare_stats stats =
+            test_compare_float_bits(ref_host, fused_host, q_rank);
+        q_mismatches = stats.mismatch_count;
+        if (stats.max_ulp > max_ulp) max_ulp = stats.max_ulp;
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_kv, 0, ref_host,
+                        (uint64_t)kv_dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_kv, 0, fused_host,
+                        (uint64_t)kv_dim * sizeof(float)) != 0);
+        stats = test_compare_float_bits(ref_host, fused_host, kv_dim);
+        kv_mismatches = stats.mismatch_count;
+        if (stats.max_ulp > max_ulp) max_ulp = stats.max_ulp;
+
+        for (uint32_t buffer = 0; buffer < n_comp_outputs; buffer++) {
+            const uint32_t width = comp_widths[buffer];
+            const uint64_t out_bytes =
+                (uint64_t)width * sizeof(float);
+            const uint64_t state_count =
+                (uint64_t)state_rows * width;
+            const uint64_t state_bytes = state_count * sizeof(float);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            ref_out[buffer], 0, ref_host,
+                            out_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            fused_out[buffer], 0, fused_host,
+                            out_bytes) != 0);
+            stats = test_compare_float_bits(ref_host, fused_host, width);
+            out_mismatches += stats.mismatch_count;
+            if (stats.max_ulp > max_ulp) max_ulp = stats.max_ulp;
+
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            ref_state[buffer], 0, ref_host,
+                            state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                            fused_state[buffer], 0, fused_host,
+                            state_bytes) != 0);
+            stats = test_compare_float_bits(
+                ref_host, fused_host, (size_t)state_count);
+            state_mismatches += stats.mismatch_count;
+            if (stats.max_ulp > max_ulp) max_ulp = stats.max_ulp;
+        }
+    }
+
+    fprintf(stderr,
+            "ds4-test: Q8 QKV/compressor compound exact ratio=%u "
+            "pos_mod=%u batch=%u q=%zu kv=%zu outputs=%zu states=%zu "
+            "max_ulp=%u\n",
+            ratio, pos % ratio, batched_commands ? 1u : 0u,
+            q_mismatches, kv_mismatches,
+            out_mismatches, state_mismatches, max_ulp);
+    TEST_ASSERT(q_mismatches == 0);
+    TEST_ASSERT(kv_mismatches == 0);
+    TEST_ASSERT(out_mismatches == 0);
+    TEST_ASSERT(state_mismatches == 0);
+    TEST_ASSERT(max_ulp == 0);
+
+    test_restore_env(q8_nsg_env, saved_q8_nsg);
+    test_restore_env(disable_store_env, saved_disable_store);
+    test_restore_env(disable_pair_proj_env, saved_disable_pair_proj);
+    test_restore_env(disable_pair_state_env, saved_disable_pair_state);
+    test_restore_env(force_pair_env, saved_force_pair);
+    free(fused_host);
+    free(ref_host);
+    free(x_host);
+    for (uint32_t i = 0; i < 4u; i++) {
+        ds4_gpu_tensor_free(fused_state[i]);
+        ds4_gpu_tensor_free(ref_state[i]);
+        ds4_gpu_tensor_free(fused_out[i]);
+        ds4_gpu_tensor_free(ref_out[i]);
+    }
+    ds4_gpu_tensor_free(fused_kv);
+    ds4_gpu_tensor_free(fused_q);
+    ds4_gpu_tensor_free(ref_kv);
+    ds4_gpu_tensor_free(ref_q);
+    ds4_gpu_tensor_free(x);
+    free(model_raw);
+}
+
+static void test_metal_q8_qkv_compressor_compound_exact(void) {
+    test_metal_q8_qkv_compressor_compound_exact_case(
+        4u, 11u, 1u, 0u, 79u, false);
+    test_metal_q8_qkv_compressor_compound_exact_case(
+        4u, 11u, 1u, 0u, 79u, true);
+    test_metal_q8_qkv_compressor_compound_exact_case(
+        128u, 255u, 0u, 1u, 83u, false);
+    test_metal_q8_qkv_compressor_compound_exact_case(
+        128u, 255u, 0u, 1u, 83u, true);
 }
 
 static void test_metal_compressor_ape_add_exact_case(
@@ -2270,7 +4176,7 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
 }
 
 static void test_metal_compressor_ratio4_direct_pool_exact(void) {
-    /* n_comp == 1 deliberately stays on the exact GGML reduction path. */
+    /* Prefill direct-pool coverage, including its legacy n_comp == 1 case. */
     test_metal_compressor_ratio4_direct_pool_exact_case(
         512, 0, 4, 1, false, 59);
     test_metal_compressor_ratio4_direct_pool_exact_case(
@@ -2283,6 +4189,271 @@ static void test_metal_compressor_ratio4_direct_pool_exact(void) {
         128, 12, 12, 0, true, 73);
     test_metal_compressor_ratio4_direct_pool_exact_case(
         128, 8, 4, 1, true, 79);
+}
+
+static void test_metal_compressor_ratio4_exact_pool_decode_case(
+        uint32_t head_dim,
+        uint32_t ape_type,
+        uint32_t seed) {
+    const uint32_t ratio = 4u;
+    const uint32_t width = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+    const uint32_t pos = 3u;
+    const uint64_t cur_count = width;
+    const uint64_t state_count = (uint64_t)state_rows * width;
+    const uint64_t cur_bytes = cur_count * sizeof(float);
+    const uint64_t state_bytes = state_count * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t ape_elem_bytes = ape_type == 1u ? 2u : 4u;
+    const uint64_t ape_bytes = (uint64_t)ratio * width * ape_elem_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t norm_offset = test_round_up_u64(ape_bytes, page);
+    const uint64_t model_bytes = test_round_up_u64(
+        norm_offset + (uint64_t)head_dim * sizeof(float), page);
+
+    ds4_gpu_tensor *kv_cur = ds4_gpu_tensor_alloc(cur_bytes);
+    ds4_gpu_tensor *sc_cur = ds4_gpu_tensor_alloc(cur_bytes);
+    ds4_gpu_tensor *ref_state_kv = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *ref_state_score = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *exact_state_kv = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *exact_state_score = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *ref_comp = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *exact_comp = ds4_gpu_tensor_alloc(comp_bytes);
+    float *kv_cur_host = malloc((size_t)cur_bytes);
+    float *sc_cur_host = malloc((size_t)cur_bytes);
+    float *state_kv_host = malloc((size_t)state_bytes);
+    float *state_score_host = malloc((size_t)state_bytes);
+    float *ref_state_kv_host = malloc((size_t)state_bytes);
+    float *ref_state_score_host = malloc((size_t)state_bytes);
+    float *exact_state_kv_host = malloc((size_t)state_bytes);
+    float *exact_state_score_host = malloc((size_t)state_bytes);
+    float *ref_comp_host = malloc((size_t)comp_bytes);
+    float *exact_comp_host = malloc((size_t)comp_bytes);
+    void *model_raw = NULL;
+    const int model_alloc_ok = posix_memalign(
+        &model_raw, (size_t)page, (size_t)model_bytes) == 0;
+
+    TEST_ASSERT(kv_cur != NULL);
+    TEST_ASSERT(sc_cur != NULL);
+    TEST_ASSERT(ref_state_kv != NULL);
+    TEST_ASSERT(ref_state_score != NULL);
+    TEST_ASSERT(exact_state_kv != NULL);
+    TEST_ASSERT(exact_state_score != NULL);
+    TEST_ASSERT(ref_comp != NULL);
+    TEST_ASSERT(exact_comp != NULL);
+    TEST_ASSERT(kv_cur_host != NULL);
+    TEST_ASSERT(sc_cur_host != NULL);
+    TEST_ASSERT(state_kv_host != NULL);
+    TEST_ASSERT(state_score_host != NULL);
+    TEST_ASSERT(ref_state_kv_host != NULL);
+    TEST_ASSERT(ref_state_score_host != NULL);
+    TEST_ASSERT(exact_state_kv_host != NULL);
+    TEST_ASSERT(exact_state_score_host != NULL);
+    TEST_ASSERT(ref_comp_host != NULL);
+    TEST_ASSERT(exact_comp_host != NULL);
+    TEST_ASSERT(model_alloc_ok);
+
+    const char *enable_env =
+        "DS4_METAL_ENABLE_COMPRESSOR_EXACT_POOL_RATIO4";
+    const char *disable_env =
+        "DS4_METAL_DISABLE_COMPRESSOR_EXACT_POOL_RATIO4";
+    const char *pre_m5_disable_env =
+        "DS4_METAL_DISABLE_PRE_M5_COMPRESSOR_EXACT_POOL_RATIO4";
+    const char *m3_disable_env =
+        "DS4_METAL_DISABLE_M3_COMPRESSOR_EXACT_POOL_RATIO4";
+    const char *m5_disable_env =
+        "DS4_METAL_DISABLE_M5_COMPRESSOR_EXACT_POOL_RATIO4";
+    const char *all_pre_m5_disable_env =
+        "DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS";
+    const char *require_env =
+        "DS4_METAL_REQUIRE_COMPRESSOR_EXACT_POOL_RATIO4";
+    const char *poison_env =
+        "DS4_METAL_TEST_POISON_COMPRESSOR_EXACT_REDUCTION_SCRATCH";
+    char *saved_enable = test_save_env(enable_env);
+    char *saved_disable = test_save_env(disable_env);
+    char *saved_pre_m5_disable = test_save_env(pre_m5_disable_env);
+    char *saved_m3_disable = test_save_env(m3_disable_env);
+    char *saved_m5_disable = test_save_env(m5_disable_env);
+    char *saved_all_pre_m5_disable = test_save_env(all_pre_m5_disable_env);
+    char *saved_require = test_save_env(require_env);
+    char *saved_poison = test_save_env(poison_env);
+    test_float_compare_stats comp_stats = {0};
+    test_float_compare_stats state_kv_stats = {0};
+    test_float_compare_stats state_score_stats = {0};
+
+    const bool allocated = kv_cur && sc_cur && ref_state_kv &&
+        ref_state_score && exact_state_kv && exact_state_score && ref_comp &&
+        exact_comp && kv_cur_host && sc_cur_host && state_kv_host &&
+        state_score_host && ref_state_kv_host && ref_state_score_host &&
+        exact_state_kv_host && exact_state_score_host && ref_comp_host &&
+        exact_comp_host && model_alloc_ok;
+    if (allocated) {
+        memset(model_raw, 0, (size_t)model_bytes);
+        if (ape_type == 1u) {
+            uint16_t *ape = model_raw;
+            for (uint64_t i = 0; i < (uint64_t)ratio * width; i++) {
+                const int value =
+                    (int)((i * 17u + (i >> 3u) * 13u + seed * 11u) %
+                          101u) - 50;
+                ape[i] = test_float_to_f16((float)value / 96.0f);
+            }
+        } else {
+            float *ape = model_raw;
+            for (uint64_t i = 0; i < (uint64_t)ratio * width; i++) {
+                const int value =
+                    (int)((i * 17u + (i >> 3u) * 13u + seed * 11u) %
+                          101u) - 50;
+                ape[i] = (float)value / 96.0f;
+            }
+        }
+        float *norm =
+            (float *)((uint8_t *)model_raw + norm_offset);
+        for (uint32_t i = 0; i < head_dim; i++) {
+            norm[i] = 0.75f +
+                (float)((i * 7u + seed * 3u) % 29u) / 128.0f;
+        }
+
+        for (uint32_t i = 0; i < width; i++) {
+            const int kv_value =
+                (int)(((uint64_t)i * 29u + seed * 37u) % 211u) - 105;
+            const int score_value =
+                (int)(((uint64_t)i * 31u + seed * 19u) % 181u) - 90;
+            kv_cur_host[i] = (float)kv_value / 112.0f;
+            sc_cur_host[i] = (float)score_value / 48.0f;
+        }
+        for (uint32_t row = 0; row < state_rows; row++) {
+            for (uint32_t col = 0; col < width; col++) {
+                const uint64_t i = (uint64_t)row * width + col;
+                const int kv_value =
+                    (int)(((uint64_t)row * 43u + (uint64_t)col * 23u +
+                           seed * 41u) % 257u) - 128;
+                const int score_value =
+                    (int)(((uint64_t)row * 47u + (uint64_t)col * 17u +
+                           seed * 31u) % 193u) - 96;
+                state_kv_host[i] = (float)kv_value / 128.0f;
+                state_score_host[i] = (float)score_value / 56.0f;
+            }
+        }
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        kv_cur, 0, kv_cur_host, cur_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        sc_cur, 0, sc_cur_host, cur_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_state_kv, 0, state_kv_host, state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_state_score, 0, state_score_host,
+                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        exact_state_kv, 0, state_kv_host, state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        exact_state_score, 0, state_score_host,
+                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+        ds4_gpu_set_quality(false);
+
+        /* Force-enable and force-disable together: the kill switch must win. */
+        TEST_ASSERT(setenv(enable_env, "1", 1) == 0);
+        TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+        TEST_ASSERT(unsetenv(require_env) == 0);
+        TEST_ASSERT(unsetenv(poison_env) == 0);
+        const int ref_ok = ds4_gpu_compressor_update_tensor(
+            kv_cur, sc_cur, ref_state_kv, ref_state_score, ref_comp,
+            model_raw, model_bytes, 0, ape_type, norm_offset, 0,
+            head_dim, ratio, pos, 0, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f,
+            false, false, false);
+        TEST_ASSERT(ref_ok != 0);
+
+        TEST_ASSERT(unsetenv(disable_env) == 0);
+        TEST_ASSERT(unsetenv(pre_m5_disable_env) == 0);
+        TEST_ASSERT(unsetenv(m3_disable_env) == 0);
+        TEST_ASSERT(unsetenv(m5_disable_env) == 0);
+        TEST_ASSERT(unsetenv(all_pre_m5_disable_env) == 0);
+        TEST_ASSERT(setenv(require_env, "1", 1) == 0);
+        TEST_ASSERT(setenv(poison_env, "1", 1) == 0);
+        const int exact_ok = ds4_gpu_compressor_update_tensor(
+            kv_cur, sc_cur, exact_state_kv, exact_state_score, exact_comp,
+            model_raw, model_bytes, 0, ape_type, norm_offset, 0,
+            head_dim, ratio, pos, 0, 0, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f,
+            false, false, false);
+        TEST_ASSERT(exact_ok != 0);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_comp, 0, ref_comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        exact_comp, 0, exact_comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_state_kv, 0, ref_state_kv_host,
+                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        exact_state_kv, 0, exact_state_kv_host,
+                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_state_score, 0, ref_state_score_host,
+                        state_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        exact_state_score, 0, exact_state_score_host,
+                        state_bytes) != 0);
+
+        comp_stats = test_compare_float_bits(
+            ref_comp_host, exact_comp_host, head_dim);
+        state_kv_stats = test_compare_float_bits(
+            ref_state_kv_host, exact_state_kv_host, (size_t)state_count);
+        state_score_stats = test_compare_float_bits(
+            ref_state_score_host, exact_state_score_host,
+            (size_t)state_count);
+    }
+
+    test_restore_env(enable_env, saved_enable);
+    test_restore_env(disable_env, saved_disable);
+    test_restore_env(pre_m5_disable_env, saved_pre_m5_disable);
+    test_restore_env(m3_disable_env, saved_m3_disable);
+    test_restore_env(m5_disable_env, saved_m5_disable);
+    test_restore_env(all_pre_m5_disable_env, saved_all_pre_m5_disable);
+    test_restore_env(require_env, saved_require);
+    test_restore_env(poison_env, saved_poison);
+    fprintf(stderr,
+            "ds4-test: compressor ratio4 exact decode pool head=%u ape=%s "
+            "comp=%zu/%u state_kv=%zu/%llu state_score=%zu/%llu "
+            "max_ulp=%u/%u/%u\n",
+            head_dim, ape_type == 1u ? "f16" : "f32",
+            comp_stats.mismatch_count, head_dim,
+            state_kv_stats.mismatch_count,
+            (unsigned long long)state_count,
+            state_score_stats.mismatch_count,
+            (unsigned long long)state_count,
+            comp_stats.max_ulp, state_kv_stats.max_ulp,
+            state_score_stats.max_ulp);
+    TEST_ASSERT(comp_stats.mismatch_count == 0);
+    TEST_ASSERT(state_kv_stats.mismatch_count == 0);
+    TEST_ASSERT(state_score_stats.mismatch_count == 0);
+
+    free(model_raw);
+    free(exact_comp_host);
+    free(ref_comp_host);
+    free(exact_state_score_host);
+    free(exact_state_kv_host);
+    free(ref_state_score_host);
+    free(ref_state_kv_host);
+    free(state_score_host);
+    free(state_kv_host);
+    free(sc_cur_host);
+    free(kv_cur_host);
+    ds4_gpu_tensor_free(exact_comp);
+    ds4_gpu_tensor_free(ref_comp);
+    ds4_gpu_tensor_free(exact_state_score);
+    ds4_gpu_tensor_free(exact_state_kv);
+    ds4_gpu_tensor_free(ref_state_score);
+    ds4_gpu_tensor_free(ref_state_kv);
+    ds4_gpu_tensor_free(sc_cur);
+    ds4_gpu_tensor_free(kv_cur);
+}
+
+static void test_metal_compressor_ratio4_exact_pool_decode(void) {
+    test_metal_compressor_ratio4_exact_pool_decode_case(128u, 1u, 83u);
+    test_metal_compressor_ratio4_exact_pool_decode_case(512u, 0u, 89u);
 }
 
 static void test_metal_inplace_rope_pair_exact(void) {
@@ -3641,9 +5812,1052 @@ static void test_metal_zero_prefix_prefill_mask_cache_exact(void) {
     test_metal_zero_prefix_prefill_mask_cache_exact_kind(
         TEST_METAL_PREFILL_MASK_CACHE_RATIO128, 47);
 }
+
+static double test_metal_small_prefill_gpu_batch_ms(
+        test_metal_prefill_mask_cache_kind kind,
+        bool masked,
+        const test_metal_prefill_mask_cache_shape *shape,
+        ds4_gpu_tensor *heads,
+        const void *model_map,
+        uint64_t model_size,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw,
+        const ds4_gpu_tensor *comp,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t flags,
+        uint32_t repeats,
+        uint32_t expected_nwg) {
+    ds4_gpu_test_set_flags(flags);
+    const int begin_ok = ds4_gpu_begin_commands();
+    TEST_ASSERT(begin_ok != 0);
+    if (!begin_ok) return -1.0;
+    for (uint32_t rep = 0u; rep < repeats; rep++) {
+        const int call_ok = test_metal_zero_prefix_prefill_mask_cache_call(
+            kind, heads, model_map, model_size, q, raw, comp, comp_mask,
+            shape, masked, n_head, head_dim);
+        TEST_ASSERT(call_ok != 0);
+        if (!call_ok) {
+            (void)ds4_gpu_end_commands();
+            return -1.0;
+        }
+    }
+    const int end_ok = ds4_gpu_end_commands();
+    TEST_ASSERT(end_ok != 0);
+    if (!end_ok) return -1.0;
+    const uint32_t selected_nwg =
+        ds4_gpu_test_last_flash_attn_prefill_nwg();
+    TEST_ASSERT(selected_nwg == expected_nwg);
+    if (selected_nwg != expected_nwg) return -1.0;
+    const double gpu_ms = ds4_gpu_test_last_completed_gpu_ms();
+    TEST_ASSERT(gpu_ms > 0.0);
+    return gpu_ms > 0.0 ? gpu_ms / (double)repeats : -1.0;
+}
+
+static void test_metal_small_prefill_direct_exact(void) {
+    const uint32_t head_dim = 512u;
+    const uint32_t n_head = 2u;
+    const uint32_t max_tokens = 19u;
+    const uint32_t max_comp = 14u;
+    const uint64_t guard_bytes = 256u;
+    const uint64_t raw_count = (uint64_t)max_tokens * head_dim;
+    const uint64_t comp_count = (uint64_t)max_comp * head_dim;
+    const uint64_t q_count =
+        (uint64_t)max_tokens * n_head * head_dim;
+    const uint64_t mask_count = (uint64_t)max_tokens * max_comp;
+    const uint64_t raw_bytes = raw_count * sizeof(float);
+    const uint64_t comp_bytes = comp_count * sizeof(uint16_t);
+    const uint64_t q_bytes = q_count * sizeof(float);
+    const uint64_t mask_bytes = mask_count * sizeof(float);
+    const uint64_t heads_base_bytes = guard_bytes + q_bytes + guard_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    const char *disable_env = "DS4_METAL_DISABLE_SMALL_PREFILL_DIRECT";
+    char *saved_disable = test_save_env(disable_env);
+    const char *stage_profile_env = "DS4_METAL_FLASH_ATTN_STAGE_PROFILE";
+    char *saved_stage_profile = test_save_env(stage_profile_env);
+
+    typedef struct {
+        const char *name;
+        test_metal_prefill_mask_cache_kind kind;
+        bool masked;
+        test_metal_prefill_mask_cache_shape shape;
+    } test_metal_small_prefill_case;
+    static const test_metal_small_prefill_case cases[] = {
+        {"raw-1", TEST_METAL_PREFILL_MASK_CACHE_RAW, false,
+         {1u, 0u, 0u, 0u}},
+        {"raw-7", TEST_METAL_PREFILL_MASK_CACHE_RAW, false,
+         {7u, 0u, 5u, 0u}},
+        {"raw-19", TEST_METAL_PREFILL_MASK_CACHE_RAW, false,
+         {19u, 0u, 11u, 0u}},
+        {"static-12", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, false,
+         {7u, 5u, 5u, 4u}},
+        {"static-32", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, false,
+         {19u, 13u, 11u, 4u}},
+        {"masked-12", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, true,
+         {7u, 5u, 5u, 4u}},
+        {"masked-32", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, true,
+         {19u, 13u, 11u, 4u}},
+        {"static-33-fallback", TEST_METAL_PREFILL_MASK_CACHE_RATIO4, false,
+         {19u, 14u, 11u, 4u}},
+    };
+    enum {
+        TEST_SMALL_PREFILL_DIRECT_COLD = 0,
+        TEST_SMALL_PREFILL_PSO_FALLBACK,
+        TEST_SMALL_PREFILL_ENV_ROLLBACK,
+        TEST_SMALL_PREFILL_DIRECT_REPLAY,
+        TEST_SMALL_PREFILL_ARM_COUNT,
+    };
+
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *comp_mask = ds4_gpu_tensor_alloc(mask_bytes);
+    ds4_gpu_tensor *heads_base = ds4_gpu_tensor_alloc(heads_base_bytes);
+    float *raw_host = malloc((size_t)raw_bytes);
+    uint16_t *comp_host = malloc((size_t)comp_bytes);
+    float *q_host = malloc((size_t)q_bytes);
+    float *mask_host = malloc((size_t)mask_bytes);
+    uint8_t *initial = malloc((size_t)heads_base_bytes);
+    uint8_t *snapshots = malloc(
+        (size_t)(TEST_SMALL_PREFILL_ARM_COUNT * heads_base_bytes));
+    /* Metal retains a no-copy model view after this oracle returns.  Static
+     * page-aligned storage keeps that backing valid until backend cleanup. */
+    static uint8_t model_storage[16384]
+        __attribute__((aligned(16384)));
+    void *model_raw = model_storage;
+    const bool model_storage_ok = page <= sizeof(model_storage);
+    TEST_ASSERT(model_storage_ok);
+    TEST_ASSERT(raw != NULL);
+    TEST_ASSERT(comp != NULL);
+    TEST_ASSERT(q != NULL);
+    TEST_ASSERT(comp_mask != NULL);
+    TEST_ASSERT(heads_base != NULL);
+    TEST_ASSERT(raw_host != NULL);
+    TEST_ASSERT(comp_host != NULL);
+    TEST_ASSERT(q_host != NULL);
+    TEST_ASSERT(mask_host != NULL);
+    TEST_ASSERT(initial != NULL);
+    TEST_ASSERT(snapshots != NULL);
+
+    size_t direct_mismatches = 0u;
+    size_t replay_mismatches = 0u;
+    size_t fallback_mismatches = 0u;
+    size_t alias_mismatches = 0u;
+    size_t alias_guard_mismatches = 0u;
+    size_t guard_mismatches = 0u;
+    size_t nonfinite = 0u;
+    size_t total_words = 0u;
+    size_t completed_cases = 0u;
+    const bool allocated = raw && comp && q && comp_mask && heads_base &&
+        raw_host && comp_host && q_host && mask_host && initial &&
+        snapshots && model_storage_ok;
+    if (allocated) {
+        memset(model_raw, 0, (size_t)page);
+        ((float *)model_raw)[0] = -0.375f;
+        ((float *)model_raw)[1] = 0.21875f;
+        for (uint64_t i = 0; i < raw_count; i++) {
+            const int value = (int)((i * 17u +
+                (i ^ (i >> 5u)) * 11u + 23u) % 211u) - 105;
+            raw_host[i] = (float)value / 192.0f;
+        }
+        for (uint64_t i = 0; i < comp_count; i++) {
+            const int value = (int)((i * 23u +
+                (i ^ (i >> 4u)) * 7u + 29u) % 193u) - 96;
+            comp_host[i] = test_float_to_f16(
+                0.125f + (float)value / 224.0f);
+        }
+        for (uint64_t i = 0; i < q_count; i++) {
+            const int value = (int)((i * 31u +
+                (i ^ (i >> 3u)) * 5u + 37u) % 227u) - 113;
+            q_host[i] = (float)value / 208.0f;
+        }
+        for (uint64_t i = 0; i < mask_count; i++) {
+            mask_host[i] = (i % 5u) == 0u
+                ? -65504.0f : -(float)((i % 13u) + 1u) / 16.0f;
+        }
+        for (uint64_t i = 0; i < heads_base_bytes; i++) {
+            initial[i] = (uint8_t)(0xa5u ^ (uint8_t)(i * 37u));
+        }
+        const uint32_t poison = 0x7fc12345u;
+        for (uint64_t i = 0; i < q_count; i++) {
+            memcpy(initial + guard_bytes + i * sizeof(poison),
+                   &poison, sizeof(poison));
+        }
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            raw, 0u, raw_host, raw_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            comp, 0u, comp_host, comp_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            q, 0u, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+            comp_mask, 0u, mask_host, mask_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, page) != 0);
+        ds4_gpu_set_quality(false);
+        TEST_ASSERT(unsetenv(disable_env) == 0);
+        TEST_ASSERT(unsetenv(stage_profile_env) == 0);
+
+        for (size_t case_i = 0;
+             case_i < sizeof(cases) / sizeof(cases[0]); case_i++) {
+            const test_metal_small_prefill_case *c = &cases[case_i];
+            const uint64_t output_count =
+                (uint64_t)c->shape.n_tokens * n_head * head_dim;
+            const uint64_t output_bytes = output_count * sizeof(float);
+            ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
+                heads_base, guard_bytes, output_bytes);
+            TEST_ASSERT(heads != NULL);
+            bool case_ok = heads != NULL;
+            for (uint32_t arm = 0u;
+                 arm < TEST_SMALL_PREFILL_ARM_COUNT && case_ok; arm++) {
+                const bool cold_scratch_case =
+                    case_i == 0u || case_i == 3u;
+                if (cold_scratch_case &&
+                    (arm == TEST_SMALL_PREFILL_DIRECT_COLD ||
+                     arm == TEST_SMALL_PREFILL_PSO_FALLBACK)) {
+                    TEST_ASSERT(ds4_gpu_test_reset_flash_attn_tmp() != 0);
+                    TEST_ASSERT(ds4_gpu_test_flash_attn_tmp_bytes() == 0u);
+                }
+                TEST_ASSERT(ds4_gpu_tensor_write(
+                    heads_base, 0u, initial, heads_base_bytes) != 0);
+                const bool env_rollback =
+                    arm == TEST_SMALL_PREFILL_ENV_ROLLBACK;
+                const int env_ok = env_rollback
+                    ? setenv(disable_env, "0", 1)
+                    : unsetenv(disable_env);
+                TEST_ASSERT(env_ok == 0);
+                ds4_gpu_test_set_flags(
+                    arm == TEST_SMALL_PREFILL_PSO_FALLBACK
+                        ? DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG1_FAILURE
+                        : 0u);
+                const int call_ok =
+                    test_metal_zero_prefix_prefill_mask_cache_call(
+                        c->kind, heads, model_raw, page, q, raw, comp,
+                        comp_mask, &c->shape, c->masked,
+                        n_head, head_dim);
+                TEST_ASSERT(call_ok != 0);
+                const uint32_t n_keys =
+                    c->shape.n_tokens + c->shape.n_comp;
+                const bool expect_direct =
+                    (arm == TEST_SMALL_PREFILL_DIRECT_COLD ||
+                     arm == TEST_SMALL_PREFILL_DIRECT_REPLAY) &&
+                    n_keys <= 32u;
+                const uint32_t expected_nwg = expect_direct ? 1u : 32u;
+                const uint32_t selected_nwg =
+                    ds4_gpu_test_last_flash_attn_prefill_nwg();
+                TEST_ASSERT(selected_nwg == expected_nwg);
+                if (cold_scratch_case &&
+                    arm == TEST_SMALL_PREFILL_DIRECT_COLD) {
+                    TEST_ASSERT(
+                        ds4_gpu_test_flash_attn_tmp_bytes() == 0u);
+                }
+                if (cold_scratch_case &&
+                    arm == TEST_SMALL_PREFILL_PSO_FALLBACK) {
+                    TEST_ASSERT(
+                        ds4_gpu_test_flash_attn_tmp_bytes() != 0u);
+                }
+                const int read_ok = call_ok && ds4_gpu_tensor_read(
+                    heads_base, 0u,
+                    snapshots + (uint64_t)arm * heads_base_bytes,
+                    heads_base_bytes) != 0;
+                TEST_ASSERT(read_ok != 0);
+                case_ok = read_ok != 0 && selected_nwg == expected_nwg;
+            }
+            ds4_gpu_test_set_flags(0u);
+            ds4_gpu_tensor_free(heads);
+            if (!case_ok) continue;
+
+            const uint8_t *direct = snapshots +
+                TEST_SMALL_PREFILL_DIRECT_COLD * heads_base_bytes;
+            const uint8_t *baseline = snapshots +
+                TEST_SMALL_PREFILL_ENV_ROLLBACK * heads_base_bytes;
+            const uint8_t *replay = snapshots +
+                TEST_SMALL_PREFILL_DIRECT_REPLAY * heads_base_bytes;
+            const uint8_t *fallback = snapshots +
+                TEST_SMALL_PREFILL_PSO_FALLBACK * heads_base_bytes;
+            const test_float_compare_stats direct_stats =
+                test_compare_float_bits(
+                    (const float *)(baseline + guard_bytes),
+                    (const float *)(direct + guard_bytes),
+                    (size_t)output_count);
+            const test_float_compare_stats replay_stats =
+                test_compare_float_bits(
+                    (const float *)(baseline + guard_bytes),
+                    (const float *)(replay + guard_bytes),
+                    (size_t)output_count);
+            const test_float_compare_stats fallback_stats =
+                test_compare_float_bits(
+                    (const float *)(baseline + guard_bytes),
+                    (const float *)(fallback + guard_bytes),
+                    (size_t)output_count);
+            direct_mismatches += direct_stats.mismatch_count;
+            replay_mismatches += replay_stats.mismatch_count;
+            fallback_mismatches += fallback_stats.mismatch_count;
+            total_words += (size_t)output_count;
+            completed_cases++;
+
+            for (uint32_t arm = 0u;
+                 arm < TEST_SMALL_PREFILL_ARM_COUNT; arm++) {
+                const uint8_t *snapshot =
+                    snapshots + (uint64_t)arm * heads_base_bytes;
+                for (uint64_t i = 0; i < heads_base_bytes; i++) {
+                    const bool in_output = i >= guard_bytes &&
+                        i < guard_bytes + output_bytes;
+                    if (!in_output && snapshot[i] != initial[i]) {
+                        guard_mismatches++;
+                    }
+                }
+                const float *values =
+                    (const float *)(snapshot + guard_bytes);
+                for (uint64_t i = 0; i < output_count; i++) {
+                    if (!isfinite(values[i])) nonfinite++;
+                }
+            }
+            fprintf(stderr,
+                    "ds4-test: small-prefill direct %s keys=%u "
+                    "direct=%zu/%llu replay=%zu/%llu fallback=%zu/%llu\n",
+                    c->name,
+                    c->shape.n_tokens + c->shape.n_comp,
+                    direct_stats.mismatch_count,
+                    (unsigned long long)output_count,
+                    replay_stats.mismatch_count,
+                    (unsigned long long)output_count,
+                    fallback_stats.mismatch_count,
+                    (unsigned long long)output_count);
+        }
+
+        /* The legacy split path permits heads to alias q because its first
+         * dispatch finishes reading q before the reducer writes heads.  The
+         * direct kernel must preserve that API behavior by falling back. */
+        {
+            static const size_t alias_case_indices[] = {1u, 3u, 5u};
+            for (size_t alias_i = 0u;
+                 alias_i < sizeof(alias_case_indices) /
+                     sizeof(alias_case_indices[0]);
+                 alias_i++) {
+                const test_metal_small_prefill_case *c =
+                    &cases[alias_case_indices[alias_i]];
+                const uint64_t output_count =
+                    (uint64_t)c->shape.n_tokens * n_head * head_dim;
+                const uint64_t output_bytes = output_count * sizeof(float);
+                ds4_gpu_tensor *heads_ref = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, output_bytes);
+                ds4_gpu_tensor *q_alias = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, q_bytes);
+                ds4_gpu_tensor *heads_alias = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, output_bytes);
+                TEST_ASSERT(heads_ref != NULL);
+                TEST_ASSERT(q_alias != NULL);
+                TEST_ASSERT(heads_alias != NULL);
+                if (heads_ref && q_alias && heads_alias) {
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        q, 0u, q_host, q_bytes) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        heads_base, 0u, initial, heads_base_bytes) != 0);
+                    TEST_ASSERT(setenv(disable_env, "0", 1) == 0);
+                    ds4_gpu_test_set_flags(0u);
+                    const int ref_ok =
+                        test_metal_zero_prefix_prefill_mask_cache_call(
+                            c->kind, heads_ref, model_raw, page, q, raw,
+                            comp, comp_mask, &c->shape, c->masked,
+                            n_head, head_dim);
+                    TEST_ASSERT(ref_ok != 0);
+                    TEST_ASSERT(
+                        ds4_gpu_test_last_flash_attn_prefill_nwg() == 32u);
+                    const int ref_read_ok = ref_ok && ds4_gpu_tensor_read(
+                        heads_base, 0u, snapshots, heads_base_bytes) != 0;
+                    TEST_ASSERT(ref_read_ok != 0);
+
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        heads_base, 0u, initial, heads_base_bytes) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_write(
+                        q_alias, 0u, q_host, q_bytes) != 0);
+                    const int before_read_ok = ds4_gpu_tensor_read(
+                        heads_base, 0u, snapshots + heads_base_bytes,
+                        heads_base_bytes) != 0;
+                    TEST_ASSERT(before_read_ok != 0);
+                    TEST_ASSERT(unsetenv(disable_env) == 0);
+                    ds4_gpu_test_set_flags(0u);
+                    const int alias_ok =
+                        test_metal_zero_prefix_prefill_mask_cache_call(
+                            c->kind, heads_alias, model_raw, page, q_alias,
+                            raw, comp, comp_mask, &c->shape, c->masked,
+                            n_head, head_dim);
+                    TEST_ASSERT(alias_ok != 0);
+                    const uint32_t alias_nwg =
+                        ds4_gpu_test_last_flash_attn_prefill_nwg();
+                    TEST_ASSERT(alias_nwg == 32u);
+                    const int alias_read_ok = alias_ok &&
+                        ds4_gpu_tensor_read(
+                            heads_base, 0u,
+                            snapshots + 2u * heads_base_bytes,
+                            heads_base_bytes) != 0;
+                    TEST_ASSERT(alias_read_ok != 0);
+                    if (ref_read_ok && before_read_ok && alias_read_ok) {
+                        const test_float_compare_stats alias_stats =
+                            test_compare_float_bits(
+                                (const float *)(snapshots + guard_bytes),
+                                (const float *)(snapshots +
+                                    2u * heads_base_bytes + guard_bytes),
+                                (size_t)output_count);
+                        alias_mismatches += alias_stats.mismatch_count;
+                        size_t case_guard_mismatches = 0u;
+                        const uint8_t *before =
+                            snapshots + heads_base_bytes;
+                        const uint8_t *after =
+                            snapshots + 2u * heads_base_bytes;
+                        for (uint64_t i = 0u;
+                             i < heads_base_bytes; i++) {
+                            const bool in_output = i >= guard_bytes &&
+                                i < guard_bytes + output_bytes;
+                            if (!in_output && before[i] != after[i]) {
+                                case_guard_mismatches++;
+                            }
+                        }
+                        alias_guard_mismatches += case_guard_mismatches;
+                        fprintf(stderr,
+                                "ds4-test: small-prefill q/heads alias "
+                                "%s nwg=%u mismatches=%zu/%llu guards=%zu\n",
+                                c->name, alias_nwg,
+                                alias_stats.mismatch_count,
+                                (unsigned long long)output_count,
+                                case_guard_mismatches);
+                    }
+                }
+                ds4_gpu_test_set_flags(0u);
+                TEST_ASSERT(unsetenv(disable_env) == 0);
+                ds4_gpu_tensor_free(heads_alias);
+                ds4_gpu_tensor_free(q_alias);
+                ds4_gpu_tensor_free(heads_ref);
+            }
+        }
+
+        if (test_env_bool("DS4_TEST_METAL_SMALL_PREFILL_TIMING")) {
+            /* GPUStartTime/GPUEndTime excludes CPU mask construction,
+             * encoding, submit, and wait time.  Both arms run the same
+             * copy/pad kernels; their only topology difference is NWG=32 +
+             * reduce versus direct NWG=1 output.  Alternate pair order to
+             * limit thermal/order bias.  Keep this opt-in so the exactness
+             * oracle remains suitable for routine test runs. */
+            static const size_t timing_case_indices[] = {2u, 4u};
+            const uint32_t timing_repeats = 16u;
+            const uint32_t timing_samples = 4u;
+            for (size_t timing_i = 0u;
+                 timing_i < sizeof(timing_case_indices) /
+                     sizeof(timing_case_indices[0]);
+                 timing_i++) {
+                const test_metal_small_prefill_case *c =
+                    &cases[timing_case_indices[timing_i]];
+                const uint64_t output_bytes =
+                    (uint64_t)c->shape.n_tokens * n_head * head_dim *
+                    sizeof(float);
+                ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
+                    heads_base, guard_bytes, output_bytes);
+                TEST_ASSERT(heads != NULL);
+                if (!heads) continue;
+
+                (void)test_metal_small_prefill_gpu_batch_ms(
+                    c->kind, c->masked, &c->shape, heads, model_raw, page,
+                    q, raw, comp, comp_mask, n_head, head_dim,
+                    DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG32, 4u, 32u);
+                (void)test_metal_small_prefill_gpu_batch_ms(
+                    c->kind, c->masked, &c->shape, heads, model_raw, page,
+                    q, raw, comp, comp_mask, n_head, head_dim,
+                    0u, 4u, 1u);
+
+                double baseline_sum = 0.0;
+                double direct_sum = 0.0;
+                double log_speedup_sum = 0.0;
+                uint32_t valid_samples = 0u;
+                for (uint32_t sample = 0u;
+                     sample < timing_samples; sample++) {
+                    double pair_ms[2] = {-1.0, -1.0};
+                    for (uint32_t order_i = 0u; order_i < 2u; order_i++) {
+                        const uint32_t arm = (sample & 1u) != 0u
+                            ? 1u - order_i : order_i;
+                        pair_ms[arm] =
+                            test_metal_small_prefill_gpu_batch_ms(
+                                c->kind, c->masked, &c->shape,
+                                heads, model_raw, page, q, raw, comp,
+                                comp_mask, n_head, head_dim,
+                                arm == 0u
+                                    ? DS4_GPU_TEST_FLASH_ATTN_SMALL_PREFILL_NWG32
+                                    : 0u,
+                                timing_repeats,
+                                arm == 0u ? 32u : 1u);
+                    }
+                    if (pair_ms[0] > 0.0 && pair_ms[1] > 0.0) {
+                        baseline_sum += pair_ms[0];
+                        direct_sum += pair_ms[1];
+                        log_speedup_sum += log(pair_ms[0] / pair_ms[1]);
+                        valid_samples++;
+                    }
+                }
+                TEST_ASSERT(valid_samples == timing_samples);
+                if (valid_samples != 0u) {
+                    const double baseline_ms =
+                        baseline_sum / (double)valid_samples;
+                    const double direct_ms =
+                        direct_sum / (double)valid_samples;
+                    const double speedup =
+                        exp(log_speedup_sum / (double)valid_samples);
+                    fprintf(stderr,
+                            "ds4-test: small-prefill GPU-only kernel-chain %s "
+                            "legacy=%.6f ms direct=%.6f ms speedup=%.3fx "
+                            "throughput=%.1f%%\n",
+                            c->name, baseline_ms, direct_ms, speedup,
+                            (speedup - 1.0) * 100.0);
+                }
+                ds4_gpu_tensor_free(heads);
+            }
+        }
+    }
+
+    ds4_gpu_test_set_flags(0u);
+    test_restore_env(stage_profile_env, saved_stage_profile);
+    test_restore_env(disable_env, saved_disable);
+    fprintf(stderr,
+            "ds4-test: small-prefill direct exact cases=%zu/%zu "
+            "words=%zu direct=%zu replay=%zu fallback=%zu alias=%zu "
+            "guards=%zu alias_guards=%zu nonfinite=%zu\n",
+            completed_cases, sizeof(cases) / sizeof(cases[0]), total_words,
+            direct_mismatches, replay_mismatches, fallback_mismatches,
+            alias_mismatches, guard_mismatches, alias_guard_mismatches,
+            nonfinite);
+    TEST_ASSERT(completed_cases == sizeof(cases) / sizeof(cases[0]));
+    TEST_ASSERT(direct_mismatches == 0u);
+    TEST_ASSERT(replay_mismatches == 0u);
+    TEST_ASSERT(fallback_mismatches == 0u);
+    TEST_ASSERT(alias_mismatches == 0u);
+    TEST_ASSERT(guard_mismatches == 0u);
+    TEST_ASSERT(alias_guard_mismatches == 0u);
+    TEST_ASSERT(nonfinite == 0u);
+
+    free(snapshots);
+    free(initial);
+    free(mask_host);
+    free(q_host);
+    free(comp_host);
+    free(raw_host);
+    ds4_gpu_tensor_free(heads_base);
+    ds4_gpu_tensor_free(comp_mask);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+}
 #endif
 
 #if defined(__APPLE__)
+typedef enum {
+    TEST_METAL_ATTN_OUT_HC_Q8,
+    TEST_METAL_ATTN_OUT_HC_Q4,
+} test_metal_attn_out_hc_kind;
+
+static uint32_t test_metal_attn_out_hc_poison_bits(
+        uint32_t tag,
+        uint64_t index) {
+    return 0x7fc00000u |
+        ((tag & 0x1fu) << 16u) |
+        (uint32_t)((index + 1u) & 0xffffu);
+}
+
+static void test_metal_attn_out_hc_fill_poison(
+        float    *dst,
+        uint64_t  count,
+        uint32_t  tag) {
+    for (uint64_t i = 0; i < count; i++) {
+        const uint32_t bits = test_metal_attn_out_hc_poison_bits(tag, i);
+        memcpy(dst + i, &bits, sizeof(bits));
+    }
+}
+
+static size_t test_metal_attn_out_hc_canary_mismatches(
+        const float *values,
+        uint64_t     begin,
+        uint64_t     end,
+        uint32_t     tag) {
+    size_t mismatches = 0u;
+    for (uint64_t i = begin; i < end; i++) {
+        uint32_t bits = 0u;
+        memcpy(&bits, values + i, sizeof(bits));
+        if (bits != test_metal_attn_out_hc_poison_bits(tag, i)) {
+            mismatches++;
+        }
+    }
+    return mismatches;
+}
+
+static size_t test_metal_attn_out_hc_poisoned_values(
+        const float *values,
+        uint64_t     count,
+        uint32_t     tag) {
+    size_t poisoned = 0u;
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t bits = 0u;
+        memcpy(&bits, values + i, sizeof(bits));
+        if (bits == test_metal_attn_out_hc_poison_bits(tag, i)) {
+            poisoned++;
+        }
+    }
+    return poisoned;
+}
+
+static int test_metal_batch_attn_out_hc_fused_call(
+        test_metal_attn_out_hc_kind kind,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_b_offset,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_tokens) {
+    const uint32_t group_dim = 4096u;
+    const uint32_t rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint32_t out_dim = 4096u;
+    const uint32_t n_hc = 4u;
+    if (kind == TEST_METAL_ATTN_OUT_HC_Q4) {
+        return ds4_gpu_attention_output_q4_K_batch_hc_tensor(
+            out, out_hc, residual_hc, split, low, group_tmp, low_tmp,
+            model_map, model_size, 0u, out_b_offset, 12u,
+            group_dim, rank, n_groups, out_dim, heads, n_tokens, n_hc);
+    }
+    return ds4_gpu_attention_output_q8_batch_hc_tensor(
+        out, out_hc, residual_hc, split, low, group_tmp, low_tmp,
+        model_map, model_size, 0u, out_b_offset,
+        group_dim, rank, n_groups, out_dim, heads, n_tokens, n_hc);
+}
+
+static void test_metal_batch_attn_out_hc_fusion_exact_case(
+        test_metal_attn_out_hc_kind kind) {
+    const bool q4 = kind == TEST_METAL_ATTN_OUT_HC_Q4;
+    const uint32_t n_tokens = 32u;
+    const uint32_t alloc_tokens = n_tokens + 1u;
+    const uint32_t group_dim = 4096u;
+    const uint32_t rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint32_t low_dim = n_groups * rank;
+    const uint32_t out_dim = 4096u;
+    const uint32_t n_hc = 4u;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t row_a_bytes = q4
+        ? (uint64_t)(group_dim / 256u) * 144u
+        : (uint64_t)(group_dim / 32u) * 34u;
+    const uint64_t row_b_bytes = q4
+        ? (uint64_t)(low_dim / 256u) * 144u
+        : (uint64_t)(low_dim / 32u) * 34u;
+    const uint64_t out_a_bytes = (uint64_t)low_dim * row_a_bytes;
+    const uint64_t out_b_offset = test_round_up_u64(out_a_bytes, page);
+    const uint64_t out_b_bytes = (uint64_t)out_dim * row_b_bytes;
+    const uint64_t model_bytes =
+        test_round_up_u64(out_b_offset + out_b_bytes, page);
+    const uint64_t heads_count =
+        (uint64_t)alloc_tokens * n_groups * group_dim;
+    const uint64_t low_count = (uint64_t)alloc_tokens * low_dim;
+    const uint64_t out_count = (uint64_t)alloc_tokens * out_dim;
+    const uint64_t hc_count =
+        (uint64_t)alloc_tokens * n_hc * out_dim;
+    const uint64_t split_count = (uint64_t)alloc_tokens * mix_hc;
+    const uint64_t active_heads_count =
+        (uint64_t)n_tokens * n_groups * group_dim;
+    const uint64_t active_low_count = (uint64_t)n_tokens * low_dim;
+    const uint64_t active_out_count = (uint64_t)n_tokens * out_dim;
+    const uint64_t active_hc_count =
+        (uint64_t)n_tokens * n_hc * out_dim;
+    const uint64_t active_split_count = (uint64_t)n_tokens * mix_hc;
+    const uint64_t heads_bytes = heads_count * sizeof(float);
+    const uint64_t low_bytes = low_count * sizeof(float);
+    const uint64_t out_bytes = out_count * sizeof(float);
+    const uint64_t hc_bytes = hc_count * sizeof(float);
+    const uint64_t split_bytes = split_count * sizeof(float);
+    const uint64_t active_heads_bytes = active_heads_count * sizeof(float);
+    const uint64_t active_low_bytes = active_low_count * sizeof(float);
+    const uint64_t active_out_bytes = active_out_count * sizeof(float);
+    const uint64_t active_hc_bytes = active_hc_count * sizeof(float);
+    const uint64_t active_split_bytes = active_split_count * sizeof(float);
+    const uint64_t scratch_bytes =
+        (uint64_t)alloc_tokens * low_dim * sizeof(uint16_t);
+    enum {
+        ref_low_tag = 1u,
+        fused_low_tag = 2u,
+        ref_out_tag = 3u,
+        fused_out_tag = 4u,
+        ref_hc_tag = 5u,
+        fused_hc_tag = 6u,
+    };
+
+    const char *disable_fusion_env =
+        "DS4_METAL_DISABLE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION";
+    const char *require_q8_env =
+        "DS4_METAL_REQUIRE_PRE_M5_BATCH_ATTN_OUT_HC_FUSION";
+    const char *require_q4_env =
+        "DS4_METAL_REQUIRE_Q4_BATCH_ATTN_OUT_HC_FUSION";
+    const char *require_q4_rhs_env =
+        "DS4_METAL_REQUIRE_Q4_ATTN_OUT_B_F16_RHS";
+    const char *disable_q4_rhs_env =
+        "DS4_METAL_DISABLE_Q4_ATTN_OUT_B_F16_RHS";
+    const char *stage_profile_env = "DS4_METAL_ATTN_OUT_STAGE_PROFILE";
+    const char *q8_profile_env = "DS4_METAL_Q8_PREFILL_PROFILE";
+    char *saved_disable_fusion = test_save_env(disable_fusion_env);
+    char *saved_require_q8 = test_save_env(require_q8_env);
+    char *saved_require_q4 = test_save_env(require_q4_env);
+    char *saved_require_q4_rhs = test_save_env(require_q4_rhs_env);
+    char *saved_disable_q4_rhs = test_save_env(disable_q4_rhs_env);
+    char *saved_stage_profile = test_save_env(stage_profile_env);
+    char *saved_q8_profile = test_save_env(q8_profile_env);
+
+    void *model_raw = NULL;
+    float *heads_host = NULL;
+    float *residual_host = NULL;
+    float *split_host = NULL;
+    float *ref_low_host = NULL;
+    float *fused_low_host = NULL;
+    float *ref_out_host = NULL;
+    float *fused_out_host = NULL;
+    float *ref_hc_host = NULL;
+    float *fused_hc_host = NULL;
+    ds4_gpu_tensor *heads_base = NULL;
+    ds4_gpu_tensor *residual_base = NULL;
+    ds4_gpu_tensor *split_base = NULL;
+    ds4_gpu_tensor *ref_low_base = NULL;
+    ds4_gpu_tensor *fused_low_base = NULL;
+    ds4_gpu_tensor *ref_out_base = NULL;
+    ds4_gpu_tensor *fused_out_base = NULL;
+    ds4_gpu_tensor *ref_hc_base = NULL;
+    ds4_gpu_tensor *fused_hc_base = NULL;
+    ds4_gpu_tensor *group_tmp = NULL;
+    ds4_gpu_tensor *low_tmp = NULL;
+    ds4_gpu_tensor *heads = NULL;
+    ds4_gpu_tensor *residual = NULL;
+    ds4_gpu_tensor *split = NULL;
+    ds4_gpu_tensor *ref_low = NULL;
+    ds4_gpu_tensor *fused_low = NULL;
+    ds4_gpu_tensor *ref_out = NULL;
+    ds4_gpu_tensor *fused_out = NULL;
+    ds4_gpu_tensor *ref_hc = NULL;
+    ds4_gpu_tensor *fused_hc = NULL;
+
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    if (model_raw) {
+        memset(model_raw, 0, (size_t)model_bytes);
+        if (q4) {
+            test_fill_q4_K_weights(
+                model_raw, group_dim, low_dim, 211u);
+            test_fill_q4_K_weights(
+                (uint8_t *)model_raw + out_b_offset,
+                low_dim, out_dim, 307u);
+        } else {
+            test_fill_q8_0_weights(
+                model_raw, group_dim, low_dim, 211u);
+            test_fill_q8_0_weights(
+                (uint8_t *)model_raw + out_b_offset,
+                low_dim, out_dim, 307u);
+        }
+    }
+
+    heads_host = malloc((size_t)heads_bytes);
+    residual_host = malloc((size_t)hc_bytes);
+    split_host = malloc((size_t)split_bytes);
+    ref_low_host = malloc((size_t)low_bytes);
+    fused_low_host = malloc((size_t)low_bytes);
+    ref_out_host = malloc((size_t)out_bytes);
+    fused_out_host = malloc((size_t)out_bytes);
+    ref_hc_host = malloc((size_t)hc_bytes);
+    fused_hc_host = malloc((size_t)hc_bytes);
+    heads_base = ds4_gpu_tensor_alloc(heads_bytes);
+    residual_base = ds4_gpu_tensor_alloc(hc_bytes);
+    split_base = ds4_gpu_tensor_alloc(split_bytes);
+    ref_low_base = ds4_gpu_tensor_alloc(low_bytes);
+    fused_low_base = ds4_gpu_tensor_alloc(low_bytes);
+    ref_out_base = ds4_gpu_tensor_alloc(out_bytes);
+    fused_out_base = ds4_gpu_tensor_alloc(out_bytes);
+    ref_hc_base = ds4_gpu_tensor_alloc(hc_bytes);
+    fused_hc_base = ds4_gpu_tensor_alloc(hc_bytes);
+    group_tmp = ds4_gpu_tensor_alloc(scratch_bytes);
+    low_tmp = ds4_gpu_tensor_alloc(sizeof(float));
+    heads = heads_base
+        ? ds4_gpu_tensor_view(heads_base, 0u, active_heads_bytes) : NULL;
+    residual = residual_base
+        ? ds4_gpu_tensor_view(residual_base, 0u, active_hc_bytes) : NULL;
+    split = split_base
+        ? ds4_gpu_tensor_view(split_base, 0u, active_split_bytes) : NULL;
+    ref_low = ref_low_base
+        ? ds4_gpu_tensor_view(ref_low_base, 0u, active_low_bytes) : NULL;
+    fused_low = fused_low_base
+        ? ds4_gpu_tensor_view(fused_low_base, 0u, active_low_bytes) : NULL;
+    ref_out = ref_out_base
+        ? ds4_gpu_tensor_view(ref_out_base, 0u, active_out_bytes) : NULL;
+    fused_out = fused_out_base
+        ? ds4_gpu_tensor_view(fused_out_base, 0u, active_out_bytes) : NULL;
+    ref_hc = ref_hc_base
+        ? ds4_gpu_tensor_view(ref_hc_base, 0u, active_hc_bytes) : NULL;
+    fused_hc = fused_hc_base
+        ? ds4_gpu_tensor_view(fused_hc_base, 0u, active_hc_bytes) : NULL;
+
+    const bool allocated = model_raw && heads_host && residual_host &&
+        split_host && ref_low_host && fused_low_host && ref_out_host &&
+        fused_out_host && ref_hc_host && fused_hc_host && heads_base &&
+        residual_base && split_base && ref_low_base && fused_low_base &&
+        ref_out_base && fused_out_base && ref_hc_base && fused_hc_base &&
+        group_tmp && low_tmp && heads && residual && split && ref_low &&
+        fused_low && ref_out && fused_out && ref_hc && fused_hc;
+    TEST_ASSERT(allocated);
+
+    test_float_compare_stats low_stats = {0};
+    test_float_compare_stats hc_stats = {0};
+    size_t reject_writes = 0u;
+    size_t active_poisoned = 0u;
+    size_t guard_mismatches = 0u;
+    size_t fused_out_writes = 0u;
+    if (allocated) {
+        for (uint64_t i = 0; i < heads_count; i++) {
+            const int value =
+                (int)((i * 17u + (i ^ (i >> 7u)) * 3u +
+                       (q4 ? 19u : 7u)) % 127u) - 63;
+            heads_host[i] = (float)value / 96.0f;
+        }
+        for (uint64_t i = 0; i < hc_count; i++) {
+            const int value =
+                (int)((i * 19u + (i ^ (i >> 5u)) * 7u +
+                       (q4 ? 23u : 11u)) % 149u) - 74;
+            residual_host[i] = (float)value / 80.0f;
+        }
+        for (uint32_t t = 0; t < alloc_tokens; t++) {
+            float *row = split_host + (uint64_t)t * mix_hc;
+            for (uint32_t h = 0; h < n_hc; h++) {
+                row[h] = 0.0f;
+                row[n_hc + h] =
+                    0.55f + (float)((t + h * 3u) % 11u) / 32.0f;
+            }
+            for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+                for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                    const int value =
+                        (int)((t * 5u + dst_hc * 7u + src_hc * 11u +
+                               (q4 ? 3u : 0u)) % 17u) - 8;
+                    row[2u * n_hc + dst_hc * n_hc + src_hc] =
+                        (float)value / 24.0f;
+                }
+            }
+        }
+        test_metal_attn_out_hc_fill_poison(
+            ref_low_host, low_count, ref_low_tag);
+        test_metal_attn_out_hc_fill_poison(
+            fused_low_host, low_count, fused_low_tag);
+        test_metal_attn_out_hc_fill_poison(
+            ref_out_host, out_count, ref_out_tag);
+        test_metal_attn_out_hc_fill_poison(
+            fused_out_host, out_count, fused_out_tag);
+        test_metal_attn_out_hc_fill_poison(
+            ref_hc_host, hc_count, ref_hc_tag);
+        test_metal_attn_out_hc_fill_poison(
+            fused_hc_host, hc_count, fused_hc_tag);
+
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        heads_base, 0u, heads_host, heads_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        residual_base, 0u, residual_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        split_base, 0u, split_host, split_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_low_base, 0u, ref_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_low_base, 0u, fused_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_out_base, 0u, ref_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_out_base, 0u, fused_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        ref_hc_base, 0u, ref_hc_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        fused_hc_base, 0u, fused_hc_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+
+        TEST_ASSERT(unsetenv(disable_fusion_env) == 0);
+        TEST_ASSERT(unsetenv(require_q8_env) == 0);
+        TEST_ASSERT(unsetenv(require_q4_env) == 0);
+        TEST_ASSERT(unsetenv(require_q4_rhs_env) == 0);
+        TEST_ASSERT(unsetenv(disable_q4_rhs_env) == 0);
+        TEST_ASSERT(unsetenv(stage_profile_env) == 0);
+        TEST_ASSERT(unsetenv(q8_profile_env) == 0);
+        TEST_ASSERT(setenv(
+                        q4 ? require_q4_env : require_q8_env,
+                        "1", 1) == 0);
+        if (q4) {
+            TEST_ASSERT(setenv(require_q4_rhs_env, "1", 1) == 0);
+        }
+        ds4_gpu_set_quality(false);
+        ds4_gpu_test_set_flags(q4
+            ? DS4_GPU_TEST_BATCH_ATTN_OUT_Q4_HC_FUSION
+            : DS4_GPU_TEST_BATCH_ATTN_OUT_Q8_HC_FUSION);
+
+        /* The force hook removes only the production minimum.  Neighbors of
+         * the 32-row tile must still fail closed and leave every destination
+         * byte untouched. */
+        TEST_ASSERT(test_metal_batch_attn_out_hc_fused_call(
+                        kind, fused_out_base, fused_hc_base, residual_base,
+                        split_base, fused_low_base, group_tmp, low_tmp,
+                        model_raw, model_bytes, out_b_offset, heads_base,
+                        n_tokens - 1u) == -1);
+        TEST_ASSERT(test_metal_batch_attn_out_hc_fused_call(
+                        kind, fused_out_base, fused_hc_base, residual_base,
+                        split_base, fused_low_base, group_tmp, low_tmp,
+                        model_raw, model_bytes, out_b_offset, heads_base,
+                        n_tokens + 1u) == -1);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_low_base, 0u, fused_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_out_base, 0u, fused_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_hc_base, 0u, fused_hc_host, hc_bytes) != 0);
+        reject_writes += test_metal_attn_out_hc_canary_mismatches(
+            fused_low_host, 0u, low_count, fused_low_tag);
+        reject_writes += test_metal_attn_out_hc_canary_mismatches(
+            fused_out_host, 0u, out_count, fused_out_tag);
+        reject_writes += test_metal_attn_out_hc_canary_mismatches(
+            fused_hc_host, 0u, hc_count, fused_hc_tag);
+
+        int reference_ok = 0;
+        if (q4) {
+            reference_ok = ds4_gpu_attention_output_q4_K_batch_tensor(
+                ref_out, ref_low, group_tmp, low_tmp,
+                model_raw, model_bytes, 0u, out_b_offset, 12u,
+                group_dim, rank, n_groups, out_dim, heads, n_tokens);
+        } else {
+            reference_ok = ds4_gpu_attention_output_q8_batch_tensor(
+                ref_out, ref_low, group_tmp, low_tmp,
+                model_raw, model_bytes, 0u, out_b_offset,
+                group_dim, rank, n_groups, out_dim, heads, n_tokens);
+        }
+        TEST_ASSERT(reference_ok == 1);
+        TEST_ASSERT(ds4_gpu_hc_expand_split_tensor(
+                        ref_hc, ref_out, residual, split,
+                        out_dim, n_hc) != 0);
+        TEST_ASSERT(test_metal_batch_attn_out_hc_fused_call(
+                        kind, fused_out, fused_hc, residual, split,
+                        fused_low, group_tmp, low_tmp,
+                        model_raw, model_bytes, out_b_offset, heads,
+                        n_tokens) == 1);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_low_base, 0u, ref_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_low_base, 0u, fused_low_host, low_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_out_base, 0u, ref_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_out_base, 0u, fused_out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        ref_hc_base, 0u, ref_hc_host, hc_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        fused_hc_base, 0u, fused_hc_host, hc_bytes) != 0);
+
+        low_stats = test_compare_float_bits(
+            ref_low_host, fused_low_host, (size_t)active_low_count);
+        hc_stats = test_compare_float_bits(
+            ref_hc_host, fused_hc_host, (size_t)active_hc_count);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            ref_low_host, active_low_count, ref_low_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            fused_low_host, active_low_count, fused_low_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            ref_out_host, active_out_count, ref_out_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            ref_hc_host, active_hc_count, ref_hc_tag);
+        active_poisoned += test_metal_attn_out_hc_poisoned_values(
+            fused_hc_host, active_hc_count, fused_hc_tag);
+        fused_out_writes = test_metal_attn_out_hc_canary_mismatches(
+            fused_out_host, 0u, out_count, fused_out_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            ref_low_host, active_low_count, low_count, ref_low_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            fused_low_host, active_low_count, low_count, fused_low_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            ref_out_host, active_out_count, out_count, ref_out_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            ref_hc_host, active_hc_count, hc_count, ref_hc_tag);
+        guard_mismatches += test_metal_attn_out_hc_canary_mismatches(
+            fused_hc_host, active_hc_count, hc_count, fused_hc_tag);
+    }
+
+    fprintf(stderr,
+            "ds4-test: Metal %s batch attention-output HC exact N=%u "
+            "low=%zu/%llu hc=%zu/%llu max_ulp=%u/%u "
+            "active_poison=%zu guard=%zu fused_out_writes=%zu "
+            "reject_writes=%zu\n",
+            q4 ? "Q4_K/F16-RHS" : "Q8_0",
+            n_tokens,
+            low_stats.mismatch_count,
+            (unsigned long long)active_low_count,
+            hc_stats.mismatch_count,
+            (unsigned long long)active_hc_count,
+            low_stats.max_ulp,
+            hc_stats.max_ulp,
+            active_poisoned,
+            guard_mismatches,
+            fused_out_writes,
+            reject_writes);
+    TEST_ASSERT(low_stats.mismatch_count == 0u && low_stats.max_ulp == 0u);
+    TEST_ASSERT(hc_stats.mismatch_count == 0u && hc_stats.max_ulp == 0u);
+    TEST_ASSERT(active_poisoned == 0u);
+    TEST_ASSERT(guard_mismatches == 0u);
+    TEST_ASSERT(fused_out_writes == 0u);
+    TEST_ASSERT(reject_writes == 0u);
+
+    ds4_gpu_test_set_flags(0u);
+    ds4_gpu_set_quality(false);
+    test_restore_env(q8_profile_env, saved_q8_profile);
+    test_restore_env(stage_profile_env, saved_stage_profile);
+    test_restore_env(disable_q4_rhs_env, saved_disable_q4_rhs);
+    test_restore_env(require_q4_rhs_env, saved_require_q4_rhs);
+    test_restore_env(require_q4_env, saved_require_q4);
+    test_restore_env(require_q8_env, saved_require_q8);
+    test_restore_env(disable_fusion_env, saved_disable_fusion);
+    ds4_gpu_tensor_free(fused_hc);
+    ds4_gpu_tensor_free(ref_hc);
+    ds4_gpu_tensor_free(fused_out);
+    ds4_gpu_tensor_free(ref_out);
+    ds4_gpu_tensor_free(fused_low);
+    ds4_gpu_tensor_free(ref_low);
+    ds4_gpu_tensor_free(split);
+    ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_tensor_free(low_tmp);
+    ds4_gpu_tensor_free(group_tmp);
+    ds4_gpu_tensor_free(fused_hc_base);
+    ds4_gpu_tensor_free(ref_hc_base);
+    ds4_gpu_tensor_free(fused_out_base);
+    ds4_gpu_tensor_free(ref_out_base);
+    ds4_gpu_tensor_free(fused_low_base);
+    ds4_gpu_tensor_free(ref_low_base);
+    ds4_gpu_tensor_free(split_base);
+    ds4_gpu_tensor_free(residual_base);
+    ds4_gpu_tensor_free(heads_base);
+    free(fused_hc_host);
+    free(ref_hc_host);
+    free(fused_out_host);
+    free(ref_out_host);
+    free(fused_low_host);
+    free(ref_low_host);
+    free(split_host);
+    free(residual_host);
+    free(heads_host);
+    free(model_raw);
+}
+
+static void test_metal_batch_attn_out_hc_fusion_exact(void) {
+    test_metal_batch_attn_out_hc_fusion_exact_case(
+        TEST_METAL_ATTN_OUT_HC_Q8);
+    test_metal_batch_attn_out_hc_fusion_exact_case(
+        TEST_METAL_ATTN_OUT_HC_Q4);
+}
+
 static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
     /* Compare the batched HC+RMSNorm fusion against the exact two-dispatch
      * sequence used by the reference path at DS4's production dimensions. */
@@ -3837,6 +7051,194 @@ static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
     ds4_gpu_tensor_free(ref_norm);
     ds4_gpu_tensor_free(fused_norm);
     free(model_raw);
+}
+
+static void test_metal_hc_producer_pre_norm_compound_exact(void) {
+    const uint32_t n = 16384u;
+    const uint32_t mix_dim = 24u;
+    const uint32_t n_embd = 4096u;
+    const uint32_t n_hc = 4u;
+    const uint32_t sinkhorn_iters = 20u;
+    const float eps = 1.0e-6f;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t weight_offset = page;
+    const uint64_t weight_bytes =
+        (uint64_t)n * mix_dim * sizeof(uint16_t);
+    const uint64_t scale_offset =
+        test_round_up_u64(weight_offset + weight_bytes, page);
+    const uint64_t base_offset =
+        test_round_up_u64(scale_offset + 3u*sizeof(float), page);
+    const uint64_t norm_offset =
+        test_round_up_u64(base_offset + mix_dim*sizeof(float), page);
+    const uint64_t model_bytes =
+        test_round_up_u64(norm_offset + n_embd*sizeof(float), page);
+    const uint64_t residual_bytes = (uint64_t)n*sizeof(float);
+    const uint64_t mix_bytes = (uint64_t)mix_dim*sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_embd*sizeof(float);
+
+    const char *force_env =
+        "DS4_METAL_ENABLE_HC_PRODUCER_PRE_NORM_FUSE";
+    const char *disable_env =
+        "DS4_METAL_DISABLE_HC_PRODUCER_PRE_NORM_FUSE";
+    const char *disable_pre_env =
+        "DS4_METAL_DISABLE_PRE_M5_HC_PRODUCER_PRE_NORM_FUSE";
+    const char *disable_m5_env =
+        "DS4_METAL_DISABLE_M5_HC_PRODUCER_PRE_NORM_FUSE";
+    const char *disable_ports_env =
+        "DS4_METAL_DISABLE_PRE_M5_DECODE_PORTS";
+    char *saved_force = test_save_env(force_env);
+    char *saved_disable = test_save_env(disable_env);
+    char *saved_disable_pre = test_save_env(disable_pre_env);
+    char *saved_disable_m5 = test_save_env(disable_m5_env);
+    char *saved_disable_ports = test_save_env(disable_ports_env);
+
+    void *model_raw = NULL;
+    float *residual_host = NULL;
+    float *ref_host = NULL;
+    float *fused_host = NULL;
+    ds4_gpu_tensor *residual = NULL;
+    ds4_gpu_tensor *ref_mix = NULL;
+    ds4_gpu_tensor *fused_mix = NULL;
+    ds4_gpu_tensor *ref_split = NULL;
+    ds4_gpu_tensor *fused_split = NULL;
+    ds4_gpu_tensor *ref_out = NULL;
+    ds4_gpu_tensor *fused_out = NULL;
+    ds4_gpu_tensor *ref_norm = NULL;
+    ds4_gpu_tensor *fused_norm = NULL;
+
+    TEST_ASSERT(setenv(force_env, "1", 1) == 0);
+    TEST_ASSERT(unsetenv(disable_env) == 0);
+    TEST_ASSERT(unsetenv(disable_pre_env) == 0);
+    TEST_ASSERT(unsetenv(disable_m5_env) == 0);
+    TEST_ASSERT(unsetenv(disable_ports_env) == 0);
+    TEST_ASSERT(posix_memalign(
+                    &model_raw, (size_t)page, (size_t)model_bytes) == 0);
+    if (!model_raw) goto cleanup;
+    memset(model_raw, 0, (size_t)model_bytes);
+
+    uint16_t *weight =
+        (uint16_t *)((uint8_t *)model_raw + weight_offset);
+    float *hc_scale = (float *)((uint8_t *)model_raw + scale_offset);
+    float *hc_base = (float *)((uint8_t *)model_raw + base_offset);
+    float *norm_weight = (float *)((uint8_t *)model_raw + norm_offset);
+    for (uint32_t o = 0; o < mix_dim; o++) {
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t key = i*37u + o*1009u + ((i >> 3u) ^ (o*19u));
+            const int value = (int)(key % 127u) - 63;
+            weight[(uint64_t)o*n + i] =
+                test_float_to_f16((float)value/256.0f);
+        }
+    }
+    hc_scale[0] = 0.625f;
+    hc_scale[1] = -0.75f;
+    hc_scale[2] = 0.4375f;
+    for (uint32_t i = 0; i < mix_dim; i++) {
+        const int value = (int)((i*17u + 5u) % 29u) - 14;
+        hc_base[i] = (float)value/32.0f;
+    }
+    for (uint32_t i = 0; i < n_embd; i++) {
+        norm_weight[i] = 0.5f + (float)((i*13u + 7u) % 31u)/32.0f;
+    }
+
+    residual_host = malloc((size_t)residual_bytes);
+    ref_host = malloc((size_t)out_bytes);
+    fused_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(residual_host != NULL);
+    TEST_ASSERT(ref_host != NULL);
+    TEST_ASSERT(fused_host != NULL);
+    if (!residual_host || !ref_host || !fused_host) goto cleanup;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t key = i*131u + ((i >> 4u) ^ (i*7u));
+        const int value = (int)(key % 4093u) - 2046;
+        residual_host[i] = (float)value/1024.0f;
+    }
+
+    residual = ds4_gpu_tensor_alloc(residual_bytes);
+    ref_mix = ds4_gpu_tensor_alloc(mix_bytes);
+    fused_mix = ds4_gpu_tensor_alloc(mix_bytes);
+    ref_split = ds4_gpu_tensor_alloc(mix_bytes);
+    fused_split = ds4_gpu_tensor_alloc(mix_bytes);
+    ref_out = ds4_gpu_tensor_alloc(out_bytes);
+    fused_out = ds4_gpu_tensor_alloc(out_bytes);
+    ref_norm = ds4_gpu_tensor_alloc(out_bytes);
+    fused_norm = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(residual && ref_mix && fused_mix && ref_split && fused_split &&
+                ref_out && fused_out && ref_norm && fused_norm);
+    if (!residual || !ref_mix || !fused_mix || !ref_split || !fused_split ||
+        !ref_out || !fused_out || !ref_norm || !fused_norm) {
+        goto cleanup;
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(
+                    residual, 0, residual_host, residual_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_hc_rms_norm_mix_f16_tensor(
+                    ref_mix, residual, model_raw, model_bytes,
+                    weight_offset, n, mix_dim, eps) != 0);
+    TEST_ASSERT(ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                    ref_out, ref_norm, ref_split, ref_mix, residual,
+                    model_raw, model_bytes, scale_offset, base_offset,
+                    norm_offset, n_embd, n_hc, sinkhorn_iters,
+                    eps, eps) != 0);
+    TEST_ASSERT(ds4_gpu_hc_rms_norm_mix_split_norm_f16_available() != 0);
+    TEST_ASSERT(ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
+                    fused_mix, fused_out, fused_norm, fused_split, residual,
+                    model_raw, model_bytes, weight_offset, scale_offset,
+                    base_offset, norm_offset, n, mix_dim, n_embd, n_hc,
+                    sinkhorn_iters, eps, eps, eps) > 0);
+
+    test_float_compare_stats mix_stats = {0};
+    test_float_compare_stats split_stats = {0};
+    test_float_compare_stats out_stats = {0};
+    test_float_compare_stats norm_stats = {0};
+#define TEST_HC_COMPOUND_COMPARE(ref_, fused_, bytes_, count_, stats_) do { \
+        TEST_ASSERT(ds4_gpu_tensor_read((ref_), 0, ref_host, (bytes_)) != 0); \
+        TEST_ASSERT(ds4_gpu_tensor_read((fused_), 0, fused_host, (bytes_)) != 0); \
+        (stats_) = test_compare_float_bits(ref_host, fused_host, (count_)); \
+    } while (0)
+    TEST_HC_COMPOUND_COMPARE(
+        ref_mix, fused_mix, mix_bytes, mix_dim, mix_stats);
+    TEST_HC_COMPOUND_COMPARE(
+        ref_split, fused_split, mix_bytes, mix_dim, split_stats);
+    TEST_HC_COMPOUND_COMPARE(
+        ref_out, fused_out, out_bytes, n_embd, out_stats);
+    TEST_HC_COMPOUND_COMPARE(
+        ref_norm, fused_norm, out_bytes, n_embd, norm_stats);
+#undef TEST_HC_COMPOUND_COMPARE
+
+    fprintf(stderr,
+            "ds4-test: HC producer/pre-norm compound exact "
+            "mix=%zu/%u split=%zu/%u collapse=%zu/%u norm=%zu/%u\n",
+            mix_stats.mismatch_count, mix_dim,
+            split_stats.mismatch_count, mix_dim,
+            out_stats.mismatch_count, n_embd,
+            norm_stats.mismatch_count, n_embd);
+    TEST_ASSERT(mix_stats.mismatch_count == 0 && mix_stats.max_ulp == 0);
+    TEST_ASSERT(split_stats.mismatch_count == 0 && split_stats.max_ulp == 0);
+    TEST_ASSERT(out_stats.mismatch_count == 0 && out_stats.max_ulp == 0);
+    TEST_ASSERT(norm_stats.mismatch_count == 0 && norm_stats.max_ulp == 0);
+    TEST_ASSERT(setenv(disable_env, "1", 1) == 0);
+    TEST_ASSERT(ds4_gpu_hc_rms_norm_mix_split_norm_f16_available() == 0);
+
+cleanup:
+    ds4_gpu_tensor_free(fused_norm);
+    ds4_gpu_tensor_free(ref_norm);
+    ds4_gpu_tensor_free(fused_out);
+    ds4_gpu_tensor_free(ref_out);
+    ds4_gpu_tensor_free(fused_split);
+    ds4_gpu_tensor_free(ref_split);
+    ds4_gpu_tensor_free(fused_mix);
+    ds4_gpu_tensor_free(ref_mix);
+    ds4_gpu_tensor_free(residual);
+    free(fused_host);
+    free(ref_host);
+    free(residual_host);
+    free(model_raw);
+    test_restore_env(disable_ports_env, saved_disable_ports);
+    test_restore_env(disable_m5_env, saved_disable_m5);
+    test_restore_env(disable_pre_env, saved_disable_pre);
+    test_restore_env(disable_env, saved_disable);
+    test_restore_env(force_env, saved_force);
 }
 
 static void test_metal_output_hc_weights4_exact(void) {
@@ -4725,6 +8127,14 @@ static void test_metal_router_weights_batch_exact(void) {
 #endif
 
 static void test_metal_kernel_group(void) {
+#if defined(__APPLE__)
+    if (test_env_bool("DS4_TEST_METAL_RESIDENT_ORACLES_ONLY")) {
+        test_metal_flush_commands_progress_exact();
+        test_metal_small_prefill_direct_exact();
+        test_metal_batch_attn_out_hc_fusion_exact();
+        return;
+    }
+#endif
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
@@ -4733,18 +8143,29 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
+    test_metal_flush_commands_progress_exact();
+    test_metal_q8_0_decode_rows_exact();
+    test_metal_q8_attention_output_static_batch_exact();
+    test_metal_q4_attention_output_tiny_batch_exact();
+    test_metal_dspark_device_proposer_q8();
     test_metal_f16_compressor_pair_state_store_exact();
+    test_metal_f16_compressor_quad_state_store_exact();
+    test_metal_q8_qkv_compressor_compound_exact();
     test_metal_compressor_ape_add_exact();
     test_metal_compressor_ratio4_pack_exact();
     test_metal_compressor_ratio4_replay_pack_exact();
     test_metal_compressor_ratio4_direct_pool_exact();
+    test_metal_compressor_ratio4_exact_pool_decode();
     test_metal_inplace_rope_pair_exact();
     test_metal_contiguous_f32_f16_roundtrip_exact();
     test_metal_gathered_kv_stage_exact();
     test_metal_contiguous_compressed_f16_attention_exact();
     test_metal_persistent_zero_attention_mask_exact();
     test_metal_zero_prefix_prefill_mask_cache_exact();
+    test_metal_small_prefill_direct_exact();
+    test_metal_batch_attn_out_hc_fusion_exact();
     test_metal_hc_split_weighted_sum_norm_batch_exact();
+    test_metal_hc_producer_pre_norm_compound_exact();
     test_metal_output_hc_weights4_exact();
     test_metal_hc_rms_scale_project_f16_exact();
     test_metal_router_simd_finalize_exact();
@@ -6734,9 +10155,6 @@ static void test_dspark_verify_depth(void) {
         return;
     }
 
-    char *saved_scheduler = test_save_env("DS4_DSPARK_SCHEDULER");
-    setenv("DS4_DSPARK_SCHEDULER", "0", 1);
-
     ds4_engine *engine = test_open_dspark_engine(support);
     ds4_tokens prompt = {0};
     int *spec = NULL;
@@ -6781,7 +10199,6 @@ static void test_dspark_verify_depth(void) {
     free(spec);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
-    test_restore_env("DS4_DSPARK_SCHEDULER", saved_scheduler);
 }
 #endif
 
@@ -6837,7 +10254,7 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
     puts("  DS4_TEST_BACKEND=cpu       Run model tests on CPU instead of Metal/CUDA.");
-    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through Metal SSD streaming.");
+    puts("  DS4_TEST_SSD_STREAMING=1   Run model tests through backend SSD streaming.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_GB=N  Streaming routed expert cache in GiB.");
     puts("  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=N  Streaming routed expert cache count.");
     puts("  DS4_TEST_SSD_STREAMING_COLD=1  Skip streaming hot expert preload.");
@@ -6849,6 +10266,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  DS4_TEST_METAL_RESIDENT_ORACLES_ONLY=1  Restrict --metal-kernels to resident optimization oracles.");
+    puts("  DS4_TEST_METAL_SMALL_PREFILL_TIMING=1   Include the small-prefill GPU-only microbenchmark.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
     puts("  DS4_TEST_CONTINUED_PREFILL_TOKENS=N  Large suffix size for --glm53-continued-prefill.");

@@ -1143,31 +1143,6 @@ __global__ static void glm_store_indexer_k_kernel(
     }
 }
 
-__global__ static void glm_k_b_project_q8_0_kernel(
-        float *out,
-        const unsigned char *weight,
-        const float *kv_norm,
-        uint32_t n_tokens,
-        uint32_t kv_lora_dim,
-        uint32_t qk_nope,
-        uint32_t n_head,
-        uint32_t row_bytes) {
-    const uint32_t token = blockIdx.x;
-    const uint32_t head = blockIdx.y;
-    const uint32_t q = threadIdx.x + blockIdx.z * blockDim.x;
-    if (token >= n_tokens || head >= n_head || q >= qk_nope) return;
-    const float *kv = kv_norm + (uint64_t)token * kv_lora_dim;
-    float acc = 0.0f;
-    const uint32_t b = q >> 5u;
-    const uint32_t j_in_block = q & 31u;
-    for (uint32_t j = 0; j < kv_lora_dim; j++) {
-        const unsigned char *row = weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
-        const unsigned char *blk = row + (uint64_t)b * 34u;
-        acc += q8_0_scale_scalar(blk) * (float)((const int8_t *)(blk + 2u))[j_in_block] * kv[j];
-    }
-    out[((uint64_t)token * n_head + head) * qk_nope + q] = acc;
-}
-
 __global__ static void glm_k_b_project_q8_0_head_kernel(
         float *out,
         const unsigned char *weight,

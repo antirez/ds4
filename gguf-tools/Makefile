@@ -32,10 +32,10 @@ endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 QUALITY_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 QUALITY_TARGETS := ds4.o ds4_cuda.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_image.o rax.o ds4_gpu_args.o \
-	cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o \
+	cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/ds4_mmq_q4_16warp.o \
 	cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
 QUALITY_OBJS := ../ds4.o ../ds4_cuda.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../ds4_image.o ../rax.o ../ds4_gpu_args.o \
-	../cuda/mmq/ds4_ggml_stubs.o ../cuda/mmq/ds4_mmq.o ../cuda/mmq/ds4_mmq_d2r.o \
+	../cuda/mmq/ds4_ggml_stubs.o ../cuda/mmq/ds4_mmq.o ../cuda/mmq/ds4_mmq_d2r.o ../cuda/mmq/ds4_mmq_q4_16warp.o \
 	../cuda/mmq/quantize.o ../cuda/mmq/mmid.o ../cuda/mmq/mmvq.o ../cuda/mmq/ds4_repack.o
 QUALITY_LINK := $(NVCC) $(NVCCFLAGS) -I.. -o
 LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \

@@ -42,13 +42,6 @@
 #include "ds4_mmq.h"
 #include "quantize.cuh"
 
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim, void *out) {
-    (void)src;
-    (void)in_dim;
-    (void)out;
-    return 0;
-}
-
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

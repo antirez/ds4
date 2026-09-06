@@ -17,7 +17,7 @@
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
 
-typedef enum {
+enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
     DS4_KVSTORE_REASON_COLD      = 1,
     DS4_KVSTORE_REASON_CONTINUED = 2,
@@ -25,7 +25,7 @@ typedef enum {
     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
-} ds4_kvstore_reason;
+};
 
 typedef enum {
     DS4_KVSTORE_LOG_DEFAULT,
@@ -180,12 +180,6 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    const ds4_kvstore_trailer_hooks *hooks,
                                    char *err,
                                    size_t err_len);
-bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
-                                       ds4_engine *engine,
-                                       ds4_session *session,
-                                       const ds4_kvstore_trailer_hooks *hooks,
-                                       char *err,
-                                       size_t err_len);
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,

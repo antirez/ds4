@@ -94,6 +94,52 @@ static void vec_dot_q4_K_q8_K(int n, float *s, const block_q4_K *x, const block_
     *s = sumf;
 }
 
+/* Scalar oracle for the production two-token traversal. */
+static void vec_dot_q4_K_q8_K_2(
+        int n, float *s0, float *s1, const block_q4_K *x,
+        const block_q8_K *y0, const block_q8_K *y1) {
+    const int nb = n / QK_K;
+    float sumf0 = 0.0f;
+    float sumf1 = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float xd = f16_to_f32(x[i].d);
+        const float xmin = f16_to_f32(x[i].dmin);
+        const float d0 = y0[i].d * xd;
+        const float d1 = y1[i].d * xd;
+        const float dm0 = -y0[i].d * xmin;
+        const float dm1 = -y1[i].d * xmin;
+        int summs0 = 0;
+        int summs1 = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, x[i].scales, &sc_val, &m_val);
+            const int32_t gsum0 = (int32_t)y0[i].bsums[j * 2] +
+                                  (int32_t)y0[i].bsums[j * 2 + 1];
+            const int32_t gsum1 = (int32_t)y1[i].bsums[j * 2] +
+                                  (int32_t)y1[i].bsums[j * 2 + 1];
+            summs0 += m_val * gsum0;
+            summs1 += m_val * gsum1;
+        }
+        int isum0 = 0;
+        int isum1 = 0;
+        for (int j = 0; j < QK_K / 32; j++) {
+            uint8_t sc_val, m_val;
+            q4_k_get_scale_min(j, x[i].scales, &sc_val, &m_val);
+            const int byte_off = (j >> 1) * 32;
+            const int shift = (j & 1) * 4;
+            for (int l = 0; l < 32; l++) {
+                const int q4 = (x[i].qs[byte_off + l] >> shift) & 0xF;
+                isum0 += q4 * (int)y0[i].qs[j * 32 + l] * sc_val;
+                isum1 += q4 * (int)y1[i].qs[j * 32 + l] * sc_val;
+            }
+        }
+        sumf0 += d0 * (float)isum0 + dm0 * (float)summs0;
+        sumf1 += d1 * (float)isum1 + dm1 * (float)summs1;
+    }
+    *s0 = sumf0;
+    *s1 = sumf1;
+}
+
 /* Reference: fully dequantize Q4_K to float, then dot with Q8_K's dequantized values. */
 static float ref_dot(const block_q4_K *bx, const block_q8_K *by) {
     float x[QK_K];
@@ -204,6 +250,40 @@ static int test_dot_reference(void) {
     return ok ? 0 : 1;
 }
 
+static int test_dot_pair_bitwise(void) {
+    static const int widths[] = {256, 1024, 4096, 7168, 16384};
+    block_q4_K bx[16384 / QK_K];
+    block_q8_K by0[16384 / QK_K];
+    block_q8_K by1[16384 / QK_K];
+    int ok = 1;
+
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const int nb = widths[wi] / QK_K;
+        for (uint32_t seed = 1; seed <= 16; seed++) {
+            for (int b = 0; b < nb; b++) {
+                fill_q4_K(&bx[b], seed * 101u + (uint32_t)b);
+                fill_q8_K(&by0[b], seed * 211u + (uint32_t)b);
+                fill_q8_K(&by1[b], seed * 307u + (uint32_t)b);
+            }
+            float ref0 = 0.0f, ref1 = 0.0f;
+            float got0 = 0.0f, got1 = 0.0f;
+            vec_dot_q4_K_q8_K(widths[wi], &ref0, bx, by0);
+            vec_dot_q4_K_q8_K(widths[wi], &ref1, bx, by1);
+            vec_dot_q4_K_q8_K_2(widths[wi], &got0, &got1, bx, by0, by1);
+            if (memcmp(&got0, &ref0, sizeof(got0)) != 0 ||
+                memcmp(&got1, &ref1, sizeof(got1)) != 0) {
+                printf("    width=%d seed=%u: pair=(%g,%g) single=(%g,%g)\n",
+                       widths[wi], seed, got0, got1, ref0, ref1);
+                ok = 0;
+            }
+        }
+    }
+
+    printf("  two-token dot vs two singles (bitwise): %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 /* Test with a hand-crafted known block. */
 static int test_dot_known(void) {
     block_q4_K bx;
@@ -250,7 +330,8 @@ int main(void) {
     failures += test_scale_extraction();
     failures += test_dot_known();
     failures += test_dot_reference();
+    failures += test_dot_pair_bitwise();
 
-    printf("\n%d/%d tests passed\n", 4 - failures, 4);
+    printf("\n%d/%d tests passed\n", 5 - failures, 5);
     return failures ? 1 : 0;
 }

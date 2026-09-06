@@ -19,17 +19,22 @@
 //   IQ2_XXS MoE _id ....... pending (Phase 4)
 
 #include "ds4_mmq.h"
+#include "ds4_q4_mmvq_epilogue.h"
 
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
+#if !defined(GGML_USE_HIP)
+#include "ds4_mmq_q4_16warp.cuh"
+#endif
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstring>
+#include <mutex>
 
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
@@ -100,25 +105,38 @@ private:
 // Init
 // ----------------------------------------------------------------------------
 
-// Step 7 task #29: experimental persistent Q8_1 scratch buffer.
-//
-// Hypothesis: ggml_cuda_pool_alloc inside ds4_mmq_moe_vec_impl records a
-// cudaMallocAsync graph node into the captured layer graph.  At replay
-// time the alloc node returns a (potentially different) address, but the
-// matvec kernel's pointer argument was baked in at capture time.  Result:
-// the matvec reads stale/wrong memory and produces a different output
-// than eager execution, even with identical inputs.
-//
-// Mitigation under test: pre-allocate a persistent device buffer at
-// startup via plain cudaMalloc (NOT cudaMallocAsync, NOT inside any
-// capture).  When the env flag DS4_CUDA_MMQ_Q81_PERSISTENT=1 is set,
-// ds4_mmq_moe_vec_impl uses this persistent buffer instead of pool_alloc.
-//
-// Sized for V4 Flash decode shapes: gate Q8_1 ~8 KB, down Q8_1 ~14 KB.
-// 256 KB allocation gives generous headroom for short prefill batches.
+// Experimental persistent Q8_1 scratch.  The grouped raw prefill path below
+// aliases its input and down-Q8 staging in this arena: both ranges have the
+// same layout but disjoint lifetimes on the default stream.  The feature stays
+// opt-in because a process-global address is only safe for the single-owner
+// GB10 dispatch covered by q81_grouped_persistent_acquire().
 static void *g_q81_scratch_ptr   = nullptr;
 static size_t g_q81_scratch_bytes = 0;
-static bool   g_q81_scratch_enabled = false;
+// A failed resize retirement can leave both allocations live.  Keep the
+// unpublished replacement owned here so cleanup/reinit can retry its free.
+static void *g_q81_unpublished_replacement_ptr = nullptr;
+// Older vector wrappers still contain a generic persistent branch.  Keep that
+// branch disabled: unlike grouped fused_raw it has no default-stream lease or
+// capture exclusion and therefore cannot safely share the owned arena.
+static constexpr bool g_q81_scratch_enabled = false;
+static bool   g_q81_grouped_enabled = false;
+static bool   g_q81_scratch_poisoned = false;
+static int    g_q81_scratch_device = -1;
+static std::mutex g_q81_state_mutex; // Process-global state, not per-tensor.
+
+static uint64_t g_q81_grouped_candidates;
+static uint64_t g_q81_grouped_uses;
+static uint64_t g_q81_grouped_hits;
+static uint64_t g_q81_grouped_pool_fallbacks;
+static uint64_t g_q81_grouped_allocations;
+static uint64_t g_q81_grouped_resizes;
+static uint64_t g_q81_grouped_owner_rejects;
+static uint64_t g_q81_grouped_stream_rejects;
+static uint64_t g_q81_grouped_capture_rejects;
+static uint64_t g_q81_grouped_device_rejects;
+static uint64_t g_q81_grouped_size_rejects;
+static size_t   g_q81_grouped_high_water;
+
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_aligned_q81_scratch_device = -1;
@@ -140,6 +158,171 @@ struct mmq_pair_map_scratch {
 
 static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
 
+// Backend init/teardown owns transitions, but dispatch admission reads this
+// flag without taking the Q8_1 arena mutex. Keep those reads race-free while
+// retaining the mutex below for arena ownership and cleanup serialization.
+static std::atomic<bool> g_gb10_optimizations{false};
+
+static bool gb10_optimizations_enabled() {
+    return g_gb10_optimizations.load(std::memory_order_relaxed);
+}
+
+static constexpr size_t DS4_MMQ_Q81_ARENA_MIN_BYTES = 4u * 1024u * 1024u;
+
+enum q81_arena_result {
+    Q81_ARENA_REJECTED = 0,
+    Q81_ARENA_HIT,
+    Q81_ARENA_ALLOCATED,
+    Q81_ARENA_RESIZED,
+};
+
+static bool q81_persistent_requested() {
+    const char *value = getenv("DS4_CUDA_MMQ_Q81_PERSISTENT");
+    if (!value || value[0] == '\0' || strcmp(value, "0") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+        strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 ||
+           strcmp(value, "on") == 0 || strcmp(value, "ON") == 0 ||
+           strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+           strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0;
+}
+
+static bool q81_is_gb10_owner(int device) {
+    if (!gb10_optimizations_enabled() || device < 0 ||
+        device >= ggml_cuda_info().device_count) {
+        return false;
+    }
+    const auto &info = ggml_cuda_info().devices[device];
+    return info.integrated && info.cc == GGML_CUDA_CC_DGX_SPARK;
+}
+
+static q81_arena_result q81_arena_ensure_locked(int device, size_t required) {
+    if (g_q81_scratch_poisoned || required > SIZE_MAX - 255u ||
+        (g_q81_scratch_ptr && g_q81_scratch_device != device)) {
+        return Q81_ARENA_REJECTED;
+    }
+    if (g_q81_scratch_ptr && required <= g_q81_scratch_bytes) {
+        g_q81_grouped_enabled = true;
+        return Q81_ARENA_HIT;
+    }
+
+    const size_t aligned = (required + 255u) & ~(size_t)255u;
+    const size_t bytes = aligned > DS4_MMQ_Q81_ARENA_MIN_BYTES
+        ? aligned : DS4_MMQ_Q81_ARENA_MIN_BYTES;
+    void *replacement = nullptr;
+    cudaError_t err = cudaMalloc(&replacement, bytes);
+    if (err != cudaSuccess || !replacement) {
+        fprintf(stderr,
+                "ds4_mmq: cudaMalloc(persistent Q8_1 arena %zu B) failed: %s; "
+                "using stream pool\n",
+                bytes, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return Q81_ARENA_REJECTED;
+    }
+
+    if (g_q81_scratch_ptr) {
+        /* The lease excludes another host submission and the persistent path
+         * only accepts the legacy default stream.  Drain the device before
+         * retiring the old address: allocation succeeds before any state is
+         * changed, so OOM leaves the previous arena usable.  A drain/free
+         * failure is different -- pointer liveness is ambiguous and the
+         * feature stays poisoned until explicit cleanup. */
+        err = cudaDeviceSynchronize();
+        if (err == cudaSuccess) {
+            err = cudaFree(g_q81_scratch_ptr);
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4_mmq: persistent Q8_1 arena resize from %zu B to "
+                    "%zu B failed while retiring the old arena: %s; "
+                    "persistent reuse poisoned\n",
+                    g_q81_scratch_bytes, bytes, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            const cudaError_t replacement_free_err = cudaFree(replacement);
+            if (replacement_free_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4_mmq: freeing unpublished Q8_1 replacement "
+                        "failed: %s\n",
+                        cudaGetErrorString(replacement_free_err));
+                (void)cudaGetLastError();
+                g_q81_unpublished_replacement_ptr = replacement;
+            }
+            g_q81_grouped_enabled = false;
+            g_q81_scratch_poisoned = true;
+            return Q81_ARENA_REJECTED;
+        }
+    }
+
+    const bool resized = g_q81_scratch_ptr != nullptr;
+    g_q81_scratch_ptr = replacement;
+    g_q81_scratch_bytes = bytes;
+    g_q81_scratch_device = device;
+    g_q81_grouped_enabled = true;
+    g_q81_grouped_allocations++;
+    if (resized) g_q81_grouped_resizes++;
+    fprintf(stderr,
+            "ds4_mmq: persistent Q8_1 arena %s (%zu B at %p, device %d)\n",
+            resized ? "resized" : "enabled", bytes,
+            g_q81_scratch_ptr, device);
+    return resized ? Q81_ARENA_RESIZED : Q81_ARENA_ALLOCATED;
+}
+
+// On success, lease remains locked until the complete host dispatch has been
+// submitted.  A following dispatch therefore cannot interleave its writes;
+// default-stream ordering protects the device-side lifetime after unlock.
+static char *q81_grouped_persistent_acquire(
+        int device, cudaStream_t stream, size_t required,
+        std::unique_lock<std::mutex> *lease) {
+    if (!lease || !q81_persistent_requested()) return nullptr;
+    lease->lock();
+    g_q81_grouped_candidates++;
+    if (required > g_q81_grouped_high_water) {
+        g_q81_grouped_high_water = required;
+    }
+    if (!q81_is_gb10_owner(device)) {
+        g_q81_grouped_device_rejects++;
+    } else if (stream != (cudaStream_t)0) {
+        g_q81_grouped_stream_rejects++;
+    } else {
+        int active_device = -1;
+        const cudaError_t device_err = cudaGetDevice(&active_device);
+        if (device_err != cudaSuccess || active_device != device ||
+            (g_q81_scratch_device >= 0 &&
+             g_q81_scratch_device != device)) {
+            (void)cudaGetLastError();
+            g_q81_grouped_owner_rejects++;
+        } else {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            const cudaError_t capture_err =
+                cudaStreamIsCapturing(stream, &capture);
+            if (capture_err != cudaSuccess ||
+                capture != cudaStreamCaptureStatusNone) {
+                (void)cudaGetLastError();
+                g_q81_grouped_capture_rejects++;
+            } else {
+                const q81_arena_result arena =
+                    q81_arena_ensure_locked(device, required);
+                if (arena != Q81_ARENA_REJECTED &&
+                    g_q81_grouped_enabled && !g_q81_scratch_poisoned &&
+                    required <= g_q81_scratch_bytes) {
+                    g_q81_grouped_uses++;
+                    if (arena == Q81_ARENA_HIT) g_q81_grouped_hits++;
+                    return (char *)g_q81_scratch_ptr;
+                }
+                if (g_q81_scratch_ptr && required > g_q81_scratch_bytes) {
+                    g_q81_grouped_size_rejects++;
+                }
+            }
+        }
+    }
+    g_q81_grouped_pool_fallbacks++;
+    lease->unlock();
+    return nullptr;
+}
+
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
     g_aligned_q81_scratch_bytes = ptr ? bytes : 0;
@@ -154,30 +337,204 @@ static void *ds4_mmq_aligned_q81_scratch(int device, size_t bytes) {
         ? g_aligned_q81_scratch_ptr : nullptr;
 }
 
-// Read by ds4_mmq_moe_vec_impl; non-zero means use the persistent buffer.
-// Set by ds4_mmq_init once based on env.  (Single-threaded GPU work; no
-// atomicity needed.)
-extern "C" int ds4_mmq_q81_persistent_enabled(void) {
-    return g_q81_scratch_enabled ? 1 : 0;
+/* Test-only preflight hook.  It deliberately traverses the production
+ * acquire path (including owner/default-stream/capture checks and resize
+ * retirement) without enqueueing a synthetic large MMQ fixture. */
+extern "C" int ds4_mmq_q81_persistent_preflight_for_test(
+        int device, size_t required) {
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        cudaSetDevice(device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    char *arena = nullptr;
+    {
+        std::unique_lock<std::mutex> lease(
+            g_q81_state_mutex, std::defer_lock);
+        arena = q81_grouped_persistent_acquire(
+            device, (cudaStream_t)0, required, &lease);
+    }
+    const cudaError_t restore_err = previous != device
+        ? cudaSetDevice(previous) : cudaSuccess;
+    if (restore_err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -2;
+    }
+    return arena ? 0 : -3;
 }
 
-extern "C" void *ds4_mmq_q81_scratch_ptr(void) {
-    return g_q81_scratch_ptr;
+static uint64_t g_q8_fold_oracle_byte_calls;
+static uint64_t g_q8_fold_oracle_byte_mismatches;
+static uint64_t g_q8_fold_oracle_output_calls;
+static uint64_t g_q8_fold_oracle_output_mismatches;
+static uint64_t g_q8_fold_oracle_raw_moe_calls;
+static uint64_t g_q8_fold_oracle_aligned_q8_calls;
+static uint64_t g_q8_fold_oracle_aligned_iq2_calls;
+static uint64_t g_q8_fold_oracle_skips;
+static int g_q8_fold_oracle_report_registered;
+
+static cudaError_t ds4_mmq_q8_fold_oracle_free(
+        void *ptr, const char *label, cudaError_t prior_err) {
+    if (!ptr) return prior_err;
+    const cudaError_t free_err = cudaFree(ptr);
+    if (free_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q8_1 fold oracle cudaFree(%s) failed: %s\n",
+                label, cudaGetErrorString(free_err));
+        if (prior_err == cudaSuccess) return free_err;
+    }
+    return prior_err;
 }
 
-// M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
-// A hit returns canonical block_q8_1 codes for this exact activation
-// pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
-// its quantize prelude.  Only valid for single-token unpadded rows
-// (ne10_padded == K); the registry itself guarantees freshness (slots are
-// reset by the producing entry every layer and pops are one-shot).
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
-                                         const void **q81);
+static void ds4_mmq_q8_fold_oracle_report(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q8_1 fold oracle: byte_calls=%llu "
+            "byte_mismatches=%llu output_calls=%llu "
+            "output_mismatches=%llu raw_moe_calls=%llu "
+            "aligned_q8_calls=%llu aligned_iq2_calls=%llu skips=%llu "
+            "(canonical reference retained)\n",
+            (unsigned long long)g_q8_fold_oracle_byte_calls,
+            (unsigned long long)g_q8_fold_oracle_byte_mismatches,
+            (unsigned long long)g_q8_fold_oracle_output_calls,
+            (unsigned long long)g_q8_fold_oracle_output_mismatches,
+            (unsigned long long)g_q8_fold_oracle_raw_moe_calls,
+            (unsigned long long)g_q8_fold_oracle_aligned_q8_calls,
+            (unsigned long long)g_q8_fold_oracle_aligned_iq2_calls,
+            (unsigned long long)g_q8_fold_oracle_skips);
+}
+
+static bool ds4_mmq_q8_fold_oracle_enabled() {
+    const char *env = getenv("DS4_CUDA_Q8_FOLD_ORACLE");
+    const bool enabled = env && strcmp(env, "1") == 0;
+    if (enabled && !g_q8_fold_oracle_report_registered) {
+        g_q8_fold_oracle_report_registered = 1;
+        (void)atexit(ds4_mmq_q8_fold_oracle_report);
+    }
+    return enabled;
+}
+
+__global__ static void q8_fold_output_compare_kernel(
+        uint32_t *mismatch, const float *candidate,
+        const float *reference, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(candidate[i]) !=
+                 __float_as_uint(reference[i])) {
+        atomicExch(mismatch, 1u);
+    }
+}
+
+/* Byte oracle for every consumer.  On mismatch the fresh canonical bytes
+ * overwrite the sidecar before it is consumed.  Any setup/capture failure
+ * rejects the fold entirely so the established prelude quantizes again. */
+static bool ds4_mmq_q8_fold_oracle_bytes(
+        const float *X_f32, int64_t K, int64_t ne10_padded,
+        char *folded, cudaStream_t stream) {
+    if (!ds4_mmq_q8_fold_oracle_enabled()) return true;
+    if (!X_f32 || !folded || K <= 0 || ne10_padded != K ||
+        (K % QK8_1) != 0) {
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_err = cudaStreamIsCapturing(stream, &capture);
+    if (capture_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle stream-capture query failed: %s\n",
+                cudaGetErrorString(capture_err));
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle skipped during stream capture\n");
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    const size_t bytes = (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+    if (bytes == 0u || bytes > 16384u) {
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    char *fresh = nullptr;
+    char *host = (char *)malloc(bytes * 2u);
+    if (!host) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle host allocation (%zu B) failed\n",
+                bytes * 2u);
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    const cudaError_t fresh_alloc_err = cudaMalloc((void **)&fresh, bytes);
+    if (fresh_alloc_err != cudaSuccess || !fresh) {
+        fprintf(stderr,
+                "ds4_mmq: Q8 fold oracle device allocation (%zu B) failed: "
+                "%s%s\n",
+                bytes, cudaGetErrorString(fresh_alloc_err),
+                fresh_alloc_err == cudaSuccess ? " (null pointer)" : "");
+        free(host);
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, fresh, GGML_TYPE_Q8_0,
+        /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+        /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    bool setup_ok = cudaGetLastError() == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess &&
+                    cudaMemcpy(host, folded, bytes,
+                               cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    cudaMemcpy(host + bytes, fresh, bytes,
+                               cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (!setup_ok) {
+        (void)cudaGetLastError();
+        cudaError_t cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            fresh, "byte-fresh", cudaSuccess);
+        if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
+        free(host);
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    const bool match = memcmp(host, host + bytes, bytes) == 0;
+    g_q8_fold_oracle_byte_calls++;
+    if (!match) {
+        g_q8_fold_oracle_byte_mismatches++;
+        if (cudaMemcpyAsync(folded, fresh, bytes,
+                            cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cudaError_t cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "byte-fresh", cudaSuccess);
+            if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
+            free(host);
+            g_q8_fold_oracle_skips++;
+            return false;
+        }
+    }
+    cudaError_t cleanup_err = ds4_mmq_q8_fold_oracle_free(
+        fresh, "byte-fresh", cudaSuccess);
+    free(host);
+    if (cleanup_err != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return false;
+    }
+    return true;
+}
+
 static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
-                                int64_t ne10_padded) {
+                                int64_t ne10_padded, cudaStream_t stream) {
     if (n_tokens != 1 || ne10_padded != K) return nullptr;
     const void *p = nullptr;
-    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
+    if (!ds4_cuda_q8_fold_take_q81(
+            (const void *)X_f32, (uint64_t)K, stream, &p)) return nullptr;
+    if (!ds4_mmq_q8_fold_oracle_bytes(
+            X_f32, K, ne10_padded, (char *)(uintptr_t)p, stream)) {
+        return nullptr;
+    }
     static int logged = 0;
     if (!logged) {
         logged = 1;
@@ -308,10 +665,6 @@ static int64_t d2r_min_cols() {
     return cached;
 }
 
-extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
-    return g_q81_scratch_bytes;
-}
-
 extern "C" int ds4_mmq_init(int device) {
     if (device < 0) {
         fprintf(stderr, "ds4_mmq_init: invalid device %d\n", device);
@@ -349,27 +702,126 @@ extern "C" int ds4_mmq_init(int device) {
         maps.expert_bounds = base + 2u * MMQ_GFX1151_PAIR_MAP_ROWS;
     }
 
-    // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
-    // Must happen here (before any layer-graph capture) so the cudaMalloc
-    // is not forbidden by capture-mode restrictions, and so the kernel
-    // pointer arg baked into the captured graph stays valid at replay.
-    if (getenv("DS4_CUDA_MMQ_Q81_PERSISTENT") && !g_q81_scratch_ptr) {
-        const size_t bytes = 256 * 1024;
-        cudaError_t err = cudaMalloc(&g_q81_scratch_ptr, bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4_mmq_init: cudaMalloc(q81_scratch %zu B) failed: %s; "
-                            "falling back to pool_alloc\n",
-                    bytes, cudaGetErrorString(err));
-            g_q81_scratch_ptr = nullptr;
-            g_q81_scratch_enabled = false;
-        } else {
-            g_q81_scratch_bytes = bytes;
-            g_q81_scratch_enabled = true;
-            fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
-                    bytes, g_q81_scratch_ptr);
-        }
+    // Allocation is intentionally lazy.  The first eligible grouped dispatch
+    // knows its exact maximum input/down staging requirement and resolves the
+    // arena during preflight, before it submits any device operation.
+    {
+        std::lock_guard<std::mutex> lock(g_q81_state_mutex);
+        const bool requested = q81_persistent_requested();
+        g_q81_grouped_enabled = requested && q81_is_gb10_owner(device) &&
+            g_q81_scratch_ptr && !g_q81_scratch_poisoned &&
+            g_q81_scratch_device == device;
     }
     return 0;
+}
+
+extern "C" int ds4_mmq_q81_persistent_cleanup(void) {
+    std::lock_guard<std::mutex> lock(g_q81_state_mutex);
+    g_q81_grouped_enabled = false;
+    if (!g_q81_scratch_ptr && !g_q81_unpublished_replacement_ptr) {
+        g_q81_scratch_bytes = 0;
+        g_q81_scratch_device = -1;
+        g_q81_scratch_poisoned = false;
+        return 0;
+    }
+
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess ||
+        g_q81_scratch_device < 0 ||
+        cudaSetDevice(g_q81_scratch_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_q81_scratch_poisoned = true;
+        return -1;
+    }
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    cudaError_t arena_free_err = cudaSuccess;
+    cudaError_t replacement_free_err = cudaSuccess;
+    if (sync_err == cudaSuccess) {
+        if (g_q81_scratch_ptr) {
+            arena_free_err = cudaFree(g_q81_scratch_ptr);
+            if (arena_free_err == cudaSuccess) {
+                g_q81_scratch_ptr = nullptr;
+                g_q81_scratch_bytes = 0;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+        if (g_q81_unpublished_replacement_ptr) {
+            replacement_free_err = cudaFree(
+                g_q81_unpublished_replacement_ptr);
+            if (replacement_free_err == cudaSuccess) {
+                g_q81_unpublished_replacement_ptr = nullptr;
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+    } else {
+        (void)cudaGetLastError();
+    }
+    const cudaError_t restore_err = previous != g_q81_scratch_device
+        ? cudaSetDevice(previous) : cudaSuccess;
+    if (sync_err != cudaSuccess || arena_free_err != cudaSuccess ||
+        replacement_free_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4_mmq: persistent Q8_1 arena cleanup failed: "
+                "sync=%s arena_free=%s replacement_free=%s\n",
+                cudaGetErrorString(sync_err),
+                cudaGetErrorString(arena_free_err),
+                cudaGetErrorString(replacement_free_err));
+        g_q81_scratch_poisoned = true;
+        return -1;
+    }
+    // Both owned allocations are now retired; only now may reinit clear the
+    // poison and admit a new lazy allocation.
+    g_q81_scratch_device = -1;
+    g_q81_scratch_poisoned = false;
+    if (restore_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4_mmq: persistent Q8_1 arena freed, but restoring CUDA "
+                "device %d failed: %s\n",
+                previous, cudaGetErrorString(restore_err));
+        (void)cudaGetLastError();
+        return -2;
+    }
+    return 0;
+}
+
+extern "C" void ds4_mmq_q81_persistent_counters(
+        uint64_t *candidates, uint64_t *uses, uint64_t *hits,
+        uint64_t *pool_fallbacks, uint64_t *allocations, uint64_t *resizes,
+        size_t *arena_bytes, size_t *high_water) {
+    std::lock_guard<std::mutex> lock(g_q81_state_mutex);
+    if (candidates) *candidates = g_q81_grouped_candidates;
+    if (uses) *uses = g_q81_grouped_uses;
+    if (hits) *hits = g_q81_grouped_hits;
+    if (pool_fallbacks) *pool_fallbacks = g_q81_grouped_pool_fallbacks;
+    if (allocations) *allocations = g_q81_grouped_allocations;
+    if (resizes) *resizes = g_q81_grouped_resizes;
+    if (arena_bytes) *arena_bytes = g_q81_scratch_bytes;
+    if (high_water) *high_water = g_q81_grouped_high_water;
+}
+
+extern "C" void ds4_mmq_q81_persistent_report(void) {
+    std::lock_guard<std::mutex> lock(g_q81_state_mutex);
+    fprintf(stderr,
+            "ds4: CUDA MMQ grouped Q8_1 persistent: candidates=%llu "
+            "uses=%llu hits=%llu pool_fallbacks=%llu allocations=%llu "
+            "resizes=%llu "
+            "arena=%zu high_water=%zu rejects(device/owner/stream/capture/size)="
+            "%llu/%llu/%llu/%llu/%llu poisoned=%d\n",
+            (unsigned long long)g_q81_grouped_candidates,
+            (unsigned long long)g_q81_grouped_uses,
+            (unsigned long long)g_q81_grouped_hits,
+            (unsigned long long)g_q81_grouped_pool_fallbacks,
+            (unsigned long long)g_q81_grouped_allocations,
+            (unsigned long long)g_q81_grouped_resizes,
+            g_q81_scratch_bytes, g_q81_grouped_high_water,
+            (unsigned long long)g_q81_grouped_device_rejects,
+            (unsigned long long)g_q81_grouped_owner_rejects,
+            (unsigned long long)g_q81_grouped_stream_rejects,
+            (unsigned long long)g_q81_grouped_capture_rejects,
+            (unsigned long long)g_q81_grouped_size_rejects,
+            g_q81_scratch_poisoned ? 1 : 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -513,6 +965,323 @@ bool ds4_mmq_k_tile_supported(const char *tag, int K, int cc) {
     return true;
 }
 
+#if !defined(GGML_USE_HIP)
+static bool ds4_q4_test_q8_1_layout(
+        int N, int K, size_t *payload_bytes, size_t *total_bytes) {
+    if (N <= 0 || K <= 0 || (K % QK_K) != 0) return false;
+    const int64_t padded_k = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t blocks_per_column =
+        (size_t)padded_k / (4u * (size_t)QK8_1);
+    if ((size_t)N > SIZE_MAX / blocks_per_column) return false;
+    const size_t blocks = (size_t)N * blocks_per_column;
+    if (blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) return false;
+    const size_t payload = blocks * sizeof(block_q8_1_mmq);
+    const size_t slack = 128u * sizeof(block_q8_1_mmq);
+    if (payload > SIZE_MAX - slack) return false;
+    if (payload_bytes) *payload_bytes = payload;
+    if (total_bytes) *total_bytes = payload + slack;
+    return true;
+}
+
+/* The candidate and its caller-owned fixup buffer model canonical m128n128.
+ * Confirm the real canonical picker chooses that tile: a width limit alone is
+ * insufficient because resource constraints or a ceil-division plateau can
+ * retain a narrower width and change both partitioning and scratch size. */
+static bool ds4_q4_test_reference_uses_m128n128(
+        int device, int cc, int N) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || N <= 0 ||
+        get_mmq_y_host(cc) != 128) {
+        return false;
+    }
+    const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
+    const int mmq_x_max = get_mmq_x_max_host(cc);
+    int mmq_x_best = 0;
+    int64_t ntiles_x_best = INT64_MAX;
+    for (int mmq_x = 8;
+         mmq_x <= mmq_x_max && ntiles_x_best > 1;
+         mmq_x += 8) {
+        const int granularity = mmq_get_granularity_host(mmq_x, cc);
+        if (mmq_x % granularity != 0 ||
+            mmq_get_nbytes_shared<GGML_TYPE_Q4_K>(
+                mmq_x, 128, cc, warp_size, nwarps) > smpbo) {
+            continue;
+        }
+        const int64_t ntiles_x =
+            ((int64_t)N + mmq_x - 1) / mmq_x;
+        if (ntiles_x < ntiles_x_best) {
+            mmq_x_best = mmq_x;
+            ntiles_x_best = ntiles_x;
+        }
+    }
+    return mmq_x_best == 128;
+}
+
+extern "C" int
+ds4_mmq_q4_K_dense_preq_reference_m128n128_for_test(int N) {
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return 0;
+    return ds4_q4_test_reference_uses_m128n128(
+        dev, ggml_cuda_info().devices[dev].cc, N) ? 1 : 0;
+}
+
+extern "C" size_t ds4_mmq_q4_K_q8_1_scratch_bytes(int N, int K) {
+    size_t total = 0;
+    return ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ? total : 0;
+}
+
+extern "C" int ds4_mmq_q4_K_quantize_q8_1_for_test(
+        const float *X_f32, void *q8_ds4, size_t q8_bytes,
+        int N, int K, cudaStream_t stream) {
+    size_t total = 0;
+    if (!X_f32 || !q8_ds4 ||
+        !ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ||
+        q8_bytes < total) {
+        return -1;
+    }
+    cudaError_t err = cudaMemsetAsync(q8_ds4, 0, total, stream);
+    if (err != cudaSuccess) return -2;
+    quantize_mmq_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, q8_ds4, GGML_TYPE_Q4_K,
+        /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
+        /*ne0=*/GGML_PAD((int64_t)K, MATRIX_ROW_PADDING),
+        /*ne1=*/N, /*ne2=*/1, /*ne3=*/1, stream);
+    err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : -3;
+}
+
+extern "C" int ds4_mmq_q4_K_dense_preq_reference_for_test(
+        const void *W_q4_K, const void *q8_ds4, size_t q8_bytes,
+        float *out_f32, int M, int N, int K, int use_stream_k,
+        void *stream_k_fixup, size_t stream_k_fixup_bytes,
+        cudaStream_t stream) {
+    size_t payload = 0, total = 0;
+    if (!W_q4_K || !q8_ds4 || !out_f32 || M <= 0 ||
+        !ds4_q4_test_q8_1_layout(N, K, &payload, &total) ||
+        q8_bytes < total) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return -1;
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(
+            "ds4_mmq_q4_K_dense_preq_reference_for_test", K, cc)) {
+        return -1;
+    }
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    if ((stream_k_fixup == nullptr && stream_k_fixup_bytes != 0u) ||
+        (stream_k_fixup != nullptr &&
+         ((uintptr_t)stream_k_fixup % alignof(float)) != 0) ||
+        (stream_k_fixup_bytes % sizeof(float)) != 0u) {
+        return -1;
+    }
+    if (stream_k_fixup != nullptr) {
+        if (!use_stream_k) return -1;
+        if (!ds4_q4_test_reference_uses_m128n128(dev, cc, N)) {
+            return DS4_MMQ_NOT_APPLICABLE;
+        }
+        const size_t required =
+            ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+                M, N, ggml_cuda_info().devices[dev].nsm);
+        if (required > stream_k_fixup_bytes) return -1;
+    }
+    ds4_pool_set_stream(stream);
+    const int64_t stride_row_x = (int64_t)K / QK_K;
+    const int64_t stride_y = (int64_t)(payload / sizeof(int));
+    const mmq_args args = {
+        /*x=*/(const char *)W_q4_K,
+        /*type_x=*/GGML_TYPE_Q4_K,
+        /*y=*/(const int *)q8_ds4,
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out_f32,
+        /*ncols_x=*/(int64_t)K, /*nrows_x=*/(int64_t)M,
+        /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/stride_row_x, /*ncols_y=*/(int64_t)N,
+        /*nrows_dst=*/(int64_t)M,
+        /*nchannels_x=*/1, /*nchannels_y=*/1,
+        /*stride_channel_x=*/0, /*stride_channel_y=*/stride_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_y=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/stride_y,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k != 0,
+        /*ncols_max=*/(int64_t)N,
+        /*x_soa=*/nullptr,
+        /*soa_blocks=*/0,
+        /*stream_k_fixup=*/static_cast<float *>(stream_k_fixup),
+        /*stream_k_fixup_elements=*/stream_k_fixup_bytes / sizeof(float),
+    };
+    mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args, stream);
+    const cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : -2;
+}
+
+static int ds4_q4_16warp_prepare_once(int device);
+
+extern "C" int ds4_mmq_q4_K_dense_preq_16warp_for_test(
+        const void *W_q4_K, const void *q8_ds4, size_t q8_bytes,
+        float *out_f32, int M, int N, int K, cudaStream_t stream) {
+    size_t total = 0;
+    if (!W_q4_K || !q8_ds4 || !out_f32 ||
+        !ds4_q4_test_q8_1_layout(N, K, nullptr, &total) ||
+        q8_bytes < total) {
+        return -1;
+    }
+    // This Stream-K oracle hook deliberately accepts an N tail (the production
+    // selector is stricter until NVIDIA measurements justify broadening it),
+    // but it must reject shapes that cannot be represented by this kernel
+    // before enqueueing any work.
+    if (M < 128 || (M % 128) != 0 || N < 512 ||
+        K < 1024 || K > 8192 || (K % QK_K) != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_q4_K_dense_16warp_available(cc) ||
+        ds4_q4_16warp_prepare_once(dev) != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return DS4_MMQ_NOT_APPLICABLE;
+    ds4_pool_set_stream(stream);
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
+    const size_t fixup_bytes =
+        ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(M, N, nsm);
+    ggml_cuda_pool_alloc<char> fixup(ctx->pool());
+    if (fixup_bytes != 0u) fixup.alloc(fixup_bytes);
+    return ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+        W_q4_K, q8_ds4, out_f32, fixup.get(), fixup_bytes,
+        M, N, K, nsm, stream);
+}
+
+enum {
+    DS4_Q4_16WARP_REQUEST = 1,
+    DS4_Q4_16WARP_REQUIRE = 2,
+    DS4_Q4_16WARP_DISABLE = 4,
+};
+
+static bool ds4_q4_16warp_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
+}
+
+static int ds4_q4_16warp_mode(void) {
+    static const int cached = [] {
+        int mode = 0;
+        if (ds4_q4_16warp_env_enabled("DS4_CUDA_Q4_MMQ_16WARP")) {
+            mode |= DS4_Q4_16WARP_REQUEST;
+        }
+        if (ds4_q4_16warp_env_enabled(
+                "DS4_CUDA_REQUIRE_Q4_MMQ_16WARP")) {
+            mode |= DS4_Q4_16WARP_REQUEST | DS4_Q4_16WARP_REQUIRE;
+        }
+        if (ds4_q4_16warp_env_enabled("DS4_CUDA_NO_Q4_MMQ_16WARP")) {
+            mode |= DS4_Q4_16WARP_DISABLE;
+        }
+        return mode;
+    }();
+    return cached;
+}
+
+static int ds4_q4_16warp_prepare_once(int device) {
+    static std::mutex mutex;
+    static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return -1;
+    int cached = state[device].load(std::memory_order_acquire);
+    if (cached == 1) return 0;
+    if (cached < 0) return cached;
+    std::lock_guard<std::mutex> lock(mutex);
+    cached = state[device].load(std::memory_order_relaxed);
+    if (cached == 1) return 0;
+    if (cached < 0) return cached;
+    const int rc = ds4_mmq_q4_K_dense_16warp_prepare();
+    state[device].store(rc == 0 ? 1 : rc, std::memory_order_release);
+    return rc;
+}
+
+/* Keep the 16-warp experiment on geometries with enough independent output
+ * tiles to occupy the device well.  Below canonical's 90% whole-tile cutoff,
+ * the candidate mirrors canonical stream-K partitioning and fixup; this 80%
+ * gate is therefore only an admission/performance heuristic, not a numerical
+ * shortcut.  On GB10 the Q-A/KV N=4096 shapes score 88%. */
+static bool ds4_q4_16warp_grid_efficient(int M, int N, int nsm) {
+    if (M <= 0 || N <= 0 || nsm <= 0) return false;
+    const int64_t tiles_m = ((int64_t)M + 127) / 128;
+    const int64_t tiles_n = ((int64_t)N + 127) / 128;
+    if (tiles_m > INT64_MAX / tiles_n) return false;
+    const int64_t tiles = tiles_m * tiles_n;
+    const int64_t waves = (tiles + nsm - 1) / nsm;
+    if (waves <= 0 || (int64_t)nsm > INT64_MAX / waves) return false;
+    return (100 * tiles) / ((int64_t)nsm * waves) >= 80;
+}
+
+static bool ds4_q4_16warp_pair_leg_shape_supported(
+        int cc, int M, int N, int K) {
+    return ds4_mmq_q4_K_dense_16warp_available(cc) &&
+           M >= 512 && (M % 128) == 0 &&
+           N >= 512 && (N % 128) == 0 &&
+           K >= 1024 && K <= 4096 && (K % QK_K) == 0;
+}
+
+/* Resolve the experiment before allocation or enqueue. The standalone path
+ * uses the public M>=1024 gate; a dense-pair leg may go down to M=512 because
+ * Q-A/KV pairs contain a 512-row leg. Each candidate grid must retain at least
+ * 80% whole-tile SM-wave efficiency; scheduling itself follows canonical
+ * stream-K whenever canonical would split K. */
+static int ds4_q4_16warp_select(
+        const char *tag, int device, int cc, int M, int N, int K,
+        bool pair_leg, bool *selected) {
+    if (!selected) return DS4_MMQ_NOT_APPLICABLE;
+    *selected = false;
+    const int mode = ds4_q4_16warp_mode();
+    const bool disabled = (mode & DS4_Q4_16WARP_DISABLE) != 0;
+    const bool requested = (mode & DS4_Q4_16WARP_REQUEST) != 0;
+    const bool required = (mode & DS4_Q4_16WARP_REQUIRE) != 0;
+    if (!requested) return 0;
+
+    const bool shape_supported = pair_leg
+        ? ds4_q4_16warp_pair_leg_shape_supported(cc, M, N, K)
+        : ds4_mmq_q4_K_dense_16warp_supported(cc, M, N, K) != 0;
+    // The exact oracle models canonical m128n128 MMQ. Check the selector's
+    // actual result, not only its upper bound: resource limits and equal
+    // ceil-division plateaus can make it retain a narrower tile.
+    const bool canonical_x128 =
+        ds4_q4_test_reference_uses_m128n128(device, cc, N);
+    const bool grid_efficient = ds4_q4_16warp_grid_efficient(
+        M, N, ggml_cuda_info().devices[device].nsm);
+    if (required && (disabled || !shape_supported || !canonical_x128 ||
+                     !grid_efficient)) {
+        fprintf(stderr,
+                "%s: required Q4 16-warp path is ineligible "
+                "(scope=%s disabled=%d shape=%d x128=%d grid_eff=%d "
+                "M=%d N=%d K=%d)\n",
+                tag, pair_leg ? "pair-leg" : "dense",
+                disabled ? 1 : 0, shape_supported ? 1 : 0,
+                canonical_x128 ? 1 : 0, grid_efficient ? 1 : 0, M, N, K);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (disabled || !shape_supported || !canonical_x128 || !grid_efficient) {
+        return 0;
+    }
+
+    const int prep = ds4_q4_16warp_prepare_once(device);
+    if (prep == 0) {
+        *selected = true;
+        return 0;
+    }
+    if (required) {
+        fprintf(stderr, "%s: required Q4 16-warp preflight failed: %d\n",
+                tag, prep);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    (void)cudaGetLastError();
+    return 0;
+}
+#endif
+
 template <ggml_type type>
 int ds4_mmq_dense_impl(
         const char  * tag,
@@ -542,6 +1311,18 @@ int ds4_mmq_dense_impl(
     const int dev = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[dev].cc;
     if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
+
+#if !defined(GGML_USE_HIP)
+    bool use_q4_16warp = false;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        const int select_rc = ds4_q4_16warp_select(
+            tag, dev, cc, M, N, K, /*pair_leg=*/false,
+            &use_q4_16warp);
+        if (select_rc != 0) {
+            return select_rc;
+        }
+    }
+#endif
 
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -639,6 +1420,29 @@ int ds4_mmq_dense_impl(
         (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
+#if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (use_q4_16warp) {
+            const int nsm = ggml_cuda_info().devices[dev].nsm;
+            const size_t fixup_bytes =
+                ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+                    M, N, nsm);
+            ggml_cuda_pool_alloc<char> fixup(ctx->pool());
+            if (fixup_bytes != 0u) fixup.alloc(fixup_bytes);
+            const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+                W, src1_q8_1, out_f32, fixup.get(), fixup_bytes,
+                M, N, K, nsm, stream);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "%s: Q4 16-warp stream-K launch failed: %d\n",
+                        tag, rc);
+                return -3;
+            }
+            return 0;
+        }
+    }
+#endif
+
     const mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
@@ -663,7 +1467,471 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    if constexpr (type != GGML_TYPE_Q4_K) {
+        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    }
+    return 0;
+}
+
+/* Batched Q4_K pair for the prefill tier.  The two ordinary dense calls
+ * differ only in their weight/output rows; their Q8_1 MMQ activation is
+ * byte-identical.  Keep that activation alive across both established MMQ
+ * launches so Q-A and KV pay the quantize/tail-clear prelude once. */
+int ds4_mmq_q4_K_dense_pair_impl(
+        const void  * W0,
+        const void  * W1,
+        const float * X_f32,
+        float       * out0_f32,
+        float       * out1_f32,
+        int           M0,
+        int           M1,
+        int           N,
+        int           K,
+        cudaStream_t  stream) {
+    const char *tag = "ds4_mmq_q4_K_dense_pair";
+    if (!W0 || !W1 || !X_f32 || !out0_f32 || !out1_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0 || K % 256 != 0) {
+        fprintf(stderr, "%s: bad shape M0=%d M1=%d N=%d K=%d\n",
+                tag, M0, M1, N, K);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if ((size_t)M0 > SIZE_MAX / (size_t)N / sizeof(float) ||
+        (size_t)M1 > SIZE_MAX / (size_t)N / sizeof(float)) {
+        fprintf(stderr, "%s: output size overflow\n", tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t out0_bytes = (size_t)M0 * (size_t)N * sizeof(float);
+    const size_t out1_bytes = (size_t)M1 * (size_t)N * sizeof(float);
+    const uintptr_t out0_addr = (uintptr_t)out0_f32;
+    const uintptr_t out1_addr = (uintptr_t)out1_f32;
+    const bool outputs_overlap = out0_addr <= out1_addr
+        ? (size_t)(out1_addr - out0_addr) < out0_bytes
+        : (size_t)(out0_addr - out1_addr) < out1_bytes;
+    if (outputs_overlap) {
+        fprintf(stderr, "%s: output ranges overlap\n", tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_Q4_K>(tag, K, cc)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+#if !defined(GGML_USE_HIP)
+    bool use_q4_16warp0 = false;
+    bool use_q4_16warp1 = false;
+    int select_rc = ds4_q4_16warp_select(
+        tag, dev, cc, M0, N, K, /*pair_leg=*/true,
+        &use_q4_16warp0);
+    if (select_rc != 0) return select_rc;
+    select_rc = ds4_q4_16warp_select(
+        tag, dev, cc, M1, N, K, /*pair_leg=*/true,
+        &use_q4_16warp1);
+    if (select_rc != 0) return select_rc;
+#endif
+
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n",
+                tag, dev);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    ds4_pool_set_stream(stream);
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t blocks_per_col =
+        (size_t)ne10_padded / (4u * (size_t)QK8_1);
+    const size_t bytes_per_col =
+        blocks_per_col * sizeof(block_q8_1_mmq);
+    const size_t slack_blocks = (size_t)get_mmq_x_max_host(cc);
+    if ((size_t)N > SIZE_MAX / bytes_per_col ||
+        slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) {
+        fprintf(stderr, "%s: activation scratch size overflow\n", tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t payload_bytes = (size_t)N * bytes_per_col;
+    const size_t slack_bytes = slack_blocks * sizeof(block_q8_1_mmq);
+    if (payload_bytes > SIZE_MAX - slack_bytes) {
+        fprintf(stderr, "%s: activation scratch size overflow\n", tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t nbytes_q8_1 = payload_bytes + slack_bytes;
+
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ybuf_memset(src1_q8_1.get(), nbytes_q8_1, stream);
+    quantize_mmq_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        GGML_TYPE_Q4_K, /*ne00=*/K, /*s11=*/(int64_t)K,
+        /*s12=*/0, /*s13=*/0,
+        /*ne0=*/ne10_padded, /*ne1=*/(int64_t)N,
+        /*ne2=*/1, /*ne3=*/1, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const int64_t stride_row_x = (int64_t)K / QK_K;
+    const int64_t stride_channel_y =
+        (int64_t)(payload_bytes / sizeof(int));
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+
+#if !defined(GGML_USE_HIP)
+    const int q4_16warp_nsm = ggml_cuda_info().devices[dev].nsm;
+    const size_t q4_16warp_fixup0 = use_q4_16warp0
+        ? ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+              M0, N, q4_16warp_nsm)
+        : 0u;
+    const size_t q4_16warp_fixup1 = use_q4_16warp1
+        ? ds4_mmq_q4_K_dense_16warp_streamk_scratch_bytes(
+              M1, N, q4_16warp_nsm)
+        : 0u;
+    const size_t q4_16warp_fixup_bytes =
+        q4_16warp_fixup0 > q4_16warp_fixup1
+            ? q4_16warp_fixup0 : q4_16warp_fixup1;
+    // Both legs are ordered on the same stream, so one allocation can be
+    // cleared and reused after the first leg's fixup has consumed it.
+    ggml_cuda_pool_alloc<char> q4_16warp_fixup(ctx->pool());
+    if (q4_16warp_fixup_bytes != 0u) {
+        q4_16warp_fixup.alloc(q4_16warp_fixup_bytes);
+    }
+#endif
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out0_f32, 0, out0_bytes, stream);
+    }
+    const mmq_args args0 = {
+        /*x=*/(const char *)W0,
+        /*type_x=*/GGML_TYPE_Q4_K,
+        /*y=*/(const int *)src1_q8_1.get(),
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out0_f32,
+        /*ncols_x=*/(int64_t)K,
+        /*nrows_x=*/(int64_t)M0,
+        /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/stride_row_x,
+        /*ncols_y=*/(int64_t)N,
+        /*nrows_dst=*/(int64_t)M0,
+        /*nchannels_x=*/1,
+        /*nchannels_y=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/stride_channel_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1,
+        /*nsamples_y=*/1,
+        /*stride_sample_x=*/0,
+        /*stride_sample_y=*/stride_channel_y,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k,
+        /*ncols_max=*/(int64_t)N,
+    };
+#if !defined(GGML_USE_HIP)
+    if (use_q4_16warp0) {
+        const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+            W0, src1_q8_1.get(), out0_f32,
+            q4_16warp_fixup.get(), q4_16warp_fixup_bytes,
+            M0, N, K, q4_16warp_nsm, stream);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "%s: first Q4 16-warp stream-K launch failed: %d\n",
+                    tag, rc);
+            return -3;
+        }
+    } else
+#endif
+    {
+        mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args0, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: first mul_mat_q_case launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -3;
+        }
+    }
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out1_f32, 0, out1_bytes, stream);
+    }
+    const mmq_args args1 = {
+        /*x=*/(const char *)W1,
+        /*type_x=*/GGML_TYPE_Q4_K,
+        /*y=*/(const int *)src1_q8_1.get(),
+        /*ids_dst=*/nullptr,
+        /*expert_bounds=*/nullptr,
+        /*dst=*/out1_f32,
+        /*ncols_x=*/(int64_t)K,
+        /*nrows_x=*/(int64_t)M1,
+        /*ncols_dst=*/(int64_t)N,
+        /*stride_row_x=*/stride_row_x,
+        /*ncols_y=*/(int64_t)N,
+        /*nrows_dst=*/(int64_t)M1,
+        /*nchannels_x=*/1,
+        /*nchannels_y=*/1,
+        /*stride_channel_x=*/0,
+        /*stride_channel_y=*/stride_channel_y,
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1,
+        /*nsamples_y=*/1,
+        /*stride_sample_x=*/0,
+        /*stride_sample_y=*/stride_channel_y,
+        /*stride_sample_dst=*/0,
+        /*use_stream_k=*/use_stream_k,
+        /*ncols_max=*/(int64_t)N,
+    };
+#if !defined(GGML_USE_HIP)
+    if (use_q4_16warp1) {
+        const int rc = ds4_mmq_q4_K_dense_16warp_streamk_enqueue(
+            W1, src1_q8_1.get(), out1_f32,
+            q4_16warp_fixup.get(), q4_16warp_fixup_bytes,
+            M1, N, K, q4_16warp_nsm, stream);
+        if (rc != 0) {
+            fprintf(stderr,
+                    "%s: second Q4 16-warp stream-K launch failed: %d\n",
+                    tag, rc);
+            return -4;
+        }
+    } else
+#endif
+    {
+        mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args1, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: second mul_mat_q_case launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -4;
+        }
+    }
+    return 0;
+}
+
+#if !defined(GGML_USE_HIP)
+static bool ds4_q4_grouped_q81_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
+}
+#endif
+
+/* Token-batched grouped Q4_K projection for attention output-A.  The source
+ * is token-major [N][G][K], while MMQ stores directly into token-major
+ * [N][G][M].  Quantizing the strided source as G channels removes the old
+ * pack/unpack copies and shares one scratch allocation/quantizer launch.
+ *
+ * single_grid=false retains the established one-MMQ-launch-per-group path.
+ * single_grid=true maps groups to grid.z in one launch, but isolates each
+ * z-slice's stream-k coordinate space.  Its grid.x, partial-K ownership and
+ * fixup order are therefore identical to the former per-group invocation. */
+int ds4_mmq_q4_K_grouped_dense_impl(
+        const void  *W,
+        const float *X,
+        float       *out,
+        int          M,
+        int          N,
+        int          K,
+        int          n_groups,
+        bool         single_grid,
+        cudaStream_t stream) {
+    const char *tag = single_grid
+        ? "ds4_mmq_q4_K_grouped_dense_single_grid"
+        : "ds4_mmq_q4_K_grouped_dense";
+    const int pre_enqueue_failure = single_grid
+        ? DS4_MMQ_NOT_APPLICABLE
+        : -1;
+    if (!W || !X || !out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return pre_enqueue_failure;
+    }
+    if (M <= 0 || N <= 0 || K <= 0 || n_groups <= 0 ||
+        K % QK_K != 0) {
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d groups=%d\n",
+                tag, M, N, K, n_groups);
+        return pre_enqueue_failure;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[dev].cc;
+#if !defined(GGML_USE_HIP)
+    const bool q81_disable =
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr;
+    const bool q81_require = ds4_q4_grouped_q81_env_enabled(
+        "DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_Q81");
+    const bool q81_eligible =
+        gb10_optimizations_enabled() &&
+        cc == GGML_CUDA_CC_DGX_SPARK && M == 1024 && N > 8 &&
+        N <= INT32_MAX / (8*4096) && K == 4096 && n_groups == 8 &&
+        (((uintptr_t)X & 15u) == 0u);
+    if (q81_require && (q81_disable || !q81_eligible)) {
+        fprintf(stderr,
+                "%s: required grouped K4096/G8 Q8_1 quantizer is not "
+                "eligible\n",
+                tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const bool use_specialized_q81 = q81_eligible && !q81_disable;
+#endif
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n",
+                tag, dev);
+        return pre_enqueue_failure;
+    }
+    ds4_pool_set_stream(stream);
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t blocks_per_col =
+        (size_t)ne10_padded / (4u * (size_t)QK8_1);
+    const size_t bytes_per_col =
+        blocks_per_col * sizeof(block_q8_1_mmq);
+    if ((size_t)N > SIZE_MAX / bytes_per_col) return pre_enqueue_failure;
+    const size_t channel_bytes = (size_t)N * bytes_per_col;
+    if ((size_t)n_groups > SIZE_MAX / channel_bytes) {
+        return pre_enqueue_failure;
+    }
+    const size_t payload_bytes = (size_t)n_groups * channel_bytes;
+    const size_t slack_blocks = (size_t)get_mmq_x_max_host(cc);
+    if (slack_blocks > SIZE_MAX / sizeof(block_q8_1_mmq)) {
+        return pre_enqueue_failure;
+    }
+    const size_t slack_bytes = slack_blocks * sizeof(block_q8_1_mmq);
+    if (payload_bytes > SIZE_MAX - slack_bytes) return pre_enqueue_failure;
+
+    const int64_t row_blocks = (int64_t)K / QK_K;
+    if ((size_t)M > SIZE_MAX / (size_t)row_blocks /
+                        sizeof(block_q4_K)) return pre_enqueue_failure;
+    const size_t group_weight_bytes =
+        (size_t)M * (size_t)row_blocks * sizeof(block_q4_K);
+    const int64_t group_weight_blocks = (int64_t)M * row_blocks;
+    const int64_t low_dim = (int64_t)M * n_groups;
+    if (low_dim > INT_MAX ||
+        (uint64_t)low_dim > UINT64_MAX / (uint64_t)N) {
+        return pre_enqueue_failure;
+    }
+    /* The grouped kernel ABI narrows strides and weight-block offsets to int.
+     * Reject before allocating or enqueueing so an optional caller can safely
+     * fall back to the established per-group launch loop. */
+    if (single_grid &&
+        (n_groups > 65535 || group_weight_blocks > INT_MAX ||
+         group_weight_blocks * (int64_t)n_groups > INT_MAX ||
+         channel_bytes / sizeof(int) > (size_t)INT_MAX)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    ggml_cuda_pool_alloc<char> y_q8_1(
+        ctx->pool(), payload_bytes + slack_bytes);
+    ybuf_memset(y_q8_1.get(), payload_bytes + slack_bytes, stream);
+#if !defined(GGML_USE_HIP)
+    if (use_specialized_q81) {
+        quantize_mmq_q8_1_q4_grouped_k4096_g8x2_cuda(
+            X, (void *)y_q8_1.get(), N, stream);
+    } else
+#endif
+    {
+        quantize_mmq_q8_1_cuda(
+            X, /*ids=*/nullptr, (void *)y_q8_1.get(), GGML_TYPE_Q4_K,
+            /*ne00=*/K,
+            /*s01=*/(int64_t)n_groups * K,
+            /*s02=*/(int64_t)K,
+            /*s03=*/(int64_t)n_groups * N * K,
+            /*ne0=*/ne10_padded, /*ne1=*/N,
+            /*ne2=*/n_groups, /*ne3=*/1, stream);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    if (out_memset_enabled()) {
+        cudaMemsetAsync(out, 0,
+                        (size_t)N * (size_t)low_dim * sizeof(float), stream);
+    }
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+    if (single_grid) {
+        const mmq_args args = {
+            /*x=*/(const char *)W,
+            /*type_x=*/GGML_TYPE_Q4_K,
+            /*y=*/(const int *)y_q8_1.get(),
+            /*ids_dst=*/nullptr,
+            /*expert_bounds=*/nullptr,
+            /*dst=*/out,
+            /*ncols_x=*/(int64_t)K,
+            /*nrows_x=*/(int64_t)M,
+            /*ncols_dst=*/(int64_t)N,
+            /*stride_row_x=*/row_blocks,
+            /*ncols_y=*/(int64_t)N,
+            /*nrows_dst=*/low_dim,
+            /*nchannels_x=*/(int64_t)n_groups,
+            /*nchannels_y=*/(int64_t)n_groups,
+            /*stride_channel_x=*/group_weight_blocks,
+            /*stride_channel_y=*/(int64_t)(channel_bytes / sizeof(int)),
+            /*stride_channel_dst=*/(int64_t)M,
+            /*nsamples_x=*/1,
+            /*nsamples_y=*/1,
+            /*stride_sample_x=*/0,
+            /*stride_sample_y=*/0,
+            /*stride_sample_dst=*/0,
+            /*use_stream_k=*/use_stream_k,
+            /*ncols_max=*/(int64_t)N,
+        };
+        mul_mat_q_case_grouped_channels<GGML_TYPE_Q4_K>(*ctx, args, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: grouped launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -3;
+        }
+        return 0;
+    }
+    for (int g = 0; g < n_groups; ++g) {
+        const mmq_args args = {
+            /*x=*/(const char *)W + (size_t)g * group_weight_bytes,
+            /*type_x=*/GGML_TYPE_Q4_K,
+            /*y=*/(const int *)(y_q8_1.get() + (size_t)g * channel_bytes),
+            /*ids_dst=*/nullptr,
+            /*expert_bounds=*/nullptr,
+            /*dst=*/out + (int64_t)g * M,
+            /*ncols_x=*/(int64_t)K,
+            /*nrows_x=*/(int64_t)M,
+            /*ncols_dst=*/(int64_t)N,
+            /*stride_row_x=*/row_blocks,
+            /*ncols_y=*/(int64_t)N,
+            /*nrows_dst=*/low_dim,
+            /*nchannels_x=*/1,
+            /*nchannels_y=*/1,
+            /*stride_channel_x=*/0,
+            /*stride_channel_y=*/(int64_t)(channel_bytes / sizeof(int)),
+            /*stride_channel_dst=*/0,
+            /*nsamples_x=*/1,
+            /*nsamples_y=*/1,
+            /*stride_sample_x=*/0,
+            /*stride_sample_y=*/(int64_t)(channel_bytes / sizeof(int)),
+            /*stride_sample_dst=*/0,
+            /*use_stream_k=*/use_stream_k,
+            /*ncols_max=*/(int64_t)N,
+        };
+        mul_mat_q_case<GGML_TYPE_Q4_K>(*ctx, args, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: group %d launch failed: %s\n",
+                    tag, g, cudaGetErrorString(err));
+            return -3;
+        }
+    }
     return 0;
 }
 
@@ -894,6 +2162,62 @@ extern "C" int ds4_mmq_q4_K_dense(
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
 }
+
+extern "C" int ds4_mmq_q4_K_dense_pair(
+        const void * W0, const void * W1, const float * X,
+        float * out0, float * out1,
+        int M0, int M1, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_q4_K_dense_pair_impl(
+        W0, W1, X, out0, out1, M0, M1, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_dense(
+        const void *W, const float *X, float *out,
+        int M, int N, int K, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_dense_impl(
+        W, X, out, M, N, K, n_groups, false, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_dense_single_grid(
+        const void *W, const float *X, float *out,
+        int M, int N, int K, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_dense_impl(
+        W, X, out, M, N, K, n_groups, true, stream);
+}
+
+#if !defined(GGML_USE_HIP)
+extern "C" size_t ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(int N) {
+    if (N <= 0 || N > INT32_MAX / (8*4096)) return 0u;
+    constexpr size_t blocks_per_token = 8u * 4096u / (4u * QK8_1);
+    if ((size_t)N > SIZE_MAX / blocks_per_token /
+                        sizeof(block_q8_1_mmq)) {
+        return 0u;
+    }
+    return (size_t)N * blocks_per_token * sizeof(block_q8_1_mmq);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_quantize_q8_1_for_test(
+        const float *X, void *q8, size_t q8_bytes, int N,
+        int use_specialized, cudaStream_t stream) {
+    const size_t required =
+        ds4_mmq_q4_K_grouped_q8_1_scratch_bytes_for_test(N);
+    if (!X || !q8 || required == 0u || q8_bytes < required ||
+        (((uintptr_t)X & 15u) != 0u)) {
+        return -1;
+    }
+    if (use_specialized) {
+        quantize_mmq_q8_1_q4_grouped_k4096_g8x2_cuda(
+            X, q8, N, stream);
+    } else {
+        quantize_mmq_q8_1_cuda(
+            X, /*ids=*/nullptr, q8, GGML_TYPE_Q4_K,
+            /*ne00=*/4096, /*s01=*/8*4096, /*s02=*/4096,
+            /*s03=*/(int64_t)N*8*4096,
+            /*ne0=*/4096, /*ne1=*/N, /*ne2=*/8, /*ne3=*/1, stream);
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+#endif
 
 extern "C" int ds4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,
@@ -1163,7 +2487,7 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
-    if (sanitize_out) {
+    if (sanitize_out && type != GGML_TYPE_Q4_K) {
         ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
     return 0;
@@ -1336,6 +2660,16 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
+    // Past the shared-memory cap the launcher takes the bit-identical global
+    // variant unless the authoritative large-map kill switch rejects it.
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo &&
+        !ds4_mmid_large_enabled()) {
+        fprintf(stderr,
+                "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; "
+                "falling back\n", tag, n_tokens);
+        return -1;
+    }
+
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
     ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
@@ -1408,28 +2742,62 @@ int ds4_mmq_moe_pair_impl(
         ids_src1 = (int32_t *)ids_src1_raw;
         ids_dst = (int32_t *)ids_dst_raw;
         expert_bounds = (int32_t *)expert_bounds_raw;
-    } else if (persistent_pair_maps) {
-        const auto & maps = g_mmq_pair_maps[dev];
-        ids_src1 = maps.ids_src1;
-        ids_dst = maps.ids_dst;
-        expert_bounds = maps.expert_bounds;
-    } else {
-        ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
-        ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
-        expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+    }
+
+    /* `fused_raw` is the only grouped path that owns neither aligned weights
+     * nor caller scratch.  Its input Q8 is dead after gate/up, before down Q8
+     * is produced, so one max-sized range can back both phases.  Resolve the
+     * opt-in arena (or allocate its one-block pool fallback) before the first
+     * expert-map enqueue; no mid-pipeline allocation failure can strand a
+     * partially submitted candidate. */
+    const bool grouped_raw_q81 = profile_fused_prefill &&
+        type == GGML_TYPE_IQ2_XXS && fused_down != nullptr &&
+        !direct_gateup_q8 && xa_soa == nullptr && xb_soa == nullptr &&
+        fused_down->W_soa == nullptr;
+    size_t grouped_down_q8_bytes = 0;
+    size_t grouped_q81_required = 0;
+    std::unique_lock<std::mutex> grouped_q81_lease(
+        g_q81_state_mutex, std::defer_lock);
+    ggml_cuda_pool_alloc<char> grouped_q81_pool;
+    char *grouped_q81_scratch = nullptr;
+    if (grouped_raw_q81 && q81_persistent_requested()) {
+        const int64_t down_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
+        const size_t tail =
+            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        if ((size_t)ne_get_rows > SIZE_MAX / (size_t)down_padded ||
+            (size_t)ne_get_rows * (size_t)down_padded >
+                (SIZE_MAX - tail) / sizeof(block_q8_1)) {
+            return -98;
+        }
+        grouped_down_q8_bytes =
+            (size_t)ne_get_rows * (size_t)down_padded *
+                sizeof(block_q8_1) / QK8_1 + tail;
+        grouped_q81_required = nbytes_src1_q8_1 > grouped_down_q8_bytes
+            ? nbytes_src1_q8_1 : grouped_down_q8_bytes;
+        grouped_q81_scratch = q81_grouped_persistent_acquire(
+            dev, stream, grouped_q81_required, &grouped_q81_lease);
+        if (!grouped_q81_scratch) {
+            grouped_q81_scratch = grouped_q81_pool.alloc(
+                ctx->pool(), grouped_q81_required);
+        }
+    }
+
+    if (!direct_gateup_q8) {
+        if (persistent_pair_maps) {
+            const auto & maps = g_mmq_pair_maps[dev];
+            ids_src1 = maps.ids_src1;
+            ids_dst = maps.ids_dst;
+            expert_bounds = maps.expert_bounds;
+        } else {
+            ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
+            ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
+            expert_bounds = expert_bounds_alloc.alloc(
+                ctx->pool(), n_experts + 1);
+        }
     }
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
-
-    // Same cap guard as ds4_mmq_moe_impl (see comment there): past the smem
-    // cap the launcher takes the bit-identical global variant (P5); only
-    // refuse with DS4_MMID_LARGE=0.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
-        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
-                tag, n_tokens);
-        return -1;
-    }
 
     cudaError_t err = cudaSuccess;
     {
@@ -1478,7 +2846,9 @@ int ds4_mmq_moe_pair_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
     char *src1_q8_1 = direct_gateup_q8
         ? (char *)fused_down->input_q8_scratch
-        : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+        : (grouped_q81_scratch
+            ? grouped_q81_scratch
+            : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1));
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -1760,8 +3130,11 @@ int ds4_mmq_moe_pair_impl(
             (size_t)ne_get_rows * (size_t)down_ne10_padded * sizeof(block_q8_1) / QK8_1;
         const size_t tail_q8_bytes =
             (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> down_q8_1(
-            ctx->pool(), logical_q8_bytes + tail_q8_bytes);
+        const size_t down_q8_bytes = logical_q8_bytes + tail_q8_bytes;
+        ggml_cuda_pool_alloc<char> down_q8_1_pool;
+        char *down_q8_1 = grouped_q81_scratch
+            ? grouped_q81_scratch
+            : down_q8_1_pool.alloc(ctx->pool(), down_q8_bytes);
 
         const uint64_t mid_values = (uint64_t)ne_get_rows * (uint64_t)M;
         {
@@ -1769,7 +3142,7 @@ int ds4_mmq_moe_pair_impl(
                     "ds4/prefill/moe/swiglu_down_quant",
                     ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                     nvtx_prefill);
-            ybuf_memset(down_q8_1.get(), logical_q8_bytes + tail_q8_bytes, stream);
+            ybuf_memset(down_q8_1, down_q8_bytes, stream);
             ds4_swiglu_weighted_f32<<<
                 (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
                     out_a, out_b, fused_down->router_weights,
@@ -1782,7 +3155,7 @@ int ds4_mmq_moe_pair_impl(
             }
 
             quantize_mmq_q8_1_cuda(
-                fused_down->mid_f32, ids_dst, (void *)down_q8_1.get(),
+                fused_down->mid_f32, ids_dst, (void *)down_q8_1,
                 GGML_TYPE_Q2_K, /*ne00=*/M, /*s01=*/M,
                 /*s02=*/(int64_t)M, /*s03=*/(int64_t)M * ne_get_rows,
                 /*ne0=*/down_ne10_padded, /*ne1=*/ne_get_rows,
@@ -1807,7 +3180,7 @@ int ds4_mmq_moe_pair_impl(
         const mmq_args down_args = {
             /*x=*/(const char *)fused_down->W,
             /*type_x=*/GGML_TYPE_Q2_K,
-            /*y=*/(const int *)down_q8_1.get(),
+            /*y=*/(const int *)down_q8_1,
             /*ids_dst=*/ids_dst,
             /*expert_bounds=*/expert_bounds,
             /*dst=*/fused_down->out,
@@ -1848,7 +3221,7 @@ int ds4_mmq_moe_pair_impl(
                 down_done = ds4_mmq_q2_K_moe_d2r_launch(
                         fused_down->W_soa,
                         fused_down->soa_blocks,
-                        down_q8_1.get(),
+                        down_q8_1,
                         ids_dst,
                         expert_bounds,
                         fused_down->out,
@@ -1876,7 +3249,7 @@ int ds4_mmq_moe_pair_impl(
             }
         }
     }
-    if (sanitize_out) {
+    if (sanitize_out && type != GGML_TYPE_Q4_K) {
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
@@ -2110,6 +3483,100 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
     return 0;
 }
 
+/* Canonical-GGUF/raw counterpart of the materialized aligned-SoA pipeline.
+ * SSD streaming compacts the selected experts and remaps ids before this
+ * boundary, so n_experts describes the compact table rather than the model's
+ * global expert count.  Keep all preflight ahead of the single pair_impl
+ * invocation: after that point map/quantize/MMQ work may already be queued and
+ * a negative result must be propagated instead of being converted into the
+ * retryable NOT_APPLICABLE result. */
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_raw(
+        const void * W_gate, const void * W_up, const void * W_down,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * up, float * mid_f32, float * down,
+        int expert_mid_dim, int expert_in_dim, int out_dim,
+        int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    if (!W_gate || !W_up || !W_down || !X || !ids || !router_weights ||
+        !gate || !up || !mid_f32 || !down ||
+        expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
+        n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || n_experts == INT_MAX ||
+        n_tokens >= (1 << 22) || n_expert_used >= (1 << 10) ||
+        expert_in_dim % 256 != 0 || expert_mid_dim % 256 != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const size_t nt = (size_t)n_tokens;
+    const size_t nu = (size_t)n_expert_used;
+    const size_t mid = (size_t)expert_mid_dim;
+    const size_t in = (size_t)expert_in_dim;
+    const size_t out = (size_t)out_dim;
+    if (nt > SIZE_MAX / nu) return DS4_MMQ_NOT_APPLICABLE;
+    const size_t assignments = nt * nu;
+    if (assignments > SIZE_MAX / mid ||
+        assignments * mid > SIZE_MAX / sizeof(float) ||
+        assignments > SIZE_MAX / out ||
+        assignments * out > SIZE_MAX / sizeof(float) ||
+        assignments > SIZE_MAX / in ||
+        assignments * in > SIZE_MAX / 512u ||
+        assignments * mid > SIZE_MAX / 512u) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    /* Bound the raw per-expert strides used by both MMQs before any pool or
+     * stream operation.  All dimensions enter as int, but their products do
+     * not necessarily fit int64_t. */
+    const int64_t iq2_k_blocks = expert_in_dim / 256;
+    const int64_t q2_k_blocks = expert_mid_dim / 256;
+    if ((int64_t)n_experts > INT64_MAX / expert_mid_dim ||
+        (int64_t)n_experts * expert_mid_dim > INT64_MAX / iq2_k_blocks ||
+        (int64_t)n_experts > INT64_MAX / out_dim ||
+        (int64_t)n_experts * out_dim > INT64_MAX / q2_k_blocks) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const int cc = ggml_cuda_info().devices[dev].cc;
+    if (!ds4_mmq_k_tile_supported<GGML_TYPE_IQ2_XXS>(
+            "ds4_mmq_iq2_xxs_q2_K_moe_fused_raw", expert_in_dim, cc) ||
+        !get_ctx_for_device(dev) ||
+        ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo &&
+         !ds4_mmid_large_enabled())) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const ds4_mmq_fused_down fused_down = {
+        W_down,
+        nullptr,
+        0,
+        router_weights,
+        mid_f32,
+        down,
+        out_dim,
+        clamp,
+        false,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        0,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+        "ds4_mmq_iq2_xxs_q2_K_moe_fused_raw",
+        W_gate, W_up, X, ids, gate, up,
+        expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
+        stream,
+        nullptr, nullptr, 0,
+        /*sanitize_out=*/false, &fused_down);
+}
+
 /* Aligned-artifact production fast path: gate/up accumulators stay in
  * registers, weighted SwiGLU is quantized directly into down_q8_scratch by
  * the fused D2R kernel, and only the pair-major down output is materialized.
@@ -2135,11 +3602,30 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         !input_q8_scratch || input_q8_scratch_bytes == 0 ||
         !down_q8_scratch || down_q8_scratch_bytes == 0 ||
         !work_scratch || work_scratch_bytes == 0 || !down) {
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
     }
-    const size_t down_bytes =
-        (size_t)n_tokens * (size_t)n_expert_used *
-        (size_t)out_dim * sizeof(float);
+    const size_t nt = (size_t)n_tokens;
+    const size_t nu = (size_t)n_expert_used;
+    const size_t od = (size_t)out_dim;
+    if (nt > SIZE_MAX / nu || nt * nu > SIZE_MAX / od ||
+        nt * nu * od > SIZE_MAX / sizeof(float)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t assignments = nt * nu;
+    const size_t expert_in = (size_t)expert_in_dim;
+    const size_t expert_mid = (size_t)expert_mid_dim;
+    if (assignments > SIZE_MAX / expert_in ||
+        assignments > SIZE_MAX / expert_mid) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    /* The internal MMQ producer sizes multiply these logical element counts
+     * by block structs before dividing by their values-per-block. Keep ample
+     * headroom for that multiplication and its fixed tail allocation. */
+    if (assignments * expert_in > SIZE_MAX / 512u ||
+        assignments * expert_mid > SIZE_MAX / 512u) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t down_bytes = assignments * od * sizeof(float);
     if (ds4_mmq_scratch_overlaps(
             input_q8_scratch, input_q8_scratch_bytes,
             down_q8_scratch, down_q8_scratch_bytes) ||
@@ -2155,12 +3641,20 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
             down_q8_scratch, down_q8_scratch_bytes, down, down_bytes) ||
         ds4_mmq_scratch_overlaps(
             work_scratch, work_scratch_bytes, down, down_bytes)) {
-        return -1;
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const int64_t iq2_k_blocks = expert_in_dim / 256;
+    const int64_t q2_k_blocks = expert_mid_dim / 256;
+    if ((int64_t)n_experts > INT64_MAX / expert_mid_dim ||
+        (int64_t)n_experts * expert_mid_dim > INT64_MAX / iq2_k_blocks ||
+        (int64_t)n_experts > INT64_MAX / (out_dim / 2) ||
+        (int64_t)n_experts * (out_dim / 2) > INT64_MAX / q2_k_blocks) {
+        return DS4_MMQ_NOT_APPLICABLE;
     }
     const int64_t iq2_blocks =
-        (int64_t)n_experts * expert_mid_dim * (expert_in_dim / 256);
+        (int64_t)n_experts * expert_mid_dim * iq2_k_blocks;
     const int64_t q2_pairs =
-        (int64_t)n_experts * (out_dim / 2) * (expert_mid_dim / 256);
+        (int64_t)n_experts * (out_dim / 2) * q2_k_blocks;
     const ds4_mmq_fused_down fused_down = {
         W_down,
         (const char *)W_down,
@@ -2180,13 +3674,17 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         input_q8_ext,
         input_q8_ext_bytes,
     };
-    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+    const int rc = ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",
         W_gate, W_up, X, ids, nullptr, nullptr,
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
         (const char *)W_gate, (const char *)W_up, iq2_blocks,
         /*sanitize_out=*/false, &fused_down);
+    if (rc == -1 || (rc <= -91 && rc >= -97)) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    return rc;
 }
 
 extern "C" int ds4_mmq_q4_K_moe_pair(
@@ -2291,11 +3789,10 @@ int ds4_mmq_moe_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    // Step 7 task #29: experimental persistent Q8_1 scratch.  Avoids
-    // pool_alloc (cudaMallocAsync) graph nodes whose pointer baked at
-    // capture time may not match the address resolved at replay.  When
-    // disabled (default) or when the persistent buffer is too small,
-    // fall back to the pool path.  See ds4_mmq_init for setup.
+    // Step 7 task #29: experimental persistent Q8_1 scratch. It avoids
+    // captured pool alloc/free nodes as a performance experiment. When
+    // disabled (default) or too small, the valid same-stream graph-memory
+    // pool path remains the fallback. See ds4_mmq_init for setup.
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
     if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
@@ -3047,6 +4544,206 @@ int ds4_mmq_moe_pair_vec_impl(
     return 0;
 }
 
+/* Diagnostic counters are host-dispatch counters.  CUDA graph replays do not
+ * re-enter this wrapper, so they are deliberately not presented as kernel
+ * execution counts.  They are still a fail-closed coverage signal: a GB10
+ * model run must observe at least one candidate and one use before this path
+ * can be promoted from opt-in to default. */
+static uint64_t g_q4_k1024_persistent_candidates;
+static uint64_t g_q4_k1024_persistent_uses;
+static uint64_t g_q4_k1024_persistent_fallbacks;
+static uint64_t g_q4_k1024_persistent_require_failures;
+static uint64_t g_q4_k1024_persistent_oracle_calls;
+static uint64_t g_q4_k1024_persistent_oracle_mismatches;
+static uint64_t g_q4_k1024_persistent_oracle_skips;
+static int g_q4_k1024_persistent_report_registered;
+static int g_q4_k1024_persistent_oracle_mismatch_reported;
+
+static bool q4_k1024_env_flag(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static void q4_k1024_persistent_report(void) {
+    fprintf(stderr,
+            "ds4: CUDA Q4 K1024 persistent: "
+            "candidates=%llu uses=%llu fallbacks=%llu "
+            "require_failures=%llu oracle_calls=%llu "
+            "oracle_mismatches=%llu oracle_skips=%llu "
+            "(host dispatches; graph replays excluded, canonical oracle output retained)\n",
+            (unsigned long long)g_q4_k1024_persistent_candidates,
+            (unsigned long long)g_q4_k1024_persistent_uses,
+            (unsigned long long)g_q4_k1024_persistent_fallbacks,
+            (unsigned long long)g_q4_k1024_persistent_require_failures,
+            (unsigned long long)g_q4_k1024_persistent_oracle_calls,
+            (unsigned long long)g_q4_k1024_persistent_oracle_mismatches,
+            (unsigned long long)g_q4_k1024_persistent_oracle_skips);
+}
+
+static void q4_k1024_persistent_maybe_register_report(void) {
+    if (!g_q4_k1024_persistent_report_registered &&
+        (q4_k1024_env_flag("DS4_CUDA_Q4_K1024_PERSISTENT_STATS") ||
+         q4_k1024_env_flag("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE"))) {
+        g_q4_k1024_persistent_report_registered = 1;
+        (void)atexit(q4_k1024_persistent_report);
+    }
+}
+
+__global__ static void q4_K_k1024_bitwise_compare_kernel(
+        uint32_t    *mismatch,
+        const float *candidate,
+        const float *reference,
+        uint64_t     count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count &&
+        __float_as_uint(candidate[i]) != __float_as_uint(reference[i])) {
+        atomicExch(mismatch, 1u);
+    }
+}
+
+/* GB10 AProjQ4 Q-b decode specialization (M=32768, N=1, K=1024).
+ *
+ * The canonical MMVQ small-K launch uses four warps to evaluate four rows:
+ * warp 0 owns Q4_K superblocks 0/1, warp 1 owns 2/3, and warps 2/3
+ * contribute +0.0f.  Its reduction first adds the three peer-warp partials
+ * lane by lane, then applies warp_reduce_sum's XOR tree.  Two independent
+ * four-warp groups below preserve that assignment and arithmetic order while
+ * persistent CTAs walk eight-row tiles at a grid stride.  The immutable
+ * canonical Q8_1 activation is staged once per CTA; no Q8_K re-quantization
+ * or Q4_K weight repack is involved.
+ *
+ * Keep this kernel paired with the exact M/N/K admission in
+ * ds4_mmq_dense_vec_impl.  Generalizing the row-warp mapping would change
+ * floating-point association relative to MMVQ. */
+static __global__ __launch_bounds__(256, 4) void
+q4_K_dense_vec_k1024_persistent_kernel(
+        const block_q4_K * __restrict__ W,
+        const block_q8_1 * __restrict__ x8,
+        float            * __restrict__ out,
+        int                              M) {
+    constexpr int k_q4_blocks = 4;       /* 1024 / QK_K */
+    constexpr int k_q8_blocks = 32;      /* 1024 / QK8_1 */
+    constexpr int k_rows_per_group = 4;  /* canonical MMVQ small-K tile */
+    constexpr int k_groups = 2;
+
+    /* block_q8_1 is 36 bytes.  A uint32_t backing array both copies it
+     * efficiently and preserves the alignment required by vec_dot's int
+     * loads from qs. */
+    __shared__ __align__(16) uint32_t x8_words[
+        (k_q8_blocks * sizeof(block_q8_1)) / sizeof(uint32_t)];
+    __shared__ float partial[k_groups][3][k_rows_per_group][32];
+
+    const uint32_t *x8_src = (const uint32_t *)x8;
+    for (uint32_t i = threadIdx.x;
+         i < (uint32_t)(sizeof(x8_words) / sizeof(x8_words[0]));
+         i += blockDim.x) {
+        x8_words[i] = x8_src[i];
+    }
+    __syncthreads();
+
+    const block_q8_1 *x8_shared = (const block_q8_1 *)x8_words;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t group = warp >> 2u;
+    const uint32_t warp_in_group = warp & 3u;
+    const uint32_t group_tid = warp_in_group * 32u + lane;
+    const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
+
+    /* tile, row_tiles, and gridDim.x are block-uniform, and this loop has no
+     * divergent exit.  Every thread therefore reaches both barriers below on
+     * every iteration; unrolling is unrelated to their correctness. */
+    for (uint64_t tile = blockIdx.x; tile < row_tiles; tile += gridDim.x) {
+        const uint32_t row0 = (uint32_t)(tile * 8u) +
+                              group * k_rows_per_group;
+        float tmp[k_rows_per_group] = {0.0f};
+
+        /* This is the canonical N=1, K=1024 MMVQ small-K loop verbatim:
+         * qi/vdr = 16 and blocks_per_iter = 8 for Q4_K. */
+        const int kqs = VDR_Q4_K_Q8_1_MMVQ * (int)(group_tid % 16u);
+        for (int kbx = (int)(group_tid / 16u);
+             kbx < k_q4_blocks;
+             kbx += 8) {
+            const int kby = kbx * (QK_K / QK8_1);
+#pragma unroll
+            for (int i = 0; i < k_rows_per_group; ++i) {
+                tmp[i] += vec_dot_q4_K_q8_1(
+                    W, &x8_shared[kby],
+                    (int)((uint64_t)(row0 + (uint32_t)i) * k_q4_blocks) + kbx,
+                    kqs);
+            }
+        }
+
+        if (warp_in_group > 0u) {
+#pragma unroll
+            for (int i = 0; i < k_rows_per_group; ++i) {
+                partial[group][warp_in_group - 1u][i][lane] = tmp[i];
+            }
+        }
+        __syncthreads();
+
+        if (warp_in_group == 0u) {
+#pragma unroll
+            for (int i = 0; i < k_rows_per_group; ++i) {
+#pragma unroll
+                for (int peer = 0; peer < 3; ++peer) {
+                    tmp[i] += partial[group][peer][i][lane];
+                }
+                tmp[i] = warp_reduce_sum<32>(tmp[i]);
+            }
+            if (lane < k_rows_per_group) {
+                out[row0 + lane] = tmp[lane];
+            }
+        }
+        /* Both groups must finish consuming partial before the next
+         * grid-stride tile reuses it. */
+        __syncthreads();
+    }
+}
+
+static bool ds4_mmq_q4_epilogue_eligible(
+        ggml_type type, int M, int N, int K, int device) {
+#if !defined(GGML_USE_HIP)
+    if (type != GGML_TYPE_Q4_K || !ds4_q4_mmvq_epilogue_shape_ok(M, N, K)) return false;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING &&
+           getenv("DS4_CUDA_DISABLE_Q4_MMVQ_EPILOGUE") == nullptr;
+#else
+    GGML_UNUSED_VARS(type, M, N, K, device);
+    return false;
+#endif
+}
+
+// Single and shared-activation pair projections use the same dense layout.
+// Keep backend selection and stride construction in one place; callers own
+// output clearing, sanitization, and launch error handling.
+template <ggml_type type>
+static void ds4_mmq_launch_dense_vec(
+        const void *W, const void *x8, float *out,
+        int M, int N, int K, int64_t stride_col_y,
+        bool fused_epilogue, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP)
+    if (fused_epilogue) {
+        ds4_mmvq_q4_K_dense_sanitized(W, x8, out, M, N, K, (int)stride_col_y, stream);
+        return;
+    }
+#else
+    GGML_UNUSED_VARS(fused_epilogue);
+#endif
+    const ggml_cuda_mm_fusion_args_device fusion = {};
+    mul_mat_vec_q_switch_type(
+        /*vx=*/W, /*type_x=*/type, /*vy=*/x8,
+        /*ids=*/nullptr, /*fusion=*/fusion, /*dst=*/out,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
+        /*stride_row_x=*/(int)((int64_t)K / ggml_blck_size(type)),
+        /*stride_col_y=*/(int)stride_col_y, /*stride_col_dst=*/M,
+        /*nchannels_x=*/1, /*nchannels_y=*/1, /*nchannels_dst=*/1,
+        /*stride_channel_x=*/0, /*stride_channel_y=*/(int)((int64_t)N * stride_col_y),
+        /*stride_channel_dst=*/0,
+        /*nsamples_x=*/1, /*nsamples_dst=*/1,
+        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+        /*ids_stride=*/0, stream);
+}
+
 template <ggml_type type>
 int ds4_mmq_dense_vec_impl(
         const char  * tag,
@@ -3056,6 +4753,7 @@ int ds4_mmq_dense_vec_impl(
         int           M,
         int           N,
         int           K,
+        int           q4_weight_device_resident,
         cudaStream_t  stream) {
 
     if (!W || !X_f32 || !out_f32) {
@@ -3083,19 +4781,115 @@ int ds4_mmq_dense_vec_impl(
         return -1;
     }
 
+    /* Resolve the exact-shape admission before allocating pool storage,
+     * quantizing X, clearing output, or launching any kernel.  REQUIRE and
+     * the oracle are coverage gates: an ineligible candidate must therefore
+     * fail without leaving work queued on the caller's stream. */
+    bool q4_k1024_exact = false;
+    bool q4_k1024_eligible = false;
+    bool q4_k1024_oracle = false;
+    unsigned q4_k1024_grid = 0u;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        q4_k1024_persistent_maybe_register_report();
+        q4_k1024_exact = M == 32768 && N == 1 && K == 1024;
+        q4_k1024_oracle = q4_k1024_exact &&
+            q4_k1024_env_flag("DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE");
+        const bool enable =
+            q4_k1024_env_flag("DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT");
+        const bool disable =
+            q4_k1024_env_flag("DS4_CUDA_NO_Q4_K1024_PERSISTENT") ||
+            q4_k1024_env_flag("DS4_CUDA_NO_Q4_GB10_FAST");
+        if (q4_k1024_exact) {
+            g_q4_k1024_persistent_candidates++;
+        }
+        if (q4_k1024_exact && gb10_optimizations_enabled() &&
+            (enable || q4_k1024_oracle) && !disable &&
+            q4_weight_device_resident > 0 &&
+            (((uintptr_t)W & 15u) == 0u)) {
+            const uint64_t row_tiles = ((uint64_t)(uint32_t)M + 7u) / 8u;
+            const int nsm = ggml_cuda_info().devices[dev].nsm;
+            const uint64_t resident_blocks =
+                nsm > 0 ? (uint64_t)(uint32_t)nsm * 4u : 0u;
+            const uint64_t grid64 = row_tiles < resident_blocks
+                ? row_tiles : resident_blocks;
+            if (grid64 > 0u && grid64 <= UINT32_MAX) {
+                q4_k1024_grid = (unsigned)grid64;
+                q4_k1024_eligible = true;
+            }
+        }
+        if (q4_k1024_exact && !q4_k1024_eligible) {
+            g_q4_k1024_persistent_fallbacks++;
+            const bool require =
+                q4_k1024_env_flag(
+                    "DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT");
+            if (require || q4_k1024_oracle) {
+                g_q4_k1024_persistent_require_failures++;
+                if (q4_k1024_oracle) {
+                    g_q4_k1024_persistent_oracle_skips++;
+                }
+                fprintf(stderr,
+                        "%s: required Q4_K K1024 persistent path unavailable "
+                        "before enqueue\n",
+                        tag);
+                return -4;
+            }
+        }
+        if (q4_k1024_eligible && q4_k1024_oracle) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            const cudaError_t capture_err =
+                cudaStreamIsCapturing(stream, &capture);
+            if (capture_err != cudaSuccess ||
+                capture != cudaStreamCaptureStatusNone) {
+                (void)cudaGetLastError();
+                g_q4_k1024_persistent_fallbacks++;
+                g_q4_k1024_persistent_require_failures++;
+                g_q4_k1024_persistent_oracle_skips++;
+                fprintf(stderr,
+                        "%s: Q4_K K1024 persistent oracle refuses CUDA "
+                        "graph capture before enqueue; run the oracle with "
+                        "DS4_CUDA_DECODE_GRAPHS=0\n",
+                        tag);
+                return -5;
+            }
+        }
+    }
+
     // Route the pool's cudaMallocAsync through the caller-supplied stream
     // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
     ds4_pool_set_stream(stream);
+
+    /* Oracle-only storage.  Graph capture was rejected above, so the pool
+     * allocations and the host readback below cannot become graph nodes.
+     * The persistent candidate writes here; canonical MMVQ always owns the
+     * caller-visible output. */
+    ggml_cuda_pool_alloc<float> q4_k1024_candidate;
+    ggml_cuda_pool_alloc<uint32_t> q4_k1024_mismatch;
+    if (q4_k1024_eligible && q4_k1024_oracle) {
+        q4_k1024_candidate.alloc(ctx->pool(), (size_t)M);
+        q4_k1024_mismatch.alloc(ctx->pool(), 1u);
+    }
 
     // Dense: no MoE, ids=null. Layout [K, N, 1, 1] for src1.
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    char *x8 = nullptr;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (gb10_optimizations_enabled() &&
+            getenv("DS4_CUDA_NO_Q4_GB10_FAST") == nullptr &&
+            getenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH") == nullptr) {
+            x8 = (char *)ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1);
+        }
+    }
+    if (!x8) {
+        src1_q8_1.alloc(ctx->pool(), nbytes_q8_1);
+        x8 = src1_q8_1.get();
+    }
 
     // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
     quantize_row_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+        X_f32, /*ids=*/nullptr, (void *)x8,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
         /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
@@ -3108,40 +4902,33 @@ int ds4_mmq_dense_vec_impl(
         return -2;
     }
 
-    // Dense (no ids): per upstream dispatch (mmvq.cu:1121-1127),
-    //   ncols_dst          = ne1  = N
-    //   nchannels_y        = ne12 = 1
-    //   nchannels_dst      = ne2  = 1
-    //   stride_col_y       = s11  = ne10_padded / QK8_1
-    //   stride_channel_y   = s12  = N * (ne10_padded / QK8_1)
-    const int64_t blck      = ggml_blck_size(type);
-    const int64_t s01_row   = (int64_t)K / blck;
-    const int64_t s11_y     = ne10_padded / QK8_1;
-    const int64_t s12_y     = (int64_t)N * s11_y;
-    const int64_t s1_dst    = (int64_t)M;
+    // Dense N=1..8 MMVQ fully overwrites aligned row cohorts. Sanitize in the
+    // output-owning lane to avoid both the pre-clear and the post-read kernel.
+    // Leave the independent persistent experiment and its oracle untouched.
+    const bool fused_epilogue = !q4_k1024_eligible &&
+        ds4_mmq_q4_epilogue_eligible(type, M, N, K, dev);
+    if (!fused_epilogue)
+        (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
 
-    ggml_cuda_mm_fusion_args_device fusion = {};
+    bool q4_k1024_persistent = false;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (q4_k1024_eligible) {
+            float *candidate_out = q4_k1024_oracle
+                ? q4_k1024_candidate.get() : out_f32;
+            q4_K_dense_vec_k1024_persistent_kernel<<<
+                q4_k1024_grid, 256, 0, stream>>>(
+                    (const block_q4_K *)W,
+                    (const block_q8_1 *)x8,
+                    candidate_out, M);
+            g_q4_k1024_persistent_uses++;
+            q4_k1024_persistent = !q4_k1024_oracle;
+        }
+    }
 
-    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
-
-    mul_mat_vec_q_switch_type(
-        /*vx=*/W, /*type_x=*/type,
-        /*vy=*/(const void *)src1_q8_1.get(),
-        /*ids=*/nullptr, /*fusion=*/fusion,
-        /*dst=*/out_f32,
-        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
-        /*stride_row_x=*/(int)s01_row,
-        /*stride_col_y=*/(int)s11_y,
-        /*stride_col_dst=*/(int)s1_dst,
-        /*nchannels_x=*/1,
-        /*nchannels_y=*/1,
-        /*nchannels_dst=*/1,
-        /*stride_channel_x=*/0,
-        /*stride_channel_y=*/(int)s12_y,
-        /*stride_channel_dst=*/0,
-        /*nsamples_x=*/1, /*nsamples_dst=*/1,
-        /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
-        /*ids_stride=*/0, stream);
+    if (!q4_k1024_persistent) {
+        ds4_mmq_launch_dense_vec<type>(
+            W, x8, out_f32, M, N, K, ne10_padded / QK8_1, fused_epilogue, stream);
+    }
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -3149,7 +4936,324 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    const uint64_t out_count = (uint64_t)M * (uint64_t)N;
+    if (!fused_epilogue) ds4_mmq_sanitize_f32(out_f32, out_count, stream);
+    if (q4_k1024_oracle) {
+        ds4_mmq_sanitize_f32(q4_k1024_candidate.get(), out_count, stream);
+        if (cudaGetLastError() != cudaSuccess) {
+            fprintf(stderr, "%s: Q4_K K1024 oracle sanitize failed\n", tag);
+            g_q4_k1024_persistent_oracle_skips++;
+            return -6;
+        }
+        cudaError_t oracle_err = cudaMemsetAsync(
+            q4_k1024_mismatch.get(), 0, sizeof(uint32_t), stream);
+        if (oracle_err == cudaSuccess) {
+            q4_K_k1024_bitwise_compare_kernel<<<
+                (unsigned)((out_count + 255u) / 256u), 256, 0, stream>>>(
+                    q4_k1024_mismatch.get(), q4_k1024_candidate.get(),
+                    out_f32, out_count);
+            oracle_err = cudaGetLastError();
+        }
+        uint32_t mismatch_host = 0u;
+        if (oracle_err == cudaSuccess) {
+            oracle_err = cudaMemcpyAsync(
+                &mismatch_host, q4_k1024_mismatch.get(), sizeof(uint32_t),
+                cudaMemcpyDeviceToHost, stream);
+        }
+        if (oracle_err == cudaSuccess) {
+            oracle_err = cudaStreamSynchronize(stream);
+        }
+        if (oracle_err != cudaSuccess) {
+            fprintf(stderr,
+                    "%s: Q4_K K1024 persistent oracle failed: %s\n",
+                    tag, cudaGetErrorString(oracle_err));
+            (void)cudaGetLastError();
+            g_q4_k1024_persistent_oracle_skips++;
+            return -6;
+        }
+        g_q4_k1024_persistent_oracle_calls++;
+        if (mismatch_host != 0u) {
+            g_q4_k1024_persistent_oracle_mismatches++;
+            if (!g_q4_k1024_persistent_oracle_mismatch_reported) {
+                g_q4_k1024_persistent_oracle_mismatch_reported = 1;
+                fprintf(stderr,
+                        "%s: Q4_K K1024 persistent oracle found a bitwise "
+                        "mismatch; retained canonical MMVQ output\n",
+                        tag);
+            }
+        }
+    }
+    return 0;
+}
+
+template <ggml_type type>
+int ds4_mmq_dense_pair_vec_impl(
+        const char  * tag,
+        const void  * W0,
+        const void  * W1,
+        const float * X_f32,
+        float       * out0_f32,
+        float       * out1_f32,
+        int           M0,
+        int           M1,
+        int           N,
+        int           K,
+        cudaStream_t  stream) {
+
+    if (!W0 || !W1 || !X_f32 || !out0_f32 || !out1_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (M0 <= 0 || M1 <= 0 || N <= 0 || K <= 0) {
+        fprintf(stderr, "%s: bad shape M0=%d M1=%d N=%d K=%d\n",
+                tag, M0, M1, N, K);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (K % 256 != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (N > MMVQ_MAX_BATCH_SIZE) {
+        fprintf(stderr, "%s: N=%d exceeds MMVQ_MAX_BATCH_SIZE=%d\n",
+                tag, N, MMVQ_MAX_BATCH_SIZE);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n",
+                tag, dev);
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    ds4_pool_set_stream(stream);
+
+    /* Match ds4_mmq_dense_vec_impl's activation layout and quantizer exactly,
+     * but retain the Q8_1 row for both projections. */
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t nbytes_q8_1 = (size_t)N * ne10_padded *
+                               sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    char *x8 = nullptr;
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (gb10_optimizations_enabled() &&
+            getenv("DS4_CUDA_NO_Q4_GB10_FAST") == nullptr &&
+            getenv("DS4_CUDA_NO_Q4_DENSE_SCRATCH") == nullptr) {
+            x8 = (char *)ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1);
+        }
+    }
+    if (!x8) {
+        src1_q8_1.alloc(ctx->pool(), nbytes_q8_1);
+        x8 = src1_q8_1.get();
+    }
+
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, (void *)x8,
+        type, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N,
+        /*s13=*/(int64_t)K * N,
+        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
+        stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const int64_t s11_y = ne10_padded / QK8_1;
+
+    // Each aligned single-token leg fuses its own sanitizer. Keep both original
+    // matvec launches and their arithmetic; only setup/epilogue work is removed.
+    const bool fused0 = ds4_mmq_q4_epilogue_eligible(type, M0, N, K, dev);
+    const bool fused1 = ds4_mmq_q4_epilogue_eligible(type, M1, N, K, dev);
+    if (!fused0) cudaMemsetAsync(out0_f32, 0,
+                    (size_t)M0 * (size_t)N * sizeof(float), stream);
+    ds4_mmq_launch_dense_vec<type>(
+        W0, x8, out0_f32, M0, N, K, s11_y, fused0, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: first dense MMVQ launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+    if (!fused0) ds4_mmq_sanitize_f32(out0_f32, (uint64_t)M0 * (uint64_t)N, stream);
+
+    if (!fused1) cudaMemsetAsync(out1_f32, 0,
+                    (size_t)M1 * (size_t)N * sizeof(float), stream);
+    ds4_mmq_launch_dense_vec<type>(
+        W1, x8, out1_f32, M1, N, K, s11_y, fused1, stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: second dense MMVQ launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -4;
+    }
+    if (!fused1) ds4_mmq_sanitize_f32(out1_f32, (uint64_t)M1 * (uint64_t)N, stream);
+    return 0;
+}
+
+__global__ static void ds4_mmq_group_ids_i32_kernel(
+        int32_t *ids, int n, int n_groups) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) ids[i] = i % n_groups;
+}
+
+/* Grouped AProjQ4 attention-A projection.  Flatten (token, group) into the
+ * MMVQ channel dimension (never the column dimension): ncols_dst stays one,
+ * so every pair uses exactly the same one-row Q4_K MMVQ specialization, K
+ * partition, peer-warp fold, and reduction tree as the canonical nested
+ * token/group loop. The legacy repeated ids select W[group]; the fused Q4
+ * specialization derives the same group from grid.y and sanitizes at store.
+ * Both retain the token-major activation/output indices. */
+static int ds4_mmq_q4_K_grouped_batch_vec_impl(
+        const void  *W,
+        const float *X,
+        float       *out,
+        int          M,
+        int          K,
+        int          n_tokens,
+        int          n_groups,
+        cudaStream_t stream) {
+    const char *tag = n_tokens == 1
+        ? "ds4_mmq_q4_K_grouped_vec"
+        : "ds4_mmq_q4_K_grouped_batch_vec";
+    if (!W || !X || !out) {
+        fprintf(stderr, "%s: null pointer\n", tag);
+        return -1;
+    }
+    if (!gb10_optimizations_enabled() ||
+        getenv("DS4_CUDA_NO_Q4_GB10_FAST") != nullptr ||
+        getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A") != nullptr ||
+        M <= 0 || K <= 0 || n_tokens <= 0 || n_tokens > 8 ||
+        n_groups <= 0 || n_groups > 16 ||
+        K % 256 != 0) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    if (n_tokens > 1) {
+        const char *enable =
+            getenv("DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH");
+        if (!enable || !enable[0] || strcmp(enable, "0") == 0 ||
+            getenv("DS4_CUDA_NO_Q4_GROUPED_ATTN_A_BATCH") != nullptr) {
+            return DS4_MMQ_NOT_APPLICABLE;
+        }
+    }
+
+    const int flat_channels = n_tokens * n_groups; /* <= 8 * 16 */
+
+    const int64_t row_blocks = (int64_t)K / ggml_blck_size(GGML_TYPE_Q4_K);
+    const int64_t weight_channel_stride = (int64_t)M * row_blocks;
+    if (row_blocks <= 0 || row_blocks > INT_MAX ||
+        weight_channel_stride > INT_MAX) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t q8_row_bytes = (size_t)ne10_padded *
+                                sizeof(block_q8_1) / QK8_1;
+    if ((size_t)flat_channels > SIZE_MAX / q8_row_bytes) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+    const size_t nbytes_q8_1 = (size_t)flat_channels * q8_row_bytes;
+    if (nbytes_q8_1 > SIZE_MAX - 15u) return DS4_MMQ_NOT_APPLICABLE;
+    const size_t ids_offset = (nbytes_q8_1 + 15u) & ~(size_t)15u;
+    const size_t ids_bytes = (size_t)flat_channels * sizeof(int32_t);
+    if (ids_offset > SIZE_MAX - ids_bytes) {
+        return DS4_MMQ_NOT_APPLICABLE;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    const int64_t y_channel_stride = ne10_padded / QK8_1;
+    // Preserve the scratch-capacity contract in both arms so rollback never
+    // needs a larger arena, even though the fused arm does not populate ids.
+    char *x8 = (char *)ds4_mmq_aligned_q81_scratch(
+        dev, ids_offset + ids_bytes);
+    if (!x8) return DS4_MMQ_NOT_APPLICABLE;
+    bool fused_grouped = false;
+#if !defined(GGML_USE_HIP)
+    if (ds4_q4_mmvq_grouped_shape_ok(M, K, n_tokens, n_groups, y_channel_stride)) {
+        const int cc = ggml_cuda_info().devices[dev].cc;
+        fused_grouped = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING &&
+            getenv("DS4_CUDA_DISABLE_Q4_GROUPED_MMVQ_FUSION") == nullptr;
+    }
+#endif
+    int32_t *ids = (int32_t *)(x8 + ids_offset);
+    cudaError_t err = cudaSuccess;
+    if (!fused_grouped) {
+        ds4_mmq_group_ids_i32_kernel<<<
+            (unsigned)(flat_channels + 31) / 32u, 32, 0, stream>>>(
+                ids, flat_channels, n_groups);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: group-id launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -2;
+        }
+    }
+
+    quantize_row_q8_1_cuda(
+        X, /*ids=*/nullptr, (void *)x8,
+        GGML_TYPE_Q4_K, /*ne00=*/K,
+        /*s11=*/(int64_t)K,
+        /*s12=*/(int64_t)K * flat_channels,
+        /*s13=*/(int64_t)K * flat_channels,
+        /*ne0=*/ne10_padded, /*ne1=*/flat_channels, /*ne2=*/1, /*ne3=*/1,
+        stream);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
+
+#if !defined(GGML_USE_HIP)
+    if (fused_grouped) {
+        ds4_mmvq_q4_K_grouped_sanitized(
+            W, x8, out, M, K, n_tokens, n_groups, (int)y_channel_stride, stream);
+    } else
+#endif
+    {
+        ggml_cuda_mm_fusion_args_device fusion = {};
+        err = cudaMemsetAsync(
+            out, 0, (size_t)flat_channels * (size_t)M * sizeof(float), stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: output clear failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -4;
+        }
+        mul_mat_vec_q_switch_type(
+            /*vx=*/W, /*type_x=*/GGML_TYPE_Q4_K,
+            /*vy=*/(const void *)x8,
+            /*ids=*/ids, /*fusion=*/fusion,
+            /*dst=*/out,
+            /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/1,
+            /*stride_row_x=*/(int)row_blocks,
+            /*stride_col_y=*/(int)y_channel_stride,
+            /*stride_col_dst=*/M,
+            /*nchannels_x=*/n_groups,
+            /*nchannels_y=*/flat_channels,
+            /*nchannels_dst=*/flat_channels,
+            /*stride_channel_x=*/(int)weight_channel_stride,
+            /*stride_channel_y=*/(int)y_channel_stride,
+            /*stride_channel_dst=*/M,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1,
+            /*stride_sample_x=*/0, /*stride_sample_y=*/0,
+            /*stride_sample_dst=*/0,
+            /*ids_stride=*/1, stream);
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: grouped MMVQ launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -5;
+    }
+    if (!fused_grouped) {
+        ds4_mmq_sanitize_f32(
+            out, (uint64_t)(uint32_t)flat_channels * (uint64_t)(uint32_t)M,
+            stream);
+    }
     return 0;
 }
 
@@ -3679,7 +5783,9 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_pool;
     // M2-Inc2a: the fused HC stage may have emitted this activation's q8_1
     // codes already (ffn_norm) -- take them and skip the quantize prelude.
-    char *src1_q8_1_ptr = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    char *src1_q8_1_ptr = ds4_mmq_folded_q81(
+        X_f32, K, n_tokens, ne10_padded, stream);
+    const bool folded_hit = src1_q8_1_ptr != nullptr;
     cudaError_t err;
     if (!src1_q8_1_ptr) {
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
@@ -3711,6 +5817,106 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
 
     const dim3 block_nums((M + 63) / 64, n_tokens * n_expert_used);
     const dim3 block_dims(256);
+    if (folded_hit && ds4_mmq_q8_fold_oracle_enabled()) {
+        const size_t q8_bytes =
+            (size_t)ne10_padded * sizeof(block_q8_1) / QK8_1;
+        const uint64_t mid_count =
+            (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used;
+        const size_t mid_bytes = (size_t)mid_count * sizeof(float);
+        block_q8_1 *fresh = nullptr;
+        float *reference = nullptr;
+        uint32_t *mismatch_device = nullptr;
+        const bool allocated =
+            cudaMalloc((void **)&fresh, q8_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&reference, mid_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) == cudaSuccess &&
+            fresh && reference && mismatch_device;
+        if (!allocated) {
+            (void)cudaGetLastError();
+            cudaError_t cleanup_err = cudaSuccess;
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "raw-moe-fresh", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "raw-moe-reference", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "raw-moe-mismatch", cleanup_err);
+            if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
+            g_q8_fold_oracle_skips++;
+        } else {
+            cudaError_t oracle_err = cudaMemsetAsync(
+                mismatch_device, 0, sizeof(uint32_t), stream);
+            if (oracle_err == cudaSuccess) {
+                quantize_row_q8_1_cuda(
+                    X_f32, /*ids=*/nullptr, fresh, type,
+                    /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+                    /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1,
+                    stream);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<
+                    block_nums, block_dims, 0, stream>>>(
+                        W_gate, W_up,
+                        (const block_q8_1 *)src1_q8_1_ptr,
+                        ids, weights, mid_f32,
+                        (uint32_t)K, (uint32_t)M,
+                        (uint32_t)n_tokens, (uint32_t)n_experts,
+                        stride_row_x, stride_col_y, stride_channel_x, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<
+                    block_nums, block_dims, 0, stream>>>(
+                        W_gate, W_up, fresh, ids, weights, reference,
+                        (uint32_t)K, (uint32_t)M,
+                        (uint32_t)n_tokens, (uint32_t)n_experts,
+                        stride_row_x, stride_col_y, stride_channel_x, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                q8_fold_output_compare_kernel<<<
+                    (unsigned)((mid_count + 255u) / 256u), 256, 0, stream>>>(
+                        mismatch_device, mid_f32, reference, mid_count);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    mid_f32, reference, mid_bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+            }
+            uint32_t mismatch_host = 0u;
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    &mismatch_host, mismatch_device, sizeof(mismatch_host),
+                    cudaMemcpyDeviceToHost, stream);
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaStreamSynchronize(stream);
+            }
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "raw-moe-fresh", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "raw-moe-reference", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "raw-moe-mismatch", oracle_err);
+            if (oracle_err != cudaSuccess) {
+                (void)cudaGetLastError();
+                g_q8_fold_oracle_skips++;
+                fprintf(stderr, "%s: fold consumer oracle failed\n", tag);
+                return -3;
+            }
+            g_q8_fold_oracle_output_calls++;
+            g_q8_fold_oracle_raw_moe_calls++;
+            if (mismatch_host != 0u) {
+                g_q8_fold_oracle_output_mismatches++;
+                fprintf(stderr,
+                        "ds4: CUDA Q8_1 fold oracle found a raw MoE "
+                        "consumer output mismatch; retained canonical "
+                        "output\n");
+            }
+            return 0;
+        }
+    }
     ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W_gate, W_up, (const block_q8_1 *)src1_q8_1_ptr, ids, weights, mid_f32,
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
@@ -3799,7 +6005,7 @@ static int ds4_mmq_q4_K_dense_pair_vec_impl(
     const size_t qbytes =
         (size_t)padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = ds4_mmq_folded_q81(X, K, 1, padded);
+    char *x8 = ds4_mmq_folded_q81(X, K, 1, padded, stream);
     if (!x8) {
         if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, qbytes)) {
             x8 = (char *)scratch;
@@ -3835,6 +6041,27 @@ static int ds4_mmq_q4_K_dense_pair_vec_impl(
 }
 
 } // anonymous namespace
+
+extern "C" void ds4_mmq_q4_K_k1024_persistent_counters(
+        uint64_t *candidates,
+        uint64_t *uses,
+        uint64_t *fallbacks,
+        uint64_t *require_failures,
+        uint64_t *oracle_calls,
+        uint64_t *oracle_mismatches,
+        uint64_t *oracle_skips) {
+    if (candidates) *candidates = g_q4_k1024_persistent_candidates;
+    if (uses) *uses = g_q4_k1024_persistent_uses;
+    if (fallbacks) *fallbacks = g_q4_k1024_persistent_fallbacks;
+    if (require_failures) {
+        *require_failures = g_q4_k1024_persistent_require_failures;
+    }
+    if (oracle_calls) *oracle_calls = g_q4_k1024_persistent_oracle_calls;
+    if (oracle_mismatches) {
+        *oracle_mismatches = g_q4_k1024_persistent_oracle_mismatches;
+    }
+    if (oracle_skips) *oracle_skips = g_q4_k1024_persistent_oracle_skips;
+}
 
 extern "C" int ds4_mmq_q8_0_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
@@ -3932,6 +6159,20 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
     return 0;
 }
 
+extern "C" void ds4_mmq_set_gb10_optimizations(int enabled) {
+    {
+        // Serialize the transition with any persistent Q8_1 host lease.  The
+        // atomic also covers GB10 admission reads outside this arena lock.
+        std::lock_guard<std::mutex> lock(g_q81_state_mutex);
+        g_gb10_optimizations.store(enabled != 0, std::memory_order_relaxed);
+    }
+    if (!enabled) {
+        // Backend teardown/reinit already funnels through this setter.  Keep
+        // MMQ's owned arena lifecycle local to this translation unit.
+        (void)ds4_mmq_q81_persistent_cleanup();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Aligned-SoA Q8_0 dense decode matvec (megakernel program M1-Inc3).
 //
@@ -3982,6 +6223,96 @@ __global__ void q8_0_aligned_dense_vec_kernel(
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) out[row] = acc;
+}
+
+/* K=1024 decode specialization. Eight persistent row warps per CTA hoist the
+ * 32 Q8_1 activation blocks into registers and walk output rows at a grid
+ * stride. Each lane still owns the same single block term and the warp tree is
+ * unchanged, so output bits match q8_0_aligned_dense_vec_kernel. */
+__global__ __launch_bounds__(256, 6) void q8_0_aligned_dense_vec_k1024_persistent_kernel(
+        float             *out,
+        const int4        *qs,
+        const __half      *dq,
+        const block_q8_1  *x8,
+        int                M)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int *u = (const int *)x8[lane].qs;
+    const int u0 = u[0];
+    const int u1 = u[1];
+    const int u2 = u[2];
+    const int u3 = u[3];
+    const int u4 = u[4];
+    const int u5 = u[5];
+    const int u6 = u[6];
+    const int u7 = u[7];
+    const float dx = __low2float(x8[lane].ds);
+    const int64_t row0 = (int64_t)blockIdx.x * 8 + warp;
+    const int64_t row_stride = (int64_t)gridDim.x * 8;
+
+    for (int64_t row = row0; row < (int64_t)M; row += row_stride) {
+        const long long block = (long long)row * 32 + lane;
+        const int4 w0 = qs[block * 2 + 0];
+        const int4 w1 = qs[block * 2 + 1];
+        int s0 = ggml_cuda_dp4a(w0.x, u0, 0);
+        s0 = ggml_cuda_dp4a(w0.y, u1, s0);
+        int s1 = ggml_cuda_dp4a(w0.z, u2, 0);
+        s1 = ggml_cuda_dp4a(w0.w, u3, s1);
+        int s2 = ggml_cuda_dp4a(w1.x, u4, 0);
+        s2 = ggml_cuda_dp4a(w1.y, u5, s2);
+        int s3 = ggml_cuda_dp4a(w1.z, u6, 0);
+        s3 = ggml_cuda_dp4a(w1.w, u7, s3);
+        const int sumi = (s0 + s1) + (s2 + s3);
+        float acc = 0.0f;
+        acc += __half2float(dq[block]) * dx * (float)sumi;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) out[row] = acc;
+    }
+}
+
+/* Persistent-CTA form for the K=4096 vocabulary projection. It preserves
+ * the original lane/block assignment, per-lane term order, and warp tree;
+ * grouping eight row warps removes the one-warp CTA occupancy ceiling. */
+__global__ __launch_bounds__(256, 6) void q8_0_aligned_dense_vec_persistent_kernel(
+        float             *out,
+        const int4        *qs,
+        const __half      *dq,
+        const block_q8_1  *x8,
+        int                M,
+        int                nb)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int64_t row0 = (int64_t)blockIdx.x * 8 + warp;
+    const int64_t row_stride = (int64_t)gridDim.x * 8;
+    for (int64_t row = row0; row < (int64_t)M; row += row_stride) {
+        const long long rbase = (long long)row * nb;
+        float acc = 0.0f;
+        for (int b0 = 0; b0 < nb; b0 += 32) {
+            const int b = b0 + lane;
+            const int4 w0 = qs[(rbase + b) * 2 + 0];
+            const int4 w1 = qs[(rbase + b) * 2 + 1];
+            const int *u = (const int *)x8[b].qs;
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
+            sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
+            sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
+            sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
+            sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
+            sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
+            sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
+            sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+            acc += __half2float(dq[rbase + b]) *
+                   __low2float(x8[b].ds) * (float)sumi;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) out[row] = acc;
+    }
 }
 
 // Verify-width variant (v0.4 dense chase, proto_q8_aligned_nc): same aligned
@@ -4036,6 +6367,170 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
             acc[c] += __shfl_down_sync(0xffffffffu, acc[c], off);
         if (lane == 0) out[(size_t)c * M + row] = acc[c];
     }
+}
+
+static int ds4_q8_aligned_warps_per_block(int cc);
+
+static cudaError_t q8_0_aligned_dense_vec_launch(
+        float *out, const int4 *qs, const __half *dq,
+        const block_q8_1 *x8, int M, int N, int K,
+        cudaStream_t stream) {
+    switch (N) {
+    case 1:
+        if (gb10_optimizations_enabled() &&
+            getenv("DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT") == NULL &&
+            (K == 1024 || K == 4096) && M >= 32768) {
+            const uint64_t row_blocks = ((uint64_t)(unsigned)M + 7u) / 8u;
+            const unsigned persistent_blocks =
+                row_blocks < 288u ? (unsigned)row_blocks : 288u;
+            if (K == 1024) {
+                q8_0_aligned_dense_vec_k1024_persistent_kernel<<<
+                    persistent_blocks, 256, 0, stream>>>(
+                        out, qs, dq, x8, M);
+            } else {
+                q8_0_aligned_dense_vec_persistent_kernel<<<
+                    persistent_blocks, 256, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+            }
+        } else {
+            switch (ds4_q8_aligned_warps_per_block(
+                        ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            case 16:
+                q8_0_aligned_dense_vec_kernel<16>
+                    <<<((unsigned)M + 15u) / 16u, 512, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+                break;
+            case 8:
+                q8_0_aligned_dense_vec_kernel<8>
+                    <<<((unsigned)M + 7u) / 8u, 256, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+                break;
+            case 4:
+                q8_0_aligned_dense_vec_kernel<4>
+                    <<<((unsigned)M + 3u) / 4u, 128, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+                break;
+            case 2:
+                q8_0_aligned_dense_vec_kernel<2>
+                    <<<((unsigned)M + 1u) / 2u, 64, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+                break;
+            default:
+                q8_0_aligned_dense_vec_kernel<1>
+                    <<<(unsigned)M, 32, 0, stream>>>(
+                        out, qs, dq, x8, M, K / 32);
+                break;
+            }
+        }
+        break;
+    case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 4: q8_0_aligned_dense_vec_nc_kernel<4><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 5: q8_0_aligned_dense_vec_nc_kernel<5><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 6: q8_0_aligned_dense_vec_nc_kernel<6><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 7: q8_0_aligned_dense_vec_nc_kernel<7><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    case 8: q8_0_aligned_dense_vec_nc_kernel<8><<<(unsigned)M, 32, 0, stream>>>(out, qs, dq, x8, M, K / 32); break;
+    default: return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
+}
+
+/* Full consumer oracle for the folded single-column Q8_0 aligned entry.
+ * It regenerates canonical Q8_1, runs the exact same consumer twice, compares
+ * output bits, and always leaves the freshly quantized reference output in
+ * the caller buffer.  Return 1 when handled, 0 when diagnostics could not be
+ * set up before enqueue, and -1 after a CUDA failure. */
+static int q8_fold_q8_aligned_output_oracle(
+        const float *X_f32, const block_q8_1 *folded,
+        float *out, const int4 *qs, const __half *dq,
+        int M, int K, cudaStream_t stream) {
+    if (!ds4_mmq_q8_fold_oracle_enabled() || !folded || M <= 0 || K <= 0) {
+        return 0;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return 0;
+    }
+    const size_t q8_bytes = (size_t)K * sizeof(block_q8_1) / QK8_1;
+    const size_t out_bytes = (size_t)M * sizeof(float);
+    block_q8_1 *fresh = nullptr;
+    float *reference = nullptr;
+    uint32_t *mismatch_device = nullptr;
+    if (cudaMalloc((void **)&fresh, q8_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&reference, out_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) != cudaSuccess ||
+        !fresh || !reference || !mismatch_device) {
+        (void)cudaGetLastError();
+        cudaError_t cleanup_err = cudaSuccess;
+        cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            fresh, "aligned-q8-fresh", cleanup_err);
+        cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            reference, "aligned-q8-reference", cleanup_err);
+        cleanup_err = ds4_mmq_q8_fold_oracle_free(
+            mismatch_device, "aligned-q8-mismatch", cleanup_err);
+        if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return 0;
+    }
+
+    cudaError_t err = cudaMemsetAsync(
+        mismatch_device, 0, sizeof(uint32_t), stream);
+    if (err == cudaSuccess) {
+        quantize_row_q8_1_cuda(
+            X_f32, /*ids=*/nullptr, fresh, GGML_TYPE_Q8_0,
+            /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+            /*ne0=*/K, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1, stream);
+        err = cudaGetLastError();
+    }
+    if (err == cudaSuccess) {
+        err = q8_0_aligned_dense_vec_launch(
+            out, qs, dq, folded, M, 1, K, stream);
+    }
+    if (err == cudaSuccess) {
+        err = q8_0_aligned_dense_vec_launch(
+            reference, qs, dq, fresh, M, 1, K, stream);
+    }
+    if (err == cudaSuccess) {
+        q8_fold_output_compare_kernel<<<
+            (unsigned)(((uint64_t)M + 255u) / 256u), 256, 0, stream>>>(
+                mismatch_device, out, reference, (uint64_t)M);
+        err = cudaGetLastError();
+    }
+    if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(out, reference, out_bytes,
+                              cudaMemcpyDeviceToDevice, stream);
+    }
+    uint32_t mismatch_host = 0u;
+    if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(&mismatch_host, mismatch_device,
+                              sizeof(mismatch_host),
+                              cudaMemcpyDeviceToHost, stream);
+    }
+    if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+
+    err = ds4_mmq_q8_fold_oracle_free(
+        fresh, "aligned-q8-fresh", err);
+    err = ds4_mmq_q8_fold_oracle_free(
+        reference, "aligned-q8-reference", err);
+    err = ds4_mmq_q8_fold_oracle_free(
+        mismatch_device, "aligned-q8-mismatch", err);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_q8_fold_oracle_skips++;
+        return -1;
+    }
+    g_q8_fold_oracle_output_calls++;
+    g_q8_fold_oracle_aligned_q8_calls++;
+    if (mismatch_host != 0u) {
+        g_q8_fold_oracle_output_mismatches++;
+        fprintf(stderr,
+                "ds4: CUDA Q8_1 fold oracle found a Q8 aligned consumer "
+                "output mismatch; retained canonical output\n");
+    }
+    return 1;
 }
 
 extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
@@ -4122,7 +6617,7 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec_pair(
     const size_t qbytes =
         (size_t)padded * sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, padded);
+    char *x8 = ds4_mmq_folded_q81(X_f32, K, 1, padded, stream);
     if (!x8) {
         if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, qbytes)) {
             x8 = (char *)scratch;
@@ -4204,28 +6699,37 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
     // kernel) -- take them and skip the quantize prelude.  Single-column
     // producers only; verify widths always quantize.
-    char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
+    char *x8 = N == 1
+        ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded, stream)
+        : NULL;
+    const bool folded_hit = x8 != NULL;
     cudaError_t err;
     if (!x8) {
-    if (void *scratch = ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1)) {
-        x8 = (char *)scratch;
-    } else if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
-        x8 = (char *)g_q81_scratch_ptr;
-    } else {
-        q8_pool.alloc(ctx->pool(), nbytes_q8_1);
-        x8 = q8_pool.get();
-    }
-    quantize_row_q8_1_cuda(
-        X_f32, /*ids=*/nullptr, (void *)x8,
-        GGML_TYPE_Q8_0, /*ne00=*/K,
-        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
-        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
-        stream);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
-        return -2;
-    }
+        if (getenv("DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH") == NULL) {
+            x8 = (char *)ds4_mmq_aligned_q81_scratch(dev, nbytes_q8_1);
+        }
+        if (!x8 && g_q81_scratch_enabled && g_q81_scratch_ptr &&
+            g_q81_scratch_bytes >= nbytes_q8_1) {
+            x8 = (char *)g_q81_scratch_ptr;
+        }
+        if (!x8) {
+            q8_pool.alloc(ctx->pool(), nbytes_q8_1);
+            x8 = q8_pool.get();
+        }
+        quantize_row_q8_1_cuda(
+            X_f32, /*ids=*/nullptr, (void *)x8,
+            GGML_TYPE_Q8_0, /*ne00=*/K,
+            /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N,
+            /*s13=*/(int64_t)K * N,
+            /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
+            stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "%s: quantize_row_q8_1_cuda failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -2;
+        }
     }
 
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
@@ -4233,46 +6737,17 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     const int4   *qsp = (const int4 *)((const char *)W_aligned + dq_bytes);
     const __half *dqp = (const __half *)W_aligned;
     const block_q8_1 *x8p = (const block_q8_1 *)x8;
-    switch (N) {
-    case 1:
-        switch (ds4_q8_aligned_warps_per_block(
-                    ggml_cuda_info().devices[dev].cc)) {
-        case 16:
-            q8_0_aligned_dense_vec_kernel<16>
-                <<<((unsigned)M + 15u) / 16u, 512, 0, stream>>>(
-                    out_f32, qsp, dqp, x8p, M, K / 32);
-            break;
-        case 8:
-            q8_0_aligned_dense_vec_kernel<8>
-                <<<((unsigned)M + 7u) / 8u, 256, 0, stream>>>(
-                    out_f32, qsp, dqp, x8p, M, K / 32);
-            break;
-        case 4:
-            q8_0_aligned_dense_vec_kernel<4>
-                <<<((unsigned)M + 3u) / 4u, 128, 0, stream>>>(
-                    out_f32, qsp, dqp, x8p, M, K / 32);
-            break;
-        case 2:
-            q8_0_aligned_dense_vec_kernel<2>
-                <<<((unsigned)M + 1u) / 2u, 64, 0, stream>>>(
-                    out_f32, qsp, dqp, x8p, M, K / 32);
-            break;
-        default:
-            q8_0_aligned_dense_vec_kernel<1>
-                <<<(unsigned)M, 32, 0, stream>>>(
-                    out_f32, qsp, dqp, x8p, M, K / 32);
-            break;
+    if (folded_hit && N == 1 && ds4_mmq_q8_fold_oracle_enabled()) {
+        const int oracle_rc = q8_fold_q8_aligned_output_oracle(
+            X_f32, x8p, out_f32, qsp, dqp, M, K, stream);
+        if (oracle_rc > 0) return 0;
+        if (oracle_rc < 0) {
+            fprintf(stderr, "%s: fold consumer oracle failed\n", tag);
+            return -3;
         }
-        break;
-    case 2: q8_0_aligned_dense_vec_nc_kernel<2><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 3: q8_0_aligned_dense_vec_nc_kernel<3><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 4: q8_0_aligned_dense_vec_nc_kernel<4><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 5: q8_0_aligned_dense_vec_nc_kernel<5><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 6: q8_0_aligned_dense_vec_nc_kernel<6><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 7: q8_0_aligned_dense_vec_nc_kernel<7><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
-    case 8: q8_0_aligned_dense_vec_nc_kernel<8><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
     }
-    err = cudaGetLastError();
+    err = q8_0_aligned_dense_vec_launch(
+        out_f32, qsp, dqp, x8p, M, N, K, stream);
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
@@ -4583,7 +7058,9 @@ extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
 // pool otherwise) or nullptr on failure; *pool must outlive the launches.
 static char *iq2_aligned_quantize_xn(
         const char *tag, const float *X_f32, int K, int n_tokens,
-        ggml_cuda_pool_alloc<char> *pool, cudaStream_t stream) {
+        ggml_cuda_pool_alloc<char> *pool, cudaStream_t stream,
+        bool *was_folded) {
+    if (was_folded) *was_folded = false;
     const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
@@ -4595,8 +7072,10 @@ static char *iq2_aligned_quantize_xn(
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
     // M2-Inc2a: producer-emitted q8_1 codes (ffn_norm from the fused HC
     // stage) -- take them and skip the quantize prelude.
-    char *folded = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
+    char *folded = ds4_mmq_folded_q81(
+        X_f32, K, n_tokens, ne10_padded, stream);
     if (folded) {
+        if (was_folded) *was_folded = true;
         // C3-Inc4 fold twin selftest (DS4_Q8_FOLD_SELFTEST=<call budget>,
         // eager legs only -- syncs the stream): the taken sidecar must be
         // byte-identical to the fresh quantize this prelude would have run.
@@ -4674,7 +7153,8 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
         return -1;
     }
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);
+    char *x8 = iq2_aligned_quantize_xn(
+        tag, X_f32, K, n_tokens, &q8_pool, stream, nullptr);
     if (!x8) return -2;
 
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
@@ -4711,7 +7191,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         return -1;
     }
     ggml_cuda_pool_alloc<char> q8_pool;
-    char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);
+    bool folded_hit = false;
+    char *x8 = iq2_aligned_quantize_xn(
+        tag, X_f32, K, n_tokens, &q8_pool, stream, &folded_hit);
     if (!x8) return -2;
 
     const uint64_t nblk = (uint64_t)n_experts * (uint64_t)M * (uint64_t)(K / 256);
@@ -4721,6 +7203,99 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     const __half *dq_g = (const __half *)W_gate_aligned;
     const uint2  *qs_u = (const uint2 *)((const char *)W_up_aligned + dq_bytes);
     const __half *dq_u = (const __half *)W_up_aligned;
+    if (folded_hit && n_tokens == 1 &&
+        ds4_mmq_q8_fold_oracle_enabled()) {
+        const size_t q8_bytes = (size_t)K * sizeof(block_q8_1) / QK8_1;
+        const uint64_t mid_count =
+            (uint64_t)M * (uint64_t)n_expert_used;
+        const size_t mid_bytes = (size_t)mid_count * sizeof(float);
+        block_q8_1 *fresh = nullptr;
+        float *reference = nullptr;
+        uint32_t *mismatch_device = nullptr;
+        const bool allocated =
+            cudaMalloc((void **)&fresh, q8_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&reference, mid_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&mismatch_device, sizeof(uint32_t)) == cudaSuccess &&
+            fresh && reference && mismatch_device;
+        if (!allocated) {
+            (void)cudaGetLastError();
+            cudaError_t cleanup_err = cudaSuccess;
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "aligned-iq2-fresh", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "aligned-iq2-reference", cleanup_err);
+            cleanup_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "aligned-iq2-mismatch", cleanup_err);
+            if (cleanup_err != cudaSuccess) (void)cudaGetLastError();
+            g_q8_fold_oracle_skips++;
+        } else {
+            cudaError_t oracle_err = cudaMemsetAsync(
+                mismatch_device, 0, sizeof(uint32_t), stream);
+            if (oracle_err == cudaSuccess) {
+                quantize_row_q8_1_cuda(
+                    X_f32, /*ids=*/nullptr, fresh, GGML_TYPE_IQ2_XXS,
+                    /*ne00=*/K, /*s11=*/K, /*s12=*/K, /*s13=*/K,
+                    /*ne0=*/K, /*ne1=*/1, /*ne2=*/1, /*ne3=*/1, stream);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
+                    mid_f32, qs_g, dq_g, qs_u, dq_u,
+                    (const block_q8_1 *)x8, ids, weights,
+                    M, K / 256, K / 32, n_expert_used, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                iq2_xxs_aligned_moe_gate_up_mid_kernel<<<grid, 32, 0, stream>>>(
+                    reference, qs_g, dq_g, qs_u, dq_u, fresh,
+                    ids, weights, M, K / 256, K / 32,
+                    n_expert_used, clamp);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                q8_fold_output_compare_kernel<<<
+                    (unsigned)((mid_count + 255u) / 256u), 256, 0, stream>>>(
+                        mismatch_device, mid_f32, reference, mid_count);
+                oracle_err = cudaGetLastError();
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    mid_f32, reference, mid_bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+            }
+            uint32_t mismatch_host = 0u;
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaMemcpyAsync(
+                    &mismatch_host, mismatch_device, sizeof(mismatch_host),
+                    cudaMemcpyDeviceToHost, stream);
+            }
+            if (oracle_err == cudaSuccess) {
+                oracle_err = cudaStreamSynchronize(stream);
+            }
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                fresh, "aligned-iq2-fresh", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                reference, "aligned-iq2-reference", oracle_err);
+            oracle_err = ds4_mmq_q8_fold_oracle_free(
+                mismatch_device, "aligned-iq2-mismatch", oracle_err);
+            if (oracle_err != cudaSuccess) {
+                (void)cudaGetLastError();
+                g_q8_fold_oracle_skips++;
+                fprintf(stderr, "%s: fold consumer oracle failed\n", tag);
+                return -3;
+            }
+            g_q8_fold_oracle_output_calls++;
+            g_q8_fold_oracle_aligned_iq2_calls++;
+            if (mismatch_host != 0u) {
+                g_q8_fold_oracle_output_mismatches++;
+                fprintf(stderr,
+                        "ds4: CUDA Q8_1 fold oracle found an IQ2 MoE "
+                        "consumer output mismatch; retained canonical "
+                        "output\n");
+            }
+            return 0;
+        }
+    }
     /* v0.4 V6: verify widths dedup expert overlap (see the dedup kernel's
      * header comment).  n_tokens==1 has no cross-token overlap and keeps
      * the per-slot kernel; widths beyond the verify envelope likewise.
@@ -4929,14 +7504,80 @@ extern "C" int ds4_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
-        "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
+        "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K,
+        /*q4_weight_device_resident=*/0, stream);
+}
+
+static int ds4_mmq_pointer_is_device_resident(
+        const void *ptr, int expected_device) {
+    if (!ptr || expected_device < 0) return 0;
+    cudaPointerAttributes attr = {};
+    const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+#if defined(GGML_USE_HIP) && HIP_VERSION >= 60000000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#elif defined(GGML_USE_HIP)
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#elif CUDART_VERSION >= 10000
+    return attr.type == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#else
+    return attr.memoryType == cudaMemoryTypeDevice &&
+           attr.device == expected_device;
+#endif
+}
+
+extern "C" int ds4_mmq_q4_K_dense_vec(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    int weight_device_resident = 0;
+    /* Keep pointer introspection out of generic Q4 MMVQ traffic. It is only
+     * needed when the exact-shape persistent candidate could be considered;
+     * the full runtime uses the explicit provenance API below instead. */
+    if (M == 32768 && N == 1 && K == 1024) {
+        weight_device_resident = ds4_mmq_pointer_is_device_resident(
+            W, ggml_cuda_get_device());
+    }
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_vec", W, X, out, M, N, K,
+        weight_device_resident, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_dense_vec_with_weight_residency(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, int weight_device_resident,
+        cudaStream_t stream) {
+    return ds4_mmq_dense_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_vec_with_weight_residency",
+        W, X, out, M, N, K, weight_device_resident > 0, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_vec(
+        const void *W, const float *X, float *out,
+        int M, int K, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_batch_vec_impl(
+        W, X, out, M, K, 1, n_groups, stream);
+}
+
+extern "C" int ds4_mmq_q4_K_grouped_batch_vec(
+        const void *W, const float *X, float *out,
+        int M, int K, int n_tokens, int n_groups, cudaStream_t stream) {
+    return ds4_mmq_q4_K_grouped_batch_vec_impl(
+        W, X, out, M, K, n_tokens, n_groups, stream);
 }
 
 extern "C" int ds4_mmq_q4_K_dense_pair_vec(
-        const void *W0, const void *W1, const float *X,
-        float *out0, float *out1, int M, int K, cudaStream_t stream) {
-    return ds4_mmq_q4_K_dense_pair_vec_impl(
-        W0, W1, X, out0, out1, M, K, stream);
+        const void * W0, const void * W1, const float * X,
+        float * out0, float * out1,
+        int M0, int M1, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_pair_vec_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_dense_pair_vec", W0, W1, X, out0, out1,
+        M0, M1, N, K, stream);
 }
 
 // Explicit instantiations. One per quant type the public API exposes.

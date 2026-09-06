@@ -2,6 +2,9 @@
 
 [README](../README.md)
 
+For branch-specific Q4/Q8 kernel selection, rollback controls, and tester
+commands, see [SSD and quantized kernel notes](BRANCH_SSD_KERNELS.md).
+
 Use resident inference when the model and runtime fit: it is faster.
 SSD streaming keeps a bounded cache of routed experts and reads missing
 experts from the GGUF. It trades speed for capacity; it does not remove the

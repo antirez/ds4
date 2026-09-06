@@ -66,6 +66,47 @@ family, plus enough free disk for the temporary output.  Use `--dry-run` and
 `--compare-tensor` before starting a full write, and use `--overwrite` only when
 you really mean to replace an existing GGUF.
 
+### Requantize a GGUF Directly
+
+Dense attention projections can be requantized directly from an existing GGUF
+without the original Hugging Face safetensors. Direct requantization supports
+`Q8_0 -> Q4_K` and `F16 -> Q4_K`; tensors not selected by the policy are copied
+byte for byte. The output path must differ from the source path. For a full run,
+write to a temporary output name and rename it only after validation; an
+interrupted run leaves a partial output file.
+
+Validate the plan and all required imatrix entries first:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --source-gguf /path/to/DeepSeek-V4-Flash-AProjQ8.gguf \
+  --attention-proj q4_k \
+  --imatrix /path/to/DeepSeek-V4-Flash-chat-v2-routed-and-dense-ds4-220k.dat \
+  --imatrix-strict \
+  --dry-run
+```
+
+Then write the Q4 GGUF:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --source-gguf /path/to/DeepSeek-V4-Flash-AProjQ8.gguf \
+  --out /path/to/DeepSeek-V4-Flash-AProjQ4.gguf \
+  --attention-proj q4_k \
+  --imatrix /path/to/DeepSeek-V4-Flash-chat-v2-routed-and-dense-ds4-220k.dat \
+  --imatrix-strict
+```
+
+Quantize only the sparse-attention indexer query projections while preserving
+the F16 indexer compressors and weight projection:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --source-gguf /path/to/DeepSeek-V4-Flash-AProjQ4.gguf \
+  --out /path/to/DeepSeek-V4-Flash-AProjQ4-IndexerQ4.gguf \
+  --indexer-q q4_k
+```
+
 Q2 routed experts with imatrix:
 
 ```sh
@@ -103,6 +144,7 @@ You can override tensor families:
 --experts iq2_xxs
 --routed-w2 q2_k
 --attention-proj q8_0
+--indexer-q q4_k
 --shared q8_0
 --output q8_0
 ```

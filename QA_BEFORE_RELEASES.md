@@ -247,8 +247,8 @@ Use the normal Flash GGUF that 128 GB users run.
 ### DSpark / DeepSpec Runtime
 
 DSpark is opt-in, but it mutates the verifier, target-hidden capture, support
-model loading, and scheduler paths.  Run these whenever DSpark support,
-speculative verification, confidence/scheduler policy, target hidden capture,
+model loading, and proposal paths. Run these whenever DSpark support,
+speculative verification, confidence policy, target hidden capture,
 tiny routed-MoE verifier kernels, or shared `--mtp-model` support-model code changes:
 
 Use the 0731 DSpark support GGUF only with a Flash 0731 target. A support model
@@ -282,6 +282,247 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
   `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
+- For Metal DSpark verifier/proposer/replay changes, run this same-machine A/B
+  matrix with `DS4_DSPARK_STATS=1`, greedy decoding, the same prompt and token
+  limit, and no other environment changes:
+
+  | Target expert cache | Expected DSpark depth | Legacy control | Candidate |
+  | ---: | ---: | --- | --- |
+  | 16 | 2 | `DS4_METAL_DSPARK_PROPOSER_BLOCK_MAX=0 DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY=0 DS4_METAL_DSPARK_HEADLESS_REPLAY=0` | Leave proposer/headless unset; keep acceptance-only `=0` |
+  | 32 | 5 | `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=5 DS4_METAL_DSPARK_ACCEPTANCE_ONLY_VERIFY=0 DS4_METAL_DSPARK_HEADLESS_REPLAY=0` | Keep the verifier cap, set acceptance-only `=1`, and leave proposer/headless unset |
+
+  Use `--ssd-streaming-cache-experts 16` or `32` to match the row. The 0731
+  top-6 verifier needs 30 effective slots for five draft rows; 32 leaves a small
+  margin. Require byte-identical stdout between control and candidate and
+  `errors=0`, `verifier_unavailable=0`, `proposed>0`, and
+  `accepted_draft>0`. Record generation t/s, acceptance, `propose`, `verify`,
+  `replay`, `prop_capped`, `prop_scheduled_rows`, `metal_accept_only`,
+  `metal_verify_rows_saved`, and `metal_replay_headless`. In the candidate,
+  eligible `N >= 3` verification cycles should save one target row; aligned
+  ratio-4 boundaries intentionally remain on the legacy path. The
+  depth-2 run exercises proposer capping and headless replay while retaining
+  the legacy verifier; the depth-5 run should retain the checkpoint's native
+  five proposal rows and exercise acceptance-only verification.
+  On low-memory Metal, repeat the depth-5 candidate once with
+  `DS4_METAL_DSPARK_PIN_MAIN_PROJ=1`. Require a startup log confirming the
+  locked byte count, identical stdout and acceptance, and compare
+  `prop_setup`, total `propose`, page faults, and generation t/s. A lock
+  failure or a slower median keeps this optimization opt-in.
+- For the experimental Metal SSD exact-2 verifier, repeat the depth-2 row
+  above with `DS4_METAL_DSPARK_EXACT2=0` as the control and `=1` as the only
+  candidate change. Set `DS4_DSPARK_FIXTURE_REQUIRE_EXACT2=1` only on the
+  candidate. Require byte-identical stdout against both control and
+  target-only output, `exact2_attempt>0`, `exact2_full>0`,
+  `exact2_fallback=0`, and `errors=0`. Record generation t/s, `verify`, and
+  `replay`; then repeat for at least 100 generated tokens to catch cumulative
+  state drift. Do not infer that the generic five-row batch state is directly
+  committable from this two-row result.
+- For Metal exact-union or the AProjQ4/HC decode fusions, first run the
+  model-backed oracle with the target AProjQ4 GGUF:
+  `DS4_TEST_MODEL=/path/to/deepseek-v4-flash-aprojq4.gguf make test-metal-exactn-oracle`.
+  Require its N=2..5 cases to be byte-identical to sequential decode for
+  serialized KV/compressor state, logits, and the four-token continuation.
+  The matrix must include full accepts for N=2,3,4,5, all N=5 partial prefixes
+  1..4, and EOS in the first and a middle row. This is a correctness gate, not
+  evidence of a speedup.
+- The Q8 Q-A/KV compound rows below require a separate AProjQ8 target whose
+  metadata includes both ratio-4 and ratio-128 compressor layers. An AProjQ4
+  oracle cannot exercise that compound and is a failed coverage gate even if
+  greedy output remains correct.
+- Then run isolated, same-machine greedy A/B pairs with identical prompt,
+  context, cache, token limit, and `DS4_DSPARK_STATS=1`. Change only the gate
+  named by the row:
+
+  | Metal fusion | Reference control | Candidate |
+  | --- | --- | --- |
+  | HC RMSNorm + F16 mixer on M1-M4 | `DS4_METAL_DISABLE_PRE_M5_HC_NORM_MIX_FUSE=1` | Leave the disable switch unset |
+  | HC RMSNorm + F16 mixer on another Apple generation | Leave both HC norm/mix switches unset | `DS4_METAL_ENABLE_HC_NORM_MIX_FUSE=1` |
+  | HC producer + split/Sinkhorn/destination RMSNorm on M1-M5 | `DS4_METAL_DISABLE_HC_PRODUCER_PRE_NORM_FUSE=1` | Leave the disable switch unset |
+  | Q4 Q-A/KV + compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1` with the Q4 enable switch unset | Keep exact-union `=1`; set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
+  | Q4 Q-A/KV + compressor store in ordinary `FULL` decode | Leave `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE` unset | Set `DS4_METAL_ENABLE_Q4_QKV_COMPRESSOR_FUSE=1` |
+  | Q8 Q-A/KV + compressor store in SSD `FULL` (AProjQ8) | Leave the Q8 enable/require switches unset | Set `DS4_METAL_ENABLE_Q8_QKV_COMPRESSOR_FUSE=1 DS4_METAL_REQUIRE_Q8_QKV_COMPRESSOR_FUSE=1` |
+  | Q8 Q-A/KV + compressor store in SSD exact-union (AProjQ8) | `DS4_METAL_DSPARK_EXACTN_UNION=1` with the Q8 enable/require switches unset | Keep exact-union `=1`; set `DS4_METAL_ENABLE_Q8_QKV_COMPRESSOR_FUSE=1 DS4_METAL_REQUIRE_Q8_QKV_COMPRESSOR_FUSE=1` |
+  | Q4 attention-output tiny batch in the generic verifier | Set `DS4_METAL_DSPARK_EXACTN_UNION=0 DS4_METAL_DSPARK_EXACTN=0 DS4_METAL_DSPARK_EXACT2=0`; leave tiny enable/require unset | Keep all three exact gates `=0`; set `DS4_METAL_REQUIRE_Q4_ATTN_OUT_TINY_BATCH=1` and require at least one proposed block of depth 3–5 (the acceptance-only suffix evaluates one fewer row) |
+  | F16 attention+indexer quad compressor store in `FULL` decode | `DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` | Leave the disable switch unset |
+  | F16 attention+indexer quad compressor store in exact-union | `DS4_METAL_DSPARK_EXACTN_UNION=1 DS4_METAL_DISABLE_COMPRESSOR_QUAD_STORE=1` | Keep exact-union `=1`; leave the quad disable switch unset |
+  | Exact ratio-4 one-row compressor pool on M1-M5 | `DS4_METAL_DISABLE_COMPRESSOR_EXACT_POOL_RATIO4=1` | Leave the disable switch unset |
+  | Q4 attention-output B + HC expansion | `DS4_METAL_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` | Leave the disable switch unset |
+  | FlashAttention pad/block PSO memo | `DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO=1` | Leave the disable switch unset |
+  | FlashAttention batched/vector PSO memo | `DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO=1` | Leave the disable switch unset |
+  | Exact-union asynchronous routed tails | `DS4_METAL_DSPARK_EXACTN_UNION=1` with `DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS` unset | Keep exact-union `=1`; set `DS4_METAL_DSPARK_EXACT_ROWS_ASYNC_TAILS=1` |
+
+  The Q4 Q-A/KV compound is opt-in in both exact-union and ordinary `FULL`
+  decode; it is enabled only when the explicit enable variable is present.
+  Require byte-identical stdout and `errors=0`; for exact-union also
+  require `exactn_union_attempt>0` and `exactn_union_error_fallback=0`.
+  Partial-accept fallback is expected when the draft diverges. Record
+  `exactn_union_full`, `exactn_union_partial_fallback`, `propose`, `verify`,
+  `replay`, stage timings, page faults, and generation t/s. A candidate that
+  is correct but slower remains disabled or opt-in according to its gate.
+  For asynchronous tails, also repeat the model-backed oracle with the switch
+  set and run enough exact-union cycles to cross cache eviction and raw-ring
+  wrap boundaries. The candidate removes a CPU wait but retains private expert
+  buffers until command-buffer completion; serialized state and process memory
+  after synchronization must match the synchronous control.
+  Before the model-backed runs, build `ds4_test` and run
+  `./ds4_test --metal-kernels`. This covers the isolated compound HC, F16 quad
+  compressor-store, exact ratio-4 pool, and tie-heavy Metal routing kernels.
+  For the exact one-row pool candidate, repeat once with
+  `DS4_METAL_REQUIRE_COMPRESSOR_EXACT_POOL_RATIO4=1`; the run must exercise the
+  specialization instead of silently falling back. Also exercise the global
+  kill switches plus the matching pre-M5 or M5 HC/pool rollback on the target
+  machine. Treat the FlashAttention memo rows as host-dispatch A/B tests: the
+  selected specialization and output must remain identical, and any timing
+  comparison must use repeated warm runs.
+- For the default M1 IQ2 address-table mid-only path, first run
+  `make test-metal-iq2-midonly`. It must cover 12,288 full-shape top-6 mid
+  words in both unmasked and complementary masked address-table modes with
+  both mid mismatch counters at zero, no canonical unwritten rows, zero
+  candidate gate/up writes, and zero guard mismatches. Then use the same greedy
+  IQ2_XXS/Q2_K SSD-streaming model, prompt, cache state, and token count for
+  three decode runs: leave all switches unset for the automatic candidate,
+  set `DS4_METAL_REQUIRE_M1_IQ2_MID_ONLY=1` for fail-closed coverage, and set
+  `DS4_METAL_DISABLE_M1_IQ2_MID_ONLY=1` for the canonical control and
+  kill-switch fallback.
+  Enable the routed-MoE stage profiler on one candidate layer and require path
+  `iq2_stream_addr_mid_only_4096x2048` or
+  `iq2_stream_addr_mask_mid_only_4096x2048`; absence of both is failed model
+  coverage. Require byte-identical greedy output and top-logprobs, and report
+  prefill separately from decode: this one-token routed producer is not a
+  prefill optimization. Compare repeated hot-cache medians, then repeat a
+  cold-cache sanity run to exclude a change in SSD cache behavior.
+- For the removed Metal 512-column streaming top-k path, there is no runtime
+  candidate gate. Compare the current binary with a build immediately before
+  its removal only if historical timing is needed. First require
+  `./ds4_test --metal-kernels` to pass, including tie-heavy routing cases, then
+  require identical selected expert ids and greedy output. Correct deterministic
+  ordering takes precedence over a timing difference.
+- For the default CPU unrolled argmax, run `tests/test_sampling`, then compare
+  an otherwise identical greedy workload with
+  `DS4_CPU_DISABLE_UNROLLED_ARGMAX=1` (scalar control) and with the variable
+  unset (candidate). Require identical tokens for ordinary, excluded-id,
+  cross-lane-tie, and vocabulary-tail cases; record median generation t/s over
+  repeated runs without claiming a speedup from the implementation alone.
+- For the experimental resident-CUDA exact-2 verifier, use three controlled
+  runs with verifier cap two on the same single-GPU host: native proposer plus
+  legacy verifier
+  (`DS4_CUDA_DSPARK_EXACT2=0 DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=0 DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=2`),
+  two-row proposer plus legacy verifier
+  (`DS4_CUDA_DSPARK_EXACT2=0 DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=2 DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=2`),
+  and two-row proposer plus exact-2
+  (`DS4_CUDA_DSPARK_EXACT2=1 DS4_CUDA_DSPARK_PROPOSER_BLOCK_MAX=2 DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=2`).
+  This separates the non-causal proposer-width change from the verifier and
+  replay change. Then compare uncapped legacy DSpark against exact-2 as an
+  end-to-end policy test. Keep SSD streaming and TP disabled. Require
+  byte-identical stdout, `errors=0`, and `verifier_unavailable=0` from every
+  run; set `DS4_DSPARK_FIXTURE_REQUIRE_EXACT2=1` on the exact-2 run so the
+  fixture enforces `exact2_attempt>0` and `exact2_fallback=0`.
+  Record `prop_scheduled_rows/cycles`, `propose`, `verify`, `replay`, `net_saved`,
+  `miss_first`, `no_draft`, `avg_accept`, and generation t/s from every run.
+- For resident CUDA exact-N, keep exact-2 disabled and compare
+  `DS4_CUDA_DSPARK_EXACTN=0` against `=1` with the native five-row proposer
+  and `DS4_DSPARK_SSD_VERIFY_BLOCK_MAX=5`. Repeat N=2,3,4,5 with explicit
+  proposer/verifier caps, then exercise the kill switch with both
+  `DS4_CUDA_DSPARK_EXACTN=1` and
+  `DS4_CUDA_DISABLE_DSPARK_EXACTN=1`. Require byte-identical greedy stdout,
+  `errors=0`, `verifier_unavailable=0`, `cuda_exactn_attempt>0`, and at least
+  one `cuda_exactn_full`; partial cases must increment the partial and
+  aggregate fallback counters, never the error counter, and continue
+  identically through legacy replay. Include
+  EOS as the first and a middle draft, a raw-ring wrap boundary, a context
+  capacity cut, and prefill workspaces below five rows. Record
+  `cuda_exactn_rows`, its full/partial/error counters, `snapshot`, `verify`,
+  `replay`, acceptance, and generation t/s. Run with CUDA decode graphs both
+  enabled and disabled. Do not promote the gate without a CUDA device build
+  and serialized KV/compressor-state oracle; host syntax tests do not execute
+  this path. On candidate fixture runs set
+  `DS4_DSPARK_FIXTURE_REQUIRE_CUDA_EXACTN=1`; it requires aggregate
+  `cuda_exactn_attempt>0` and `cuda_exactn_error_fallback=0`. It reports but
+  does not reject aggregate `cuda_exactn_fallback`, because valid partial
+  matches increment both the partial and aggregate fallback counters before
+  legacy replay.
+- For CUDA DSpark non-causal proposer attention, compare the reference with
+  `DS4_CUDA_ENABLE_DSPARK_NONCAUSAL_ONLINE=0` against the candidate with `=1`.
+  Repeat at proposal depths two and five, across every raw-ring start index,
+  and once with both the enable variable and
+  `DS4_CUDA_DISABLE_DSPARK_NONCAUSAL_ONLINE=1` to prove the kill switch restores
+  the reference dispatch. On the short diagnostic runs also set
+  `DS4_DSPARK_VERIFY_NONCAUSAL=1`; record all three reported `max_abs` and
+  `max_rel` comparisons and reject non-finite values or a material error
+  regression. Then run the acceptance fixture without the diagnostic host
+  readbacks and require byte-identical target stdout, `errors=0`, and
+  `verifier_unavailable=0`. Record proposal time, acceptance, generation t/s,
+  and the startup dispatch log. Draft logits or acceptance may differ slightly
+  because online softmax changes the floating-point reduction order; that is
+  not permission for the verified target continuation to differ.
+- For CUDA HC and tiny routed-MoE kernel changes, keep
+  `DS4_CUDA_DSPARK_EXACT2` unset and repeat the resident acceptance fixture
+  with these explicit A/B pairs: HC control
+  `DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED=1` versus candidate with that variable
+  absent; routed-MoE control `DS4_CUDA_DSPARK_TINY_ALIGNED_VEC=0` versus
+  candidate `=1`. Require byte-identical stdout, `errors=0`, and
+  `verifier_unavailable=0`; record `prop_chain`, `verify_layer`, total
+  proposal/verify time, acceptance, and generation t/s. Also run
+  `--decode-consistency 64` and the logprob-vector regression before enabling
+  a numerically different kernel by default.
+- For the CUDA AProjQ4 ports, run an isolated A/B for each dispatch:
+  Q-A/KV pair control `DS4_CUDA_DISABLE_Q4_DENSE_PAIR=1` versus candidate with
+  that variable absent; HC norm/mix control
+  `DS4_CUDA_DISABLE_HC_NORM_MIX_FUSE=1` versus candidate
+  `DS4_CUDA_ENABLE_HC_NORM_MIX_FUSE=1 DS4_CUDA_NO_F16_CUBLAS_ONE=1`; and Q4
+  attention-output/HC control `DS4_CUDA_DISABLE_Q4_ATTN_OUT_HC_FUSE=1` versus
+  the graph-compatible canonical candidate with that variable absent. Run a separate
+  non-captured diagnostic with `DS4_CUDA_Q4_ATTN_OUT_HC_ORACLE=1`; require
+  the summary to be present with `calls>0`, `skips=0`, and
+  `epilogue_mismatches=0`, while `q8k_mismatches` records the expected
+  numerical distance from the optional one-dispatch Q8_K experiment. A
+  zero-call summary is a failed coverage gate. Only
+  test `DS4_CUDA_Q4_ATTN_OUT_HC_Q8K_EXPERIMENT=1` as a promotion candidate if
+  its oracle mismatches are also zero. Repeat the pair and attention-output
+  cases with `DS4_CUDA_MMQ=0` to exercise the canonical Q8_K fallback
+  separately from the default MMVQ/Q8_1 path. Require byte-identical stdout
+  and full-logit/tensor equivalence before promoting an opt-in gate. Run with
+  decode graphs both enabled and disabled, and record target, proposer,
+  verifier, replay, acceptance, and generation t/s. A CUDA build and hardware
+  run are mandatory; a host-only build does not compile the device kernels.
+- When DSpark, support-model mapping, or SSD streaming changes, repeat both
+  the acceptance fixture and verifier invariant on every advertised graph
+  backend. Apply the backend and SSD options to the target-only baseline as
+  well as the DSpark run:
+
+  ```sh
+  DS4_DSPARK_MODEL=/path/to/flash-0731.gguf \
+  DS4_DSPARK_SUPPORT=/path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  DS4_DSPARK_FIXTURE_BACKEND=cuda \
+  DS4_DSPARK_FIXTURE_SSD_STREAMING=1 \
+  DS4_DSPARK_FIXTURE_SSD_STREAMING_CACHE_EXPERTS=32 \
+  DS4_DSPARK_FIXTURE_CONFIDENCE=0 \
+  make dspark-acceptance
+
+  DS4_TEST_MODEL=/path/to/flash-0731.gguf \
+  DS4_DSPARK_SUPPORT=/path/to/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  DS4_TEST_SSD_STREAMING=1 \
+  DS4_TEST_SSD_STREAMING_CACHE_EXPERTS=32 \
+  make dspark-verify-depth
+  ```
+
+  On Strix Halo use the same variables with
+  `DS4_DSPARK_FIXTURE_BACKEND=rocm make rocm-dspark-acceptance` and
+  `make rocm-dspark-verify-depth`. Do not use the generic targets after a ROCm
+  build: on non-Apple hosts their default object set is CUDA. For the 0731
+  Flash layout, ROCm needs at least 30 expert slots; use 32 in release tests.
+- The fixture must report aggregate `proposed>0`, `accepted_draft>0`,
+  `verifier_unavailable=0`, and `errors=0`; stdout must remain byte-identical
+  to the target-only SSD baseline. The verifier smoke must report
+  `max_chunk>1`, `nspec>64`, and `worst_argmax_gap<=2`.
+- Preserve baseline and DSpark `generation` t/s from the same fixture run,
+  with the same host, model, cache, runtime settings, thermal state, and
+  background load. A DSpark path that is materially slower than the target-only
+  SSD path without a documented correctness tradeoff is a release blocker.
+- On ROCm, also run one `DS4_DSPARK_PROBE=1`
+  generation and require the non-causal attention and stage-chain probes to
+  pass. This covers the HIP draft-attention kernel before the end-to-end
+  verifier gate.
 - If shared support-model or verifier structures changed, also run legacy MTP:
   `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
@@ -289,7 +530,7 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   `replay_fallbacks`, `errors=0`, `verify_layer`, `net_saved`, and
   `output_match` for both 32-token and 64-token runs. At least one direct commit
   must occur. A faster run with lower proposal quality is a regression unless
-  it was an intentional scheduler change.
+  it was an intentional confidence-policy change.
 - If verifier MoE kernels changed, run one diagnostic `c_add` profile with
   `DS4_DSPARK_VERIFY_SELECTED_PROFILE=1` or the Metal MoE stage profiler and
   record the selected-expert footprint or stage timing in the DSpark log.
@@ -766,6 +1007,136 @@ Do not use high-performance Hugging Face Xet mode while vLLM is resident.
   receiving explicit permission to use `192.168.60.250` for this QA pass.
 - Run:
   `make cuda-regression`.
+- On GB10, run `make test-cuda-q8-quantize CUDA_ARCH=sm_121` and
+  `make bench-cuda-q8-prefill-quantize CUDA_ARCH=sm_121` before accepting the
+  default-on tiled prefill activation producer. Require bitwise parity of
+  bytes/scales for large batches, guard/tail safety and graph replay. Then
+  compare model prefill/decode with `DS4_CUDA_DISABLE_Q8_PREFILL_TILED=1`
+  against the unset default; keep the older global warp rollback unset in
+  both arms. Follow [the three-way measurement protocol](speed-bench/cuda_q8_prefill_tiled.md).
+  CPU-only tests and a kernel-only speedup do not establish a Q4/Q8 TPS gain.
+- For transient Q4 weight expansion, run
+  `make test-cuda-q4-prefill-dequant CUDA_ARCH=sm_121` and
+  `make bench-cuda-q4-prefill-dequant CUDA_ARCH=sm_121`. Compare full-model
+  default/`DS4_CUDA_DISABLE_Q4_PREFILL_DEQUANT_VEC=1` with all earlier
+  activation/epilogue flags held fixed; follow the
+  [shared dequantization acceptance protocol](speed-bench/q4_prefill_dequant_vec.md).
+- On a single GB10 (`sm_121`), validate the imported Q2 decode fast paths with
+  the AProjQ8/OutQ8 Flash GGUF.  Compare the default against a rollback process
+  that sets all of:
+  `DS4_CUDA_NO_DIRECT_Q2_PREFILL=1`,
+  `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_STORE=1`,
+  `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE=1`,
+  `DS4_CUDA_NO_F16_PAIR_COMPRESSOR_TRANSPOSE_PREFETCH8=1`,
+  `DS4_CUDA_NO_Q8_FUSED_ALIGNED=1`,
+  `DS4_CUDA_NO_Q8_ALIGNED_PERSISTENT=1`,
+  `DS4_CUDA_NO_Q8_ALIGNED_DENSE_SCRATCH=1`, and
+  `DS4_CUDA_NO_HC_SPLIT_NORM_SPLIT4096=1`.  Use separate processes, require
+  byte-identical greedy stdout and per-token logprobs, then run the same pair
+  under Compute Sanitizer.  Record prefill, decode, and steady decode rather
+  than copying the upstream PR numbers into a release claim.
+- Repeat the GB10 comparison with AProjQ4/OutQ8.  First run
+  `make test-mmq-parity-cuda CUDA_ARCH=sm_121`; its Q4 cases must report zero
+  bit mismatches for persistent scratch, grouped attention-A, and the
+  opt-in K1024 persistent kernel.  For the model A/B, use
+  `DS4_CUDA_NO_Q4_GB10_FAST=1` in the control and leave it unset in the
+  candidate. Run a separate generic-verifier candidate with
+  `DS4_CUDA_DISABLE_DSPARK_EXACTN=1`,
+  `DS4_CUDA_ENABLE_Q4_GROUPED_ATTN_A_BATCH=1`,
+  `DS4_CUDA_REQUIRE_Q4_GROUPED_ATTN_A_BATCH=1`, and
+  `DS4_CUDA_Q4_GROUPED_ATTN_A_ORACLE=1`; require `batch_candidates>0`,
+  `batch_calls>0`, `batch_mismatches=0`, and `batch_skips=0`, plus
+  byte-identical stdout. Build the resident prefill harness and run
+  `./speed-bench/cuda_q4_prefill_bench --path mmq --case outa --tokens
+  127,128,129,257,512,2048,4096 --samples 16 --warmup 4`; require bitwise
+  equality between `pack8_mmq_unpack` and `grouped_8_grids`, finite/canary/CPU
+  oracle success, and record the paired median. Run
+  `make test-mmq-q4-grouped-q81-cuda CUDA_ARCH=sm_121`, then isolate the new
+  Q8_1 front-end with
+  `--grouped-q81-kernel --tokens 512,1024,2048,4096,6144,8192`; require
+  byte-identical direct parity, bitwise final output, and a repeatable paired
+  median win between `grouped_generic_q81` and
+  `grouped_k4096_g8x2_q81`. Then compare full-model
+  prefills with the default environment against the dominant
+  `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_PREFILL=1` rollback, and separately against
+  the narrow `DS4_CUDA_NO_Q4_GROUPED_ATTN_A_Q81=1` rollback. Keep the
+  single-grid and 16-warp experiments unset in this promotion comparison.
+  Benchmark the K1024
+  persistent kernel as a
+  separate fail-closed arm with both
+  `DS4_CUDA_ENABLE_Q4_K1024_PERSISTENT=1` and
+  `DS4_CUDA_REQUIRE_Q4_K1024_PERSISTENT=1`; its rollback is
+  `DS4_CUDA_NO_Q4_K1024_PERSISTENT=1`. Then run a non-captured oracle process
+  with `DS4_CUDA_DECODE_GRAPHS=0`,
+  `DS4_CUDA_Q4_K1024_PERSISTENT_ORACLE=1`, and
+  `DS4_CUDA_Q4_K1024_PERSISTENT_STATS=1`; require `candidates>0`, `uses>0`,
+  `oracle_calls>0`, `oracle_mismatches=0`, and `oracle_skips=0`. The parity
+  test must also show a nonzero REQUIRE failure with the local kill set,
+  proving admission fails before enqueue, and a canonical reference forced by
+  that same kill. The counters are host dispatches and intentionally exclude
+  CUDA graph replays. The persistent OutQ8
+  vocabulary, compressor, HC split, direct routed-MoE paths, Q4 scratch,
+  grouped attention-A, and canonical B+HC epilogue remain relevant, while
+  the Q8-only attention-projection consumers are intentionally ineligible.
+- Validate the experimental HC-to-consumer Q8_1 producer fold in separate
+  processes. Use `DS4_CUDA_NO_Q8_FOLD=1` for the control and
+  `DS4_CUDA_ENABLE_Q8_FOLD=1` for the candidate, first with the normal graph
+  setting and then with `DS4_CUDA_DECODE_GRAPHS=0`. For the non-captured arm,
+  also set `DS4_CUDA_Q8_FOLD_ORACLE=1` and require `hits>0`, `byte_calls>0`,
+  `output_calls>0`, `byte_mismatches=0`, `output_mismatches=0`, and `skips=0`.
+  The reached consumer must be reported as aligned Q8 or IQ2 MoE rather than
+  inferred from producer counters alone. Require byte-identical greedy stdout
+  and per-token logprobs, then repeat the control/candidate pair under Compute
+  Sanitizer. Keep the oracle off for the graph-on timing arm: capture is an
+  intentional fail-closed miss and is checked for safety, not fold coverage.
+  Run these arms through the ordinary serialized inference dispatcher; the
+  opt-in fold does not support concurrent host-thread submission to one CUDA
+  stream.
+- If the umbrella AProjQ4 A/B changes logits, do not attribute that change to
+  "the Q4 fast path" as a unit. Run the fail-closed component matrix from a
+  clean `cuda-spark` build. The output directory is intentionally explicit so
+  the six independent-process arms, two oracle arms, raw logs, and diffs are
+  retained:
+
+  ```sh
+  make clean && make cuda-spark
+  make gguf-tools/quality-testing/score_official CUDA_ARCH=sm_121
+
+  DS4_CUDA_Q4_MATRIX_SSD_STREAMING=1 \
+  DS4_CUDA_Q4_MATRIX_SSD_CACHE=16GB \
+  DS4_CUDA_Q4_MATRIX_DECODE_GRAPHS=1 \
+  tests/cuda_q4_gb10_fast_matrix.sh \
+    /path/to/DeepSeek-V4-Flash-AProjQ4-OutQ8.gguf \
+    gguf-tools/quality-testing/data/flash/manifest.tsv \
+    /tmp/q4-gb10-graphs-on
+
+  DS4_CUDA_Q4_MATRIX_SSD_STREAMING=1 \
+  DS4_CUDA_Q4_MATRIX_SSD_CACHE=16GB \
+  DS4_CUDA_Q4_MATRIX_DECODE_GRAPHS=0 \
+  tests/cuda_q4_gb10_fast_matrix.sh \
+    /path/to/DeepSeek-V4-Flash-AProjQ4-OutQ8.gguf \
+    gguf-tools/quality-testing/data/flash/manifest.tsv \
+    /tmp/q4-gb10-graphs-off
+  ```
+
+  The matrix first proves that the three local rollback switches reproduce
+  `DS4_CUDA_NO_Q4_GB10_FAST=1`; failure of `local_control` means the matrix is
+  incomplete and no component claim is valid. It then enables exactly one of
+  persistent Q8_1 scratch, grouped attention-A, or the graph-compatible B+HC
+  call, with K1024 persistent kept disabled because it is a separate opt-in.
+  The grouped and HC oracle summaries must have `calls>0`, `skips=0`, and zero
+  relevant mismatches. `summary.txt` must say `promotion_gate=pass`. When it
+  is blocked, use the named `*_differences` arms and their `.diff` or
+  `.comparison.txt` files to identify a component; if no single arm differs
+  but `default_fast` does, report an interaction rather than blaming an
+  individual kernel. The tensor oracles and synthetic parity test are the
+  bit-exact component gates; the top-128 smoke dump and every scorer TSV row
+  are complementary end-to-end drift detectors, not a full-logit proof.
+- Exercise CUDA DSpark at verifier/proposer depth 5 with the fast paths enabled
+  and disabled.  Require identical final output, zero verifier errors, and
+  matching full/partial acceptance histograms.  Test both the generic batch
+  verifier (direct Q2 path) and CUDA exact-N (one-row decode paths); do not
+  infer speculative speedup from the target-only benchmark.
 - After aligned Q8 scratch changes, run `make test-cuda-q8-scratch
   CUDA_ARCH=sm_121`, also under Compute Sanitizer. Dense and paired outputs
   must be exact with reused scratch, an undersized buffer, and captured graph
@@ -877,6 +1248,33 @@ a substitute for CUDA or Metal release testing.
 - Do not use the mixed q2-q4 or Q4 Flash GGUFs for routine Strix Halo QA yet.
   They are dangerous on this machine for now because the ROCm path can hit
   system OOM instead of failing cleanly.
+- When ROCm Q4 code changes, run `make test-strix-rocm-q4-parity` and
+  `make test-strix-rocm-q4-prefill` before attempting a model. The prefill
+  oracle must compare the TILE8 default with
+  `DS4_ROCM_DISABLE_Q4_PREFILL_TILE8=1` at K=256, 1024, and 4096 and at token
+  counts covering a partial tile and the 128-token production chunk. Require
+  bitwise dense, pair, Q4-attention-B, and Q8-attention-B parity with intact
+  canaries. A REQUIRE-plus-DISABLE arm must fail before modifying output.
+- For the Q4 F32 `attn_q_b` epilogue candidate, run
+  `make test-rocm-q4-qb-epilogue ROCM_ARCH=gfx1151 DS4_TEST_REQUIRE_ROCM_DEVICE=1`.
+  Also run `make test-rocm-q4-prefill-dequant ROCM_ARCH=gfx1151` and
+  `make bench-rocm-q4-prefill-dequant ROCM_ARCH=gfx1151` for vectorized
+  transient weight expansion. Compare full-model default against
+  `DS4_ROCM_DISABLE_Q4_PREFILL_DEQUANT_VEC=1`, keeping the epilogue arm fixed.
+  Require bitwise finite-output parity and intact guards against the forced
+  legacy kernel, including signed zero, YaRN/inverse RoPE, token boundaries,
+  and quality/SSD/generic-API exclusions. NaN payloads are not compared, but
+  non-finite classification must agree. The host-only mapping/tree test is
+  not HIP/GPU validation. Run the native benchmark and the fixed-4096-chunk
+  model default/rollback A/B described in
+  `speed-bench/rocm_q4_qb_f32_epilogue.md` before claiming any throughput win.
+- Keep ROCm grouped attention-A decode opt-in until a model A/B wins. Its
+  fail-closed test uses `DS4_ROCM_ENABLE_Q4_GROUPED_ATTN_A=1`,
+  `DS4_ROCM_REQUIRE_Q4_GROUPED_ATTN_A=1`, and
+  `DS4_ROCM_Q4_GROUPED_ATTN_A_STATS=1`; require dispatches and groups above
+  zero, with zero fallbacks/failures and bitwise equality to the per-group
+  reference. This synthetic coverage does not supersede the Q4-model OOM
+  warning above.
 - Run a short CLI prompt:
   `./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --ctx 4096 --nothink -p "Reply with exactly: OK"`.
 - For DeepSeek Flash and GLM 5.3 Flash decode, confirm the default path uses

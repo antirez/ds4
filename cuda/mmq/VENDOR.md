@@ -94,6 +94,18 @@ Symbols the vendored files reference, and how they resolve in this directory:
 
 ## Re-syncing with upstream
 
+DS4 also specializes `mul_mat_vec_q` with a default-false sanitized-output
+template parameter. The CUDA-only `ds4_mmvq_q4_K_dense_sanitized` adapter reuses
+the canonical Q4_K N=1..8 dispatch and only maps nonfinite results to zero at
+the store. Preserve that specialization, the sanitized-output forwarding in
+all eight column-switch arms, and `ds4_q4_mmvq_epilogue.h` on re-sync;
+the generic/legacy instantiations and MoE entry points retain their old stores.
+The default-false `cyclic_groups` parameter is exclusive to DS4's grouped
+attention-A adapter: it selects weight channel `grid.y % n_groups` without
+an ids table and reuses the sanitized store. Keep its divisor initialization
+and the offset bounds in the shared admission helper when re-syncing; do not
+apply this cyclic mapping to general routed MoE ids.
+
 When upstream lands a bugfix or perf improvement we want, the procedure is:
 
 ```sh

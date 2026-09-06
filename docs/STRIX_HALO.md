@@ -13,13 +13,13 @@ For a container setup, see the maintained
 It can also be managed with
 [AI Toolbox Cockpit](https://github.com/kyuz0/ai-toolbox-cockpit).
 
-For a native Ubuntu build you need HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA,
+For a native Ubuntu build you need HIP, hipBLAS, rocBLAS, rocWMMA,
 and hipCUB development files. The Ubuntu 26.04 setup used these packages:
 
 ```sh
 sudo apt-get update
 sudo apt-get install -y hipcc rocminfo rocm-smi \
-  libamdhip64-dev libhipblas-dev libhipblaslt-dev librocblas-dev \
+  libamdhip64-dev libhipblas-dev librocblas-dev \
   librocwmma-dev libhipcub-dev
 sudo usermod -aG render,video "$USER"
 ```
@@ -83,3 +83,6 @@ ROCm. Add the matching encoder with `--vision FILE`, as described in
 
 For a model-free routed-kernel check, use `make test-mxfp4-rocm`.
 Full-model validation is described in [testing](TESTING.md).
+
+The branch's Q4 tiled-prefill changes and rollback controls are documented in
+[the kernel notes](BRANCH_SSD_KERNELS.md#rocm-q4-tiled-prefill).

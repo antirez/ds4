@@ -70,7 +70,7 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0>
+template<short NR0, bool SINGLE_BARRIER = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -86,14 +86,16 @@ static inline void helper_mv_reduce_and_write(
     for (short row = 0; row < NR0; ++row) {
         shmem_f32[row] = (threadgroup float *) shmem + NW*row;
 
-        if (sgitg == 0) {
+        // Padding lanes and simdgroup leaders have disjoint destinations.
+        // The legacy specialization remains available to other consumers.
+        if (sgitg == 0 && (!SINGLE_BARRIER || tiisg >= FC_mul_mv_nsg)) {
             shmem_f32[row][tiisg] = 0.0f;
         }
 
         sumf[row] = simd_sum(sumf[row]);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!SINGLE_BARRIER) threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short row = 0; row < NR0; ++row) {
         if (tiisg == 0) {
@@ -102,6 +104,9 @@ static inline void helper_mv_reduce_and_write(
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // No further block barriers: only this simdgroup stores the result.
+    if (SINGLE_BARRIER && sgitg != 0) return;
 
     for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
         float tot = simd_sum(shmem_f32[row][tiisg]);
@@ -112,7 +117,7 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
-template<short NR0, typename args_t>
+template<short NR0, typename args_t, bool SINGLE_BARRIER = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -179,7 +184,7 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, SINGLE_BARRIER>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -195,6 +200,22 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// Same two-row Q8_0 matvec, with a single cross-simdgroup rendezvous and no
+// redundant final reductions in simdgroups that do not write the output.
+[[host_name("kernel_mul_mv_q8_0_f32_single_barrier")]]
+kernel void kernel_mul_mv_q8_0_f32_single_barrier(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
@@ -345,10 +366,10 @@ kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
 
 // Decode Q-A/KV pair. Both projections consume the same activation row but
 // have independent weight ranges and output extents. Keep the standalone Q8_0
-// lane/block traversal and two-stage reduction verbatim for each bank; only
-// the activation load and threadgroup scheduling are shared.
-[[host_name("kernel_mul_mv_q8_0_f32_pair")]]
-kernel void kernel_mul_mv_q8_0_f32_pair(
+// lane/block traversal and reduction tree for each bank. The single-barrier
+// specialization only removes synchronization and non-writing final reductions.
+template<bool SINGLE_BARRIER>
+kernel void kernel_mul_mv_q8_0_f32_pair_impl(
         constant ds4_metal_args_mul_mv & args0,
         constant ds4_metal_args_mul_mv & args1,
         device const char * src0_a,
@@ -426,7 +447,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         sha[row] = shared + NW * row;
         shb[row] = shared + NW * (NR0 + row);
-        if (sgitg == 0) {
+        if (sgitg == 0 && (!SINGLE_BARRIER || tiisg >= NSG)) {
             sha[row][tiisg] = 0.0f;
             if (active_b) shb[row][tiisg] = 0.0f;
         }
@@ -434,7 +455,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
         if (active_b) sumb[row] = simd_sum(sumb[row]);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!SINGLE_BARRIER) threadgroup_barrier(mem_flags::mem_threadgroup);
 
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         if (tiisg == 0) {
@@ -444,6 +465,8 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (SINGLE_BARRIER && sgitg != 0) return;
 
     device float *out_a = (device float *)dst_a;
     device float *out_b = (device float *)dst_b;
@@ -463,6 +486,12 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
     }
 }
 
+typedef decltype(kernel_mul_mv_q8_0_f32_pair_impl<false>) mul_mv_q8_0_pair_t;
+template [[host_name("kernel_mul_mv_q8_0_f32_pair")]]
+kernel mul_mv_q8_0_pair_t kernel_mul_mv_q8_0_f32_pair_impl<false>;
+template [[host_name("kernel_mul_mv_q8_0_f32_pair_single_barrier")]]
+kernel mul_mv_q8_0_pair_t kernel_mul_mv_q8_0_f32_pair_impl<true>;
+
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
 //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)
@@ -473,7 +502,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+template<short NR0, bool STORE_GATE_UP, bool SINGLE_BARRIER = false>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -549,7 +578,9 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         sh_gate[row] = shmem_f32 + NW * row;
         sh_up[row]   = shmem_f32 + NW * (NR0 + row);
-        if (sgitg == 0) {
+        // Leaders own [0, NSG); zero only the disjoint padding lanes in the
+        // single-barrier variant. The final 32-lane reduction is unchanged.
+        if (sgitg == 0 && (!SINGLE_BARRIER || tiisg >= NSG)) {
             sh_gate[row][tiisg] = 0.0f;
             sh_up[row][tiisg] = 0.0f;
         }
@@ -557,7 +588,7 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         sumu[row] = simd_sum(sumu[row]);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!SINGLE_BARRIER) threadgroup_barrier(mem_flags::mem_threadgroup);
 
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         if (tiisg == 0) {
@@ -590,7 +621,7 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u;
         }
     }
@@ -614,6 +645,34 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
+
+// SSD decode specialization: same launch geometry and reduction tree, one
+// cross-simdgroup rendezvous instead of two. Host dispatch requires NSG <= 32.
+template<bool STORE_GATE_UP>
+kernel void kernel_dsv4_shared_swiglu_q8_0_single_barrier(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        constant float &clamp_value,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, STORE_GATE_UP, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_dsv4_shared_swiglu_q8_0_single_barrier<true>)
+    shared_swiglu_q8_0_single_barrier_t;
+template [[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_single_barrier")]]
+kernel shared_swiglu_q8_0_single_barrier_t kernel_dsv4_shared_swiglu_q8_0_single_barrier<true>;
+template [[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_single_barrier")]]
+kernel shared_swiglu_q8_0_single_barrier_t kernel_dsv4_shared_swiglu_q8_0_single_barrier<false>;
 
 // Same body as kernel_dsv4_shared_gate_up_swiglu_q8_0_impl with the row
 // bound taken from a thread value instead of args.ne01 (GPU-decided lane
@@ -1103,7 +1162,7 @@ kernel void kernel_dsv4_router_shared_gate_up_q8_0(
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u;
         }
     }
@@ -1996,6 +2055,44 @@ void dequantize_dense_q4_K(device const ds4_dense_block_q4_K *xb, short il, thre
 }
 
 /*
+ * One-shot resident Q4_K -> F16 materialization used by the attn_q_b
+ * prefill cache.  Keeping the production dequantizer here is intentional:
+ * kernel_mul_mm_q4_K_f32 computes the same float4x4 values and rounds them
+ * while storing into its half threadgroup tile.  Instantiating the helper
+ * with half4x4 performs that same single rounding here, so the cached matrix
+ * contains exactly the half values the native Q4 kernel would otherwise
+ * rebuild for every 64x32 output tile.
+ *
+ * Each thread expands one consecutive 16-value chunk.  Four explicit half4
+ * stores preserve the half4x4 layout without relying on device-address-space
+ * matrix stores, which are not accepted by every supported Metal compiler.
+ */
+kernel void kernel_dequantize_q4_K_f16(
+        device const ds4_dense_block_q4_K *src [[buffer(0)]],
+        device       half4                *dst [[buffer(1)]],
+        constant     uint                 &chunks_per_row [[buffer(2)]],
+        constant     uint                 &row_count [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= chunks_per_row || gid.y >= row_count) return;
+
+    const uint block = gid.x >> 4;
+    const short il = (short)(gid.x & 15u);
+    const uint blocks_per_row = chunks_per_row >> 4;
+    device const ds4_dense_block_q4_K *xb =
+        src + (uint64_t)gid.y * blocks_per_row + block;
+
+    half4x4 values;
+    dequantize_dense_q4_K(xb, il, values);
+
+    const uint64_t out4 =
+        ((uint64_t)gid.y * chunks_per_row + gid.x) * 4u;
+    dst[out4 + 0u] = values[0];
+    dst[out4 + 1u] = values[1];
+    dst[out4 + 2u] = values[2];
+    dst[out4 + 3u] = values[3];
+}
+
+/*
  * Bit-identical twin of dequantize_q8_0 for the MPP staging loop: same
  * half(float(qs[i]) * d) per element, but the 16 consecutive int8 lanes are
  * fetched as eight aligned 16-bit loads instead of sixteen byte loads.
@@ -2298,7 +2395,7 @@ void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[i01] = silu * u;
         }
     }
@@ -2494,7 +2591,10 @@ template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
 // contains 16*nl weights.
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+// The Q4/F16 pair uses M32/K64: four accumulators per SIMDgroup and half as
+// many staging barriers improve short-prefill occupancy. Both shapes keep
+// the same half inputs and ordered 8-wide K products; M32/K64 needs 8 KiB.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false, bool M32_K64 = false>
 kernel void kernel_mul_mm(
         constant ds4_metal_args_mul_mm & args,
         device const char * src0,
@@ -2505,26 +2605,31 @@ kernel void kernel_mul_mm(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
+    constexpr int NR0 = M32_K64 ? 32 : 64;
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
-
-    constexpr int NR0 = 64;
     constexpr int NR1 = 32;
 
-    constexpr int NK  = 32;
-    constexpr int NL0 = NK/16;
-    constexpr int NL1 = NK/8;
+    constexpr int NK  = M32_K64 ? 64 : 32;
+    constexpr int NL0 = M32_K64 ? 4 : 2;
+    constexpr int NL1 = 4;
 
     const int im = tgpig.z;
     const int r0 = tgpig.y*NR0;
     const int r1 = tgpig.x*NR1;
 
-    // if this block is of 64x32 shape or smaller
+    // Active output rows within the NR0-by-32 tile.
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+    // SIMDgroups 0/1 own token rows 0..15 and SIMDgroups 2/3 own rows
+    // 16..31.  Every thread still participates in cooperative A/B staging and
+    // every threadgroup barrier; on a short final Q4_K tile only the waves with
+    // valid token rows construct fragments, execute MMA, and store results.
+    const bool mma_active =
+        !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
 
     // a thread shouldn't load data outside of the matrix
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. NR0-1
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1; // 0 .. 31
 
     const short il0 = (tiitg % NL0);
@@ -2547,13 +2652,16 @@ kernel void kernel_mul_mm(
         + args.nb11*(r1 + lr1)
         + args.nb10*iy);
 
-    S0_8x8 ma[4];
+    constexpr short MA = NR0/16;
+    S0_8x8 ma[MA];
     S1_8x8 mb[2];
 
-    simdgroup_float8x8 mc[8];
+    simdgroup_float8x8 mc[2*MA];
 
-    for (short i = 0; i < 8; i++){
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    if (mma_active) {
+        for (short i = 0; i < 2*MA; i++){
+            mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -2569,7 +2677,7 @@ kernel void kernel_mul_mm(
                 const short lx = (tiitg/NL0)%8;
                 const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                const short ib = (NR0/8)*sx + sy;
 
                 *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;
             }
@@ -2586,7 +2694,7 @@ kernel void kernel_mul_mm(
                 const short lx = (tiitg/NL0)%8;
                 const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                const short ib = (NR0/8)*sx + sy;
 
                 // Pointer-form store avoids a slower address-lowering path in
                 // current Apple Metal compilers for this dequantized tile write.
@@ -2594,8 +2702,11 @@ kernel void kernel_mul_mm(
             }
         }
 
-        if (FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 8; ++i) {
+        FOR_UNROLL (short pass = 0; pass < (M32_K64 ? 2 : 1); pass++) {
+            threadgroup S1 *sb_pass = sb + 1024*pass;
+            device const T1 *y_pass = y + 32*pass;
+            if (FC_mul_mm_bc_inp) {
+              for (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
 
@@ -2604,71 +2715,79 @@ kernel void kernel_mul_mm(
 
                 const short ib = 4*sx + sy;
 
-                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb_pass + 64*ib + 8*ly + lx) = loop_k + 32*pass + iy + i < args.ne00 ? (S1) *((device T1 *) y_pass + i) : 0;
+              }
+            } else {
+                const short sx = (tiitg%NL1);
+                const short sy = (tiitg/NL1)/8;
+
+                const short ly = (tiitg/NL1)%8;
+
+                const short ib = 4*sx + sy;
+
+                *(threadgroup S1_2x4 *)(sb_pass + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y_pass));
             }
-        } else {
-            const short sx = (tiitg%NL1);
-            const short sy = (tiitg/NL1)/8;
-
-            const short ly = (tiitg/NL1)%8;
-
-            const short ib = 4*sx + sy;
-
-            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 
-        il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        constexpr short advance = M32_K64 ? 4 : 2;
+        il = (il + advance < nl) ? il + advance : il % NL0;
+        x  = (il < NL0) ? x + (advance + nl - 1)/nl : x;
 
         y += NK;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // load matrices from threadgroup memory and conduct outer products
-        threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const S0 * lsma = (sa + MA*64*(sgitg%2));
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
-        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
+        if (mma_active) {
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                FOR_UNROLL (short i = 0; i < MA; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2*MA; i++){
+                    simdgroup_multiply_accumulate(mc[i], mb[i/MA], ma[i%MA], mc[i]);
+                }
+
+                lsma += (NR0/8)*64;
+                lsmb += 4*64;
             }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-            }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 8; i++){
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
-            }
-
-            lsma += 8*64;
-            lsmb += 4*64;
         }
     }
 
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
-            (r0 + 32*(sgitg &  1)) + \
+            (r0 + (NR0/2)*(sgitg &  1)) + \
             (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
 
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        if (mma_active) {
+            for (short i = 0; i < 2*MA; i++) {
+                simdgroup_store(mc[i], C + 8*(i%MA) + 8*args.ne0*(i/MA), args.ne0, 0, false);
+            }
         }
     } else {
-        // block is smaller than 64x32, we should avoid writing data outside of the matrix
+        // Avoid writes outside a partial NR0-by-32 output tile.
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + (NR0/2)*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        if (mma_active) {
+            for (short i = 0; i < 2*MA; i++) {
+                simdgroup_store(mc[i], temp_str + 8*(i%MA) + 8*NR0*(i/MA), NR0, 0, false);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2907,9 +3026,22 @@ kernel void kernel_mul_mm_f16_f32_scaled(
 }
 
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, true>) mul_mm_q4_K_tail_cull_t;
 
 // Host-visible prefill matmul variants for F16 and Q8_0 weights.
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
+// Resident Q4 sidecars and stream-local transient expansions can pair their
+// F16 weights with an RHS rounded to F16 once by the producer.  This retains
+// the exact legacy simdgroup-MMA and FP32 accumulation schedule while avoiding
+// the repeated F32 load/conversion performed once per 64-row output tile.
+template [[host_name("kernel_mul_mm_f16_f16_rhs")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  half,  half2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32_tail_cull")]] kernel mul_mm_q4_K_tail_cull_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, true>;
+// Q4_K output projection with a pre-materialized F16 RHS.  The ordinary F32
+// variant performs this same F32-to-F16 conversion every time a 64-row weight
+// tile revisits the activation matrix; this variant lets the host perform it
+// once while preserving the MMA tile and accumulation order.
+template [[host_name("kernel_mul_mm_q4_K_f16_rhs")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f16_rhs_k64_m32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, half, half2x4, false, true>;

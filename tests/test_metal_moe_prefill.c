@@ -63,6 +63,10 @@ static int check_case(const void *model, uint64_t model_size,
     ok = ds4_gpu_tensor_write(xt, 0, x, (uint64_t)tokens * INPUT * sizeof(float)) &&
          ds4_gpu_tensor_write(it, 0, ids, pairs * sizeof(int32_t)) &&
          ds4_gpu_tensor_write(wt, 0, weights, pairs * sizeof(float));
+    /* This oracle compares every intermediate of the separate gate/up paths.
+     * The branch's pair-SwiGLU kernel writes only mid, leaving gate/up poisoned.
+     * Keep it out of both arms; its own oracle covers that fused contract. */
+    setenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU", "1", 1);
     for (int run = 0; run < 3 && ok; run++) {
         if (run == 0) setenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED", "1", 1);
         else unsetenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED");
@@ -111,6 +115,7 @@ static int check_case(const void *model, uint64_t model_size,
         }
     }
 cleanup:
+    unsetenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU");
     unsetenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED");
     unsetenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION");
     for (int i = 0; i < 5; i++) {
@@ -237,6 +242,8 @@ int main(void) {
         for (uint32_t j = 0; j < sizeof(w[b].qs); j++) w[b].qs[j] = random_u32();
     }
     int ok = ds4_gpu_init() && ds4_gpu_set_model_map(model, model_size);
+    if (ok && !ds4_gpu_device_is_m5_apple_silicon())
+        fprintf(stderr, "MoE packed MPP/static coverage: SKIP (requires M5); checking fallback paths\n");
     ds4_gpu_set_quality(false);
     ds4_gpu_set_ssd_streaming(false);
     const uint32_t sizes[] = {511, 512, 513, 1024, 2048, 4096, 512};

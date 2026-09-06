@@ -33,12 +33,14 @@ Do not mix the two checkpoints. DSpark is not supported for PRO.
 The same flags work in `ds4-agent` and non-batched `ds4-server` requests.
 
 The support file adds about 5.6 GiB of weights plus runtime state. On Metal,
-the main model can be resident or SSD-streamed. DSpark replaces the legacy
+CUDA, and ROCm, the main model can be resident or SSD-streamed; the support
+model stays separately mapped or device-cached. DSpark replaces the legacy
 one-stage MTP drafter for that run; the two are not stacked.
 
 Resident M5 paths batch supported verifier expert rows, including two-Mac TP.
-The scheduler can back off when drafting is unproductive. Defaults select the
-fast paths; diagnostic environment variables are not needed for normal use.
+Defaults select the established fast paths; additional branch experiments
+remain opt-in. See [branch runtime and tester notes](BRANCH_DSPARK.md) for
+backend eligibility, rollback controls, and acceptance fixtures.
 Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
 ## GLM: built-in MTP

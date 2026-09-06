@@ -30,7 +30,6 @@ enum {
 static int g_rocblas_f16_solution_set;
 static int g_rocblas_f16_solutions_disabled;
 static int g_rocblas_attention_b_solution_disabled;
-#include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
 static int g_glm_model;
@@ -535,14 +534,6 @@ static int cuda_tensor_has_i32(const ds4_gpu_tensor *t, uint64_t elems) {
     return cuda_tensor_has_elems(t, elems, sizeof(int32_t));
 }
 
-static int cuda_tensor_has_f16(const ds4_gpu_tensor *t, uint64_t elems) {
-    return cuda_tensor_has_elems(t, elems, sizeof(__half));
-}
-
-static int cuda_tensor_has_u16(const ds4_gpu_tensor *t, uint64_t elems) {
-    return cuda_tensor_has_elems(t, elems, sizeof(uint16_t));
-}
-
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -575,8 +566,6 @@ __global__ static void dequant_q8_0_to_f16_transpose_kernel(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks);
-
-static void cuda_shared_gate_up_async_cleanup(void);
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
@@ -3647,191 +3636,6 @@ static int cuda_stream_batch_selected_prepare(
     return ok;
 }
 
-static int cuda_stream_layer_expert_cache_prepare_batch(
-        const void *model_map,
-        uint32_t layer,
-        const ds4_gpu_tensor *selected,
-        uint32_t n_tokens,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes,
-        const ds4_gpu_tensor **selected_exec,
-        const char ***gate_ptrs,
-        const char ***up_ptrs,
-        const char ***down_ptrs,
-        uint32_t *unique_out) {
-    if (!selected ||
-        !selected_exec ||
-        !gate_ptrs ||
-        !up_ptrs ||
-        !down_ptrs ||
-        !unique_out ||
-        !cuda_tensor_has_elems2(selected, n_tokens, n_selected, sizeof(int32_t)) ||
-        n_tokens <= 1 ||
-        n_total_expert == 0 ||
-        n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
-        n_selected == 0 ||
-        n_selected > DS4_ROCM_N_EXPERT_USED ||
-        gate_expert_bytes == 0 ||
-        down_expert_bytes == 0) {
-        return 0;
-    }
-    const char *layer_gate = NULL;
-    const char *layer_up = NULL;
-    const char *layer_down = NULL;
-    if (!cuda_stream_layer_expert_cache_apply(model_map,
-                                              layer,
-                                              n_total_expert,
-                                              gate_offset,
-                                              up_offset,
-                                              down_offset,
-                                              gate_expert_bytes,
-                                              down_expert_bytes,
-                                              &layer_gate,
-                                              &layer_up,
-                                              &layer_down)) {
-        return 0;
-    }
-
-    uint64_t n_ids64 = 0;
-    if (!cuda_u64_mul_checked(n_tokens, n_selected, &n_ids64) ||
-        n_ids64 > SIZE_MAX / sizeof(int32_t)) {
-        return 0;
-    }
-    int32_t *ids = (int32_t *)malloc((size_t)n_ids64 * sizeof(ids[0]));
-    int32_t *compact_ids =
-        (int32_t *)malloc((size_t)n_ids64 * sizeof(compact_ids[0]));
-    if (!ids || !compact_ids) {
-        free(ids);
-        free(compact_ids);
-        return 0;
-    }
-
-    int ok = cuda_ok(cudaMemcpy(ids,
-                                selected->ptr,
-                                (size_t)n_ids64 * sizeof(ids[0]),
-                                cudaMemcpyDeviceToHost),
-                     "streaming full-layer selected ids copy");
-
-    int32_t map[DS4_ROCM_MAX_N_EXPERT];
-    int32_t unique_ids[DS4_ROCM_MAX_N_EXPERT];
-    for (uint32_t i = 0; i < DS4_ROCM_MAX_N_EXPERT; i++) map[i] = -1;
-    uint32_t unique_count = 0;
-    for (uint64_t i = 0; ok && i < n_ids64; i++) {
-        const int32_t expert = ids[i];
-        if (expert < 0 || (uint32_t)expert >= n_total_expert) {
-            fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "streaming full-layer selected expert id %d "
-                    "outside 0..%u (layer=%u)\n",
-                    expert,
-                    n_total_expert,
-                    layer);
-            ok = 0;
-            break;
-        }
-        int32_t slot = map[(uint32_t)expert];
-        if (slot < 0) {
-            if (unique_count >= DS4_ROCM_MAX_N_EXPERT) {
-                ok = 0;
-                break;
-            }
-            slot = (int32_t)unique_count;
-            map[(uint32_t)expert] = slot;
-            unique_ids[unique_count++] = expert;
-        }
-        compact_ids[i] = slot;
-    }
-    if (ok && unique_count == 0) ok = 0;
-    if (ok && !cuda_stream_batch_selected_ensure_buffers(n_ids64, unique_count)) {
-        ok = 0;
-    }
-    if (ok && !cuda_stream_selected_ensure_stream()) ok = 0;
-
-    const char *gate_host[DS4_ROCM_MAX_N_EXPERT] = {0};
-    const char *up_host[DS4_ROCM_MAX_N_EXPERT] = {0};
-    const char *down_host[DS4_ROCM_MAX_N_EXPERT] = {0};
-    for (uint32_t u = 0; ok && u < unique_count; u++) {
-        const uint64_t expert = (uint64_t)(uint32_t)unique_ids[u];
-        uint64_t gate_rel = 0;
-        uint64_t down_rel = 0;
-        if (!cuda_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
-            !cuda_u64_mul_checked(expert, down_expert_bytes, &down_rel)) {
-            ok = 0;
-            break;
-        }
-        gate_host[u] = layer_gate + gate_rel;
-        up_host[u] = layer_up + gate_rel;
-        down_host[u] = layer_down + down_rel;
-    }
-
-    if (ok) {
-        cudaError_t err = cudaMemcpyAsync(g_stream_batch_selected_cache.selected_ids,
-                                          compact_ids,
-                                          (size_t)n_ids64 * sizeof(compact_ids[0]),
-                                          cudaMemcpyHostToDevice,
-                                          g_stream_selected_upload_stream);
-        if (err == cudaSuccess) {
-            err = cudaMemcpyAsync(g_stream_batch_selected_cache.gate_ptrs,
-                                  gate_host,
-                                  unique_count * sizeof(gate_host[0]),
-                                  cudaMemcpyHostToDevice,
-                                  g_stream_selected_upload_stream);
-        }
-        if (err == cudaSuccess) {
-            err = cudaMemcpyAsync(g_stream_batch_selected_cache.up_ptrs,
-                                  up_host,
-                                  unique_count * sizeof(up_host[0]),
-                                  cudaMemcpyHostToDevice,
-                                  g_stream_selected_upload_stream);
-        }
-        if (err == cudaSuccess) {
-            err = cudaMemcpyAsync(g_stream_batch_selected_cache.down_ptrs,
-                                  down_host,
-                                  unique_count * sizeof(down_host[0]),
-                                  cudaMemcpyHostToDevice,
-                                  g_stream_selected_upload_stream);
-        }
-        if (err == cudaSuccess) err = cudaStreamSynchronize(g_stream_selected_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr,
-                    DS4_GPU_LOG_PREFIX "streaming full-layer selected table upload failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            ok = 0;
-        }
-    }
-
-    if (ok) {
-        g_stream_batch_selected_cache.loaded = 0;
-        g_stream_batch_selected_cache.model_map = model_map;
-        g_stream_batch_selected_cache.layer = layer;
-        g_stream_batch_selected_cache.n_total_expert = n_total_expert;
-        g_stream_batch_selected_cache.n_selected = n_selected;
-        g_stream_batch_selected_cache.n_tokens = n_tokens;
-        g_stream_batch_selected_cache.n_unique = unique_count;
-        g_stream_batch_selected_cache.gate_offset = gate_offset;
-        g_stream_batch_selected_cache.up_offset = up_offset;
-        g_stream_batch_selected_cache.down_offset = down_offset;
-        g_stream_batch_selected_cache.gate_expert_bytes = gate_expert_bytes;
-        g_stream_batch_selected_cache.down_expert_bytes = down_expert_bytes;
-        *selected_exec = &g_stream_batch_selected_cache.selected_tensor;
-        *gate_ptrs = g_stream_batch_selected_cache.gate_ptrs;
-        *up_ptrs = g_stream_batch_selected_cache.up_ptrs;
-        *down_ptrs = g_stream_batch_selected_cache.down_ptrs;
-        *unique_out = unique_count;
-    } else {
-        g_stream_batch_selected_cache.loaded = 0;
-    }
-
-    free(ids);
-    free(compact_ids);
-    return ok;
-}
-
 static int cuda_stream_layer_expert_cache_seed_selected(
         const void *model_map,
         uint64_t model_size,
@@ -5848,22 +5652,14 @@ extern "C" int ds4_gpu_init(void) {
         __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
         g_rocblas_ready = 1;
     }
-    if (!g_hipblaslt_ready) {
-        if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
-            g_hipblaslt_ready = 1;
-        }
-    }
 #endif
     return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
     cuda_stream_cache_stats_print("cleanup");
-    cuda_shared_gate_up_async_cleanup();
-#ifdef __HIP_PLATFORM_AMD__
-    hipblaslt_gemm_plan_clear();
-#endif
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -5877,11 +5673,6 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
         __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
-    }
-    if (g_hipblaslt_ready) {
-        (void)hipblasLtDestroy(g_hipblaslt);
-        g_hipblaslt_ready = 0;
-        g_hipblaslt = NULL;
     }
 #endif
     cuda_model_range_release_all();
@@ -5931,6 +5722,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_fd = -1;
+    g_model_fd_host_base = NULL;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
         g_model_direct_fd = -1;
@@ -5938,6 +5730,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_ssd_streaming_mode = 0;
+    g_stream_expert_cache_budget = 0;
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -6114,6 +5908,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     const int multi_model =
         g_model_host_base != NULL &&
         (g_model_host_base != model_map || g_model_registered_size != model_size);
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -6206,6 +6001,46 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
     fprintf(stderr, DS4_GPU_LOG_PREFIX "mapped %.2f GiB auxiliary model\n",
             (double)map_size / 1073741824.0);
     return 1;
+}
+
+extern "C" int ds4_gpu_prepare_support_model(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size,
+        uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!model_map || model_size == 0 || map_offset > model_size ||
+        map_size == 0 || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (g_model_fd < 0 || g_model_fd_host_base != model_map) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "support model fd does not match its mmap\n");
+        return 0;
+    }
+
+    /* ROCm's streaming range cache is intentionally replaced at every target
+     * layer. Store the small DSpark GGUF in the persistent, mmap-keyed image
+     * registry instead, while leaving the target map as the active mapping. */
+    const void *saved_host_base = g_model_host_base;
+    const char *saved_device_base = g_model_device_base;
+    const uint64_t saved_registered_size = g_model_registered_size;
+    const int saved_device_owned = g_model_device_owned;
+
+    if (!ds4_gpu_release_q4_attn_q_b_f16_sidecars()) return 0;
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_for_multi_model = 1;
+    const int ok = cuda_model_copy_chunked(model_map,
+                                           model_size,
+                                           map_offset,
+                                           map_size);
+
+    g_model_host_base = saved_host_base;
+    g_model_device_base = saved_device_base;
+    g_model_registered_size = saved_registered_size;
+    g_model_device_owned = saved_device_owned;
+    return ok;
 }
 
 extern "C" int ds4_gpu_set_model_map_spans(
@@ -6411,6 +6246,9 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
     const int new_quality_mode = quality ? 1 : 0;
+    if (new_quality_mode && !g_quality_mode) {
+        (void)ds4_gpu_release_q4_attn_q_b_f16_sidecars();
+    }
     if (g_quality_mode != new_quality_mode) {
         g_rocm_cfg.initialized = 0;
     }

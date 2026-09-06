@@ -388,18 +388,6 @@ bool ds4_tp_enabled(const ds4_tp_options *opt) {
     return opt && opt->role != DS4_TP_NONE;
 }
 
-void ds4_tp_usage(FILE *fp) {
-    fprintf(fp,
-        "Tensor parallelism (two identical machines):\n"
-        "  --tensor-parallel           Use --role/--listen/--coordinator for a 50/50 TP pair.\n"
-        "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
-        "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
-        "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
-        "  --tensor-parallel-token-prefill\n"
-        "                              GLM diagnostic: prefill one token at a time.\n"
-        "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
-}
-
 int ds4_tp_parse_cli_arg(
         const char *arg,
         int *index,
@@ -1889,7 +1877,6 @@ void ds4_tp_free(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
-uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
@@ -2669,29 +2656,6 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
     }
     *mode = msg.mode;
     *token_count = msg.count;
-    return 1;
-}
-
-int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
-    struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
-        tp_set_err(err, errlen, "tp: hash send failed");
-        return 0;
-    }
-    uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-        tp_set_err(err, errlen, "tp: hash recv failed");
-        return 0;
-    }
-    if (theirs.seq != seq || theirs.hash != hash) {
-        tp_set_err(err, errlen,
-                   "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
-                   (unsigned long long)seq,
-                   (unsigned long long)hash, (unsigned long long)theirs.hash);
-        return -1;
-    }
     return 1;
 }
 

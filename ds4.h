@@ -389,6 +389,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+/* Prepares one-shot resources for the next prompt without changing session
+ * state. Timed callers can invoke this before ds4_session_sync(). */
+int ds4_session_prepare_sync(ds4_session *s,
+                             const ds4_tokens *prompt,
+                             char *err,
+                             size_t errlen);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 float ds4_session_directional_steering_ffn(ds4_session *s);
@@ -477,7 +483,12 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                       float *target_probs);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
+int ds4_test_indexer_q_type_supported(uint32_t type);
 uint64_t ds4_test_mixed_native_count(void);
+#if defined(__APPLE__)
+int ds4_test_q4_stream_overlap_policy(
+        int count, bool resident, bool ssd_streaming, bool quality);
+#endif
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

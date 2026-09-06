@@ -273,3 +273,129 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+
+/* Decode only needs the best vocabulary id, not a sorted candidate list.
+ * Stage 1 scans disjoint chunks and publishes one lexicographic winner
+ * per threadgroup.  Stage 2 reduces those pairs after a dispatch boundary,
+ * which is the required device-wide ordering without atomics. */
+struct ds4_metal_args_dsv4_argmax_top1 {
+    int32_t n_vocab;
+    int32_t n_tg;
+};
+
+static inline void ds4_argmax_top1_merge(
+        float ov, int oi, thread float *bv, thread int *bi) {
+    if (ov > *bv ||
+        (ov == *bv && (*bi < 0 || (oi >= 0 && oi < *bi)))) {
+        *bv = ov;
+        *bi = oi;
+    }
+}
+
+kernel void kernel_dsv4_argmax_top1_stage1_f32(
+        constant ds4_metal_args_dsv4_argmax_top1 &args,
+        device const float   *src0,
+        device float         *scratch_v,
+        device int32_t       *scratch_i,
+        threadgroup char     *shmem_raw [[threadgroup(0)]],
+        uint                  tgpig [[threadgroup_position_in_grid]],
+        ushort                tiitg [[thread_index_in_threadgroup]],
+        ushort                tiisg [[thread_index_in_simdgroup]],
+        ushort                sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float *tg_v = (threadgroup float *)shmem_raw;
+    threadgroup int32_t *tg_i =
+        (threadgroup int32_t *)(tg_v + 8);
+
+    const uint n = (uint)args.n_vocab;
+    const uint ntg = (uint)args.n_tg;
+    const uint chunk = (n + ntg - 1u) / ntg;
+    const uint begin = tgpig * chunk;
+    const uint end = min(n, begin + chunk);
+
+    float bv = -INFINITY;
+    int bi = -1;
+    for (uint i = begin + (uint)tiitg; i < end; i += 256u) {
+        const float v = src0[i];
+        if (v > bv) {
+            bv = v;
+            bi = (int)i;
+        }
+    }
+    for (ushort off = 16u; off > 0u; off >>= 1u) {
+        ds4_argmax_top1_merge(simd_shuffle_xor(bv, off),
+                              simd_shuffle_xor(bi, off),
+                              &bv, &bi);
+    }
+    if (tiisg == 0u) {
+        tg_v[sgitg] = bv;
+        tg_i[sgitg] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0u) {
+        if (tiisg >= 8u) {
+            bv = -INFINITY;
+            bi = -1;
+        } else {
+            bv = tg_v[tiisg];
+            bi = tg_i[tiisg];
+        }
+        for (ushort off = 4u; off > 0u; off >>= 1u) {
+            ds4_argmax_top1_merge(simd_shuffle_xor(bv, off),
+                                  simd_shuffle_xor(bi, off),
+                                  &bv, &bi);
+        }
+        if (tiisg == 0u) {
+            scratch_v[tgpig] = bv;
+            scratch_i[tgpig] = bi;
+        }
+    }
+}
+
+kernel void kernel_dsv4_argmax_top1_stage2_f32(
+        constant ds4_metal_args_dsv4_argmax_top1 &args,
+        device const float   *scratch_v,
+        device const int32_t *scratch_i,
+        device int32_t       *dst,
+        threadgroup char     *shmem_raw [[threadgroup(0)]],
+        ushort                tiitg [[thread_index_in_threadgroup]],
+        ushort                tiisg [[thread_index_in_simdgroup]],
+        ushort                sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float *tg_v = (threadgroup float *)shmem_raw;
+    threadgroup int32_t *tg_i =
+        (threadgroup int32_t *)(tg_v + 8);
+
+    const uint ntg = (uint)args.n_tg;
+    float bv = -INFINITY;
+    int bi = -1;
+    if ((uint)tiitg < ntg) {
+        bv = scratch_v[tiitg];
+        bi = scratch_i[tiitg];
+    }
+    for (ushort off = 16u; off > 0u; off >>= 1u) {
+        ds4_argmax_top1_merge(simd_shuffle_xor(bv, off),
+                              simd_shuffle_xor(bi, off),
+                              &bv, &bi);
+    }
+    if (tiisg == 0u) {
+        tg_v[sgitg] = bv;
+        tg_i[sgitg] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0u) {
+        if (tiisg >= 8u) {
+            bv = -INFINITY;
+            bi = -1;
+        } else {
+            bv = tg_v[tiisg];
+            bi = tg_i[tiisg];
+        }
+        for (ushort off = 4u; off > 0u; off >>= 1u) {
+            ds4_argmax_top1_merge(simd_shuffle_xor(bv, off),
+                                  simd_shuffle_xor(bi, off),
+                                  &bv, &bi);
+        }
+        /* sample_argmax starts at index zero with -INF.  Preserve that edge
+         * contract when every logit is NaN or -INF. */
+        if (tiisg == 0u) dst[0] = bi >= 0 ? bi : 0;
+    }
+}

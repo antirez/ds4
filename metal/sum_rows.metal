@@ -2,7 +2,6 @@
 
 #define FC_SUM_ROWS 1400
 
-#define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
 
 struct ds4_metal_args_sum_rows {

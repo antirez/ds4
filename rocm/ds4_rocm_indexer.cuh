@@ -336,7 +336,8 @@ __global__ static void indexer_top1_rows_kernel(
     indices[tid] = best_index;
     __syncthreads();
 
-    for (uint32_t stride = THREADS / 2u; stride > 0u; stride >>= 1u) {
+#pragma unroll
+    for (uint32_t stride = THREADS / 2; stride > 0u; stride >>= 1u) {
         if (tid < stride &&
             topk_score_better(values[tid + stride], indices[tid + stride],
                               values[tid], indices[tid])) {

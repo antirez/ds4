@@ -11,6 +11,350 @@ static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
 }
 
 enum {
+    DS4_ROCM_MOE_ENV_INVALID = -2
+};
+
+static const char *const DS4_ROCM_IQ2_Q2_TAIL_CULL_ENABLE_ENV =
+    "DS4_ROCM_ENABLE_IQ2_MOE_WMMA_TAIL_CULL";
+static const char *const DS4_ROCM_IQ2_Q2_TAIL_CULL_DISABLE_ENV =
+    "DS4_ROCM_DISABLE_IQ2_MOE_WMMA_TAIL_CULL";
+static const char *const DS4_ROCM_IQ2_Q2_WMMA_PROFILE_ENV =
+    "DS4_ROCM_IQ2_MOE_WMMA_PROFILE";
+
+static pthread_mutex_t g_routed_moe_hotlist_policy_mu =
+    PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_routed_moe_hotlist_notice_mask;
+
+static int routed_moe_hotlist_notice_once(uint32_t bit) {
+    pthread_mutex_lock(&g_routed_moe_hotlist_policy_mu);
+    const int report = (g_routed_moe_hotlist_notice_mask & bit) == 0u;
+    g_routed_moe_hotlist_notice_mask |= bit;
+    pthread_mutex_unlock(&g_routed_moe_hotlist_policy_mu);
+    return report;
+}
+
+static int routed_moe_env_value_eq(const char *value,
+                                   size_t value_len,
+                                   const char *literal) {
+    const size_t literal_len = strlen(literal);
+    if (value_len != literal_len) return 0;
+    for (size_t i = 0; i < value_len; i++) {
+        if (tolower((unsigned char)value[i]) !=
+            tolower((unsigned char)literal[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Return -1 for unset, 0/1 for a recognized boolean, and -2 for invalid.
+ * Do not cache values: benchmark A/B arms may change the environment between
+ * launches in the same process. */
+static int routed_moe_env_bool_value(const char *name, uint32_t notice_bit) {
+    const char *value = name ? getenv(name) : NULL;
+    if (!value) return -1;
+    while (isspace((unsigned char)*value)) value++;
+    size_t value_len = strlen(value);
+    while (value_len != 0u &&
+           isspace((unsigned char)value[value_len - 1u])) {
+        value_len--;
+    }
+    if (value_len == 0u) return 1;
+    if (routed_moe_env_value_eq(value, value_len, "1") ||
+        routed_moe_env_value_eq(value, value_len, "true") ||
+        routed_moe_env_value_eq(value, value_len, "yes") ||
+        routed_moe_env_value_eq(value, value_len, "on")) {
+        return 1;
+    }
+    if (routed_moe_env_value_eq(value, value_len, "0") ||
+        routed_moe_env_value_eq(value, value_len, "false") ||
+        routed_moe_env_value_eq(value, value_len, "no") ||
+        routed_moe_env_value_eq(value, value_len, "off")) {
+        return 0;
+    }
+    if (routed_moe_hotlist_notice_once(notice_bit)) {
+        const size_t shown_len = value_len < 96u ? value_len : 96u;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "invalid boolean environment value "
+                "%s=%.*s%s; treating the opt-in as disabled\n",
+                name,
+                (int)shown_len,
+                value,
+                shown_len == value_len ? "" : "...");
+    }
+    return DS4_ROCM_MOE_ENV_INVALID;
+}
+
+/* HIP exposes the hardware wave width through cudaDeviceProp::warpSize.  The
+ * active device is thread-local in the runtime, so keep the successful property
+ * query thread-local too.  This avoids a process-wide mutex on every prefill
+ * layer while still noticing cudaSetDevice changes.  Failures stay fail-closed
+ * and may be retried on a later launch. */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+static int routed_moe_runtime_warp_size_value(void) {
+    int device = -1;
+    const cudaError_t device_err = cudaGetDevice(&device);
+    if (device_err != cudaSuccess || device < 0) {
+        if (routed_moe_hotlist_notice_once(1u << 4)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "cannot query the active device for "
+                    "routed-MoE rocWMMA; using scalar fallback: %s\n",
+                    cudaGetErrorString(device_err));
+        }
+        (void)cudaGetLastError();
+        return 0;
+    }
+    static thread_local int cached_device = -1;
+    static thread_local int cached_warp_size = 0;
+    if (cached_device == device && cached_warp_size != 0) {
+        return cached_warp_size;
+    }
+
+    cudaDeviceProp prop = {};
+    const cudaError_t prop_err = cudaGetDeviceProperties(&prop, device);
+    if (prop_err != cudaSuccess || prop.warpSize <= 0) {
+        if (routed_moe_hotlist_notice_once(1u << 5)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "cannot query runtime warpSize for "
+                    "routed-MoE rocWMMA; using scalar fallback: %s\n",
+                    cudaGetErrorString(prop_err));
+        }
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cached_device = device;
+    cached_warp_size = prop.warpSize;
+    return cached_warp_size;
+}
+#endif
+
+static int routed_moe_iq2_q2_tail_wave_cull_resolve(
+        int runtime_warp_size,
+        int *enable_value,
+        int *disable_value) {
+    const int enable = routed_moe_env_bool_value(
+        DS4_ROCM_IQ2_Q2_TAIL_CULL_ENABLE_ENV, 1u << 0);
+    const int disable = routed_moe_env_bool_value(
+        DS4_ROCM_IQ2_Q2_TAIL_CULL_DISABLE_ENV, 1u << 1);
+    if (enable_value) *enable_value = enable;
+    if (disable_value) *disable_value = disable;
+    if (enable == DS4_ROCM_MOE_ENV_INVALID ||
+        disable == DS4_ROCM_MOE_ENV_INVALID) {
+        return 0;
+    }
+    if (disable == 1) {
+        if (enable == 1 && routed_moe_hotlist_notice_once(1u << 2)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "IQ2/Q2 hot-list tail-wave cull "
+                    "disabled by %s (overrides %s)\n",
+                    DS4_ROCM_IQ2_Q2_TAIL_CULL_DISABLE_ENV,
+                    DS4_ROCM_IQ2_Q2_TAIL_CULL_ENABLE_ENV);
+        }
+        return 0;
+    }
+    if (enable != 1) return 0; /* Explicit opt-in: default is off. */
+    if (runtime_warp_size != 32) {
+        if (routed_moe_hotlist_notice_once(1u << 3)) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "IQ2/Q2 hot-list tail-wave cull "
+                    "requested with runtime warpSize=%d; using scalar "
+                    "fallback\n",
+                    runtime_warp_size);
+        }
+        return 0;
+    }
+    if (routed_moe_hotlist_notice_once(1u << 6)) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "IQ2/Q2 hot-list tail-wave cull policy enabled "
+                "(opt-in, runtime warpSize=32)\n");
+    }
+    return 1;
+}
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+typedef struct {
+    cudaEvent_t start;
+    cudaEvent_t end;
+} routed_moe_wmma_profile_timer;
+
+static int routed_moe_wmma_profile_timer_destroy(
+        routed_moe_wmma_profile_timer *timer,
+        const char *what) {
+    if (!timer) return 0;
+    int ok = 1;
+    if (timer->start) {
+        const cudaError_t err = cudaEventDestroy(timer->start);
+        timer->start = NULL;
+        if (!cuda_ok(err, what)) ok = 0;
+    }
+    if (timer->end) {
+        const cudaError_t err = cudaEventDestroy(timer->end);
+        timer->end = NULL;
+        if (!cuda_ok(err, what)) ok = 0;
+    }
+    return ok;
+}
+
+static int routed_moe_wmma_profile_timer_begin(
+        routed_moe_wmma_profile_timer *timer,
+        const char *what) {
+    if (!timer) return 0;
+    timer->start = NULL;
+    timer->end = NULL;
+    cudaError_t err = cudaEventCreate(&timer->start);
+    if (err != cudaSuccess) return cuda_ok(err, what);
+    err = cudaEventCreate(&timer->end);
+    if (err != cudaSuccess) {
+        (void)cuda_ok(err, what);
+        (void)routed_moe_wmma_profile_timer_destroy(timer, what);
+        return 0;
+    }
+    err = cudaEventRecord(timer->start, 0);
+    if (err != cudaSuccess) {
+        (void)cuda_ok(err, what);
+        (void)routed_moe_wmma_profile_timer_destroy(timer, what);
+        return 0;
+    }
+    return 1;
+}
+
+static int routed_moe_wmma_profile_timer_finish(
+        routed_moe_wmma_profile_timer *timer,
+        float *elapsed_ms,
+        const char *what) {
+    if (!timer || !timer->start || !timer->end || !elapsed_ms) {
+        if (timer) {
+            (void)routed_moe_wmma_profile_timer_destroy(timer, what);
+        }
+        return 0;
+    }
+    int ok = cuda_ok(cudaEventRecord(timer->end, 0), what);
+    if (ok) ok = cuda_ok(cudaEventSynchronize(timer->end), what);
+    if (ok) {
+        float ms = 0.0f;
+        ok = cuda_ok(cudaEventElapsedTime(&ms, timer->start, timer->end),
+                     what);
+        if (ok) *elapsed_ms = ms;
+    }
+    if (!routed_moe_wmma_profile_timer_destroy(timer, what)) ok = 0;
+    return ok;
+}
+#endif
+
+static int routed_moe_wmma_profile_emit(
+        int enabled,
+        int tail_wave_cull,
+        uint32_t n_tokens,
+        uint64_t assignments,
+        int gate_up_seen,
+        float gate_up_ms,
+        int down_seen,
+        float down_ms,
+        int call_ok) {
+    if (!enabled) return call_ok;
+    const int complete = call_ok && gate_up_seen && down_seen;
+    const float shown_gate_up_ms = gate_up_seen ? gate_up_ms : -1.0f;
+    const float shown_down_ms = down_seen ? down_ms : -1.0f;
+    const float total_ms = gate_up_seen && down_seen
+        ? gate_up_ms + down_ms
+        : -1.0f;
+    const int printed = fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "DS4_ROCM_IQ2_MOE_WMMA_PROFILE "
+            "tail_cull=%d tokens=%u assignments=%llu "
+            "gate_up_gpu_ms=%.6f down_gpu_ms=%.6f "
+            "wmma_total_gpu_ms=%.6f timing=cudaEvent result=%s\n",
+            tail_wave_cull,
+            n_tokens,
+            (unsigned long long)assignments,
+            shown_gate_up_ms,
+            shown_down_ms,
+            total_ms,
+            complete ? "PASS" : "FAIL");
+    if (printed < 0 || fflush(stderr) != 0) return 0;
+    return complete;
+}
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+template <int MTILES, bool OUT_F16, bool X_F16>
+static void routed_moe_launch_iq2_hotlist_wmma_n2(
+        dim3 grid,
+        dim3 block,
+        size_t shmem,
+        int tail_wave_cull,
+        float *mid_out,
+        half *mid_out_h,
+        const char *gate_base,
+        const char *up_base,
+        const float *x,
+        const half *x_h,
+        const float *weights,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *hot_experts,
+        uint32_t hot_count,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        float clamp) {
+    if (tail_wave_cull) {
+        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<
+            MTILES, 16, 16, 16, OUT_F16, X_F16, true>
+            <<<grid, block, shmem>>>(
+                mid_out, mid_out_h, gate_base, up_base, x, x_h, weights,
+                counts, offsets, pairs, hot_experts, hot_count, expert_in_dim,
+                expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+    } else {
+        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<
+            MTILES, 16, 16, 16, OUT_F16, X_F16, false>
+            <<<grid, block, shmem>>>(
+                mid_out, mid_out_h, gate_base, up_base, x, x_h, weights,
+                counts, offsets, pairs, hot_experts, hot_count, expert_in_dim,
+                expert_mid_dim, gate_expert_bytes, gate_row_bytes, clamp);
+    }
+}
+
+template <int MTILES, bool MID_F16, bool OUT_F16>
+static void routed_moe_launch_q2_down_hotlist_wmma_n2(
+        dim3 grid,
+        dim3 block,
+        size_t shmem,
+        int tail_wave_cull,
+        float *down_out,
+        half *down_out_h,
+        const char *down_base,
+        const float *mid,
+        const half *mid_h,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *hot_experts,
+        uint32_t hot_count,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t n_expert) {
+    if (tail_wave_cull) {
+        moe_down_q2K_hotlist_wmma_n2_kernel<
+            MTILES, 16, 16, 16, MID_F16, OUT_F16, false, true>
+            <<<grid, block, shmem>>>(
+                down_out, down_out_h, down_base, mid, mid_h, counts, offsets,
+                pairs, hot_experts, hot_count, expert_mid_dim, out_dim,
+                down_expert_bytes, down_row_bytes, n_expert);
+    } else {
+        moe_down_q2K_hotlist_wmma_n2_kernel<
+            MTILES, 16, 16, 16, MID_F16, OUT_F16, false, false>
+            <<<grid, block, shmem>>>(
+                down_out, down_out_h, down_base, mid, mid_h, counts, offsets,
+                pairs, hot_experts, hot_count, expert_mid_dim, out_dim,
+                down_expert_bytes, down_row_bytes, n_expert);
+    }
+}
+#endif
+
+enum {
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_START = 0,
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_END,
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_MISSING_START,
@@ -204,6 +548,11 @@ static int routed_moe_q2_float_down_launch(
         const uint32_t *offsets,
         const uint32_t *sorted_pairs,
         uint32_t *hot_experts_dev,
+        int hotlist_wmma_wave32,
+        int tail_wave_cull,
+        int wmma_profile,
+        int *wmma_profile_seen,
+        float *wmma_profile_ms,
         uint32_t n_tokens,
         uint32_t n_total_expert,
         uint32_t n_expert,
@@ -215,6 +564,7 @@ static int routed_moe_q2_float_down_launch(
         n_tokens == 0u || n_total_expert == 0u || n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
         n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
         (expert_mid_dim % CUDA_QK_K) != 0u || expert_mid_dim == 0u || out_dim == 0u ||
+        (wmma_profile && (!wmma_profile_seen || !wmma_profile_ms)) ||
         !cuda_tensor_has_elems3(mid, n_tokens, n_expert, expert_mid_dim, sizeof(float)) ||
         !cuda_tensor_has_elems3(down, n_tokens, n_expert, out_dim, sizeof(float)) ||
         !cuda_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
@@ -240,6 +590,7 @@ static int routed_moe_q2_float_down_launch(
     const uint32_t hot_threshold = 8u;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     const int use_wmma_hot = n_tokens >= hot_threshold && hot_experts_dev &&
+        hotlist_wmma_wave32 &&
         !g_quality_mode &&
         (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u;
 #else
@@ -331,6 +682,13 @@ static int routed_moe_q2_float_down_launch(
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     if (use_wmma_hot && hot_count != 0u) {
+        routed_moe_wmma_profile_timer profile_timer = {};
+        if (wmma_profile &&
+            !routed_moe_wmma_profile_timer_begin(
+                &profile_timer,
+                "routed_moe q2 wmma down profile begin")) {
+            return 0;
+        }
         constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
         const int no_n2 = 0;
         const uint32_t wmma_mtiles = 4u;
@@ -343,22 +701,26 @@ static int routed_moe_q2_float_down_launch(
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
                                         (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<4,true,true>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             NULL, down_h, down_w, NULL, mid_h_hot,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else if (use_f16_down) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<4,false,true>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             NULL, down_h, down_w, (const float *)mid->ptr, NULL,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else if (hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,false><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<4,true,false>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             (float *)down->ptr, NULL, down_w, NULL, mid_h_hot,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<4,false,false>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
@@ -371,22 +733,26 @@ static int routed_moe_q2_float_down_launch(
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
                                         (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<16,true,true>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             NULL, down_h, down_w, NULL, mid_h_hot,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else if (use_f16_down) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<16,false,true>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             NULL, down_h, down_w, (const float *)mid->ptr, NULL,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else if (hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true,false><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<16,true,false>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             (float *)down->ptr, NULL, down_w, NULL, mid_h_hot,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<16,false,false>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
@@ -399,22 +765,26 @@ static int routed_moe_q2_float_down_launch(
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
                                         (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<8,true,true>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             NULL, down_h, down_w, NULL, mid_h_hot,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else if (use_f16_down) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<8,false,true>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             NULL, down_h, down_w, (const float *)mid->ptr, NULL,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else if (hot_mid_f16 && mid_h_hot) {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,false><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<8,true,false>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             (float *)down->ptr, NULL, down_w, NULL, mid_h_hot,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
                 } else {
-                    moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
+                    routed_moe_launch_q2_down_hotlist_wmma_n2<8,false,false>(
+                            grid, block, shmem_n2, tail_wave_cull,
                             (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
                             counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                             expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes, n_expert);
@@ -451,7 +821,26 @@ static int routed_moe_q2_float_down_launch(
                     counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
                     expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
         }
-        if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down wmma launch")) return 0;
+        const cudaError_t launch_err = cudaGetLastError();
+        if (!cuda_ok(
+                launch_err,
+                "routed_moe iq2/q2 float-down wmma launch")) {
+            if (wmma_profile) {
+                (void)routed_moe_wmma_profile_timer_destroy(
+                    &profile_timer,
+                    "routed_moe q2 wmma down profile cleanup");
+            }
+            return 0;
+        }
+        if (wmma_profile) {
+            if (!routed_moe_wmma_profile_timer_finish(
+                    &profile_timer,
+                    wmma_profile_ms,
+                    "routed_moe q2 wmma down profile finish")) {
+                return 0;
+            }
+            *wmma_profile_seen = 1;
+        }
     }
 #endif
 
@@ -597,12 +986,42 @@ static int routed_moe_launch(
     const int mxfp4_path = plan.mxfp4_path;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
+    int runtime_warp_size = 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    if ((iq2_gate_path && n_tokens > 1u) ||
+        (q2k_path && n_tokens >= 32u)) {
+        runtime_warp_size = routed_moe_runtime_warp_size_value();
+    }
+#endif
+    const int hotlist_wmma_wave32 = runtime_warp_size == 32;
+    int iq2_q2_tail_cull_enable_value = -1;
+    int iq2_q2_tail_cull_disable_value = -1;
+    const int iq2_q2_tail_wave_cull = iq2_path && n_tokens > 1u
+        ? routed_moe_iq2_q2_tail_wave_cull_resolve(
+              runtime_warp_size,
+              &iq2_q2_tail_cull_enable_value,
+              &iq2_q2_tail_cull_disable_value)
+        : 0;
+    const int iq2_q2_wmma_profile_value = iq2_path && n_tokens > 1u
+        ? routed_moe_env_bool_value(
+              DS4_ROCM_IQ2_Q2_WMMA_PROFILE_ENV, 1u << 7)
+        : -1;
+    const int iq2_q2_wmma_profile = iq2_q2_wmma_profile_value == 1;
+    int iq2_q2_profile_gate_up_seen = 0;
+    int iq2_q2_profile_down_seen = 0;
+    float iq2_q2_profile_gate_up_ms = 0.0f;
+    float iq2_q2_profile_down_ms = 0.0f;
     uint64_t pair_count64 = 0;
     if (!cuda_u64_mul_checked(n_tokens, n_expert, &pair_count64) ||
         pair_count64 > UINT32_MAX) {
         return 0;
     }
     const uint32_t pair_count = (uint32_t)pair_count64;
+    if (iq2_q2_wmma_profile && !hotlist_wmma_wave32) {
+        return routed_moe_wmma_profile_emit(
+            1, iq2_q2_tail_wave_cull, n_tokens, pair_count64,
+            0, 0.0f, 0, 0.0f, 0);
+    }
     const ds4_gpu_tensor *selected_exec = selected;
     const char *gate_w = NULL;
     const char *up_w = NULL;
@@ -759,6 +1178,12 @@ static int routed_moe_launch(
         !cuda_u64_mul_checked(xq_count, sizeof(cuda_block_q8_K), &xq_bytes) ||
         !cuda_u64_mul_checked(midq_count, sizeof(cuda_block_q8_K), &midq_bytes)) {
         return 0;
+    }
+    if (iq2_q2_wmma_profile &&
+        (q2k_path || down->bytes < xq_bytes || gate->bytes < midq_bytes)) {
+        return routed_moe_wmma_profile_emit(
+            1, iq2_q2_tail_wave_cull, n_tokens, pair_count64,
+            0, 0.0f, 0, 0.0f, 0);
     }
     if (!q2k_path && down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
@@ -997,7 +1422,16 @@ static int routed_moe_launch(
                 }
             }
             if (ok) ok = cuda_stream_batch_selected_mark_inflight();
-            return ok;
+            return routed_moe_wmma_profile_emit(
+                iq2_q2_wmma_profile,
+                iq2_q2_tail_wave_cull,
+                n_tokens,
+                pair_count64,
+                iq2_q2_profile_gate_up_seen,
+                iq2_q2_profile_gate_up_ms,
+                iq2_q2_profile_down_seen,
+                iq2_q2_profile_down_ms,
+                ok);
         }
         if (ok && use_sorted_pairs) {
             const uint32_t bucket_count = n_total_expert;
@@ -1164,7 +1598,18 @@ static int routed_moe_launch(
             n_tokens >= iq2_gate_hot_threshold && n_expert == 6u && !write_gate_up &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts && iq2_gate_hot_dev && use_expert_tiles &&
             (expert_in_dim % 16u) == 0u && (expert_mid_dim % 16u) == 0u &&
-            !g_quality_mode;
+            hotlist_wmma_wave32 && !g_quality_mode;
+        if (iq2_gate_path && n_tokens > 1u &&
+            getenv("DS4_ROCM_MOE_PATH_DEBUG") != NULL) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "IQ2 hot-list selector runtime_warp=%d "
+                    "wmma_eligible=%u tail_policy=%d enable=%d disable=%d\n",
+                    runtime_warp_size,
+                    use_iq2_gate_wmma,
+                    iq2_q2_tail_wave_cull,
+                    iq2_q2_tail_cull_enable_value,
+                    iq2_q2_tail_cull_disable_value);
+        }
         if (use_iq2_gate_wmma) {
             uint32_t h_counts[DS4_ROCM_MAX_N_EXPERT] = {0};
             if (!cuda_ok(cudaMemcpy(h_counts, sorted_counts, n_total_expert * sizeof(uint32_t), cudaMemcpyDeviceToHost),
@@ -1187,8 +1632,10 @@ static int routed_moe_launch(
             }
         }
         const uint32_t iq2_gate_scalar_max = iq2_gate_hot_count != 0u ? iq2_gate_hot_threshold : 0u;
+        /* Only the Q2 down path consumes half intermediates. IQ2 down
+         * quantizes mid->ptr as F32, so its hot experts must write there. */
         const int use_iq2_hot_f16_mid =
-            ((use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
+            iq2_path && ((use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
               iq2_gate_hot_threshold == iq2_down_hot_threshold) ||
              use_rocm_mmq_gateup) &&
             (out_dim & 1u) == 0u && !g_quality_mode;
@@ -1661,6 +2108,15 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (ok && use_iq2_gate_wmma && iq2_gate_hot_count != 0u) {
+                routed_moe_wmma_profile_timer profile_timer = {};
+                if (iq2_q2_wmma_profile &&
+                    !routed_moe_wmma_profile_timer_begin(
+                        &profile_timer,
+                        "routed_moe iq2 wmma gate/up profile begin")) {
+                    return routed_moe_wmma_profile_emit(
+                        1, iq2_q2_tail_wave_cull, n_tokens, pair_count64,
+                        0, 0.0f, 0, 0.0f, 0);
+                }
                 constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
                 const uint32_t wmma_mtiles = 4u;
                 if (wmma_mtiles == 4u) {
@@ -1672,25 +2128,29 @@ static int routed_moe_launch(
                     const size_t shmem_n2 = (mt * bm * bk + 4u * bk * bn) * sizeof(half) +
                                             (4u * mt * bm * bn) * sizeof(float);
                     if (use_iq2_hot_f16_mid && use_iq2_x_f16) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<4,true,true>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_hot_f16_mid) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,true><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<4,true,false>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_x_f16) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<4,false,true>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<4,16,16,16><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<4,false,false>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
@@ -1705,32 +2165,50 @@ static int routed_moe_launch(
                     const size_t shmem_n2 = (mt * bm * bk + 4u * bk * bn) * sizeof(half) +
                                             (4u * mt * bm * bn) * sizeof(float);
                     if (use_iq2_hot_f16_mid && use_iq2_x_f16) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<8,true,true>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_hot_f16_mid) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,true><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<8,true,false>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 NULL, iq2_hot_mid_h, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else if (use_iq2_x_f16) {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16,false,true><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<8,false,true>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, iq2_x_h,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     } else {
-                        moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel<8,16,16,16><<<grid, block, shmem_n2>>>(
+                        routed_moe_launch_iq2_hotlist_wmma_n2<8,false,false>(
+                                grid, block, shmem_n2, iq2_q2_tail_wave_cull,
                                 (float *)mid->ptr, NULL, gate_w, up_w, (const float *)x->ptr, NULL,
                                 (const float *)weights->ptr, sorted_counts, sorted_offsets, sorted_pairs,
                                 iq2_gate_hot_dev, iq2_gate_hot_count, expert_in_dim, expert_mid_dim,
                                 gate_expert_bytes, gate_row_bytes, clamp);
                     }
                 }
-                ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 wmma hot gate/up launch");
+                const cudaError_t launch_err = cudaGetLastError();
+                ok = cuda_ok(
+                        launch_err,
+                        "routed_moe iq2 wmma hot gate/up launch");
+                if (!ok && iq2_q2_wmma_profile) {
+                    (void)routed_moe_wmma_profile_timer_destroy(
+                            &profile_timer,
+                            "routed_moe iq2 wmma gate/up profile cleanup");
+                } else if (iq2_q2_wmma_profile) {
+                    ok = routed_moe_wmma_profile_timer_finish(
+                            &profile_timer,
+                            &iq2_q2_profile_gate_up_ms,
+                            "routed_moe iq2 wmma gate/up profile finish");
+                    if (ok) iq2_q2_profile_gate_up_seen = 1;
+                }
             }
 #endif
         }
@@ -1853,6 +2331,10 @@ static int routed_moe_launch(
                     ok = routed_moe_q2_float_down_launch(
                             out, down, mid, iq2_hot_mid_h, use_iq2_hot_f16_mid, down_w,
                             sorted_counts, sorted_offsets, sorted_pairs, tile_experts,
+                            hotlist_wmma_wave32, iq2_q2_tail_wave_cull,
+                            iq2_q2_wmma_profile,
+                            &iq2_q2_profile_down_seen,
+                            &iq2_q2_profile_down_ms,
                             n_tokens, n_total_expert, n_expert, expert_mid_dim, out_dim,
                             down_expert_bytes, down_row_bytes);
                 }
@@ -2071,7 +2553,16 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
-        return ok;
+        return routed_moe_wmma_profile_emit(
+            iq2_q2_wmma_profile,
+            iq2_q2_tail_wave_cull,
+            n_tokens,
+            pair_count64,
+            iq2_q2_profile_gate_up_seen,
+            iq2_q2_profile_gate_up_ms,
+            iq2_q2_profile_down_seen,
+            iq2_q2_profile_down_ms,
+            ok);
     }
 
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
@@ -2190,7 +2681,7 @@ static int routed_moe_launch(
         const uint64_t f16_low_gate_bytes = (uint64_t)bucket_count * sizeof(uint32_t);
         const uint64_t f16_low_down_bytes = (uint64_t)bucket_count * sizeof(uint32_t);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        const int moe_wmma_hot = !g_quality_mode &&
+        const int moe_wmma_hot = hotlist_wmma_wave32 && !g_quality_mode &&
                                  expert_in_dim % 16u == 0u &&
                                  expert_mid_dim % 16u == 0u &&
                                  out_dim % 16u == 0u;

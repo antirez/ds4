@@ -551,11 +551,17 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         ds4_session_free(session);
         return 1;
     }
+    char err[160];
+    if (ds4_session_prepare_sync(
+            session, prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: prompt preparation failed: %s\n", err);
+        ds4_session_free(session);
+        return 1;
+    }
     /* Pay the one-time first-submission GPU cost before the prefill timer
      * starts (matches the TP worker's startup warmup). */
     ds4_session_gpu_warmup(session);
 
-    char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
     token_printer printer = {
         .engine = engine,
@@ -1567,6 +1573,13 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         .input_tokens = suffix,
         .use_color = ds4_log_is_tty(stderr),
     };
+    if (ds4_session_prepare_sync(
+            chat->session, &chat->transcript, err, sizeof(err)) != 0) {
+        chat->transcript.len = rollback_len;
+        repl_chat_trim_images(chat, rollback_images);
+        fprintf(stderr, "ds4: prompt preparation failed: %s\n", err);
+        return 1;
+    }
     const double t_prefill0 = cli_now_sec();
     ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
     ds4_session_set_display_progress(chat->session,

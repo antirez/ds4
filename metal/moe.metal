@@ -375,6 +375,266 @@ static constant ulong ds4_metal_iq2xxs_grid[256] = {
 #define ksigns_iq2xs ds4_metal_ksigns_iq2xs
 #define iq2xxs_grid ds4_metal_iq2xxs_grid
 
+// iq2xxs_grid entry (row) x byte: exact binary16 of 0.25 * grid byte.
+static constant ushort ds4_metal_iq2xxs_half_values[256][8] = {
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4960u, 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4960u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4960u, 0x4640u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4960u, 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4960u, 0x4640u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4960u, 0x4640u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4640u, 0x4960u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4640u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4960u, 0x4960u, 0x4000u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4960u, 0x4000u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4960u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4960u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4960u, 0x4000u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4000u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4640u },
+    { 0x4960u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4640u, 0x4640u },
+    { 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4960u, 0x4640u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4640u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4640u },
+    { 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4960u, 0x4640u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4640u, 0x4640u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4960u, 0x4000u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4640u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4640u },
+    { 0x4960u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4640u, 0x4640u, 0x4960u, 0x4640u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4960u, 0x4640u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4640u, 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4960u, 0x4640u, 0x4000u, 0x4960u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4960u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4960u, 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4640u, 0x4960u, 0x4000u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4960u },
+    { 0x4960u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4640u, 0x4640u, 0x4640u, 0x4640u, 0x4640u, 0x4960u },
+    { 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4640u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4640u, 0x4960u, 0x4640u, 0x4960u },
+    { 0x4960u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4000u, 0x4960u, 0x4960u },
+    { 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4000u, 0x4000u, 0x4960u, 0x4960u },
+    { 0x4640u, 0x4960u, 0x4000u, 0x4000u, 0x4640u, 0x4000u, 0x4960u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4000u, 0x4000u, 0x4960u, 0x4000u, 0x4960u, 0x4960u },
+    { 0x4000u, 0x4960u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4960u },
+    { 0x4000u, 0x4000u, 0x4640u, 0x4640u, 0x4000u, 0x4960u, 0x4960u, 0x4960u },
+    { 0x4000u, 0x4640u, 0x4000u, 0x4000u, 0x4640u, 0x4960u, 0x4960u, 0x4960u },
+};
+
 struct block_q2_K {
     uchar scales[QK_K/16];
     uchar qs[QK_K/4];
@@ -442,7 +702,7 @@ static inline float ds4_glm_swiglu(float gate, float up, float limit) {
         gate = min(gate, limit);
         up = clamp(up, -limit, limit);
     }
-    return (gate / (1.0f + exp(-gate))) * up;
+    return ds4_silu(gate) * up;
 }
 
 
@@ -506,7 +766,7 @@ kernel void kernel_dsv4_moe_swiglu_weight(
                 up_row[i] = u;
             }
         }
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         mid_row[i] = silu * u * route_weight;
     }
 }
@@ -544,7 +804,7 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
                 up_row[i] = u;
             }
         }
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         mid_row[i] = (half)(silu * u * route_weight);
     }
 }
@@ -620,20 +880,6 @@ void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg
     }
 }
 
-static inline float ds4_glm_q2_K_value(device const block_q2_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q2_K *xb = blocks + block;
-    const uint group = idx / 16u;
-    const uint l = idx - group * 16u;
-    const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
-    const uint shift = ((group / 2u) & 3u) * 2u;
-    const uint q = ((uint)xb->qs[q_base + l] >> shift) & 0x03u;
-    const uint sc = (uint)xb->scales[group];
-    return (float)xb->d * (float)(sc & 0x0fu) * (float)q -
-           (float)xb->dmin * (float)(sc >> 4u);
-}
-
 static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
     return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
@@ -652,115 +898,6 @@ static inline float ds4_glm_q4_K_value(device const block_q4_K *blocks, uint k) 
     const uint q = (xb->qs[byte_off] >> shift) & 0x0Fu;
     return (float)xb->d * (float)sm.x * (float)q -
            (float)xb->dmin * (float)sm.y;
-}
-
-static inline float ds4_glm_q5_K_value(device const block_q5_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q5_K *xb = blocks + block;
-    const uint group = idx / 32u;
-    const uint l = idx - group * 32u;
-    const uchar2 sm = get_scale_min_k4_just2((int)group, 0, xb->scales);
-    const uint ql_base = (group >> 1u) * 32u + l;
-    const uint shift = (group & 1u) * 4u;
-    uint q = (xb->qs[ql_base] >> shift) & 0x0Fu;
-    q += (xb->qh[l] & (uchar)(1u << group)) ? 16u : 0u;
-    return (float)xb->d * (float)sm.x * (float)q -
-           (float)xb->dmin * (float)sm.y;
-}
-
-static inline float ds4_glm_q6_K_value(device const block_q6_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q6_K *xb = blocks + block;
-    const uint n128 = idx >> 7u;
-    const uint r = idx & 127u;
-    const uint l = r & 31u;
-    const uint quarter = r >> 5u;
-    const uint ql_base = n128 * 64u;
-    const uint qh_base = n128 * 32u;
-    const uint sc_base = n128 * 8u;
-    uint q;
-    int sc;
-
-    if (quarter == 0u) {
-        q = (xb->ql[ql_base + l] & 0x0Fu) | (((xb->qh[qh_base + l] >> 0u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 0u];
-    } else if (quarter == 1u) {
-        q = (xb->ql[ql_base + 32u + l] & 0x0Fu) | (((xb->qh[qh_base + l] >> 2u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 2u];
-    } else if (quarter == 2u) {
-        q = (xb->ql[ql_base + l] >> 4u) | (((xb->qh[qh_base + l] >> 4u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 4u];
-    } else {
-        q = (xb->ql[ql_base + 32u + l] >> 4u) | (((xb->qh[qh_base + l] >> 6u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 6u];
-    }
-
-    return (float)xb->d * (float)sc * (float)((int)q - 32);
-}
-
-kernel void kernel_glm_q4_K_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const int32_t *selected,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]]) {
-    const uint ntg = 256u;
-    const uint row = tgpig.x;
-    const uint slot = tgpig.y;
-    const uint token = tgpig.z;
-    if (row >= args.mid_dim || slot >= args.n_expert_used || token >= args.n_tokens) return;
-
-    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    const uint64_t mid_off = (uint64_t)token * args.mid_token_stride +
-                             (uint64_t)slot * args.mid_dim + row;
-    const int expert = selected[selected_off];
-    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
-                            args.tp_rank, args.tp_world)) {
-        if (tid == 0u) mid[mid_off] = 0.0f;
-        return;
-    }
-    const int local_expert = expert - args.tp_expert_base;
-
-    device const block_q4_K *gate_row =
-        (device const block_q4_K *)(gate +
-            (uint64_t)(uint)local_expert * args.gate_expert_bytes +
-            (uint64_t)row * args.gate_row_bytes);
-    device const block_q4_K *up_row =
-        (device const block_q4_K *)(up +
-            (uint64_t)(uint)local_expert * args.up_expert_bytes +
-            (uint64_t)row * args.up_row_bytes);
-
-    float acc_gate = 0.0f;
-    float acc_up = 0.0f;
-    device const float *token_x = x + (uint64_t)token * args.in_dim;
-    for (uint k = tid; k < args.in_dim; k += ntg) {
-        const float xv = token_x[k];
-        acc_gate += ds4_glm_q4_K_value(gate_row, k) * xv;
-        acc_up += ds4_glm_q4_K_value(up_row, k) * xv;
-    }
-
-    scratch[tid] = acc_gate;
-    scratch[ntg + tid] = acc_up;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-            scratch[ntg + tid] += scratch[ntg + tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) {
-        mid[mid_off] = ds4_glm_swiglu(scratch[0], scratch[ntg],
-                                      args.swiglu_clamp) * weights[selected_off];
-    }
 }
 
 template <short N_R0>
@@ -1386,71 +1523,6 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
         expert - args.tp_expert_base, tiisg, sgitg);
 }
 
-kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    if (expert >= args.n_total_expert) return;
-    if (!ds4_tp_owns_expert((int)expert, args.n_total_expert,
-                            args.tp_rank, args.tp_world)) return;
-    const uint count = htpe[expert];
-    const uint map_base = tgpig.y * 32u;
-    for (uint i = 0; i < 32u; i++) {
-        const uint map_row = map_base + i;
-        if (map_row >= count) break;
-        const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-        if (id < 0) continue;
-        const uint token = (uint)id / args.n_expert_used;
-        const uint slot = (uint)id - token * args.n_expert_used;
-        if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
-        const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K>(
-            args, gate, up, x, weights, mid, scratch,
-            tgpig, slot, token, selected_off,
-            (int)expert - args.tp_expert_base, tiisg, sgitg);
-    }
-}
-
-kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    const uint map_row = tgpig.y;
-    if (expert >= args.n_total_expert || map_row >= htpe[expert]) return;
-    if (!ds4_tp_owns_expert((int)expert, args.n_total_expert,
-                            args.tp_rank, args.tp_world)) return;
-    const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-    if (id < 0) return;
-    const uint token = (uint)id / args.n_expert_used;
-    const uint slot = (uint)id - token * args.n_expert_used;
-    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
-    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K>(
-        args, gate, up, x, weights, mid, scratch,
-        tgpig, slot, token, selected_off,
-        (int)expert - args.tp_expert_base, tiisg, sgitg);
-}
-
 static inline void glm_q5_K_pair_swiglu_f32_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *gate,
@@ -1650,65 +1722,6 @@ kernel void kernel_glm_q5_K_pair_swiglu_f32(
         tgpig, slot, token, selected_off, expert, tiisg, sgitg);
 }
 
-kernel void kernel_glm_q5_K_pair_swiglu_mapped_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    if (expert >= args.n_total_expert) return;
-    const uint count = htpe[expert];
-    const uint map_base = tgpig.y * 32u;
-    for (uint i = 0; i < 32u; i++) {
-        const uint map_row = map_base + i;
-        if (map_row >= count) break;
-        const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-        if (id < 0) continue;
-        const uint token = (uint)id / args.n_expert_used;
-        const uint slot = (uint)id - token * args.n_expert_used;
-        if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
-        const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-        glm_q5_K_pair_swiglu_f32_impl(
-            args, gate, up, x, weights, mid, scratch,
-            tgpig, slot, token, selected_off, (int)expert, tiisg, sgitg);
-    }
-}
-
-kernel void kernel_glm_q5_K_pair_swiglu_mapped_row_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
-        device const char *gate,
-        device const char *up,
-        device const float *x,
-        device const uint32_t *htpe,
-        device const int32_t *hids,
-        device const float *weights,
-        device float *mid,
-        threadgroup float *scratch [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint expert = tgpig.z;
-    const uint map_row = tgpig.y;
-    if (expert >= args.n_total_expert || map_row >= htpe[expert]) return;
-    const int id = hids[(uint64_t)expert * args.n_tokens + map_row];
-    if (id < 0) return;
-    const uint token = (uint)id / args.n_expert_used;
-    const uint slot = (uint)id - token * args.n_expert_used;
-    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
-    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    glm_q5_K_pair_swiglu_f32_impl(
-        args, gate, up, x, weights, mid, scratch,
-        tgpig, slot, token, selected_off, (int)expert, tiisg, sgitg);
-}
-
 kernel void kernel_glm_q5_K_down_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
@@ -1745,9 +1758,11 @@ kernel void kernel_glm_q5_K_down_f32(
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[selected_base + slot];
         if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                                args.tp_rank, args.tp_world)) continue;
         device const block_q5_K *x =
             (device const block_q5_K *)(down +
-                (uint64_t)(uint)expert * args.down_expert_bytes +
+                (uint64_t)(uint)(expert - args.tp_expert_base) * args.down_expert_bytes +
                 (uint64_t)row0 * args.down_row_bytes);
         device const float *y = mid + mid_base + (uint64_t)slot * args.mid_dim;
         device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
@@ -2343,9 +2358,11 @@ kernel void kernel_glm_q6_K_down_f32(
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[selected_base + slot];
         if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                                args.tp_rank, args.tp_world)) continue;
         device const block_q6_K *x =
             (device const block_q6_K *)(down +
-                (uint64_t)(uint)expert * args.down_expert_bytes +
+                (uint64_t)(uint)(expert - args.tp_expert_base) * args.down_expert_bytes +
                 (uint64_t)row0 * args.down_row_bytes);
         device const float *yy = mid + mid_base + (uint64_t)slot * args.mid_dim;
 
@@ -2575,6 +2592,9 @@ void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 &reg)
     }
 }
 
+/* 0.25 * grid byte is exact in binary16, so the table replaces the u64
+ * grid load, byte extract, and float conversion. Sign is a bit flip;
+ * the remaining rounding is the same f32->f16 store as before. */
 template <typename type4x4>
 void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -2584,16 +2604,18 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
     const uint32_t aux32_g = q2[0] | (q2[1] << 16);
     const uint32_t aux32_s = q2[2] | (q2[3] << 16);
     thread const uint8_t * aux8 = (thread const uint8_t *)&aux32_g;
-    const float dl = d * (0.5f + (aux32_s >> 28)) * 0.25f;
-    constant uint8_t * grid = (constant uint8_t *)(iq2xxs_grid + aux8[2*il+0]);
+    const float dl = d * (0.5f + (aux32_s >> 28));
+    constant const ushort * values = ds4_metal_iq2xxs_half_values[aux8[2*il+0]];
     uint8_t signs = ksigns_iq2xs[(aux32_s >> 14*il) & 127];
-    for (int i = 0; i < 8; ++i) {
-        reg[i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+    FOR_UNROLL (int i = 0; i < 8; ++i) {
+        const ushort bits = values[i] ^ (signs & kmask_iq2xs[i] ? 0x8000u : 0x0000u);
+        reg[i/4][i%4] = dl * (float)as_type<half>(bits);
     }
-    grid = (constant uint8_t *)(iq2xxs_grid + aux8[2*il+1]);
+    values = ds4_metal_iq2xxs_half_values[aux8[2*il+1]];
     signs = ksigns_iq2xs[(aux32_s >> (14*il+7)) & 127];
-    for (int i = 0; i < 8; ++i) {
-        reg[2+i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+    FOR_UNROLL (int i = 0; i < 8; ++i) {
+        const ushort bits = values[i] ^ (signs & kmask_iq2xs[i] ? 0x8000u : 0x0000u);
+        reg[2+i/4][i%4] = dl * (float)as_type<half>(bits);
     }
 }
 
@@ -2649,10 +2671,6 @@ struct ds4_metal_q4_expert_table {
     array<device const char *, 384> experts [[id(0)]];
 };
 
-struct ds4_metal_expert_address_table {
-    device const uint64_t *addrs;
-};
-
 struct ds4_metal_stream_expert_validate_args {
     uint32_t n_total_expert;
     uint32_t n_expert;
@@ -2697,6 +2715,23 @@ struct ds4_metal_args_mul_mm_id {
     int32_t  tp_rank;
     int32_t  tp_world;
     int32_t  tp_expert_base;
+};
+
+// Exact-N Q4_K attention-output projection used only by the opt-in SSD
+// prefill path.  One threadgroup stages a pair of packed weight rows once
+// and sixteen independent SIMDgroups consume that pair for sixteen tokens.
+// Keep this layout in lock-step with ds4_gpu_q4_attn_exactn_args.
+struct ds4_metal_args_q4_attn_exactn {
+    uint32_t in_dim;
+    uint32_t out_rows;
+    uint32_t n_groups;
+    uint32_t n_tokens;
+    uint64_t weight_row_bytes;
+    uint64_t weight_group_bytes;
+    uint64_t input_group_bytes;
+    uint64_t input_token_bytes;
+    uint64_t output_group_bytes;
+    uint64_t output_token_bytes;
 };
 
 template<int nr0, typename args_t>
@@ -2900,6 +2935,341 @@ void kernel_mul_mv_q4_K_f32_impl(
     (void)shmem;
 }
 
+// Two-token classic matvec. Preload each lane's quant bytes and scale/min
+// metadata once, then run the original scalar arithmetic for each token.
+// Each output keeps the classic ix/ib partition and simd_sum tree; the two
+// tokens never share an accumulator. Only dense token-major callers use this.
+struct ds4_q4_K_lane_weights {
+    ushort4 q1, q2;
+    ushort sc16[4];
+    half2 dm;
+};
+
+template<int nr0, int tokens_per_group = 2>
+void kernel_mul_mv_q4_K_token_pair_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int first_row = (tgpig.x * FC_mul_mv_nsg + sgitg) * nr0;
+    const int first_token = tokens_per_group * tgpig.y;
+    const short ix = tiisg / 8;
+    const short iq = (tiisg % 8) / 4;
+    const short ir = tiisg % 4;
+    const int nb = args.ne00 / QK_K;
+    float sumf[tokens_per_group][nr0] = {};
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        ds4_q4_K_lane_weights w[nr0];
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {
+            // Guard tails before loading, including fully inactive SIMDgroups.
+            if (first_row + row < args.ne0) {
+                device const block_q4_K *b = (device const block_q4_K *)(
+                    src0 + (uint64_t)(first_row + row) * args.nb01) + ib;
+                device const ushort *sc = (device const ushort *)b->scales + iq;
+                device const ushort *q1 = (device const ushort *)b->qs + 16 * iq + 4 * ir;
+                w[row].q1 = *(device const ushort4 *)q1;
+                w[row].q2 = *(device const ushort4 *)(q1 + 32);
+                w[row].sc16[0] = sc[0] & 0x3f3f;
+                w[row].sc16[1] = sc[2] & 0x3f3f;
+                w[row].sc16[2] = (sc[4] & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+                w[row].sc16[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+                w[row].dm = *(device const half2 *)&b->d;
+            }
+        }
+        for (short token = 0; token < tokens_per_group; ++token) {
+            if (first_token + token >= args.ne11) break;
+            device const float *y4 = (device const float *)(
+                src1 + (uint64_t)(first_token + token) * args.nb11) +
+                ib * QK_K + 64 * iq + 8 * ir;
+            float yl[16], yh[16];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                if (first_row + row < args.ne0) {
+                    const ushort4 q1 = w[row].q1, q2 = w[row].q2;
+                    const half2 dh = w[row].dm;
+                    thread const uchar *sc8 = (thread const uchar *)w[row].sc16;
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    FOR_UNROLL (short i = 0; i < 4; ++i) {
+                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                    }
+                    sumf[token][row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                                               (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                               (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                               (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                                      dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+                }
+            }
+        }
+    }
+    for (short token = 0; token < tokens_per_group && first_token + token < args.ne11; ++token) {
+        device float *out = (device float *)dst + (uint64_t)(first_token + token) * args.ne0;
+        for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+            const float value = simd_sum(sumf[token][row]);
+            if (tiisg == 0) out[first_row + row] = value;
+        }
+    }
+}
+
+// Experimental single-token specialization: keep the vector weight loads
+// without the second token's accumulators. Do not infer a single-token gain
+// from the established two-token weight-reuse measurements.
+kernel void kernel_mul_mv_q4_K_dense_single_vec_f32(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K, 1>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+    (void)shmem;
+}
+
+kernel void kernel_mul_mv_q4_K_dense_token_pair_f32(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+    (void)shmem;
+}
+
+// Oracle/benchmark only. Production Q-A/KV pairs retain the legacy kernel:
+// K4096 paired timings were mixed, unlike the standalone Q-b admission.
+kernel void kernel_mul_mv_q4_K_dense_pair_token_pair_f32(
+        constant ds4_metal_args_mul_mv &args0,
+        constant ds4_metal_args_mul_mv &args1,
+        device const char *src0_a, device const char *src0_b,
+        device const char *src1, device char *dst_a, device char *dst_b,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int first_row = (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+    if (first_row < args0.ne0)
+        kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K>(args0, src0_a, src1, dst_a, tgpig, tiisg, sgitg);
+    if (first_row < args1.ne0)
+        kernel_mul_mv_q4_K_token_pair_impl<N_R0_Q4_K>(args1, src0_b, src1, dst_b, tgpig, tiisg, sgitg);
+    (void)shmem;
+}
+
+// This is the classic Q4_K matvec inner loop with only the weight address
+// space changed from device to threadgroup.  Its lane-to-K mapping, scalar
+// operation order and simd_sum reduction are deliberately kept identical to
+// kernel_mul_mv_q4_K_f32_impl: the exact-N oracle requires bitwise equality.
+template<int nr0, bool use_preexpanded_scales = false>
+void kernel_mul_mv_q4_K_staged_exactn_impl(
+        uint32_t in_dim,
+        uint64_t weight_row_bytes,
+        threadgroup const char *src0,
+        threadgroup const ushort4 *preexpanded_scales,
+        device const char *src1,
+        device       char *dst,
+        uint32_t valid_rows,
+        ushort tiisg) {
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const int nb = in_dim / QK_K;
+
+    threadgroup const block_q4_K *x =
+        (threadgroup const block_q4_K *)src0;
+    device const float *y = (device const float *)src1;
+
+    float yl[16];
+    float yh[16];
+    float sumf[nr0] = {0.f};
+
+    device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        threadgroup const uint16_t *sc =
+            (threadgroup const uint16_t *)x[ib].scales + iq;
+        threadgroup const uint16_t *q1 =
+            (threadgroup const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        threadgroup const half *dh = &x[ib].d;
+
+        for (short row = 0; row < nr0 && row < valid_rows; row++) {
+            if (use_preexpanded_scales) {
+                const uint32_t meta_index =
+                    ((uint32_t)row * (uint32_t)nb + (uint32_t)ib) * 2u +
+                    (uint32_t)iq;
+                const ushort4 expanded = preexpanded_scales[meta_index];
+                sc16[0] = expanded[0];
+                sc16[1] = expanded[1];
+                sc16[2] = expanded[2];
+                sc16[3] = expanded[3];
+            } else {
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] =
+                    ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] =
+                    ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            }
+            thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+            threadgroup const uint16_t *q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+            }
+
+            sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                  (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += weight_row_bytes / 2;
+            sc += weight_row_bytes / 2;
+            dh += weight_row_bytes / 2;
+        }
+
+        y4 += 4 * QK_K;
+    }
+
+    device float *dst_f32 = (device float *)dst;
+    for (int row = 0; row < nr0 && row < valid_rows; ++row) {
+        float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[row] = sum_all;
+        }
+    }
+}
+
+// Grid: x = output-row pairs, y = 16-token tiles, z = independent groups.
+// All 512 threads join the raw packed-row load and barrier.  The optimized
+// specialization also expands the integer scale/min metadata before that same
+// barrier so all token SIMDgroups can reuse it without changing FP arithmetic.
+template<bool preexpand_scales>
+kernel void kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl(
+        constant ds4_metal_args_q4_attn_exactn &args,
+        device const char *weights,
+        device const char *input,
+        device       char *output,
+        threadgroup  char *staged [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint32_t first_row = tgpig.x * 2u;
+    const uint32_t valid_rows = min(2u, args.out_rows - first_row);
+    const uint64_t group_base = (uint64_t)tgpig.z * args.weight_group_bytes;
+
+    const uint64_t row0_base =
+        group_base + (uint64_t)first_row * args.weight_row_bytes;
+    for (uint64_t i = tiitg; i < args.weight_row_bytes; i += 32u * 16u) {
+        staged[i] = weights[row0_base + i];
+    }
+    const uint64_t row1_base = row0_base + args.weight_row_bytes;
+    for (uint64_t i = tiitg; i < args.weight_row_bytes; i += 32u * 16u) {
+        staged[args.weight_row_bytes + i] =
+            valid_rows == 2u ? weights[row1_base + i] : 0;
+    }
+
+    const uint32_t blocks_per_row = args.in_dim / QK_K;
+    threadgroup ushort4 *scale_meta =
+        (threadgroup ushort4 *)(staged + 2u * args.weight_row_bytes);
+    if (preexpand_scales) {
+        const uint32_t meta_count = valid_rows * blocks_per_row * 2u;
+        for (uint32_t meta_index = tiitg;
+             meta_index < meta_count;
+             meta_index += 32u * 16u) {
+            const uint32_t iq = meta_index & 1u;
+            const uint32_t block_index = meta_index >> 1u;
+            const uint32_t row = block_index / blocks_per_row;
+            const uint32_t ib = block_index - row * blocks_per_row;
+            device const block_q4_K *xb =
+                (device const block_q4_K *)(weights + row0_base +
+                    (uint64_t)row * args.weight_row_bytes) + ib;
+            device const uint16_t *sc =
+                (device const uint16_t *)xb->scales + iq;
+            const ushort4 expanded = ushort4(
+                sc[0] & 0x3f3fu,
+                sc[2] & 0x3f3fu,
+                ((sc[4] >> 0) & 0x0f0fu) |
+                    ((sc[0] & 0xc0c0u) >> 2),
+                ((sc[4] >> 4) & 0x0f0fu) |
+                    ((sc[2] & 0xc0c0u) >> 2));
+            scale_meta[meta_index] = expanded;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint32_t token = tgpig.y * 16u + sgitg;
+    if (token >= args.n_tokens) return;
+
+    device const char *token_input =
+        input + (uint64_t)token * args.input_token_bytes +
+        (uint64_t)tgpig.z * args.input_group_bytes;
+    device char *token_output =
+        output + (uint64_t)token * args.output_token_bytes +
+        (uint64_t)tgpig.z * args.output_group_bytes +
+        (uint64_t)first_row * sizeof(float);
+
+    kernel_mul_mv_q4_K_staged_exactn_impl<2, preexpand_scales>(
+        args.in_dim,
+        args.weight_row_bytes,
+        staged,
+        scale_meta,
+        token_input,
+        token_output,
+        valid_rows,
+        tiisg);
+}
+
+typedef decltype(
+    kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl<false>)
+    q4_attn_ssd_prefill_exactn_t;
+template [[host_name("kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_f32")]]
+kernel q4_attn_ssd_prefill_exactn_t
+    kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl<false>;
+template [[host_name("kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_scale_meta_f32")]]
+kernel q4_attn_ssd_prefill_exactn_t
+    kernel_dsv4_attn_out_q4_K_ssd_prefill_exactn_impl<true>;
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_mxfp4_f32_impl(
         args_t args,
@@ -3075,12 +3445,14 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        const uint tid = 32u*(uint)sgitg + (uint)tiisg;
+        const uint nth = 32u*(uint)NSG;
+        for (uint i = tid; i < 256u; i += nth) {
+            svalues[i] = ds4_metal_iq2xxs_grid[i];
+        }
+        for (uint i = tid; i < 128u; i += nth) {
+            ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3247,6 +3619,141 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     }
 }
 
+// Address-table decode specialization for the DeepSeek Flash IQ2 gate/up
+// shape.  It deliberately keeps the exact dot-product, simd_sum, scale,
+// clamp, exp, and route-weight order of kernel_mul_mv_iq2_xxs_pair_f32_impl
+// followed by the canonical fused SwiGLU epilogue.  The only removed work is
+// the round trip through the gate/up destination buffers: downstream consumes
+// `mid` exclusively on this dispatch.
+template<int nr0>
+void kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl(
+        ds4_metal_args_mul_mv args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_mid,
+        device const char * weights,
+        uint64_t pair_row,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr int ne00 = 4096;
+    constexpr int ne0 = 2048;
+    constexpr int nb = ne00 / QK_K;
+    const short NSG = FC_mul_mv_nsg;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t offset0 = first_row * args.nb01 +
+        (i12 / args.r2) * args.nb02 + (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+
+    device const block_iq2_xxs *xg =
+        (device const block_iq2_xxs *)(src0_gate + offset0);
+    device const block_iq2_xxs *xu =
+        (device const block_iq2_xxs *)(src0_up + offset0);
+    device const float *y = (device const float *)(src1 + offset1);
+
+    float yl[32];
+    float sumg[nr0] = {0.f};
+    float sumu[nr0] = {0.f};
+    constexpr int nb32 = nb * (QK_K / 32);
+
+    threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
+    threadgroup uint8_t *ssigns = (threadgroup uint8_t *)(svalues + 256);
+    {
+        const uint tid = 32u * (uint)sgitg + (uint)tiisg;
+        const uint nth = 32u * (uint)NSG;
+        for (uint i = tid; i < 256u; i += nth) {
+            svalues[i] = ds4_metal_iq2xxs_grid[i];
+        }
+        for (uint i = tid; i < 128u; i += nth) {
+            ssigns[i] = ds4_metal_ksigns_iq2xs[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int ix = tiisg;
+    device const float *y4 = y + 32 * ix;
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        FOR_UNROLL (short i = 0; i < 32; ++i) {
+            yl[i] = y4[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib = ib32 % (QK_K / 32);
+        device const block_iq2_xxs *xgr = xg + ibl;
+        device const block_iq2_xxs *xur = xu + ibl;
+        device const uint16_t *qg = xgr->qs + 4 * ib;
+        device const uint16_t *qu = xur->qs + 4 * ib;
+        device const half *dhg = &xgr->d;
+        device const half *dhu = &xur->d;
+
+        for (short row = 0; row < nr0; ++row) {
+            device const uint8_t *aux8g = (device const uint8_t *)qg;
+            device const uint8_t *aux8u = (device const uint8_t *)qu;
+            const uint32_t aux32g = qg[2] | (qg[3] << 16);
+            const uint32_t aux32u = qu[2] | (qu[3] << 16);
+            const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+            const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+            float sg = 0;
+            float su = 0;
+            FOR_UNROLL (short l = 0; l < 4; ++l) {
+                const threadgroup uint8_t *gridg =
+                    (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                const threadgroup uint8_t *gridu =
+                    (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
+                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                FOR_UNROLL (short j = 0; j < 8; ++j) {
+                    const float v = yl[8 * l + j];
+                    sg += v * gridg[j] *
+                        (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    su += v * gridu[j] *
+                        (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+            }
+            sumg[row] += dg * sg;
+            sumu[row] += du * su;
+
+            dhg += args.nb01 / 2;
+            dhu += args.nb01 / 2;
+            qg += args.nb01 / 2;
+            qu += args.nb01 / 2;
+        }
+        y4 += 32 * 32;
+    }
+
+    device float *mid_f32 =
+        (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w =
+        (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+    for (int row = 0; row < nr0 && first_row + row < ne0; ++row) {
+        const float sum_gate = simd_sum(sumg[row]);
+        const float sum_up = simd_sum(sumu[row]);
+        if (tiisg == 0) {
+            float g = sum_gate * 0.25f;
+            float u = sum_up * 0.25f;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = ds4_silu(g);
+            mid_f32[first_row + row] = silu * u * route_weight;
+        }
+    }
+}
+
 typedef void (kernel_mul_mv2_disp_t)(
         ds4_metal_args_mul_mv args,
         device const char * src0,
@@ -3381,6 +3888,244 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Dense Q-A/KV pair. Both projections consume the same activation rows and
+// retain the standalone Q4_K reduction order. Combining them removes one
+// Metal dispatch/encoder transition while keeping independently-sized output
+// matrices and byte-identical arithmetic.
+kernel void kernel_mul_mv_q4_K_dense_pair_f32(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int first_row =
+        (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+    if (first_row < args0.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            args0, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    }
+    if (first_row < args1.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            args1, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
+// Decode Q4_K Q-A/KV pair plus the attention/indexer F16 compressor pairs.
+// The Q4_K range calls the same per-row implementation as the standalone
+// dense-pair kernel.  With NSG=8 each simdgroup still owns an independent
+// two-row cohort, so changing the number of cohorts in a threadgroup does not
+// change the K walk or the simd reduction for any output row.  The shifted
+// compressor ranges are the standalone F16 pair/store body verbatim.  The
+// fused dispatch therefore removes encoder/dispatch transitions while
+// preserving the bits produced by all three original kernels.
+kernel void kernel_dsv4_q4_K_qkv_pair_quad_compressor_store(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        constant ds4_metal_args_mul_mv & cargs,
+        constant ds4_metal_args_compressor_pair_store & store0,
+        constant ds4_metal_args_compressor_pair_store & store1,
+        constant uint & pair_tgs,
+        device const char * qw0,
+        device const char * qw1,
+        device const char * cw0a,
+        device const char * cw0b,
+        device const char * cw1a,
+        device const char * cw1b,
+        device const char * src1,
+        device       char * dst0,
+        device       char * dst1,
+        device       char * cdst_a0,
+        device       char * cdst_b0,
+        device       char * cdst_a1,
+        device       char * cdst_b1,
+        device const char * ape0,
+        device const char * ape1,
+        device       float * state0_kv,
+        device       float * state0_score,
+        device       float * state1_kv,
+        device       float * state1_score,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        ushort tiitg  [[thread_index_in_threadgroup]],
+        ushort tiisg  [[thread_index_in_simdgroup]],
+        ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
+    if (tgpig.x < pair_tgs) {
+        const int first_row =
+            (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+        if (first_row < args0.ne0) {
+            kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+                args0, qw0, src1, dst0, shmem, tgpig, tiisg, sgitg);
+        }
+        if (first_row < args1.ne0) {
+            kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+                args1, qw1, src1, dst1, shmem, tgpig, tiisg, sgitg);
+        }
+        return;
+    }
+
+    constexpr short NR0 = 2;
+    const uint lx = tgpig.x - pair_tgs;
+    const uint tgs0 = ((uint)store0.width + NR0 - 1u) / NR0;
+    const uint tgs1 = ((uint)store1.width + NR0 - 1u) / NR0;
+    if (lx >= tgs0 + tgs1) return;
+    const bool second = lx >= tgs0;
+
+    uint3 local_tgpig = tgpig;
+    local_tgpig.x = second ? lx - tgs0 : lx;
+
+    ds4_metal_args_mul_mv largs = cargs;
+    largs.nr0 = NR0;
+    largs.ne01 = second ? (int32_t)store1.width : (int32_t)store0.width;
+
+    if (!second) {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+            largs, cw0a, cw0b, src1, cdst_a0, cdst_b0,
+            shmem, local_tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_f16_f32_pair_4_impl<NR0>(
+            largs, cw1a, cw1b, src1, cdst_a1, cdst_b1,
+            shmem, local_tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    constant ds4_metal_args_compressor_pair_store & store =
+        second ? store1 : store0;
+    if (tiitg >= NR0 || store.width == 0u || store.ratio == 0u) {
+        return;
+    }
+    const uint col = local_tgpig.x * (uint)NR0 + tiitg;
+    if (col >= store.width) return;
+
+    const uint pos_mod = store.pos % store.ratio;
+    const uint dst_row = store.ratio == 4u ? store.ratio + pos_mod : pos_mod;
+    const uint dst = dst_row * store.width + col;
+    const uint ape_i = pos_mod * store.width + col;
+
+    device volatile const float * projected_kv = second
+        ? (device volatile const float *)cdst_a1
+        : (device volatile const float *)cdst_a0;
+    device volatile const float * projected_score = second
+        ? (device volatile const float *)cdst_b1
+        : (device volatile const float *)cdst_b0;
+    device const char * ape = second ? ape1 : ape0;
+    device float * state_kv = second ? state1_kv : state0_kv;
+    device float * state_score = second ? state1_score : state0_score;
+
+    float ape_v;
+    if (store.ape_type == 1u) {
+        ape_v = (float)(((device const half *)ape)[ape_i]);
+    } else {
+        ape_v = ((device const float *)ape)[ape_i];
+    }
+
+    state_kv[dst] = projected_kv[col];
+    state_score[dst] = projected_score[col] + ape_v;
+}
+
+// ABI-compatible subset of ds4_metal_args_dsv4_hc_expand.  The Q4_K kernel
+// lives in this source file beside the classic Q4 implementation, while the
+// generic HC kernels are concatenated later from dsv4_hc.metal.
+struct ds4_metal_args_q4_hc_expand {
+    int64_t  n_embd;
+    int64_t  n_hc;
+    int64_t  n_tokens;
+    uint64_t nb_block0;
+    uint64_t nb_block1;
+    uint64_t nb_add0;
+    uint64_t nb_add1;
+    uint64_t nb_res0;
+    uint64_t nb_res1;
+    uint64_t nb_res2;
+    uint64_t nb_post0;
+    uint64_t nb_post1;
+    uint64_t nb_comb0;
+    uint64_t nb_comb1;
+    uint64_t nb_comb2;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    int32_t  has_add;
+};
+
+// Decode attention-output tail for AProjQ4:
+//
+//     block_out = input @ Wob(Q4_K)
+//     out_hc    = HCPost(block_out, residual_hc, split)
+//
+// The matvec is the exact standalone classic Q4_K implementation.  Once its
+// stored F32 row is visible to the threadgroup, the owning simdgroup expands
+// the same value into the four HC streams.  Materializing block_out preserves
+// diagnostics and makes an A/B memcmp possible.
+kernel void kernel_dsv4_q4_K_hc_expand4(
+        constant ds4_metal_args_mul_mv & mv,
+        constant ds4_metal_args_q4_hc_expand & hc,
+        device const char * weight,
+        device const char * input,
+        device       char * block_out,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (hc.n_hc != 4 || hc.n_tokens != 1 || hc.has_add != 0 ||
+        mv.ne0 != hc.n_embd || (mv.ne0 & 1) != 0 ||
+        hc.nb_block0 != sizeof(float)) {
+        return;
+    }
+
+    const int first_row =
+        (tgpig.x * FC_mul_mv_nsg + sgitg) * N_R0_Q4_K;
+    if (first_row < mv.ne0) {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            mv, weight, input, block_out, shmem,
+            tgpig, tiisg, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tiisg != 0) return;
+    FOR_UNROLL(short row = 0; row < N_R0_Q4_K; ++row) {
+        const int d = first_row + row;
+        if (d >= mv.ne0) continue;
+
+        const float block_v = *((device const float *)(
+            block_out + (uint64_t)d * hc.nb_block0));
+        const float r0 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+        const float r1 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+        const float r2 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+        const float r3 = *((device const float *)(
+            residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+        FOR_UNROLL(short dst_hc = 0; dst_hc < 4; ++dst_hc) {
+            float acc = block_v * *((device const float *)(
+                post + (uint64_t)dst_hc * hc.nb_post0));
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+            acc += *((device const float *)(
+                comb + (uint64_t)dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+            *((device float *)(dst + (uint64_t)d * hc.nb0 +
+                                (uint64_t)dst_hc * hc.nb1)) = acc;
+        }
+    }
+}
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //
@@ -3442,6 +4187,83 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         tgpig,
         tiisg,
         sgitg);
+}
+
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_K 4096
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS 1024
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUPS 8u
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS 128
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES 4352
+#define DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES 4456448
+
+static inline void ds4_attn_out_low_q8_static_impl(
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR0 = N_R0_Q8_0;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NSG = 4;
+
+    // The z grid is flattened as pair = token * groups + group.
+    const uint pair = tgpig.z;
+    const uint group = pair % DS4_ATTN_OUT_LOW_Q8_STATIC_GROUPS;
+    const int r0 = (int)tgpig.x * NR0;
+    device const char *src0 = src0s +
+        (uint64_t)group * DS4_ATTN_OUT_LOW_Q8_STATIC_GROUP_BYTES;
+    device const float *y = (device const float *)(src1 +
+        (uint64_t)pair * DS4_ATTN_OUT_LOW_Q8_STATIC_K * sizeof(float));
+    device float *out = (device float *)(dst +
+        (uint64_t)pair * DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS * sizeof(float));
+
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *)(src0 +
+            (uint64_t)(r0 + row) * DS4_ATTN_OUT_LOW_Q8_STATIC_ROW_BYTES);
+    }
+
+    float sumf[NR0] = { 0.0f };
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+    float yl[NQ];
+
+    FOR_UNROLL (int ib = ib0; ib < DS4_ATTN_OUT_LOW_Q8_STATIC_BLOCKS;
+         ib += NSG * NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            float sumq = 0.0f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) sumq += qs[i] * yl[i];
+            sumf[row] += sumq * ax[row][ib].d;
+        }
+        yb += NSG * NQ * QK8_0;
+    }
+
+    helper_mv_reduce_and_write<NR0>(
+        out, sumf, r0, DS4_ATTN_OUT_LOW_Q8_STATIC_ROWS,
+        tiisg, sgitg, shmem);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_flash_decode_static_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_attn_out_low_q8_static_impl(
+        src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+    (void)args;
+    (void)tiitg;
 }
 
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
@@ -3715,7 +4537,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
         }
         dst_gate_f32[out_row] = gate;
         dst_up_f32[out_row] = up;
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         dst_mid_f32[out_row] = silu * u * route_weight;
     }
 
@@ -3867,7 +4689,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
         }
         dst_gate_f32[out_row] = gate;
         dst_up_f32[out_row] = up;
-        const float silu = g / (1.0f + exp(-g));
+        const float silu = ds4_silu(g);
         dst_mid_f32[out_row] = silu * u * route_weight;
     }
 
@@ -3963,7 +4785,7 @@ kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -4053,11 +4875,165 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
 
+    (void)tiitg;
+}
+
+// M1 SSD-streaming candidate for the exact Flash 4096 -> 2048 gate/up shape.
+// `dst_gate` and `dst_up` remain in the ABI so the host can switch pipelines
+// without changing resource bindings; this kernel intentionally never writes
+// either buffer.  Host dispatch is opt-in and falls back to the kernel above
+// for every other shape or execution mode.
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (args.ne00 != 4096 || args.ne01 != 2048 || args.ne0 != 2048 ||
+        args.nr0 != N_R0_IQ2_XXS || args.nei1 != 1) {
+        return;
+    }
+
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx = tgpig.z % args.nei0;
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t gate_addr = gate_addrs[(uint)i02];
+    const uint64_t up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+    kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl<N_R0_IQ2_XXS>(
+        args0,
+        act,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_mid,
+        weights,
+        pair_row,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    (void)dst_gate;
+    (void)dst_up;
+    (void)tiitg;
+}
+
+// Same mid-only arithmetic for the ordinary SSD cache split.  Complementary
+// resident/missing masks may execute in separate command buffers; each active
+// slot owns a disjoint mid row, so no gate/up materialization is required.
+kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_mid_only_4096x2048_masked_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant ds4_metal_stream_expert_split_args & split,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (args.ne00 != 4096 || args.ne01 != 2048 || args.ne0 != 2048 ||
+        args.nr0 != N_R0_IQ2_XXS || args.nei1 != 1 ||
+        split.accumulate != 0u || split.active_mask == 0u ||
+        (split.active_mask & ~0x3fu) != 0u) {
+        return;
+    }
+
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx = tgpig.z % args.nei0;
+    if ((split.active_mask & (1u << (uint)idx)) == 0) {
+        return;
+    }
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+        return;
+    }
+    const uint64_t gate_addr = gate_addrs[(uint)i02];
+    const uint64_t up_addr = up_addrs[(uint)i02];
+    if (gate_addr == 0 || up_addr == 0) {
+        return;
+    }
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    device const char *src0_gate_cur =
+        reinterpret_cast<device const char *>(gate_addr);
+    device const char *src0_up_cur =
+        reinterpret_cast<device const char *>(up_addr);
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+    kernel_mul_mv_iq2_xxs_pair_swiglu_mid_only_4096x2048_impl<N_R0_IQ2_XXS>(
+        args0,
+        act,
+        src0_gate_cur,
+        src0_up_cur,
+        src1_cur,
+        dst_mid,
+        weights,
+        pair_row,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    (void)dst_gate;
+    (void)dst_up;
     (void)tiitg;
 }
 
@@ -4200,7 +5176,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -4317,45 +5293,22 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
         sgitg);
 }
 
-// Same release-path fusion as the IQ2_XXS kernel above for the Q4_K expert
-// variant.  The Q4 pair path reuses the existing exact matvec implementation
-// for gate and up, then the same lane that wrote each row derives the routed
-// SwiGLU input.  This keeps Q4 behavior aligned with the Q2 optimization while
-// preserving the old pair projection arithmetic.
-kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
-        device const char * src0_gate,
-        device const char * src0_up,
-        device const char * src1,
-        device       char * dst_gate,
-        device       char * dst_up,
-        device       char * dst_mid,
-        device const char * ids,
-        device const char * weights,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const int iid1 = tgpig.z / args.nei0;
-    const int idx  = tgpig.z % args.nei0;
-
-    tgpig.z = 0;
-
-    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
-    const int i02b = i02 - args.tp_expert_base;
-    const int64_t i11 = idx % args.ne11;
-    const int64_t i12 = iid1;
-
-    device const char *src0_gate_cur = src0_gate + (int64_t)i02b * args.nb02;
-    device const char *src0_up_cur   = src0_up   + (int64_t)i02b * args.nb02;
-    device const char *src1_cur      = src1      + i11 * args.nb11 + i12 * args.nb12;
-
-    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
-    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
-
+// Gate/up share the activation load and sumy terms, preserving each projection's
+// accumulation order. Reused by resident and streamed-expert entry points.
+inline void kernel_mul_mv_q4_K_pair_shared_x_impl(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate_cur,
+        device const char *src0_up_cur,
+        device const char *src1_cur,
+        device char *dst_gate_cur,
+        device char *dst_up_cur,
+        device char *dst_mid,
+        device const char *weights,
+        uint64_t pair_row,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
@@ -4369,7 +5322,6 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
     device float *gate_f32 = (device float *)dst_gate_cur;
     device float *up_f32 = (device float *)dst_up_cur;
-    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
     device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
     const float c = act.clamp_value;
@@ -4485,10 +5437,51 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
             }
             gate_f32[out_row] = gate;
             up_f32[out_row] = up;
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
+}
+
+kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
+    const int i02b = i02 - args.tp_expert_base;
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_gate_cur = src0_gate + (int64_t)i02b * args.nb02;
+    device const char *src0_up_cur   = src0_up   + (int64_t)i02b * args.nb02;
+    device const char *src1_cur      = src1      + i11 * args.nb11 + i12 * args.nb12;
+
+    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    kernel_mul_mv_q4_K_pair_shared_x_impl(
+        args, act, src0_gate_cur, src0_up_cur, src1_cur,
+        dst_gate_cur, dst_up_cur, dst_mid, weights,
+        (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx,
+        tgpig, tiisg, sgitg);
 
     (void)tiitg;
 }
@@ -4583,7 +5576,7 @@ void kernel_mul_mv_mxfp4_pair_swiglu_impl(
                 }
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
-                mid_f32[out_row] = (g / (1.0f + exp(-g))) * u * route_weight;
+                mid_f32[out_row] = ds4_silu(g) * u * route_weight;
             }
         }
     }
@@ -4764,7 +5757,7 @@ void kernel_mul_mv_mxfp4_pair_swiglu_static_impl(
                 }
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
-                mid_f32[out_row] = (g / (1.0f + exp(-g))) * u * route_weight;
+                mid_f32[out_row] = ds4_silu(g) * u * route_weight;
             }
         }
     }
@@ -5070,7 +6063,7 @@ kernel void kernel_mul_mv_table_q4_K_pair_swiglu_f32(
             }
             gate_f32[out_row] = gate;
             up_f32[out_row] = up;
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -5078,7 +6071,8 @@ kernel void kernel_mul_mv_table_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
-kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
+template<bool SHARED_X>
+kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const ulong * gate_addrs,
@@ -5114,6 +6108,15 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
 
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    if (SHARED_X) {
+        kernel_mul_mv_q4_K_pair_shared_x_impl(
+            args, act, src0_gate_cur, src0_up_cur, src1_cur,
+            dst_gate_cur, dst_up_cur, dst_mid, weights,
+            (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx,
+            tgpig, tiisg, sgitg);
+        return;
+    }
 
     ds4_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
@@ -5161,13 +6164,19 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
 
     (void)tiitg;
 }
+
+typedef decltype(kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl<false>) kernel_mul_mv_addr_q4_K_pair_swiglu_f32_t;
+template [[host_name("kernel_mul_mv_addr_q4_K_pair_swiglu_f32")]]
+kernel kernel_mul_mv_addr_q4_K_pair_swiglu_f32_t kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl<false>;
+template [[host_name("kernel_mul_mv_addr_q4_K_pair_swiglu_f32_shared_x")]]
+kernel kernel_mul_mv_addr_q4_K_pair_swiglu_f32_t kernel_mul_mv_addr_q4_K_pair_swiglu_f32_impl<true>;
 
 kernel void kernel_q4_gather_slots6(
         constant ds4_metal_q4_gather_slots6_args &args,
@@ -5213,7 +6222,8 @@ kernel void kernel_q4_gather_slots6(
     out[chunk] = src[chunk];
 }
 
-kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
+template<bool SHARED_X>
+kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const char * src0_gate0,
@@ -5262,6 +6272,15 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
+    if (SHARED_X) {
+        kernel_mul_mv_q4_K_pair_shared_x_impl(
+            args, act, src0_gate_cur, src0_up_cur, src1_cur,
+            dst_gate_cur, dst_up_cur, dst_mid, weights,
+            (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx,
+            tgpig, tiisg, sgitg);
+        return;
+    }
+
     ds4_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
@@ -5308,13 +6327,19 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
 
     (void)tiitg;
 }
+
+typedef decltype(kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl<false>) kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_t;
+template [[host_name("kernel_mul_mv_slots6_q4_K_pair_swiglu_f32")]]
+kernel kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_t kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl<false>;
+template [[host_name("kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_shared_x")]]
+kernel kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_t kernel_mul_mv_slots6_q4_K_pair_swiglu_f32_impl<true>;
 
 static inline device const char *ds4_q4_group24_select(
         uint32_t group_id,
@@ -5480,7 +6505,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -5604,7 +6629,7 @@ kernel void kernel_mul_mv_group8_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -5787,7 +6812,7 @@ kernel void kernel_mul_mv_group_q4_K_pair_swiglu_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             mid_f32[out_row] = silu * u * route_weight;
         }
     }
@@ -7754,8 +8779,7 @@ kernel void kernel_mul_mm_id_map0(
     const short ide = tpitg;
 
     uint32_t n_all = 0;
-
-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+    device int32_t * ids_i32 = (device int32_t *) hids;
 
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
         if (i21 + tpitg < args.ne21) {
@@ -7778,36 +8802,80 @@ kernel void kernel_mul_mm_id_map0(
 
             threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
 
-            short sel = 0;
+            uint32_t matches = 0;
             #pragma unroll(ne20)
             for (short i20 = 0; i20 < ne20; i20++) {
-                sel += (sids[i20] == ide)*(i20 + 1);
+                matches += sids[i20] == ide;
             }
-
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
-
-            n_all += sel > 0;
+            n_all += matches;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    /* Store a packed route list, not a fixed n_tokens slice per expert.  A
+     * malformed/synthetic top-k list may select the same expert in multiple
+     * slots of one token.  The historical `sel += slot + 1` collapsed those
+     * routes and could even point at a different slot.  Counting every match
+     * and assigning prefix-sum ranges preserves the original (token, slot)
+     * identity while keeping total storage bounded by ne21 * ne20. */
+    threadgroup uint32_t * route_counts =
+        (threadgroup uint32_t *) shmem;
+    route_counts[ide] = n_all;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t route_base = 0;
+    uint32_t tile_base = 0;
+    for (ushort i = 0; i < ide; i++) {
+        const uint32_t count = route_counts[i];
+        route_base += count;
+        tile_base += (count + 31u) / 32u;
+    }
+
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-    tpe_u32[ide] = n_all;
+    tpe_u32[2u*ide + 0u] = n_all;
+    tpe_u32[2u*ide + 1u] = route_base;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t route = 0;
+    for (int i21 = 0; i21 < args.ne21; i21 += ntg) {
+        if (i21 + tpitg < args.ne21) {
+            device const int32_t * src2_i32 =
+                (device const int32_t *)(src2 +
+                    (i21 + tpitg)*args.nb21);
+            threadgroup uint16_t * sids =
+                (threadgroup uint16_t *) shmem + tpitg*ne20;
+
+            #pragma unroll(ne20)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                sids[i20] = src2_i32[i20];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short t = 0; t < ntg; t++) {
+            if (i21 + t >= args.ne21) break;
+            threadgroup const uint16_t * sids =
+                (threadgroup const uint16_t *) shmem + t*ne20;
+
+            #pragma unroll(ne20)
+            for (short i20 = 0; i20 < ne20; i20++) {
+                if (sids[i20] == ide) {
+                    ids_i32[route_base + route++] =
+                        (i21 + t)*ne20 + i20;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // Reuse the route-id staging memory after the map is complete to build a
     // compact list of non-empty 32-row matmul tiles. The old dispatch covered
     // every possible token tile for every expert, even though most experts
     // receive only a small fraction of the prompt rows.
-    threadgroup uint16_t * tile_counts = (threadgroup uint16_t *) shmem;
     const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
-    tile_counts[ide] = n_tiles;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint32_t tile_base = 0;
-    for (ushort i = 0; i < ide; i++) {
-        tile_base += tile_counts[i];
-    }
 
     device uint32_t * work_count = (device uint32_t *) work;
     device uint2 * work_items = (device uint2 *)(work + 8);
@@ -7851,8 +8919,8 @@ kernel void kernel_mul_mm_id_map_scatter_work(
         ushort   ntg[[threads_per_threadgroup]]) {
     threadgroup atomic_uint * counts =
         (threadgroup atomic_uint *) shmem;
-    threadgroup uint16_t * tile_counts =
-        (threadgroup uint16_t *)(shmem +
+    threadgroup uint32_t * route_bases =
+        (threadgroup uint32_t *)(shmem +
             (uint32_t)args.ne02*sizeof(uint32_t));
     device uint32_t * tpe_u32 = (device uint32_t *) htpe;
     device int32_t * ids_i32 = (device int32_t *) hids;
@@ -7873,32 +8941,56 @@ kernel void kernel_mul_mm_id_map_scatter_work(
                 continue;
             }
 
-            const uint32_t row = atomic_fetch_add_explicit(
-                counts + expert, 1u, memory_order_relaxed);
-            // Production top-k selections are unique. Keep malformed or
-            // synthetic duplicates from exceeding the fixed expert slice.
-            if (row < (uint32_t)args.ne21) {
-                ids_i32[(uint32_t)expert*args.ne21 + row] =
-                    i21*ne20 + i20;
-            }
+            atomic_fetch_add_explicit(counts + expert,
+                                      1u,
+                                      memory_order_relaxed);
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const short ide = tpitg;
-    const uint32_t n_all = min(
-        atomic_load_explicit(counts + ide, memory_order_relaxed),
-        (uint32_t)args.ne21);
-    tpe_u32[ide] = n_all;
-
-    const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
-    tile_counts[ide] = n_tiles;
+    const uint32_t n_all =
+        atomic_load_explicit(counts + ide, memory_order_relaxed);
+    uint32_t route_base = 0;
+    for (ushort i = 0; i < ide; i++) {
+        route_base += atomic_load_explicit(counts + i,
+                                           memory_order_relaxed);
+    }
+    tpe_u32[2u*ide + 0u] = n_all;
+    tpe_u32[2u*ide + 1u] = route_base;
+    route_bases[ide] = route_base;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* Reuse the counters as per-expert write cursors for a second, stable-ABI
+     * scatter.  The packed ranges have room for every route, including
+     * repeated expert IDs in different top-k slots. */
+    atomic_store_explicit(counts + ide, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i21 = tpitg; i21 < args.ne21; i21 += ntg) {
+        device const int32_t * src2_i32 =
+            (device const int32_t *)(src2 + i21*args.nb21);
+
+        #pragma unroll(ne20)
+        for (short i20 = 0; i20 < ne20; i20++) {
+            const int32_t expert = src2_i32[i20];
+            if ((uint32_t)expert >= (uint32_t)args.ne02) continue;
+            const uint32_t row = atomic_fetch_add_explicit(
+                counts + expert, 1u, memory_order_relaxed);
+            const uint32_t base = route_bases[(uint32_t)expert];
+            ids_i32[base + row] = i21*ne20 + i20;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint16_t n_tiles = (uint16_t)((n_all + 31u) / 32u);
     uint32_t tile_base = 0;
     for (ushort i = 0; i < ide; i++) {
-        tile_base += tile_counts[i];
+        const uint32_t count_i =
+            atomic_load_explicit(counts + i, memory_order_relaxed);
+        tile_base += (count_i + 31u) / 32u;
     }
 
     device uint32_t * work_count = (device uint32_t *) work;
@@ -7962,7 +9054,8 @@ kernel void kernel_mul_mm_id(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -7981,7 +9074,7 @@ kernel void kernel_mul_mm_id(
          * the downstream swiglu/sum stages stay unchanged. Each (token,slot)
          * row belongs to exactly one expert, so nothing else writes them. */
         for (short j = sgitg; j < nr1; j += 4) {
-            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const int idj = ids_i32[route_base + r1 + j];
 
             const short ide = idj % args.ne20;
             const short idt = idj / args.ne20;
@@ -8002,7 +9095,7 @@ kernel void kernel_mul_mm_id(
 
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -8026,7 +9119,7 @@ kernel void kernel_mul_mm_id(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
@@ -8034,7 +9127,7 @@ kernel void kernel_mul_mm_id(
         if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (short i = 0; i < 16; i++) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
                 const short sy = (tiitg/NL0)/8;
 
@@ -8065,7 +9158,7 @@ kernel void kernel_mul_mm_id(
         }
 
         if (FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 8; ++i) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
 
@@ -8128,7 +9221,7 @@ kernel void kernel_mul_mm_id(
     threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
+        FOR_UNROLL (short i = 0; i < 8; i++) {
             simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
     }
@@ -8136,7 +9229,7 @@ kernel void kernel_mul_mm_id(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = sgitg; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -8159,10 +9252,144 @@ kernel void kernel_mul_mm_id(
     }
 }
 
+// Fixed-routing Q4_K attention output-A projection for the production
+// [token][group][K] -> [token][group][rank] layout.  The generic routed
+// matmul builds an expert-major map, work list, and scatter description even
+// though attention output-A always routes slot g to weight group g.  Keep the
+// same Q4 dequantization, F32->F16 staging, K-loop order, simdgroup MMA, and
+// final scatter arithmetic while deriving that fixed route directly from the
+// dispatch coordinates.
+kernel void kernel_attn_out_low_q4_K_legacy_direct(
+        constant ds4_metal_args_mul_mm_id & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short Q4_NL = 16;
+    constexpr int SA_BYTES = NR0*NR1*(int)sizeof(half);
+
+    const int group = (int)tgpig.z;
+    const int r0 = (int)tgpig.y*NR0;
+    const int r1 = (int)tgpig.x*NR1;
+    if (group >= args.ne02 || r0 >= args.ne0 || r1 >= args.ne21) return;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne21 - r1 < NR1) ? (args.ne21 - r1) : NR1;
+    const short lr0 = ((short)tiitg/NL0) < nr0 ?
+        ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ?
+        ((short)tiitg/NL1) : nr1 - 1;
+    const short il0 = tiitg % NL0;
+    short il = il0;
+
+    threadgroup half *sa = (threadgroup half *)shmem;
+    threadgroup half *sb =
+        (threadgroup half *)(shmem + SA_BYTES);
+
+    const uint64_t offset0 = (uint64_t)group*args.nb02;
+    const short offset1 = il0/Q4_NL;
+    device const block_q4_K *x =
+        (device const block_q4_K *)(src0 + args.nb01*(r0 + lr0) + offset0) +
+        offset1;
+
+    const short iy = 8*(tiitg % NL1);
+    device const float *y = (device const float *)(src1
+        + args.nb12*(r1 + lr1)
+        + args.nb11*group
+        + args.nb10*iy);
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    FOR_UNROLL (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        half4x4 temp_a;
+        dequantize_q4_K(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        const short sx = tiitg%NL1;
+        const short sy = (tiitg/NL1)/8;
+        const short ly = (tiitg/NL1)%8;
+        const short ib = 4*sx + sy;
+        *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) =
+            half2x4(*((device float2x4 *)y));
+
+        il = (il + 2 < Q4_NL) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + Q4_NL - 1)/Q4_NL : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *lsma = sa + 4*64*(sgitg%2);
+        threadgroup const half *lsmb = sb + 2*64*(sgitg/2);
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL (short i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float *temp_str =
+        ((threadgroup float *)shmem) + 32*(sgitg&1) +
+        (16*(sgitg >> 1))*NR0;
+    FOR_UNROLL (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) +
+            8*NR0*(i/4), NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short j = sgitg; j < nr1; j += 4) {
+        device float *D = (device float *)dst + r0 + group*args.ne0 +
+            (uint64_t)(r1 + j)*args.ne1*args.ne0;
+        device float4 *D4 = (device float4 *)D;
+        threadgroup float *C = (threadgroup float *)shmem + j*NR0;
+        threadgroup float4 *C4 = (threadgroup float4 *)C;
+
+        int i = tiisg;
+        for (; i < nr0/4; i += 32) D4[i] = C4[i];
+        i = 4*(nr0/4) + tiisg;
+        for (; i < nr0; i += 32) D[i] = C[i];
+    }
+}
+
 // Address-table variant used by SSD streaming.  The routing ids remain the
 // model's original expert ids, but each expert's resident buffer is found via a
 // GPU-address table instead of a contiguous full-layer tensor.
-template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool CULL_TAIL_SIMDGROUPS = false>
 kernel void kernel_mul_mm_id_addr(
         constant ds4_metal_args_mul_mm_id & args,
         device const uint64_t * src0_addrs,
@@ -8170,6 +9397,7 @@ kernel void kernel_mul_mm_id_addr(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * work,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -8186,14 +9414,31 @@ kernel void kernel_mul_mm_id_addr(
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
 
-    const int im = tgpig.z;
+    // The SSD address table can contain hundreds of experts while a prompt
+    // routes only top-k rows per token.  Consume the compact non-empty tile
+    // list emitted by kernel_mul_mm_id_map0 instead of launching the full
+    // expert x token-tile Cartesian grid.
+    device const uint32_t * work_count =
+        (device const uint32_t *)work;
+    const uint32_t work_index = tgpig.x;
+    if (work_index >= work_count[0]) {
+        return;
+    }
+    device const uint2 * work_items =
+        (device const uint2 *)(work + 8);
+    const uint2 item = work_items[work_index];
+    const int im = (int)item.x;
+    if ((uint)im >= (uint)args.ne02) {
+        return;
+    }
     const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
+    const int r1 = (int)item.y;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -8207,6 +9452,8 @@ kernel void kernel_mul_mm_id_addr(
 
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+    const bool mma_active =
+        !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
 
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
@@ -8215,7 +9462,7 @@ kernel void kernel_mul_mm_id_addr(
 
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -8238,7 +9485,7 @@ kernel void kernel_mul_mm_id_addr(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
@@ -8246,7 +9493,7 @@ kernel void kernel_mul_mm_id_addr(
         if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (short i = 0; i < 16; i++) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
                 const short sy = (tiitg/NL0)/8;
 
@@ -8277,7 +9524,7 @@ kernel void kernel_mul_mm_id_addr(
         }
 
         if (FC_mul_mm_bc_inp) {
-            for (short i = 0; i < 8; ++i) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
                 const short sx = (tiitg%NL1);
                 const short sy = (tiitg/NL1)/8;
 
@@ -8309,27 +9556,30 @@ kernel void kernel_mul_mm_id_addr(
         threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
-        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
+        if (mma_active) {
+            FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+                simdgroup_barrier(mem_flags::mem_none);
 
-            FOR_UNROLL (short i = 0; i < 4; i++) {
-                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 2; i++) {
+                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                }
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                FOR_UNROLL (short i = 0; i < 8; i++){
+                    simdgroup_multiply_accumulate(
+                        mc[i], mb[i/4], ma[i%4], mc[i]);
+                }
+
+                lsma += 8*64;
+                lsmb += 4*64;
             }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 2; i++) {
-                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
-            }
-
-            simdgroup_barrier(mem_flags::mem_none);
-
-            FOR_UNROLL (short i = 0; i < 8; i++){
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
-            }
-
-            lsma += 8*64;
-            lsmb += 4*64;
         }
     }
 
@@ -8337,14 +9587,18 @@ kernel void kernel_mul_mm_id_addr(
 
     threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
 
-    for (short i = 0; i < 8; i++) {
-        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+    if (mma_active) {
+        FOR_UNROLL (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i],
+                            temp_str + 8*(i%4) + 8*NR0*(i/4),
+                            NR0, 0, false);
+        }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = sgitg; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -8355,13 +9609,11 @@ kernel void kernel_mul_mm_id_addr(
         threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
         threadgroup float4 * C4 = (threadgroup float4 *) C;
 
-        int i = tiisg;
-        for (; i < nr0/4; i += 32) {
+        FOR_UNROLL (int i = tiisg; i < nr0/4; i += 32) {
             *(D4 + i) = *(C4 + i);
         }
 
-        i = (4*(nr0/4)) + tiisg;
-        for (; i < nr0; i += 32) {
+        FOR_UNROLL (int i = (4*(nr0/4)) + tiisg; i < nr0; i += 32) {
             *(D + i) = *(C + i);
         }
     }
@@ -8413,7 +9665,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -8433,7 +9686,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     const short il0 = (tiitg % NL0);
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -8462,7 +9715,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     simdgroup_float8x8 mc_gate[8];
     simdgroup_float8x8 mc_up[8];
 
-    for (short i = 0; i < 8; i++) {
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc_gate[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
         mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
@@ -8537,15 +9790,15 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     threadgroup float * temp_gate = (threadgroup float *) shmem;
     threadgroup float * temp_up = temp_gate + NR0*NR1;
-    threadgroup float * temp_gate_str =
-        temp_gate + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-    threadgroup float * temp_up_str =
-        temp_up + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    const int str_index = 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+    threadgroup float * temp_gate_str = temp_gate + str_index;
+    threadgroup float * temp_up_str = temp_up + str_index;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-            simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        FOR_UNROLL (short i = 0; i < 8; i++) {
+            const int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
+            simdgroup_store(mc_gate[i], temp_gate_str + si, NR0, 0, false);
+            simdgroup_store(mc_up[i],   temp_up_str   + si, NR0, 0, false);
         }
     }
 
@@ -8553,7 +9806,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     const float c = act.clamp_value;
     for (short j = sgitg; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -8566,15 +9819,14 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         threadgroup float *Cg = temp_gate + j*NR0;
         threadgroup float *Cu = temp_up   + j*NR0;
 
-        int i = tiisg;
-        for (; i < nr0; i += 32) {
+        for (int i = tiisg; i < nr0; i += 32) {
             float g = Cg[i];
             float u = Cu[i];
             if (c > 1.0e-6f) {
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             D[i] = (half)(silu * u * route_weight);
         }
     }
@@ -8628,7 +9880,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
     if (r1 >= neh1) {
         return;
     }
@@ -8646,8 +9899,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     const short il0 = (tiitg % NL0);
     short il = il0;
 
-    const int id_b0 = ids_i32[im*args.ne21 + r1 + lr1_b0];
-    const int id_b1 = ids_i32[im*args.ne21 + r1 + lr1_b1];
+    const int id_b0 = ids_i32[route_base + r1 + lr1_b0];
+    const int id_b1 = ids_i32[route_base + r1 + lr1_b1];
 
     const short i11_b0 = (id_b0 % args.ne20) % args.ne11;
     const short i12_b0 = (id_b0 / args.ne20);
@@ -8683,7 +9936,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     simdgroup_float8x8 mc_gate[8];
     simdgroup_float8x8 mc_up[8];
 
-    for (short i = 0; i < 8; i++) {
+    FOR_UNROLL (short i = 0; i < 8; i++) {
         mc_gate[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
         mc_up[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
@@ -8767,9 +10020,10 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     threadgroup float * temp_up_str = temp_up + 16*sgitg*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-            simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        FOR_UNROLL (short i = 0; i < 8; i++) {
+            const int si = (8 * (i & 3)) + (8 * NR0 * (i >> 2));
+            simdgroup_store(mc_gate[i], temp_gate_str + si, NR0, 0, false);
+            simdgroup_store(mc_up[i],   temp_up_str   + si, NR0, 0, false);
         }
     }
 
@@ -8777,7 +10031,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 
     const float c = act.clamp_value;
     for (short j = sgitg; j < nr1; j += 2) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -8790,21 +10044,21 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
         threadgroup float *Cg = temp_gate + j*NR0;
         threadgroup float *Cu = temp_up   + j*NR0;
 
-        int i = tiisg;
-        for (; i < nr0; i += 32) {
+        for (int i = tiisg; i < nr0; i += 32) {
             float g = Cg[i];
             float u = Cu[i];
             if (c > 1.0e-6f) {
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            const float silu = g / (1.0f + exp(-g));
+            const float silu = ds4_silu(g);
             D[i] = (half)(silu * u * route_weight);
         }
     }
 }
 
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mul_mm_id_pair_swiglu_f16_iq2;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, true>) mul_mm_id_pair_swiglu_f16_iq2_tail_cull;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_id_pair_swiglu_f16_q4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>) mul_mm_id_pair_swiglu_f16_mxfp4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4, true>) mul_mm_id_pair_swiglu_f16_mxfp4_tail_cull;
@@ -8812,6 +10066,7 @@ typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4,
 
 // Host-visible fused routed pair matmuls for the DS4 expert quant formats.
 template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_tail_cull")]] kernel mul_mm_id_pair_swiglu_f16_iq2_tail_cull kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, true>;
 template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;
@@ -8826,6 +10081,7 @@ typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, ha
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4>) mul_mm_id_mxfp4_f16_rhs_half_lut;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4, true>) mul_mm_id_mxfp4_f16_rhs_half_lut_tail_cull;
 typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_addr;
+typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, true>) mul_mm_id_addr_tail_cull;
 typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_addr_f16_rhs;
 
 // Host-visible batched MoE matmul variants for the DS4 quant formats.
@@ -8848,11 +10104,43 @@ template [[host_name("kernel_mul_mm_id_mxfp4_f16_half_lut")]] kernel mul_mm_id_m
 template [[host_name("kernel_mul_mm_id_mxfp4_f16_half_lut_tail_cull")]] kernel mul_mm_id_mxfp4_f16_rhs_half_lut_tail_cull kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4_half_lut, half, half4x4, half, half2x4, true>;
 
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_addr_iq2_xxs_f32")]] kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_addr_q2_K_f32_tail_cull")]] kernel mul_mm_id_addr_tail_cull kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, true>;
+template [[host_name("kernel_mul_mm_id_addr_iq2_xxs_f32_tail_cull")]] kernel mul_mm_id_addr_tail_cull kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, true>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mxfp4_f32")]]   kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_mxfp4_f16")]]   kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
+
+// Gather each expert's activation tile once for reuse by all output tiles.
+// The map stores interleaved (count, route base) pairs and compact route IDs.
+template<typename T>
+kernel void kernel_moe_pack_rhs(
+        constant ds4_metal_args_mul_mm_id &args,
+        device const char *src,
+        device const uint *tpe,
+        device const int *ids,
+        device const uint *work,
+        device half *dst,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    constexpr int N = 32;
+    const uint wi = row/N;
+    if (wi >= work[0]) return;
+    const uint2 item = ((device const uint2 *)(work + 2))[wi];
+    if (!ds4_tp_owns_expert(item.x, args.ne02, args.tp_rank, args.tp_world)) return;
+    const uint ri = min(item.y + row%N, tpe[2u*item.x] - 1);
+    const int id = ids[tpe[2u*item.x + 1u] + ri];
+    device const T *x = (device const T *)(src +
+        args.nb12*(id/args.ne20) + args.nb11*((id%args.ne20)%args.ne11));
+    for (uint k = tid; k < (uint)args.ne00; k += 128)
+        dst[(uint64_t)row*args.ne00 + k] = (half)x[k];
+}
+
+typedef decltype(kernel_moe_pack_rhs<float>) moe_pack_rhs_t;
+template [[host_name("kernel_moe_pack_rhs_f32")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<float>;
+template [[host_name("kernel_moe_pack_rhs_f16")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<half>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill. It uses
@@ -8982,41 +10270,13 @@ kernel void kernel_attn_out_low_mpp_direct_rhs(
     }
 }
 
-// Gather each expert's activation tile once for reuse by all output tiles.
-template<typename T>
-kernel void kernel_moe_pack_rhs(
-        constant ds4_metal_args_mul_mm_id &args,
-        device const char *src,
-        device const uint *counts,
-        device const int *ids,
-        device const uint *work,
-        device half *dst,
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]]) {
-    constexpr int N = 32;
-    const uint wi = row/N;
-    if (wi >= work[0]) return;
-    const uint2 item = ((device const uint2 *)(work + 2))[wi];
-    if (!ds4_tp_owns_expert(item.x, args.ne02, args.tp_rank, args.tp_world)) return;
-    const uint ri = min(item.y + row%N, counts[item.x] - 1);
-    const int id = ids[item.x*args.ne21 + ri];
-    device const T *x = (device const T *)(src +
-        args.nb12*(id/args.ne20) + args.nb11*((id%args.ne20)%args.ne11));
-    for (uint k = tid; k < (uint)args.ne00; k += 128)
-        dst[(uint64_t)row*args.ne00 + k] = (half)x[k];
-}
-
-typedef decltype(kernel_moe_pack_rhs<float>) moe_pack_rhs_t;
-template [[host_name("kernel_moe_pack_rhs_f32")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<float>;
-template [[host_name("kernel_moe_pack_rhs_f16")]] kernel moe_pack_rhs_t kernel_moe_pack_rhs<half>;
-
 template<typename block_q, short nl,
          void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 kernel void kernel_mul_mm_id_mpp_packed(
         constant ds4_metal_args_mul_mm_id &args,
         device const char *src0,
         device const half *src1,
-        device const uint *counts,
+        device const uint *tpe,
         device const int *ids,
         device float *dst,
         device const uint *work,
@@ -9028,11 +10288,12 @@ kernel void kernel_mul_mm_id_mpp_packed(
     const uint2 item = ((device const uint2 *)(work + 2))[group.x];
     const int expert = item.x, r0 = group.y*M, r1 = item.y;
     const int nr0 = min(M, args.ne0 - r0);
-    const int nr1 = min(N, (int)counts[expert] - r1);
+    const int nr1 = min(N, (int)tpe[2u*expert] - r1);
+    const uint route_base = tpe[2u*expert + 1u];
     if (nr0 <= 0 || nr1 <= 0) return;
     if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) {
         for (int i = tid; i < nr1*nr0; i += 128) {
-            const int id = ids[expert*args.ne21 + r1 + i/nr0];
+            const int id = ids[route_base + r1 + i/nr0];
             dst[(uint64_t)(id/args.ne20)*args.ne1*args.ne0 +
                 (id%args.ne20)*args.ne0 + r0 + i%nr0] = 0;
         }
@@ -9078,7 +10339,7 @@ kernel void kernel_mul_mm_id_mpp_packed(
     acc.store(tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = tid; i < nr1*nr0; i += 128) {
-        const int id = ids[expert*args.ne21 + r1 + i/nr0];
+        const int id = ids[route_base + r1 + i/nr0];
         dst[(uint64_t)(id/args.ne20)*args.ne1*args.ne0 +
             (id%args.ne20)*args.ne0 + r0 + i%nr0] =
             ((threadgroup float *)shmem)[(i/nr0)*M + i%nr0];
@@ -9090,9 +10351,12 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed")]] kernel mm_id_packe
 template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_mul_mm_id_mxfp4_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_mxfp4, 2, dequantize_mxfp4>;
 
-// Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline. The
-// barrier after mm.run prevents the next K iteration from replacing staged
-// tiles while the cooperative matmul still reads them.
+// Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline.
+// The 32 routed rows are two independent 16-row cooperative matmul2d
+// ops (one per SIMDgroup pair). Staging is double-buffered so the K
+// loop takes one barrier per step. A short final tile's empty row-half
+// skips MMA, accumulator init, and store; staging and barriers stay
+// unconditional. Threadgroup is sa[2]+sb[2] = 12 KiB.
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id_mpp(
         constant ds4_metal_args_mul_mm_id & args,
@@ -9108,7 +10372,7 @@ kernel void kernel_mul_mm_id_mpp(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 8192);
     threadgroup float *sc = (threadgroup float *)shmem;
 
     constexpr int NR0 = 64;
@@ -9131,7 +10395,8 @@ kernel void kernel_mul_mm_id_mpp(
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
 
-    const int32_t neh1 = tpe_u32[im];
+    const int32_t neh1 = tpe_u32[2u*(uint)im + 0u];
+    const uint32_t route_base = tpe_u32[2u*(uint)im + 1u];
 
     if (r1 >= neh1) {
         return;
@@ -9140,9 +10405,12 @@ kernel void kernel_mul_mm_id_mpp(
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
 
+    const short h = sgitg/2;
+    const bool mma_active = 16*h < nr1;
+
     if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
         for (short j = sgitg; j < nr1; j += 4) {
-            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const int idj = ids_i32[route_base + r1 + j];
             const short ide = idj % args.ne20;
             const short idt = idj / args.ne20;
             device float *D = (device float *)dst + r0 + ide*args.ne0 +
@@ -9156,9 +10424,8 @@ kernel void kernel_mul_mm_id_mpp(
     const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
 
     const short il0 = (tiitg % NL0);
-    short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[route_base + r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
@@ -9168,51 +10435,58 @@ kernel void kernel_mul_mm_id_mpp(
         (uint64_t)(im - args.tp_expert_base)*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
-    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * x_base = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
 
     const short iy = 8*(tiitg % NL1);
 
-    device const T1 * y = (device const T1 *)(src1
+    device const T1 * y_base = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*i12
         + args.nb11*i11
         + args.nb10*iy);
 
     auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
-    auto tB = tensor(sb, dextents<int32_t, 2>(NR1, NK));
+    auto tA1 = tensor(sa + NR0*NK, dextents<int32_t, 2>(NK, NR0));
+    auto tBh = tensor(sb + h*16*NK, dextents<int32_t, 2>(NK, 16));
+    auto tBh1 = tensor(sb + NR1*NK + h*16*NK, dextents<int32_t, 2>(NK, 16));
 
     matmul2d<
-        matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+        matmul2d_descriptor(16, NR0, NK, false, true, false,
             matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<4>> mm;
+        execution_simdgroups<2>> mm;
 
-    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tBh), decltype(tA), float>();
 
-    #pragma unroll
-    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-        if (cT.is_valid_element(i)) {
-            cT[i] = 0.0f;
+    if (mma_active) {
+        #pragma unroll
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+            if (cT.is_valid_element(i)) {
+                cT[i] = 0.0f;
+            }
         }
     }
 
-    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto stage_tile = [&](const int loop_k,
+                          threadgroup S0 * sa_buf,
+                          threadgroup S1 * sb_buf) {
+        const int chunk = loop_k / 16 + il0;
+        const short il = (short)(chunk % nl);
 
-            for (short i = 0; i < 16; i++) {
+        device const block_q * xb = x_base + (chunk / nl);
+
+        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+            FOR_UNROLL (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
                 const short sy = (tiitg/NL0)/8;
                 const short lx = i%8;
                 const short ly = (tiitg/NL0)%8;
 
-                *(sa + NK*(8*sy + ly) + 8*sx + lx) =
-                    loop_k + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;
+                *(sa_buf + NK*(8*sy + ly) + 8*sx + lx) =
+                    loop_k + 16*il + i < args.ne00 ? *((device T0 *) xb + i) : 0;
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dequantize_func(xb, il, temp_a);
 
             FOR_UNROLL (short i = 0; i < 16; i++) {
                 const short sx = 2*il0 + i/8;
@@ -9220,9 +10494,11 @@ kernel void kernel_mul_mm_id_mpp(
                 const short lx = i%8;
                 const short ly = (tiitg/NL0)%8;
 
-                *(sa + NK*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
+                *(sa_buf + NK*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
             }
         }
+
+        device const T1 * yb = y_base + loop_k;
 
         if (FC_mul_mm_bc_inp) {
             for (short i = 0; i < 8; ++i) {
@@ -9231,41 +10507,51 @@ kernel void kernel_mul_mm_id_mpp(
                 const short lx = i;
                 const short ly = (tiitg/NL1)%8;
 
-                *(sb + NK*(8*sy + ly) + 8*sx + lx) =
-                    loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb_buf + NK*(8*sy + ly) + 8*sx + lx) =
+                    loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) yb + i) : 0;
             }
         } else {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
             const short ly = (tiitg/NL1)%8;
 
-            *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) =
-                (S1_2x4)(*((device T1_2x4 *) y));
+            *(threadgroup S1_2x4 *)(sb_buf + NK*(8*sy + ly) + 8*sx) =
+                (S1_2x4)(*((device T1_2x4 *) yb));
+        }
+    };
+
+    stage_tile(0, sa, sb);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint buf_sel = 0;
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        if (mma_active) {
+            auto sA = (buf_sel ? tA1 : tA).slice(0, 0);
+            auto sB = (buf_sel ? tBh1 : tBh).slice(0, 0);
+            mm.run(sB, sA, cT);
         }
 
-        il = (il + 2 < nl) ? il + 2 : il % 2;
-        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
-
-        y += NK;
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto sA = tA.slice(0, 0);
-        auto sB = tB.slice(0, 0);
-        mm.run(sB, sA, cT);
-
+        const int next_k = loop_k + NK;
+        if (next_k < args.ne00) {
+            buf_sel ^= 1u;
+            stage_tile(next_k,
+                       buf_sel ? (sa + NR0*NK) : sa,
+                       buf_sel ? (sb + NR1*NK) : sb);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto tC = tensor(sc, dextents<int32_t, 2>(NR0, NR1));
-    cT.store(tC);
+    if (mma_active) {
+        auto tC = tensor(sc + h*16*NR0, dextents<int32_t, 2>(NR0, 16));
+        cT.store(tC);
+    }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = tiitg/32; j < nr1; j += 4) {
-        const int idj = ids_i32[im*args.ne21 + r1 + j];
+        const int idj = ids_i32[route_base + r1 + j];
 
         const short ide = idj % args.ne20;
         const short idt = idj / args.ne20;
@@ -9287,8 +10573,6 @@ kernel void kernel_mul_mm_id_mpp(
         }
     }
 }
-
-
 
 typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_mpp_t;
 typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_mpp_f16_rhs_t;

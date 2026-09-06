@@ -1,6 +1,5 @@
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
-#include <hipblaslt/hipblaslt.h>
 #include <rocblas/rocblas.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
@@ -66,7 +65,6 @@ extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
 #endif
 
 #define CUDA_QK_K 256
-#define DS4_ROCM_UNUSED __attribute__((unused))
 
 enum {
     /* attention_decode_mixed_kernel stores raw-window scores plus visible
@@ -115,13 +113,6 @@ typedef struct {
 
 static_assert(sizeof(cuda_block_mxfp4) == 17, "cuda_block_mxfp4 must match the GGUF MXFP4 block layout");
 
-/* Twice the MXFP4 values so each 32-value sub-block can use signed-int8
- * dp4a; the factor of 1/2 is folded into the sub-block scale. */
-__device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
-     0,  1,  2,  3,  4,  6,  8,  12,
-     0, -1, -2, -3, -4, -6, -8, -12,
-};
-
 #include "ds4_iq2_tables_cuda.inc"
 
 #include "rocm/ds4_rocm_runtime.cuh"
@@ -131,6 +122,8 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
     return ds4_rocm_is_gfx1151();
 }
+
+#include "rocm/ds4_rocm_q4_qb_sidecar.cuh"
 
 #include "rocm/ds4_rocm_q8.cuh"
 
@@ -163,6 +156,8 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 
 #include "rocm/ds4_rocm_moe.cuh"
 
+#include "rocm/ds4_rocm_q4.cuh"
+
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
 #include "rocm/ds4_rocm_glm.cuh"
@@ -181,6 +176,42 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     (void)layer; (void)gate;
     fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
     return 0;
+}
+
+/* The TP flag-fold and deferred kv-norm paths are Metal-only optimizations;
+ * non-Apple backends always take the plain fallback (add without the checked
+ * flag, kv norm always standalone). */
+extern "C" int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate) {
+    (void)layer; (void)gate;
+    return ds4_gpu_add_tensor(out, a, b, n);
+}
+
+extern "C" void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+}
+
+extern "C" void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void) {
+}
+
+extern "C" int ds4_gpu_kv_norm_task_pending(void) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_kv_norm_task_flush(void) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_kv_norm_task_begin_concurrent(void) {
+    return 0;
+}
+
+extern "C" void ds4_gpu_kv_norm_task_end_concurrent(void) {
 }
 
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {

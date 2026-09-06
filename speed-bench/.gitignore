@@ -3,3 +3,11 @@ __pycache__/
 local-runs/
 metal_decode_schedule_bench
 metal_prefill_variant_bench
+metal_q4_dense_pair_bench
+metal_q4_prefill_pair_bench
+metal_q4_mm_tail_cull_bench
+metal_iq2_moe_tail_cull_bench
+metal_iq2_moe_top8_pair_bench
+gpu_iq2_moe_prefill_bench
+cuda_q4_prefill_bench
+rocm_q4_prefill_bench

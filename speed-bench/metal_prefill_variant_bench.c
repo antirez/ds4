@@ -28,6 +28,10 @@ typedef struct {
     int warmup_tokens;
     int ctx;
     int repeats;
+    uint32_t ssd_cache_experts;
+    uint32_t ssd_preload_experts;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
 } bench_config;
 
 typedef struct {
@@ -47,7 +51,13 @@ static void usage(FILE *fp, const char *argv0) {
             "  --initial-tokens N     untimed live prefix before appending to that length\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
             "  --ctx N                session allocation (default: max lengths + 1)\n"
-            "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n",
+            "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n"
+            "  --ssd-streaming        use the SSD-backed model path\n"
+            "  --ssd-streaming-cold   skip the default expert-cache preload\n"
+            "  --ssd-streaming-cache-experts N\n"
+            "                         dynamic expert-cache entry count\n"
+            "  --ssd-streaming-preload-experts N\n"
+            "                         popularity preload count\n",
             argv0);
 }
 
@@ -84,6 +94,10 @@ static bench_config parse_options(int argc, char **argv) {
         .warmup_tokens = DEFAULT_WARMUP_TOKENS,
         .ctx = 0,
         .repeats = DEFAULT_REPEATS,
+        .ssd_cache_experts = 0,
+        .ssd_preload_experts = 0,
+        .ssd_streaming = false,
+        .ssd_streaming_cold = false,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -110,6 +124,16 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--repeats")) {
             cfg.repeats =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            cfg.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            cfg.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            cfg.ssd_cache_experts = (uint32_t)parse_int_arg(
+                need_arg(&i, argc, argv, arg), arg, 1);
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            cfg.ssd_preload_experts = (uint32_t)parse_int_arg(
+                need_arg(&i, argc, argv, arg), arg, 1);
         } else {
             fprintf(stderr, "%s: unknown option: %s\n", BENCH_NAME, arg);
             usage(stderr, argv[0]);
@@ -120,6 +144,14 @@ static bench_config parse_options(int argc, char **argv) {
     if (!cfg.candidate_env || cfg.candidate_env[0] == '\0' ||
         strchr(cfg.candidate_env, '=') != NULL) {
         fprintf(stderr, "%s: --candidate-env requires a valid name\n", BENCH_NAME);
+        exit(2);
+    }
+    if (!cfg.ssd_streaming &&
+        (cfg.ssd_streaming_cold || cfg.ssd_cache_experts != 0 ||
+         cfg.ssd_preload_experts != 0)) {
+        fprintf(stderr,
+                "%s: SSD cache options require --ssd-streaming\n",
+                BENCH_NAME);
         exit(2);
     }
     if (cfg.initial_tokens >= cfg.prefix_tokens) {
@@ -301,7 +333,11 @@ int main(int argc, char **argv) {
         .context_size = cfg.ctx,
         .prefill_chunk = 4096,
         .power_percent = 100,
-        .warm_weights = true,
+        .warm_weights = !cfg.ssd_streaming,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .ssd_streaming_cache_experts = cfg.ssd_cache_experts,
+        .ssd_streaming_preload_experts = cfg.ssd_preload_experts,
     };
     ds4_engine *engine = NULL;
     ds4_tokens tokens = {0};
@@ -341,7 +377,8 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "%s: model=%s prompt=%s prefix=%d initial=%d warmup=%d ctx=%d repeats=%d "
-            "candidate_env=%s\n",
+            "candidate_env=%s ssd_streaming=%s ssd_cold=%s "
+            "cache_experts=%u preload_experts=%u\n",
             BENCH_NAME,
             cfg.model_path,
             cfg.prompt_path,
@@ -350,7 +387,11 @@ int main(int argc, char **argv) {
             cfg.warmup_tokens,
             cfg.ctx,
             cfg.repeats,
-            cfg.candidate_env);
+            cfg.candidate_env,
+            cfg.ssd_streaming ? "yes" : "no",
+            cfg.ssd_streaming_cold ? "yes" : "no",
+            cfg.ssd_cache_experts,
+            cfg.ssd_preload_experts);
 
     for (int variant = 0; variant < VARIANT_COUNT; variant++) {
         err[0] = '\0';

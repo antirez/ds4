@@ -65,7 +65,6 @@
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
-#define DS4_DIST_RECV_TRANSPORT_ERROR 1
 #define DS4_DIST_RECV_REMOTE_ERROR 2
 #define DS4_DIST_SNAPSHOT_CHUNK_BYTES (8u * 1024u * 1024u)
 
@@ -8138,30 +8137,6 @@ ds4_dist_options *ds4_dist_options_create(void) {
 
 void ds4_dist_options_free(ds4_dist_options *opt) {
     free(opt);
-}
-
-void ds4_dist_usage(FILE *fp) {
-    fprintf(fp,
-        "  --role ROLE\n"
-        "      Distributed role: coordinator or worker.\n"
-        "  --layers A:B\n"
-        "      Inclusive distributed layer slice, e.g. 10:20 or 21:output.\n"
-        "  --listen HOST PORT\n"
-        "      Coordinator TCP listen address. Workers may later use it to force their data listener.\n"
-        "  --coordinator HOST PORT\n"
-        "      Coordinator TCP address for --role worker.\n"
-        "  --dist-prefill-chunk N\n"
-        "      Coordinator prefill pipeline chunk size. Default: session cap, normally 4096.\n"
-        "      Non-default values are experimental and can change logits unless validated.\n"
-        "  --dist-prefill-window N\n"
-        "      Coordinator max end-to-end prefill chunks in flight. Default: workers+2, capped at 8.\n"
-        "  --dist-activation-bits N\n"
-        "      Coordinator hidden-state transport width: 32, 16, or 8. Default: 32.\n"
-        "  --dist-replay-check\n"
-        "      Coordinator diagnostic: reset and replay the prompt, then compare logits.\n"
-        "  --debug\n"
-        "      Print coordinator route/debug logs. Workers keep their normal logs without this.\n"
-    );
 }
 
 ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
