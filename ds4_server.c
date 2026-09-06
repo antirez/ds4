@@ -13383,6 +13383,31 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static bool has_chunked_transfer_encoding(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    const char *te_header = "transfer-encoding";
+    size_t te_len = strlen(te_header);
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > te_len && strncasecmp(line, te_header, te_len) == 0 && line[te_len] == ':') {
+            const char *v = line + te_len + 1;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            const char *val_end = line + len;
+            while (val_end > v && isspace((unsigned char)*(val_end - 1))) val_end--;
+            if (val_end - v >= 7 && strncasecmp(val_end - 7, "chunked", 7) == 0) {
+                if (val_end - v == 7 || *(val_end - 8) == ',' || isspace((unsigned char)*(val_end - 8))) {
+                    return true;
+                }
+            }
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -13411,6 +13436,156 @@ static bool read_http_request(int fd, http_request *r) {
     if (q) *q = '\0';
 
     long clen = content_length(b.ptr, (size_t)hend);
+    bool chunked = has_chunked_transfer_encoding(b.ptr, (size_t)hend);
+    if (chunked && clen > 0) {
+        goto fail;
+    }
+    
+    if (chunked) {
+        buf decoded = {0};
+        size_t src_pos = (size_t)hend;
+
+        for (;;) {
+            /* Find the end of the chunk size line starting at src_pos */
+            size_t line_end = src_pos;
+            while (line_end < b.len && b.ptr[line_end] != '\n') {
+                line_end++;
+            }
+
+            /* If we don't have a complete line (i.e. \n is not found before b.len) */
+            while (line_end >= b.len) {
+                char tmp[4096];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                buf_append(&b, tmp, (size_t)n);
+                if (b.len - (size_t)hend > max_body) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                /* Re-scan from the previous line_end since b.ptr might have reallocated */
+                while (line_end < b.len && b.ptr[line_end] != '\n') {
+                    line_end++;
+                }
+            }
+
+            /* Parse the hex chunk size 'val' using strtol on the line */
+            const char *line_start = b.ptr + src_pos;
+            char *ep;
+            char hex_buf[128];
+            size_t line_len = line_end - src_pos;
+            if (line_len >= sizeof(hex_buf)) {
+                buf_free(&decoded);
+                goto fail;
+            }
+            memcpy(hex_buf, line_start, line_len);
+            hex_buf[line_len] = '\0';
+
+            long val = strtol(hex_buf, &ep, 16);
+            if (ep == hex_buf || !(*ep == '\0' || *ep == '\r' || *ep == ';') || val < 0 || val > 64 * 1024 * 1024) {
+                buf_free(&decoded);
+                goto fail;
+            }
+
+            /* Move src_pos past the chunk size line */
+            src_pos = line_end + 1;
+
+            /* If val == 0, we have finished reading all chunks */
+            if (val == 0) {
+                /* Consume trailer-section lines until we find an empty line */
+                for (;;) {
+                    size_t trailer_end = src_pos;
+                    while (trailer_end < b.len && b.ptr[trailer_end] != '\n') {
+                        trailer_end++;
+                    }
+                    while (trailer_end >= b.len) {
+                        char tmp[4096];
+                        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n <= 0) {
+                            buf_free(&decoded);
+                            goto fail;
+                        }
+                        buf_append(&b, tmp, (size_t)n);
+                        while (trailer_end < b.len && b.ptr[trailer_end] != '\n') {
+                            trailer_end++;
+                        }
+                    }
+                    size_t trailer_len = trailer_end - src_pos;
+                    if (trailer_len && b.ptr[trailer_end - 1] == '\r') {
+                        trailer_len--;
+                    }
+                    src_pos = trailer_end + 1;
+                    if (trailer_len == 0) {
+                        break; /* Empty line found; trailer section is fully consumed */
+                    }
+                }
+
+                /* Rebuild b with header + decoded body */
+                buf nb = {0};
+                buf_append(&nb, b.ptr, (size_t)hend);
+                buf_append(&nb, decoded.ptr, decoded.len);
+                clen = (long)decoded.len;
+                buf_free(&decoded);
+                buf_free(&b);
+                b = nb;
+                goto have_body;
+            }
+
+            /* Read from fd until we have at least val + 1 bytes in the buffer after src_pos */
+            while (b.len < src_pos + (size_t)val + 1) {
+                char tmp[4096];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                buf_append(&b, tmp, (size_t)n);
+                if (b.len - (size_t)hend > max_body) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+            }
+
+            /* Detect terminator length: 2 bytes if CRLF, 1 byte if LF */
+            size_t term_len = (b.ptr[src_pos + (size_t)val] == '\r') ? 2 : 1;
+
+            /* Read until the entire terminator is in the buffer */
+            while (b.len < src_pos + (size_t)val + term_len) {
+                char tmp[4096];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+                buf_append(&b, tmp, (size_t)n);
+                if (b.len - (size_t)hend > max_body) {
+                    buf_free(&decoded);
+                    goto fail;
+                }
+            }
+
+            /* Append the val bytes of chunk data to decoded */
+            buf_append(&decoded, b.ptr + src_pos, (size_t)val);
+
+            /* Move src_pos past the chunk data */
+            src_pos += (size_t)val;
+
+            /* Skip the chunk terminator (\r\n or \n) */
+            if (src_pos < b.len && b.ptr[src_pos] == '\r') {
+                src_pos++;
+            }
+            if (src_pos < b.len && b.ptr[src_pos] == '\n') {
+                src_pos++;
+            }
+        }
+    }
+    
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -13420,6 +13595,7 @@ static bool read_http_request(int fd, http_request *r) {
         buf_append(&b, tmp, (size_t)n);
     }
 
+have_body:
     r->body_len = (size_t)clen;
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
