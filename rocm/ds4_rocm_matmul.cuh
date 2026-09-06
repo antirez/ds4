@@ -547,7 +547,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             return cuda_ok(cudaGetLastError(),
                            "matmul_q8_0 f32 tiny exact8 launch");
         }
-        if (!g_quality_mode && (in_dim % 32u) == 0u &&
+        if (g_wmma_v1 && !g_quality_mode && (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
