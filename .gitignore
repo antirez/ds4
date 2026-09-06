@@ -9,6 +9,7 @@
 /ds4_test
 /ds4flash.gguf
 /TODO.md
+glm53flash_prefill*.md
 /gguf/
 /core
 /core.*
