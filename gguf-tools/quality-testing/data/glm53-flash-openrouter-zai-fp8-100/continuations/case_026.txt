@@ -1,0 +1,15 @@
+# Test Plan: Long-Context Prompt Chunking
+
+## Objective
+Validate that chunking long prompts preserves semantic coherence, retrieval accuracy, and answer quality compared to full-context processing.
+
+## Scope
+- Input documents/prompts exceeding context limits (e.g., 10K–1M tokens)
+- Chunking strategies: fixed-size, sentence/paragraph-based, recursive, semantic, sliding window with overlap
+
+## Test Scenarios
+
+**1. Chunking correctness**
+- Verify chunk sizes stay within token limits (test edge cases: exactly at limit, 1 token over)
+- Confirm no content loss or duplication across chunks
+- Validate

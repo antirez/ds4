@@ -1,0 +1,7 @@
+To understand how speculative decoding preserves **exact greedy output**, we need to look at the specific mechanism it uses to verify the draft tokens. 
+
+Here is the summary:
+
+**Speculative decoding preserves exact greedy output through a strict, token-by-token verification step that acts as a mathematical filter.** 
+
+Here is how it

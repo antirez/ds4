@@ -1,0 +1,46 @@
+{
+  "id": "gen-1788630686-mfFj1TLwWLIShFECwWeh",
+  "object": "chat.completion",
+  "created": 1788630686,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "## State owned by the server (per the excerpt)\n\n**Process-global state:**\n\n- `g_stop_requested` and `g_listen_fd` — `volatile sig_atomic_t` shutdown flags touched by `stop_signal_handler` (second SIGINT exits immediately with code 130; first one closes the listen fd to break the accept loop).\n\n**Per-connection / per-request state:**\n\n- `buf` — a growable byte buffer (`ptr`/`len`/`cap`) used for JSON string building, raw values, and minification. Never grows past `SIZE_MAX - len - 1`; always NUL",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3666,
+    "completion_tokens": 128,
+    "total_tokens": 3794,
+    "cost": 0.00030695,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.00030695,
+      "upstream_inference_prompt_cost": 0.00027495,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

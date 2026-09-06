@@ -1,0 +1,9 @@
+# Speculative Decoding: Preserving Exact Greedy Output
+
+## The Core Idea
+Speculative decoding uses a small, fast **draft model** to propose several tokens ahead, then verifies them in parallel with the large **target model**. The key question: how does this produce *identical* results to running the target model alone?
+
+## Why It's Exact (Greedy Case)
+
+**1. Verification is cheap and exact.**
+After the draft model proposes k tokens, the target model runs a single forward pass over the prompt + draft tokens. Because of causal attention, this one pass yields the target model's logits at

@@ -1,0 +1,13 @@
+# Why the Page Cache Speeds Up Second Reads
+
+## The Basic Idea
+
+The **page cache** is an in-memory cache maintained by the operating system that stores recently accessed file data in RAM. When a file is read, its contents are copied from disk into memory pages; subsequent reads of the same data can be served directly from RAM.
+
+## First Read (Slow)
+
+1. Application calls `read()`.
+2. The OS checks the page cache — miss.
+3. Data must be fetched from disk:
+   - Disk seek/rotation latency (HDDs: milliseconds)
+   - Or flash access latency (SSDs:

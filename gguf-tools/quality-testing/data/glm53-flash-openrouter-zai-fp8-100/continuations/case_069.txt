@@ -1,0 +1,14 @@
+# PR Review Checklist: Memory Lifetimes
+
+## Ownership & Scope
+- [ ] Clear single owner for each allocation (who frees it?)
+- [ ] No double-free or use-after-move possibilities
+- [ ] Ownership transfers documented (function signatures, comments)
+
+## Resource Cleanup
+- [ ] Every `new`/`malloc`/acquire has a matching release path
+- [ ] Early returns and error paths don't leak
+- [ ] RAII / smart pointers / try-with-resources used where available (no manual management without justification)
+- [ ] Destructors/cleanup run even on exceptions or panics
+
+##

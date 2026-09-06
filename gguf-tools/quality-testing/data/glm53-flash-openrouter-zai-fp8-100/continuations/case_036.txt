@@ -1,0 +1,10 @@
+# Piano di test: Chunking di prompt lunghi
+
+## Obiettivo
+Verificare che la suddivisione (chunking) di prompt lunghi preservi coerenza, completezza e qualità delle risposte.
+
+## 1. Preparazione dei dati
+- Selezionare 5-10 prompt lunghi (2.000–50.000 token) di tipologie diverse: documenti tecnici, conversazioni, codice, testi narrativi.
+- Definire le risposte attese (ground truth) per ogni prompt.
+
+## 2. Configur

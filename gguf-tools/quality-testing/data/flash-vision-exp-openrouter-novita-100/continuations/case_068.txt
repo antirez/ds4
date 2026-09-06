@@ -1,0 +1,5 @@
+To understand why quantization error disproportionately affects **rare experts** (specialized, low-frequency components of a model) versus **common experts** (high-frequency, frequently activated components), we have to look at how quantization works mathematically and statistically. 
+
+Here is the breakdown of the four core reasons:
+
+### 1. The "

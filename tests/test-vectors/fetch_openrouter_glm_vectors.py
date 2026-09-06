@@ -111,16 +111,18 @@ def request_vector(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    seed: int | None,
 ) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "seed": 1,
         "logprobs": True,
         "top_logprobs": top_logprobs,
         "stream": False,
     }
+    if seed is not None:
+        payload["seed"] = seed
     payload[token_limit_field] = max_completion_tokens
     if reasoning_effort != "omit":
         payload["reasoning"] = {"effort": reasoning_effort}
@@ -136,7 +138,7 @@ def request_vector(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "X-Title": "DwarfStar GLM vector checks",
+            "X-Title": "DwarfStar model vector checks",
         },
         method="POST",
     )
@@ -156,6 +158,7 @@ def fetch_vector_with_retry(
     provider_order: list[str],
     provider_allow_fallbacks: bool,
     provider_require_parameters: bool,
+    seed: int | None,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
@@ -172,6 +175,7 @@ def fetch_vector_with_retry(
                 provider_order,
                 provider_allow_fallbacks,
                 provider_require_parameters,
+                seed,
             )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
@@ -190,8 +194,13 @@ def fetch_vector_with_retry(
 def normalize_record(args: argparse.Namespace, prompt_spec: dict, response: dict) -> dict:
     choice = response["choices"][0]
     logprob_items = (choice.get("logprobs") or {}).get("content", []) or []
-    if not logprob_items:
-        raise RuntimeError(f"{prompt_spec['id']}: response did not include output-token logprobs")
+    if not logprob_items and not args.allow_missing_logprobs:
+        raise RuntimeError(
+            f"{prompt_spec['id']}: response did not include output-token "
+            f"logprobs (provider={response.get('provider')!r}, "
+            f"model={response.get('model')!r}, "
+            f"choice_fields={sorted(choice)})"
+        )
     steps = []
     for step, item in enumerate(logprob_items):
         top = []
@@ -222,13 +231,14 @@ def normalize_record(args: argparse.Namespace, prompt_spec: dict, response: dict
     request = {
         "model": args.model,
         "temperature": 0,
-        "seed": 1,
         "token_limit_field": args.token_limit_field,
         args.token_limit_field: args.max_completion_tokens,
         "logprobs": True,
         "top_logprobs": args.top_logprobs,
         "messages": [{"role": "user", "content": prompt_spec["prompt"]}],
     }
+    if args.seed is not None:
+        request["seed"] = args.seed
     if args.reasoning_effort != "omit":
         request["reasoning"] = {"effort": args.reasoning_effort}
     if args.provider_order or args.require_parameters:
@@ -239,7 +249,8 @@ def normalize_record(args: argparse.Namespace, prompt_spec: dict, response: dict
         request["provider"] = provider
 
     return {
-        "schema": "ds4-openrouter-logprobs-v1",
+        "schema": ("ds4-openrouter-logprobs-v1" if logprob_items
+                   else "ds4-openrouter-continuation-v1"),
         "source": "openrouter",
         "model": args.model,
         "endpoint": args.endpoint,
@@ -253,6 +264,7 @@ def normalize_record(args: argparse.Namespace, prompt_spec: dict, response: dict
         "finish_reason": choice.get("finish_reason"),
         "message": choice.get("message", {}),
         "logits_available": False,
+        "logprobs_available": bool(logprob_items),
         "steps": steps,
     }
 
@@ -264,7 +276,7 @@ def hex_bytes(values: list[int]) -> str:
 def write_compact_fixture(root: Path, manifest: dict) -> None:
     lines = [
         "# ds4-official-logprob-vectors-v1",
-        "# source openrouter z-ai/glm-5.2",
+        f"# source openrouter {manifest['model']}",
         "# case <id> <ctx> <steps> <prompt-file>",
         "# step <index> <selected-hex> <top-count>",
         "# top <token-hex> <official-logprob>",
@@ -310,6 +322,10 @@ def write_quality_manifest(root: Path, manifest: dict) -> None:
         record_path = root / prompt["official_file"]
         record = json.loads(record_path.read_text(encoding="utf-8"))
         content = record.get("message", {}).get("content", "")
+        if not isinstance(content, str) or not content:
+            raise RuntimeError(
+                f"{prompt['id']}: response has no assistant continuation"
+            )
         cont_path = cont_dir / f"{prompt['id']}.txt"
         cont_path.write_text(content, encoding="utf-8")
         lines.append("\t".join([
@@ -331,12 +347,20 @@ def main() -> int:
     parser.add_argument("--reasoning-effort",
                         choices=("xhigh", "high", "medium", "low", "minimal", "none", "omit"),
                         default="none")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--omit-seed", dest="seed", action="store_const",
+                        const=None,
+                        help="omit seed for providers that do not expose it")
     parser.add_argument("--token-limit-field",
                         choices=("max_tokens", "max_completion_tokens"),
                         default="max_tokens")
     parser.add_argument("--provider-order", default=",".join(PROVIDER_ORDER),
                         help="comma-separated OpenRouter provider slugs")
     parser.add_argument("--allow-provider-fallbacks", action="store_true")
+    parser.add_argument("--require-response-provider",
+                        help="reject responses from any other provider")
+    parser.add_argument("--allow-missing-logprobs", action="store_true",
+                        help="write continuation-only records when a provider omits logprobs")
     parser.add_argument("--no-require-parameters", dest="require_parameters",
                         action="store_false",
                         help="allow routing to providers that do not advertise all requested parameters")
@@ -373,9 +397,12 @@ def main() -> int:
         "max_completion_tokens": args.max_completion_tokens,
         "token_limit_field": args.token_limit_field,
         "reasoning_effort": args.reasoning_effort,
+        "seed": args.seed,
         "provider_order": args.provider_order,
         "allow_provider_fallbacks": args.allow_provider_fallbacks,
         "require_parameters": args.require_parameters,
+        "required_response_provider": args.require_response_provider,
+        "allow_missing_logprobs": args.allow_missing_logprobs,
         "prompts": [],
     }
 
@@ -397,7 +424,15 @@ def main() -> int:
             args.provider_order,
             args.allow_provider_fallbacks,
             args.require_parameters,
+            args.seed,
         )
+        if (args.require_response_provider and
+                response.get("provider") != args.require_response_provider):
+            raise RuntimeError(
+                f"{spec['id']}: expected provider "
+                f"{args.require_response_provider!r}, got "
+                f"{response.get('provider')!r}"
+            )
         record = normalize_record(args, spec, response)
         out_path = official_dir / f"{spec['id']}.official.json"
         out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -415,7 +450,7 @@ def main() -> int:
 
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     write_quality_manifest(root, manifest)
-    if not wanted:
+    if not wanted and all(prompt["steps"] for prompt in manifest["prompts"]):
         write_compact_fixture(root, manifest)
     return 0
 

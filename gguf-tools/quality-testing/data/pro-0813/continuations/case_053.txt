@@ -1,0 +1,6 @@
+Ecco uno schema JSON minimo per una tool call:
+
+```json
+{
+  "type": "object",
+ 

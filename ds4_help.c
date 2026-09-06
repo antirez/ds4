@@ -147,6 +147,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
+    }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -169,23 +172,28 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: N is an exact dynamic expert count; NGB is a routed memory budget that also reserves two full prefill layers. Auto: 80% working set minus non-routed weights; GLM Metal caps lower.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots; NGB also reserves two full prefill layers. Either may be reduced to fit the model, graph, context, and backend working set.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
-        if (tool != DS4_HELP_BENCH) {
-            opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
+        if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+            opt(fp, c, "--mtp", "Enable model-embedded MTP speculation.");
+            opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
-            opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
-            opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
-            opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
-            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Default: Metal 0.6; CUDA/ROCm 0.7");
+            opt(fp, c, "--mtp-timing", "Enable embedded MTP and print acceptance/timing counters.");
+            opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");
+            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8");
+            opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
+        } else if (tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
+            opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
@@ -259,6 +267,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live conversation.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
@@ -268,7 +277,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
 static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
-    opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
+    opt(fp, c, "--dump-tokens", "Print the exact CLI prompt token stream, then exit. Use --raw for literal text.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");
@@ -279,6 +288,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
     opt(fp, c, "--imatrix-max-prompts N", "Stop imatrix collection after N prompts.");
     opt(fp, c, "--imatrix-max-tokens N", "Stop imatrix collection after N prompt tokens.");
+    opt(fp, c, "--imatrix-min-expert-samples N", "Continue until every routed expert has N samples.");
     opt(fp, c, "--head-test", "Run the output HC/logits head after the native slice.");
     opt(fp, c, "--first-token-test", "Run exact CPU whole-model pass for the first prompt token.");
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");
@@ -293,7 +303,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
-    opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
+    opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
     opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
     fputc('\n', fp);
@@ -302,8 +312,10 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
 static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
-    opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
-    opt(fp, c, "--raw-prompt", "Non-interactive -p only: tokenize prompt without agent chat/tool text.");
+    opt(fp, c, "--prompt-file FILE", "Read the initial prompt from FILE.");
+    opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live task.");
+    opt(fp, c, "--non-interactive", "Run without TUI. With an initial prompt: one turn; otherwise: repeated stdin prompts.");
+    opt(fp, c, "--raw-prompt", "Non-interactive initial prompt only: omit agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
@@ -333,7 +345,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
-    opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
+    opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
@@ -377,6 +389,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--step-mul F", "Multiplicative step. Default: 1");
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "--teacher-forced-decode", "Decode the following prompt tokens instead of each predicted argmax.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);
@@ -384,9 +397,16 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
 
 static void print_eval_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Evaluation");
-    opt(fp, c, "-n, --tokens N", "Max generated tokens per question. Default: 16000");
-    opt(fp, c, "--questions N", "Run only the first N embedded questions.");
+    opt(fp, c, "--suite NAME", "core, hard, all, or hard-smoke. Default: core");
+    opt(fp, c, "--source NAME", "Run only cases from this source.");
+    opt(fp, c, "--domain NAME", "Run only cases in this domain.");
+    opt(fp, c, "--case-id ID", "Run the case with this source ID.");
+    opt(fp, c, "--list-cases", "List selected cases without loading a model.");
+    opt(fp, c, "--validate-cases", "Validate all embedded cases and exit.");
+    opt(fp, c, "-n, --tokens N", "Override the generation budget for every question.");
+    opt(fp, c, "--questions N", "Run only the first N selected questions.");
     opt(fp, c, "--case-sequence LIST", "Run 1-based case numbers in this comma-separated order.");
+    opt(fp, c, "--retry-incomplete", "Retry a missing final answer once with twice the budget.");
     opt(fp, c, "--trace FILE", "Write questions, outputs, and grading decisions.");
     opt(fp, c, "--regrade-trace FILE", "Regrade a prior trace without loading the model.");
     opt(fp, c, "--soft-limit-reply-budget N", "Soft close thinking near the end of reply budget. Default: 1024");

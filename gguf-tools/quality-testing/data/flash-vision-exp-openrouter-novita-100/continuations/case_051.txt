@@ -1,0 +1,1 @@
+Questa è una domanda fondamentale per capire come funzionano i modelli linguistici (LLM). La risposta breve è: **perché la funzione softmax trasforma differenze infinitesimali nei logit in differenze enormi di probabilità, e la decodifica greedy sceglie il

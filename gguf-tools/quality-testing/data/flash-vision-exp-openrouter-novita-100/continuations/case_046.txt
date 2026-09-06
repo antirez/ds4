@@ -1,0 +1,5 @@
+To understand the role of a router in a Mixture-of-Experts (MoE) layer, it helps to think of it as the **traffic controller** or **dispatcher** of a neural network. 
+
+Here is a breakdown of its role, how it works, and why it is so critical.
+
+###

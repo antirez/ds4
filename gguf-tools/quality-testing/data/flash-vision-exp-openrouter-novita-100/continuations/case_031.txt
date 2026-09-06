@@ -1,0 +1,8 @@
+Ecco una breve funzione C che limita un intero a un intervallo specificato:
+
+```c
+#include <stdio.h>
+
+// Funzione che limita un intero a un intervallo [min, max]
+int clamp(int value, int min, int max) {
+    if (value < min)

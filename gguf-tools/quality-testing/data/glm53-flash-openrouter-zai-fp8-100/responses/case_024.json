@@ -1,0 +1,46 @@
+{
+  "id": "gen-1787762145-jzqNoOjE9PVRtwW3QOWd",
+  "object": "chat.completion",
+  "created": 1787762145,
+  "model": "z-ai/glm-5.3-flash",
+  "provider": "Z.AI",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "# Safe Format for Storing Model Checkpoint Headers\n\nA checkpoint header is the metadata at the start of a serialized model file. Here's a robust design:\n\n## Recommended Structure\n\n```\n+---------------------------+\n| Magic Number (4 bytes)    |  e.g., 0x4D434B50 (\"MCKP\")\n| Version (2 bytes)         |  format version for forward compat\n| Header Size (4 bytes)     |  allows skipping unknown fields\n| Flags (4 bytes)           |  compression, encryption, endianness\n| Payload Length (8 bytes)  |  expected",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 128,
+    "total_tokens": 151,
+    "cost": 3.3725e-05,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 3.3725e-05,
+      "upstream_inference_prompt_cost": 1.725e-06,
+      "upstream_inference_completions_cost": 3.2e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}

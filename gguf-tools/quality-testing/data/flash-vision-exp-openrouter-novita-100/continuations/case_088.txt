@@ -1,0 +1,1 @@
+A tokenizer should treat special tags (like `[CLS]`, `[SEP]`, `<s>`, `</s>`, `[MASK]`, `[PAD]`, or custom XML/HTML-like tags) carefully because **these tokens carry structural, semantic, or functional meaning that

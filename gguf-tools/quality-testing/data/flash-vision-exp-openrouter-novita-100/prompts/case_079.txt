@@ -1,0 +1,1 @@
+Scrivi una breve checklist per revisionare lifetime di memoria in una PR.

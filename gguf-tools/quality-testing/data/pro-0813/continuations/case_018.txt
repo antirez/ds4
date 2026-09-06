@@ -1,0 +1,1 @@
+La differenza di velocità tra la fase di **prefill** e la fase di **decode** (generazione
