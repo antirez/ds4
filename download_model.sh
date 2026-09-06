@@ -444,6 +444,22 @@ download_one() {
     echo "from https://huggingface.co/$REPO"
     echo "If the download stops, run the same command again to resume it."
 
+    # Prefer the Hugging Face CLI when available: it is xet-bridge native
+    # and resumable. The plain curl path below 400s on some large files
+    # (e.g. the ~430 GB PRO bundle) because Hugging Face's xet bridge
+    # rejects range-less GETs above a certain size.
+    HF_BIN=$(command -v hf 2>/dev/null || command -v huggingface-cli 2>/dev/null || true)
+    if [ -n "$HF_BIN" ]; then
+        # Pass the token via HF_TOKEN env rather than --token so it does
+        # not appear in `ps` output of the child process.
+        if [ -n "$TOKEN" ]; then
+            HF_TOKEN="$TOKEN" "$HF_BIN" download "$REPO" "$file" --local-dir "$OUT_DIR"
+        else
+            "$HF_BIN" download "$REPO" "$file" --local-dir "$OUT_DIR"
+        fi
+        return
+    fi
+
     if [ -n "$TOKEN" ]; then
         curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
     else
