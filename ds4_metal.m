@@ -28631,12 +28631,42 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     }
     id<MTLComputePipelineState> blk_pipeline =
         ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
+    /* Skip empty mask blocks only in the measured resident pre-M5 square
+     * prefill range. Longer and cached/rectangular prefills keep the generic
+     * loop; the diagnostic disable switch provides its same-binary oracle. */
+    const bool disable_static_block_skip =
+        getenv("DS4_METAL_DISABLE_PRE_M5_STATIC_MIXED_BLOCK_SKIP") != NULL;
+    const bool require_static_block_skip =
+        getenv("DS4_METAL_REQUIRE_PRE_M5_STATIC_MIXED_BLOCK_SKIP") != NULL &&
+        !disable_static_block_skip;
+    const bool skip_static_masked_blocks =
+        !g_quality_mode && !g_ssd_streaming_mode && g_tp_split_world == 1 &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        use_comp_mask == 0u && q_row0 == 0u && n_q == n_tokens &&
+        n_tokens >= 512u && n_tokens <= 2048u && n_tokens % 64u == 0u &&
+        window == 128u && (ratio == 4u || ratio == 128u) &&
+        n_comp == n_tokens / ratio && n_head == 64u && head_dim == 512u &&
+        !disable_static_block_skip;
+    if (!skip_static_masked_blocks && require_static_block_skip) {
+        fprintf(stderr, "ds4: required Metal static-mixed block skip was not selected\n");
+        return 0;
+    }
+    const char *attn_name = !skip_static_masked_blocks
+        ? "kernel_flash_attn_ext_f16_dk512_dv512"
+        : ratio == 4u ? "kernel_flash_attn_ext_f16_dk512_dv512_static_r4"
+                      : "kernel_flash_attn_ext_f16_dk512_dv512_static_r128";
     id<MTLComputePipelineState> attn_pipeline =
-        ds4_gpu_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
+        ds4_gpu_get_flash_attn_pipeline(attn_name,
                                           true, true, false, false, has_kvpad, bc_mask,
                                           (int32_t)head_dim,
                                           (int32_t)head_dim,
                                           (int32_t)nsg);
+    if (!attn_pipeline && skip_static_masked_blocks && !require_static_block_skip) {
+        attn_pipeline = ds4_gpu_get_flash_attn_pipeline(
+            "kernel_flash_attn_ext_f16_dk512_dv512",
+            true, true, false, false, has_kvpad, bc_mask,
+            (int32_t)head_dim, (int32_t)head_dim, (int32_t)nsg);
+    }
     if (!blk_pipeline || !attn_pipeline) return 0;
 
     if (has_kvpad) {

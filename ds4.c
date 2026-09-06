@@ -28768,7 +28768,13 @@ static bool metal_graph_dspark_capture_commit_prefix(
 
 /* Encode a full single-token decode step on Metal.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
-static bool metal_graph_encode_token_raw_swa(
+typedef struct {
+    int (*confirm)(void *ctx); /* negative: error, zero: rejected, positive: approved */
+    void *ctx;
+    bool rejected;
+} metal_graph_raw_prefix_gate;
+
+static bool metal_graph_encode_token_raw_swa_with_raw_prefix_gate(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -28776,7 +28782,8 @@ static bool metal_graph_encode_token_raw_swa(
         uint32_t               pos,
         bool                   need_logits,
         bool                   allow_split_flush,
-        const ds4_gpu_tensor  *token_dev) {
+        const ds4_gpu_tensor  *token_dev,
+        metal_graph_raw_prefix_gate *prefix_gate) {
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
@@ -28947,6 +28954,19 @@ static bool metal_graph_encode_token_raw_swa(
             ok = metal_graph_flush_hc_expand(g);
         }
         if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+        if (ok && prefix_gate && il == 1u) {
+            /* Only the two leading raw layers may run before confirmation.
+             * The caller guarantees ring slack, so their future KV rows are
+             * invisible on rejection. Two HC swaps preserve pointer parity;
+             * no compressor frontier or output logits have been touched. */
+            ok = ds4_gpu_flush_commands() != 0;
+            if (ok) {
+                const int confirmed = prefix_gate->confirm(prefix_gate->ctx);
+                ok = confirmed >= 0;
+                prefix_gate->rejected = confirmed == 0;
+                if (!ok || prefix_gate->rejected) break;
+            }
+        }
         /* Shared-event TP arrival is monotonic: a later command buffer could
          * satisfy an earlier gate before that gate's payload is ready. The
          * default single-session flag path instead publishes an exact value
@@ -28960,15 +28980,29 @@ static bool metal_graph_encode_token_raw_swa(
         }
     }
 
-    if (ok && need_logits) {
-        if (ok) ok = metal_graph_flush_hc_expand(g);
-        ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && need_logits && !(prefix_gate && prefix_gate->rejected)) {
+        ok = metal_graph_flush_hc_expand(g);
+        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
 #if defined(__APPLE__)
     (void)ds4_gpu_set_decode_pipeline_fast_lookup(
         previous_pipeline_fast_lookup);
 #endif
     return ok;
+}
+
+static bool metal_graph_encode_token_raw_swa(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        int token,
+        uint32_t pos,
+        bool need_logits,
+        bool allow_split_flush,
+        const ds4_gpu_tensor *token_dev) {
+    return metal_graph_encode_token_raw_swa_with_raw_prefix_gate(
+            g, model, weights, token, pos, need_logits, allow_split_flush,
+            token_dev, NULL);
 }
 
 static ds4_gpu_tensor *metal_graph_tensor_row_view(
@@ -30488,13 +30522,18 @@ static bool metal_graph_encode_layer_attention_batch(
         const bool topk_prefill_needed =
             ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
 #if defined(__APPLE__)
-        /* A zero-prefix ratio-4 batch does not consume the indexer query or
+        /* A ratio-4 batch does not consume the indexer query or
          * its per-head weights until the compressed cache grows beyond
          * top-k.  Keep building the indexer compressor/cache below, but skip
          * these four ephemeral query dispatches while every attention row
-         * still uses the exact static-mixed path. */
+         * still uses the exact static-mixed path. Continuations use the same
+         * final-count test: counts increase monotonically, and every query
+         * consumer requires more than top-k compressed rows. */
         const bool prune_unused_indexer_query =
-            ratio == 4 && zero_prefix && n_tokens >= 32u &&
+            ratio == 4 && n_tokens >= 32u &&
+            (zero_prefix ||
+             (ds4_gpu_device_is_pre_m5_apple_silicon() &&
+              getenv("DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_QUERY_PRUNE_CONTINUATION") == NULL)) &&
             !topk_prefill_needed &&
             !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
             g->placement == NULL && g->tp_world < 2u &&
@@ -30503,6 +30542,94 @@ static bool metal_graph_encode_layer_attention_batch(
                 "DS4_METAL_DISABLE_M5_BATCH_INDEXER_QUERY_PRUNE");
 #else
         const bool prune_unused_indexer_query = false;
+#endif
+
+        uint32_t indexer_query_row0 = 0;
+        uint32_t indexer_query_rows = n_tokens;
+        ds4_gpu_tensor *indexer_query = metal_graph_batch_indexer_q(g);
+        ds4_gpu_tensor *indexer_weights = metal_graph_batch_indexer_weights(g);
+        ds4_gpu_tensor *indexer_scores = metal_graph_indexer_scores(g);
+        ds4_gpu_tensor *indexer_topk = metal_graph_comp_selected(g);
+        const ds4_gpu_tensor *indexer_q_source = metal_graph_batch_qr_norm(g);
+        const ds4_gpu_tensor *indexer_weight_source = metal_graph_batch_attn_norm(g);
+        enum { indexer_leading_view_count = 7 };
+        ds4_gpu_tensor *indexer_leading_views[indexer_leading_view_count] = {NULL};
+#if defined(__APPLE__)
+        const bool prune_leading_indexer_queries =
+            ok && topk_prefill_needed && n_tokens >= 64u &&
+            (zero_prefix || n_tokens <= g->raw_cap) &&
+            !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
+            g->placement == NULL && g->tp_world < 2u &&
+            !visual_attention && !g->spec_capture_prefixes &&
+            !index_stage_profile && !layer_stage_profile &&
+            metal_graph_debug_get_config()->prefix == NULL &&
+            DS4_MODEL_VARIANT == DS4_VARIANT_FLASH && q_rank == 1024u &&
+            DS4_N_INDEXER_HEAD == 64u && DS4_N_INDEXER_HEAD_DIM == 128u &&
+            DS4_N_INDEXER_TOP_K == 512u &&
+            layer->indexer_attn_q_b && layer->indexer_proj &&
+            layer->indexer_attn_q_b->type == DS4_TENSOR_F16 &&
+            layer->indexer_attn_q_b->dim[0] == q_rank &&
+            layer->indexer_attn_q_b->dim[1] == 8192u &&
+            layer->indexer_proj->type == DS4_TENSOR_F16 &&
+            layer->indexer_proj->dim[0] == DS4_N_EMBD &&
+            layer->indexer_proj->dim[1] == DS4_N_INDEXER_HEAD &&
+            ds4_gpu_device_is_pre_m5_apple_silicon() &&
+            getenv("DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_LEADING_QUERY_PRUNE") == NULL;
+        if (prune_leading_indexer_queries) {
+            /* The first query needing a choice among compressed rows has
+             * absolute position 4*(512+1)-1 = 2051. Earlier queries see at
+             * most 512 rows. Keep cuts on the existing 32-token MMA tiles
+             * and at least 32 tail rows, preserving the F16 PSO, tile lane
+             * and tail shape instead of switching to a small-N matvec. */
+            const uint64_t first_needed =
+                (uint64_t)ratio * (DS4_N_INDEXER_TOP_K + 1u) - 1u;
+            uint32_t unused_rows = first_needed > pos0
+                ? (uint32_t)(first_needed - pos0) : 0u;
+            if (unused_rows > n_tokens - 32u) unused_rows = n_tokens - 32u;
+            indexer_query_row0 = unused_rows & ~31u;
+            indexer_query_rows = n_tokens - indexer_query_row0;
+            if (indexer_query_row0 != 0u) {
+                const uint64_t query_width =
+                    (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+                indexer_leading_views[0] = metal_graph_tensor_row_range_view(
+                    metal_graph_batch_qr_norm(g), indexer_query_row0,
+                    indexer_query_rows, q_rank);
+                indexer_leading_views[1] = metal_graph_tensor_row_range_view(
+                    metal_graph_batch_attn_norm(g), indexer_query_row0,
+                    indexer_query_rows, DS4_N_EMBD);
+                indexer_leading_views[2] = metal_graph_tensor_row_range_view(
+                    indexer_query, indexer_query_row0, indexer_query_rows, query_width);
+                indexer_leading_views[3] = metal_graph_tensor_row_range_view(
+                    indexer_weights, indexer_query_row0, indexer_query_rows,
+                    DS4_N_INDEXER_HEAD);
+                indexer_leading_views[4] = metal_graph_tensor_row_range_view(
+                    indexer_scores, indexer_query_row0, indexer_query_rows, n_comp);
+                indexer_leading_views[5] = metal_graph_tensor_row_range_view(
+                    indexer_topk, indexer_query_row0, indexer_query_rows,
+                    DS4_N_INDEXER_TOP_K);
+                indexer_leading_views[6] = metal_graph_tensor_row_range_view(
+                    indexer_topk, 0, indexer_query_row0, DS4_N_INDEXER_TOP_K);
+                for (unsigned i = 0; i < indexer_leading_view_count; i++) {
+                    if (!indexer_leading_views[i]) ok = false;
+                }
+                if (ok) {
+                    indexer_q_source = indexer_leading_views[0];
+                    indexer_weight_source = indexer_leading_views[1];
+                    indexer_query = indexer_leading_views[2];
+                    indexer_weights = indexer_leading_views[3];
+                    indexer_scores = indexer_leading_views[4];
+                    indexer_topk = indexer_leading_views[5];
+                    /* Seed each unused row with 0..511. The existing full
+                     * attention pass still sorts chronologically and stops
+                     * at idx >= visible, so it consumes exactly 0..visible-1
+                     * in the old order. A synthetic range origin of 511
+                     * makes this existing fill helper emit every slot. */
+                    ok = ds4_gpu_glm_fill_selected_range_batch_tensor(
+                        indexer_leading_views[6], indexer_query_row0,
+                        DS4_N_INDEXER_TOP_K - 1u, DS4_N_INDEXER_TOP_K, 0u) != 0;
+                }
+            }
+        }
 #endif
 
         if (ok && ratio == 4) {
@@ -30541,19 +30668,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   (uint64_t)index_width * n_tokens,
                                                   il,
                                                   pos0);
-            if (ok && !prune_unused_indexer_query) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_indexer_q(g),
+            if (ok && !prune_unused_indexer_query) ok = metal_graph_matmul_plain_tensor(indexer_query,
                                                           model,
                                                           layer->indexer_attn_q_b,
                                                           q_rank,
                                                           (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
-                                                          metal_graph_batch_qr_norm(g),
-                                                          n_tokens);
-            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_indexer_q(g),
-                                                    n_tokens,
+                                                          indexer_q_source,
+                                                          indexer_query_rows);
+            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_rope_tail_tensor(indexer_query,
+                                                    indexer_query_rows,
                                                     DS4_N_INDEXER_HEAD,
                                                     DS4_N_INDEXER_HEAD_DIM,
                                                     DS4_N_ROT,
-                                                    pos0,
+                                                    pos0 + indexer_query_row0,
                                                     compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                     false,
                                                     freq_base,
@@ -30562,17 +30689,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_dsv4_indexer_qat_tensor(metal_graph_batch_indexer_q(g),
-                                                          n_tokens * DS4_N_INDEXER_HEAD,
+            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_dsv4_indexer_qat_tensor(indexer_query,
+                                                          indexer_query_rows * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
-            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
+            if (ok && !prune_unused_indexer_query) ok = ds4_gpu_matmul_f16_tensor(indexer_weights,
                                                      model->map,
                                                      model->size,
                                                      layer->indexer_proj->abs_offset,
                                                      DS4_N_EMBD,
                                                      DS4_N_INDEXER_HEAD,
-                                                     metal_graph_batch_attn_norm(g),
-                                                     n_tokens) != 0;
+                                                     indexer_weight_source,
+                                                     indexer_query_rows) != 0;
             if (zero_prefix) {
                 if (ok && n_comp > g->layer_comp_cap[il]) {
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
@@ -30898,13 +31025,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
-                ok = ds4_gpu_indexer_scores_decode_batch_tensor(metal_graph_indexer_scores(g),
-                                                                  metal_graph_batch_indexer_q(g),
-                                                                  metal_graph_batch_indexer_weights(g),
+                ok = ds4_gpu_indexer_scores_decode_batch_tensor(indexer_scores,
+                                                                  indexer_query,
+                                                                  indexer_weights,
                                                                   g->layer_index_comp_cache[il],
                                                                   n_comp,
-                                                                  n_tokens,
-                                                                  pos0,
+                                                                  indexer_query_rows,
+                                                                  pos0 + indexer_query_row0,
                                                                   DS4_N_INDEXER_HEAD,
                                                                   DS4_N_INDEXER_HEAD_DIM,
                                                                   ratio,
@@ -30925,10 +31052,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
                 if (ok) {
-                    ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                                       metal_graph_indexer_scores(g),
+                    ok = ds4_gpu_indexer_topk_tensor(indexer_topk,
+                                                       indexer_scores,
                                                        n_comp,
-                                                       n_tokens,
+                                                       indexer_query_rows,
                                                        DS4_N_INDEXER_TOP_K) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("topk",
@@ -31019,16 +31146,26 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
-            ok = ds4_gpu_indexer_scores_prefill_tensor(metal_graph_indexer_scores(g),
-                                                         metal_graph_batch_indexer_q(g),
-                                                         metal_graph_batch_indexer_weights(g),
-                                                         g->layer_index_comp_cache[il],
-                                                         n_comp,
-                                                         n_tokens,
-                                                         DS4_N_INDEXER_HEAD,
-                                                         DS4_N_INDEXER_HEAD_DIM,
-                                                         ratio,
-                                                         index_scale) != 0;
+            if (indexer_query_row0 != 0u) {
+                /* The shifted wrapper changes only the row origin. Score
+                 * and selection views retain full n_comp/512 row strides;
+                 * the complete attention pass still uses the base tensors. */
+                ok = ds4_gpu_indexer_scores_decode_batch_tensor(indexer_scores,
+                    indexer_query, indexer_weights, g->layer_index_comp_cache[il],
+                    n_comp, indexer_query_rows, pos0 + indexer_query_row0,
+                    DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, ratio, index_scale) != 0;
+            } else {
+                ok = ds4_gpu_indexer_scores_prefill_tensor(metal_graph_indexer_scores(g),
+                                                             metal_graph_batch_indexer_q(g),
+                                                             metal_graph_batch_indexer_weights(g),
+                                                             g->layer_index_comp_cache[il],
+                                                             n_comp,
+                                                             n_tokens,
+                                                             DS4_N_INDEXER_HEAD,
+                                                             DS4_N_INDEXER_HEAD_DIM,
+                                                             ratio,
+                                                             index_scale) != 0;
+            }
             if (ok && index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                 il,
@@ -31045,10 +31182,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                               pos0);
             }
             if (ok) {
-                ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                                   metal_graph_indexer_scores(g),
+                ok = ds4_gpu_indexer_topk_tensor(indexer_topk,
+                                                   indexer_scores,
                                                    n_comp,
-                                                   n_tokens,
+                                                   indexer_query_rows,
                                                    DS4_N_INDEXER_TOP_K) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("topk",
@@ -31172,6 +31309,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                            DS4_N_HEAD_DIM) != 0;
             }
             if (ok) batch_attention_done = true;
+        }
+        /* All paths, including partial view-allocation or encode failure,
+         * release only the owned aliases; the graph's base tensors persist. */
+        for (unsigned i = 0; i < indexer_leading_view_count; i++) {
+            ds4_gpu_tensor_free(indexer_leading_views[i]);
         }
     }
 
@@ -32490,9 +32632,49 @@ static bool metal_graph_eval_token_raw_swa(
  * --------------------------------------------------------------------- */
 #define DS4_GREEDY_CHAIN_AHEAD 2
 
+typedef struct {
+    ds4_gpu_graph *g;
+    ds4_gpu_tensor *ring;
+    uint64_t event;
+    int index;
+    int *approved;
+    bool (*on_token)(void *ctx, int token);
+    void *on_token_ctx;
+    bool verify;
+} metal_graph_chain_confirmation;
+
+static int metal_graph_chain_confirm_id(void *vctx) {
+    metal_graph_chain_confirmation *c = vctx;
+    int32_t id = -1;
+    if (!ds4_gpu_wait_selected_readback_ready(c->event, "greedy chain id") ||
+        !ds4_gpu_tensor_read(c->ring, (uint64_t)c->index * sizeof(int32_t),
+                            &id, sizeof(id))) return -1;
+    if (getenv("DS4_GREEDY_CHAIN_DUMP_IDS")) {
+        fprintf(stderr, "ds4: chain id[%d]=%d\n", c->index, (int)id);
+    }
+    if (c->verify && getenv("DS4_GREEDY_CHAIN_VERIFY")) {
+        float *lbuf = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (ds4_gpu_tensor_read(metal_graph_logits(c->g), 0, lbuf,
+                                (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0) {
+            const int cpu_id = sample_argmax(lbuf, DS4_N_VOCAB);
+            if (cpu_id != (int)id) {
+                fprintf(stderr, "ds4: chain verify mismatch at id[%d]: gpu=%d cpu=%d\n",
+                        c->index, (int)id, cpu_id);
+            }
+        }
+        free(lbuf);
+    }
+    if (!c->on_token(c->on_token_ctx, (int)id)) return 0;
+    (*c->approved)++;
+    return 1;
+}
+
 /* Chains n_evals evals from pos0 with ring[0] = seed_token, calling on_token
  * for the seed and then for every confirmed id in order; a false return stops
- * the chain early (up to AHEAD-1 already-committed evals are discarded).
+ * the chain early. Lookahead 2 is for disposable CLI graphs; lookahead 1
+ * confirms each id before updating recurrent compressor state. Its safe raw
+ * prefix may run before confirmation without committing the rejected token
+ * to a reusable session's retained KV/logits frontier.
  * Returns the number of approved tokens (>= 0, seed included) or -1 on error.
  * When logits_out is non-NULL the final token's logits are read back after
  * the chain drains. */
@@ -32503,9 +32685,47 @@ static int metal_graph_greedy_chain(
         int                seed_token,
         uint32_t           pos0,
         int                n_evals,
+        int                lookahead,
         bool             (*on_token)(void *ctx, int token),
         void              *on_token_ctx,
         float             *logits_out) {
+    if (lookahead < 1 || lookahead > DS4_GREEDY_CHAIN_AHEAD) return -1;
+    const bool raw_prefix_disabled =
+        getenv("DS4_METAL_DISABLE_SESSION_CHAIN_RAW_PREFIX") != NULL;
+    const bool raw_prefix_required = lookahead == 1 && !raw_prefix_disabled &&
+        getenv("DS4_METAL_REQUIRE_SESSION_CHAIN_RAW_PREFIX") != NULL;
+    bool raw_prefix = lookahead == 1 && !raw_prefix_disabled &&
+        ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH && DS4_N_LAYER > 2u &&
+        ds4_layer_compress_ratio(0) == 0u && ds4_layer_compress_ratio(1) == 0u &&
+        g->raw_cap > g->raw_window && n_evals >= 2 &&
+        !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
+        !g->placement && g->tp_world < 2u &&
+        !g->dspark_capture_enabled && !g->spec_capture_prefixes &&
+        !g->decode_stage_profile && !g->decode_index_stage_profile &&
+        !g->output_stage_profile && !g_expert_profile.active &&
+        metal_graph_debug_get_config()->prefix == NULL &&
+        !ds4_gpu_stage_counters_enabled() &&
+        getenv("DS4_METAL_ATTN_OUT_STAGE_PROFILE") == NULL &&
+        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") == NULL &&
+        getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
+        getenv("DS4_METAL_MOE_STAGE_PROFILE") == NULL &&
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+        getenv("DS4_METAL_SELECTED_PROFILE") == NULL &&
+        getenv("DS4_METAL_Q4_SELECTED_PROFILE") == NULL;
+    /* The default is measured for Flash with MXFP4 routed experts on pre-M5
+     * Apple silicon. Check every layer: the loader permits mixed route types. */
+    for (uint32_t il = 0; raw_prefix && il < DS4_N_LAYER; ++il) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        raw_prefix = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+            l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+            l->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+            l->ffn_down_exps->type == DS4_TENSOR_MXFP4;
+    }
+    if (raw_prefix_required && !raw_prefix) {
+        fprintf(stderr, "ds4: required Metal session-chain raw prefix was not selected\n");
+        return -1;
+    }
     ds4_gpu_tensor *ring =
         ds4_gpu_tensor_alloc(((uint64_t)n_evals + 2u) * sizeof(int32_t));
     if (!ring) {
@@ -32533,26 +32753,40 @@ static int metal_graph_greedy_chain(
         return approved;
     }
     if (getenv("DS4_GREEDY_CHAIN_DEBUG")) {
-        fprintf(stderr, "ds4: greedy chain engaged: pos0=%u n_evals=%d\n",
-                pos0, n_evals);
+        fprintf(stderr, "ds4: greedy chain engaged: pos0=%u n_evals=%d lookahead=%d raw_prefix=%d\n",
+                pos0, n_evals, lookahead, raw_prefix);
     }
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    int encoded = 0;            /* evals committed: eval(j) for j in [0, encoded) */
+    int encoded = 0;            /* complete evals encoded: eval(j) for j in [0, encoded) */
     bool stop = false;
     uint64_t ev_ring[DS4_GREEDY_CHAIN_AHEAD] = {0};
     for (int j = 0; ok && j < n_evals && !stop; j++) {
+        metal_graph_chain_confirmation confirmation = {
+            .g = g, .ring = ring,
+            .event = j > 0 ? ev_ring[(j - 1) % lookahead] : 0,
+            .index = j, .approved = &approved,
+            .on_token = on_token, .on_token_ctx = on_token_ctx,
+            .verify = true,
+        };
+        metal_graph_raw_prefix_gate prefix_gate = {
+            .confirm = metal_graph_chain_confirm_id, .ctx = &confirmation,
+        };
         ds4_gpu_tensor *vin = ds4_gpu_tensor_view(ring,
                                                   (uint64_t)j * sizeof(int32_t),
                                                   sizeof(int32_t));
         g->chain_token_view = vin;
         ok = vin != NULL &&
-             metal_graph_encode_token_raw_swa(g, model, weights,
-                                              0, pos0 + (uint32_t)j,
-                                              true, true, vin);
+             metal_graph_encode_token_raw_swa_with_raw_prefix_gate(
+                     g, model, weights, 0, pos0 + (uint32_t)j,
+                     true, true, vin, raw_prefix && j > 0 ? &prefix_gate : NULL);
         g->chain_token_view = NULL;
         ds4_gpu_tensor_free(vin);
         if (!ok) break;
+        if (prefix_gate.rejected) {
+            stop = true;
+            break;
+        }
         ds4_gpu_tensor *vout = ds4_gpu_tensor_view(ring,
                                                    (uint64_t)(j + 1) * sizeof(int32_t),
                                                    sizeof(int32_t));
@@ -32563,59 +32797,35 @@ static int metal_graph_greedy_chain(
         uint64_t ev = 0;
         ok = ds4_gpu_signal_selected_readback_ready(&ev) != 0;
         if (!ok) break;
-        ok = ds4_gpu_flush_commands() != 0;
+        /* Piggyback the next raw prefix on this tail buffer. Its gate flushes
+         * after layers 0/1, then confirms this signal while the GPU executes
+         * that safe prefix. The last eval has no following prefix to flush it. */
+        if (!raw_prefix || j + 1 == n_evals) ok = ds4_gpu_flush_commands() != 0;
         if (!ok) break;
         encoded = j + 1;
-        ev_ring[j % DS4_GREEDY_CHAIN_AHEAD] = ev;
+        ev_ring[j % lookahead] = ev;
         /* Confirm the id that falls out of the encode-ahead window. */
-        const int k = j - (DS4_GREEDY_CHAIN_AHEAD - 1);
-        if (k >= 0) {
-            const uint64_t ev_k = ev_ring[k % DS4_GREEDY_CHAIN_AHEAD];
-            int32_t id = -1;
-            ok = ds4_gpu_wait_selected_readback_ready(ev_k, "greedy chain id") != 0 &&
-                 ds4_gpu_tensor_read(ring,
-                                     (uint64_t)(k + 1) * sizeof(int32_t),
-                                     &id,
-                                     sizeof(id)) != 0;
-            if (!ok) break;
-            if (getenv("DS4_GREEDY_CHAIN_DUMP_IDS")) {
-                fprintf(stderr, "ds4: chain id[%d]=%d\n", k + 1, (int)id);
-            }
-            if (getenv("DS4_GREEDY_CHAIN_VERIFY")) {
-                float *lbuf = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-                if (ds4_gpu_tensor_read(metal_graph_logits(g), 0, lbuf,
-                                        (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0) {
-                    const int cpu_id = sample_argmax(lbuf, DS4_N_VOCAB);
-                    if (cpu_id != (int)id) {
-                        fprintf(stderr, "ds4: chain verify mismatch at id[%d]: gpu=%d cpu=%d\n",
-                                k + 1, (int)id, cpu_id);
-                    }
-                }
-                free(lbuf);
-            }
-            if (!on_token(on_token_ctx, (int)id)) {
-                stop = true;
-            } else {
-                approved++;
-            }
+        const int k = j - (lookahead - 1);
+        if (!raw_prefix && k >= 0) {
+            confirmation.event = ev_ring[k % lookahead];
+            confirmation.index = k + 1;
+            const int confirmed = metal_graph_chain_confirm_id(&confirmation);
+            ok = confirmed >= 0;
+            stop = confirmed == 0;
         }
     }
     /* Drain the encode-ahead window: confirm the remaining ids. */
-    for (int k = encoded - (DS4_GREEDY_CHAIN_AHEAD - 1); ok && !stop && k < encoded; k++) {
+    const int drain_start = raw_prefix ? encoded - 1 : encoded - (lookahead - 1);
+    for (int k = drain_start; ok && !stop && k < encoded; k++) {
         if (k < 0) continue;
-        const uint64_t ev_k = ev_ring[k % DS4_GREEDY_CHAIN_AHEAD];
-        int32_t id = -1;
-        ok = ds4_gpu_wait_selected_readback_ready(ev_k, "greedy chain id") != 0 &&
-             ds4_gpu_tensor_read(ring,
-                                 (uint64_t)(k + 1) * sizeof(int32_t),
-                                 &id,
-                                 sizeof(id)) != 0;
-        if (!ok) break;
-        if (getenv("DS4_GREEDY_CHAIN_DUMP_IDS")) {
-            fprintf(stderr, "ds4: chain id[%d]=%d\n", k + 1, (int)id);
-        }
-        if (!on_token(on_token_ctx, (int)id)) stop = true;
-        else approved++;
+        metal_graph_chain_confirmation confirmation = {
+            .g = g, .ring = ring, .event = ev_ring[k % lookahead],
+            .index = k + 1, .approved = &approved,
+            .on_token = on_token, .on_token_ctx = on_token_ctx,
+        };
+        const int confirmed = metal_graph_chain_confirm_id(&confirmation);
+        ok = confirmed >= 0;
+        stop = confirmed == 0;
     }
     if (ds4_gpu_end_commands() == 0) ok = false;
     if (ok && logits_out) {
@@ -53957,6 +54167,7 @@ static int generate_metal_graph_raw_swa(
                                                seed,
                                                (uint32_t)pos,
                                                chain_evals,
+                                               DS4_GREEDY_CHAIN_AHEAD,
                                                metal_graph_chain_on_token,
                                                &chain_ctx,
                                                logits);
@@ -69871,19 +70082,22 @@ typedef struct {
     ds4_session *s;
     bool (*on_token)(void *ctx, int token);
     void *on_token_ctx;
+    int remaining;
     bool stopped_early;
 } ds4_session_chain_tramp;
 
 static bool ds4_session_chain_tramp_on_token(void *vctx, int token) {
     ds4_session_chain_tramp *t = (ds4_session_chain_tramp *)vctx;
-    /* Only tokens the caller approves enter the checkpoint; a false return
-     * stops the chain and leaves the already-encoded ahead-evals discarded
-     * (their KV rows are overwritten by any later eval at those positions). */
+    /* The last evaluation produces one additional prediction. Suppress that
+     * id without reporting an early stop: the requested tokens are already
+     * evaluated and the graph logits match the checkpoint. */
+    if (t->remaining == 0) return false;
     if (!t->on_token(t->on_token_ctx, token)) {
         t->stopped_early = true;
         return false;
     }
     token_vec_push(&t->s->checkpoint, token);
+    t->remaining--;
     return true;
 }
 
@@ -69905,19 +70119,20 @@ int ds4_session_eval_chain_greedy(ds4_session *s, int max_tokens,
     const int ctx_left = s->ctx_size - s->checkpoint.len;
     if (n > ctx_left) n = ctx_left;
     if (n < 2) {
-        /* A one-token burst would never run a GPU eval, leaving s->logits
-         * stale; the caller uses the classic step for that. */
+        /* Ring setup and the final logits copy do not amortize over one
+         * token; callers retain the classic step for that case. */
         if (errlen) snprintf(err, errlen, "greedy chain burst requires at least 2 tokens of headroom");
         return -1;
     }
-    ds4_session_chain_tramp tramp = { s, on_token, on_token_ctx, false };
+    ds4_session_chain_tramp tramp = { s, on_token, on_token_ctx, n, false };
     const int seed = ds4_session_argmax(s);
     const int approved = metal_graph_greedy_chain(&s->graph,
                                                   &e->model,
                                                   &e->weights,
                                                   seed,
                                                   (uint32_t)s->checkpoint.len,
-                                                  n - 1,
+                                                  n,
+                                                  1,
                                                   ds4_session_chain_tramp_on_token,
                                                   &tramp,
                                                   s->logits);

@@ -24,7 +24,7 @@ typedef struct {
     const char *prompt_path;
     const char *candidate_env;
     int prefix_tokens;
-    int initial_tokens;
+    int cached_tokens;
     int warmup_tokens;
     int ctx;
     int repeats;
@@ -43,8 +43,9 @@ static void usage(FILE *fp, const char *argv0) {
             "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
             "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
-            "  --prefix-tokens N      final prefill length (default: 8192)\n"
-            "  --initial-tokens N     untimed live prefix before appending to that length\n"
+            "  --prefix-tokens N      final prefix length (default: 8192)\n"
+            "  --cached-tokens N      prime N prefix tokens before timing (default: 0)\n"
+            "  --initial-tokens N     alias for --cached-tokens (untimed live prefix)\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
             "  --ctx N                session allocation (default: max lengths + 1)\n"
             "  --repeats N            alternating ABBA/BAAB pairs (default: 2)\n",
@@ -85,6 +86,7 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx = 0,
         .repeats = DEFAULT_REPEATS,
     };
+    bool cached_tokens_set = false;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -103,8 +105,18 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warmup-tokens")) {
             cfg.warmup_tokens = parse_int_arg(
                 need_arg(&i, argc, argv, arg), arg, DEFAULT_WARMUP_TOKENS);
-        } else if (!strcmp(arg, "--initial-tokens")) {
-            cfg.initial_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
+        } else if (!strcmp(arg, "--cached-tokens") ||
+                   !strcmp(arg, "--initial-tokens")) {
+            const int cached_tokens =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
+            if (cached_tokens_set && cfg.cached_tokens != cached_tokens) {
+                fprintf(stderr,
+                        "%s: --cached-tokens and --initial-tokens name the same prefix; values must agree\n",
+                        BENCH_NAME);
+                exit(2);
+            }
+            cfg.cached_tokens = cached_tokens;
+            cached_tokens_set = true;
         } else if (!strcmp(arg, "--ctx")) {
             cfg.ctx = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 2);
         } else if (!strcmp(arg, "--repeats")) {
@@ -122,8 +134,8 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "%s: --candidate-env requires a valid name\n", BENCH_NAME);
         exit(2);
     }
-    if (cfg.initial_tokens >= cfg.prefix_tokens) {
-        fprintf(stderr, "%s: --initial-tokens must be less than --prefix-tokens\n", BENCH_NAME);
+    if (cfg.cached_tokens >= cfg.prefix_tokens) {
+        fprintf(stderr, "%s: --cached-tokens/--initial-tokens must be smaller than --prefix-tokens\n", BENCH_NAME);
         exit(2);
     }
     const int longest =
@@ -270,7 +282,22 @@ static int warm_variant(
                 variant == 0 ? "control" : "candidate");
         return 1;
     }
-    const int rc = ds4_session_sync(session, &warmup, err, errlen);
+    int rc = ds4_session_sync(session, &warmup, err, errlen);
+    if (rc == 0 && cfg->cached_tokens) {
+        /* Warm the same append geometry in a fresh session; a zero-prefix
+         * warmup does not exercise the continuation kernels. */
+        ds4_session_free(session);
+        session = NULL;
+        ds4_tokens cached = {
+            .v = all_tokens->v, .len = cfg->cached_tokens, .cap = cfg->cached_tokens,
+        };
+        ds4_tokens prefix = {
+            .v = all_tokens->v, .len = cfg->prefix_tokens, .cap = cfg->prefix_tokens,
+        };
+        rc = ds4_session_create(&session, engine, cfg->ctx);
+        if (rc == 0) rc = ds4_session_sync(session, &cached, err, errlen);
+        if (rc == 0) rc = ds4_session_sync(session, &prefix, err, errlen);
+    }
     if (rc != 0) {
         fprintf(stderr,
                 "%s: %s warmup failed: %s\n",
@@ -340,13 +367,14 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "%s: model=%s prompt=%s prefix=%d initial=%d warmup=%d ctx=%d repeats=%d "
+            "%s: model=%s prompt=%s prefix=%d initial=%d cached=%d warmup=%d ctx=%d repeats=%d "
             "candidate_env=%s\n",
             BENCH_NAME,
             cfg.model_path,
             cfg.prompt_path,
             cfg.prefix_tokens,
-            cfg.initial_tokens,
+            cfg.cached_tokens,
+            cfg.cached_tokens,
             cfg.warmup_tokens,
             cfg.ctx,
             cfg.repeats,
@@ -365,8 +393,12 @@ int main(int argc, char **argv) {
         .len = cfg.prefix_tokens,
         .cap = cfg.prefix_tokens,
     };
-    ds4_tokens initial = { .v = tokens.v, .len = cfg.initial_tokens, .cap = cfg.initial_tokens };
-    const int timed_tokens = cfg.prefix_tokens - cfg.initial_tokens;
+    ds4_tokens cached = {
+        .v = tokens.v,
+        .len = cfg.cached_tokens,
+        .cap = cfg.cached_tokens,
+    };
+    const int timed_tokens = cfg.prefix_tokens - cfg.cached_tokens;
     size_t run = 0;
     for (int repeat = 0; repeat < cfg.repeats; repeat++) {
         const int *order = orders[repeat & 1];
@@ -386,8 +418,11 @@ int main(int argc, char **argv) {
             }
 
             err[0] = '\0';
-            if (initial.len && ds4_session_sync(session, &initial, err, sizeof(err)) != 0) {
-                fprintf(stderr, "%s: initial prefix failed: %s\n", BENCH_NAME, err);
+            if (cfg.cached_tokens &&
+                (ds4_session_sync(session, &cached, err, sizeof(err)) != 0 ||
+                 ds4_session_pos(session) != cfg.cached_tokens)) {
+                fprintf(stderr, "%s: cached prefix failed at run %zu: %s\n",
+                        BENCH_NAME, run + 1, err);
                 ds4_session_free(session);
                 goto done;
             }

@@ -32,6 +32,134 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### MXFP4 prefill pruning and session-chain decode (September 6, M3 Ultra)
+
+Measured on M3 Ultra (80 GPU cores, 512 GiB), macOS/Xcode 27 beta, using
+the 145.26 GiB 0731 MXFP4-experts / F16 HC-compressor-indexer /
+Q8 attention-shared-output model. Comparisons are uncaptured and warmed,
+using the same binary with full-vocabulary bit equality. Prefill uses
+ABBA/BAAB order; decode alternates both order and physical-session binding.
+
+Continued ratio-4 prefill batches now omit unused indexer-query projection,
+RoPE, quantization and head-weight projection while the final compressed
+count is at most top-k (512). Persistent compressor/cache work is unchanged.
+This extends the existing zero-prefix optimization to eligible pre-M5
+continuations; quality, SSD, placements and TP retain their previous paths.
+
+Measured append throughput: cached 1024 to final 2048, 588.8947 to 597.0880
+t/s (+1.39%); cached 512 to final 1024, 507.7831 to 514.6913 (+1.36%);
+cached 2019 to final 2051, 105.5593 to 107.5164 (+1.85%). Final 2052 is
+ineligible and flat. These forward screens compared 3,619,840 logits exactly;
+32 decode steps crossing the first top-k selection boundary compared another
+4,266,240 logits and 32 selected IDs exactly. An independent inverse screen
+confirmed the default: 596.6530 t/s versus 589.0466 with rollback.
+
+Both balanced harnesses accept `--cached-tokens N`: they prime the prefix
+untimed in fresh sessions and compare the resulting continuation state. The
+prefill harness counts only appended tokens and warms the same append shape.
+For example (the candidate here disables the optimization, so a negative
+delta confirms the production default):
+
+```sh
+rtk proxy make -j8 metal-prefill-variant-bench
+rtk proxy ./speed-bench/metal_prefill_variant_bench \
+  -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt \
+  --cached-tokens 1024 --prefix-tokens 2048 --warmup-tokens 2048 \
+  --candidate-env DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_QUERY_PRUNE_CONTINUATION \
+  --repeats 2
+```
+
+Static mixed prefill attention also skips known fully masked block intervals
+before entering the original block loop. Live-block QK, softmax, PV, sink and
+reduction arithmetic is unchanged. Eligible square zero-prefix 512–2048-token
+prefills (multiples of 64, pre-M5 resident path) use the specialization;
+`DS4_METAL_DISABLE_PRE_M5_STATIC_MIXED_BLOCK_SKIP=1` restores the generic
+kernel. Two independent 2K screens measured +0.308% and +0.334%; 512/1024
+screens measured +0.085%/+0.153%. The 8K screen was flat, so larger shapes
+keep the generic path. The direct oracle is
+`make test-static-mixed-attention-metal`.
+
+The promoted default also passed an inverse 2K screen (669.8144 versus
+669.1107 t/s with rollback), the expanded direct 222,363,648-float oracle, and
+64 post-prefill decode steps (8,403,200 exact logits and 64 selected IDs).
+The inverse screen includes a slower first default run; gains here are small.
+
+For batches crossing the first top-k boundary, leading-query pruning also
+omits unused query, weight, score and selection rows. Cuts preserve the
+32-row projection tiles and at least 32 tail rows. The skipped selection rows
+contain identity IDs; unchanged chronological attention consumes the same
+visible keys. Compressor state is untouched. Eligible pre-M5 Flash F16-indexer
+paths retain a rollback via
+`DS4_METAL_DISABLE_PRE_M5_BATCH_INDEXER_LEADING_QUERY_PRUNE`.
+The initial 2052-token boundary screen measured 640.4804 to 654.2399 t/s
+(+2.148%); a separate clean 8K ABBA/BAAB screen measured 640.2505 to
+644.2452 t/s (+0.624%), with 1,034,240 exact logits.
+Cached 2000→2064 followed by 32 decode steps compared
+4,266,240 logits and 32 IDs exactly. The primitive oracle is
+`make test-indexer-leading-query-metal`.
+The promoted-default inverse screen confirmed 653.7626 t/s versus 639.9618
+with rollback (-2.111%), with another 517,120 exact logits.
+
+The session-chain correctness regression is `make test-metal-chain-state`.
+It compares complete and rejected bursts against classical evaluation,
+including compressor boundaries and forced continuations. The corrected
+lookahead-one fallback was speed-neutral in balanced 16-token-burst screens: +0.114%
+at a 64-token prefix and -0.064% at 2K. The dedicated harness
+`make metal-session-chain-bench` counts every evaluated token, including the
+seed and final token, and checks IDs, checkpoints and full-vocabulary logits
+at every burst boundary.
+
+Eligible pre-M5 Flash MXFP4 session chains now overlap the next token's first
+two raw-only layers with host confirmation. This preserves FULL-layer kernels
+and adaptive splits. Rejected tokens cannot change compressed state or retained
+logical KV/logits: the raw ring must have more than one window of capacity.
+`DS4_METAL_DISABLE_SESSION_CHAIN_RAW_PREFIX` restores the corrected fallback;
+`DS4_METAL_REQUIRE_SESSION_CHAIN_RAW_PREFIX` diagnoses unexpected fallback.
+At a 64-token prefix, 512 measured steps improved 44.5273 to 45.2757 t/s
+(+1.681%) versus fallback. At 2K, classical decoding improved 43.5607 to
+44.2282 (+1.532%); at 8K, fallback improved 39.1204 to 39.7021 (+1.487%).
+These screens compared 1,328 selected IDs and 11,118,080 logits exactly.
+The promoted-default 64-prefix repeat confirmed 44.6008 to 45.2909 t/s
+(+1.547%), with another 528 IDs and 4,395,520 exact logits.
+The expanded raw-prefix regression also covers rejection and repeated bursts
+across raw-ring wrap (including 2K/8K frontiers) and tests both REQUIRE refusal
+and DISABLE rollback. All 20 cases passed: 116 frontiers / 14,996,480 exact
+logits. Run `./tests/test_metal_chain_state ds4flash.gguf --raw-prefix` to
+require optimized-path admission as well as exercising rollback.
+
+```sh
+rtk proxy make -j8 metal-session-chain-bench
+rtk proxy env DS4_METAL_REQUIRE_SESSION_CHAIN_RAW_PREFIX=1 \
+  ./speed-bench/metal_session_chain_bench \
+  -m ds4flash.gguf --prompt-file speed-bench/promessi_sposi.txt \
+  --prefix-tokens 64 --ctx 4096 --warmup 16 --tokens 512 --burst 16 \
+  --control-chain
+```
+
+This is a public session-chain API improvement, not a CLI or server speedup.
+Neither existing application loop was changed. Server integration needs a
+separate pending-token adapter to preserve post-evaluation streaming, stop
+handling and exact cache-checkpoint boundaries.
+
+Rejected exact experiments, removed after alternating end-to-end screens:
+router probability fusion (-0.021%), HC24 discarded-MMA culling (+0.030%,
+flat), compact attention storage (-0.053%), compressor pair reduction
+(-0.154%), live-split attention (-2.75% at a 64-token prefix, -1.205% at 8K),
+large dense Q8 NR4 (-0.365%),
+and hash-router transform/gather/weight fusion (-0.004% at 64-token prefix,
++0.049% at 2K; flat across 512 measured steps per variant).
+These are not decode speed improvements.
+
+These results cover local resident Metal and an SSD cold-streaming smoke.
+CUDA/ROCm use neither the new Metal kernels nor the continued-query branch.
+Tensor parallelism is excluded, but distributed layer-pipeline nodes can use
+the per-layer changes; that mode still needs an authorized distributed smoke.
+Final promoted-source validation passed `make -j8 test`, a CPU-only object
+build (no large CPU inference), both direct Metal oracles, the 20-case
+raw-prefix state regression, and the SSD cold-streaming smoke (16 cached
+experts, 8 generated tokens). The latter is a compatibility smoke, not an SSD
+speed claim. No CUDA or distributed hardware test was run.
+
 ### DSpark speculation on M3 Ultra (measured, not yet profitable)
 
 DSpark non-strict decode was measured end to end on M3 Ultra with the MXFP4
@@ -182,9 +310,14 @@ Combined round state: 43.46 → 45.51 t/s (+4.7%), bit-exact, `make test`
 `s->logits` (identical to the classic temp-0 sample), pos0 =
 `checkpoint.len`, approved tokens pushed into `s->checkpoint` by a trampoline
 only after the caller's callback approves them; on full completion
-`logits_out = s->logits` preserves the session logits invariant (on early
-stop the logits are stale — eval only stops early on stop-token/quit/switch,
-where they are never read).  Guards mirror the CLI set plus session state:
+`logits_out = s->logits` is intended to preserve the session logits invariant.
+The September 6 frontier regression exposed an off-by-one evaluation count
+and speculative compressor-state contamination after early stops; the session
+path now confirms each ID before updating recurrent compressor state and fully
+evaluates every approved token. Eligible raw-only prefixes may run before
+confirmation; unapproved tokens never advance the retained logical KV/logits
+frontier. Successful early returns preserve valid logits. Guards mirror the CLI
+set plus session state:
 no GLM/CPU/distributed/TP/multi-tier, `support_kind == DS4_SUPPORT_NONE`, no
 ssd-streaming/quality/CPU-router/steering, same env kill switch
 (`DS4_DISABLE_GREEDY_CHAIN=1` forces the classic loop everywhere).

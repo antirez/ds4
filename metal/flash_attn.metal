@@ -304,7 +304,8 @@ template<
     short DV,
     short Q,
     short C,
-    short NSG>
+    short NSG,
+    short STATIC_MIXED_RATIO = 0>
 void kernel_flash_attn_ext_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -429,7 +430,36 @@ void kernel_flash_attn_ext_impl(
             slope = pow(base, exph);
         }
 
-        for (int ic0 = 0; ; ++ic0) {
+        int first_block = 0;
+        int raw_end_block = 0;
+        int comp_first_block = 0;
+        int comp_end_block = 0;
+        if (STATIC_MIXED_RATIO != 0) {
+            /* The square static mask exposes two ordered intervals: the
+             * union of this query tile's 128-row raw windows, then its
+             * visible compressed prefix. Every omitted block is entirely
+             * masked, so it never updates softmax state in the legacy loop. */
+            constexpr int ratio = STATIC_MIXED_RATIO ? STATIC_MIXED_RATIO : 1;
+            const int query_end = min(args.ne01, (int)iq1 + Q);
+            first_block = max(0, (int)iq1 + 1 - 128) / C;
+            raw_end_block = (query_end + C - 1) / C;
+            comp_first_block = args.ne01 / C;
+            comp_end_block = (args.ne01 + query_end / ratio + C - 1) / C;
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                pm2[jj] += first_block * (C / 2);
+            }
+        }
+
+        for (int ic0 = first_block; ; ++ic0) {
+            if (STATIC_MIXED_RATIO != 0) {
+                if (ic0 == raw_end_block && ic0 < comp_first_block) {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        pm2[jj] += (comp_first_block - ic0) * (C / 2);
+                    }
+                    ic0 = comp_first_block;
+                }
+                if (ic0 >= comp_end_block) break;
+            }
             int ic = ic0*C;
             if (ic >= args.ne11) {
                 break;
@@ -888,7 +918,8 @@ template<
     short DK,
     short DV,
     short Q  = OP_FLASH_ATTN_EXT_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_NCPSG,
+    short STATIC_MIXED_RATIO = 0>
 kernel void kernel_flash_attn_ext(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -903,11 +934,17 @@ kernel void kernel_flash_attn_ext(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (STATIC_MIXED_RATIO != 0) {
+        constexpr int ratio = STATIC_MIXED_RATIO ? STATIC_MIXED_RATIO : 1;
+        if (!FC_flash_attn_ext_has_mask || C != 64 || Q != 8 ||
+            args.ne01 % C != 0 ||
+            args.ne11 != args.ne01 + args.ne01 / ratio) return;
+    }
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
 #define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
-        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4>(FWD_ARGS); break;
-        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8>(FWD_ARGS); break;
+        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4, STATIC_MIXED_RATIO>(FWD_ARGS); break;
+        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8, STATIC_MIXED_RATIO>(FWD_ARGS); break;
     }
 #undef FWD_TMPL
 #undef FWD_ARGS
@@ -927,6 +964,10 @@ typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f
 // Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
+template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512_static_r4")]]
+kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, 8, 64, 4>;
+template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512_static_r128")]]
+kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, 8, 64, 128>;
 
 // Host-visible prefill FlashAttention variant for GLM's 256-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]

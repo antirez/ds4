@@ -30,6 +30,7 @@ typedef struct {
     const char *prompt_path;
     const char *candidate_env;
     int prefix_tokens;
+    int cached_tokens;
     int ctx;
     int warmup;
     int measured;
@@ -45,6 +46,7 @@ static void usage(FILE *fp, const char *argv0) {
             "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
             "  --prefix-tokens N      prefill length (default: 2048)\n"
+            "  --cached-tokens N      prime N tokens before remaining prefill (default: 0)\n"
             "  --ctx N                session allocation (default: 4096)\n"
             "  --warmup N             untimed steps per variant (default: 16)\n"
             "  --tokens N             measured steps per variant (default: 512)\n"
@@ -116,6 +118,9 @@ static bench_config parse_options(int argc, char **argv) {
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
         } else if (!strcmp(arg, "--ctx")) {
             cfg.ctx = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
+        } else if (!strcmp(arg, "--cached-tokens")) {
+            cfg.cached_tokens =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
         } else if (!strcmp(arg, "--warmup")) {
             cfg.warmup =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 0);
@@ -159,6 +164,10 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (cfg.cached_tokens >= cfg.prefix_tokens) {
+        fprintf(stderr, "metal-decode-schedule-bench: --cached-tokens must be smaller than --prefix-tokens\n");
+        exit(2);
+    }
     const int64_t needed =
         (int64_t)cfg.prefix_tokens + cfg.warmup + cfg.measured + 1;
     if (needed > cfg.ctx) {
@@ -418,12 +427,19 @@ int main(int argc, char **argv) {
         .len = cfg.prefix_tokens,
         .cap = cfg.prefix_tokens,
     };
+    ds4_tokens cached = {
+        .v = tokens.v,
+        .len = cfg.cached_tokens,
+        .cap = cfg.cached_tokens,
+    };
     /* Build each session's persistent KV/compressor state under its own
      * variant.  This also makes the first frontier comparison cover prefill
      * features instead of comparing two default-prefix sessions. */
     for (int i = 0; i < VARIANT_COUNT; i++) {
         if (select_variant(&cfg, i) != 0 ||
             ds4_session_create(&sessions[i], engine, cfg.ctx) != 0 ||
+            (cfg.cached_tokens &&
+             ds4_session_sync(sessions[i], &cached, err, sizeof(err)) != 0) ||
             ds4_session_sync(sessions[i], &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "metal-decode-schedule-bench: session %d prefill failed: %s\n",
@@ -440,12 +456,13 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr,
-            "metal-decode-schedule-bench: model=%s prompt=%s prefix=%d "
+            "metal-decode-schedule-bench: model=%s prompt=%s prefix=%d cached=%d "
             "ctx=%d warmup=%d measured=%d control=%d/%d candidate=%d/%d "
             "candidate_env=%s include_selection=%s\n",
             cfg.model_path,
             cfg.prompt_path,
             cfg.prefix_tokens,
+            cfg.cached_tokens,
             cfg.ctx,
             cfg.warmup,
             cfg.measured,
