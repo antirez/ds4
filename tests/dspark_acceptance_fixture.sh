@@ -133,6 +133,19 @@ fi
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/ds4-dspark-fixture.XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
+run_logged() {
+    out=$1
+    err=$2
+    shift 2
+    if "$@" >"$out" 2>"$err"; then
+        return 0
+    else
+        status=$?
+        cat "$err" >&2
+        return "$status"
+    fi
+}
+
 run_case() {
     id=$1
     prompt=$2
@@ -141,26 +154,23 @@ run_case() {
     dspark_out="$tmpdir/$id.dspark.out"
     dspark_err="$tmpdir/$id.dspark.err"
 
-    "$DS4_BIN" -m "$MODEL" \
+    run_logged "$base_out" "$base_err" "$DS4_BIN" -m "$MODEL" \
         --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
-        --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
-        >"$base_out" 2>"$base_err"
+        --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt"
 
     if [ -n "$CONFIDENCE" ]; then
         DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark $exact_sampling_arg \
+        run_logged "$dspark_out" "$dspark_err" "$DS4_BIN" --dspark $exact_sampling_arg \
             --dspark-confidence "$CONFIDENCE" \
             -m "$MODEL" --mtp-model "$SUPPORT" \
             --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
-            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
-            >"$dspark_out" 2>"$dspark_err"
+            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt"
     else
         DS4_DSPARK_STATS=1 \
-        "$DS4_BIN" --dspark $exact_sampling_arg \
+        run_logged "$dspark_out" "$dspark_err" "$DS4_BIN" --dspark $exact_sampling_arg \
             -m "$MODEL" --mtp-model "$SUPPORT" \
             --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
-            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
-            >"$dspark_out" 2>"$dspark_err"
+            --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt"
     fi
 
     output_match=1
@@ -187,15 +197,25 @@ run_case() {
     partial=$(printf '%s\n' "$stats" | sed -n 's/.* partial=\([0-9][0-9]*\).*/\1/p')
     errors=$(printf '%s\n' "$stats" | sed -n 's/.*errors=\([0-9][0-9]*\).*/\1/p')
     accepted_draft=$(printf '%s\n' "$stats" | sed -n 's/.*accepted_draft=\([0-9][0-9]*\).*/\1/p')
+    proposed=$(printf '%s\n' "$stats" | sed -n 's/.* proposed=\([0-9][0-9]*\).*/\1/p')
+    first_tokens=$(printf '%s\n' "$stats" | sed -n 's/.* first_tokens=\([0-9][0-9]*\).*/\1/p')
+    seed_batches=$(printf '%s\n' "$stats" | sed -n 's/.* seed_batches=\([0-9][0-9]*\).*/\1/p')
     direct_full=$(printf '%s\n' "$stats" | sed -n 's/.*direct_full=\([0-9][0-9]*\).*/\1/p')
     direct_partial=$(printf '%s\n' "$stats" | sed -n 's/.*direct_partial=\([0-9][0-9]*\).*/\1/p')
     partial=${partial:-0}
     errors=${errors:-0}
     accepted_draft=${accepted_draft:-0}
+    proposed=${proposed:-0}
+    first_tokens=${first_tokens:-0}
+    seed_batches=${seed_batches:-0}
     direct_full=${direct_full:-0}
     direct_partial=${direct_partial:-0}
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
+        return 1
+    fi
+    if [ "$accepted_draft" -gt "$proposed" ] || [ "$seed_batches" -gt "$first_tokens" ]; then
+        echo "dspark-fixture: inconsistent seed/draft accounting for $id: $stats" >&2
         return 1
     fi
     if [ "$PROPOSAL_QUALITY_GUARD_ACTIVE" -ne 0 ] && [ "$id" = c_add ] &&

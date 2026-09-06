@@ -197,6 +197,151 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
+// K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
+// poll-gate flag published by the last-arriving threadgroup (see
+// kernel_dsv4_add2_f32_tp_flag_checked).  Writes exactly the values the plain
+// kernel writes; the checksum is the integer sum of the stored words.
+template<short NR0>
+void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device atomic_uint * ctl,
+        constant uint & ntg,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        threadgroup uint * ctl_shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    // Reduce and write exactly as the plain kernel does, keeping the stored
+    // words for the checksum.
+    {
+        constexpr short NWR = N_SIMDWIDTH;
+        threadgroup float * shmem_f32[NR0];
+        for (short row = 0; row < NR0; ++row) {
+            shmem_f32[row] = (threadgroup float *) shmem + NWR*row;
+            if (sgitg == 0) {
+                shmem_f32[row][tiisg] = 0.0f;
+            }
+            sumf[row] = simd_sum(sumf[row]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) {
+                shmem_f32[row][sgitg] = sumf[row];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint words = 0u;
+        for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+            float tot = simd_sum(shmem_f32[row][tiisg]);
+            if (tiisg == 0 && sgitg == 0) {
+                dst_f32[r0 + row] = tot;
+                words += as_type<uint>(tot);
+            }
+        }
+        // Publish: accumulate this threadgroup's words, then arrive; the
+        // last arriver writes the checksum and the flag.
+        if (tiisg == 0 && sgitg == 0) ctl_shmem[0] = words;
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        if (tiisg == 0 && sgitg == 0) {
+            atomic_fetch_add_explicit(&ctl[1], ctl_shmem[0], memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (tiisg == 0 && sgitg == 0) {
+            const uint old = atomic_fetch_add_explicit(&ctl[0], 1u, memory_order_relaxed);
+            if (old + 1u == ntg) {
+                const uint total = atomic_exchange_explicit(&ctl[1], 0u, memory_order_relaxed);
+                atomic_store_explicit(&ctl[0], 0u, memory_order_relaxed);
+                atomic_store_explicit(&check, total ^ (value * 0x9E3779B9u), memory_order_relaxed);
+                atomic_store_explicit(&flag, value, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+[[host_name("kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked")]]
+kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device atomic_uint * ctl,
+        constant uint & ntg,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        threadgroup  uint * ctl_shmem [[threadgroup(1)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl<N_R0_Q8_0>(
+            args, flag, check, value, ctl, ntg, src0, src1, dst, shmem,
+            ctl_shmem, tgpig, tiisg, sgitg);
+}
 
 // Decode Q-A/KV pair. Both projections consume the same activation row but
 // have independent weight ranges and output extents. Keep the standalone Q8_0
@@ -468,6 +613,317 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
     kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+// Same body as kernel_dsv4_shared_gate_up_swiglu_q8_0_impl with the row
+// bound taken from a thread value instead of args.ne01 (GPU-decided lane
+// count).  Arguments stay in constant memory.
+template<short NR0, bool STORE_GATE_UP>
+void kernel_dsv4_shared_gate_up_swiglu_q8_0_rows_impl(
+        const int row_count,
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const float *y = (device const float *)(src1 + offset1);
+
+    device const block_q8_0 *ag[NR0];
+    device const block_q8_0 *au[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row) * args.nb01 +
+                                 (i12 / args.r2) * args.nb02 +
+                                 (i13 / args.r3) * args.nb03;
+        ag[row] = (device const block_q8_0 *)((device const char *)src0_gate + offset0);
+        au[row] = (device const block_q8_0 *)((device const char *)src0_up   + offset0);
+    }
+
+    float sumg[NR0] = { 0.f };
+    float sumu[NR0] = { 0.f };
+
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    float yl[NQ];
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t *qg = ag[row][ib].qs + il * NQ;
+            device const int8_t *qu = au[row][ib].qs + il * NQ;
+
+            float sg = 0.f;
+            float su = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sg += qg[i] * yl[i];
+                su += qu[i] * yl[i];
+            }
+
+            sumg[row] += sg * ag[row][ib].d;
+            sumu[row] += su * au[row][ib].d;
+        }
+
+        yb += NSG * NQ * QK8_0;
+    }
+
+    threadgroup float *shmem_f32 = (threadgroup float *)shmem;
+    threadgroup float *sh_gate[NR0];
+    threadgroup float *sh_up[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        sh_gate[row] = shmem_f32 + NW * row;
+        sh_up[row]   = shmem_f32 + NW * (NR0 + row);
+        if (sgitg == 0) {
+            sh_gate[row][tiisg] = 0.0f;
+            sh_up[row][tiisg] = 0.0f;
+        }
+        sumg[row] = simd_sum(sumg[row]);
+        sumu[row] = simd_sum(sumu[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            sh_gate[row][sgitg] = sumg[row];
+            sh_up[row][sgitg] = sumu[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *gate_f32 = (device float *)dst_gate +
+        (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+    device float *up_f32 = (device float *)dst_up +
+        (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+    device float *mid_f32 = (device float *)dst_mid +
+        (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+
+    FOR_UNROLL (short row = 0; row < NR0 && r0 + row < row_count; ++row) {
+        const float gate = simd_sum(sh_gate[row][tiisg]);
+        const float up = simd_sum(sh_up[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            const uint out_row = r0 + row;
+            if (STORE_GATE_UP) {
+                gate_f32[out_row] = gate;
+                up_f32[out_row] = up;
+            }
+            float g = gate;
+            float u = up;
+            if (clamp_value > 1.0e-6f) {
+                g = min(g, clamp_value);
+                u = clamp(u, -clamp_value, clamp_value);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u;
+        }
+    }
+}
+
+// Same K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl with the
+// K length taken from a thread value (GPU-decided lane count); the caller
+// bumps src0 to the lane base inside every row.
+template<short NR0>
+void kernel_dsv4_shared_down_q8_0_k_impl(
+        const int k_count,
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = k_count/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+// GPU-decided shared-expert lane split for two-rank TP decode.
+//
+// Routed experts are owned statically by expert id (ds4_tp_owns_expert), so
+// the number of selected experts each rank streams changes per token (0..6
+// of 6) while the shared expert used to be split in fixed halves.  The rank
+// owning more selected experts is the critical path of the layer and the
+// other rank idles at the gate.  Both ranks read the same selected ids, so
+// every threadgroup recomputes the same partition without any host round
+// trip: rank 0 takes lanes [0, lanes0), rank 1 takes [lanes0, shared_dim),
+// lanes0 = shared_dim/2 + (n1 - n0) * shift * shared_dim, where n0/n1 count
+// the selected experts owned by rank 0/1 and shift = routed expert bytes /
+// (2 * shared expert bytes).  With the MXFP4 routed / Q8 shared mix of the
+// V4 Flash file, one extra routed expert moves ~half of the shared expert to
+// the other rank; one owning 4 of 6 hands over the whole shared expert and
+// both ranks stream the same byte count.  shift_q16 == 0 reproduces the
+// static halves bit-exactly.  The union of both ranges is always the full
+// shared width, and a rank with zero lanes writes a zero partial.
+typedef struct {
+    int32_t tp_rank;
+    int32_t tp_world;
+    int32_t n_expert;
+    int32_t n_expert_used;
+    int32_t shared_dim;
+    int32_t lane_granule;
+    int32_t shift_q16;
+} ds4_metal_shared_split_args;
+
+static inline void ds4_shared_split_range(
+        constant ds4_metal_shared_split_args &sp,
+        device const int32_t *ids,
+        thread int &base,
+        thread int &count) {
+    const int per_rank = sp.n_expert / sp.tp_world;
+    int n0 = 0;
+    for (int i = 0; i < sp.n_expert_used; ++i) {
+        n0 += ids[i] < per_rank ? 1 : 0;
+    }
+    const int n1 = sp.n_expert_used - n0;
+    // |n1 - n0| <= 64, shift_q16 <= 65536, shared_dim <= 32768: fits int64.
+    const int64_t delta_q16 =
+        (int64_t)(n1 - n0) * (int64_t)sp.shift_q16 * (int64_t)sp.shared_dim;
+    const int delta = (int)(delta_q16 >= 0 ? (delta_q16 >> 16)
+                                          : -((-delta_q16) >> 16));
+    int lanes0 = sp.shared_dim / 2 + delta;
+    lanes0 = clamp(lanes0, 0, sp.shared_dim);
+    const int granule = sp.lane_granule;
+    lanes0 = ((lanes0 + granule / 2) / granule) * granule;
+    lanes0 = min(lanes0, sp.shared_dim);
+    if (sp.tp_rank == 0) {
+        base = 0;
+        count = (int)lanes0;
+    } else {
+        base = (int)lanes0;
+        count = sp.shared_dim - (int)lanes0;
+    }
+}
+
+[[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_split")]]
+kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0_split(
+        constant ds4_metal_args_mul_mv & args,
+        constant ds4_metal_shared_split_args & sp,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    int base = 0;
+    int count = 0;
+    ds4_shared_split_range(sp, (device const int32_t *)ids, base, count);
+    // Uniform per threadgroup: rows past this rank's lane count exit before
+    // any barrier.  The grid always covers the full shared width.
+    if ((int)tgpig.x * N_R0_Q8_0 >= count) return;
+    const uint64_t lane_bytes = (uint64_t)base * (uint64_t)args.nb01;
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_rows_impl<N_R0_Q8_0, true>(
+            count, args, src0_gate + lane_bytes, src0_up + lane_bytes, src1,
+            dst_gate, dst_up, dst_mid, clamp_value, shmem,
+            tgpig, tiisg, sgitg);
+}
+
+// Shared-expert down projection over this rank's lane range: the K slice
+// starts at the lane base inside every Q8_0 row and runs for the lane
+// count; the SwiGLU intermediate is compact at the buffer base.  A rank
+// with no lanes runs an empty K loop and writes zeros for every row.
+[[host_name("kernel_dsv4_shared_down_q8_0_split")]]
+kernel void kernel_dsv4_shared_down_q8_0_split(
+        constant ds4_metal_args_mul_mv & args,
+        constant ds4_metal_shared_split_args & sp,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    int base = 0;
+    int count = 0;
+    ds4_shared_split_range(sp, (device const int32_t *)ids, base, count);
+    const uint64_t k_bytes = ((uint64_t)base / QK8_0) * (uint64_t)args.nb00;
+    kernel_dsv4_shared_down_q8_0_k_impl<N_R0_Q8_0>(
+            count, args, src0 + k_bytes, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Decode-only fusion of the router logits matvec (F16, embd -> n_expert)

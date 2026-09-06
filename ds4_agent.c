@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_prompt_prefix.h"
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
@@ -55,6 +56,7 @@ typedef struct {
     const char *prompt;
     char *prompt_owned;
     const char *system;
+    ds4_prompt_prefix prefix;
     const char *trace_path;
     bool raw_prompt;
     int n_predict;
@@ -728,6 +730,19 @@ static agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.gen.prompt = c.gen.prompt_owned;
+        } else if (!strcmp(arg, "--prefix-file")) {
+            if (c.gen.prefix.count != 0) {
+                fprintf(stderr, "ds4-agent: specify --prefix-file only once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            char err[256] = {0};
+            if (ds4_prompt_prefix_load(&c.gen.prefix, path,
+                                       err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-agent: %s\n",
+                        err[0] ? err : "invalid prefix file");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
@@ -906,6 +921,11 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.gen.raw_prompt && (!c.non_interactive || !c.gen.prompt)) {
         fprintf(stderr,
                 "ds4-agent: --raw-prompt requires --non-interactive and an initial prompt\n");
+        exit(2);
+    }
+    if (c.gen.raw_prompt && c.gen.prefix.count != 0) {
+        fprintf(stderr,
+                "ds4-agent: --prefix-file cannot be combined with --raw-prompt\n");
         exit(2);
     }
     return c;
@@ -4611,6 +4631,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     }
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system,
                                w->cfg->edit_upto);
+    ds4_prompt_prefix_append(w->engine, out, &w->cfg->gen.prefix);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -8876,6 +8897,19 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
+static int agent_worker_rewind(agent_worker *w, int pos,
+                               char *err, size_t err_len) {
+    ds4_session_rewind(w->session, pos);
+    ds4_tokens prefix = {0};
+    ds4_tokens_copy(&prefix, ds4_session_tokens(w->session));
+    int rc = 0;
+    if (ds4_session_common_prefix(w->session, &prefix) != prefix.len) {
+        rc = agent_worker_sync_tokens(w, &prefix, false, err, err_len);
+    }
+    ds4_tokens_free(&prefix);
+    return rc;
+}
+
 static int worker_finish_generated_token(agent_worker *w,
                                          int token,
                                          int *generated,
@@ -9240,8 +9274,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                 (int)(text_len > 80 ? 80 : text_len),
                                 text);
                     free(text);
-                    ds4_session_rewind(w->session, block_start + ti);
-                    if (worker_force_generated_text(w, "[upto]\n", max_tokens,
+                    if (agent_worker_rewind(w, block_start + ti,
+                                             err, sizeof(err)) != 0 ||
+                        worker_force_generated_text(w, "[upto]\n", max_tokens,
                                                     &generated, t0, &stream,
                                                     err, sizeof(err)) != 0) {
                         agent_dsml_parser_free(&dsml);
@@ -9290,8 +9325,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     /* Later tokens were proposed under the old parser mode.
                      * Re-evaluate this boundary token to restore its logits,
                      * then sample the suffix under the new mode. */
-                    ds4_session_rewind(w->session, block_start + ti);
-                    if (ds4_session_eval(w->session, token,
+                    if (agent_worker_rewind(w, block_start + ti,
+                                             err, sizeof(err)) != 0 ||
+                        ds4_session_eval(w->session, token,
                                          err, sizeof(err)) != 0) {
                         agent_dsml_parser_free(&dsml);
                         agent_set_error(w, err);
@@ -12054,6 +12090,7 @@ int main(int argc, char **argv) {
     ds4_engine_close(engine);
     ds4_tp_free(tp_leader);
     free(cfg.gen.prompt_owned);
+    ds4_prompt_prefix_free(&cfg.gen.prefix);
     return rc;
 }
 #endif

@@ -97,6 +97,31 @@ if [ -x ./ds4-eval ]; then
     else
         fail "ds4-eval retained obsolete --mtp FILE spelling"
     fi
+
+    ./ds4-eval --metal --tensor-parallel --role coordinator \
+        --listen 127.0.0.1 9911 --transport tcp \
+        --tensor-parallel-token-prefill --debug-hash 2 \
+        --rdma-device rdma-test --rdma-gid-index 0 \
+        -m /dev/null --questions 1 > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -qE "model file is too small|another ds4 process is already running" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-eval tensor-parallel coordinator options reach model loading"
+    else
+        fail "ds4-eval tensor-parallel coordinator options did not reach model loading"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+
+    ./ds4-eval --metal --tensor-parallel --role worker \
+        --coordinator 127.0.0.1 9911 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q "serving mode; start workers with ./ds4" "$LOG"; then
+        ok "ds4-eval tensor-parallel worker directs users to ds4"
+    else
+        fail "ds4-eval tensor-parallel worker returned the wrong error"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
 fi
 
 # 1b: ds4-bench accepts the basic DSpark options before model loading.

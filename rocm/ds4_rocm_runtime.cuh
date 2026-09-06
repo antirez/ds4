@@ -4901,15 +4901,9 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     if (g_ssd_streaming_mode) {
         return cuda_stream_resident_free_reserve_bytes();
     }
-    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
-        return 512ull * 1048576ull;
-    }
-
-    /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
-     * device memory free for cuBLAS workspaces, transient graph buffers, and
-     * driver bookkeeping instead of letting optional cached weights consume the
-     * last few GiB on 96 GiB cards. */
-    const uint64_t min_reserve = 4096ull * 1048576ull;
+    /* Optional expanded weights must leave room for BLAS workspaces, transient
+     * graph buffers and the OS on unified-memory devices. */
+    const uint64_t min_reserve = 8192ull * 1048576ull;
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
 }
@@ -5544,26 +5538,6 @@ static int cuda_stream_model_cache_prepare_memory(
     return 1;
 }
 
-static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    const uint64_t default_bytes = 1792ull * 1048576ull;
-    /*
-     * Two allocations larger than half the default arena can never share it.
-     * Allocate those spans tightly for DeepSeek instead of stranding the
-     * remainder of every arena.  This matters for Q4 expert spans (1152 MiB),
-     * where the default policy otherwise wastes 640 MiB per tensor span.
-     *
-     * Keep GLM on its existing allocation policy.
-     */
-    if (!g_glm_model && need > default_bytes / 2u) return need;
-
-    uint64_t bytes = default_bytes;
-    if (bytes < need) {
-        const uint64_t align = 256ull * 1048576ull;
-        bytes = (need + align - 1u) & ~(align - 1u);
-    }
-    return bytes;
-}
-
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -5582,7 +5556,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    const uint64_t chunk = ds4_rocm_model_arena_bytes(aligned);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {

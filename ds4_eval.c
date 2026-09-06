@@ -1,6 +1,8 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_eval_cases.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -10,21 +12,10 @@
  * also intentionally simple: no ncurses, just ANSI cursor movement, colors, and
  * a fixed two-pane layout.
  *
- * The embedded questions are small fixed subsets of GPQA Diamond, SuperGPQA,
- * AIME 2025, and COMPSEC.  The SuperGPQA slice is intentionally audited: rows
- * with wrong keys, missing figures, or underspecified prompts are replaced
- * instead of being locally re-keyed, because ds4-eval is a regression harness
- * and a bad target is worse than a merely hard target.  COMPSEC contains a
- * small audited subset of reduced C/C++ single-function vulnerability
- * localization questions derived from public CVE writeups; the CVE anchors and
- * private rationales are not rendered to the model.
- * GPQA is released under CC BY 4.0.  SuperGPQA is released under ODC-BY and
- * includes mostly original data plus a limited amount of transformed
- * third-party data.  The AIME 2025 mirror used here is MIT licensed.  Source
- * mirrors used while preparing this file:
- * https://huggingface.co/datasets/Wanfq/gpqa
- * https://huggingface.co/datasets/m-a-p/SuperGPQA
- * https://huggingface.co/datasets/test-time-compute/aime_2025
+ * The original core suite contains fixed subsets of GPQA Diamond, SuperGPQA,
+ * AIME 2025, and COMPSEC. The separate hard suite adds MMLU-Pro,
+ * OlympiadBench, LiveBench, and NIST Juliet-derived cases. See EVAL_DATA.md for
+ * source revisions, licenses, and transformations.
  */
 
 #include <ctype.h>
@@ -54,8 +45,7 @@
 #define ANSI_CYAN "\x1b[36m"
 #define ANSI_BOLD "\x1b[1m"
 
-#define EVAL_MAX_CHOICES 10
-#define EVAL_ANSWER_MAX 32
+#define EVAL_ANSWER_MAX 256
 #define EVAL_MAX_CONTEXT 1000000
 
 typedef enum {
@@ -64,6 +54,7 @@ typedef enum {
     EVAL_THINKING,
     EVAL_SKIPPED,
     EVAL_STOPPED,
+    EVAL_INCOMPLETE,
     EVAL_PASSED,
     EVAL_FAILED,
 } eval_status;
@@ -82,17 +73,7 @@ typedef enum {
     EVAL_THINK_CLOSE_HARD,
 } eval_think_close_kind;
 
-typedef struct {
-    const char *source;
-    const char *id;
-    const char *domain;
-    const char *title;
-    const char *question;
-    const char *choice[EVAL_MAX_CHOICES];
-    const char *answer;
-} eval_case;
-
-static const eval_case eval_cases[] = {
+static const eval_case eval_core_cases[] = {
     {
         .source = "GPQA Diamond",
         .id = "recNu3MXkvWUzHZr9",
@@ -1196,6 +1177,10 @@ typedef struct {
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
+    const char *source_filter;
+    const char *domain_filter;
+    const char *case_id_filter;
+    uint32_t suite_mask;
     ds4_backend backend;
     int threads;
     int ctx_size;
@@ -1218,6 +1203,7 @@ typedef struct {
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1225,6 +1211,10 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool self_test_extractors;
+    bool validate_cases;
+    bool list_cases;
+    bool retry_incomplete;
+    bool max_tokens_set;
 } eval_config;
 
 typedef struct {
@@ -1276,6 +1266,8 @@ typedef struct {
 static eval_ui *global_ui;
 
 static double run_clock_sec(void);
+static int validate_eval_cases(bool verbose);
+static void list_eval_cases(const eval_case *cases, int ncases);
 
 static void tui_run_clock_tick(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
@@ -1385,6 +1377,101 @@ static bool eval_case_is_multiple_choice(const eval_case *tc) {
 
 static bool eval_case_is_compsec(const eval_case *tc) {
     return tc->source && !strcmp(tc->source, "COMPSEC");
+}
+
+static size_t eval_core_case_count(void) {
+    return sizeof(eval_core_cases) / sizeof(eval_core_cases[0]);
+}
+
+static eval_answer_kind eval_case_answer_kind(const eval_case *tc) {
+    if (tc->answer_kind != EVAL_ANSWER_AUTO) return tc->answer_kind;
+    if (eval_case_is_multiple_choice(tc)) return EVAL_ANSWER_CHOICE;
+    if (eval_case_is_compsec(tc)) return EVAL_ANSWER_LINE_SET;
+    return EVAL_ANSWER_INTEGER;
+}
+
+static const char *eval_answer_kind_name(eval_answer_kind kind) {
+    switch (kind) {
+    case EVAL_ANSWER_CHOICE: return "choice";
+    case EVAL_ANSWER_INTEGER: return "integer";
+    case EVAL_ANSWER_RATIONAL: return "reduced_rational";
+    case EVAL_ANSWER_EXACT_TEXT: return "exact_text";
+    case EVAL_ANSWER_ORDERED_SEQUENCE: return "ordered_sequence";
+    case EVAL_ANSWER_LINE_SET: return "security_line_set";
+    case EVAL_ANSWER_AUTO:
+    default: return "auto";
+    }
+}
+
+static uint32_t parse_suite(const char *s, const char *opt) {
+    if (!strcmp(s, "core")) return EVAL_SUITE_CORE;
+    if (!strcmp(s, "hard")) return EVAL_SUITE_HARD;
+    if (!strcmp(s, "all")) return EVAL_SUITE_CORE | EVAL_SUITE_HARD;
+    if (!strcmp(s, "hard-smoke")) return EVAL_SUITE_HARD_SMOKE;
+    fprintf(stderr,
+            "ds4-eval: invalid value for %s: %s (expected core, hard, all, or hard-smoke)\n",
+            opt, s);
+    exit(2);
+}
+
+static const char *eval_suite_name(uint32_t mask) {
+    if (mask == EVAL_SUITE_CORE) return "core";
+    if (mask == EVAL_SUITE_HARD) return "hard";
+    if (mask == (EVAL_SUITE_CORE | EVAL_SUITE_HARD)) return "all";
+    if (mask == EVAL_SUITE_HARD_SMOKE) return "hard-smoke";
+    return "custom";
+}
+
+static bool eval_case_matches_filters(const eval_case *tc,
+                                      const eval_config *cfg) {
+    if (cfg->source_filter && strcasecmp(tc->source, cfg->source_filter)) return false;
+    if (cfg->domain_filter && strcasecmp(tc->domain, cfg->domain_filter)) return false;
+    if (cfg->case_id_filter && strcmp(tc->id, cfg->case_id_filter)) return false;
+    return true;
+}
+
+static eval_case *select_eval_cases(const eval_config *cfg, int *count_out) {
+    const size_t core_count = eval_core_case_count();
+    const size_t max_count = core_count + eval_hard_case_count;
+    eval_case *selected = calloc(max_count ? max_count : 1, sizeof(*selected));
+    if (!selected) {
+        fprintf(stderr, "ds4-eval: out of memory while selecting cases\n");
+        return NULL;
+    }
+
+    int count = 0;
+    if (cfg->suite_mask & EVAL_SUITE_CORE) {
+        for (size_t i = 0; i < core_count; i++) {
+            if (eval_case_matches_filters(&eval_core_cases[i], cfg))
+                selected[count++] = eval_core_cases[i];
+        }
+    }
+    if (cfg->suite_mask & (EVAL_SUITE_HARD | EVAL_SUITE_HARD_SMOKE)) {
+        for (size_t i = 0; i < eval_hard_case_count; i++) {
+            const eval_case *tc = &eval_hard_cases[i];
+            if ((cfg->suite_mask & EVAL_SUITE_HARD_SMOKE) &&
+                !(cfg->suite_mask & EVAL_SUITE_HARD) &&
+                !(tc->suites & EVAL_SUITE_HARD_SMOKE))
+                continue;
+            if (eval_case_matches_filters(tc, cfg)) selected[count++] = *tc;
+        }
+    }
+
+    if (cfg->question_limit > count) {
+        fprintf(stderr, "ds4-eval: only %d questions match the selected suite and filters\n",
+                count);
+        free(selected);
+        return NULL;
+    }
+    if (cfg->question_limit > 0 && cfg->question_limit < count)
+        count = cfg->question_limit;
+    if (count == 0) {
+        fprintf(stderr, "ds4-eval: no questions match the selected suite and filters\n");
+        free(selected);
+        return NULL;
+    }
+    *count_out = count;
+    return selected;
 }
 
 static void style_append(style_buf *b, unsigned char style, size_t n) {
@@ -1516,6 +1603,7 @@ static eval_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .backend = default_backend(),
         .max_tokens = 16000,
+        .suite_mask = EVAL_SUITE_CORE,
         .top_p = DS4_DEFAULT_TOP_P,
         .min_p = DS4_DEFAULT_MIN_P,
         .pause_ms = 350,
@@ -1550,6 +1638,23 @@ static eval_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-eval: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
@@ -1558,10 +1663,25 @@ static eval_config parse_options(int argc, char **argv) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.max_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.max_tokens_set = true;
         } else if (!strcmp(arg, "--questions")) {
             c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--case-sequence")) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--suite")) {
+            c.suite_mask = parse_suite(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--source")) {
+            c.source_filter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--domain")) {
+            c.domain_filter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--case-id")) {
+            c.case_id_filter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--list-cases")) {
+            c.list_cases = true;
+        } else if (!strcmp(arg, "--validate-cases")) {
+            c.validate_cases = true;
+        } else if (!strcmp(arg, "--retry-incomplete")) {
+            c.retry_incomplete = true;
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
@@ -1663,14 +1783,26 @@ static eval_config parse_options(int argc, char **argv) {
             exit(2);
         }
     }
-    if (c.self_test_extractors || c.regrade_trace_path) return c;
+    if (c.self_test_extractors || c.validate_cases || c.list_cases ||
+        c.regrade_trace_path)
+        return c;
 
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.tp, &c.dist,
+                                          tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
         exit(2);
     }
     if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
+    if (c.tp.role == DS4_TP_WORKER) {
         fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
@@ -1746,6 +1878,7 @@ static void term_set_color_for_status(eval_status st) {
     case EVAL_THINKING: fputs(ANSI_YELLOW, stdout); break;
     case EVAL_SKIPPED:  fputs(ANSI_DIM, stdout); break;
     case EVAL_STOPPED:  fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
+    case EVAL_INCOMPLETE:fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
     case EVAL_PASSED:   fputs(ANSI_GREEN ANSI_BOLD, stdout); break;
     case EVAL_FAILED:   fputs(ANSI_RED ANSI_BOLD, stdout); break;
     }
@@ -1758,6 +1891,7 @@ static const char *status_name(eval_status st) {
     case EVAL_THINKING: return "RUN";
     case EVAL_SKIPPED: return "SKIP";
     case EVAL_STOPPED: return "STOP";
+    case EVAL_INCOMPLETE: return "INC";
     case EVAL_PASSED: return "PASS";
     case EVAL_FAILED: return "FAIL";
     }
@@ -2017,19 +2151,22 @@ static void tui_draw_frame(eval_ui *ui) {
 static void tui_draw_left(eval_ui *ui) {
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     for (int i = 0; i < ui->ncases; i++) {
         if (ui->status[i] == EVAL_PASSED) passed++;
         else if (ui->status[i] == EVAL_FAILED) failed++;
+        else if (ui->status[i] == EVAL_INCOMPLETE) incomplete++;
     }
 
     tui_draw_title(ui);
 
     term_move(2, 1);
     tui_clear_left_line(ui, 2);
-    printf("score %s%d%s/%d  failed %s%d%s",
+    printf("score %s%d%s/%d  failed %s%d%s  incomplete %s%d%s",
            ANSI_GREEN, passed, ANSI_RESET,
            ui->ncases,
-           failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET);
+           failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET,
+           incomplete ? ANSI_YELLOW : ANSI_DIM, incomplete, ANSI_RESET);
 
     const int first_row = 4;
     const int visible_rows = ui->rows >= first_row ? ui->rows - first_row + 1 : 0;
@@ -2071,7 +2208,8 @@ static void tui_draw_left(eval_ui *ui) {
                      ui->cases[i].source, ui->cases[i].title);
             print_trimmed(title, title_w);
         }
-        if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED) {
+        if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED ||
+            ui->status[i] == EVAL_INCOMPLETE) {
             char answers[64];
             snprintf(answers, sizeof(answers), "%s/%s",
                      ui->guess[i][0] ? ui->guess[i] : "?",
@@ -2379,8 +2517,9 @@ static const char *eval_system_prompt(void) {
 static char *build_question_prompt(const eval_case *tc) {
     byte_buf b = {0};
     int nchoices = eval_case_nchoices(tc);
+    eval_answer_kind kind = eval_case_answer_kind(tc);
     buf_appendf(&b, "%s\n", tc->question);
-    if (nchoices > 0) {
+    if (kind == EVAL_ANSWER_CHOICE) {
         buf_append(&b, "\nChoices:\n", strlen("\nChoices:\n"));
         for (int i = 0; i < nchoices; i++) {
             buf_appendf(&b, "%c. %s\n", 'A' + i, tc->choice[i]);
@@ -2392,7 +2531,7 @@ static char *build_question_prompt(const eval_case *tc) {
             strlen("\nSolve the question. At the end, write exactly one final line in this "
                    "format and do not write anything after it:\n"
                    "Answer: <letter>"));
-    } else if (eval_case_is_compsec(tc)) {
+    } else if (kind == EVAL_ANSWER_LINE_SET) {
         buf_append(&b,
             "\nAt the end, write exactly one final line in this format and do not "
             "write anything after it:\n"
@@ -2400,7 +2539,7 @@ static char *build_question_prompt(const eval_case *tc) {
             strlen("\nAt the end, write exactly one final line in this format and do not "
                    "write anything after it:\n"
                    "Answer: <line number or comma-separated line numbers>"));
-    } else {
+    } else if (kind == EVAL_ANSWER_INTEGER) {
         buf_append(&b,
             "\nSolve the problem. At the end, write exactly one final line in this "
             "format and do not write anything after it:\n"
@@ -2408,11 +2547,55 @@ static char *build_question_prompt(const eval_case *tc) {
             strlen("\nSolve the problem. At the end, write exactly one final line in this "
                    "format and do not write anything after it:\n"
                    "Answer: <integer>"));
+    } else if (kind == EVAL_ANSWER_RATIONAL) {
+        buf_append(&b,
+            "\nSolve the problem. Reduce the result. At the end, write exactly one final "
+            "line in this format and do not write anything after it:\n"
+            "Answer: <integer or reduced fraction>",
+            strlen("\nSolve the problem. Reduce the result. At the end, write exactly one final "
+                   "line in this format and do not write anything after it:\n"
+                   "Answer: <integer or reduced fraction>"));
+    } else if (kind == EVAL_ANSWER_ORDERED_SEQUENCE) {
+        buf_append(&b,
+            "\nSolve the problem. At the end, write exactly one final line containing the "
+            "answers in the requested order, separated by commas, and do not write anything "
+            "after it:\nAnswer: <ordered answers>",
+            strlen("\nSolve the problem. At the end, write exactly one final line containing the "
+                   "answers in the requested order, separated by commas, and do not write anything "
+                   "after it:\nAnswer: <ordered answers>"));
+    } else {
+        buf_append(&b,
+            "\nSolve the problem. At the end, write exactly one final line in this format "
+            "and do not write anything after it:\nAnswer: <exact answer>",
+            strlen("\nSolve the problem. At the end, write exactly one final line in this format "
+                   "and do not write anything after it:\nAnswer: <exact answer>"));
     }
     if (b.v) return b.v;
     char *empty = malloc(1);
     if (empty) empty[0] = '\0';
     return empty;
+}
+
+static int eval_case_generation_budget(const eval_config *cfg,
+                                       const eval_case *tc,
+                                       bool retry) {
+    uint64_t budget = (!cfg->max_tokens_set && tc->max_tokens) ?
+                      tc->max_tokens : (uint32_t)cfg->max_tokens;
+    if (retry) budget *= 2;
+    if (budget > EVAL_MAX_CONTEXT) budget = EVAL_MAX_CONTEXT;
+    return (int)budget;
+}
+
+static int eval_max_generation_budget(const eval_config *cfg,
+                                      const eval_case *cases,
+                                      int ncases) {
+    int max_budget = 0;
+    for (int i = 0; i < ncases; i++) {
+        int budget = eval_case_generation_budget(cfg, &cases[i],
+                                                 cfg->retry_incomplete);
+        if (budget > max_budget) max_budget = budget;
+    }
+    return max_budget;
 }
 
 static int eval_max_prompt_tokens(ds4_engine *engine,
@@ -2450,6 +2633,7 @@ static int eval_auto_context_size(ds4_engine *engine,
                                   eval_config *cfg,
                                   const eval_case *cases,
                                   int ncases,
+                                  int max_generation_tokens,
                                   int *max_prompt_out,
                                   int *max_case_out)
 {
@@ -2464,12 +2648,12 @@ static int eval_auto_context_size(ds4_engine *engine,
      * thinking mode that the actual run will use. */
     for (int iter = 0; iter < 3; iter++) {
         max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
-        long long required = (long long)max_prompt + (long long)cfg->max_tokens;
+        long long required = (long long)max_prompt + (long long)max_generation_tokens;
         if (required < min_ctx) required = min_ctx;
         if (required > EVAL_MAX_CONTEXT) {
             fprintf(stderr,
-                    "ds4-eval: largest prompt (%d tokens, case %d) + --tokens (%d) exceeds the %d token context cap\n",
-                    max_prompt, max_case + 1, cfg->max_tokens, EVAL_MAX_CONTEXT);
+                    "ds4-eval: largest prompt (%d tokens, case %d) + generation budget (%d) exceeds the %d token context cap\n",
+                    max_prompt, max_case + 1, max_generation_tokens, EVAL_MAX_CONTEXT);
             exit(2);
         }
         if ((int)required == ctx) break;
@@ -2492,7 +2676,8 @@ static void eval_warn_think_max_downgraded(const eval_config *cfg) {
             cfg->ctx_size);
 }
 
-static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens, int max_prompt_case) {
+static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens,
+                                     int max_prompt_case, int max_generation_tokens) {
     if (max_prompt_tokens >= cfg->ctx_size) {
         fprintf(stderr,
                 "ds4-eval: warning: largest prompt (%d tokens, case=%d) does not fit ctx=%d\n",
@@ -2503,14 +2688,14 @@ static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_toke
     }
 
     const int room = cfg->ctx_size - max_prompt_tokens;
-    if (room < cfg->max_tokens) {
+    if (room < max_generation_tokens) {
         fprintf(stderr,
                 "ds4-eval: warning: largest prompt (%d tokens, case=%d) leaves %d generation tokens in ctx=%d; requested %d\n",
                 max_prompt_tokens,
                 max_prompt_case + 1,
                 room,
                 cfg->ctx_size,
-                cfg->max_tokens);
+                max_generation_tokens);
     }
 }
 
@@ -2556,7 +2741,8 @@ static int token_rank_in_top(ds4_session *session, int token, int max_rank) {
 static void trace_write_header(FILE *trace, const eval_config *cfg,
                                const char *model_name,
                                int ncases,
-                               int max_prompt_tokens) {
+                               int max_prompt_tokens,
+                               int max_generation_tokens) {
     if (!trace) return;
     fprintf(trace,
             "# ds4-eval trace\n"
@@ -2564,8 +2750,13 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "model: %s\n"
             "model_shape: %s\n"
             "backend: %s\n"
+            "suite: %s\n"
+            "source_filter: %s\n"
+            "domain_filter: %s\n"
+            "case_id_filter: %s\n"
             "ctx: %d\n"
             "max_tokens: %d\n"
+            "max_generation_tokens: %d\n"
             "max_prompt_tokens: %d\n"
             "questions: %d\n"
             "temperature: %.6g\n"
@@ -2581,8 +2772,13 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             cfg->model_path,
             model_name ? model_name : "unknown",
             ds4_backend_name(cfg->backend),
+            eval_suite_name(cfg->suite_mask),
+            cfg->source_filter ? cfg->source_filter : "*",
+            cfg->domain_filter ? cfg->domain_filter : "*",
+            cfg->case_id_filter ? cfg->case_id_filter : "*",
             cfg->ctx_size,
             cfg->max_tokens,
+            max_generation_tokens,
             max_prompt_tokens,
             ncases,
             cfg->temperature,
@@ -2609,6 +2805,7 @@ static void trace_write_case(FILE *trace,
                              ds4_think_mode effective_think_mode,
                              int prompt_tokens,
                              int generated_tokens,
+                             int generation_budget,
                              double elapsed_sec,
                              const char *picked,
                              const eval_think_close_info *think_close) {
@@ -2626,6 +2823,7 @@ static void trace_write_case(FILE *trace,
             "expected: %s\n"
             "prompt_tokens: %d\n"
             "generated_tokens: %d\n"
+            "generation_budget: %d\n"
             "elapsed_sec: %.3f\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
@@ -2642,6 +2840,7 @@ static void trace_write_case(FILE *trace,
             tc->answer,
             prompt_tokens,
             generated_tokens,
+            generation_budget,
             elapsed_sec,
             cfg->temperature,
             cfg->top_p,
@@ -2667,9 +2866,9 @@ static void trace_write_case(FILE *trace,
         for (int i = 0; i < nchoices; i++) {
             fprintf(trace, "  %c. %s\n", 'A' + i, tc->choice[i]);
         }
-    } else {
-        fprintf(trace, "answer_kind: exact_integer\n");
     }
+    fprintf(trace, "answer_kind: %s\n",
+            eval_answer_kind_name(eval_case_answer_kind(tc)));
     trace_write_block(trace, "SYSTEM_PROMPT", system_prompt);
     trace_write_block(trace, "QUESTION_PROMPT", question_prompt);
     trace_write_block(trace, "MODEL_OUTPUT", model_output);
@@ -2677,9 +2876,8 @@ static void trace_write_case(FILE *trace,
     fflush(trace);
 }
 
-/* Model outputs can contain provisional "answer" text after a forced
- * </think> and then a later final line.  A strict final Answer: marker is the
- * best grading target; outputs without one keep the original loose fallback. */
+/* Old traces predate strict final-line grading, so the low-level extractors keep
+ * their loose fallback. Live runs call find_case_answer_strict() instead. */
 static char *strcasestr_local(const char *hay, const char *needle) {
     size_t nlen = strlen(needle);
     if (nlen == 0) return (char *)hay;
@@ -2990,29 +3188,204 @@ static bool compsec_answer_matches(const char *expected_spec, const char *got_sp
     return hit;
 }
 
+static const char *answer_payload(const char *line) {
+    char *marker = find_last_answer_marker(line);
+    if (!marker) return NULL;
+    const char *p = marker + strlen("answer");
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p && (isspace((unsigned char)*p) || *p == '*')) p++;
+    return p;
+}
+
+static void normalize_exact_answer(const char *src, char *dst, size_t dstlen) {
+    size_t n = 0;
+    if (dstlen == 0) return;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (isspace(*p) || *p == '$' || *p == '*' || *p == '{' || *p == '}')
+            continue;
+        if (*p == '\\') {
+            if (!strncmp((const char *)p, "\\boxed", 6)) p += 5;
+            else if (!strncmp((const char *)p, "\\left", 5)) p += 4;
+            else if (!strncmp((const char *)p, "\\right", 6)) p += 5;
+            continue;
+        }
+        if (n + 1 < dstlen) dst[n++] = (char)tolower(*p);
+    }
+    while (n > 0 && (dst[n - 1] == '.' || dst[n - 1] == ';')) n--;
+    dst[n] = '\0';
+}
+
+static void normalize_ordered_answer(const char *src, char *dst, size_t dstlen) {
+    size_t n = 0;
+    bool in_tag = false;
+    if (dstlen == 0) return;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (*p == '<') {
+            in_tag = true;
+            continue;
+        }
+        if (in_tag) {
+            if (*p == '>') in_tag = false;
+            continue;
+        }
+        if (isalnum(*p) || *p == ',' || *p == '-' || *p == '+' ||
+            *p == '/' || *p == '.') {
+            if (n + 1 < dstlen) dst[n++] = (char)tolower(*p);
+        }
+    }
+    while (n > 0 && (dst[n - 1] == '.' || dst[n - 1] == ',')) n--;
+    dst[n] = '\0';
+}
+
+static void normalize_rational_answer(const char *src, char *dst, size_t dstlen) {
+    if (dstlen == 0) return;
+    const char *frac = strstr(src, "\\frac");
+    if (frac) {
+        const char *a = strchr(frac, '{');
+        const char *a_end = a ? strchr(a + 1, '}') : NULL;
+        const char *b = a_end ? strchr(a_end + 1, '{') : NULL;
+        const char *b_end = b ? strchr(b + 1, '}') : NULL;
+        if (a && a_end && b && b_end) {
+            size_t n = 0;
+            for (const char *p = a + 1; p < a_end && n + 1 < dstlen; p++)
+                if (!isspace((unsigned char)*p)) dst[n++] = *p;
+            if (n + 1 < dstlen) dst[n++] = '/';
+            for (const char *p = b + 1; p < b_end && n + 1 < dstlen; p++)
+                if (!isspace((unsigned char)*p)) dst[n++] = *p;
+            dst[n] = '\0';
+            return;
+        }
+    }
+
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (isdigit(*p) || *p == '-' || *p == '+' || *p == '/' || *p == '.') {
+            if (n + 1 < dstlen) dst[n++] = (char)*p;
+        }
+    }
+    while (n > 0 && dst[n - 1] == '.') n--;
+    dst[n] = '\0';
+}
+
+static void find_payload_answer(const eval_case *tc, const char *generated,
+                                char *dst, size_t dstlen) {
+    if (dstlen == 0) return;
+    snprintf(dst, dstlen, "?");
+    const char *visible = strstr(generated, "</think>");
+    visible = visible ? visible + 8 : generated;
+    const char *payload = answer_payload(visible);
+    if (!payload) return;
+
+    switch (eval_case_answer_kind(tc)) {
+    case EVAL_ANSWER_RATIONAL:
+        normalize_rational_answer(payload, dst, dstlen);
+        break;
+    case EVAL_ANSWER_ORDERED_SEQUENCE:
+        normalize_ordered_answer(payload, dst, dstlen);
+        break;
+    case EVAL_ANSWER_EXACT_TEXT:
+        normalize_exact_answer(payload, dst, dstlen);
+        break;
+    default:
+        break;
+    }
+    if (dst[0] == '\0') snprintf(dst, dstlen, "?");
+}
+
 static void find_case_answer(const eval_case *tc, const char *generated,
                              char *dst, size_t dstlen) {
     if (dstlen == 0) return;
-    if (eval_case_is_multiple_choice(tc)) {
+    switch (eval_case_answer_kind(tc)) {
+    case EVAL_ANSWER_CHOICE:
         dst[0] = find_answer_letter(generated, eval_case_nchoices(tc));
         if (dstlen > 1) dst[1] = '\0';
-    } else if (eval_case_is_compsec(tc)) {
+        break;
+    case EVAL_ANSWER_LINE_SET:
         find_compsec_answer(generated, dst, dstlen);
-    } else {
+        break;
+    case EVAL_ANSWER_INTEGER:
         find_integer_answer(generated, dst, dstlen);
+        break;
+    case EVAL_ANSWER_RATIONAL:
+    case EVAL_ANSWER_EXACT_TEXT:
+    case EVAL_ANSWER_ORDERED_SEQUENCE:
+        find_payload_answer(tc, generated, dst, dstlen);
+        break;
+    case EVAL_ANSWER_AUTO:
+    default:
+        snprintf(dst, dstlen, "?");
+        break;
+    }
+}
+
+static bool find_case_answer_strict(const eval_case *tc, const char *generated,
+                                    char *dst, size_t dstlen) {
+    if (dstlen == 0) return false;
+    snprintf(dst, dstlen, "?");
+
+    const char *end = generated + strlen(generated);
+    while (end > generated && isspace((unsigned char)end[-1])) end--;
+    if (end == generated) return false;
+    const char *start = end;
+    while (start > generated && start[-1] != '\n' && start[-1] != '\r') start--;
+
+    size_t len = (size_t)(end - start);
+    char *line = malloc(len + 1);
+    if (!line) {
+        fprintf(stderr, "ds4-eval: out of memory while grading answer\n");
+        return false;
+    }
+    memcpy(line, start, len);
+    line[len] = '\0';
+    if (!answer_payload(line)) {
+        free(line);
+        return false;
+    }
+    find_case_answer(tc, line, dst, dstlen);
+    free(line);
+    return true;
+}
+
+static void normalize_expected_answer(eval_answer_kind kind, const char *src,
+                                      char *dst, size_t dstlen) {
+    switch (kind) {
+    case EVAL_ANSWER_RATIONAL:
+        normalize_rational_answer(src, dst, dstlen);
+        break;
+    case EVAL_ANSWER_EXACT_TEXT:
+        normalize_exact_answer(src, dst, dstlen);
+        break;
+    case EVAL_ANSWER_ORDERED_SEQUENCE:
+        normalize_ordered_answer(src, dst, dstlen);
+        break;
+    case EVAL_ANSWER_INTEGER:
+        normalize_integer_answer(src, strlen(src), dst, dstlen);
+        break;
+    default:
+        snprintf(dst, dstlen, "%s", src);
+        break;
     }
 }
 
 static bool answer_matches(const eval_case *tc, const char *got) {
-    if (eval_case_is_multiple_choice(tc)) {
+    eval_answer_kind kind = eval_case_answer_kind(tc);
+    if (kind == EVAL_ANSWER_CHOICE) {
         return got && got[0] && tc->answer && got[0] == tc->answer[0];
     }
-    if (eval_case_is_compsec(tc)) {
+    if (kind == EVAL_ANSWER_LINE_SET) {
         return got && tc->answer && compsec_answer_matches(tc->answer, got);
     }
+    if (!got || !tc->answer) return false;
     char expected[EVAL_ANSWER_MAX];
-    normalize_integer_answer(tc->answer, strlen(tc->answer), expected, sizeof(expected));
-    return got && strcmp(got, expected) == 0;
+    normalize_expected_answer(kind, tc->answer, expected, sizeof(expected));
+    if (strcmp(got, expected) == 0) return true;
+    for (int i = 0; i < EVAL_MAX_ALIASES && tc->alias[i]; i++) {
+        normalize_expected_answer(kind, tc->alias[i], expected, sizeof(expected));
+        if (strcmp(got, expected) == 0) return true;
+    }
+    return false;
 }
 
 static char *read_text_file(const char *path, size_t *len_out) {
@@ -3182,12 +3555,17 @@ static bool trace_get_line_field(const char *start, const char *end,
 
 static const eval_case *find_eval_case_by_source_id(const char *source,
                                                     const char *id) {
-    size_t ncases = sizeof(eval_cases) / sizeof(eval_cases[0]);
-    for (size_t i = 0; i < ncases; i++) {
-        if (eval_cases[i].source && eval_cases[i].id &&
-            !strcmp(eval_cases[i].source, source) &&
-            !strcmp(eval_cases[i].id, id))
-            return &eval_cases[i];
+    for (size_t i = 0; i < eval_core_case_count(); i++) {
+        if (eval_core_cases[i].source && eval_core_cases[i].id &&
+            !strcmp(eval_core_cases[i].source, source) &&
+            !strcmp(eval_core_cases[i].id, id))
+            return &eval_core_cases[i];
+    }
+    for (size_t i = 0; i < eval_hard_case_count; i++) {
+        if (eval_hard_cases[i].source && eval_hard_cases[i].id &&
+            !strcmp(eval_hard_cases[i].source, source) &&
+            !strcmp(eval_hard_cases[i].id, id))
+            return &eval_hard_cases[i];
     }
     return NULL;
 }
@@ -3353,6 +3731,25 @@ static int extractor_self_test_case(const char *name, const eval_case *tc,
     return 1;
 }
 
+static int extractor_strict_self_test_case(const char *name, const eval_case *tc,
+                                           const char *generated,
+                                           bool expected_complete,
+                                           const char *expected_extract) {
+    char got[EVAL_ANSWER_MAX];
+    bool complete = find_case_answer_strict(tc, generated, got, sizeof(got));
+    bool ok = complete == expected_complete;
+    if (expected_complete)
+        ok = ok && !strcmp(got, expected_extract) && answer_matches(tc, got);
+    if (ok) return 0;
+
+    fprintf(stderr,
+            "ds4-eval: strict extractor self-test failed: %s "
+            "(complete %d/%d, got %s, expected %s)\n",
+            name, complete, expected_complete, got,
+            expected_extract ? expected_extract : "-");
+    return 1;
+}
+
 static int trace_copy_self_test_case(void) {
     const char *prompt_output =
         "Prompt text may mention\n"
@@ -3466,6 +3863,9 @@ static int run_extractor_self_tests(void) {
         &mc,
         "</think>The answer is F. This answer is final; option H is tempting.",
         "F");
+    failed += extractor_strict_self_test_case(
+        "multiple-choice strict final line",
+        &mc, "</think>Option H is tempting.\nAnswer: F", true, "F");
 
     const eval_case integer = {
         .source = "AIME2025",
@@ -3482,6 +3882,59 @@ static int run_extractor_self_tests(void) {
         "</think>The answer is 082. This answer comes from AIME 2025.",
         "82");
 
+    failed += extractor_strict_self_test_case(
+        "strict grading accepts a final answer line",
+        &integer,
+        "</think>The result is 82.\n**Answer:** 082\n",
+        true, "82");
+    failed += extractor_strict_self_test_case(
+        "strict grading rejects incidental answer prose",
+        &integer,
+        "</think>The answer is 82, but the generation was truncated.",
+        false, NULL);
+    failed += extractor_strict_self_test_case(
+        "strict grading rejects text after the answer line",
+        &integer,
+        "</think>Answer: 82\nA later unfinished sentence",
+        false, NULL);
+
+    const eval_case rational = {
+        .answer = "25/2",
+        .alias[0] = "12.5",
+        .answer_kind = EVAL_ANSWER_RATIONAL,
+    };
+    failed += extractor_strict_self_test_case(
+        "rational accepts LaTeX fraction",
+        &rational, "Reasoning.\nAnswer: \\frac{25}{2}", true, "25/2");
+    failed += extractor_strict_self_test_case(
+        "rational accepts declared decimal alias",
+        &rational, "Reasoning.\nAnswer: 12.5", true, "12.5");
+
+    const eval_case exact = {
+        .answer = "2n-2",
+        .alias[0] = "2(n-1)",
+        .answer_kind = EVAL_ANSWER_EXACT_TEXT,
+    };
+    failed += extractor_strict_self_test_case(
+        "exact text accepts a declared algebraic alias",
+        &exact, "Reasoning.\nAnswer: $2 (n - 1)$", true, "2(n-1)");
+
+    const eval_case ordered = {
+        .answer = "(1,8,19),(2,7,13),(4,5,7)",
+        .alias[0] = "(4,5,7),(2,7,13),(1,8,19)",
+        .answer_kind = EVAL_ANSWER_ORDERED_SEQUENCE,
+    };
+    failed += extractor_strict_self_test_case(
+        "ordered sequence ignores presentation brackets",
+        &ordered,
+        "Reasoning.\nAnswer: [(1, 8, 19), (2, 7, 13), (4, 5, 7)]",
+        true, "1,8,19,2,7,13,4,5,7");
+    failed += extractor_strict_self_test_case(
+        "ordered sequence accepts a declared ordering alias",
+        &ordered,
+        "Reasoning.\nAnswer: (4,5,7), (2,7,13), (1,8,19)",
+        true, "4,5,7,2,7,13,1,8,19");
+
     const eval_case compsec = {
         .source = "COMPSEC",
         .answer = "9-10",
@@ -3493,6 +3946,10 @@ static int run_extractor_self_tests(void) {
         "**Answer:** 10</think>The primary write is at line 10.\n"
         "Answer: 10",
         "10");
+    failed += extractor_strict_self_test_case(
+        "security line set strict final line",
+        &compsec, "</think>The fault is nearby.\nAnswer: lines 9 and 10",
+        true, "9,10");
 
     /* --- Regression cases for answer-extractor false negatives. These guard
      *     against the grader under-reporting model accuracy on well-formed
@@ -3581,6 +4038,7 @@ static int run_extractor_self_tests(void) {
         "integer: digits on a later line do not override the answer line",
         &int_82, "</think>Answer: 82\nThe value 2025 is just the year.", "82");
 
+    failed += validate_eval_cases(false);
     if (failed) return 1;
     printf("ds4-eval: answer extractor self-tests passed\n");
     return 0;
@@ -3636,8 +4094,9 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
 
 static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                                     const eval_config *cfg, eval_ui *ui,
-                                    FILE *trace, int idx, uint64_t *rng) {
-    const eval_case *tc = &eval_cases[idx];
+                                    FILE *trace, int idx, int generation_budget,
+                                    uint64_t *rng) {
+    const eval_case *tc = &ui->cases[idx];
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
     const ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
@@ -3662,7 +4121,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt does not fit context", system, question, "",
-                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         think_mode, prompt.len, 0, generation_budget, 0.0, "?", NULL);
         if (!tty) {
             printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
                    idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
@@ -3672,7 +4131,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         return EVAL_RUN_OK;
     }
 
-    int generation_limit = cfg->max_tokens;
+    int generation_limit = generation_budget;
     int ctx_generation_limit = cfg->ctx_size - prompt.len;
     if (ctx_generation_limit < generation_limit) generation_limit = ctx_generation_limit;
     if (generation_limit < 1) {
@@ -3683,7 +4142,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt leaves no generation room", system, question, "",
-                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         think_mode, prompt.len, 0, generation_limit, 0.0, "?", NULL);
         if (!tty) {
             printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
                    idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
@@ -3726,7 +4185,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         tui_run_clock_stop(ui);
         fprintf(stderr, "ds4-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
-                         system, question, "", think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt.len, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         ds4_tokens_free(&prompt);
         return EVAL_RUN_ERROR;
@@ -3745,7 +4205,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
-                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         return EVAL_RUN_QUIT;
     }
@@ -3754,7 +4215,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
-                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         return EVAL_RUN_SWITCH;
     }
@@ -3784,7 +4246,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
@@ -3798,7 +4261,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
@@ -3817,7 +4281,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
@@ -3831,7 +4296,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 ds4_tokens_free(&think_close_tokens);
@@ -3888,7 +4354,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             fprintf(stderr, "ds4-eval: decode failed for %s: %s\n", tc->id, err);
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
-                             prompt_tokens, ui->generated, now_sec() - t0, "?",
+                             prompt_tokens, ui->generated, generation_limit,
+                             now_sec() - t0, "?",
                              &think_close);
             free(question);
             ds4_tokens_free(&think_close_tokens);
@@ -3936,22 +4403,27 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     }
 
     char got[EVAL_ANSWER_MAX];
-    find_case_answer(tc, raw.v ? raw.v : "", got, sizeof(got));
+    bool complete = find_case_answer_strict(tc, raw.v ? raw.v : "",
+                                            got, sizeof(got));
     snprintf(ui->guess[idx], EVAL_ANSWER_MAX, "%s", got);
-    bool pass = answer_matches(tc, got);
-    ui->status[idx] = pass ? EVAL_PASSED : EVAL_FAILED;
+    bool pass = complete && answer_matches(tc, got);
+    ui->status[idx] = !complete ? EVAL_INCOMPLETE :
+                      (pass ? EVAL_PASSED : EVAL_FAILED);
     ui->generated_tokens[idx] = ui->generated;
     tui_run_clock_stop(ui);
     double sec = now_sec() - t0;
-    tui_refresh(ui, pass ? "passed" : "failed");
-    trace_write_case(trace, cfg, tc, idx, ui->ncases, pass ? "PASSED" : "FAILED", NULL,
+    const char *result_name = !complete ? "INCOMPLETE" :
+                              (pass ? "PASSED" : "FAILED");
+    tui_refresh(ui, !complete ? "incomplete" : (pass ? "passed" : "failed"));
+    trace_write_case(trace, cfg, tc, idx, ui->ncases, result_name, NULL,
                      system, question, raw.v ? raw.v : "", think_mode, prompt_tokens,
-                     ui->generated, sec, got, &think_close);
+                     ui->generated, generation_limit, sec, got, &think_close);
 
     if (!tty) {
         printf("%s%s%s got %s expected %s (%.1fs, %d tokens)\n",
-               use_plain_color ? (pass ? ANSI_GREEN : ANSI_RED) : "",
-               pass ? "PASSED" : "FAIL",
+               use_plain_color ? (!complete ? ANSI_YELLOW :
+                                  (pass ? ANSI_GREEN : ANSI_RED)) : "",
+               !complete ? "INCOMPLETE" : (pass ? "PASSED" : "FAIL"),
                use_plain_color ? ANSI_RESET : "",
                got, tc->answer, sec, ui->generated);
     }
@@ -4080,6 +4552,7 @@ static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
     case EVAL_FAILED: return "FAILED";
+    case EVAL_INCOMPLETE: return "INCOMPLETE";
     case EVAL_SKIPPED: return "SKIPPED";
     case EVAL_STOPPED: return "STOPPED";
     case EVAL_PREFILL: return "PREFILL";
@@ -4089,21 +4562,23 @@ static const char *report_status_name(eval_status st) {
     }
 }
 
-static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed) {
+static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed,
+                              int incomplete) {
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
 
     printf("ds4-eval: %d/%d passed", passed, ncases);
     if (failed) printf(", %d failed", failed);
+    if (incomplete) printf(", %d incomplete", incomplete);
     printf(", runtime %s\n", elapsed);
-    printf("%-3s %-8s %8s %8s %8s %-8s %-8s %s\n",
+    printf("%-3s %-10s %8s %8s %8s %-20s %-20s %s\n",
            "#", "state", "prompt", "gen", "total", "given", "correct", "test");
     for (int i = 0; i < ncases; i++) {
         int prompt_tokens = ui->prompt_tokens ? ui->prompt_tokens[i] : 0;
         int generated_tokens = ui->generated_tokens ? ui->generated_tokens[i] : 0;
         int total_tokens = prompt_tokens + generated_tokens;
         const char *given = ui->guess && ui->guess[i][0] ? ui->guess[i] : "-";
-        printf("%3d %-8s %8d %8d %8d %-8s %-8s %s/%s\n",
+        printf("%3d %-10s %8d %8d %8d %-20.20s %-20.20s %s/%s\n",
                i + 1,
                report_status_name(ui->status[i]),
                prompt_tokens,
@@ -4116,22 +4591,163 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+static const eval_case *eval_case_at(size_t index, bool *hard_out) {
+    size_t core_count = eval_core_case_count();
+    if (index < core_count) {
+        if (hard_out) *hard_out = false;
+        return &eval_core_cases[index];
+    }
+    if (hard_out) *hard_out = true;
+    return &eval_hard_cases[index - core_count];
+}
+
+static bool eval_source_is_declared(const char *source) {
+    for (size_t i = 0; i < eval_hard_source_count; i++)
+        if (!strcmp(source, eval_hard_sources[i].name)) return true;
+    return false;
+}
+
+static int validate_eval_cases(bool verbose) {
+    const size_t core_count = eval_core_case_count();
+    const size_t total = core_count + eval_hard_case_count;
+    int errors = 0;
+    size_t smoke_count = 0;
+
+    for (size_t i = 0; i < total; i++) {
+        bool hard = false;
+        const eval_case *tc = eval_case_at(i, &hard);
+        const char *where = hard ? "hard" : "core";
+#define REQUIRE_CASE_FIELD(field) do { \
+        if (!tc->field || !tc->field[0]) { \
+            fprintf(stderr, "ds4-eval: %s case %zu has no %s\n", \
+                    where, i + 1, #field); \
+            errors++; \
+        } \
+    } while (0)
+        REQUIRE_CASE_FIELD(source);
+        REQUIRE_CASE_FIELD(id);
+        REQUIRE_CASE_FIELD(domain);
+        REQUIRE_CASE_FIELD(title);
+        REQUIRE_CASE_FIELD(question);
+        REQUIRE_CASE_FIELD(answer);
+#undef REQUIRE_CASE_FIELD
+
+        if (hard && (tc->suites & EVAL_SUITE_HARD_SMOKE)) smoke_count++;
+        if (!tc->source || !tc->id || !tc->answer) continue;
+        if (tc->answer_kind < EVAL_ANSWER_AUTO ||
+            tc->answer_kind > EVAL_ANSWER_LINE_SET) {
+            fprintf(stderr, "ds4-eval: %s/%s has an invalid answer kind\n",
+                    tc->source, tc->id);
+            errors++;
+            continue;
+        }
+
+        int nchoices = eval_case_nchoices(tc);
+        bool saw_gap = false;
+        for (int c = 0; c < EVAL_MAX_CHOICES; c++) {
+            if (!tc->choice[c]) saw_gap = true;
+            else if (saw_gap) {
+                fprintf(stderr, "ds4-eval: %s/%s has a gap in its choices\n",
+                        tc->source, tc->id);
+                errors++;
+                break;
+            }
+        }
+
+        eval_answer_kind kind = eval_case_answer_kind(tc);
+        if (kind == EVAL_ANSWER_CHOICE) {
+            if (nchoices < 2 || strlen(tc->answer) != 1 ||
+                tc->answer[0] < 'A' || tc->answer[0] >= 'A' + nchoices) {
+                fprintf(stderr, "ds4-eval: %s/%s has an invalid choice key\n",
+                        tc->source, tc->id);
+                errors++;
+            }
+        } else if (nchoices != 0) {
+            fprintf(stderr, "ds4-eval: %s/%s has choices but is not choice-graded\n",
+                    tc->source, tc->id);
+            errors++;
+        } else if (kind == EVAL_ANSWER_LINE_SET) {
+            bool lines[256] = {0};
+            if (!parse_line_spec(tc->answer, lines, sizeof(lines))) {
+                fprintf(stderr, "ds4-eval: %s/%s has an invalid line-set key\n",
+                        tc->source, tc->id);
+                errors++;
+            }
+        } else {
+            char normalized[EVAL_ANSWER_MAX];
+            normalize_expected_answer(kind, tc->answer,
+                                      normalized, sizeof(normalized));
+            if (!normalized[0] || !strcmp(normalized, "?")) {
+                fprintf(stderr, "ds4-eval: %s/%s has an invalid answer key\n",
+                        tc->source, tc->id);
+                errors++;
+            }
+        }
+
+        if (hard) {
+            if (tc->answer_kind == EVAL_ANSWER_AUTO ||
+                !(tc->suites & EVAL_SUITE_HARD) || tc->max_tokens == 0 ||
+                !eval_source_is_declared(tc->source)) {
+                fprintf(stderr,
+                        "ds4-eval: hard case %s/%s lacks type, suite, budget, or source metadata\n",
+                        tc->source, tc->id);
+                errors++;
+            }
+        }
+
+        for (size_t j = i + 1; j < total; j++) {
+            const eval_case *other = eval_case_at(j, NULL);
+            if (other->source && other->id &&
+                !strcmp(tc->source, other->source) && !strcmp(tc->id, other->id)) {
+                fprintf(stderr, "ds4-eval: duplicate case ID %s/%s\n",
+                        tc->source, tc->id);
+                errors++;
+            }
+        }
+    }
+
+    if (eval_hard_case_count != 50 || smoke_count != 12) {
+        fprintf(stderr,
+                "ds4-eval: hard suite shape changed: cases=%zu smoke=%zu (expected 50/12)\n",
+                eval_hard_case_count, smoke_count);
+        errors++;
+    }
+    if (verbose || errors)
+        printf("ds4-eval: validated %zu core and %zu hard cases (%zu hard-smoke): %s\n",
+               core_count, eval_hard_case_count, smoke_count,
+               errors ? "FAILED" : "ok");
+    return errors ? 1 : 0;
+}
+
+static void list_eval_cases(const eval_case *cases, int ncases) {
+    printf("#\tsource\tdomain\tid\tanswer-kind\ttitle\n");
+    for (int i = 0; i < ncases; i++) {
+        printf("%d\t%s\t%s\t%s\t%s\t%s\n",
+               i + 1, cases[i].source, cases[i].domain, cases[i].id,
+               eval_answer_kind_name(eval_case_answer_kind(&cases[i])),
+               cases[i].title);
+    }
+}
+
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
+    if (cfg.validate_cases) return validate_eval_cases(true);
     if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);
 
-    int ncases = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
-    if (cfg.question_limit > 0 && cfg.question_limit < ncases) ncases = cfg.question_limit;
-    if (cfg.question_limit > (int)(sizeof(eval_cases) / sizeof(eval_cases[0]))) {
-        fprintf(stderr, "ds4-eval: only %zu questions are embedded\n",
-                sizeof(eval_cases) / sizeof(eval_cases[0]));
-        return 2;
+    int ncases = 0;
+    eval_case *cases = select_eval_cases(&cfg, &ncases);
+    if (!cases) return 2;
+    if (cfg.list_cases) {
+        list_eval_cases(cases, ncases);
+        free(cases);
+        return 0;
     }
     int *case_sequence = NULL;
     int case_sequence_len = 0;
     if (cfg.case_sequence &&
         parse_case_sequence(cfg.case_sequence, ncases, &case_sequence, &case_sequence_len) != 0) {
+        free(cases);
         return 2;
     }
     if (!cfg.seed) {
@@ -4147,6 +4763,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-eval: cannot open trace '%s': %s\n",
                     cfg.trace_path, strerror(errno));
             free(case_sequence);
+            free(cases);
             return 2;
         }
     }
@@ -4172,12 +4789,22 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
         if (trace) fclose(trace);
         free(case_sequence);
+        free(cases);
+        return 2;
+    }
+    char tp_err[256];
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n", tp_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        free(cases);
         return 2;
     }
 
@@ -4185,57 +4812,99 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &opt) != 0) {
         if (trace) fclose(trace);
         free(case_sequence);
+        free(cases);
         return 1;
     }
 
     int max_prompt_tokens = 0;
     int max_prompt_case = -1;
+    int max_generation_tokens = eval_max_generation_budget(&cfg, cases, ncases);
     const bool auto_ctx = cfg.ctx_size <= 0;
     if (auto_ctx) {
-        cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
+        cfg.ctx_size = eval_auto_context_size(engine, &cfg, cases, ncases,
+                                              max_generation_tokens,
                                               &max_prompt_tokens, &max_prompt_case);
         fprintf(stderr,
                 "ds4-eval: context auto-sized to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
-                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1,
+                max_generation_tokens);
     } else {
-        max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
+        max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, cases, ncases,
                                                    cfg.ctx_size, &max_prompt_case);
         fprintf(stderr,
                 "ds4-eval: context set to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
-                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
-        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case);
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1,
+                max_generation_tokens);
+        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case,
+                                 max_generation_tokens);
     }
     fprintf(stderr, "ds4-eval: model shape %s\n", ds4_engine_model_name(engine));
     eval_warn_think_max_downgraded(&cfg);
-    trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases, max_prompt_tokens);
+    trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases,
+                       max_prompt_tokens, max_generation_tokens);
     log_context_memory(cfg.backend,
                        cfg.ctx_size,
                        cfg.prefill_chunk,
                        cfg.ssd_streaming);
 
+    ds4_tp *tp_leader = NULL;
+    if (cfg.tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)cfg.ctx_size,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
+        if (!ds4_tp_create(&tp_leader, &cfg.tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-eval: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            if (trace) fclose(trace);
+            ds4_engine_close(engine);
+            free(case_sequence);
+            free(cases);
+            return 1;
+        }
+    }
+
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
         if (trace) fclose(trace);
         ds4_engine_close(engine);
+        ds4_tp_free(tp_leader);
         free(case_sequence);
+        free(cases);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
         wait_distributed_route(session) != 0)
     {
         ds4_session_free(session);
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
         if (trace) fclose(trace);
         ds4_engine_close(engine);
+        ds4_tp_free(tp_leader);
         free(case_sequence);
+        free(cases);
         return 1;
     }
 
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
-    tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
+    tui_start(&ui, cases, ncases, max_generation_tokens, split_ui);
 
     uint64_t rng = cfg.seed;
     int rc = 0;
@@ -4258,7 +4927,18 @@ int main(int argc, char **argv) {
             ui.selected_case = next;
         }
 
-        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next, &rng);
+        int generation_budget = eval_case_generation_budget(&cfg, &cases[next], false);
+        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace,
+                                              next, generation_budget, &rng);
+        if (result == EVAL_RUN_OK && ui.status[next] == EVAL_INCOMPLETE &&
+            cfg.retry_incomplete) {
+            int retry_budget = eval_case_generation_budget(&cfg, &cases[next], true);
+            fprintf(stderr,
+                    "ds4-eval: retrying incomplete case %s/%s with %d tokens\n",
+                    cases[next].source, cases[next].id, retry_budget);
+            result = run_one_case(engine, session, &cfg, &ui, trace, next,
+                                  retry_budget, &rng);
+        }
         if (result == EVAL_RUN_ERROR) {
             rc = 1;
             break;
@@ -4286,27 +4966,33 @@ int main(int argc, char **argv) {
 
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     for (int i = 0; i < ncases; i++) {
         if (ui.status[i] == EVAL_PASSED) passed++;
         else if (ui.status[i] == EVAL_FAILED) failed++;
+        else if (ui.status[i] == EVAL_INCOMPLETE) incomplete++;
     }
 
     if (ui.active) tui_restore();
-    print_eval_report(&ui, ncases, passed, failed);
+    print_eval_report(&ui, ncases, passed, failed, incomplete);
     if (trace) {
         fprintf(trace,
                 "===== SUMMARY =====\n"
                 "passed: %d\n"
                 "failed: %d\n"
+                "incomplete: %d\n"
                 "total: %d\n",
-                passed, failed, ncases);
+                passed, failed, incomplete, ncases);
         fflush(trace);
     }
 
     tui_free(&ui);
     ds4_session_free(session);
+    if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
+    ds4_tp_free(tp_leader);
     if (trace) fclose(trace);
     free(case_sequence);
-    return rc || failed ? 1 : 0;
+    free(cases);
+    return rc || failed || incomplete ? 1 : 0;
 }

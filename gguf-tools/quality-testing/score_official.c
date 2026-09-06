@@ -22,7 +22,7 @@ static void die(const char *msg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
-            "[--quality] "
+            "[--quality] [--rendered-prompt] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
@@ -390,35 +390,56 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
     }
 }
 
-static bool api_ref_load(const char *path, api_ref *ref) {
-    memset(ref, 0, sizeof(*ref));
-    if (!path || !path[0]) return false;
-    char *json = read_file(path);
-    const char *p = strstr(json, "\"logprobs\"");
-    if (p) p = strstr(p, "\"content\"");
-    if (p) p = strchr(p, '[');
-    if (!p) {
-        free(json);
-        return false;
+static const char *json_member(const char *p, const char *name) {
+    if (!p || *(p = json_ws(p)) != '{') return NULL;
+    p++;
+    while (*p) {
+        char key[64];
+        if (!json_key(&p, key, sizeof(key))) return NULL;
+        p = json_ws(p);
+        if (*p++ != ':') return NULL;
+        p = json_ws(p);
+        if (!strcmp(key, name)) return p;
+        const char *end = json_skip_value(p);
+        if (end == p) return NULL;
+        p = json_ws(end);
+        if (*p++ != ',') return NULL;
     }
+    return NULL;
+}
+
+static bool api_ref_parse(const char *json, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    const char *p = json_member(json, "choices");
+    if (!p || *p != '[') return false;
+    p = json_member(json_ws(p + 1), "logprobs");
+    p = json_member(p, "content");
+    if (!p || *p != '[') return false;
     p++;
     while (1) {
         p = json_ws(p);
         if (*p == ']') {
-            free(json);
             return ref->n_pos > 0;
         }
         api_pos pos = {0};
-        if (!api_parse_pos(&p, &pos)) {
+        if (!api_parse_pos(&p, &pos) || !isfinite(pos.logprob)) {
             api_pos_free(&pos);
             api_ref_free(ref);
-            free(json);
             return false;
         }
         api_ref_add_pos(ref, &pos);
         p = json_ws(p);
         if (*p == ',') p++;
     }
+}
+
+static bool api_ref_load(const char *path, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    if (!path || !path[0]) return false;
+    char *json = read_file(path);
+    bool ok = api_ref_parse(json, ref);
+    free(json);
+    return ok;
 }
 
 static int api_alt_token_id(ds4_engine *engine, const api_alt *alt) {
@@ -565,6 +586,7 @@ int main(int argc, char **argv) {
     int ctx_size = 4096;
     bool ctx_set = false;
     bool quality = false;
+    bool rendered_prompt = false;
     const char *gpu_vram_arg = NULL;
     const char *gpu_devices_arg = NULL;
     bool cuda_tensor_parallel = false;
@@ -601,6 +623,8 @@ int main(int argc, char **argv) {
 
         if (!strcmp(arg, "--quality")) {
             quality = true;
+        } else if (!strcmp(arg, "--rendered-prompt")) {
+            rendered_prompt = true;
         } else if (!strcmp(arg, "--gpu-vram")) {
             gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -790,7 +814,10 @@ int main(int argc, char **argv) {
 
         ds4_tokens prompt = {0};
         ds4_tokens target = {0};
-        ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
+        if (rendered_prompt)
+            ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        else
+            ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
         ds4_tokenize_text(engine, cont_text, &target);
 
         if (prompt.len + target.len + 1 >= ctx_size) {

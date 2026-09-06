@@ -231,6 +231,7 @@ kernel void kernel_glm53_vision_layernorm_gelu(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float mean = partial[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float var = 0.0f;
     for (uint d = tid; d < args.width; d += 256u) {
         const float centered = xr[d] - mean;

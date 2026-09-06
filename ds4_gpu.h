@@ -95,6 +95,72 @@ int ds4_gpu_parallel_ffn_start(
         uint32_t              shared_dim,
         const ds4_gpu_tensor *x,
         float                 clamp);
+int ds4_gpu_parallel_ffn_start_sliced(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        uint32_t              shared_lane_offset,
+        uint32_t              shared_lane_count,
+        const ds4_gpu_tensor *x,
+        float                 clamp);
+
+/* GPU-decided shared-expert lane split for two-rank TP decode: the split
+ * kernels read the selected expert ids and take complementary lane ranges
+ * sized to balance the bytes each rank streams (shift_q16 = routed expert
+ * bytes / (2 * shared expert bytes) in Q16; 0 reproduces static halves). */
+int ds4_gpu_parallel_ffn_start_split(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp,
+        const ds4_gpu_tensor *selected,
+        uint32_t              tp_rank,
+        uint32_t              tp_world,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              shift_q16);
+
+/* out = a + b into this rank's TP slab slot for (layer, gate), publishing the
+ * gate's checked flag from the same kernel; falls back to ds4_gpu_add_tensor
+ * when the fold does not apply.  Call right before ds4_gpu_tp_gate_encode. */
+int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate);
+
+/* Register that the next TP partial producer for (layer, gate) may publish
+ * the gate's checked flag itself (taken by the attention output K-slice
+ * matvec when its output is that slot; otherwise ignored). */
+void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
+
+/* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
+ * to run only its q task now and fold the kv task into the KV staging
+ * kernel of the same layer; flush runs it standalone if nothing consumed it. */
+void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void);
+int ds4_gpu_kv_norm_task_pending(void);
+int ds4_gpu_kv_norm_task_flush(void);
+int ds4_gpu_kv_norm_task_begin_concurrent(void);
+void ds4_gpu_kv_norm_task_end_concurrent(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
@@ -282,12 +348,23 @@ typedef int (*ds4_gpu_tp_exchange_fn)(void *ud, uint32_t layer, uint32_t gate, u
  * gpu_flags_off is the offset of its GPU-written gate-ready flag words. */
 int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
+                    uint64_t out_off, uint64_t vec_bytes,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
+/* Single-session flag gates use one exact arrival word per layer/gate, so
+ * decode command buffers may be submitted in layer order without a later
+ * monotonic event signal satisfying an earlier arrival. */
+int ds4_gpu_tp_decode_split_flush_safe(void);
+/* Weight ranges to pull into the GPU cache while the given gate (0 attention,
+ * 1 FFN) waits for the peer: consumed by the next poll gate of that kind. */
+int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
+                                  const void *model_map, uint64_t model_size,
+                                  const uint64_t *offsets, const uint64_t *bytes,
+                                  uint32_t count);
 /* The coordinator-only DSpark support model does not participate in TP.
  * Suspend ownership only while encoding it; base-model verification remains
  * split across both ranks. */
@@ -310,17 +387,6 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                const ds4_gpu_tensor *out_t,
                                ds4_gpu_tensor *in_t,
                                uint64_t bytes);
-/* Split big gate: kick publishes the GPU arrival marker (batch shared
- * event, whose completion semantics make the bounce payload visible to
- * the exchange thread) and queues the exchange, returning the gate seq
- * (0 on failure); wait encodes the release.  Multiple kicks may be in
- * flight; waiting on the last seq covers all earlier kicks (monotonic
- * release event, in-order service thread). */
-uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
-                                  const ds4_gpu_tensor *out_t,
-                                  ds4_gpu_tensor *in_t,
-                                  uint64_t bytes);
-int ds4_gpu_tp_big_gate_wait(uint64_t seq);
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */
 void ds4_gpu_tp_keepalive_pause(int paused);
@@ -333,6 +399,8 @@ void ds4_gpu_tp_set_attn_head_split(int enabled);
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
+/* Submit one trivial command buffer (first-submission costs paid at load). */
+int ds4_gpu_warm_command_queue(void);
 /* Nonzero after any gate exchange failed; the eval must abort. */
 int ds4_gpu_tp_failed(void);
 
@@ -2819,6 +2887,31 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *split,
         const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n,
+        uint32_t              mix_dim,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
+int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_prev,
+        const ds4_gpu_tensor *post,
+        const ds4_gpu_tensor *comb,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              mix_weight_offset,

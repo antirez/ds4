@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_prompt_prefix.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -61,6 +62,7 @@ static bool cli_greedy_argmax_requested(bool speculative_requested) {
 typedef struct {
     const char *prompt;
     const char *system;
+    ds4_prompt_prefix prefix;
     bool raw_prompt;
     int n_predict;
     int ctx_size;
@@ -498,14 +500,34 @@ static void print_generated_token(void *ud, int token) {
     free(text);
 }
 
+static void build_chat_prompt(ds4_engine *engine,
+                              const cli_generation_options *gen,
+                              ds4_tokens *out) {
+    const ds4_think_mode think_mode = cli_effective_think_mode(gen);
+    ds4_chat_begin(engine, out);
+    if (ds4_engine_is_glm_dsa(engine)) {
+        const char *effort = ds4_glm_reasoning_effort_text(think_mode);
+        if (effort) ds4_chat_append_message(engine, out, "system", effort);
+    } else if (think_mode == DS4_THINK_MAX) {
+        ds4_chat_append_max_effort_prefix(engine, out);
+    }
+    if (gen->system && gen->system[0])
+        ds4_chat_append_message(engine, out, "system", gen->system);
+    ds4_prompt_prefix_append(engine, out, &gen->prefix);
+    ds4_chat_append_message(engine, out, "user", gen->prompt ? gen->prompt : "");
+    ds4_chat_append_assistant_prefix(engine, out, think_mode);
+}
+
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
     if (gen->raw_prompt) {
         ds4_tokenize_text(engine, gen->prompt ? gen->prompt : "", out);
     } else if (is_rendered_chat_prompt(gen->prompt)) {
         ds4_tokenize_rendered_chat(engine, gen->prompt, out);
-    } else {
+    } else if (gen->prefix.count == 0) {
         ds4_encode_chat_prompt(engine, gen->system, gen->prompt,
                                cli_effective_think_mode(gen), out);
+    } else {
+        build_chat_prompt(engine, gen, out);
     }
 }
 
@@ -1317,6 +1339,8 @@ typedef struct {
     int think_prefix_tokens;
 } repl_chat;
 
+static void repl_chat_free(repl_chat *chat);
+
 static void repl_chat_trim_images(repl_chat *chat, size_t count) {
     while (chat->image_count > count) {
         chat->image_count--;
@@ -1436,7 +1460,40 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     if (cfg->gen.system && cfg->gen.system[0]) {
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
-    return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
+    if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
+        ds4_tokens_free(&chat->transcript);
+        return 1;
+    }
+    if (cfg->gen.prefix.count == 0) return 0;
+    if (cli_wait_distributed_route(cfg, chat->session) != 0) {
+        repl_chat_free(chat);
+        return 1;
+    }
+
+    char err[160] = {0};
+    cli_prefill_progress progress = {
+        .base_tokens = 0,
+        .input_tokens = chat->transcript.len,
+        .use_color = ds4_log_is_tty(stderr),
+    };
+    ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
+    ds4_session_set_display_progress(chat->session,
+                                     progress.use_color ? cli_prefill_progress_cb : NULL,
+                                     progress.use_color ? &progress : NULL);
+    cli_dist_busy_set(cfg, true);
+    int rc = ds4_session_sync(chat->session, &chat->transcript,
+                              err, sizeof(err));
+    cli_dist_busy_set(cfg, false);
+    ds4_session_set_progress(chat->session, NULL, NULL);
+    ds4_session_set_display_progress(chat->session, NULL, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "ds4: prefix prefill failed: %s\n",
+                err[0] ? err : "unknown error");
+        repl_chat_free(chat);
+        return 1;
+    }
+    return 0;
 }
 
 static void repl_chat_free(repl_chat *chat) {
@@ -1943,6 +2000,19 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.prompt_owned = read_prompt_file(need_arg(&i, argc, argv, arg), true);
             c.gen.prompt = c.prompt_owned;
+        } else if (!strcmp(arg, "--prefix-file")) {
+            if (c.gen.prefix.count != 0) {
+                fprintf(stderr, "ds4: specify --prefix-file only once\n");
+                exit(2);
+            }
+            const char *path = need_arg(&i, argc, argv, arg);
+            char error[256] = {0};
+            if (ds4_prompt_prefix_load(&c.gen.prefix, path,
+                                       error, sizeof(error)) != 0) {
+                fprintf(stderr, "ds4: %s\n",
+                        error[0] ? error : "invalid prefix file");
+                exit(2);
+            }
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
@@ -2159,6 +2229,15 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
     }
+    if (c.gen.prefix.count != 0 && c.gen.raw_prompt) {
+        fprintf(stderr, "ds4: --prefix-file cannot be combined with --raw-prompt\n");
+        exit(2);
+    }
+    if (c.gen.prefix.count != 0 && is_rendered_chat_prompt(c.gen.prompt)) {
+        fprintf(stderr,
+                "ds4: --prefix-file cannot be combined with an already-rendered prompt\n");
+        exit(2);
+    }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp, c.dist,
                                           tp_err, sizeof(tp_err))) {
@@ -2181,8 +2260,17 @@ static cli_config parse_options(int argc, char **argv) {
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
+        if (cfg.gen.prefix.count != 0) {
+            fprintf(stderr, "ds4: --dump-tokens does not support --prefix-file\n");
+            ds4_prompt_prefix_free(&cfg.gen.prefix);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
+            ds4_prompt_prefix_free(&cfg.gen.prefix);
+            ds4_dist_options_free(cfg.dist);
             free(cfg.prompt_owned);
             return 2;
         }
@@ -2199,6 +2287,7 @@ int main(int argc, char **argv) {
                                             stdout);
         }
         ds4_dist_options_free(cfg.dist);
+        ds4_prompt_prefix_free(&cfg.gen.prefix);
         free(cfg.prompt_owned);
         return rc;
     }
@@ -2334,6 +2423,7 @@ int main(int argc, char **argv) {
     ds4_engine_close(engine);
     ds4_tp_free(tp_leader);
     ds4_dist_options_free(cfg.dist);
+    ds4_prompt_prefix_free(&cfg.gen.prefix);
     free(cfg.prompt_owned);
     return rc;
 }

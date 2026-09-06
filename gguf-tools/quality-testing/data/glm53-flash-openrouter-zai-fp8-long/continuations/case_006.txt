@@ -1,0 +1,1 @@
+Short answer: the excerpt doesn't actually contain the code that runs when a connection closes — it's almost entirely type definitions, protocol constants, and comments. So a definitive description of the close-hand
