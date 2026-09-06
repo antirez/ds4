@@ -4,6 +4,7 @@
 #define DS4_ROCM_Q4_LDS_CUH
 
 #include <stdint.h>
+#include <stddef.h>
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define DS4_Q4_LDS_INLINE __host__ __device__ __forceinline__
 #else
@@ -12,6 +13,51 @@
 
 namespace ds4_rocm_q4_lds {
 enum { block_words = 73u }; // sizeof(Q8_K) / sizeof(uint32_t)
+
+// LDS-only layout. Keep the external Q8_K scratch packed; align the hot qs
+// payload of every staged block so the dot can read four words at a time.
+struct alignas(16) aligned_q8_K {
+    float d;
+    uint32_t padding[3];
+    int8_t qs[256];
+    int16_t bsums[16];
+};
+static_assert(sizeof(aligned_q8_K) == 304u &&
+              offsetof(aligned_q8_K, qs) == 16u &&
+              offsetof(aligned_q8_K, bsums) == 272u,
+              "Q4 aligned LDS block layout");
+
+DS4_Q4_LDS_INLINE bool aligned_scope(
+        uint32_t blocks, uint32_t out_dim, uint32_t n_tok, uint32_t groups,
+        bool ssd, bool quality, bool gfx1151, bool disabled) {
+    return !disabled && !ssd && !quality && gfx1151 && groups == 1u &&
+           blocks == 32u && out_dim == 4096u &&
+           n_tok >= 256u && n_tok <= 4096u;
+}
+
+template<uint32_t BLOCKS>
+DS4_Q4_LDS_INLINE void copy_thread_aligned(
+        uint32_t *dst, const uint32_t *src, uint32_t tid, uint32_t threads,
+        uint32_t nt, uint32_t nb, uint64_t src_stride_words) {
+    static_assert(BLOCKS == 4u || BLOCKS == 8u, "Q4 LDS tile must be TILE4/8");
+    // One wave per packed block gives contiguous reads without division by
+    // 73 for each word. Threads is a positive multiple of 32. No thread reads
+    // inactive K/token slots; the three padding words are never consumed.
+    const uint32_t lane = tid & 31u;
+    for (uint32_t slot = tid >> 5u; slot < nt * BLOCKS; slot += threads >> 5u) {
+        const uint32_t p = slot / BLOCKS;
+        const uint32_t b = slot % BLOCKS;
+        if (b < nb) {
+            const uint32_t *block = src + (uint64_t)p * src_stride_words + b * block_words;
+            for (uint32_t w = lane; w < block_words; w += 32u) {
+                // Copy object representations: the words contain float,
+                // byte and short fields, not an array of uint32_t objects.
+                __builtin_memcpy(dst + slot * 76u + (w == 0u ? 0u : w + 3u),
+                                 block + w, sizeof(uint32_t));
+            }
+        }
+    }
+}
 
 // src already points at this tile's first token/group/K block. A token may
 // have other groups or K blocks between the ranges being staged. Destination

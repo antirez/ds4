@@ -57,6 +57,9 @@
 /tests/test_quantizer_indexer_q4
 /tests/test_rocm_q4_dense_pair
 /tests/test_rocm_q4_lds_host
+/tests/test_rocm_q4_lds_aligned_host
+/tests/test_rocm_q4_lds_aligned_host_fast
+/tests/test_rocm_q4_lds_aligned
 /tests/test_rocm_q4_wmma_load_host
 /tests/test_rocm_q4_qb_epilogue_host
 /tests/test_rocm_q4_qb_epilogue_host_fast

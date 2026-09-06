@@ -9,6 +9,7 @@
 #include "ds4_rocm_q4_lds.cuh"
 #include "ds4_rocm_q4_decode.cuh"
 #include "ds4_rocm_q4_wmma_load.cuh"
+#include <type_traits>
 
 static_assert(sizeof(cuda_block_q4_K) == 144u,
               "ROCm Q4_K block layout must match GGUF");
@@ -203,7 +204,8 @@ __global__ static void rocm_matmul_q4_K_dense_grouped_decode_kernel(
  * K loop advances in groups of eight so lane L still accumulates blocks
  * L,L+8,... in exactly the order used by rocm_matmul_q4_K_dense_kernel.
  *
- * LDS footprint: 8 tokens * 8 K blocks * 292 bytes = 18,688 bytes.
+ * Packed LDS footprint: 8 tokens * 8 K blocks * 292 bytes = 18,688 bytes.
+ * The output-B aligned variant uses 304 bytes/block (19,456 bytes total).
  * The final, partial token and K tiles are handled without an early return;
  * every thread reaches the load barrier and the reuse barrier before each
  * subsequent tile. No reuse barrier is needed after the final tile.
@@ -938,20 +940,21 @@ rocm_matmul_q4_K_prefill_wmma_k128_p144_rowtile_strided_kernel(
 #undef DS4_ROCM_Q4_GFX1151_WMMA_ROWTILE_DEVICE
 #endif
 
+template<typename Q8Block>
 __device__ __forceinline__ static void
 rocm_dot_q4_K_q8_K_block8_reuse_weights(
         const cuda_block_q4_K *x,
-        const cuda_block_q8_K *y0,
-        const cuda_block_q8_K *y1,
-        const cuda_block_q8_K *y2,
-        const cuda_block_q8_K *y3,
-        const cuda_block_q8_K *y4,
-        const cuda_block_q8_K *y5,
-        const cuda_block_q8_K *y6,
-        const cuda_block_q8_K *y7,
+        const Q8Block *y0,
+        const Q8Block *y1,
+        const Q8Block *y2,
+        const Q8Block *y3,
+        const Q8Block *y4,
+        const Q8Block *y5,
+        const Q8Block *y6,
+        const Q8Block *y7,
         uint32_t n,
         float acc[ROCM_Q4_PREFILL_TOKEN_TILE]) {
-    const cuda_block_q8_K *ys[ROCM_Q4_PREFILL_TOKEN_TILE] = {
+    const Q8Block *ys[ROCM_Q4_PREFILL_TOKEN_TILE] = {
         y0, y1, y2, y3, y4, y5, y6, y7,
     };
     const float xd = dev_f16_to_f32(x->d);
@@ -982,17 +985,39 @@ rocm_dot_q4_K_q8_K_block8_reuse_weights(
         #pragma unroll
         for (uint32_t p = 0u; p < ROCM_Q4_PREFILL_TOKEN_TILE; p++) {
             if (p < n) {
-                const cuda_block_q8_K *y = ys[p];
+                const Q8Block *y = ys[p];
                 int32_t dot0 = 0;
                 int32_t dot1 = 0;
-                #pragma unroll
-                for (uint32_t i = 0u; i < 8u; i++) {
-                    const int32_t w0 = qw[i] & 0x0f0f0f0f;
-                    const int32_t w1 = (qw[i] >> 4) & 0x0f0f0f0f;
-                    dot0 = __dp4a(w0, *reinterpret_cast<const int32_t *>(
-                                           y->qs + j0 * 32u + i * 4u), dot0);
-                    dot1 = __dp4a(w1, *reinterpret_cast<const int32_t *>(
-                                           y->qs + j1 * 32u + i * 4u), dot1);
+                if constexpr (std::is_same<Q8Block, ds4_rocm_q4_lds::aligned_q8_K>::value) {
+                    // Only the LDS layout establishes this alignment. Load
+                    // one low/high pair at a time to limit live registers;
+                    // keep the scalar kernel's dp4a order within each dot.
+                    #pragma unroll
+                    for (uint32_t i = 0u; i < 8u; i += 4u) {
+                        int4 lo, hi;
+                        __builtin_memcpy(&lo, __builtin_assume_aligned(
+                            y->qs + j0 * 32u + i * 4u, 16), sizeof(lo));
+                        __builtin_memcpy(&hi, __builtin_assume_aligned(
+                            y->qs + j1 * 32u + i * 4u, 16), sizeof(hi));
+                        dot0 = __dp4a(qw[i] & 0x0f0f0f0f, lo.x, dot0);
+                        dot1 = __dp4a((qw[i] >> 4) & 0x0f0f0f0f, hi.x, dot1);
+                        dot0 = __dp4a(qw[i+1u] & 0x0f0f0f0f, lo.y, dot0);
+                        dot1 = __dp4a((qw[i+1u] >> 4) & 0x0f0f0f0f, hi.y, dot1);
+                        dot0 = __dp4a(qw[i+2u] & 0x0f0f0f0f, lo.z, dot0);
+                        dot1 = __dp4a((qw[i+2u] >> 4) & 0x0f0f0f0f, hi.z, dot1);
+                        dot0 = __dp4a(qw[i+3u] & 0x0f0f0f0f, lo.w, dot0);
+                        dot1 = __dp4a((qw[i+3u] >> 4) & 0x0f0f0f0f, hi.w, dot1);
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t i = 0u; i < 8u; i++) {
+                        const int32_t w0 = qw[i] & 0x0f0f0f0f;
+                        const int32_t w1 = (qw[i] >> 4) & 0x0f0f0f0f;
+                        dot0 = __dp4a(w0, *reinterpret_cast<const int32_t *>(
+                                               y->qs + j0 * 32u + i * 4u), dot0);
+                        dot1 = __dp4a(w1, *reinterpret_cast<const int32_t *>(
+                                               y->qs + j1 * 32u + i * 4u), dot1);
+                    }
                 }
                 isum[p] += (int32_t)sc0 * dot0;
                 isum[p] += (int32_t)sc1 * dot1;
@@ -1106,7 +1131,7 @@ __global__ static void rocm_matmul_q4_K_prefill_k1024_tile4_kernel(
     }
 }
 
-template<bool STREAM_LDS, bool VECTOR_LDS = false>
+template<bool STREAM_LDS, bool VECTOR_LDS = false, bool ALIGNED_LDS = false>
 __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
         float *out,
         const char *w_base,
@@ -1117,8 +1142,10 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
         uint32_t n_tok,
         uint64_t xq_token_stride,
         uint64_t out_token_stride) {
-    __shared__ __align__(VECTOR_LDS ? 16 : alignof(cuda_block_q8_K))
-        cuda_block_q8_K sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
+    using Q8Block = typename std::conditional<ALIGNED_LDS,
+        ds4_rocm_q4_lds::aligned_q8_K, cuda_block_q8_K>::type;
+    __shared__ __align__((VECTOR_LDS || ALIGNED_LDS) ? 16 : alignof(cuda_block_q8_K))
+        Q8Block sxq[ROCM_Q4_PREFILL_TOKEN_TILE]
                                          [ROCM_Q4_PREFILL_KBLOCK_TILE];
 
     const uint32_t tid = threadIdx.x;
@@ -1148,7 +1175,15 @@ __global__ static void rocm_matmul_q4_K_prefill_tile8_strided_kernel(
          * struct per lane makes adjacent lanes issue 292-B-strided global
          * loads; flattening the packed blocks gives the memory coalescer long
          * contiguous runs while preserving the fixed eight-block LDS layout. */
-        if (STREAM_LDS) {
+        if constexpr (ALIGNED_LDS) {
+            const uint64_t src_block = (uint64_t)tok0 * xq_token_stride +
+                (uint64_t)group * xq_blocks + b0;
+            ds4_rocm_q4_lds::copy_thread_aligned<ROCM_Q4_PREFILL_KBLOCK_TILE>(
+                reinterpret_cast<uint32_t *>(sxq),
+                reinterpret_cast<const uint32_t *>(xq + src_block),
+                tid, blockDim.x, nt, nb,
+                (uint64_t)xq_token_stride * ROCM_Q4_Q8K_WORDS);
+        } else if (STREAM_LDS) {
             const uint64_t src_block = (uint64_t)tok0 * xq_token_stride +
                 (uint64_t)group * xq_blocks + b0;
             ds4_rocm_q4_lds::copy_thread_selected<ROCM_Q4_PREFILL_KBLOCK_TILE, VECTOR_LDS>(
@@ -1332,6 +1367,16 @@ static int rocm_q4_K_prefill_lds_vector_enabled(void) {
     return getenv("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_VECTOR") == NULL;
 }
 
+// Successful-enqueue evidence, not GPU completion or timing. Atomic because
+// the existing exit-time profile can run on a different host thread.
+static uint64_t g_rocm_q4_prefill_lds_aligned_launches;
+extern "C" void ds4_rocm_test_q4_prefill_lds_aligned_reset(void) {
+    __atomic_store_n(&g_rocm_q4_prefill_lds_aligned_launches, 0u, __ATOMIC_RELAXED);
+}
+extern "C" uint64_t ds4_rocm_test_q4_prefill_lds_aligned_get_calls(void) {
+    return __atomic_load_n(&g_rocm_q4_prefill_lds_aligned_launches, __ATOMIC_RELAXED);
+}
+
 // Independent rollbacks retain scalar streaming and the original schedule.
 template<typename... Args>
 static void rocm_q4_K_prefill_k1024_tile4_launch(dim3 grid, Args... args) {
@@ -1348,18 +1393,43 @@ static void rocm_q4_K_prefill_k1024_tile4_launch(dim3 grid, Args... args) {
     }
 }
 
-template<typename... Args>
-static void rocm_q4_K_prefill_tile8_strided_launch(dim3 grid, Args... args) {
+static void rocm_q4_K_prefill_tile8_strided_launch(
+        dim3 grid, float *out, const char *w, const cuda_block_q8_K *xq,
+        uint64_t row_bytes, uint32_t blocks, uint32_t out_dim, uint32_t n_tok,
+        uint64_t xq_token_stride, uint64_t out_token_stride) {
+    // Output B stays on exact Q8_K/TILE8 even when output A uses WMMA.
+    // Keep this change inside its resident gfx1151 shape; explicit older
+    // LDS rollbacks retain their original kernels for independent A/B tests.
+    if (ds4_rocm_q4_lds::aligned_scope(
+            blocks, out_dim, n_tok, grid.z, g_ssd_streaming_mode, g_quality_mode,
+            true, getenv("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_ALIGNED") != NULL) &&
+        xq_token_stride == blocks && out_token_stride == out_dim &&
+        rocm_q4_K_prefill_lds_stream_enabled() &&
+        rocm_q4_K_prefill_lds_vector_enabled() &&
+        rocm_attention_runtime_is_gfx1151_wave32(0)) {
+        rocm_matmul_q4_K_prefill_tile8_strided_kernel<true, false, true><<<grid, 256>>>(
+            out, w, xq, row_bytes, blocks, out_dim, n_tok,
+            xq_token_stride, out_token_stride);
+        if (hipPeekAtLastError() == hipSuccess)
+            __atomic_fetch_add(&g_rocm_q4_prefill_lds_aligned_launches, 1u, __ATOMIC_RELAXED);
+        return;
+    }
     if (rocm_q4_K_prefill_lds_stream_enabled()) {
         if (rocm_q4_K_prefill_lds_vector_enabled()) {
-            rocm_matmul_q4_K_prefill_tile8_strided_kernel<true, true><<<grid, 256>>>(args...);
+            rocm_matmul_q4_K_prefill_tile8_strided_kernel<true, true><<<grid, 256>>>(
+                out, w, xq, row_bytes, blocks, out_dim, n_tok,
+                xq_token_stride, out_token_stride);
             ++g_rocm_q4_prefill_lds_vector_launches;
         } else {
-            rocm_matmul_q4_K_prefill_tile8_strided_kernel<true><<<grid, 256>>>(args...);
+            rocm_matmul_q4_K_prefill_tile8_strided_kernel<true><<<grid, 256>>>(
+                out, w, xq, row_bytes, blocks, out_dim, n_tok,
+                xq_token_stride, out_token_stride);
         }
         ++g_rocm_q4_prefill_lds_stream_launches;
     } else {
-        rocm_matmul_q4_K_prefill_tile8_strided_kernel<false><<<grid, 256>>>(args...);
+        rocm_matmul_q4_K_prefill_tile8_strided_kernel<false><<<grid, 256>>>(
+            out, w, xq, row_bytes, blocks, out_dim, n_tok,
+            xq_token_stride, out_token_stride);
     }
 }
 
@@ -2524,7 +2594,8 @@ static void rocm_q4_K_prefill_tile8_report(void) {
             "dense_calls=%llu pair_calls=%llu attention_batch_calls=%llu "
             "k1024_tile4_calls=%llu k1024_tile4_ssd_calls=%llu "
             "wmma_calls=%llu wmma_k32_calls=%llu wmma_k64_calls=%llu "
-            "wmma_k128_calls=%llu wmma_k64_load4_calls=%llu tokens=%llu\n",
+            "wmma_k128_calls=%llu wmma_k64_load4_calls=%llu "
+            "lds_aligned_calls=%llu tokens=%llu\n",
             (unsigned long long)dense_calls,
             (unsigned long long)pair_calls,
             (unsigned long long)attention_batch_calls,
@@ -2535,6 +2606,7 @@ static void rocm_q4_K_prefill_tile8_report(void) {
             (unsigned long long)wmma_k64_calls,
             (unsigned long long)wmma_k128_calls,
             (unsigned long long)wmma_k64_load4_calls,
+            (unsigned long long)ds4_rocm_test_q4_prefill_lds_aligned_get_calls(),
             (unsigned long long)tokens);
 }
 

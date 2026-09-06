@@ -736,6 +736,10 @@ struct lds_output_check {
 template<typename Enqueue>
 bool run_prefill_lds_rollback_oracle(
         Enqueue enqueue, std::initializer_list<lds_output_check> outputs) {
+    // Isolate the packed-layout copy/fence controls. The aligned output-B
+    // layout has a separate native oracle and successful-enqueue counter.
+    env_snapshot aligned_disable("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_ALIGNED");
+    (void)setenv("DS4_ROCM_DISABLE_Q4_PREFILL_LDS_ALIGNED", "1", 1);
     env_snapshot disable(kPrefillLdsDisable);
     env_snapshot vector_disable(kPrefillLdsVectorDisable);
     // Both presence-based controls, including their precedence. The new

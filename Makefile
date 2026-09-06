@@ -171,6 +171,7 @@ help:
 	@echo "  make test-rocm-q4-parity  Run ROCm Q4_K dense/pair/prefill oracle (or SKIP without HIP)"
 	@echo "  make test-rocm-q4-prefill Run ROCm Q4 tiled-prefill parity/canary oracle"
 	@echo "  make test-rocm-q4-lds-host Check Q4 prefill LDS addressing and fence schedule without HIP"
+	@echo "  make test-rocm-q4-lds-aligned-host Check aligned Q8_K staging fields/ownership without HIP"
 	@echo "  make test-rocm-q4-wmma-load-host Check Q4 K64 float4 loader policy/addressing without HIP"
 	@echo "  make test-rocm-q4-qb-epilogue-host Check Q4 F32 epilogue mapping/reduction without HIP"
 	@echo "  make test-rocm-q4-qb-epilogue Run the gfx1151 F32 RMSNorm/RoPE parity oracle"
@@ -1018,6 +1019,38 @@ tests/test_rocm_q4_lds_host: tests/test_rocm_q4_lds_host.cpp rocm/ds4_rocm_q4_ld
 test-rocm-q4-lds-host: tests/test_rocm_q4_lds_host
 	./tests/test_rocm_q4_lds_host
 
+.PHONY: test-rocm-q4-lds-aligned-host
+tests/test_rocm_q4_lds_aligned_host: tests/test_rocm_q4_lds_aligned_host.cpp rocm/ds4_rocm_q4_lds.cuh
+	$(CXX) -O2 -Wall -Wextra -std=c++17 -fno-fast-math -I. -o $@ $<
+
+tests/test_rocm_q4_lds_aligned_host_fast: tests/test_rocm_q4_lds_aligned_host.cpp rocm/ds4_rocm_q4_lds.cuh
+	$(CXX) -O3 -Wall -Wextra -std=c++17 -ffast-math -fno-finite-math-only -I. -o $@ $<
+
+test-rocm-q4-lds-aligned-host: tests/test_rocm_q4_lds_aligned_host tests/test_rocm_q4_lds_aligned_host_fast
+	./tests/test_rocm_q4_lds_aligned_host
+	./tests/test_rocm_q4_lds_aligned_host_fast
+
+.PHONY: test-rocm-q4-lds-aligned bench-rocm-q4-lds-aligned
+tests/test_rocm_q4_lds_aligned.o: tests/test_rocm_q4_lds_aligned.cpp ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -std=c++17 -fno-fast-math -I. -c -o $@ $<
+
+tests/test_rocm_q4_lds_aligned: tests/test_rocm_q4_lds_aligned.o ds4_image.o ds4_rocm.o $(ROCM_MMQ_OBJS) ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+ROCM_Q4_LDS_ALIGNED_TEST_ARGS ?=
+test-rocm-q4-lds-aligned:
+	@lds_hipcc="$(strip $(HIPCC))"; \
+	if [ -z "$$lds_hipcc" ]; then lds_hipcc="$$(command -v hipcc 2>/dev/null || true)"; fi; \
+	lds_probe="$${lds_hipcc%% *}"; \
+	if [ -z "$$lds_probe" ] || ! command -v "$$lds_probe" >/dev/null 2>&1; then \
+		echo "ROCm Q4 aligned LDS: FAIL (hipcc and gfx1151 device required)"; exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory tests/test_rocm_q4_lds_aligned HIPCC="$$lds_hipcc" || exit $$?; \
+	./tests/test_rocm_q4_lds_aligned $(ROCM_Q4_LDS_ALIGNED_TEST_ARGS)
+
+bench-rocm-q4-lds-aligned:
+	$(MAKE) test-rocm-q4-lds-aligned ROCM_Q4_LDS_ALIGNED_TEST_ARGS="--bench $(ROCM_Q4_LDS_ALIGNED_TEST_ARGS)"
+
 .PHONY: test-rocm-q4-wmma-load-host
 tests/test_rocm_q4_wmma_load_host: tests/test_rocm_q4_wmma_load_host.cpp rocm/ds4_rocm_q4_wmma_load.cuh
 	$(CXX) -O2 -Wall -Wextra -std=c++17 -I. -o $@ $<
@@ -1159,6 +1192,7 @@ test-strix-rocm-q4-prefill:
 		DS4_TEST_REQUIRE_ROCM_DEVICE=1 ROCM_Q4_TEST_ARGS=--prefill
 	$(MAKE) --no-print-directory test-rocm-q4-qb-epilogue ROCM_ARCH=gfx1151 \
 		DS4_TEST_REQUIRE_ROCM_DEVICE=1
+	$(MAKE) --no-print-directory test-rocm-q4-lds-aligned ROCM_ARCH=gfx1151
 
 test-strix-rocm-q4-prefill-long:
 	$(MAKE) --no-print-directory -B test-rocm-q4-parity ROCM_ARCH=gfx1151 \
@@ -1368,6 +1402,7 @@ clean:
 	rm -f tests/test_rocm_q4_decode_host
 	rm -f tests/test_rocm_q4_decode_lane4
 	rm -f tests/test_rocm_q4_lds_host
+	rm -f tests/test_rocm_q4_lds_aligned_host tests/test_rocm_q4_lds_aligned_host_fast tests/test_rocm_q4_lds_aligned
 	rm -f tests/test_rocm_q4_wmma_load_host
 	rm -f tests/test_metal_q4_qb_token_pair
 	rm -f tests/test_q4_epilogue_host tests/test_cuda_q4_epilogue
