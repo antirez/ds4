@@ -48,8 +48,11 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
+#define DS4_SERVER_PRINTF(fmt, args) \
+    __attribute__((format(printf, fmt, args)))
 #else
 #define DS4_SERVER_MAYBE_UNUSED
+#define DS4_SERVER_PRINTF(fmt, args)
 #endif
 
 static void stop_signal_handler(int sig) {
@@ -442,10 +445,17 @@ typedef struct {
     size_t encoded_len;
 } server_image_input;
 
+#define SERVER_IMAGE_ERROR_BYTES 224
+
 typedef struct {
     server_image_input *v;
     size_t len;
     size_t cap;
+    /* Why the last rejected image block was refused.  Image blocks are parsed
+     * deep inside the JSON walkers, which can only report a boolean, so the
+     * request parsers would otherwise collapse every bad image into a generic
+     * "invalid JSON request" and leave the client with nothing to act on. */
+    char error[SERVER_IMAGE_ERROR_BYTES];
 } server_image_inputs;
 
 static void server_image_inputs_free(server_image_inputs *images) {
@@ -455,60 +465,125 @@ static void server_image_inputs_free(server_image_inputs *images) {
     memset(images, 0, sizeof(*images));
 }
 
+DS4_SERVER_PRINTF(2, 3)
+static void server_image_inputs_error(server_image_inputs *images,
+                                      const char *fmt, ...) {
+    if (!images || images->error[0]) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(images->error, sizeof(images->error), fmt, ap);
+    va_end(ap);
+}
+
 static int base64_value(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return 26 + c - 'a';
     if (c >= '0' && c <= '9') return 52 + c - '0';
-    if (c == '+') return 62;
-    if (c == '/') return 63;
+    /* Accept the URL-safe alphabet too: '-' and '_' never appear in standard
+     * base64, so this cannot change how valid standard input decodes. */
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
     return -1;
 }
 
+/* Decode base64 the way real clients emit it: MIME line breaks, indentation,
+ * the URL-safe alphabet and omitted '=' padding are all tolerated. */
 static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len) {
-    const size_t n = src ? strlen(src) : 0;
-    if (n == 0 || (n & 3u) != 0 || n > 64u * 1024u * 1024u)
-        return false;
-    size_t cap = (n / 4u) * 3u;
-    uint8_t *decoded = xmalloc(cap ? cap : 1);
+    if (!src) return false;
+    const size_t n = strlen(src);
+    if (n == 0 || n > 96u * 1024u * 1024u) return false;
+    uint8_t *decoded = xmalloc((n / 4u + 1u) * 3u + 4u);
     size_t used = 0;
-    for (size_t i = 0; i < n; i += 4) {
-        int a = base64_value((unsigned char)src[i]);
-        int b = base64_value((unsigned char)src[i + 1]);
-        bool pad2 = src[i + 2] == '=';
-        bool pad3 = src[i + 3] == '=';
-        int c = pad2 ? 0 : base64_value((unsigned char)src[i + 2]);
-        int d = pad3 ? 0 : base64_value((unsigned char)src[i + 3]);
-        if (a < 0 || b < 0 || c < 0 || d < 0 ||
-            (pad2 && !pad3) || ((pad2 || pad3) && i + 4 != n)) {
+    size_t symbols = 0;
+    uint32_t acc = 0;
+    unsigned bits = 0;
+    bool padded = false;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)src[i];
+        if (isspace(c)) continue;
+        if (c == '=') {
+            padded = true;
+            continue;
+        }
+        const int v = base64_value(c);
+        if (v < 0 || padded) {
             free(decoded);
             return false;
         }
-        uint32_t bits = ((uint32_t)a << 18) | ((uint32_t)b << 12) |
-                        ((uint32_t)c << 6) | (uint32_t)d;
-        decoded[used++] = (uint8_t)(bits >> 16);
-        if (!pad2) decoded[used++] = (uint8_t)(bits >> 8);
-        if (!pad3) decoded[used++] = (uint8_t)bits;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        symbols++;
+        if (bits >= 8) {
+            bits -= 8;
+            decoded[used++] = (uint8_t)(acc >> bits);
+        }
+    }
+    /* A single trailing symbol encodes no whole byte and cannot occur in a
+     * complete stream, so treat it as corruption rather than silently
+     * truncating. */
+    if (used == 0 || (symbols & 3u) == 1u) {
+        free(decoded);
+        return false;
     }
     *out = decoded;
     *out_len = used;
     return true;
 }
 
-static bool server_image_media_type(const char *media_type) {
-    return media_type &&
-           (!strcasecmp(media_type, "image/png") ||
-            !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+/* The image decoder dispatches on magic bytes and ignores any declared media
+ * type, so the media type is only used for diagnostics. */
+static const char *server_image_sniff_format(const uint8_t *b, size_t n) {
+    if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) return "PNG";
+    if (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) return "JPEG";
+    if (n >= 12 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4))
+        return "WebP";
+    if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6)))
+        return "GIF";
+    if (n >= 12 && (!memcmp(b + 4, "ftypheic", 8) ||
+                    !memcmp(b + 4, "ftypheix", 8) ||
+                    !memcmp(b + 4, "ftypmif1", 8) ||
+                    !memcmp(b + 4, "ftypavif", 8)))
+        return "HEIC/AVIF";
+    if (n >= 2 && b[0] == 'B' && b[1] == 'M') return "BMP";
+    if (n >= 4 && !memcmp(b, "II*\0", 4)) return "TIFF";
+    if (n >= 4 && !memcmp(b, "MM\0*", 4)) return "TIFF";
+    return NULL;
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             const char *media_type,
                                             const char *base64,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!server_image_media_type(media_type)) return false;
-    server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+    /* Only the family is checked: a client that mislabels a JPEG as
+     * "image/png" still works because decoding sniffs the real format. */
+    if (media_type && media_type[0] &&
+        strncasecmp(media_type, "image/", 6) != 0 &&
+        strcasecmp(media_type, "application/octet-stream") != 0) {
+        server_image_inputs_error(images,
+                                  "image media type \"%s\" is not an image; "
+                                  "send a JPEG or PNG", media_type);
         return false;
+    }
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len)) {
+        server_image_inputs_error(images,
+                                  "image data is not valid base64");
+        return false;
+    }
+    const char *format =
+        server_image_sniff_format(image.encoded, image.encoded_len);
+    if (!format || (strcmp(format, "PNG") && strcmp(format, "JPEG"))) {
+        if (format)
+            server_image_inputs_error(images,
+                                      "%s images are not supported; "
+                                      "send a JPEG or PNG", format);
+        else
+            server_image_inputs_error(images,
+                                      "image data is not a JPEG or PNG "
+                                      "(decoded %zu bytes)", image.encoded_len);
+        free(image.encoded);
+        return false;
+    }
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -536,23 +611,61 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     return true;
 }
 
+/* Parse an RFC 2397 data URI: "data:" [media-type] *(";" parameter) ";base64"
+ * "," payload.  Matching a fixed set of literal prefixes is not enough,
+ * because clients legitimately vary the case of the scheme and media type and
+ * insert parameters such as ";charset=utf-8" before ";base64". */
 static bool server_image_inputs_push_data_uri(
         server_image_inputs *images, const char *uri,
         char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    static const char png[] = "data:image/png;base64,";
-    static const char jpeg[] = "data:image/jpeg;base64,";
-    static const char jpg[] = "data:image/jpg;base64,";
-    if (!uri) return false;
-    if (!strncmp(uri, png, sizeof(png) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/png", uri + sizeof(png) - 1, marker);
-    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
-    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
-    return false;
+    if (!uri || !uri[0]) {
+        server_image_inputs_error(images, "image_url is missing a url");
+        return false;
+    }
+    if (strncasecmp(uri, "data:", 5) != 0) {
+        /* Fetching remote URLs would let a request drive outbound traffic from
+         * the server, and reading local paths would expose the host
+         * filesystem, so the client must inline the bytes. */
+        server_image_inputs_error(
+            images,
+            "image_url must be an inline base64 data URI such as "
+            "\"data:image/jpeg;base64,...\"; the server does not fetch "
+            "remote URLs or read local file paths");
+        return false;
+    }
+
+    const char *meta = uri + 5;
+    const char *comma = strchr(meta, ',');
+    if (!comma) {
+        server_image_inputs_error(images,
+                                  "image data URI is missing the \",\" that "
+                                  "separates the header from the payload");
+        return false;
+    }
+
+    char media_type[128] = {0};
+    bool base64 = false;
+    for (const char *seg = meta; seg < comma;) {
+        const char *end = memchr(seg, ';', (size_t)(comma - seg));
+        if (!end || end > comma) end = comma;
+        const size_t len = (size_t)(end - seg);
+        if (seg == meta) {
+            if (len && len < sizeof(media_type)) memcpy(media_type, seg, len);
+        } else if (len == 6 && !strncasecmp(seg, "base64", 6)) {
+            base64 = true;
+        }
+        seg = (end < comma) ? end + 1 : comma;
+    }
+
+    if (!base64) {
+        server_image_inputs_error(
+            images,
+            "image data URI must be base64 encoded (expected \";base64,\" "
+            "before the payload)");
+        return false;
+    }
+    return server_image_inputs_push_base64(images, media_type, comma + 1,
+                                           marker);
 }
 
 static void append_owned_text(char **dst, const char *text) {
@@ -561,6 +674,56 @@ static void append_owned_text(char **dst, const char *text) {
     buf_puts(&b, text ? text : "");
     free(*dst);
     *dst = buf_take(&b);
+}
+
+/* Stand in for an image that could not be decoded, so the model is told the
+ * image existed instead of answering from the surrounding text as if it had
+ * never been sent. */
+#define SERVER_IMAGE_NOTE_BYTES (SERVER_IMAGE_ERROR_BYTES + 24)
+
+static void format_dropped_image_note(char note[SERVER_IMAGE_NOTE_BYTES],
+                                      const char *why) {
+    snprintf(note, SERVER_IMAGE_NOTE_BYTES, "[image omitted: %s]",
+             why && why[0] ? why : "not a supported image");
+}
+
+static void append_dropped_image_note(char **dst, const char *why) {
+    char note[SERVER_IMAGE_NOTE_BYTES];
+    format_dropped_image_note(note, why);
+    append_owned_text(dst, note);
+}
+
+static void text_remove_all(char **s, const char *needle) {
+    if (!s || !*s || !needle || !needle[0]) return;
+    const size_t n = strlen(needle);
+    char *src = *s;
+    buf b = {0};
+    for (const char *q = src;;) {
+        const char *hit = strstr(q, needle);
+        if (!hit) {
+            buf_puts(&b, q);
+            break;
+        }
+        buf_append(&b, q, (size_t)(hit - q));
+        q = hit + n;
+    }
+    free(src);
+    *s = buf_take(&b);
+}
+
+/* Discard decoded images and the markers standing in for them, keeping the
+ * diagnostic that rejected them.  Rendering pairs every image with its marker
+ * in the prompt text, so a marker left behind would be tokenized as literal
+ * junk. */
+static void server_image_inputs_drop(server_image_inputs *images,
+                                     char **content) {
+    if (!images) return;
+    for (size_t i = 0; i < images->len; i++)
+        text_remove_all(content, images->v[i].marker);
+    char saved[SERVER_IMAGE_ERROR_BYTES];
+    snprintf(saved, sizeof(saved), "%s", images->error);
+    server_image_inputs_free(images);
+    snprintf(images->error, sizeof(images->error), "%s", saved);
 }
 
 static bool json_content(const char **p, char **out) {
@@ -752,7 +915,24 @@ typedef struct {
     chat_msg *v;
     int len;
     int cap;
+    /* Diagnostic for a rejected content block whose owning message was
+     * discarded before the request-level error was formatted. */
+    char image_error[SERVER_IMAGE_ERROR_BYTES];
 } chat_msgs;
+
+/* Undecodable images are tolerated in the transcript but not in the turn being
+ * answered.  A client replays the whole conversation on every request, so one
+ * stale image the server cannot read would otherwise reject every later
+ * request forever; an image the caller just attached still has to be reported
+ * rather than quietly answered from its surrounding text. */
+static bool chat_msgs_newest_image_rejected(chat_msgs *msgs) {
+    if (!msgs || msgs->len <= 0) return false;
+    const chat_msg *last = &msgs->v[msgs->len - 1];
+    if (!last->images.error[0]) return false;
+    snprintf(msgs->image_error, sizeof(msgs->image_error), "%s",
+             last->images.error);
+    return true;
+}
 
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
@@ -887,6 +1067,24 @@ static void chat_msgs_free(chat_msgs *msgs) {
     for (int i = 0; i < msgs->len; i++) chat_msg_free(&msgs->v[i]);
     free(msgs->v);
     memset(msgs, 0, sizeof(*msgs));
+}
+
+/* Report why a request was rejected, preferring a specific image diagnostic
+ * over the generic parse failure. Must be called before the messages are
+ * freed. */
+static void chat_msgs_request_error(const chat_msgs *msgs, char *err,
+                                    size_t errlen) {
+    if (msgs && msgs->image_error[0]) {
+        snprintf(err, errlen, "%s", msgs->image_error);
+        return;
+    }
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        if (msgs->v[i].images.error[0]) {
+            snprintf(err, errlen, "%s", msgs->v[i].images.error);
+            return;
+        }
+    }
+    snprintf(err, errlen, "invalid JSON request");
 }
 
 static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
@@ -1139,7 +1337,13 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
-static bool server_model_alias_known(const char *id) {
+/* The vision-tagged aliases exist only to stop clients from stripping image
+ * input, so they must not appear unless an encoder is actually loaded:
+ * advertising them on a text-only server would invite images it cannot read. */
+static bool server_model_alias_known(const char *id, bool vision) {
+    if (id && (!strcmp(id, "deepseek-v4-flash-vision") ||
+               !strcmp(id, "deepseek-v4-pro-vision")))
+        return vision;
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
@@ -1911,11 +2115,24 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
+    /* An untyped block carrying an image_url is an image: dropping it would
+     * answer the prompt from the text alone as if no image had been sent. */
+    const bool is_image = image_url && (!type ||
+                                        !strcmp(type, "image_url") ||
+                                        !strcmp(type, "input_image") ||
+                                        !strcmp(type, "image"));
+    if (is_image) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
-            goto bad;
-        append_owned_text(&msg->content, marker);
+        if (server_image_inputs_push_data_uri(&msg->images, image_url, marker))
+            append_owned_text(&msg->content, marker);
+        else
+            append_dropped_image_note(&msg->content, msg->images.error);
+    } else if (type && (!strcmp(type, "image_url") ||
+                        !strcmp(type, "input_image"))) {
+        server_image_inputs_error(&msg->images,
+                                  "content block of type \"%s\" has no "
+                                  "image_url", type);
+        append_dropped_image_note(&msg->content, msg->images.error);
     } else if (text) {
         append_owned_text(&msg->content, text);
     }
@@ -2028,7 +2245,13 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        if (msg.images.len && strcmp(msg.role, "user")) {
+            server_image_inputs_error(&msg.images,
+                                      "images are only accepted on \"user\" "
+                                      "messages, not \"%s\"", msg.role);
+            server_image_inputs_drop(&msg.images, &msg.content);
+            append_dropped_image_note(&msg.content, msg.images.error);
+        }
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2036,11 +2259,17 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
+        /* The message that owns the diagnostic is about to be freed, so lift
+         * it to the conversation for the request-level error. */
+        if (msg.images.error[0] && !msgs->image_error[0])
+            snprintf(msgs->image_error, sizeof(msgs->image_error), "%s",
+                     msg.images.error);
         chat_msg_free(&msg);
         return false;
     }
     if (**p != ']') return false;
     (*p)++;
+    if (chat_msgs_newest_image_rejected(msgs)) return false;
     return true;
 }
 
@@ -2193,11 +2422,27 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         msg->content = buf_take(&b);
     } else if (type && !strcmp(type, "image")) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (!source_type || strcmp(source_type, "base64") ||
-            !server_image_inputs_push_base64(&msg->images, media_type,
-                                             image_data, marker))
-            goto bad;
-        append_owned_text(&msg->content, marker);
+        if (source_type && !strcmp(source_type, "url")) {
+            server_image_inputs_error(
+                &msg->images,
+                "image source type \"url\" is not supported; send "
+                "{\"type\":\"base64\",\"media_type\":...,\"data\":...} "
+                "because the server does not fetch remote URLs");
+            append_dropped_image_note(&msg->content, msg->images.error);
+        } else if (source_type && strcmp(source_type, "base64")) {
+            /* "base64" is the only source Anthropic clients send inline, but a
+             * missing type is common in hand-rolled payloads; the data itself
+             * is still validated by the push. */
+            server_image_inputs_error(&msg->images,
+                                      "unsupported image source type \"%s\"",
+                                      source_type);
+            append_dropped_image_note(&msg->content, msg->images.error);
+        } else if (server_image_inputs_push_base64(&msg->images, media_type,
+                                                   image_data, marker)) {
+            append_owned_text(&msg->content, marker);
+        } else {
+            append_dropped_image_note(&msg->content, msg->images.error);
+        }
     } else {
         if (text) {
             buf b = {0};
@@ -2320,7 +2565,13 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        if (msg.images.len && strcmp(msg.role, "user")) {
+            server_image_inputs_error(&msg.images,
+                                      "images are only accepted on \"user\" "
+                                      "messages, not \"%s\"", msg.role);
+            server_image_inputs_drop(&msg.images, &msg.content);
+            append_dropped_image_note(&msg.content, msg.images.error);
+        }
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2328,11 +2579,17 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
+        /* The message that owns the diagnostic is about to be freed, so lift
+         * it to the conversation for the request-level error. */
+        if (msg.images.error[0] && !msgs->image_error[0])
+            snprintf(msgs->image_error, sizeof(msgs->image_error), "%s",
+                     msg.images.error);
         chat_msg_free(&msg);
         return false;
     }
     if (**p != ']') return false;
     (*p)++;
+    if (chat_msgs_newest_image_rejected(msgs)) return false;
     return true;
 }
 
@@ -3700,9 +3957,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     free(tool_schemas);
     return true;
 bad:
+    chat_msgs_request_error(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -3923,10 +4180,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    chat_msgs_request_error(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4041,17 +4298,21 @@ static bool parse_responses_content_array(const char **p, char **out,
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            bool is_image_block = type && !strcmp(type, "input_image");
+            bool is_image_block = image_url && (!type ||
+                                                !strcmp(type, "input_image") ||
+                                                !strcmp(type, "image_url") ||
+                                                !strcmp(type, "image"));
             if (is_image_block) {
                 char marker[SERVER_IMAGE_MARKER_BYTES];
-                if (!images ||
-                    !server_image_inputs_push_data_uri(images, image_url, marker)) {
-                    free(type);
-                    free(text);
-                    free(image_url);
-                    goto fail;
+                if (images &&
+                    server_image_inputs_push_data_uri(images, image_url, marker)) {
+                    buf_puts(&b, marker);
+                } else {
+                    char note[SERVER_IMAGE_NOTE_BYTES];
+                    format_dropped_image_note(note, images ? images->error :
+                                              "images are not accepted here");
+                    buf_puts(&b, note);
                 }
-                buf_puts(&b, marker);
             } else if (!is_text_block || !text) {
                 free(type);
                 free(text);
@@ -4094,7 +4355,12 @@ static bool parse_responses_content_array_multimodal(
     char *tmp = NULL;
     server_image_inputs_free(images);
     if (!parse_responses_content_array(p, &tmp, images)) {
+        /* Freeing clears the diagnostic, so carry it across the reset for the
+         * caller to turn into a useful 400. */
+        char saved[SERVER_IMAGE_ERROR_BYTES];
+        snprintf(saved, sizeof(saved), "%s", images ? images->error : "");
         server_image_inputs_free(images);
+        if (images) snprintf(images->error, sizeof(images->error), "%s", saved);
         return false;
     }
     free(*dst);
@@ -4171,6 +4437,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             } else if (!strcmp(key, "content")) {
                 if (!parse_responses_content_array_multimodal(
                         p, &content, &content_images)) {
+                    if (content_images.error[0])
+                        snprintf(msgs->image_error, sizeof(msgs->image_error),
+                                 "%s", content_images.error);
                     free(key);
                     goto item_fail;
                 }
@@ -4346,24 +4615,11 @@ item_fail:
         }
         if (content_images.len &&
             (strcmp(t, "message") || (role && strcmp(role, "user")))) {
-            free(type);
-            free(role);
-            free(content);
-            free(name);
-            free(namespace);
-            free(call_id);
-            free(item_id);
-            free(arguments);
-            free(output);
-            free(input_str);
-            free(summary);
-            free(action);
-            free(result);
-            free(tools_json);
-            free(status_str);
-            server_image_inputs_free(&content_images);
-            buf_free(&pending_reasoning);
-            return false;
+            server_image_inputs_error(&content_images,
+                                      "images are only accepted on \"user\" "
+                                      "messages");
+            server_image_inputs_drop(&content_images, &content);
+            append_dropped_image_note(&content, content_images.error);
         }
         /* Three classes of items:
          *   1. consumes_reasoning: assistant message / function_call / hosted-tool
@@ -4593,6 +4849,12 @@ item_fail:
      * empty assistant message so the next turn still renders a <think>...</think>
      * block. Dropping it loses model state when a previous response ended with
      * a reasoning-only incomplete turn and the client replays the history. */
+    /* Checked before the trailing reasoning item is flushed, so an item that
+     * carries no content of its own cannot hide a rejected image behind it. */
+    if (chat_msgs_newest_image_rejected(msgs)) {
+        buf_free(&pending_reasoning);
+        return false;
+    }
     if (pending_reasoning.len) {
         chat_msg msg = {0};
         msg.role = xstrdup("assistant");
@@ -4945,11 +5207,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    chat_msgs_request_error(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -13437,7 +13699,8 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens,
+                                     bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -13448,6 +13711,23 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         "\"owned_by\":\"ds4.c\","
         "\"name\":");
     json_escape(b, name);
+    /* Clients decide whether they may send an image from the advertised input
+     * modalities, and a client that sees text only drops the image before it
+     * ever reaches the server. Report both the OpenRouter-style nested field
+     * and a top-level copy, since discovery code in the wild reads either. */
+    buf_puts(b, vision
+        ? ","
+          "\"architecture\":{"
+              "\"modality\":\"text+image->text\","
+              "\"input_modalities\":[\"text\",\"image\"],"
+              "\"output_modalities\":[\"text\"]},"
+          "\"input_modalities\":[\"text\",\"image\"]"
+        : ","
+          "\"architecture\":{"
+              "\"modality\":\"text->text\","
+              "\"input_modalities\":[\"text\"],"
+              "\"output_modalities\":[\"text\"]},"
+          "\"input_modalities\":[\"text\"]");
     buf_printf(b,
         ","
         "\"context_length\":%d,"
@@ -13478,7 +13758,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -13500,6 +13781,18 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
     } else {
+        /* Clients commonly suppress image input for every model they
+         * classify as DeepSeek, because the upstream DeepSeek API is
+         * text-only, and re-enable it only when the model id carries a
+         * "vision" token. Offer vision-tagged ids first when an encoder is
+         * loaded, so such a client will actually send the image instead of
+         * dropping it and reporting that the model cannot see. */
+        if (ds4_engine_has_vision(s->engine)) {
+            append_model_json(&b, s, "deepseek-v4-flash-vision");
+            buf_putc(&b, ',');
+            append_model_json(&b, s, "deepseek-v4-pro-vision");
+            buf_putc(&b, ',');
+        }
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
         append_model_json(&b, s, "deepseek-v4-pro");
@@ -13640,7 +13933,8 @@ static void *client_main(void *arg) {
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        server_model_alias_known(hr.path + model_path_prefix_len,
+                                 ds4_engine_has_vision(s->engine)))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
@@ -15902,15 +16196,24 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(server_model_alias_known("glm-5.2-chat", false));
+    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner", false));
+    /* Vision-tagged ids exist so clients that gate image input on a "vision"
+     * token in the model id will send images, so they are only known when an
+     * encoder is loaded. */
+    TEST_ASSERT(server_model_alias_known("deepseek-v4-flash-vision", true));
+    TEST_ASSERT(server_model_alias_known("deepseek-v4-pro-vision", true));
+    TEST_ASSERT(!server_model_alias_known("deepseek-v4-flash-vision", false));
+    TEST_ASSERT(!server_model_alias_known("deepseek-v4-pro-vision", false));
+    TEST_ASSERT(server_model_alias_known("deepseek-v4-flash", false));
+    TEST_ASSERT(!model_alias_disables_thinking("deepseek-v4-flash-vision"));
     TEST_ASSERT(model_alias_disables_thinking("glm-5.3-flash-chat"));
     TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.3-flash-chat"));
     TEST_ASSERT(model_alias_enables_thinking("glm-5.3-flash-reasoner"));
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.3-flash-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash", false));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat", false));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner", false));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -17922,7 +18225,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -17931,12 +18234,37 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_model_metadata_advertises_image_input_with_vision(void) {
+    /* Clients gate image sending on the advertised modalities: OpenAI-style
+     * agents that read text-only capabilities strip the image from the
+     * request, so the server never gets a chance to refuse or accept it. */
+    buf vision = {0};
+    append_model_json_values(&vision, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             32768, 4096, true);
+    TEST_ASSERT(strstr(vision.ptr,
+                       "\"input_modalities\":[\"text\",\"image\"]") != NULL);
+    TEST_ASSERT(strstr(vision.ptr, "\"architecture\":{") != NULL);
+    TEST_ASSERT(strstr(vision.ptr,
+                       "\"modality\":\"text+image->text\"") != NULL);
+    buf_free(&vision);
+
+    /* Without a vision encoder the server must not claim image input, or
+     * clients will send images that can only be rejected. */
+    buf text = {0};
+    append_model_json_values(&text, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             32768, 4096, false);
+    TEST_ASSERT(strstr(text.ptr, "\"input_modalities\":[\"text\"]") != NULL);
+    TEST_ASSERT(strstr(text.ptr, "\"image\"") == NULL);
+    TEST_ASSERT(strstr(text.ptr, "\"modality\":\"text->text\"") != NULL);
+    buf_free(&text);
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -19351,6 +19679,194 @@ static void test_openai_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* Build a single-user-message OpenAI payload whose image_url is VARIANT. */
+static char *test_image_payload(const char *variant) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"describe\"},{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"");
+    buf_puts(&json, variant);
+    buf_puts(&json, "\"}}]}]");
+    return buf_take(&json);
+}
+
+static void test_openai_image_accepts_client_data_uri_variants(void) {
+    /* Real OpenAI-compatible clients vary the case of the scheme and media
+     * type, add parameters before ";base64", wrap the payload at 76 columns
+     * (base64.encodebytes), drop '=' padding and use the URL-safe alphabet.
+     * Every one of these used to collapse into "invalid JSON request". */
+    buf wrapped = {0};
+    for (size_t i = 0; test_inline_png_base64[i]; i++) {
+        buf_putc(&wrapped, test_inline_png_base64[i]);
+        if ((i + 1) % 24 == 0) buf_puts(&wrapped, "\n  ");
+    }
+    buf unpadded = {0};
+    for (size_t i = 0; test_inline_png_base64[i]; i++)
+        if (test_inline_png_base64[i] != '=')
+            buf_putc(&unpadded, test_inline_png_base64[i]);
+
+    buf variants[6] = {0};
+    buf_puts(&variants[0], "data:image/png;base64,");
+    buf_puts(&variants[0], test_inline_png_base64);
+    buf_puts(&variants[1], "DATA:IMAGE/PNG;BASE64,");
+    buf_puts(&variants[1], test_inline_png_base64);
+    buf_puts(&variants[2], "data:image/png;charset=utf-8;base64,");
+    buf_puts(&variants[2], test_inline_png_base64);
+    buf_puts(&variants[3], "data:image/png;base64,");
+    buf_puts(&variants[3], wrapped.ptr);
+    buf_puts(&variants[4], "data:image/png;base64,");
+    buf_puts(&variants[4], unpadded.ptr);
+    /* Mislabelled media type: decoding sniffs magic bytes, so a PNG sent as
+     * image/jpeg must still work rather than being refused on the label. */
+    buf_puts(&variants[5], "data:image/jpeg;base64,");
+    buf_puts(&variants[5], test_inline_png_base64);
+
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+        char *payload = test_image_payload(variants[i].ptr);
+        const char *p = payload;
+        chat_msgs msgs = {0};
+        TEST_ASSERT(parse_messages(&p, &msgs));
+        TEST_ASSERT(msgs.len == 1);
+        TEST_ASSERT(msgs.v[0].images.len == 1);
+        TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
+        TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded,
+                            "\x89PNG\r\n\x1a\n", 8));
+        chat_msgs_free(&msgs);
+        free(payload);
+        buf_free(&variants[i]);
+    }
+    buf_free(&wrapped);
+    buf_free(&unpadded);
+}
+
+static void test_openai_image_block_without_type_is_not_dropped(void) {
+    /* An untyped block carrying an image_url must be treated as an image;
+     * ignoring it would answer from the text alone as if no image was sent. */
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"image_url\":{\"url\":"
+        "\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+static void test_rejected_image_reports_actionable_error(void) {
+    /* A rejected image must explain itself instead of surfacing the generic
+     * "invalid JSON request", which leaves the client with nothing to fix. */
+    struct {
+        const char *url;
+        const char *needle;
+    } cases[] = {
+        {"https://example.com/a.png", "does not fetch remote URLs"},
+        {"/tmp/a.png", "does not fetch remote URLs"},
+        {"data:image/png,notbase64", "base64"},
+        {"data:image/png;base64,!!!!not base64!!!!", "not valid base64"},
+        {"data:text/plain;base64,aGVsbG8=", "not an image"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *payload = test_image_payload(cases[i].url);
+        const char *p = payload;
+        chat_msgs msgs = {0};
+        TEST_ASSERT(!parse_messages(&p, &msgs));
+        char err[256] = {0};
+        chat_msgs_request_error(&msgs, err, sizeof(err));
+        TEST_ASSERT(strstr(err, cases[i].needle) != NULL);
+        TEST_ASSERT(strcmp(err, "invalid JSON request") != 0);
+        chat_msgs_free(&msgs);
+        free(payload);
+    }
+}
+
+static void test_unsupported_image_format_names_the_format(void) {
+    /* GIF/WebP decode is genuinely unavailable, so the error must name the
+     * format rather than blaming the JSON. */
+    const char gif[] = "R0lGODdhAQABAIAAAAAAAAAAACwAAAAAAQABAAACAkQBADs=";
+    buf uri = {0};
+    buf_puts(&uri, "data:image/gif;base64,");
+    buf_puts(&uri, gif);
+    char *payload = test_image_payload(uri.ptr);
+    const char *p = payload;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    char err[256] = {0};
+    chat_msgs_request_error(&msgs, err, sizeof(err));
+    TEST_ASSERT(strstr(err, "GIF") != NULL);
+    TEST_ASSERT(strstr(err, "JPEG or PNG") != NULL);
+    chat_msgs_free(&msgs);
+    free(payload);
+    buf_free(&uri);
+}
+
+static void test_stale_history_image_does_not_reject_request(void) {
+    /* A client replays the whole transcript on every turn, so an image the
+     * server cannot decode must not reject every later request: once it is no
+     * longer the newest message it becomes a text note.  Without this, one
+     * WebP in the history wedges the conversation permanently. */
+    const char *json =
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"first\"},{\"type\":\"image_url\",\"image_url\":"
+        "{\"url\":\"data:image/webp;base64,UklGRhIAAABXRUJQVlA4TAUAAAAvAAAAAA==\"}}]},"
+        "{\"role\":\"assistant\",\"content\":\"ok\"},"
+        "{\"role\":\"user\",\"content\":\"second\"}]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+    /* The undecodable image is replaced in place, so the model is told it was
+     * there rather than answering "first" as if no image had been sent. */
+    TEST_ASSERT(strstr(msgs.v[0].content, "image omitted") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, "WebP") != NULL);
+    TEST_ASSERT(msgs.v[0].images.len == 0);
+    TEST_ASSERT(!strcmp(msgs.v[2].content, "second"));
+    TEST_ASSERT(!msgs.image_error[0]);
+    chat_msgs_free(&msgs);
+
+    /* The same image in the turn being answered is still a hard error: the
+     * caller just attached it and has to be told it did not arrive. */
+    char *newest = test_image_payload(
+        "data:image/webp;base64,UklGRhIAAABXRUJQVlA4TAUAAAAvAAAAAA==");
+    const char *q = newest;
+    chat_msgs bad = {0};
+    TEST_ASSERT(!parse_messages(&q, &bad));
+    char err2[256] = {0};
+    chat_msgs_request_error(&bad, err2, sizeof(err2));
+    TEST_ASSERT(strstr(err2, "WebP") != NULL);
+    chat_msgs_free(&bad);
+    free(newest);
+}
+
+static void test_dropped_image_leaves_no_marker_behind(void) {
+    /* Images are referenced from the text by a nonce marker that rendering
+     * pairs with the decoded image.  Dropping an image on a non-user message
+     * has to take its marker with it, or the marker survives into the prompt
+     * as literal control-character junk. */
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"assistant\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]},{\"role\":\"user\",\"content\":\"hi\"}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(msgs.v[0].images.len == 0);
+    TEST_ASSERT(strstr(msgs.v[0].content, "DS4_IMAGE") == NULL);
+    TEST_ASSERT(strchr(msgs.v[0].content, '\036') == NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, "image omitted") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, "user") != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
 static void test_http_image_paths_and_urls_are_rejected(void) {
     const char *cases[] = {
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
@@ -19488,6 +20004,12 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_openai_image_accepts_client_data_uri_variants();
+    test_openai_image_block_without_type_is_not_dropped();
+    test_rejected_image_reports_actionable_error();
+    test_unsupported_image_format_names_the_format();
+    test_stale_history_image_does_not_reject_request();
+    test_dropped_image_leaves_no_marker_behind();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
@@ -19502,6 +20024,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_advertises_image_input_with_vision();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
