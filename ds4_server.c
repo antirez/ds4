@@ -8980,6 +8980,8 @@ typedef struct {
      * the corresponding log line and could collide two long reasons. */
     char name[48];
     uint64_t count;
+    /* Optional per-reason sum (e.g. tokens reused per cache source). */
+    uint64_t value;
 } metrics_reason;
 
 #define METRICS_BUCKETS 9
@@ -9008,25 +9010,41 @@ typedef struct {
     double kv_stored_bytes_total;
     metrics_reason kv_hit[METRICS_REASONS_MAX];
     metrics_reason kv_miss[METRICS_REASONS_MAX];
+    /* DeepSeek live-prefix rewind: refusals by reason (a refusal falls back
+     * to the disk cache or a rebuild, so it never shows up as a miss on its
+     * own) and frontier captures skipped by reason; both stay at zero on a
+     * healthy pipeline, which is what makes them worth a dashboard panel. */
+    metrics_reason rewind_refused[METRICS_REASONS_MAX];
+    metrics_reason rewind_capture_skipped[METRICS_REASONS_MAX];
+    /* Jobs held for their draining home slot instead of rebuilding elsewhere. */
+    uint64_t dispatch_held_total;
 } server_metrics;
 
 static server_metrics g_server_metrics = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
-static void metrics_reason_add(metrics_reason *arr, const char *name) {
+static void metrics_reason_add_value(metrics_reason *arr, const char *name,
+                                     uint64_t value) {
     if (!name || !name[0]) name = "unknown";
     for (int i = 0; i < METRICS_REASONS_MAX; i++) {
         if (arr[i].name[0] == '\0') {
             snprintf(arr[i].name, sizeof(arr[i].name), "%s", name);
             arr[i].count = 1;
+            arr[i].value = value;
             return;
         }
         if (!strcmp(arr[i].name, name)) {
             arr[i].count++;
+            arr[i].value += value;
             return;
         }
     }
     /* Table full: account under the final bucket rather than dropping. */
     arr[METRICS_REASONS_MAX - 1].count++;
+    arr[METRICS_REASONS_MAX - 1].value += value;
+}
+
+static void metrics_reason_add(metrics_reason *arr, const char *name) {
+    metrics_reason_add_value(arr, name, 0);
 }
 
 static void metrics_decode_progress(int tokens, bool thinking,
@@ -9076,7 +9094,8 @@ static void metrics_prompt_done(int remainder_tokens, int reused_tokens,
     g_server_metrics.prompt_tokens_total += (uint64_t)evaluated_tokens;
     g_server_metrics.reused_tokens_total += (uint64_t)reused_tokens;
     if (reused_tokens > 0)
-        metrics_reason_add(g_server_metrics.kv_hit, cache_source);
+        metrics_reason_add_value(g_server_metrics.kv_hit, cache_source,
+                                 (uint64_t)reused_tokens);
     g_server_metrics.prompt_seconds_sum += seconds;
     g_server_metrics.prompt_seconds_count++;
     metrics_bucket_add(g_server_metrics.prompt_seconds_bucket,
@@ -9097,6 +9116,24 @@ static void metrics_request_finish(const char *reason, double seconds) {
 static void metrics_kv_miss(const char *reason) {
     pthread_mutex_lock(&g_server_metrics.mu);
     metrics_reason_add(g_server_metrics.kv_miss, reason);
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+static void metrics_rewind_refused(const char *reason) {
+    pthread_mutex_lock(&g_server_metrics.mu);
+    metrics_reason_add(g_server_metrics.rewind_refused, reason);
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+static void metrics_rewind_capture_skipped(const char *reason) {
+    pthread_mutex_lock(&g_server_metrics.mu);
+    metrics_reason_add(g_server_metrics.rewind_capture_skipped, reason);
+    pthread_mutex_unlock(&g_server_metrics.mu);
+}
+
+static void metrics_dispatch_held(void) {
+    pthread_mutex_lock(&g_server_metrics.mu);
+    g_server_metrics.dispatch_held_total++;
     pthread_mutex_unlock(&g_server_metrics.mu);
 }
 
@@ -9306,6 +9343,7 @@ struct job {
     request req;
     bool done;
     bool cancelled;
+    bool dispatch_held_counted; /* s->mu; ds4_dispatch_held_total once per job */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -12263,6 +12301,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                            old_pos, rewind_to,
                            engine_glm ? "" : " reason=",
                            engine_glm ? "" : ds4_session_rewind_reason(slot->session));
+                if (!engine_glm)
+                    metrics_rewind_refused(ds4_session_rewind_reason(slot->session));
             }
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -12502,10 +12542,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                 : "ds4-server: rewind frontier capture at %d skipped reason=%s",
                        prompt_for_sync->len - 1,
                        captured ? "" : ds4_session_rewind_reason(slot->session));
+            if (!captured)
+                metrics_rewind_capture_skipped(ds4_session_rewind_reason(slot->session));
         } else {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: rewind frontier capture at %d skipped: prefix sync rc=%d",
                        prompt_for_sync->len - 1, frontier_rc);
+            metrics_rewind_capture_skipped(frontier_rc == DS4_SESSION_SYNC_INTERRUPTED
+                                           ? "prefix-sync-interrupted" : "prefix-sync-failed");
         }
     }
 
@@ -13560,6 +13604,10 @@ static void dispatch_jobs_locked(server *s) {
             }
             if (best && required < 0 &&
                 dispatch_should_wait_for_draining_slot_locked(s, j, best_score)) {
+                if (!j->dispatch_held_counted) {
+                    j->dispatch_held_counted = true;
+                    metrics_dispatch_held();
+                }
                 continue; /* its home slot is about to free; let later jobs use the free one */
             }
             if (best) {
@@ -13890,6 +13938,33 @@ static void append_metrics_text(buf *b, server *s) {
         buf_printf(b, "ds4_kv_cache_miss_total{reason=\"%s\"} %llu\n",
                    snap.kv_miss[i].name, (unsigned long long)snap.kv_miss[i].count);
     }
+    buf_puts(b, "# HELP ds4_reused_tokens_by_source_total Prompt tokens served from KV cache reuse, by source\n"
+                "# TYPE ds4_reused_tokens_by_source_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.kv_hit[i].name[0]) break;
+        buf_printf(b, "ds4_reused_tokens_by_source_total{source=\"%s\"} %llu\n",
+                   snap.kv_hit[i].name, (unsigned long long)snap.kv_hit[i].value);
+    }
+    buf_puts(b, "# HELP ds4_rewind_refused_total DeepSeek live-prefix rewinds refused (fell back to disk cache or rebuild), by reason\n"
+                "# TYPE ds4_rewind_refused_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.rewind_refused[i].name[0]) break;
+        buf_printf(b, "ds4_rewind_refused_total{reason=\"%s\"} %llu\n",
+                   snap.rewind_refused[i].name,
+                   (unsigned long long)snap.rewind_refused[i].count);
+    }
+    buf_puts(b, "# HELP ds4_rewind_capture_skipped_total Rewind frontier captures skipped after prefill, by reason\n"
+                "# TYPE ds4_rewind_capture_skipped_total counter\n");
+    for (int i = 0; i < METRICS_REASONS_MAX; i++) {
+        if (!snap.rewind_capture_skipped[i].name[0]) break;
+        buf_printf(b, "ds4_rewind_capture_skipped_total{reason=\"%s\"} %llu\n",
+                   snap.rewind_capture_skipped[i].name,
+                   (unsigned long long)snap.rewind_capture_skipped[i].count);
+    }
+    buf_puts(b, "# HELP ds4_dispatch_held_total Requests held for their draining home slot instead of rebuilding on another\n"
+                "# TYPE ds4_dispatch_held_total counter\n");
+    buf_printf(b, "ds4_dispatch_held_total %llu\n",
+               (unsigned long long)snap.dispatch_held_total);
     if (!s) return;
     int active_requests;
     pthread_mutex_lock(&s->mu);
@@ -19992,6 +20067,11 @@ static void test_metrics_text(void) {
     metrics_request_finish("length", 5.0);
     metrics_kv_miss("token-mismatch");
     metrics_kv_stored_bridge(1288, 12, 39.79);
+    metrics_rewind_refused("dropped-by-session-invalidate");
+    metrics_rewind_refused("dropped-by-session-invalidate");
+    metrics_rewind_refused("token-hash");
+    metrics_rewind_capture_skipped("dist-route-unsupported");
+    metrics_dispatch_held();
 
     buf b = {0};
     append_metrics_text(&b, NULL);
@@ -20021,6 +20101,14 @@ static void test_metrics_text(void) {
     TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_stored_total 1\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_trimmed_tokens_total 12\n"));
     TEST_ASSERT(strstr(b.ptr, "ds4_kv_cache_miss_total{reason=\"token-mismatch\"} 1\n"));
+    /* Per-source reused tokens: the 1900-token memory-rewind hit above; a
+     * "none" prompt reuses nothing and gets no series. */
+    TEST_ASSERT(strstr(b.ptr, "ds4_reused_tokens_by_source_total{source=\"memory-rewind\"} 1900\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_reused_tokens_by_source_total{source=\"none\"}") == NULL);
+    TEST_ASSERT(strstr(b.ptr, "ds4_rewind_refused_total{reason=\"dropped-by-session-invalidate\"} 2\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_rewind_refused_total{reason=\"token-hash\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_rewind_capture_skipped_total{reason=\"dist-route-unsupported\"} 1\n"));
+    TEST_ASSERT(strstr(b.ptr, "ds4_dispatch_held_total 1\n"));
     /* Server-state gauges are omitted when no server is supplied. */
     TEST_ASSERT(strstr(b.ptr, "ds4_active_requests") == NULL);
     TEST_ASSERT(strstr(b.ptr, "ds4_context_tokens") == NULL);
