@@ -7218,24 +7218,27 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
+        /* A tool-enabled model sometimes writes a second reasoning pass into the
+         * answer channel and closes it with a literal </think> (issue #678).
+         * Drop any such stray tag so it never reaches the client, but keep
+         * streaming the surrounding text as content in real time: the previous
+         * guard held the whole answer back until the final chunk, which broke
+         * streaming for the common single-pass case (issue #783). The tag is a
+         * single vocabulary token, so it never splits across updates; a partial
+         * trailing '<' is already held by text_stream_safe_limit() below. */
+        while (st->guard_second_reasoning) {
             const char *close = strstr(raw + st->emit_pos, "</think>");
             const char *tool = r->has_tools ?
                 find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
-                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
+            if (!close || (tool && tool < close)) break;
+            const size_t limit = (size_t)(close - raw);
+            if (limit > st->emit_pos) {
+                if (!sse_chat_delta_n(fd, r, id, "content",
                                       raw + st->emit_pos,
                                       limit - st->emit_pos)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
+                st->sent_content = true;
             }
+            st->emit_pos = limit + strlen("</think>");
         }
 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
@@ -8851,27 +8854,24 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
+        /* Drop a stray </think> from a second reasoning pass (issue #678) while
+         * streaming the surrounding answer text in real time rather than holding
+         * it until the final chunk (issue #783). See the OpenAI path above for
+         * the full rationale; the tag is a single, never-split vocabulary token. */
+        while (st->guard_second_reasoning) {
             const char *close = strstr(raw + st->emit_pos, "</think>");
             const char *tool = r->has_tools ?
                 find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos) {
-                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
-                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
-                                                  raw + st->emit_pos,
-                                                  limit - st->emit_pos)) return false;
-                    st->sent_thinking = true;
-                }
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
+            if (!close || (tool && tool < close)) break;
+            const size_t limit = (size_t)(close - raw);
+            if (limit > st->emit_pos) {
+                if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+                if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
+                                              raw + st->emit_pos,
+                                              limit - st->emit_pos)) return false;
+                st->sent_text = true;
             }
+            st->emit_pos = limit + strlen("</think>");
         }
 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
@@ -15148,7 +15148,10 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     close(sv[1]);
 }
 
-static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
+/* Anthropic counterpart of the OpenAI stray-</think> suppression (issue #678):
+ * the tag is dropped, the surrounding draft streams as a text block, and the
+ * real answer after it is text too (streaming preserved, issue #783). */
+static void test_anthropic_stream_suppresses_second_think_tag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -15173,9 +15176,48 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
     char *out = read_socket_text(sv[1]);
 
     TEST_ASSERT(strstr(out, "\"thinking\":\"first pass\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"thinking\":\"escaped draft\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"escaped draft\"") != NULL);
     TEST_ASSERT(strstr(out, "\"text\":\"final answer\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"text\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "\"thinking\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Regression for #783 on the Anthropic stream: a single-pass answer (no second
+ * </think>, no tool call) must stream as a text block while generated, not be
+ * held until the final chunk. */
+static void test_anthropic_stream_streams_answer_incrementally(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_stream", 5, &st));
+    const char *partial = "reasoning</think>The answer is";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_stream",
+                                            &st, partial, strlen(partial), false));
+    TEST_ASSERT(st.sent_text);
+    const char *complete = "reasoning</think>The answer is 42.";
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_stream",
+                                          &st, complete, strlen(complete), NULL,
+                                          "stop", 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"thinking\":\"reasoning\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"The answer is") != NULL);
     TEST_ASSERT(strstr(out, "</think>") == NULL);
 
     free(out);
@@ -15378,7 +15420,11 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     close(sv[1]);
 }
 
-static void test_openai_stream_reroutes_second_reasoning_pass(void) {
+/* A tool-enabled model may write a second reasoning pass into the answer channel
+ * and close it with a literal </think> (issue #678). The stray tag must never
+ * reach the client. The surrounding text streams as content (the answer streams
+ * in real time, issue #783), and the real answer after the tag is content too. */
+static void test_openai_stream_suppresses_second_think_tag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -15404,9 +15450,50 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     char *out = read_socket_text(sv[1]);
 
     TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"escaped draft\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"escaped draft\"") != NULL);
     TEST_ASSERT(strstr(out, "\"content\":\"final answer\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"content\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Regression for #783: with thinking + tools, a normal single-pass answer (no
+ * second </think>, no tool call) must stream as content while it is generated,
+ * not be held back until the final chunk. */
+static void test_openai_stream_streams_answer_incrementally(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *partial = "<think>reasoning</think>The answer is";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_stream",
+                                         &st, partial, strlen(partial), false));
+    /* Content emitted mid-stream, before the final chunk. This is the property
+     * the old hold-until-final guard broke. */
+    TEST_ASSERT(st.sent_content);
+    const char *complete = "<think>reasoning</think>The answer is 42.";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_stream",
+                                       &st, complete, strlen(complete), NULL,
+                                       "stop", 5, 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"reasoning\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"The answer is") != NULL);
     TEST_ASSERT(strstr(out, "</think>") == NULL);
 
     free(out);
@@ -19777,11 +19864,13 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
-    test_anthropic_stream_reroutes_second_reasoning_pass();
+    test_anthropic_stream_suppresses_second_think_tag();
+    test_anthropic_stream_streams_answer_incrementally();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
-    test_openai_stream_reroutes_second_reasoning_pass();
+    test_openai_stream_suppresses_second_think_tag();
+    test_openai_stream_streams_answer_incrementally();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
