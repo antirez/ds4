@@ -9272,7 +9272,11 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
-    int clients;
+    int clients;            /* open client connections (shutdown drain) */
+    int active_requests;    /* inference jobs queued or generating; excludes
+                             * /metrics, /v1/models and other informational
+                             * endpoints so a Prometheus scrape never counts
+                             * itself */
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -13761,13 +13765,13 @@ static void append_metrics_text(buf *b, server *s) {
                    snap.kv_miss[i].name, (unsigned long long)snap.kv_miss[i].count);
     }
     if (!s) return;
-    int clients;
+    int active_requests;
     pthread_mutex_lock(&s->mu);
-    clients = s->clients;
+    active_requests = s->active_requests;
     pthread_mutex_unlock(&s->mu);
-    buf_puts(b, "# HELP ds4_active_requests HTTP requests currently in flight\n"
+    buf_puts(b, "# HELP ds4_active_requests Inference requests in flight (queued or generating); excludes /metrics and other informational endpoints\n"
                 "# TYPE ds4_active_requests gauge\n");
-    buf_printf(b, "ds4_active_requests %d\n", clients);
+    buf_printf(b, "ds4_active_requests %d\n", active_requests);
     buf_puts(b, "# HELP ds4_context_limit_tokens Configured context size\n"
                 "# TYPE ds4_context_limit_tokens gauge\n");
     buf_printf(b, "ds4_context_limit_tokens %d\n", s->ctx_size);
@@ -13822,6 +13826,22 @@ static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
     pthread_cond_broadcast(&s->clients_cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Bracket the lifetime of one inference request for the
+ * ds4_active_requests gauge: from just before it is enqueued until its
+ * job completes (or fails to enqueue). Informational endpoints never
+ * pass through here. */
+static void active_request_begin(server *s) {
+    pthread_mutex_lock(&s->mu);
+    s->active_requests++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void active_request_end(server *s) {
+    pthread_mutex_lock(&s->mu);
+    if (s->active_requests > 0) s->active_requests--;
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -14005,7 +14025,9 @@ static void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
+    active_request_begin(s);
     if (!enqueue(s, &j)) {
+        active_request_end(s);
         http_error(fd, s->enable_cors, 503, "server shutting down");
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
@@ -14013,6 +14035,7 @@ static void *client_main(void *arg) {
         goto done;
     }
     wait_for_job_or_disconnect(s, &j);
+    active_request_end(s);
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
@@ -19775,6 +19798,37 @@ static void test_metrics_text(void) {
     TEST_ASSERT(strstr(b.ptr, "ds4_active_requests") == NULL);
     TEST_ASSERT(strstr(b.ptr, "ds4_context_tokens") == NULL);
     buf_free(&b);
+
+    /* ds4_active_requests counts inference jobs only: open connections
+     * (the scrape itself, /v1/models, OPTIONS) must not show up, so a
+     * server with two idle connections and no jobs reports 0. */
+    {
+        server s = {0};
+        server_slot slot;
+        test_server_bind_slot(&s, &slot);
+        pthread_mutex_init(&s.mu, NULL);
+        s.ctx_size = 4096;
+        s.clients = 2;
+        buf mb = {0};
+        append_metrics_text(&mb, &s);
+        TEST_ASSERT(strstr(mb.ptr, "ds4_active_requests 0\n"));
+        TEST_ASSERT(strstr(mb.ptr, "ds4_context_tokens{slot=\"0\"} 0\n"));
+        buf_free(&mb);
+
+        active_request_begin(&s);
+        active_request_begin(&s);
+        active_request_end(&s);
+        append_metrics_text(&mb, &s);
+        TEST_ASSERT(strstr(mb.ptr, "ds4_active_requests 1\n"));
+        buf_free(&mb);
+
+        active_request_end(&s);
+        active_request_end(&s); /* never goes negative */
+        append_metrics_text(&mb, &s);
+        TEST_ASSERT(strstr(mb.ptr, "ds4_active_requests 0\n"));
+        buf_free(&mb);
+        pthread_mutex_destroy(&s.mu);
+    }
 
     /* Reason-table overflow: excess reasons account to the final bucket. */
     for (int i = 0; i < METRICS_REASONS_MAX + 3; i++) {
