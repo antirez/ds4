@@ -29319,6 +29319,27 @@ static bool metal_graph_stage_profile_enabled_for_layer(
     return metal_graph_profile_layer_value_match(layer_env, il);
 }
 
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS: the same stage boundaries as the layer/decode
+ * stage profilers, but each boundary only commits the batch and tags it (see
+ * ds4_gpu_stage_flush); nothing waits.  Reported per prefill chunk / decode
+ * token by ds4_gpu_stage_report. */
+static bool metal_graph_gpu_stage_timestamps(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_GPU_STAGE_TIMESTAMPS");
+        enabled = v != NULL && strcmp(v, "0") != 0;
+    }
+    return enabled != 0;
+}
+
+static bool metal_graph_gpu_stage_timestamps_layer(uint32_t il) {
+    return metal_graph_gpu_stage_timestamps() &&
+           metal_graph_stage_profile_enabled_for_layer(
+                "DS4_METAL_GPU_STAGE_TIMESTAMPS",
+                "DS4_METAL_GPU_STAGE_TIMESTAMPS_LAYER",
+                il);
+}
+
 static bool metal_graph_layer_stage_profile_enabled(uint32_t il) {
     return metal_graph_stage_profile_enabled_for_layer(
                 "DS4_ROCM_LAYER_STAGE_PROFILE",
@@ -29327,7 +29348,8 @@ static bool metal_graph_layer_stage_profile_enabled(uint32_t il) {
            metal_graph_stage_profile_enabled_for_layer(
                 "DS4_METAL_LAYER_STAGE_PROFILE",
                 "DS4_METAL_LAYER_STAGE_PROFILE_LAYER",
-                il);
+                il) ||
+           metal_graph_gpu_stage_timestamps_layer(il);
 }
 
 static bool metal_graph_decode_stage_profile_enabled(uint32_t il) {
@@ -29338,11 +29360,15 @@ static bool metal_graph_decode_stage_profile_enabled(uint32_t il) {
            metal_graph_stage_profile_enabled_for_layer(
                 "DS4_METAL_DECODE_STAGE_PROFILE",
                 "DS4_METAL_DECODE_STAGE_PROFILE_LAYER",
-                il);
+                il) ||
+           metal_graph_gpu_stage_timestamps_layer(il);
 }
 
 static bool metal_graph_layer_stage_profile_start(uint32_t il) {
     if (!metal_graph_layer_stage_profile_enabled(il)) return true;
+    if (metal_graph_gpu_stage_timestamps()) {
+        return ds4_gpu_stage_flush("layer", "before", il, 0, 0) != 0;
+    }
     if (ds4_gpu_end_commands() == 0) return false;
     return ds4_gpu_begin_commands() != 0;
 }
@@ -29358,6 +29384,9 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    pos0,
         uint32_t    n_tokens,
         double     *stage_t0) {
+    if (metal_graph_gpu_stage_timestamps()) {
+        return ds4_gpu_stage_flush(part, stage, il, pos0, n_tokens) != 0;
+    }
     if (ds4_gpu_end_commands() == 0) return false;
     const double now = now_sec();
     if (stage != NULL) {
@@ -32685,6 +32714,7 @@ static bool metal_graph_eval_token_raw_swa_top(
                     (t_read - t_done) * 1000.0,
                     (t_read - t0) * 1000.0);
         }
+        if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("decode", pos, 1);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after split-top graph eval failure also failed\n");
@@ -32743,6 +32773,7 @@ static bool metal_graph_eval_token_raw_swa_top(
                 (t_read - t0) * 1000.0,
                 logits != NULL);
     }
+    if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("decode", pos, 1);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after top-only graph eval failure also failed\n");
@@ -36191,6 +36222,7 @@ static bool metal_graph_prefill_layer_major(
         if (logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
+        if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("prefill", start, n_tokens);
         if (profile) {
             const double t_read = now_sec();
             fprintf(stderr,
@@ -36736,6 +36768,7 @@ static bool metal_graph_prefill_layer_major(
                 (t_read - t_before_read) * 1000.0,
                 (t_read - t0) * 1000.0);
     }
+    if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("prefill", start, n_tokens);
     return ok;
 }
 
