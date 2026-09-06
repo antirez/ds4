@@ -9720,6 +9720,17 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_FIXED_HEADER DS4_KVSTORE_FIXED_HEADER
 #define KV_CACHE_HIT_HALF_LIFE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
+#define KV_EXT_TOKFP DS4_KVSTORE_EXT_TOKFP
+
+/* Tokenizer fingerprint section: first trailer section of stamped files.
+ * 8-byte header (3 magic, 1 version, 4 payload length) + u64 fp. */
+#define KV_TOKFP_MAGIC0 'T'
+#define KV_TOKFP_MAGIC1 'K'
+#define KV_TOKFP_MAGIC2 'F'
+#define KV_TOKFP_VERSION 1u
+#define KV_TOKFP_HEADER 8u
+#define KV_TOKFP_PAYLOAD 8u
+#define KV_TOKFP_BYTES (KV_TOKFP_HEADER + KV_TOKFP_PAYLOAD)
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
 #define KV_TOOL_MAP_MAGIC0 'K'
@@ -10128,15 +10139,49 @@ static bool kv_cache_file_size_fits(const kv_disk_cache *kc,
 
 static bool kv_cache_tool_map_size_cb(void *ud, const char *text,
                                       uint64_t *bytes_out) {
-    return kv_tool_map_serialized_size((server *)ud, text, bytes_out);
+    uint64_t tool_bytes = 0;
+    if (!kv_tool_map_serialized_size((server *)ud, text, &tool_bytes)) return false;
+    *bytes_out = KV_TOKFP_BYTES + tool_bytes;
+    return true;
 }
 
 static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
                                        uint64_t *written_bytes) {
-    return kv_tool_map_write((server *)ud, fp, text, written_bytes);
+    server *s = (server *)ud;
+    uint64_t written = 0;
+    uint8_t h[KV_TOKFP_HEADER];
+    h[0] = KV_TOKFP_MAGIC0;
+    h[1] = KV_TOKFP_MAGIC1;
+    h[2] = KV_TOKFP_MAGIC2;
+    h[3] = KV_TOKFP_VERSION;
+    le_put32(h + 4, KV_TOKFP_PAYLOAD);
+    uint8_t fb[8];
+    uint64_t tok_fp = ds4_engine_tokenizer_fingerprint(s ? s->engine : NULL);
+    for (int i = 0; i < 8; i++) fb[i] = (uint8_t)(tok_fp >> (8 * i));
+    if (fwrite(h, 1, sizeof(h), fp) != sizeof(h)) return false;
+    if (fwrite(fb, 1, sizeof(fb), fp) != sizeof(fb)) return false;
+    written += KV_TOKFP_BYTES;
+    uint64_t tool_written = 0;
+    if (!kv_tool_map_write(s, fp, text, &tool_written)) return false;
+    written += tool_written;
+    if (written_bytes) *written_bytes = written;
+    return true;
 }
 
 static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
+    /* Skip the tokenizer fingerprint section when present; the loader has
+     * already rejected mismatches before the payload was touched, so the
+     * value is informational here.  Older files start directly at the tool
+     * map; restore the position for them. */
+    long start = ftell(fp);
+    uint8_t h[8];
+    if (start >= 0 && fread(h, 1, sizeof(h), fp) == (long)sizeof(h) &&
+        h[0] == KV_TOKFP_MAGIC0 && h[1] == KV_TOKFP_MAGIC1 &&
+        h[2] == KV_TOKFP_MAGIC2 && h[3] == KV_TOKFP_VERSION) {
+        if (fseek(fp, (long)le_get32(h + 4), SEEK_CUR) != 0) return -1;
+    } else if (start >= 0) {
+        if (fseek(fp, start, SEEK_SET) != 0) return -1;
+    }
     return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
 }
 
@@ -10144,7 +10189,7 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
                                                          const stop_list *wanted) {
     return (ds4_kvstore_trailer_hooks){
         .ud = s,
-        .ext_flag = KV_EXT_TOOL_MAP,
+        .ext_flag = (uint8_t)(KV_EXT_TOKFP | KV_EXT_TOOL_MAP),
         .serialized_size = kv_cache_tool_map_size_cb,
         .write = kv_cache_tool_map_write_cb,
         .load = kv_cache_tool_map_load_cb,

@@ -38682,6 +38682,9 @@ typedef enum {
 } ds4_vision_kind;
 
 struct ds4_engine {
+    uint64_t tokenizer_fp;
+    int tokenizer_fp_ready;
+    pthread_mutex_t tokenizer_fp_mu;
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -56085,6 +56088,80 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 #endif
 }
 
+/* Tokenizer behavioral fingerprint probes.  APPEND-ONLY: never edit or
+ * reorder existing entries, or every checkpoint stamp changes globally.
+ * The set deliberately exercises JoyAI pre-tokenizer seams: apostrophe
+ * before punctuation runs, digits, spaced indentation, newline joins,
+ * UTF-8 letters, and special-token boundaries. */
+static const char *const DS4_TOKENIZER_FP_PROBES[] = {
+    "TABLE.*mailbox|\x27.*CREATE",
+    "box|\x27.*username\x22",
+    "The user\x27s int 123456789 x",
+    "    int main() {\n        return 0;\n}",
+    "caf\xc3\xa9 na\xc3\xafve \xe4\xb8\xad",
+    "a  b\tc\n\nd",
+    "<\xe2\x80\x82User\xe2\x80\x82>hello</\xe2\x80\x82User\xe2\x80\x82>",
+    "\x27.\x27+, *-[]{}|\\/`~!@#$%^&*()",
+    "yes) -> \n navigation 0%->33%->67%",
+    "1 22 333 4444 55555 \x22quoted\x22 \x27single\x27",
+};
+
+
+static uint64_t tokenizer_fp_hash_bytes(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+uint64_t ds4_engine_tokenizer_fingerprint(ds4_engine *e) {
+    if (!e) return 0;
+    pthread_mutex_lock(&e->tokenizer_fp_mu);
+    if (!e->tokenizer_fp_ready) {
+        uint64_t h = 14695981039346656037ull;
+        /* Hash tokenizer CONTENT, never in-memory struct bytes: pointer
+         * fields change with every process mapping, which would make the
+         * fingerprint restart-unstable and reject valid checkpoints after
+         * an ordinary server restart. */
+        h = tokenizer_fp_hash_bytes(h, &e->vocab.n_vocab, sizeof(e->vocab.n_vocab));
+        for (int ti = 0; ti < e->vocab.n_vocab; ti++) {
+            h = tokenizer_fp_hash_bytes(h, &e->vocab.token[ti].len,
+                                        sizeof(e->vocab.token[ti].len));
+            h = tokenizer_fp_hash_bytes(h, e->vocab.token[ti].ptr,
+                                        (size_t)e->vocab.token[ti].len);
+        }
+        /* Merge ranks: the open-addressed slot order is a deterministic
+         * function of the GGUF merge list, so hashing slots in index order
+         * (key bytes + rank) is stable across processes. */
+        h = tokenizer_fp_hash_bytes(h, &e->vocab.merge_rank.used,
+                                    sizeof(e->vocab.merge_rank.used));
+        h = tokenizer_fp_hash_bytes(h, &e->vocab.merge_rank.cap,
+                                    sizeof(e->vocab.merge_rank.cap));
+        for (uint64_t mi = 0; mi < e->vocab.merge_rank.cap; mi++) {
+            str_i32_entry *en = &e->vocab.merge_rank.entry[mi];
+            if (!en->used) continue;
+            h = tokenizer_fp_hash_bytes(h, &en->key.len, sizeof(en->key.len));
+            h = tokenizer_fp_hash_bytes(h, en->key.ptr, (size_t)en->key.len);
+            h = tokenizer_fp_hash_bytes(h, &en->value, sizeof(en->value));
+        }
+        for (size_t pi = 0; pi < sizeof(DS4_TOKENIZER_FP_PROBES) /
+                                   sizeof(DS4_TOKENIZER_FP_PROBES[0]); pi++) {
+            ds4_tokens t = {0};
+            tokenize_rendered_chat_vocab(&e->vocab,
+                                         DS4_TOKENIZER_FP_PROBES[pi], &t);
+            h = tokenizer_fp_hash_bytes(h, t.v, (size_t)t.len * sizeof(t.v[0]));
+            ds4_tokens_free(&t);
+        }
+        e->tokenizer_fp = h;
+        e->tokenizer_fp_ready = 1;
+    }
+    uint64_t fp = e->tokenizer_fp;
+    pthread_mutex_unlock(&e->tokenizer_fp_mu);
+    return fp;
+}
+
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -62824,6 +62901,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
+    pthread_mutex_init(&e->tokenizer_fp_mu, NULL);
 #ifdef DS4_ROCM_BUILD
     g_glm_rocm_guard_available_baseline = 0;
     (void)ds4_linux_nonmovable_memory(&g_glm_rocm_guard_available_baseline);
