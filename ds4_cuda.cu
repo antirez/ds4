@@ -2332,13 +2332,50 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
-                what ? what : "weights",
-                (double)chunk / 1048576.0,
-                cudaGetErrorString(err));
+        /* Device arena is full: fall back to pinned host memory mapped
+         * into the GPU's address space (zero-copy). This keeps models
+         * whose non-routed weights exceed available VRAM working, at
+         * the cost of PCIe latency on every access to this chunk. Set
+         * DS4_CUDA_NO_PINNED_ARENA_FALLBACK to restore the old
+         * fail-fast behavior. */
         (void)cudaGetLastError();
-        g_model_cache_full = 1;
-        return NULL;
+        if (getenv("DS4_CUDA_NO_PINNED_ARENA_FALLBACK") != NULL) {
+            fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
+                    what ? what : "weights",
+                    (double)chunk / 1048576.0,
+                    cudaGetErrorString(err));
+            g_model_cache_full = 1;
+            return NULL;
+        }
+        void *host_ptr = NULL;
+        cudaError_t herr = cudaHostAlloc(&host_ptr, (size_t)chunk, cudaHostAllocMapped);
+        if (herr != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s "
+                    "(pinned fallback also failed: %s)\n",
+                    what ? what : "weights",
+                    (double)chunk / 1048576.0,
+                    cudaGetErrorString(err),
+                    cudaGetErrorString(herr));
+            (void)cudaGetLastError();
+            g_model_cache_full = 1;
+            return NULL;
+        }
+        void *dev_ptr = NULL;
+        herr = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+        if (herr != cudaSuccess || !dev_ptr) {
+            fprintf(stderr, "ds4: CUDA model arena pinned fallback device pointer lookup failed for %s: %s\n",
+                    what ? what : "weights",
+                    cudaGetErrorString(herr));
+            (void)cudaGetLastError();
+            (void)cudaFreeHost(host_ptr);
+            g_model_cache_full = 1;
+            return NULL;
+        }
+        fprintf(stderr, "ds4: CUDA model arena using pinned host RAM fallback for %s "
+                "(%.2f MiB chunk, zero-copy device access)\n",
+                what ? what : "weights",
+                (double)chunk / 1048576.0);
+        dev = dev_ptr;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
